@@ -1,0 +1,19 @@
+schema_version: 1
+framework_version: 1.1.0
+resource_profile:
+  provider_tool: null
+  billing_mode: null
+  model_policy: auto
+  available:
+    time_minutes: null
+    token_budget: null
+    monetary_budget_usd: null
+    human_review_minutes: null
+  preferences:
+    minimize_cost: true
+    allow_additional_spend: false
+    allow_model_routing: true
+    allow_parallel_agents: false
+  telemetry:
+    source: unknown
+    confidence: low

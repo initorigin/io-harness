@@ -1,0 +1,74 @@
+id: io-harness
+name: IO Harness
+classification: platform
+vision: >
+  A production-grade Rust agent harness that runs AI agents reliably from a
+  typed task contract to a verified result — the shared engine every
+  initorigin app (io-cli, io-studio) and io-eval build on.
+users:
+  - The initorigin author building io-cli and io-studio on top of the crate
+  - (later) external Rust developers building their own agentic apps
+problems:
+  - Existing harnesses are tied to one vendor, one app, or one language, and
+    hide the loop, verification, budgets, and guardrails you need to trust an
+    agent on long or sensitive work.
+  - No single embeddable core gives you the orchestration loop, tools,
+    verification, and provider-agnosticism together as a library.
+outcomes:
+  - One Rust crate that any initorigin app imports to run an agent that
+    observes, reasons, acts, verifies, and stops — safely and observably.
+requirements:
+  - Task contract — goal, constraints, expected output, success criteria
+  - Context construction — feed the model only relevant, current, trusted info
+  - Tool layer — narrow, typed actions the agent invokes
+  - Orchestration loop — observe, reason, act, check, stop
+  - State and memory — progress, intermediate results, decisions (rusqlite)
+  - Verification layer — tests, schemas, read-backs confirm task done
+  - Permissions and guardrails — what the agent may access, change, send, spend
+  - Recovery and retry — retries, fallbacks, replanning, escalation
+  - Stop conditions and budgets — cap steps, time, cost, retries, risky actions
+  - Observability and tracing — record prompts, decisions, tool calls, cost
+  - Human approval layer — review before sensitive or irreversible actions
+  - Providers — OpenRouter, then Anthropic and OpenAI, via own HTTP+SSE client
+  - Agent composition — spawn and nest many agents (100+) with shared context
+  - Long-running autonomous tasks — 24h+ with no user input
+  - Ephemeral local code-exec sandboxes — write, run, capture, destroy
+  - Built-in tool suite — filesystem, git, grep, find
+  - Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete,
+    PDF watermark, PDF form fill, OCR, barcode/QR read and generate
+  - Media — image and video passthrough when the model supports it
+  - Extensibility — MCP (rmcp), plugins, skills
+constraints:
+  - Rust crate; async on tokio; state in rusqlite; own HTTP+SSE provider client
+  - Embeddable in-process library first; daemon/client mode added later
+  - Apache 2.0
+  - Runs locally on the developer's machine; no hosted service in scope
+public_contract: >
+  A versioned Rust crate API (SemVer). No network API in v0.1; daemon/IPC
+  contract deferred.
+deployment_context: >
+  Local, single-user, single-tenant. Operated by the developer embedding the
+  crate. No server to run for MVP.
+success_measures:
+  - io-cli (or a test binary) drives io-harness through one real task that
+    edits a file, and the verification layer confirms the file meets the spec.
+non_goals:
+  - io-cli, io-studio, io-eval apps themselves — separate products and repos
+  - Hosted or cloud service, multi-tenant, or web API
+  - Building or fine-tuning models
+  - GUI (that is io-studio)
+  - Daemon/client mode in the first release
+mvp_boundary: >
+  A developer hands io-harness one task contract to modify a file to meet a
+  stated spec; the harness runs the orchestration loop using the filesystem
+  tool and the OpenRouter provider, the verification layer confirms the file
+  meets the spec, and it stops — all in one process, no sandbox, no sub-agents.
+assumptions:
+  - First consumer is the author's own io-cli/io-studio, not external users.
+  - The full tool/office/media/sandbox surface is roadmap; v0.1 ships only the
+    filesystem tool + OpenRouter provider + verify + stop.
+  - OpenRouter is the first provider; Anthropic and OpenAI come later.
+  - Each initorigin repo runs its own UltraShip workspace; io-eval, io-studio,
+    io-cli, and website are planned separately in their own repos.
+  - Intended differentiator is provider-agnosticism plus agent composition plus
+    skills/extensibility, together.
