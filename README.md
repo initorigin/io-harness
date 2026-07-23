@@ -34,6 +34,64 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
 [docs/CONTRACT.md](docs/CONTRACT.md) for the public contract.
 
+## Usage (v0.1)
+
+v0.1 ships one vertical slice: hand the harness a task contract to edit one file
+to meet a spec; it runs the loop with the filesystem tool and the OpenRouter
+provider, verifies the file deterministically, persists every step to rusqlite,
+and stops on success or a step cap. Everything else in **Capabilities** is
+roadmap.
+
+### 1. Add the crate
+
+```toml
+[dependencies]
+io-harness = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+```
+
+### 2. Provide an OpenRouter key
+
+Credentials are read from the environment and never logged. No default model is
+guessed, so set the slug explicitly:
+
+```bash
+export OPENROUTER_API_KEY=sk-or-...
+export OPENROUTER_MODEL=anthropic/claude-sonnet-4   # any OpenRouter model slug
+```
+
+### 3. Run one file-edit task
+
+```rust
+use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
+
+#[tokio::main]
+async fn main() -> io_harness::Result<()> {
+    let contract = TaskContract::new(
+        "add a `hello` function that returns 42",
+        "src/hello.rs",
+        Verification::FileContains("fn hello".into()),
+    );
+
+    let provider = OpenRouter::from_env()?;
+    let store = Store::open("runs.db")?;
+
+    let result = run(&contract, &provider, &store).await?;
+    println!("{:?}", result.outcome); // Success { steps } | StepCapReached { steps }
+
+    for step in store.steps(result.run_id)? {
+        println!("step {}: {}", step.step, step.decision);
+    }
+    Ok(())
+}
+```
+
+Or run it live end to end: `cargo run --example edit_file`.
+
+Verification is deterministic on purpose — a model-judged check can pass a file
+that does not meet the spec. v0.1 offers `Verification::FileContains(String)` and
+`Verification::FileEquals(String)`.
+
 ## Part of initorigin
 
 `IO Harness` is one of the [initorigin](https://github.com/initorigin) products:

@@ -1,0 +1,25 @@
+[package]
+name = "io-harness"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "Apache-2.0"
+description = "A production-grade Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic, verified loop, embeddable in-process."
+repository = "https://github.com/initorigin/io-harness"
+readme = "README.md"
+keywords = ["agent", "ai", "llm", "openrouter", "harness"]
+categories = ["asynchronous", "api-bindings"]
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
