@@ -7,7 +7,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 **Type:** Rust library crate
 **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
 **License:** Apache-2.0
-**Status:** Pre-release. Product is BRAINSTORMED; v0.1 targets a single-agent task through the orchestration loop with the filesystem tool and the OpenRouter provider, verified end to end.
+**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass.
 
 ## Capabilities
 
@@ -34,21 +34,26 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
 [docs/CONTRACT.md](docs/CONTRACT.md) for the public contract.
 
-## Usage (v0.1)
+## Usage (v0.2)
 
-v0.1 ships one vertical slice: hand the harness a task contract to edit one file
-to meet a spec; it runs the loop with the filesystem tool and the OpenRouter
-provider, verifies the file deterministically, persists every step to rusqlite,
-and stops on success or a step cap. Everything else in **Capabilities** is
-roadmap.
+Hand the harness a task contract to edit one file to meet a spec; it runs the
+loop with the filesystem tool and the OpenRouter provider, verifies the result,
+records every step to rusqlite, and stops on success or a budget. Everything
+else in **Capabilities** is roadmap.
 
 ### 1. Add the crate
 
 ```toml
 [dependencies]
-io-harness = "0.1"
+io-harness = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
+
+Upgrading from 0.1: `TaskContract::new` is unchanged, so existing callers keep
+compiling. `CompletionResponse` gained a `usage` field — if you implement
+`Provider` yourself and build the struct literally, add `..Default::default()`.
+A 0.1 rusqlite database is migrated in place on open (new trace columns are
+added; a 0.1 binary still reads it).
 
 ### 2. Provide an OpenRouter key
 
@@ -60,9 +65,10 @@ export OPENROUTER_API_KEY=sk-or-...
 export OPENROUTER_MODEL=anthropic/claude-sonnet-4   # any OpenRouter model slug
 ```
 
-### 3. Run one file-edit task
+### 3. Run one file-edit task, bounded and verified by execution
 
 ```rust
+use std::time::Duration;
 use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
 
 #[tokio::main]
@@ -70,31 +76,59 @@ async fn main() -> io_harness::Result<()> {
     let contract = TaskContract::new(
         "add a `hello` function that returns 42",
         "src/hello.rs",
-        Verification::FileContains("fn hello".into()),
-    );
+        // Execution-based: the file must compile AND pass this test. A stub
+        // that only contains the right substring fails the gate.
+        Verification::RustTestPasses {
+            test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
+        },
+    )
+    .with_max_steps(8)                              // step budget
+    .with_time_budget(Duration::from_secs(120))     // time budget
+    .with_token_budget(200_000)                     // cost budget, in tokens
+    .with_max_retries(2);                           // retry transient failures
 
     let provider = OpenRouter::from_env()?;
     let store = Store::open("runs.db")?;
 
     let result = run(&contract, &provider, &store).await?;
-    println!("{:?}", result.outcome); // Success { steps } | StepCapReached { steps }
-
-    for step in store.steps(result.run_id)? {
-        println!("step {}: {}", step.step, step.decision);
-    }
+    // Success | StepCapReached | TimeBudgetExceeded | CostBudgetExceeded
+    println!("{:?}", result.outcome);
     Ok(())
 }
 ```
 
-Or run it live end to end: `cargo run --example edit_file`.
+### Execution-based verification
 
-Verification is deterministic on purpose — the same file always yields the same
-pass/fail, with no model in the loop to bless a bad result. But v0.1 offers
-**content checks only** — `Verification::FileContains(String)` and
-`Verification::FileEquals(String)` — which confirm the expected text is present,
-**not** that the file compiles or is semantically correct. A model can satisfy a
-substring without meeting the full intent. Execution-based verification (compile
-and/or run a test against the artifact) lands in 0.2.
+Content checks (`FileContains`, `FileEquals`) confirm the file *says* the right
+thing but not that it *works* — the 0.1 live run passed `FileContains("fn hello")`
+by writing the literal string `fn hello`, which does not compile. v0.2 adds gates
+that run the artifact:
+
+- `Verification::CompilesRust` — passes only if the file compiles (`rustc --crate-type lib`).
+- `Verification::RustTestPasses { test_src }` — appends `test_src` and passes only if the test binary passes.
+
+Compilation runs locally in a throwaway temp dir (removed afterwards) and touches
+no network.
+
+### Trace and resume
+
+Every step's prompt, decision, tool call, and token usage is persisted. Read the
+full trace back, and resume an interrupted run under its original id instead of
+restarting:
+
+```rust
+use io_harness::{resume, Store};
+
+// After a crash or a hit budget, continue the same run from where it stopped.
+let store = Store::open("runs.db")?;
+let result = resume(&contract, &provider, &store, run_id).await?;
+
+for step in store.steps(result.run_id)? {
+    println!("step {}: {} ({} tokens)", step.step, step.decision, step.tokens);
+}
+```
+
+Or run it live end to end: `cargo run --example edit_file`.
 
 ## Part of initorigin
 

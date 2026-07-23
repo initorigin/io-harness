@@ -41,13 +41,30 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
+/// Token usage for one completion, in a vendor-neutral shape. Used to enforce
+/// the cost budget and to record spend in the trace.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Tokens in the prompt.
+    pub prompt_tokens: u64,
+    /// Tokens the model generated.
+    pub completion_tokens: u64,
+    /// Total tokens billed for this completion.
+    pub total_tokens: u64,
+}
+
 /// One model completion.
+///
+/// Construct with `..Default::default()` for forward compatibility — fields are
+/// added in minor releases (e.g. `usage` in 0.2.0).
 #[derive(Debug, Clone, Default)]
 pub struct CompletionResponse {
     /// Any free text the model returned.
     pub text: Option<String>,
     /// Tool calls the model requested, in order.
     pub tool_calls: Vec<ToolCall>,
+    /// Token usage, when the provider reports it. `None` if unknown.
+    pub usage: Option<Usage>,
 }
 
 /// Anything that can turn a [`CompletionRequest`] into a [`CompletionResponse`].
