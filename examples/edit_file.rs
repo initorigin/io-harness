@@ -19,8 +19,14 @@ async fn main() -> io_harness::Result<()> {
     let contract = TaskContract::new(
         "Create a Rust function `hello` that returns the u32 value 42.",
         &file,
-        Verification::FileContains("fn hello".into()),
-    );
+        // Execution-based: the file must compile AND the test must pass. A
+        // substring stub (the 0.1.0 I01 failure) cannot satisfy this.
+        Verification::RustTestPasses {
+            test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
+        },
+    )
+    .with_max_steps(4)
+    .with_token_budget(200_000);
 
     let provider = OpenRouter::from_env()?;
     let store = Store::open(dir.join("runs.db"))?;

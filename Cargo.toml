@@ -1,11 +1,11 @@
 [package]
 name = "io-harness"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Aakash Pawar"]
 license = "Apache-2.0"
-description = "A Rust agent harness: run an AI agent from a typed task contract to a checked result. Provider-agnostic loop, deterministic content verification, embeddable in-process."
+description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic loop, step/time/cost budgets, retry, full trace, resumable runs, and execution-based verification. Embeddable in-process."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
 keywords = ["agent", "ai", "llm", "openrouter", "harness"]
@@ -14,7 +14,7 @@ categories = ["asynchronous", "api-bindings"]
 exclude = [".ultraship/", ".github/"]
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -22,7 +22,8 @@ serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "1"
 tracing = "0.1"
+# Execution-based verification compiles the produced file in a throwaway dir.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }

@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use futures_util::StreamExt;
 use serde_json::json;
 
-use super::{CompletionRequest, CompletionResponse, Provider, ToolCall};
+use super::{CompletionRequest, CompletionResponse, Provider, ToolCall, Usage};
 use crate::error::{Error, Result};
 
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -61,6 +61,9 @@ impl OpenRouter {
         json!({
             "model": self.model,
             "stream": true,
+            // Ask for a usage summary in the final stream chunk so the cost
+            // budget can be enforced from real token counts.
+            "stream_options": { "include_usage": true },
             "messages": [
                 { "role": "system", "content": request.system },
                 { "role": "user", "content": request.user },
@@ -131,10 +134,21 @@ struct Accumulator {
     text: String,
     /// index -> (name, argument fragments joined)
     tool_calls: BTreeMap<u64, (String, String)>,
+    usage: Option<Usage>,
 }
 
 impl Accumulator {
     fn ingest(&mut self, value: &serde_json::Value) {
+        // The usage summary arrives on its own chunk (choices may be empty).
+        if let Some(u) = value.get("usage").filter(|u| u.is_object()) {
+            let get = |k| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+            self.usage = Some(Usage {
+                prompt_tokens: get("prompt_tokens"),
+                completion_tokens: get("completion_tokens"),
+                total_tokens: get("total_tokens"),
+            });
+        }
+
         let Some(delta) = value.pointer("/choices/0/delta") else {
             return;
         };
@@ -177,6 +191,7 @@ impl Accumulator {
                 Some(self.text)
             },
             tool_calls,
+            usage: self.usage,
         }
     }
 }
