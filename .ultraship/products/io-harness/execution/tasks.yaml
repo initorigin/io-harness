@@ -1,103 +1,116 @@
 product: io-harness
-version: 0.2.0
+version: 0.3.0
 tasks:
-  - id: US-IO-HARNESS-0.2.0-T01
-    summary: Add an execution-based Verification variant that compiles the produced file with rustc (and optionally runs a test), passing only on exit 0.
-    why_required: The 0.1.0 live run (US-IO-HARNESS-0.2.0-I01) passed with a substring stub; without a gate that actually compiles/runs the artifact a task can still pass with non-working code.
+  - id: US-IO-HARNESS-0.3.0-T01
+    summary: Workspace root + grep, find, and read_file tools, scoped and escape-safe.
+    why_required: Without cross-repo search the agent cannot locate what to change; every multi-file task starts by grepping/finding, and the workspace root is what keeps that search inside the project.
     status: done
     depends_on: []
     acceptance_criteria:
-      - "Execution-based verification compiles and/or runs a test against the produced artifact; the I01 case — a non-compiling substring stub — FAILS the gate."
-      - "A task whose output compiles and passes its test PASSES the execution-based gate."
-      - "Execution-based verification runs the produced artifact locally without network access and cleans up build artifacts it creates."
+      - Given a task over a multi-file fixture repo, the agent uses the grep tool to locate matches by regex/substring and receives file+line results it can act on.
+      - The find tool locates files by path/name/glob across the workspace and returns matching paths.
+      - grep and find operate only within the configured workspace root and do not traverse outside it.
     files:
+      - src/tools/workspace.rs
+      - src/tools/mod.rs
+    evidence:
+      - "cargo test --lib tools::workspace — 5 passed: grep_finds_matches_by_regex_across_files_skipping_ignored, grep_path_glob_restricts_to_matching_files, find_matches_by_basename_and_path_glob, resolve_refuses_escapes_but_allows_inner_paths, read_missing_is_empty_then_write_roundtrips_within_root."
+
+  - id: US-IO-HARNESS-0.3.0-T02
+    summary: Multi-tool, multi-file loop with an observation log, plus multi-file execution-based verification.
+    why_required: The release outcome is editing several files in one run; the single-file loop and single-file verify gate cannot express or check that, so both must become set-aware.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.3.0-T01
+    acceptance_criteria:
+      - The harness edits several distinct files in a single run and the execution-based gate verifies the full set — the run only succeeds when every edited file meets its spec.
+    files:
+      - src/run.rs
       - src/verify.rs
+      - src/contract.rs
+      - src/tools/mod.rs
+      - tests/multi_file.rs
     evidence:
-      - "verify::tests::compiles_rust_rejects_stub_accepts_real passes: `fn hello` (I01 stub) fails CompilesRust, `pub fn hello() -> u32 { 42 }` passes."
-      - "verify::tests::rust_test_passes_only_when_test_passes passes: RustTestPasses passes with a correct test, fails with a wrong assertion."
-      - "tests/edit_file.rs::execution_verify_rejects_the_i01_stub_in_the_loop and ::execution_verify_accepts_a_compiling_file pass — the gate works end to end in the loop."
-      - "compile_rust runs rustc in a tempfile::tempdir() (auto-removed) with stdout/stderr null; no network."
+      - "cargo test --test multi_file — 3 passed: agent_finds_then_edits_several_files_and_the_set_verifies (Success{steps:5}, both files written, trace records find/grep/write per file), run_fails_when_one_of_the_edited_files_is_wrong (b=99 -> StepCapReached{4}, set gate rejects partial correctness), write_outside_the_workspace_is_refused_not_crashing_the_run."
+      - "cargo test — full suite 16 unit + 9 (0.2.0 integration, unchanged) + 3 multi_file + 1 doctest, all pass; no 0.2.0 single-file regression."
+      - "verify.rs units: each_compiles_rust_fails_if_any_file_fails, workspace_test_passes_only_when_files_work_together, multi_file_variant_errors_in_single_file_mode."
 
-  - id: US-IO-HARNESS-0.2.0-T02
-    summary: Add token/cost usage to CompletionResponse (request OpenRouter stream usage) and add step, time, and cost budgets to the contract with distinct stop outcomes.
-    why_required: A longer run cannot be trusted without bounded steps, time, and spend, each stopping the run with an outcome the caller can tell apart.
+  - id: US-IO-HARNESS-0.3.0-T03
+    summary: Anthropic provider over the own HTTP + SSE client, behind the Provider trait.
+    why_required: Anthropic is one of the two providers this release adds; its /v1/messages wire format is the genuinely new transport work and must parse tool calls from that vendor's stream.
     status: done
     depends_on: []
     acceptance_criteria:
-      - "Given a multi-step task with configured step, time, and cost budgets, the harness enforces each and stops with the distinct budget outcome for whichever is exceeded first."
-      - "No provider vendor type leaks into the public budget, verification, or trace API (provider-agnostic surface preserved)."
+      - The Anthropic and OpenAI providers send requests and stream responses over the own HTTP + SSE client, and the harness parses tool calls from each vendor's wire format.
+      - Each provider's API key is read from configuration/environment, never hard-coded or logged.
     files:
-      - src/contract.rs
+      - src/provider/anthropic.rs
       - src/provider/mod.rs
+    evidence:
+      - "cargo test --lib provider::anthropic — 3 passed: body_maps_tools_to_input_schema_and_system_top_level (system top-level, tools->input_schema, max_tokens set), accumulates_tool_use_from_input_json_deltas_and_usage (tool_use name + partial_json fragments -> {path,content}, input+output tokens summed), accumulates_plain_text."
+      - "Key read from ANTHROPIC_API_KEY via from_env(); sent as x-api-key header, never logged. Shared SSE reader added to provider/mod.rs (read_sse)."
+
+  - id: US-IO-HARNESS-0.3.0-T04
+    summary: OpenAI provider over the own HTTP + SSE client, sharing the OpenAI-style transport with OpenRouter.
+    why_required: OpenAI is the second provider this release adds; its chat/completions format matches OpenRouter's, so the shared code is factored out and reused rather than duplicated.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.3.0-T03
+    acceptance_criteria:
+      - The Anthropic and OpenAI providers send requests and stream responses over the own HTTP + SSE client, and the harness parses tool calls from each vendor's wire format.
+      - Each provider's API key is read from configuration/environment, never hard-coded or logged.
+    files:
+      - src/provider/openai.rs
       - src/provider/openrouter.rs
-      - src/run.rs
+      - src/provider/openai_wire.rs
+      - src/provider/mod.rs
     evidence:
-      - "tests/edit_file.rs::stops_at_time_budget → RunOutcome::TimeBudgetExceeded { steps: 1 }; ::stops_at_cost_budget → CostBudgetExceeded { steps: 2 }; ::stops_at_step_cap_when_never_verified → StepCapReached { steps: 3 }."
-      - "Usage is a vendor-neutral struct (prompt/completion/total tokens); contract budgets are Duration/u64; no OpenRouter type in the public API."
-      - "openrouter.rs requests stream_options.include_usage and parses the usage summary chunk into Usage."
+      - "Factored OpenAI-style wire (body + SSE parse + tool-call accumulator) into src/provider/openai_wire.rs; OpenRouter and OpenAI both delegate to it, differing only in endpoint/auth/model."
+      - "cargo test --lib provider — 5 passed incl. openai_wire::accumulates_tool_call_fragments_across_deltas and body_maps_tools_to_function_schema. OpenAi reads OPENAI_API_KEY via from_env(), bearer auth, key never logged."
+      - "cargo clippy --all-targets — clean, no warnings."
 
-  - id: US-IO-HARNESS-0.2.0-T03
-    summary: Extend the rusqlite schema and Store to persist the full trace — prompt, decision, tool call, token/cost usage, outcome — migrating existing 0.1.0 databases in place.
-    why_required: Without prompt/tool-call/usage in the store the run is not fully auditable, and a schema that drops 0.1.0 databases breaks backward compatibility.
+  - id: US-IO-HARNESS-0.3.0-T05
+    summary: Provider selection at run construction, provider recorded in the trace, and the provider-agnostic public surface, proven by a three-provider parity test.
+    why_required: The outcome lets a developer choose the provider without touching the contract; this task wires selection through the generic run, records which provider ran, and proves no vendor type leaks — the release's central thesis.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.2.0-T02
+      - US-IO-HARNESS-0.3.0-T02
+      - US-IO-HARNESS-0.3.0-T04
     acceptance_criteria:
-      - "Every prompt, decision, tool call, token/cost usage, and outcome of a run is written to rusqlite and reconstructable as a full trace after the run."
-      - "Budget, retry, and verification configuration are part of the documented public API under SemVer; existing 0.1.0 task-contract callers still compile, or a documented migration is provided."
+      - The same task contract runs to verified success under OpenRouter, Anthropic, and OpenAI, selected only at run construction with no change to the contract itself.
+      - The rusqlite trace records which provider ran and the per-file tool calls and edits of the multi-file run.
+      - Provider selection and the grep/find tools are part of the documented public API under SemVer; existing 0.2.0 callers still compile, or a documented migration is provided.
+      - No Anthropic-, OpenAI-, or OpenRouter-specific type appears in the public task-contract, tool, verification, or trace API (provider-agnostic surface preserved).
     files:
-      - src/state.rs
-    evidence:
-      - "state::tests::full_trace_persists_and_reads_back passes: prompt, tool_call, tokens read back per step."
-      - "state::tests::migrates_a_0_1_0_steps_table_in_place passes: a pre-0.2 steps table is ALTERed on open, old rows survive with defaulted trace columns."
-      - "tests/edit_file.rs::edits_file_and_verifies_success asserts the persisted prompt contains the goal and tool_call contains the write — full trace end to end."
-      - "TaskContract::new signature unchanged (0.1.0 callers compile); CHANGELOG + README document the CompletionResponse ..Default::default() and DB migration."
-
-  - id: US-IO-HARNESS-0.2.0-T04
-    summary: Add retry/recovery to the loop — retry a failing provider or tool step up to a configured limit with each attempt recorded in the trace, then escalate.
-    why_required: A single transient step failure must not sink a long run, and the contract requires each retry attempt to be visible in the trace.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.2.0-T03
-    acceptance_criteria:
-      - "A step that fails (tool error or failed verification) is retried up to the configured limit, then recovered via fallback/replan or escalated; each attempt is recorded in the trace."
-    files:
-      - src/contract.rs
-      - src/run.rs
-    evidence:
-      - "tests/edit_file.rs::retries_then_succeeds_recording_each_attempt passes: 2 failures then success, trace shows 'retry 1 after error', 'retry 2 after error', 'wrote file'."
-      - "tests/edit_file.rs::escalates_after_exhausting_retries passes: an always-failing provider escalates (run returns Err) after the retry limit; the run is marked 'escalated'."
-
-  - id: US-IO-HARNESS-0.2.0-T05
-    summary: Add a resume entrypoint that continues an interrupted run from persisted rusqlite state under the same run id instead of restarting.
-    why_required: A long autonomous run that is interrupted must continue rather than redo everything; this is a stated release outcome.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.2.0-T04
-    acceptance_criteria:
-      - "An interrupted run resumes from persisted rusqlite state and continues to completion rather than restarting from step one."
-    files:
-      - src/run.rs
       - src/lib.rs
+      - src/run.rs
+      - src/state.rs
+      - tests/parity.rs
     evidence:
-      - "tests/edit_file.rs::resumes_an_interrupted_run_without_restarting passes: first run stops at StepCapReached{2}, resume continues under the same run_id to Success{steps:3}, and the trace is one run of 3 steps (not restarted)."
-      - "resume() reads Store::last_step(run_id) and continues run_from at last+1."
+      - "tests/parity.rs the_same_contract_verifies_under_every_provider_and_records_which_ran — the identical TaskContract reaches Success{steps:1} through three Provider impls named openrouter/anthropic/openai (selection = which impl is passed to run), and store.provider(run_id) returns the right label each time."
+      - "Provider::name() added as a defaulted trait method (existing impls keep compiling — 0.2.0 back-compat); runs table gains a provider column via additive ALTER (0.1/0.2 DBs migrate in place). state tests: provider_is_recorded_and_read_back, migrates_a_pre_0_3_runs_table_adding_provider."
+      - "Agnostic surface: run()/TaskContract/Verification/CompletionRequest/Store carry no vendor type; providers are selected only by which impl is constructed. lib.rs exports Anthropic, OpenAi, OpenRouter behind the Provider trait."
+      - "Full suite green: 22 unit + 9 (0.2.0 integration, unchanged) + 3 multi_file + 1 parity + 1 doctest. cargo clippy --all-targets clean."
 
-  - id: US-IO-HARNESS-0.2.0-T06
-    summary: Update README and crate docs for budgets, retry/recovery, trace/resume, and execution-based verification, and confirm cargo test and cargo publish --dry-run pass for 0.2.0.
-    why_required: target_mode is published; the release is not shippable without docs and a passing publish dry-run, and the full suite must pass.
+  - id: US-IO-HARNESS-0.3.0-T06
+    summary: .env provider-key placeholders, README/docs, version bump, packaging, and full green suite.
+    why_required: The release is only shippable once the new surface is documented, the crate metadata is 0.3.0, publish dry-run passes, and the whole suite (multi-file + parity) is green.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.2.0-T05
+      - US-IO-HARNESS-0.3.0-T05
     acceptance_criteria:
-      - "`cargo test` passes, including the I01-stub-fails-verify test, the correct-artifact-passes test, and the resume test."
-      - "`cargo publish --dry-run` succeeds with complete crate metadata for 0.2.0."
-      - "README documents budgets, retry/recovery, the trace and resume model, and execution-based verification, each with an example."
+      - "`cargo test` passes, including the multi-file find-then-edit integration test and the three-provider parity test."
+      - "`cargo publish --dry-run` succeeds with complete crate metadata for 0.3.0."
+      - README documents the grep and find tools, multi-file edits, and selecting each of the three providers, with an example.
     files:
+      - .env
+      - .env.example
       - README.md
-      - Cargo.toml
       - CHANGELOG.md
+      - Cargo.toml
+      - examples/edit_repo.rs
     evidence:
-      - "cargo test: 8 unit + 9 integration + 1 doctest = 18 passed, 0 failed (includes stub-fails, correct-passes, and resume tests); cargo clippy --all-targets clean."
-      - "cargo publish --dry-run --allow-dirty: Packaged 28 files, 122.0KiB; verify compile OK; version 0.2.0, Apache-2.0, description/readme complete."
-      - "README 'Usage (v0.2)' documents budgets, execution-based verification, trace/resume, and the 0.1→0.2 upgrade, each with a code example; CHANGELOG Unreleased lists the additions and API changes."
+      - "cargo test — 22 unit + 9 (0.2.0) + 3 multi_file + 1 parity + 1 doctest, all pass. cargo clippy --all-targets clean."
+      - "cargo publish --dry-run --allow-dirty — Packaged io-harness v0.3.0, 36 files, verify-compiled, upload aborted (dry run). Real .env (secrets) excluded from the package; only .env.example ships."
+      - "README updated: Usage (v0.3) with provider selection (OpenRouter/Anthropic/OpenAI from_env), and a repository-task section showing grep/find + multi-file WorkspaceTestPasses. CHANGELOG 0.3.0 entry + migration note. Cargo.toml bumped to 0.3.0."
+      - ".env gained ANTHROPIC_API_KEY/ANTHROPIC_MODEL/OPENAI_API_KEY/OPENAI_MODEL as empty placeholders (per user: filled later, no live testing). examples/edit_repo.rs added for a live OpenRouter workspace run."

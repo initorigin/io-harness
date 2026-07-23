@@ -13,12 +13,12 @@
 //! the gate. Compilation happens in a throwaway temp dir that is removed
 //! afterwards, and `rustc` touches no network.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use tokio::process::Command;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 
 /// How the harness decides a task is done.
 #[derive(Debug, Clone)]
@@ -37,19 +37,68 @@ pub enum Verification {
         /// Rust source appended after the file's contents, e.g. a `#[test] fn`.
         test_src: String,
     },
+    /// (workspace/multi-file) Every listed file — relative to the workspace root
+    /// — must compile on its own as a Rust library. The run only succeeds when
+    /// all of them do, so one wrong file fails the whole set.
+    EachCompilesRust(Vec<PathBuf>),
+    /// (workspace/multi-file) All listed files, concatenated in order and
+    /// followed by `test_src`, must compile and the test must pass. This proves
+    /// the edited files work *together*, not merely each in isolation.
+    WorkspaceTestPasses {
+        /// Files (relative to the workspace root) concatenated before the test.
+        files: Vec<PathBuf>,
+        /// Rust source appended after the files, e.g. a `#[test] fn`.
+        test_src: String,
+    },
 }
 
 impl Verification {
-    /// Check the produced file against the criterion.
+    /// Check a single produced file against the criterion (0.1/0.2 single-file
+    /// mode). The multi-file variants belong to [`Verification::passes_in`] and
+    /// error here.
     ///
-    /// `contents` is the current file text (already read by the caller);
-    /// `path` is where it lives, needed by the execution-based variants.
-    pub async fn passes(&self, path: &Path, contents: &str) -> Result<bool> {
+    /// `contents` is the current file text (already read by the caller).
+    pub async fn passes(&self, _path: &Path, contents: &str) -> Result<bool> {
         match self {
             Verification::FileContains(needle) => Ok(contents.contains(needle)),
             Verification::FileEquals(expected) => Ok(contents == expected),
-            Verification::CompilesRust => compile_rust(path, None).await,
-            Verification::RustTestPasses { test_src } => compile_rust(path, Some(test_src)).await,
+            Verification::CompilesRust => compile_source(contents, None).await,
+            Verification::RustTestPasses { test_src } => {
+                compile_source(contents, Some(test_src)).await
+            }
+            Verification::EachCompilesRust(_) | Verification::WorkspaceTestPasses { .. } => Err(
+                Error::Config("multi-file verification requires a workspace root".into()),
+            ),
+        }
+    }
+
+    /// Check the criterion against a workspace `root` (0.3 multi-file mode). The
+    /// multi-file variants read their own files relative to `root`.
+    pub async fn passes_in(&self, root: &Path) -> Result<bool> {
+        match self {
+            Verification::EachCompilesRust(files) => {
+                for f in files {
+                    let src = tokio::fs::read_to_string(root.join(f)).await.unwrap_or_default();
+                    if !compile_source(&src, None).await? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Verification::WorkspaceTestPasses { files, test_src } => {
+                let mut combined = String::new();
+                for f in files {
+                    let src = tokio::fs::read_to_string(root.join(f)).await.unwrap_or_default();
+                    combined.push_str(&src);
+                    combined.push('\n');
+                }
+                compile_source(&combined, Some(test_src)).await
+            }
+            // Single-file variants against a workspace need a target file, which
+            // this method does not carry; use them in single-file mode.
+            _ => Err(Error::Config(
+                "single-file verification used in workspace mode".into(),
+            )),
         }
     }
 
@@ -68,23 +117,32 @@ impl Verification {
             Verification::RustTestPasses { test_src } => {
                 format!("the file must compile and pass this test:\n{test_src}")
             }
+            Verification::EachCompilesRust(files) => {
+                format!("each of these files must compile as Rust: {files:?}")
+            }
+            Verification::WorkspaceTestPasses { files, test_src } => format!(
+                "these files {files:?} must together compile and pass this test:\n{test_src}"
+            ),
         }
     }
 }
 
-/// Compile `path` with `rustc` in a throwaway temp dir. With `test_src`, append
-/// it and run the resulting test binary. Returns whether the gate passed.
-async fn compile_rust(path: &Path, test_src: Option<&str>) -> Result<bool> {
+/// Compile `source` with `rustc` in a throwaway temp dir. With `test_src`,
+/// append it and run the resulting test binary. Returns whether the gate
+/// passed. `rustc` touches no network and the temp dir is removed on drop.
+async fn compile_source(source: &str, test_src: Option<&str>) -> Result<bool> {
     let dir = tempfile::tempdir()?; // removed on drop — nothing left behind
 
     match test_src {
         None => {
             // Metadata-only compile: type-checks without linking a binary.
+            let lib = dir.path().join("lib.rs");
+            tokio::fs::write(&lib, source).await?;
             let status = Command::new("rustc")
                 .args(["--edition", "2021", "--crate-type", "lib", "--emit", "metadata"])
                 .arg("--out-dir")
                 .arg(dir.path())
-                .arg(path)
+                .arg(&lib)
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -92,9 +150,8 @@ async fn compile_rust(path: &Path, test_src: Option<&str>) -> Result<bool> {
             Ok(status.success())
         }
         Some(test) => {
-            let base = tokio::fs::read_to_string(path).await.unwrap_or_default();
             let combined = dir.path().join("combined.rs");
-            tokio::fs::write(&combined, format!("{base}\n{test}\n")).await?;
+            tokio::fs::write(&combined, format!("{source}\n{test}\n")).await?;
             let bin = dir.path().join("t");
 
             let built = Command::new("rustc")
@@ -174,5 +231,44 @@ mod tests {
             test_src: "#[test] fn t() { assert_eq!(hello(), 41); }".into(),
         };
         assert!(!bad.passes(&file, good).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn each_compiles_rust_fails_if_any_file_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "pub fn a() -> u32 { 1 }\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub fn b() -> u32 { 2 }\n").unwrap();
+
+        let v = Verification::EachCompilesRust(vec!["a.rs".into(), "b.rs".into()]);
+        assert!(v.passes_in(root).await.unwrap());
+
+        // Break one file: the whole set must now fail.
+        std::fs::write(root.join("b.rs"), "pub fn b").unwrap();
+        assert!(!v.passes_in(root).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn workspace_test_passes_only_when_files_work_together() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.rs"), "pub fn a() -> u32 { 40 }\n").unwrap();
+        std::fs::write(root.join("b.rs"), "pub fn b() -> u32 { 2 }\n").unwrap();
+
+        let v = Verification::WorkspaceTestPasses {
+            files: vec!["a.rs".into(), "b.rs".into()],
+            test_src: "#[test] fn t() { assert_eq!(a() + b(), 42); }".into(),
+        };
+        assert!(v.passes_in(root).await.unwrap());
+
+        // One file wrong → the cross-file test fails.
+        std::fs::write(root.join("b.rs"), "pub fn b() -> u32 { 99 }\n").unwrap();
+        assert!(!v.passes_in(root).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn multi_file_variant_errors_in_single_file_mode() {
+        let v = Verification::EachCompilesRust(vec!["a.rs".into()]);
+        assert!(v.passes(&PathBuf::from("unused"), "").await.is_err());
     }
 }

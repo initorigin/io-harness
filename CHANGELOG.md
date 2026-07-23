@@ -26,6 +26,42 @@ notes are produced from it.
 
 ### Security
 
+## [0.3.0] - 2026-07-24
+
+Repository-wide work and provider choice: the agent can search a whole workspace
+and edit several files in one run, and you pick OpenRouter, Anthropic, or OpenAI
+at run construction — behind the same provider-agnostic surface.
+
+### Added
+
+- Workspace tasks: `TaskContract::workspace(goal, root, verify)` runs a
+  multi-tool loop where the agent uses `grep` (regex/substring over file
+  contents), `find` (name/path glob), `read_file`, and a path-taking
+  `write_file` to edit several files under one root. All tools are confined to
+  the root — an absolute path or a `..` that escapes it is refused. The grep/find
+  walk skips `.git`, `target`, and `node_modules`.
+- Multi-file verification: `Verification::EachCompilesRust(files)` (every listed
+  file compiles on its own) and `Verification::WorkspaceTestPasses { files,
+  test_src }` (the files, concatenated, compile and pass a test together) — the
+  run only succeeds when the whole edited set meets its spec.
+- Anthropic provider (`Anthropic`, `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`) over
+  the own HTTP + SSE client, parsing Anthropic's `/v1/messages` streaming format.
+- OpenAI provider (`OpenAi`, `OPENAI_API_KEY` / `OPENAI_MODEL`) sharing the
+  OpenAI-style chat/completions transport with OpenRouter.
+- The run trace now records which provider ran (`Store::provider(run_id)`); the
+  `Provider` trait gained a defaulted `name()` for the label.
+
+### Changed
+
+- `Provider` gained a `name()` method with a default, so existing implementers
+  keep compiling; the built-in providers override it.
+
+### Migration
+
+- 0.2 callers are unchanged: `TaskContract::new`, `run`, `resume`, and the
+  single-file loop behave exactly as before. A 0.2 rusqlite database gains a
+  `provider` column in place on open (additive; a 0.2 binary still reads it).
+
 ## [0.2.0] - 2026-07-24
 
 Trust a longer run: budgets, retry, a full trace, resumable runs, and

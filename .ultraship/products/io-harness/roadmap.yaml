@@ -22,8 +22,8 @@ versions:
     outcome: >
       A developer runs a task that greps and finds across a repository and edits several files,
       choosing OpenRouter, Anthropic, or OpenAI as the provider.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.4.0
     outcome: >
       A developer runs an agent on sensitive work with permission boundaries on what it may read,

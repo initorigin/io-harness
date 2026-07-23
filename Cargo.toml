@@ -1,14 +1,14 @@
 [package]
 name = "io-harness"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Aakash Pawar"]
 license = "Apache-2.0"
-description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic loop, step/time/cost budgets, retry, full trace, resumable runs, and execution-based verification. Embeddable in-process."
+description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI), multi-file edits with grep/find over a workspace, budgets, retry, full trace, resumable runs, and execution-based verification. Embeddable in-process."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
-keywords = ["agent", "ai", "llm", "openrouter", "harness"]
+keywords = ["agent", "ai", "llm", "anthropic", "harness"]
 categories = ["asynchronous", "api-bindings"]
 # Ship only crate consumers' files; keep internal planning/CI out of the package.
 exclude = [".ultraship/", ".github/"]
@@ -24,6 +24,8 @@ thiserror = "1"
 tracing = "0.1"
 # Execution-based verification compiles the produced file in a throwaway dir.
 tempfile = "3"
+# grep tool: regex matching, and glob->regex for the find tool's patterns.
+regex = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }

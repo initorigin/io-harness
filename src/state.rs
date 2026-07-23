@@ -75,10 +75,11 @@ impl Store {
     fn from_conn(conn: Connection) -> Result<Self> {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS runs (
-                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
-                 goal    TEXT NOT NULL,
-                 file    TEXT NOT NULL,
-                 outcome TEXT
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 goal     TEXT NOT NULL,
+                 file     TEXT NOT NULL,
+                 outcome  TEXT,
+                 provider TEXT
              );
              CREATE TABLE IF NOT EXISTS steps (
                  id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,6 +102,9 @@ impl Store {
         ] {
             let _ = conn.execute(&format!("ALTER TABLE steps ADD COLUMN {col}"), []);
         }
+        // 0.3.0: record which provider ran. Additive — a 0.1/0.2 database gains
+        // the column and a 0.2 binary still reads a migrated database.
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN provider TEXT", []);
 
         Ok(Self { conn })
     }
@@ -128,6 +132,24 @@ impl Store {
             ),
         )?;
         Ok(())
+    }
+
+    /// Record which provider ran this run, for the audit trace.
+    pub fn set_provider(&self, run_id: i64, provider: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET provider = ?1 WHERE id = ?2",
+            (provider, run_id),
+        )?;
+        Ok(())
+    }
+
+    /// The provider recorded for a run, if any.
+    pub fn provider(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT provider FROM runs WHERE id = ?1", [run_id], |r| {
+                r.get(0)
+            })?)
     }
 
     /// Record the run's final outcome.
@@ -216,5 +238,32 @@ mod tests {
         assert_eq!(steps[0].result, "old");
         assert_eq!(steps[0].prompt, "");
         assert_eq!(steps[0].tokens, 0);
+    }
+
+    #[test]
+    fn provider_is_recorded_and_read_back() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("g", "f").unwrap();
+        assert_eq!(store.provider(run).unwrap(), None);
+        store.set_provider(run, "anthropic").unwrap();
+        assert_eq!(store.provider(run).unwrap().as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn migrates_a_pre_0_3_runs_table_adding_provider() {
+        // A 0.1/0.2 database: `runs` without the provider column.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL, file TEXT NOT NULL, outcome TEXT);
+             CREATE TABLE steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL, step INTEGER NOT NULL, decision TEXT NOT NULL, result TEXT NOT NULL);
+             INSERT INTO runs (goal, file) VALUES ('g', 'f');",
+        )
+        .unwrap();
+
+        // Opening through Store adds the provider column; the old row survives.
+        let store = Store::from_conn(conn).unwrap();
+        assert_eq!(store.provider(1).unwrap(), None);
+        store.set_provider(1, "openai").unwrap();
+        assert_eq!(store.provider(1).unwrap().as_deref(), Some("openai"));
     }
 }
