@@ -1,0 +1,148 @@
+product: io-harness
+version: 0.1.0
+status: released
+release_type: minor
+
+outcome:
+  user_can: >
+    A developer adds the io-harness crate to a Rust project, constructs a task
+    contract that asks the agent to edit one file to meet a stated spec, calls
+    the harness, and gets back a result where the harness has run the loop
+    (observe, reason, act, verify, stop) using the filesystem tool and the
+    OpenRouter provider, the verification layer has confirmed the file meets the
+    spec, and the run has stopped on success or on the step cap.
+  business_value: >
+    Proves the core io-harness engine works end to end and gives io-cli and
+    io-studio a real crate to build on, validating the provider-agnostic,
+    verified-loop thesis before broader tool and provider surface is built.
+  evidence_of_value: >
+    A test binary (or io-cli) drives io-harness through one real file-edit task
+    and the verification layer confirms the edited file meets the spec.
+
+scope:
+  included:
+    - Task contract type — goal, constraints, expected output, success criteria
+    - Orchestration loop — observe, reason, act, verify, stop, on tokio async
+    - Filesystem tool — read and write a file, typed
+    - OpenRouter provider via own HTTP + SSE client
+    - Context construction feeding the model the task and current file state
+    - Verification layer — read back the file and check it meets the spec
+    - Stop conditions — stop on verified success or on a step cap
+    - Minimal state in rusqlite — steps, intermediate results, decisions
+    - Public crate API under SemVer (in-process library)
+    - Unit and integration tests, including one end-to-end file-edit task
+    - README and crate docs, Apache 2.0 license, packaged for publish
+  excluded:
+    - git, grep, find, and office/media tools (0.3.0, 0.6.0)
+    - Anthropic and OpenAI providers (0.3.0)
+    - Budgets beyond a step cap, retry/recovery, full trace (0.2.0)
+    - Permissions, guardrails, human approval (0.4.0)
+    - Sub-agents, sandboxes, long-running autonomy (0.5.0)
+    - MCP, plugins, skills (0.6.0)
+    - Daemon/client mode and any network API
+  fallback_scope:
+    - Task contract type
+    - Orchestration loop with a step cap
+    - Filesystem tool (read + write one file)
+    - OpenRouter provider via own HTTP + SSE client
+    - Verification layer confirming the file meets the spec
+    - One end-to-end file-edit test
+
+acceptance:
+  functional:
+    - Given a task contract to edit one file to a spec, the harness runs the loop and produces an edited file that the verification layer confirms meets the spec.
+    - The filesystem tool reads the target file into context and writes the agent's edit back to disk.
+    - The OpenRouter provider sends a request and streams a response over the own HTTP + SSE client and the harness parses tool calls from it.
+    - The run stops with a success result when verification passes.
+    - The run stops with a step-cap result when the configured maximum number of steps is reached without verification passing.
+    - Steps, intermediate results, and decisions for a run are written to a rusqlite database and can be read back after the run.
+  non_functional:
+    - The crate builds on stable Rust with `cargo build` and exposes a documented public API under SemVer.
+    - No provider vendor type appears in the public task-contract or result API (provider-agnostic surface).
+    - An OpenRouter API key is read from configuration/environment and never hard-coded or logged.
+  operational:
+    - "`cargo test` passes, including the end-to-end file-edit integration test."
+    - "`cargo publish --dry-run` succeeds with complete crate metadata (name, version, license, description, readme)."
+    - README documents how to add the crate, provide an OpenRouter key, and run one file-edit task.
+
+delivery:
+  target_mode: published
+  environment: crates.io registry; developer's local machine for the run itself
+  deployment_method: cargo publish to crates.io after cargo test and cargo publish --dry-run pass
+  migrations:
+    - Create the rusqlite schema (runs, steps, decisions) on first use if absent
+  observability:
+    - Structured logging of loop steps, tool calls, and stop reason via tracing
+    - Run record (steps, decisions, outcome) persisted in rusqlite
+  rollback: >
+    A published crates.io version cannot be deleted, only yanked. Roll back by
+    `cargo yank --version 0.1.0` so it can no longer be selected by new builds;
+    publish a fixed 0.1.1 as the forward path. Before publish, the crate lives
+    only on the local branch and is reverted with git.
+
+dependencies:
+  products: []
+  services:
+    - OpenRouter API (model inference)
+    - crates.io registry (publish target)
+  human_approvals:
+    - Owner runs `cargo publish` with a crates.io token/account (credential not assumed to exist yet)
+    - Owner confirms the crate name is available/reserved on crates.io
+
+resource_profile:
+  complexity: large
+  uncertainty: high
+  likely_cost_drivers:
+    - Hand-written HTTP + SSE streaming client for OpenRouter (no vendor SDK)
+    - Designing a provider-agnostic task-contract and result API that survives later providers
+    - Making the verify-and-stop loop reliable enough to trust the result
+  preferred_tools:
+    - Rust, tokio, rusqlite, reqwest or hyper for HTTP + SSE, serde, tracing
+  constraints:
+    - Rust crate; async on tokio; state in rusqlite; own HTTP + SSE provider client
+    - Embeddable in-process library only; no daemon/client mode
+    - Apache 2.0; runs locally, no hosted service
+
+risks:
+  - The own HTTP + SSE client mishandles OpenRouter streaming/tool-call framing, stalling the loop.
+  - A provider-agnostic API designed against only OpenRouter leaks OpenRouter-specific shape and breaks when Anthropic/OpenAI arrive in 0.3.0.
+  - The verification layer passes a file that does not actually meet the spec (false positive), making the result untrustworthy.
+  - The desired crate name is taken on crates.io, blocking the `published` target_mode.
+  - No step cap or a wrong cap lets the loop run away or stop too early.
+
+open_questions:
+  - Exact crate name to reserve on crates.io.
+  - Is a crates.io token available now, or does 0.1.0 fall back to release-ready?
+  - How the task contract expresses the success spec the verifier checks (assertion, schema, expected-output match, or model-judged)?
+  - Which OpenRouter model is the default for the loop?
+
+released_at: "2026-07-23T16:11:56Z"
+mode: release-ready
+delivered: >
+  A developer embeds the io-harness crate, hands it a task contract to edit one
+  file to a spec, and the harness runs the loop (observe, reason, act, verify,
+  stop) with the filesystem tool and the OpenRouter provider, confirms the file
+  meets the spec with a deterministic check, persists every step to rusqlite,
+  and stops on success or the step cap.
+evidence:
+  tests:
+    - "cargo test — 5 unit + 2 integration (tests/edit_file.rs) + 1 doctest, 8 passed, 0 failed."
+    - "edits_file_and_verifies_success — loop writes file, verify confirms, RunOutcome::Success { steps: 1 }, step auditable in rusqlite."
+    - "stops_at_step_cap_when_never_verified — RunOutcome::StepCapReached { steps: 3 }, provider called 3 times."
+    - "accumulates_tool_call_fragments_across_deltas — OpenRouter SSE tool-call fragments accumulated by index and parsed."
+  builds:
+    - "cargo build --release — Finished release profile, exit 0."
+    - "cargo clippy --all-targets — no warnings, no errors."
+    - "cargo publish --dry-run --allow-dirty — Packaged 27 files, 94.7KiB; verify compile OK; metadata (name, version, Apache-2.0, description, readme) complete."
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+  - "Not published to crates.io. target_mode was published; owner chose to stop at release-ready. Publish is the remaining step (`cargo publish` with CARGO_REGISTRY_TOKEN); crate name `io-harness` confirmed available."
+  - "The end-to-end test uses a mock provider for deterministic offline CI. A real OpenRouter model run was not executed; the live path exists only in examples/edit_file.rs and is unproven against a real model."
+  - "Verification is deterministic substring/exact-match only; no schema or model-judged verification."
+  - "Single file per task, single agent, single provider (OpenRouter). No budgets beyond a step cap, no retry/recovery, no permissions, no human approval — all roadmap."
+  - "No default OpenRouter model; OPENROUTER_MODEL must be set by the caller."
+supersedes: null
+next_recommended_version: 0.2.0
+immutable: true

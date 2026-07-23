@@ -1,0 +1,14 @@
+# Rust
+/target/
+**/*.rs.bk
+
+node_modules/
+.DS_Store
+
+# Secrets — never commit
+.env
+*.env
+!.env.example
+
+# UltraShip: transient deploy/publish hook output
+.ultraship/products/*/evidence/

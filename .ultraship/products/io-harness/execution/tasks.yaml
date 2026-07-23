@@ -1,0 +1,125 @@
+product: io-harness
+version: 0.1.0
+tasks:
+  - id: US-IO-HARNESS-0.1.0-T01
+    summary: Scaffold the Cargo crate with metadata and a documented public API skeleton that builds.
+    why_required: Nothing can be built, tested, or published without a compiling crate and its publish metadata.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - "The crate builds on stable Rust with `cargo build` and exposes a documented public API under SemVer."
+    files:
+      - Cargo.toml
+      - src/lib.rs
+      - src/error.rs
+    evidence:
+      - "cargo build: Finished dev profile, crate compiles clean."
+      - "src/lib.rs exports TaskContract, run, RunOutcome, RunResult, Verification, Store, Provider, OpenRouter with rustdoc + passing doctest."
+
+  - id: US-IO-HARNESS-0.1.0-T02
+    summary: Define the TaskContract and Verification types and the verify layer that checks a file against the spec.
+    why_required: The loop cannot decide success without a task contract to run and a verify predicate to confirm the file meets the spec.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.1.0-T01
+    acceptance_criteria: []
+    files:
+      - src/contract.rs
+      - src/verify.rs
+    evidence:
+      - "cargo test verify::tests: contains_passes_and_fails, equals_is_exact pass."
+
+  - id: US-IO-HARNESS-0.1.0-T03
+    summary: Implement the typed filesystem tool that reads the target file into context and writes edits back.
+    why_required: The agent has no way to observe or change the file without a filesystem tool.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.1.0-T01
+    acceptance_criteria:
+      - "The filesystem tool reads the target file into context and writes the agent's edit back to disk."
+    files:
+      - src/tools/fs.rs
+      - src/tools/mod.rs
+    evidence:
+      - "cargo test tools::fs::tests::missing_reads_empty_then_roundtrips passes (missing file reads empty, write then read round-trips)."
+
+  - id: US-IO-HARNESS-0.1.0-T04
+    summary: Build the provider-agnostic Provider trait and the OpenRouter implementation over an own HTTP + SSE client, reading the key from env.
+    why_required: The loop needs a model to reason and act, and the release thesis is a provider-agnostic surface with no vendor type leaking into the public API.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.1.0-T01
+    acceptance_criteria:
+      - "The OpenRouter provider sends a request and streams a response over the own HTTP + SSE client and the harness parses tool calls from it."
+      - "No provider vendor type appears in the public task-contract or result API (provider-agnostic surface)."
+      - "An OpenRouter API key is read from configuration/environment and never hard-coded or logged."
+    files:
+      - src/provider/mod.rs
+      - src/provider/openrouter.rs
+    evidence:
+      - "cargo test provider::openrouter::tests::accumulates_tool_call_fragments_across_deltas passes (SSE tool-call fragments accumulated by index and parsed)."
+      - "Provider trait + CompletionRequest/Response/ToolCall carry no vendor type; OpenRouter is behind the trait."
+      - "OpenRouter::from_env reads OPENROUTER_API_KEY via std::env; key passed as bearer_auth, never logged."
+
+  - id: US-IO-HARNESS-0.1.0-T05
+    summary: Persist run steps, intermediate results, and decisions to a rusqlite database that can be read back.
+    why_required: A run must be auditable after it finishes; without persistence the release cannot show what the agent did.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.1.0-T01
+    acceptance_criteria:
+      - "Steps, intermediate results, and decisions for a run are written to a rusqlite database and can be read back after the run."
+    files:
+      - src/state.rs
+    evidence:
+      - "cargo test state::tests::steps_persist_and_read_back passes (two steps recorded, read back in order)."
+
+  - id: US-IO-HARNESS-0.1.0-T06
+    summary: Wire the orchestration loop — context, provider, tool call, verify, stop on success or step cap.
+    why_required: This is the release outcome; without the loop tying the parts together the harness does nothing a user can reach.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.1.0-T02
+      - US-IO-HARNESS-0.1.0-T03
+      - US-IO-HARNESS-0.1.0-T04
+      - US-IO-HARNESS-0.1.0-T05
+    acceptance_criteria:
+      - "Given a task contract to edit one file to a spec, the harness runs the loop and produces an edited file that the verification layer confirms meets the spec."
+      - "The run stops with a success result when verification passes."
+      - "The run stops with a step-cap result when the configured maximum number of steps is reached without verification passing."
+    files:
+      - src/lib.rs
+      - src/run.rs
+    evidence:
+      - "tests/edit_file.rs::edits_file_and_verifies_success passes: loop writes file, verify confirms, RunOutcome::Success { steps: 1 }."
+      - "tests/edit_file.rs::stops_at_step_cap_when_never_verified passes: RunOutcome::StepCapReached { steps: 3 }, provider called 3 times."
+
+  - id: US-IO-HARNESS-0.1.0-T07
+    summary: Add the end-to-end integration test driving a full file-edit run through the loop with a mock provider, plus a live OpenRouter example.
+    why_required: The success measure is a real file-edit run confirmed by verification; without a deterministic e2e test the release is unproven in CI.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.1.0-T06
+    acceptance_criteria:
+      - "`cargo test` passes, including the end-to-end file-edit integration test."
+    files:
+      - tests/edit_file.rs
+      - examples/edit_file.rs
+    evidence:
+      - "cargo test: 5 unit + 2 integration (edit_file) + 1 doctest, all pass."
+      - "cargo build --examples: examples/edit_file.rs (live OpenRouter run) compiles."
+
+  - id: US-IO-HARNESS-0.1.0-T08
+    summary: Write the README and crate docs and confirm cargo publish --dry-run succeeds with complete metadata.
+    why_required: target_mode is published; the release is not shippable without docs and a passing dry-run of the publish path.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.1.0-T07
+    acceptance_criteria:
+      - "`cargo publish --dry-run` succeeds with complete crate metadata (name, version, license, description, readme)."
+      - "README documents how to add the crate, provide an OpenRouter key, and run one file-edit task."
+    files:
+      - README.md
+    evidence:
+      - "cargo publish --dry-run --allow-dirty: Packaged 27 files, 94.7KiB (verify compile OK); metadata name/version/license Apache-2.0/description/readme complete."
+      - "README 'Usage (v0.1)' section documents adding the crate, OPENROUTER_API_KEY/OPENROUTER_MODEL, and a one-file-edit run + live example."
