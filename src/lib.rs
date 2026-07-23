@@ -12,6 +12,12 @@
 //! that compiles the produced file so a substring stub cannot pass, and can
 //! [`resume`] an interrupted run.
 //!
+//! v0.3 adds repository work: [`TaskContract::workspace`] runs a multi-tool loop
+//! where the agent greps, finds, reads, and writes several files under one root,
+//! verified together ([`Verification::WorkspaceTestPasses`]). It also adds the
+//! [`Anthropic`] and [`OpenAi`] providers behind the same [`Provider`] trait —
+//! choose one at run construction; the task contract does not change.
+//!
 //! ```no_run
 //! use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
 //!
@@ -40,7 +46,8 @@ mod verify;
 pub use contract::TaskContract;
 pub use error::{Error, Result};
 pub use provider::{
-    CompletionRequest, CompletionResponse, OpenRouter, Provider, ToolCall, ToolSpec, Usage,
+    Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
+    ToolSpec, Usage,
 };
 pub use run::{resume, run, RunOutcome, RunResult};
 pub use state::{StepRecord, Store};

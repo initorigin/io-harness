@@ -7,7 +7,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 **Type:** Rust library crate
 **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
 **License:** Apache-2.0
-**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass.
+**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction.
 
 ## Capabilities
 
@@ -34,35 +34,56 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
 [docs/CONTRACT.md](docs/CONTRACT.md) for the public contract.
 
-## Usage (v0.2)
+## Usage (v0.3)
 
-Hand the harness a task contract to edit one file to meet a spec; it runs the
-loop with the filesystem tool and the OpenRouter provider, verifies the result,
-records every step to rusqlite, and stops on success or a budget. Everything
-else in **Capabilities** is roadmap.
+Hand the harness a task contract; it runs the loop, verifies the result, records
+every step to rusqlite, and stops on success or a budget. A single-file task uses
+the filesystem tool; a workspace task lets the agent `grep`/`find` across a
+repository and edit several files. Pick any of three providers at construction.
+Everything else in **Capabilities** is roadmap.
 
 ### 1. Add the crate
 
 ```toml
 [dependencies]
-io-harness = "0.2"
+io-harness = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
-Upgrading from 0.1: `TaskContract::new` is unchanged, so existing callers keep
-compiling. `CompletionResponse` gained a `usage` field — if you implement
-`Provider` yourself and build the struct literally, add `..Default::default()`.
-A 0.1 rusqlite database is migrated in place on open (new trace columns are
-added; a 0.1 binary still reads it).
+Upgrading from 0.2: `TaskContract::new`, `run`, `resume`, and the single-file
+loop are unchanged, so existing callers keep compiling. New in 0.3:
+`TaskContract::workspace`, the `grep`/`find`/`read_file` tools, the
+`EachCompilesRust` / `WorkspaceTestPasses` verifications, and the `Anthropic` /
+`OpenAi` providers. If you implement `Provider` yourself, note it gained a
+defaulted `name()` method (override it to label your provider in the trace — no
+change required to keep compiling). A 0.2 rusqlite database is migrated in place
+on open (a `provider` column is added; a 0.2 binary still reads it).
 
-### 2. Provide an OpenRouter key
+### 2. Choose a provider
 
-Credentials are read from the environment and never logged. No default model is
-guessed, so set the slug explicitly:
+Each provider reads its own key + model slug from the environment; credentials
+are never logged, and no default model is guessed. Selecting a provider is just
+constructing a different one — the task contract does not change.
 
 ```bash
+# OpenRouter
 export OPENROUTER_API_KEY=sk-or-...
-export OPENROUTER_MODEL=anthropic/claude-sonnet-4   # any OpenRouter model slug
+export OPENROUTER_MODEL=anthropic/claude-sonnet-4
+# Anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+export ANTHROPIC_MODEL=claude-sonnet-4
+# OpenAI
+export OPENAI_API_KEY=sk-...
+export OPENAI_MODEL=gpt-4o
+```
+
+```rust
+use io_harness::{Anthropic, OpenAi, OpenRouter};
+
+let provider = OpenRouter::from_env()?;   // or:
+let provider = Anthropic::from_env()?;    // or:
+let provider = OpenAi::from_env()?;
+// ...then hand `&provider` to `run` — nothing else changes.
 ```
 
 ### 3. Run one file-edit task, bounded and verified by execution
@@ -96,6 +117,35 @@ async fn main() -> io_harness::Result<()> {
     Ok(())
 }
 ```
+
+### 4. Run a repository task: grep, find, and multi-file edits
+
+Give the agent a workspace root instead of one file. It can `grep` file contents
+(regex or substring), `find` files by name/path glob, `read_file` to inspect
+what it found, and `write_file` to edit several files — all confined to the root
+(a `..` or absolute path that escapes is refused). Verification spans the set:
+`WorkspaceTestPasses` compiles the edited files together with a test, so the run
+only succeeds when the whole set is correct.
+
+```rust
+use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
+
+let contract = TaskContract::workspace(
+    "Make a() + b() equal 42 by editing the two source files.",
+    "my-repo",                                  // workspace root
+    Verification::WorkspaceTestPasses {
+        files: vec!["src/a.rs".into(), "src/b.rs".into()],
+        test_src: "#[test] fn t() { assert_eq!(a() + b(), 42); }".into(),
+    },
+);
+
+let result = run(&contract, &OpenRouter::from_env()?, &Store::memory()?).await?;
+println!("{:?}", result.outcome);
+```
+
+The grep/find tools skip `.git`, `target`, and `node_modules`. Use
+`Verification::EachCompilesRust(files)` when each edited file only needs to
+compile on its own.
 
 ### Execution-based verification
 

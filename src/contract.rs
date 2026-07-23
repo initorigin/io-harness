@@ -15,8 +15,13 @@ use crate::verify::Verification;
 pub struct TaskContract {
     /// Plain-language goal, e.g. "add a `hello` function that returns 42".
     pub goal: String,
-    /// The one file the agent may read and write.
+    /// The one file the agent may read and write in single-file mode. In
+    /// workspace mode (`root` is `Some`) it is unused.
     pub file: PathBuf,
+    /// Workspace root for multi-file mode. `None` (the 0.1/0.2 default) runs the
+    /// single-file loop over `file`. `Some(dir)` runs the workspace loop, where
+    /// the agent greps/finds/reads/writes several files under `dir`.
+    pub root: Option<PathBuf>,
     /// Extra rules the agent must respect, surfaced to the model verbatim.
     pub constraints: Vec<String>,
     /// The checkable success criterion. The run succeeds when this passes.
@@ -40,9 +45,34 @@ impl TaskContract {
         Self {
             goal: goal.into(),
             file: file.into(),
+            root: None,
             constraints: Vec::new(),
             verify,
             max_steps: 8,
+            max_duration: None,
+            max_tokens: None,
+            max_retries: 2,
+        }
+    }
+
+    /// A workspace task: the agent may grep, find, read, and write several files
+    /// under `root`. `verify` should be a multi-file variant
+    /// ([`Verification::EachCompilesRust`] / [`Verification::WorkspaceTestPasses`]).
+    /// Defaults match [`TaskContract::new`] (12 steps here, since repo tasks take
+    /// more turns), no time/token budget, 2 retries.
+    pub fn workspace(
+        goal: impl Into<String>,
+        root: impl Into<PathBuf>,
+        verify: Verification,
+    ) -> Self {
+        let root = root.into();
+        Self {
+            goal: goal.into(),
+            file: root.clone(),
+            root: Some(root),
+            constraints: Vec::new(),
+            verify,
+            max_steps: 12,
             max_duration: None,
             max_tokens: None,
             max_retries: 2,
