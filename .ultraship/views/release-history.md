@@ -8,7 +8,17 @@ Run `ultraship views` to regenerate.
 
 | Version | Released | Mode | Delivered |
 | --- | --- | --- | --- |
+| 0.2.0 | 2026-07-24T00:00:00Z | published | A developer runs a longer, budgeted io-harness task and can trust it: step, time, and cost (token) budgets each stop the run with a distinct outcome; a failing provider/tool step is retried and then escalated with every attempt in the trace; each step's prompt, tool call, and token usage is persisted to rusqlite; an interrupted run resumes under its original id; and verification is execution-based — the produced file is compiled (and optionally tested) with rustc, so a substring stub cannot pass. Published to crates.io as 0.2.0. |
 | 0.1.0 | 2026-07-23T16:11:56Z | release-ready | A developer embeds the io-harness crate, hands it a task contract to edit one file to a spec, and the harness runs the loop (observe, reason, act, verify, stop) with the filesystem tool and the OpenRouter provider, confirms the file meets the spec with a deterministic check, persists every step to rusqlite, and stops on success or the step cap. |
+
+### 0.2.0 known limitations
+
+- 0.1.0 was never published to crates.io (it landed release-ready), so 0.2.0 is the crate's first version on the registry; a 0.1.0→0.2.0 upgrade was never exercised against crates.io itself.
+- Execution-based verification runs model-produced code locally with no sandbox (sandboxes are 0.5.0); a hostile or buggy artifact could affect the workspace.
+- The live model run covered one model (openai/gpt-5.6-luna) and one simple task; broader model and task coverage is unproven.
+- The cost budget is counted in tokens, not currency — OpenRouter carries no reliable per-request price.
+- Only Rust execution-based gates exist (CompilesRust, RustTestPasses); other languages fall back to content checks.
+- Resume reuses the file on disk as the run's state; if the file is changed out of band between interruption and resume, resume continues from the changed file.
 
 ### 0.1.0 known limitations
 

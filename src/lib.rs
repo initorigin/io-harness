@@ -4,9 +4,13 @@
 //! [`TaskContract`] to a *verified* result. Provider-agnostic, embeddable
 //! in-process, with a deterministic verification layer.
 //!
-//! v0.1 scope: the agent edits one file to meet a [`Verification`] criterion,
-//! using the filesystem tool and the OpenRouter provider, persisting every step
-//! to rusqlite, and stopping on success or a step cap.
+//! The agent edits one file to meet a [`Verification`] criterion, using the
+//! filesystem tool and the OpenRouter provider, persisting every step to
+//! rusqlite. v0.2 bounds the run with step, time, and cost (token) budgets,
+//! retries transient step failures, records a full trace, adds execution-based
+//! verification ([`Verification::CompilesRust`], [`Verification::RustTestPasses`])
+//! that compiles the produced file so a substring stub cannot pass, and can
+//! [`resume`] an interrupted run.
 //!
 //! ```no_run
 //! use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
@@ -35,7 +39,9 @@ mod verify;
 
 pub use contract::TaskContract;
 pub use error::{Error, Result};
-pub use provider::{CompletionRequest, CompletionResponse, OpenRouter, Provider, ToolCall, ToolSpec};
-pub use run::{run, RunOutcome, RunResult};
+pub use provider::{
+    CompletionRequest, CompletionResponse, OpenRouter, Provider, ToolCall, ToolSpec, Usage,
+};
+pub use run::{resume, run, RunOutcome, RunResult};
 pub use state::{StepRecord, Store};
 pub use verify::Verification;

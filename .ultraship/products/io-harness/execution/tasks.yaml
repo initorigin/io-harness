@@ -1,125 +1,103 @@
 product: io-harness
-version: 0.1.0
+version: 0.2.0
 tasks:
-  - id: US-IO-HARNESS-0.1.0-T01
-    summary: Scaffold the Cargo crate with metadata and a documented public API skeleton that builds.
-    why_required: Nothing can be built, tested, or published without a compiling crate and its publish metadata.
+  - id: US-IO-HARNESS-0.2.0-T01
+    summary: Add an execution-based Verification variant that compiles the produced file with rustc (and optionally runs a test), passing only on exit 0.
+    why_required: The 0.1.0 live run (US-IO-HARNESS-0.2.0-I01) passed with a substring stub; without a gate that actually compiles/runs the artifact a task can still pass with non-working code.
     status: done
     depends_on: []
     acceptance_criteria:
-      - "The crate builds on stable Rust with `cargo build` and exposes a documented public API under SemVer."
+      - "Execution-based verification compiles and/or runs a test against the produced artifact; the I01 case — a non-compiling substring stub — FAILS the gate."
+      - "A task whose output compiles and passes its test PASSES the execution-based gate."
+      - "Execution-based verification runs the produced artifact locally without network access and cleans up build artifacts it creates."
     files:
-      - Cargo.toml
-      - src/lib.rs
-      - src/error.rs
-    evidence:
-      - "cargo build: Finished dev profile, crate compiles clean."
-      - "src/lib.rs exports TaskContract, run, RunOutcome, RunResult, Verification, Store, Provider, OpenRouter with rustdoc + passing doctest."
-
-  - id: US-IO-HARNESS-0.1.0-T02
-    summary: Define the TaskContract and Verification types and the verify layer that checks a file against the spec.
-    why_required: The loop cannot decide success without a task contract to run and a verify predicate to confirm the file meets the spec.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.1.0-T01
-    acceptance_criteria: []
-    files:
-      - src/contract.rs
       - src/verify.rs
     evidence:
-      - "cargo test verify::tests: contains_passes_and_fails, equals_is_exact pass."
+      - "verify::tests::compiles_rust_rejects_stub_accepts_real passes: `fn hello` (I01 stub) fails CompilesRust, `pub fn hello() -> u32 { 42 }` passes."
+      - "verify::tests::rust_test_passes_only_when_test_passes passes: RustTestPasses passes with a correct test, fails with a wrong assertion."
+      - "tests/edit_file.rs::execution_verify_rejects_the_i01_stub_in_the_loop and ::execution_verify_accepts_a_compiling_file pass — the gate works end to end in the loop."
+      - "compile_rust runs rustc in a tempfile::tempdir() (auto-removed) with stdout/stderr null; no network."
 
-  - id: US-IO-HARNESS-0.1.0-T03
-    summary: Implement the typed filesystem tool that reads the target file into context and writes edits back.
-    why_required: The agent has no way to observe or change the file without a filesystem tool.
+  - id: US-IO-HARNESS-0.2.0-T02
+    summary: Add token/cost usage to CompletionResponse (request OpenRouter stream usage) and add step, time, and cost budgets to the contract with distinct stop outcomes.
+    why_required: A longer run cannot be trusted without bounded steps, time, and spend, each stopping the run with an outcome the caller can tell apart.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.1.0-T01
+    depends_on: []
     acceptance_criteria:
-      - "The filesystem tool reads the target file into context and writes the agent's edit back to disk."
+      - "Given a multi-step task with configured step, time, and cost budgets, the harness enforces each and stops with the distinct budget outcome for whichever is exceeded first."
+      - "No provider vendor type leaks into the public budget, verification, or trace API (provider-agnostic surface preserved)."
     files:
-      - src/tools/fs.rs
-      - src/tools/mod.rs
-    evidence:
-      - "cargo test tools::fs::tests::missing_reads_empty_then_roundtrips passes (missing file reads empty, write then read round-trips)."
-
-  - id: US-IO-HARNESS-0.1.0-T04
-    summary: Build the provider-agnostic Provider trait and the OpenRouter implementation over an own HTTP + SSE client, reading the key from env.
-    why_required: The loop needs a model to reason and act, and the release thesis is a provider-agnostic surface with no vendor type leaking into the public API.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.1.0-T01
-    acceptance_criteria:
-      - "The OpenRouter provider sends a request and streams a response over the own HTTP + SSE client and the harness parses tool calls from it."
-      - "No provider vendor type appears in the public task-contract or result API (provider-agnostic surface)."
-      - "An OpenRouter API key is read from configuration/environment and never hard-coded or logged."
-    files:
+      - src/contract.rs
       - src/provider/mod.rs
       - src/provider/openrouter.rs
+      - src/run.rs
     evidence:
-      - "cargo test provider::openrouter::tests::accumulates_tool_call_fragments_across_deltas passes (SSE tool-call fragments accumulated by index and parsed)."
-      - "Provider trait + CompletionRequest/Response/ToolCall carry no vendor type; OpenRouter is behind the trait."
-      - "OpenRouter::from_env reads OPENROUTER_API_KEY via std::env; key passed as bearer_auth, never logged."
+      - "tests/edit_file.rs::stops_at_time_budget → RunOutcome::TimeBudgetExceeded { steps: 1 }; ::stops_at_cost_budget → CostBudgetExceeded { steps: 2 }; ::stops_at_step_cap_when_never_verified → StepCapReached { steps: 3 }."
+      - "Usage is a vendor-neutral struct (prompt/completion/total tokens); contract budgets are Duration/u64; no OpenRouter type in the public API."
+      - "openrouter.rs requests stream_options.include_usage and parses the usage summary chunk into Usage."
 
-  - id: US-IO-HARNESS-0.1.0-T05
-    summary: Persist run steps, intermediate results, and decisions to a rusqlite database that can be read back.
-    why_required: A run must be auditable after it finishes; without persistence the release cannot show what the agent did.
+  - id: US-IO-HARNESS-0.2.0-T03
+    summary: Extend the rusqlite schema and Store to persist the full trace — prompt, decision, tool call, token/cost usage, outcome — migrating existing 0.1.0 databases in place.
+    why_required: Without prompt/tool-call/usage in the store the run is not fully auditable, and a schema that drops 0.1.0 databases breaks backward compatibility.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.1.0-T01
+      - US-IO-HARNESS-0.2.0-T02
     acceptance_criteria:
-      - "Steps, intermediate results, and decisions for a run are written to a rusqlite database and can be read back after the run."
+      - "Every prompt, decision, tool call, token/cost usage, and outcome of a run is written to rusqlite and reconstructable as a full trace after the run."
+      - "Budget, retry, and verification configuration are part of the documented public API under SemVer; existing 0.1.0 task-contract callers still compile, or a documented migration is provided."
     files:
       - src/state.rs
     evidence:
-      - "cargo test state::tests::steps_persist_and_read_back passes (two steps recorded, read back in order)."
+      - "state::tests::full_trace_persists_and_reads_back passes: prompt, tool_call, tokens read back per step."
+      - "state::tests::migrates_a_0_1_0_steps_table_in_place passes: a pre-0.2 steps table is ALTERed on open, old rows survive with defaulted trace columns."
+      - "tests/edit_file.rs::edits_file_and_verifies_success asserts the persisted prompt contains the goal and tool_call contains the write — full trace end to end."
+      - "TaskContract::new signature unchanged (0.1.0 callers compile); CHANGELOG + README document the CompletionResponse ..Default::default() and DB migration."
 
-  - id: US-IO-HARNESS-0.1.0-T06
-    summary: Wire the orchestration loop — context, provider, tool call, verify, stop on success or step cap.
-    why_required: This is the release outcome; without the loop tying the parts together the harness does nothing a user can reach.
+  - id: US-IO-HARNESS-0.2.0-T04
+    summary: Add retry/recovery to the loop — retry a failing provider or tool step up to a configured limit with each attempt recorded in the trace, then escalate.
+    why_required: A single transient step failure must not sink a long run, and the contract requires each retry attempt to be visible in the trace.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.1.0-T02
-      - US-IO-HARNESS-0.1.0-T03
-      - US-IO-HARNESS-0.1.0-T04
-      - US-IO-HARNESS-0.1.0-T05
+      - US-IO-HARNESS-0.2.0-T03
     acceptance_criteria:
-      - "Given a task contract to edit one file to a spec, the harness runs the loop and produces an edited file that the verification layer confirms meets the spec."
-      - "The run stops with a success result when verification passes."
-      - "The run stops with a step-cap result when the configured maximum number of steps is reached without verification passing."
+      - "A step that fails (tool error or failed verification) is retried up to the configured limit, then recovered via fallback/replan or escalated; each attempt is recorded in the trace."
     files:
-      - src/lib.rs
+      - src/contract.rs
       - src/run.rs
     evidence:
-      - "tests/edit_file.rs::edits_file_and_verifies_success passes: loop writes file, verify confirms, RunOutcome::Success { steps: 1 }."
-      - "tests/edit_file.rs::stops_at_step_cap_when_never_verified passes: RunOutcome::StepCapReached { steps: 3 }, provider called 3 times."
+      - "tests/edit_file.rs::retries_then_succeeds_recording_each_attempt passes: 2 failures then success, trace shows 'retry 1 after error', 'retry 2 after error', 'wrote file'."
+      - "tests/edit_file.rs::escalates_after_exhausting_retries passes: an always-failing provider escalates (run returns Err) after the retry limit; the run is marked 'escalated'."
 
-  - id: US-IO-HARNESS-0.1.0-T07
-    summary: Add the end-to-end integration test driving a full file-edit run through the loop with a mock provider, plus a live OpenRouter example.
-    why_required: The success measure is a real file-edit run confirmed by verification; without a deterministic e2e test the release is unproven in CI.
+  - id: US-IO-HARNESS-0.2.0-T05
+    summary: Add a resume entrypoint that continues an interrupted run from persisted rusqlite state under the same run id instead of restarting.
+    why_required: A long autonomous run that is interrupted must continue rather than redo everything; this is a stated release outcome.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.1.0-T06
+      - US-IO-HARNESS-0.2.0-T04
     acceptance_criteria:
-      - "`cargo test` passes, including the end-to-end file-edit integration test."
+      - "An interrupted run resumes from persisted rusqlite state and continues to completion rather than restarting from step one."
     files:
-      - tests/edit_file.rs
-      - examples/edit_file.rs
+      - src/run.rs
+      - src/lib.rs
     evidence:
-      - "cargo test: 5 unit + 2 integration (edit_file) + 1 doctest, all pass."
-      - "cargo build --examples: examples/edit_file.rs (live OpenRouter run) compiles."
+      - "tests/edit_file.rs::resumes_an_interrupted_run_without_restarting passes: first run stops at StepCapReached{2}, resume continues under the same run_id to Success{steps:3}, and the trace is one run of 3 steps (not restarted)."
+      - "resume() reads Store::last_step(run_id) and continues run_from at last+1."
 
-  - id: US-IO-HARNESS-0.1.0-T08
-    summary: Write the README and crate docs and confirm cargo publish --dry-run succeeds with complete metadata.
-    why_required: target_mode is published; the release is not shippable without docs and a passing dry-run of the publish path.
+  - id: US-IO-HARNESS-0.2.0-T06
+    summary: Update README and crate docs for budgets, retry/recovery, trace/resume, and execution-based verification, and confirm cargo test and cargo publish --dry-run pass for 0.2.0.
+    why_required: target_mode is published; the release is not shippable without docs and a passing publish dry-run, and the full suite must pass.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.1.0-T07
+      - US-IO-HARNESS-0.2.0-T05
     acceptance_criteria:
-      - "`cargo publish --dry-run` succeeds with complete crate metadata (name, version, license, description, readme)."
-      - "README documents how to add the crate, provide an OpenRouter key, and run one file-edit task."
+      - "`cargo test` passes, including the I01-stub-fails-verify test, the correct-artifact-passes test, and the resume test."
+      - "`cargo publish --dry-run` succeeds with complete crate metadata for 0.2.0."
+      - "README documents budgets, retry/recovery, the trace and resume model, and execution-based verification, each with an example."
     files:
       - README.md
+      - Cargo.toml
+      - CHANGELOG.md
     evidence:
-      - "cargo publish --dry-run --allow-dirty: Packaged 27 files, 94.7KiB (verify compile OK); metadata name/version/license Apache-2.0/description/readme complete."
-      - "README 'Usage (v0.1)' section documents adding the crate, OPENROUTER_API_KEY/OPENROUTER_MODEL, and a one-file-edit run + live example."
+      - "cargo test: 8 unit + 9 integration + 1 doctest = 18 passed, 0 failed (includes stub-fails, correct-passes, and resume tests); cargo clippy --all-targets clean."
+      - "cargo publish --dry-run --allow-dirty: Packaged 28 files, 122.0KiB; verify compile OK; version 0.2.0, Apache-2.0, description/readme complete."
+      - "README 'Usage (v0.2)' documents budgets, execution-based verification, trace/resume, and the 0.1→0.2 upgrade, each with a code example; CHANGELOG Unreleased lists the additions and API changes."
