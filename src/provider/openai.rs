@@ -1,23 +1,24 @@
-//! OpenRouter provider over an own HTTP + SSE client.
+//! OpenAI provider over an own HTTP + SSE client.
 //!
-//! OpenRouter speaks the OpenAI chat/completions format, so the request body,
-//! SSE parsing, and tool-call accumulation live in [`super::openai_wire`]; this
-//! module only adds the endpoint, bearer auth, and model configuration.
+//! OpenAI's chat/completions format is the same one OpenRouter uses, so the
+//! request body, SSE parsing, and tool-call accumulation are shared via
+//! [`super::openai_wire`]; this module only adds the endpoint, bearer auth, and
+//! model configuration.
 
 use super::{openai_wire, CompletionRequest, CompletionResponse, Provider};
 use crate::error::{Error, Result};
 
-const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
+const ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
-/// An OpenRouter-backed [`Provider`].
-pub struct OpenRouter {
+/// An OpenAI-backed [`Provider`].
+pub struct OpenAi {
     client: reqwest::Client,
     api_key: String,
     model: String,
 }
 
-impl OpenRouter {
-    /// Build from an explicit key and model slug (e.g. `anthropic/claude-sonnet-4`).
+impl OpenAi {
+    /// Build from an explicit key and model slug (e.g. `gpt-4o`).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
@@ -26,21 +27,20 @@ impl OpenRouter {
         }
     }
 
-    /// Build from the environment: `OPENROUTER_API_KEY` (required) and
-    /// `OPENROUTER_MODEL` (required — no default is guessed so a wrong slug can't
-    /// silently ship). The key is read here and never logged.
+    /// Build from the environment: `OPENAI_API_KEY` (required) and `OPENAI_MODEL`
+    /// (required — no default guessed). The key is read here and never logged.
     pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("OPENROUTER_API_KEY")
-            .map_err(|_| Error::Config("OPENROUTER_API_KEY is not set".into()))?;
-        let model = std::env::var("OPENROUTER_MODEL")
-            .map_err(|_| Error::Config("OPENROUTER_MODEL is not set".into()))?;
+        let api_key = std::env::var("OPENAI_API_KEY")
+            .map_err(|_| Error::Config("OPENAI_API_KEY is not set".into()))?;
+        let model = std::env::var("OPENAI_MODEL")
+            .map_err(|_| Error::Config("OPENAI_MODEL is not set".into()))?;
         Ok(Self::new(api_key, model))
     }
 }
 
-impl Provider for OpenRouter {
+impl Provider for OpenAi {
     fn name(&self) -> &str {
-        "openrouter"
+        "openai"
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {

@@ -1,0 +1,24 @@
+product: io-harness
+version: 0.3.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - Large scope, but built on a proven 0.2.0 loop, Provider trait, execution-based verification,
+      and rusqlite trace that already exist and pass tests.
+    - Three providers share one Provider trait; the OpenAI wire format equals the existing
+      OpenRouter one (OpenRouter is OpenAI-compatible), so only Anthropic's /v1/messages format is
+      genuinely new work.
+    - The CompletionRequest shape is kept unchanged — agent working memory is carried as an
+      observation log inside the user turn, so adding two providers does not require reworking the
+      request/response types.
+  major_cost_drivers:
+    - Reworking the single-file loop (one fixed write_file path) into a multi-tool, multi-file loop
+      (grep/find/read_file/write_file over a workspace) without breaking 0.2.0 single-file callers.
+    - Anthropic messages/SSE wire format (content blocks, input_json_delta tool args, message_delta
+      usage) differs from the OpenAI-style stream already implemented.
+    - Multi-file execution-based verification — compiling/testing a set of edited files with an
+      unambiguous per-file pass/fail.
+  recommended_scope_change: null

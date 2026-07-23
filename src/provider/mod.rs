@@ -4,11 +4,49 @@
 //! [`CompletionRequest`] and returns a [`CompletionResponse`]; OpenRouter,
 //! Anthropic, and OpenAI are implementation details behind the trait.
 
+pub mod anthropic;
+pub mod openai;
+pub(crate) mod openai_wire;
 pub mod openrouter;
 
+pub use anthropic::Anthropic;
+pub use openai::OpenAi;
 pub use openrouter::OpenRouter;
 
-use crate::error::Result;
+use futures_util::StreamExt;
+
+use crate::error::{Error, Result};
+
+/// Read an SSE byte stream line by line, handing each `data:` payload (the text
+/// after `data:`) to `ingest`. `ingest` returns `true` to stop early on a
+/// provider's terminal event. Shared by every provider so the transport lives
+/// in one place; each provider supplies its own JSON accumulation.
+pub(crate) async fn read_sse<F>(resp: reqwest::Response, mut ingest: F) -> Result<()>
+where
+    F: FnMut(&str) -> bool,
+{
+    let mut stream = resp.bytes_stream();
+    let mut buf = String::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| Error::Provider(e.to_string()))?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(nl) = buf.find('\n') {
+            let line = buf[..nl].trim_end_matches('\r').to_string();
+            buf.drain(..=nl);
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if ingest(data) {
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
 
 /// A tool the model may call, described in a vendor-neutral shape.
 #[derive(Debug, Clone)]
@@ -69,11 +107,21 @@ pub struct CompletionResponse {
 
 /// Anything that can turn a [`CompletionRequest`] into a [`CompletionResponse`].
 ///
-/// Implemented by [`OpenRouter`]; tests supply their own to run the loop offline.
+/// Implemented by [`OpenRouter`], [`Anthropic`], and [`OpenAi`]; tests supply
+/// their own to run the loop offline. Selecting a provider is just constructing
+/// a different implementer and handing it to [`crate::run`] — no vendor type
+/// appears in the task contract.
 pub trait Provider {
     /// Perform one completion.
     fn complete(
         &self,
         request: CompletionRequest,
     ) -> impl std::future::Future<Output = Result<CompletionResponse>> + Send;
+
+    /// A short label recorded in the run's trace so an audit shows which
+    /// provider ran. Defaults to `"provider"` so existing implementers keep
+    /// compiling; the built-in providers override it.
+    fn name(&self) -> &str {
+        "provider"
+    }
 }
