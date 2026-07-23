@@ -39,8 +39,11 @@ file edit, in-process.
   first passing verification or when the step cap is reached
   (`RunOutcome::Success` / `RunOutcome::StepCapReached`).
 - Deterministic verification layer — `Verification::FileContains` and
-  `Verification::FileEquals`. Chosen over a model-judged check so a run cannot
-  pass a file that does not meet the spec.
+  `Verification::FileEquals`. Deterministic (no model in the loop), so results
+  are reproducible. Note: these are **content checks only** — they confirm the
+  expected text is present, not that the artifact compiles or is semantically
+  correct, so a model can satisfy a substring without meeting full intent.
+  Execution-based verification is planned for 0.2.
 - Filesystem tool — reads the target file into context, writes the agent's edit
   back; a missing file reads as empty so the agent can create it.
 - Provider-agnostic `Provider` trait with no vendor type in the public API, and
