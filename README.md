@@ -1,6 +1,6 @@
 # IO Harness
 
-> A production-grade Rust agent harness that runs AI agents from a typed task contract to a verified result.
+> A Rust agent harness that runs AI agents from a typed task contract to a checked result.
 
 The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 
@@ -88,9 +88,13 @@ async fn main() -> io_harness::Result<()> {
 
 Or run it live end to end: `cargo run --example edit_file`.
 
-Verification is deterministic on purpose — a model-judged check can pass a file
-that does not meet the spec. v0.1 offers `Verification::FileContains(String)` and
-`Verification::FileEquals(String)`.
+Verification is deterministic on purpose — the same file always yields the same
+pass/fail, with no model in the loop to bless a bad result. But v0.1 offers
+**content checks only** — `Verification::FileContains(String)` and
+`Verification::FileEquals(String)` — which confirm the expected text is present,
+**not** that the file compiles or is semantically correct. A model can satisfy a
+substring without meeting the full intent. Execution-based verification (compile
+and/or run a test against the artifact) lands in 0.2.
 
 ## Part of initorigin
 
@@ -113,3 +117,8 @@ follow [docs/RELEASE_PROCESS.md](docs/RELEASE_PROCESS.md).
 ## Security
 
 Report vulnerabilities per [SECURITY.md](SECURITY.md).
+
+## License
+
+Apache-2.0. Copyright 2026 Aakash Pawar (InitOrigin). See [LICENSE](LICENSE) and
+[NOTICE](NOTICE).

@@ -3,12 +3,15 @@ name = "io-harness"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
+authors = ["Aakash Pawar"]
 license = "Apache-2.0"
-description = "A production-grade Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic, verified loop, embeddable in-process."
+description = "A Rust agent harness: run an AI agent from a typed task contract to a checked result. Provider-agnostic loop, deterministic content verification, embeddable in-process."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
 keywords = ["agent", "ai", "llm", "openrouter", "harness"]
 categories = ["asynchronous", "api-bindings"]
+# Ship only crate consumers' files; keep internal planning/CI out of the package.
+exclude = [".ultraship/", ".github/"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
