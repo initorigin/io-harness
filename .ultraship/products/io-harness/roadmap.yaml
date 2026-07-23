@@ -13,7 +13,9 @@ versions:
     outcome: >
       A developer runs a longer, multi-step task and can trust it: step, time, and cost budgets are
       enforced, failed steps are retried or recovered, and a full trace plus rusqlite state make the
-      run auditable and resumable.
+      run auditable and resumable. Verification is execution-based — the gate compiles and/or runs a
+      test against the produced artifact, so a task cannot pass with a substring stub (0.1.0 live run
+      showed FileContains is trivially gamed; see iterations/US-IO-HARNESS-0.2.0-I01).
     detail: outline
     status: planned
   - version: 0.3.0

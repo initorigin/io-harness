@@ -1,0 +1,52 @@
+id: US-IO-HARNESS-0.2.0-I01
+timestamp: 2026-07-23T00:00:00Z
+category:
+  - post-release
+  - release-level
+trigger: >
+  The 0.1.0 live OpenRouter run passed verification with a degenerate output — the
+  deterministic FileContains gate is trivially gamed by the model.
+evidence:
+  - >
+    Live run (model openai/gpt-5.6-luna) against contract "Create a Rust function
+    `hello` that returns the u32 value 42" with Verification::FileContains("fn hello").
+  - >
+    Outcome Success{steps:1}; file contents were literally "fn hello" — the exact
+    match substring, not a compiling function and not returning 42.
+  - >
+    The harness behaved correctly: the weakness is the verification contract, not the
+    loop. A substring/equality gate cannot confirm the code compiles or runs.
+before:
+  scope:
+    - >
+      0.2.0 covered step/time/cost budgets, retry/recovery, and auditable/resumable
+      runs via trace + rusqlite. Verification strength was unaddressed.
+  assumptions:
+    - Deterministic file-content checks are a sufficient success gate.
+  implementation: Verification::FileContains / FileEquals only.
+change:
+  summary: >
+    Add execution-based verification (cargo check / run a test as the gate) to 0.2.0 so
+    the model cannot pass a task with a substring stub.
+  added:
+    - Execution-based Verification variant (compile and/or test the produced artifact)
+  removed: []
+  deferred: []
+  replaced: []
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.2.0
+  tasks: []
+  dependencies: []
+  resource_effect: Adds one verification variant + wiring to 0.2.0; no released record touched.
+versioning:
+  previous_target: 0.2.0
+  new_target: 0.2.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: Requested in session 2026-07-23 ("log the weak-verify finding for 0.2").
+canonical_updates:
+  - products/io-harness/roadmap.yaml
