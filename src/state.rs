@@ -155,6 +155,73 @@ pub struct Pending {
     pub resolved: Option<String>,
 }
 
+/// One event in a tree of agents: a parent spawning a child, a spawn refused by
+/// the containment boundary, or a draw against the tree's shared spend ceiling.
+///
+/// Together with each run's `parent_run_id` these make the tree a reconstructable
+/// graph — who spawned whom, what was refused, and what the tree spent — long
+/// after the process that ran it has exited.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentEvent {
+    /// The agent this event belongs to (the parent, for a spawn; the drawing
+    /// agent, for a budget draw).
+    pub run_id: i64,
+    /// The step it occurred on.
+    pub step: u32,
+    /// `"spawn"`, `"spawn_refused"`, or `"budget_draw"`.
+    pub kind: String,
+    /// The spawned child's run id, for a `"spawn"`.
+    pub child_run_id: Option<i64>,
+    /// Free-form detail: the child's goal for a spawn, the breached cap for a
+    /// refusal.
+    pub detail: Option<String>,
+    /// Tokens drawn, for a `"budget_draw"`.
+    pub tokens: Option<u64>,
+    /// The tree's remaining tokens after the draw.
+    pub remaining: Option<u64>,
+}
+
+impl AgentEvent {
+    /// A parent spawned a child.
+    pub fn spawn(run_id: i64, step: u32, child_run_id: i64, goal: impl Into<String>) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "spawn".into(),
+            child_run_id: Some(child_run_id),
+            detail: Some(goal.into()),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// A spawn was refused by the containment boundary.
+    pub fn spawn_refused(run_id: i64, step: u32, cap: &str) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "spawn_refused".into(),
+            child_run_id: None,
+            detail: Some(cap.into()),
+            tokens: None,
+            remaining: None,
+        }
+    }
+
+    /// An agent drew `tokens` against the tree, leaving `remaining`.
+    pub fn budget_draw(run_id: i64, step: u32, tokens: u64, remaining: u64) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "budget_draw".into(),
+            child_run_id: None,
+            detail: None,
+            tokens: Some(tokens),
+            remaining: Some(remaining),
+        }
+    }
+}
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -225,6 +292,25 @@ impl Store {
                  target   TEXT NOT NULL,
                  content  TEXT,
                  resolved TEXT
+             );",
+        )?;
+
+        // 0.5.0: sub-agent trees. Runs gain a parent edge and a depth; a new
+        // table records spawns, spawn refusals, and draws against the tree's
+        // shared spend ceiling. All additive — a 0.4.0 database gains the column
+        // and table and a 0.4.0 binary still reads a migrated database.
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id INTEGER", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0", []);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_events (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id       INTEGER NOT NULL,
+                 step         INTEGER NOT NULL,
+                 kind         TEXT NOT NULL,
+                 child_run_id INTEGER,
+                 detail       TEXT,
+                 tokens       INTEGER,
+                 remaining    INTEGER
              );",
         )?;
 
@@ -326,6 +412,86 @@ impl Store {
         self.conn
             .execute("INSERT INTO runs (goal, file) VALUES (?1, ?2)", (goal, file))?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Start a child run under `parent_run_id` at `depth`, so the tree records
+    /// who spawned whom. Returns the child's run id.
+    pub fn start_child_run(
+        &self,
+        goal: &str,
+        file: &str,
+        parent_run_id: i64,
+        depth: u32,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO runs (goal, file, parent_run_id, depth) VALUES (?1, ?2, ?3, ?4)",
+            (goal, file, parent_run_id, depth),
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record a spawn, a spawn refusal, or a budget draw against the tree.
+    pub fn record_agent_event(&self, e: &AgentEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO agent_events (run_id, step, kind, child_run_id, detail, tokens, remaining)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                e.run_id,
+                e.step,
+                &e.kind,
+                e.child_run_id,
+                &e.detail,
+                e.tokens,
+                e.remaining,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Every agent event recorded for a run, in order.
+    pub fn agent_events(&self, run_id: i64) -> Result<Vec<AgentEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, step, kind, child_run_id, detail, tokens, remaining
+             FROM agent_events WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(AgentEvent {
+                run_id: r.get(0)?,
+                step: r.get::<_, i64>(1)? as u32,
+                kind: r.get(2)?,
+                child_run_id: r.get(3)?,
+                detail: r.get(4)?,
+                tokens: r.get::<_, Option<i64>>(5)?.map(|n| n as u64),
+                remaining: r.get::<_, Option<i64>>(6)?.map(|n| n as u64),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The run ids of the direct children of `run_id`, in spawn order.
+    pub fn children(&self, run_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM runs WHERE parent_run_id = ?1 ORDER BY id ASC")?;
+        let rows = stmt.query_map([run_id], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The parent run id of `run_id`, or `None` for a root run.
+    pub fn parent(&self, run_id: i64) -> Result<Option<i64>> {
+        Ok(self.conn.query_row(
+            "SELECT parent_run_id FROM runs WHERE id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The nesting depth recorded for a run (0 at the root).
+    pub fn depth(&self, run_id: i64) -> Result<u32> {
+        let d: i64 = self
+            .conn
+            .query_row("SELECT depth FROM runs WHERE id = ?1", [run_id], |r| r.get(0))?;
+        Ok(d as u32)
     }
 
     /// Record one step's full trace entry.
@@ -512,6 +678,89 @@ mod tests {
         store.resolve_pending(request_id, "approve").unwrap();
         let p = store.pending(request_id).unwrap().unwrap();
         assert_eq!(p.resolved.as_deref(), Some("approve"));
+    }
+
+    #[test]
+    fn the_tree_is_reconstructable_from_a_reopened_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        // A parent spawns two children (one nests a grandchild) and the tree
+        // draws against its ceiling, then everything is dropped.
+        let (root, c1, c2, gc) = {
+            let store = Store::open(&path).unwrap();
+            let root = store.start_run("root goal", "ws").unwrap();
+            let c1 = store.start_child_run("child 1", "ws", root, 1).unwrap();
+            let c2 = store.start_child_run("child 2", "ws", root, 1).unwrap();
+            let gc = store.start_child_run("grandchild", "ws", c1, 2).unwrap();
+            store
+                .record_agent_event(&AgentEvent::spawn(root, 1, c1, "child 1"))
+                .unwrap();
+            store
+                .record_agent_event(&AgentEvent::spawn(root, 1, c2, "child 2"))
+                .unwrap();
+            store
+                .record_agent_event(&AgentEvent::spawn(c1, 1, gc, "grandchild"))
+                .unwrap();
+            store
+                .record_agent_event(&AgentEvent::spawn_refused(root, 2, "agents"))
+                .unwrap();
+            store
+                .record_agent_event(&AgentEvent::budget_draw(c1, 1, 30, 70))
+                .unwrap();
+            (root, c1, c2, gc)
+        };
+
+        // A fresh Store over the same file — the process that built the tree is gone.
+        let store = Store::open(&path).unwrap();
+        // The parent/child edges rebuild the graph.
+        assert_eq!(store.children(root).unwrap(), vec![c1, c2]);
+        assert_eq!(store.children(c1).unwrap(), vec![gc]);
+        assert_eq!(store.parent(gc).unwrap(), Some(c1));
+        assert_eq!(store.parent(root).unwrap(), None);
+        assert_eq!(store.depth(gc).unwrap(), 2);
+
+        // Spawns, the refusal, and the draw are all recorded.
+        let root_events = store.agent_events(root).unwrap();
+        assert_eq!(root_events.iter().filter(|e| e.kind == "spawn").count(), 2);
+        assert_eq!(
+            root_events.iter().filter(|e| e.kind == "spawn_refused").count(),
+            1
+        );
+        let draws = store.agent_events(c1).unwrap();
+        let draw = draws.iter().find(|e| e.kind == "budget_draw").unwrap();
+        assert_eq!(draw.tokens, Some(30));
+        assert_eq!(draw.remaining, Some(70));
+    }
+
+    #[test]
+    fn a_pre_0_5_database_migrates_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        // A 0.4.0-shaped database: runs (no parent_run_id/depth), steps, and the
+        // policy tables, with a row.
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL,
+                     file TEXT NOT NULL, outcome TEXT, provider TEXT);
+                 CREATE TABLE steps (id INTEGER PRIMARY KEY AUTOINCREMENT, run_id INTEGER NOT NULL,
+                     step INTEGER NOT NULL, decision TEXT NOT NULL, result TEXT NOT NULL,
+                     prompt TEXT NOT NULL DEFAULT '', tool_call TEXT NOT NULL DEFAULT '',
+                     tokens INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO runs (goal, file) VALUES ('old', 'old.txt');",
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        // The pre-existing row survives and reads as a root at depth 0.
+        assert_eq!(store.parent(1).unwrap(), None);
+        assert_eq!(store.depth(1).unwrap(), 0);
+        // The new table is usable.
+        let child = store.start_child_run("c", "ws", 1, 1).unwrap();
+        assert_eq!(store.children(1).unwrap(), vec![child]);
     }
 
     #[test]

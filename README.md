@@ -7,7 +7,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 **Type:** Rust library crate
 **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
 **License:** Apache-2.0
-**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited.
+**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise.
 
 ## Capabilities
 
@@ -285,6 +285,70 @@ are the adopting app's responsibility. Because denies are absolute across
 layers, a shared base stays trustworthy no matter what an app stacks on top.
 
 Run it live: `cargo run --example policy_run`.
+
+## Agent composition and containment (v0.5)
+
+A single loop does work one step wide. For large or parallelisable tasks, a
+**parent agent decomposes the work and spawns sub-agents** — up to 100+ at once —
+each running the same observe/reason/act/verify/stop loop over the **same
+workspace and the same trace**. A child's result composes back so the parent
+continues from what it produced, and children may nest.
+
+Sub-agents are **opt-in**: only [`run_tree`] offers the `spawn_agent` tool. Pass a
+`Containment` and the tree runs under it.
+
+```rust
+use io_harness::{run_tree, ApproveAll, Containment, Policy, Store, TaskContract, Verification};
+
+# async fn demo() -> io_harness::Result<()> {
+let provider = io_harness::OpenRouter::from_env()?;
+let store = Store::memory()?;
+
+let contract = TaskContract::workspace(
+    "Coordinate: delegate each file to a sub-agent, then combine.",
+    "path/to/workspace",
+    Verification::WorkspaceFileContains { file: "summary.txt".into(), needle: "DONE".into() },
+);
+
+// Caps for the WHOLE tree — no spawned task can raise them.
+let containment = Containment::new(
+    /* max_total_agents */ 100,
+    /* max_concurrent   */ 16,
+    /* max_depth         */ 3,
+    /* max_total_tokens  */ 500_000,
+);
+
+let result = run_tree(&contract, &provider, &store, &Policy::permissive(), &ApproveAll, &containment).await?;
+# Ok(())
+# }
+```
+
+### Containment is inherit-and-narrow
+
+The 0.4 policy becomes the boundary for spawned agents. Where `Policy::merge`
+lets an overlay *widen* a base (allows union), `Policy::contain` derives a
+**child** policy that can only *narrow*:
+
+- **denies union** downward — a child adds restrictions;
+- **allows intersect** downward — a child can never read, write, or execute
+  anything its parent could not;
+- the rule holds at **any depth** — no descendant can hold an effective allow the
+  root did not grant.
+
+```rust
+let child_effective = parent_policy.contain(&child_overlay); // child cannot widen
+```
+
+### One spend ceiling above the task contract
+
+The whole tree draws its token spend from **one shared ledger**. A spawned
+`TaskContract` can set a *tighter* budget but never a looser one than the tree has
+left; when the aggregate `max_total_tokens` is reached the tree halts as a whole.
+A spawn that would breach any cap — agents, depth, or budget — is **refused** as a
+tool result the parent can adapt to, and every spawn, refusal, and budget draw is
+in the rusqlite trace as one reconstructable graph.
+
+Run it live: `cargo run --example subagents`.
 
 ## Part of initorigin
 

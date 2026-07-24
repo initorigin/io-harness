@@ -25,6 +25,19 @@
 //! A caller who passes no policy gets [`Policy::permissive`] and the exact 0.3.0
 //! behaviour — the boundary is opt-in.
 //!
+//! v0.5 adds agent composition. [`run_tree`] runs a workspace contract as the
+//! root of a tree: the agent gains one tool, [`SPAWN_TOOL`], that launches a
+//! contained sub-agent over the same workspace, and its result composes back for
+//! the parent's next turn. Children may nest, and many may run at once — the
+//! fan-out is bounded by [`Containment::max_concurrent`]. Containment is the
+//! safety half: a child inherits its parent's policy and can only *narrow* it
+//! ([`Policy::contain`] — allows intersect, denies union, downward at any depth),
+//! and the whole tree draws its token spend from one shared [`Ledger`] no spawned
+//! [`TaskContract`] can raise, capped by a [`Containment`] handed in at the root.
+//! Every spawn, refusal, and budget draw lands in the rusqlite trace, so the tree
+//! is a reconstructable graph. Sub-agents are opt-in: [`run`] and [`run_with`]
+//! never expose the spawn tool.
+//!
 //! v0.3 adds repository work: [`TaskContract::workspace`] runs a multi-tool loop
 //! where the agent greps, finds, reads, and writes several files under one root,
 //! verified together ([`Verification::WorkspaceTestPasses`]). It also adds the
@@ -55,6 +68,7 @@
 //! ```
 
 pub mod approve;
+pub mod containment;
 mod contract;
 mod error;
 pub mod policy;
@@ -71,7 +85,10 @@ pub use provider::{
     ToolSpec, Usage,
 };
 pub use policy::{Act, Effect, Policy, Rule, Verdict};
+pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
-pub use run::{resume, resume_with_decision, run, run_with, RunOutcome, RunResult};
+pub use run::{
+    resume, resume_with_decision, run, run_tree, run_with, RunOutcome, RunResult, SPAWN_TOOL,
+};
 pub use state::{Pending, PolicyEvent, StepRecord, Store};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

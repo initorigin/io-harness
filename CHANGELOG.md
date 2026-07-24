@@ -26,6 +26,91 @@ notes are produced from it.
 
 ### Security
 
+## [0.5.0] - 2026-07-24
+
+Sub-agent composition: a parent decomposes a task at run time and spawns
+sub-agents on demand, bounded by an operator-held containment ceiling. This is
+the release that turns io-harness from a single-agent harness into an
+agent-composition engine.
+
+### Added
+
+- **`spawn_agent` tool.** A typed action any agent may invoke to launch a
+  sub-agent with its own goal, target, verification, and optional narrowing
+  constraints. The child runs the same observe/reason/act/verify/stop loop from
+  `run.rs` — not a second implementation — over the shared workspace and the
+  single rusqlite store, so the whole tree is one auditable run.
+- **Shared context and compose-back.** A child receives the shared workspace
+  root, the shared trace, and a parent-supplied context brief. When it finishes,
+  its `RunOutcome` and a result summary (produced paths, verified/failed, steps,
+  spend used) return to the parent as the `spawn_agent` tool result, so the
+  parent's next model call reasons over what the child actually did.
+- **Concurrent fan-out to 100+.** A parent may request many children in one step;
+  they run as bounded concurrent tokio tasks under `max_concurrent`. Spawns
+  beyond `max_concurrent` queue; spawns beyond `max_total_agents` are refused. A
+  stress test exercises the 100+ simultaneous-agent target without deadlock or
+  overspend.
+- **Bounded nesting.** A child may spawn its own children; `max_depth` caps how
+  deep, counted from the root so a long chain cannot reset it.
+- **`Containment` value.** Handed in once at root construction, carrying
+  `max_total_agents`, `max_concurrent`, `max_depth`, and an aggregate spend
+  ceiling (`max_total_tokens`, optional `max_total_cost`, optional
+  `max_total_duration`). Serde-serializable like `Policy`, so io-cli and
+  io-studio load it from config.
+- **Containment merge — inherit-and-narrow only.** A child's effective policy is
+  derived from the parent's: denies union, allows intersect, sensitive tier
+  tightens only. A child can never read, write, or execute anything its parent
+  could not. This is a separate code path from 0.4.0's `Policy::merge` (which
+  widens via allows-union) precisely so the two are never confused. Enforced in
+  the harness, never the prompt; holds downward through arbitrary depth.
+- **Tree-wide spend ceiling above the task contract.** The aggregate budget is
+  drawn down by the whole tree together. No spawned `TaskContract` can raise it —
+  a child contract may set a tighter per-child budget but never a looser one than
+  the tree has remaining. When the aggregate is exhausted the tree halts as a
+  whole; in-flight children finish their current step, then stop.
+- **Spawn refusal semantics.** A spawn breaching any cap (agents, depth,
+  remaining budget, or a widened policy) returns a typed refusal to the
+  requesting agent as its tool result, does not panic or abort the tree, and is
+  recorded — the requesting agent can adapt, exactly as with an out-of-policy
+  action in 0.4.0.
+- **One approver for the tree.** Sensitive actions in any child route to the same
+  `Approver` the root run was given; `Approve`/`Deny`/`Defer` are unchanged, and
+  a child's `Defer` persists and is resumable via `resume_with_decision`.
+- **Deterministic aggregate accounting.** The shared budget ledger is updated
+  under a single lock, so many concurrent agents cannot overspend past the
+  ceiling through a race. A concurrent-overspend stress test asserts total
+  recorded spend never exceeds `max_total_tokens`.
+- README and crate docs covering `spawn_agent`, `Containment` and every cap, the
+  containment merge versus 0.4.0 layer merge, and the tree-wide spend ceiling;
+  `examples/subagents.rs` drives a live run where a parent spawns children under
+  a `Containment`, showing compose-back and one containment refusal end to end.
+
+### Changed
+
+- The rusqlite schema gains a `parent_run_id` on runs (null at root), spawn-event
+  records, containment-refusal records, and budget-draw records, so the tree is a
+  reconstructable graph and the aggregate spend is auditable after the fact.
+  Additive only — a 0.4.0 database migrates in place and a 0.4.0 binary still
+  reads a migrated database.
+
+### Security
+
+- **Sub-agents are opt-in.** The `spawn_agent` tool exists only when the root run
+  is constructed with a `Containment`. A 0.4.0 caller that constructs none gets
+  no spawn tool and the exact 0.4.0 surface and behaviour — `run_with`, `resume`,
+  `resume_with_decision`, `Policy`, and `Approver` are unchanged.
+- **Containment is enforced in the harness, not the prompt.** A child requesting
+  a widened policy or an over-cap spawn is refused even when the model asks for it
+  directly. No child at any depth can hold an effective allow, or a looser budget,
+  than the root granted.
+- Spawn, refusal, and budget-draw records carry agent ids, paths, commands,
+  rules, layers, decisions, and token counts only — never file contents or
+  credentials, consistent with 0.4.0.
+- **Not isolated: children still compile model-produced code directly on the
+  host** (the execution risk carried since 0.2.0), now multiplied by the fan-out
+  factor. 0.5.0 bounds what the tree may touch and spend, not where code runs;
+  per-run sandboxing is the next release (0.6.0).
+
 ## [0.4.0] - 2026-07-24
 
 ### Added
