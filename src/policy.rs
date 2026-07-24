@@ -236,6 +236,46 @@ impl Policy {
         self
     }
 
+    /// Derive a child agent's effective policy from this parent policy under
+    /// *containment*: the child inherits every parent rule and may only narrow.
+    ///
+    /// The child's own deny/ask rules are added (denies union downward), but its
+    /// allow rules are dropped — allows *intersect* downward, so a child can
+    /// never grant itself read, write, or execute the parent lacked. Defaults
+    /// tighten to the stricter of the two per action.
+    ///
+    /// This is deliberately *not* [`Policy::merge`], where an overlay may add
+    /// allows to widen a base. Containment flows one way: no descendant, at any
+    /// depth, can hold an effective allow the root did not — because `contain`
+    /// only ever appends denies and tightens defaults, applying it again for a
+    /// grandchild preserves the invariant.
+    pub fn contain(&self, child: &Policy) -> Policy {
+        let mut layers = self.layers.clone();
+        for l in &child.layers {
+            // Keep only the child's tightening rules; its allows grant nothing.
+            let rules: Vec<Rule> = l
+                .rules
+                .iter()
+                .filter(|r| r.effect != Effect::Allow)
+                .cloned()
+                .collect();
+            if !rules.is_empty() {
+                layers.push(Layer {
+                    name: l.name.clone(),
+                    rules,
+                });
+            }
+        }
+        Policy {
+            layers,
+            defaults: Defaults {
+                read: self.defaults.read.max(child.defaults.read),
+                write: self.defaults.write.max(child.defaults.write),
+                exec: self.defaults.exec.max(child.defaults.exec),
+            },
+        }
+    }
+
     /// Evaluate `act` against `target`, returning the effect with the rule and
     /// layer that produced it.
     ///
@@ -426,6 +466,69 @@ mod tests {
         let fallback = merged.explain(Act::Write, "elsewhere/x");
         assert_eq!(fallback.effect, Effect::Ask);
         assert_eq!(fallback.layer, None);
+    }
+
+    // --- 0.5.0 containment merge: inherit-and-narrow only, downward. ---
+
+    #[test]
+    fn a_child_overlay_allow_cannot_reach_a_path_the_parent_denies() {
+        // Parent denies secrets. A child that tries to allow it gains nothing —
+        // allows intersect downward, so the deny still stands.
+        let parent = base(); // denies secrets/*
+        let child = Policy::permissive()
+            .layer("child")
+            .allow_read("secrets/*")
+            .allow_write("secrets/*");
+        let contained = parent.contain(&child);
+        assert_eq!(contained.check(Act::Write, "secrets/key.txt").effect, Effect::Deny);
+        assert_eq!(contained.check(Act::Read, "secrets/key.txt").effect, Effect::Deny);
+    }
+
+    #[test]
+    fn a_child_overlay_allow_cannot_widen_a_parent_default() {
+        // The real teeth of containment vs merge: the parent never allowed
+        // docs/* writes (they fall to the Ask default). merge() would let a
+        // child allow widen it to Allow; contain() must not.
+        let parent = Policy::default().layer("parent").allow_write("src/*");
+        let child = Policy::permissive().layer("child").allow_write("docs/*");
+        assert_eq!(
+            parent.clone().merge(child.clone()).check(Act::Write, "docs/x.md").effect,
+            Effect::Allow,
+            "merge widens (0.4.0 behaviour)"
+        );
+        assert_eq!(
+            parent.contain(&child).check(Act::Write, "docs/x.md").effect,
+            Effect::Ask,
+            "contain does not widen"
+        );
+    }
+
+    #[test]
+    fn a_child_overlay_deny_narrows_the_parent() {
+        // A child adds a deny the parent lacked; denies union downward, and the
+        // child may narrow. Paths the child did not deny still follow the parent.
+        let parent = Policy::default().layer("parent").allow_write("src/*");
+        let child = Policy::permissive().layer("child").deny_write("src/generated/*");
+        let contained = parent.contain(&child);
+        assert_eq!(contained.check(Act::Write, "src/a.rs").effect, Effect::Allow);
+        assert_eq!(contained.check(Act::Write, "src/generated/x.rs").effect, Effect::Deny);
+    }
+
+    #[test]
+    fn containment_holds_downward_through_depth() {
+        // A grandchild cannot re-open what the root denied, nor widen a root
+        // default — the invariant holds at depth > 1, not just parent->child.
+        let root = base(); // denies secrets/*, allows src/*
+        let child = Policy::permissive().layer("child").deny_write("src/vendor/*");
+        let grandchild = Policy::permissive()
+            .layer("grandchild")
+            .allow_write("secrets/*") // try to re-allow a root deny
+            .allow_write("docs/*"); // try to widen past the root default
+        let effective = root.contain(&child).contain(&grandchild);
+        assert_eq!(effective.check(Act::Write, "secrets/key.txt").effect, Effect::Deny);
+        assert_eq!(effective.check(Act::Write, "docs/x.md").effect, Effect::Ask);
+        assert_eq!(effective.check(Act::Write, "src/vendor/x.rs").effect, Effect::Deny);
+        assert_eq!(effective.check(Act::Write, "src/a.rs").effect, Effect::Allow);
     }
 
     #[test]

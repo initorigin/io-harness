@@ -1,0 +1,45 @@
+product: io-harness
+version: 0.5.0
+timestamp: 2026-07-24T12:32:01Z
+reason: blocker
+repository_state: passing
+completed_acceptance:
+  - A child whose overlay allows a path the parent denies does not gain that path — a write the child attempts there is refused exactly as it would be for the parent, proving allows intersect downward.
+  - A child whose overlay adds a deny the parent lacked is refused on that path, proving denies union downward and that a child may narrow.
+  - A tree whose combined token draw crosses the aggregate `max_total_tokens` halts as a whole with the halt attributed to the containment budget, and no single child had individually exceeded its own contract budget — proving the ceiling is tree-wide, not per-agent.
+  - A child `TaskContract` setting a larger `max_tokens` than the tree has remaining does not get the larger budget — the effective budget is the tree's remaining, proving a contract cannot raise the ceiling.
+  - Every spawn, refusal, and budget draw is recorded so the tree is reconstructable from the store alone after the process ends — a test rebuilds the parent/child graph from a reopened store.
+  - A parent contract that spawns three children over a shared workspace reaches a verified success; each child's edit is present, the parent's compose-back used the children's results, and the trace contains the parent, all three children, and the parent/child edges.
+  - "`spawn_agent` returns the child's outcome and a result summary to the parent, proven by a test where the parent's success depends on a value only a child produced."
+  - A spawn beyond `max_total_agents` is refused as a typed tool result while the children spawned within the cap still complete to success; the refusal is in the trace attributed to the agent cap.
+  - A spawn beyond `max_depth` is refused, and depth is counted from the root so a chain of children cannot reset it — a test drives a nesting chain to the cap and asserts the next spawn is refused.
+  - With `max_concurrent` set below the number of children requested in one step, no more than `max_concurrent` children run at once (asserted by an observed concurrency counter) and all requested children eventually complete.
+  - A run configured at the 100+ concurrent target spawns and completes within its containment caps without deadlock or overspend, proving the fan-out target is real and bounded.
+  - Concurrent draws on the aggregate budget by many children do not overspend past the ceiling — a stress test with many small concurrent children asserts total recorded spend never exceeds `max_total_tokens`, proving the ledger race is closed.
+  - A sensitive action inside a child reaches the same `Approver` the root was given; `ApproveAll` lets it proceed and `DenyAll` stops that child, with the decision recorded against the child's run, proving one approver serves the tree.
+  - A 0.4.0 single-agent run constructed without a `Containment` exposes no `spawn_agent` tool and reaches the same verified success it did in 0.4.0, proving sub-agents are opt-in and additive.
+  - "`cargo clippy --all-targets` reports zero warnings."
+  - "`cargo publish --dry-run` succeeds with complete crate metadata for 0.5.0."
+  - "README and crate docs document `spawn_agent`, `Containment` and every cap, the containment merge versus 0.4.0 layer merge, and the tree-wide spend ceiling, with a runnable example."
+  - A child that defers a sensitive action persists an `AwaitingApproval` pending action resumable by `resume_with_decision`, unchanged from 0.4.0.
+remaining_acceptance:
+  - An example binary drives one live run where a parent spawns children over a shared workspace under a `Containment`, showing compose-back and one containment refusal end to end.
+active_hypotheses:
+  - >
+    T07 defer-in-child RESOLVED. A child that defers now propagates its pause up: spawn_child returns
+    a Paused signal, so the whole tree stops at RunOutcome::AwaitingApproval carrying the child's
+    request_id. store.pending(request_id).run_id gives the child run, and resume_with_decision on that
+    run performs the pending write and finishes the child — the 0.4.0 resume path, reused unchanged.
+    Proven by a_child_defer_persists_and_resumes_via_resume_with_decision.
+  - >
+    T09 live run. Docs, the examples/subagents.rs binary, and cargo publish --dry-run are done and
+    green; the one live end-to-end run needs OPENROUTER_API_KEY and network, which are not present in
+    this session. Run it with:
+    `OPENROUTER_API_KEY=... OPENROUTER_MODEL=... cargo run --example subagents`
+    and capture the output as evidence, exactly as 0.1.0-0.4.0 did at the release stage.
+next_task: US-IO-HARNESS-0.5.0-T07
+required_context:
+  - src/run.rs
+  - src/approve.rs
+  - examples/subagents.rs
+  - tests/subagents.rs

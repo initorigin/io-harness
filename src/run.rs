@@ -6,23 +6,30 @@
 //! and [`resume`], which continues an interrupted run under its original id
 //! instead of restarting.
 
-use std::path::Path;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde_json::json;
 use tracing::info;
 
+use crate::containment::{Containment, Draw, Ledger};
 use crate::contract::TaskContract;
 use crate::error::Result;
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
-use crate::state::{StepRecord, Store};
+use crate::state::{AgentEvent, StepRecord, Store};
 use crate::approve::{ApproveAll, Approver, Decision, Request};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::state::PolicyEvent;
-use crate::verify::ExecGuard;
+use crate::verify::{ExecGuard, Verification};
 use crate::tools::{
     FsTool, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL,
 };
+
+/// The tool a parent agent calls to spawn a contained sub-agent.
+pub const SPAWN_TOOL: &str = "spawn_agent";
 
 /// Cap on how much of a read file / grep result is folded into the observation
 /// log, so one large file cannot blow up the prompt.
@@ -49,6 +56,10 @@ pub enum RunOutcome {
     /// process, so [`resume_with_decision`] can continue it once a human
     /// decides. `steps` is how many steps completed.
     AwaitingApproval { request_id: i64, steps: u32 },
+    /// (sub-agent trees) The tree's aggregate spend ceiling was crossed, so the
+    /// whole tree halts — not this one agent hitting its own budget. `steps` is
+    /// how many steps this agent completed before the tree-wide halt.
+    BudgetCeilingReached { steps: u32 },
 }
 
 /// The result of a run, including the persisted run id for audit.
@@ -500,6 +511,299 @@ async fn run_workspace_from<P: Provider>(
         }, run_id))
 }
 
+/// Shared context for one agent tree: everything every agent in the tree
+/// draws on — the provider, the store, the one approver, the shared spend
+/// ledger, the containment caps, and the workspace root.
+struct Tree<'a, P: Provider> {
+    provider: &'a P,
+    store: &'a Store,
+    approver: &'a dyn Approver,
+    ledger: Arc<Ledger>,
+    containment: &'a Containment,
+    root: PathBuf,
+}
+
+/// Run a workspace contract as the root of an agent tree under `containment`.
+///
+/// The root agent runs the workspace loop with one extra tool, [`SPAWN_TOOL`],
+/// which launches a contained sub-agent. A child inherits the parent policy and
+/// can only narrow it ([`Policy::contain`]); the whole tree draws its token
+/// spend from one shared ledger no child contract can raise; and every spawn,
+/// refusal, and budget draw is recorded so the tree is a reconstructable graph.
+///
+/// Sub-agents are opt-in: this is the only entry point that offers the spawn
+/// tool. [`run_with`] and [`run`] are unchanged and never expose it.
+pub async fn run_tree<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+) -> Result<RunResult> {
+    let root = contract.root.clone().ok_or_else(|| {
+        crate::error::Error::Config(
+            "run_tree needs a workspace contract — build it with TaskContract::workspace".into(),
+        )
+    })?;
+    let ledger = Arc::new(Ledger::new(containment));
+    let run_id = store.start_run(&contract.goal, &root.display().to_string())?;
+    store.set_provider(run_id, provider.name())?;
+    let tree = Tree {
+        provider,
+        store,
+        approver,
+        ledger,
+        containment,
+        root,
+    };
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await?;
+    Ok(RunResult::new(outcome, run_id))
+}
+
+/// One agent's loop, reused for the root and every child. Identical to the
+/// workspace loop, plus: it may spawn children (recursively, via [`SPAWN_TOOL`]),
+/// and its token spend is drawn from the tree's shared ledger rather than only
+/// its own contract budget.
+///
+/// `depth` is 0 at the root; a child's depth is its parent's + 1. Returns the
+/// agent's [`RunOutcome`]; a tree-wide budget halt propagates up as
+/// [`RunOutcome::BudgetCeilingReached`].
+fn run_agent<'f, P: Provider>(
+    tree: &'f Tree<'_, P>,
+    contract: &'f TaskContract,
+    run_id: i64,
+    depth: u32,
+    policy: &'f Policy,
+    start_step: u32,
+) -> Pin<Box<dyn Future<Output = Result<RunOutcome>> + 'f>> {
+    // Boxed so the loop can recurse into itself when an agent spawns a child.
+    Box::pin(async move {
+        let ws = Workspace::with_policy(&tree.root, policy.clone());
+        let system = tree_system_prompt();
+        let tools = tree_tools();
+        // The budget this agent runs under is the smaller of what its contract
+        // asked for and what the tree has left — a contract cannot raise it.
+        let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
+        let started = Instant::now();
+        let mut tokens_used: u64 = 0;
+        let mut observations = String::new();
+
+        for step in start_step..=contract.max_steps {
+            if let Some(max) = contract.max_duration {
+                if started.elapsed() > max {
+                    tree.store.finish_run(run_id, "time_budget_exceeded")?;
+                    return Ok(RunOutcome::TimeBudgetExceeded { steps: step - 1 });
+                }
+            }
+
+            let user = workspace_user_prompt(contract, &observations);
+            let request = CompletionRequest {
+                system: system.clone(),
+                user: user.clone(),
+                tools: tools.clone(),
+            };
+            let response = complete_with_retry(
+                tree.provider,
+                &request,
+                contract.max_retries,
+                tree.store,
+                run_id,
+                step,
+            )
+            .await?;
+
+            let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
+            tokens_used += step_tokens;
+
+            let mut decisions: Vec<String> = Vec::new();
+            let mut calls_json: Vec<String> = Vec::new();
+            if response.tool_calls.is_empty() {
+                let said = response.text.clone().unwrap_or_default();
+                observations.push_str(&format!("\n[step {step}] (no tool call) {said}\n"));
+                decisions.push("no tool call".into());
+            }
+            // Non-spawn tools mutate the workspace and the observation log, so
+            // they run in order. Spawn calls are independent sub-agents, so they
+            // fan out concurrently, bounded by the tree's `max_concurrent`.
+            let mut paused: Option<i64> = None;
+            let mut spawn_calls: Vec<&ToolCall> = Vec::new();
+            for call in &response.tool_calls {
+                calls_json.push(format!("{}:{}", call.name, call.arguments));
+                if call.name == SPAWN_TOOL {
+                    spawn_calls.push(call);
+                    continue;
+                }
+                match dispatch(&ws, call, tree.approver, tree.store, run_id, step).await? {
+                    Dispatched::Continue { decision, obs, .. } => {
+                        observations.push_str(&obs);
+                        decisions.push(decision);
+                    }
+                    Dispatched::Pause { request_id } => {
+                        decisions.push(format!("awaiting approval (request {request_id})"));
+                        paused = Some(request_id);
+                        break;
+                    }
+                }
+            }
+            if paused.is_none() && !spawn_calls.is_empty() {
+                use futures_util::stream::{self, StreamExt};
+                let max_c = tree.containment.max_concurrent.max(1) as usize;
+                let results: Vec<Result<SpawnResult>> = stream::iter(
+                    spawn_calls
+                        .into_iter()
+                        .map(|c| spawn_child(tree, c, run_id, depth, policy, step)),
+                )
+                .buffer_unordered(max_c)
+                .collect()
+                .await;
+                for r in results {
+                    match r? {
+                        SpawnResult::Composed { decision, obs } => {
+                            observations.push_str(&obs);
+                            decisions.push(decision);
+                        }
+                        // A child deferred; pause the tree with its request_id.
+                        SpawnResult::Paused { request_id } => {
+                            decisions.push(format!("child awaiting approval (request {request_id})"));
+                            paused = Some(request_id);
+                        }
+                    }
+                }
+            }
+
+            tree.store.record(
+                run_id,
+                &StepRecord::new(step, decisions.join("; "), tail(&observations, OBS_READ_CAP))
+                    .with_trace(user, calls_json.join(" | "), step_tokens),
+            )?;
+            info!(run_id, depth, step, decisions = %decisions.join("; "), tokens = step_tokens, "agent step");
+
+            if let Some(request_id) = paused {
+                tree.store.finish_run(run_id, "awaiting_approval")?;
+                return Ok(RunOutcome::AwaitingApproval { request_id, steps: step });
+            }
+
+            // Draw this step's tokens against the tree. The draw is recorded even
+            // when it crosses the ceiling — the tokens were already spent — and a
+            // crossing halts the whole tree, not just this agent.
+            let draw = tree.ledger.draw_tokens(step_tokens);
+            tree.store.record_agent_event(&AgentEvent::budget_draw(
+                run_id,
+                step,
+                step_tokens,
+                tree.ledger.remaining_tokens(),
+            ))?;
+            if draw == Draw::Halted {
+                tree.store.finish_run(run_id, "budget_ceiling_reached")?;
+                return Ok(RunOutcome::BudgetCeilingReached { steps: step });
+            }
+            // This agent's own contract budget (never looser than the tree's).
+            if tokens_used > token_cap {
+                tree.store.finish_run(run_id, "cost_budget_exceeded")?;
+                return Ok(RunOutcome::CostBudgetExceeded { steps: step });
+            }
+
+            if contract
+                .verify
+                .passes_in_guarded(&tree.root, &ExecGuard::new(policy).tracing(tree.store, run_id, step))
+                .await?
+            {
+                tree.store.finish_run(run_id, "success")?;
+                return Ok(RunOutcome::Success { steps: step });
+            }
+        }
+
+        tree.store.finish_run(run_id, "step_cap_reached")?;
+        Ok(RunOutcome::StepCapReached { steps: contract.max_steps })
+    })
+}
+
+/// The result of one [`SPAWN_TOOL`] call.
+enum SpawnResult {
+    /// The child finished; fold its composed result into the parent's log.
+    Composed { decision: String, obs: String },
+    /// The child deferred a sensitive action to a human. The pending action is
+    /// persisted under `request_id`; the whole tree pauses so the caller can
+    /// resume it with [`resume_with_decision`], exactly as a single run does.
+    Paused { request_id: i64 },
+}
+
+/// Handle one [`SPAWN_TOOL`] call: enforce the containment caps, derive the
+/// child's narrowed policy, run it, and compose its result back for the parent's
+/// next turn. A refused spawn is a typed observation the parent can adapt to,
+/// never a failure of the parent run; a child that defers propagates the pause
+/// up so the caller can resume the child once a human decides.
+async fn spawn_child<P: Provider>(
+    tree: &Tree<'_, P>,
+    call: &ToolCall,
+    parent_run_id: i64,
+    depth: u32,
+    parent_policy: &Policy,
+    step: u32,
+) -> Result<SpawnResult> {
+    let a = &call.arguments;
+    let goal = a.get("goal").and_then(|v| v.as_str()).unwrap_or_default();
+    let file = a.get("verify_file").and_then(|v| v.as_str()).unwrap_or_default();
+    let needle = a.get("verify_contains").and_then(|v| v.as_str()).unwrap_or_default();
+    if goal.is_empty() || file.is_empty() {
+        return Ok(SpawnResult::Composed {
+            decision: "spawn missing fields".into(),
+            obs: "\n[spawn error] spawn_agent needs \"goal\" and \"verify_file\"\n".into(),
+        });
+    }
+
+    let child_depth = depth + 1;
+    // The containment boundary decides whether this child may exist at all.
+    if let Err(refusal) = tree.ledger.register_agent(child_depth) {
+        tree.store
+            .record_agent_event(&AgentEvent::spawn_refused(parent_run_id, step, refusal.cap()))?;
+        return Ok(SpawnResult::Composed {
+            decision: format!("spawn refused ({})", refusal.cap()),
+            obs: format!("\n[spawn refused] {refusal} — adapt or finish with what you have\n"),
+        });
+    }
+
+    // A child inherits the parent policy and may only narrow it. Optional
+    // `deny_write` globs let the parent tighten the child further.
+    let mut overlay = Policy::permissive().layer("child");
+    if let Some(denies) = a.get("deny_write").and_then(|v| v.as_array()) {
+        for d in denies.iter().filter_map(|v| v.as_str()) {
+            overlay = overlay.deny_write(d);
+        }
+    }
+    let child_policy = parent_policy.contain(&overlay);
+
+    let verify = Verification::WorkspaceFileContains {
+        file: file.into(),
+        needle: needle.into(),
+    };
+    let mut child_contract = TaskContract::workspace(goal, &tree.root, verify);
+    if let Some(n) = a.get("max_steps").and_then(|v| v.as_u64()) {
+        child_contract = child_contract.with_max_steps(n as u32);
+    }
+
+    let child_run =
+        tree.store
+            .start_child_run(goal, &tree.root.display().to_string(), parent_run_id, child_depth)?;
+    tree.store
+        .record_agent_event(&AgentEvent::spawn(parent_run_id, step, child_run, goal))?;
+
+    let outcome = run_agent(tree, &child_contract, child_run, child_depth, &child_policy, 1).await?;
+
+    // A child that deferred pauses the whole tree, surfacing its request_id so
+    // the caller can resume that child once a human decides.
+    if let RunOutcome::AwaitingApproval { request_id, .. } = outcome {
+        return Ok(SpawnResult::Paused { request_id });
+    }
+
+    // Otherwise compose the child's result back for the parent's next turn.
+    Ok(SpawnResult::Composed {
+        decision: format!("spawned child {child_run}: {outcome:?}"),
+        obs: format!("\n[child {child_run} \"{goal}\" -> {outcome:?}]\n"),
+    })
+}
+
 /// The result of dispatching one tool call.
 enum Dispatched {
     /// The call resolved; fold `obs` into the observation log and carry any
@@ -839,6 +1143,42 @@ fn workspace_user_prompt(contract: &TaskContract, observations: &str) -> String 
         goal = contract.goal,
         criterion = contract.verify.describe(),
     )
+}
+
+fn tree_system_prompt() -> String {
+    "You are an agent working across a repository to meet a stated specification. \
+     Use `grep`, `find`, `read_file`, and `write_file` as in a normal run. You may \
+     also decompose the work: call `spawn_agent` to launch a sub-agent that pursues \
+     a smaller goal over the same workspace, and its result is reported back to you. \
+     A sub-agent inherits your permissions and can only be more restricted, never \
+     less. Prefer spawning when parts of the task are independent. Work in small \
+     steps; the whole set is checked against the success criterion after each. Do \
+     not explain; call tools."
+        .to_string()
+}
+
+/// Workspace tools plus [`SPAWN_TOOL`] — offered only inside an agent tree.
+fn tree_tools() -> Vec<ToolSpec> {
+    let mut tools = workspace_tools();
+    tools.push(ToolSpec {
+        name: SPAWN_TOOL.to_string(),
+        description: "Spawn a contained sub-agent to pursue a smaller goal over the same \
+                      workspace. The sub-agent inherits your permissions (it can only be \
+                      further restricted) and its outcome is reported back to you."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "goal": { "type": "string", "description": "The sub-agent's goal." },
+                "verify_file": { "type": "string", "description": "File (relative to the workspace root) whose contents decide the sub-agent's success." },
+                "verify_contains": { "type": "string", "description": "Text that file must contain for the sub-agent to succeed." },
+                "deny_write": { "type": "array", "items": { "type": "string" }, "description": "Optional globs the sub-agent must not write — tightens its inherited policy." },
+                "max_steps": { "type": "integer", "description": "Optional step budget for the sub-agent." }
+            },
+            "required": ["goal", "verify_file", "verify_contains"]
+        }),
+    });
+    tools
 }
 
 fn workspace_tools() -> Vec<ToolSpec> {
