@@ -44,6 +44,19 @@ pub enum Error {
         /// The layer that rule came from.
         layer: Option<String>,
     },
+
+    /// A durable run could not be resumed from its checkpoint — the checkpoint
+    /// format is newer than this binary supports, the run row is missing or
+    /// corrupt, or the run has already finished. Typed separately so a caller
+    /// handles a bad-checkpoint resume as a recoverable error instead of a panic
+    /// or a silent half-resume. A partially written (crashed mid-commit) step is
+    /// never surfaced here: the transaction rolls it back, so resume always sees
+    /// the prior consistent checkpoint, not a torn one.
+    #[error("cannot resume: {reason}")]
+    Resume {
+        /// Why the run could not be resumed.
+        reason: String,
+    },
 }
 
 /// Crate result alias.

@@ -10,7 +10,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
 
 use serde_json::json;
 use tracing::info;
@@ -19,7 +18,7 @@ use crate::containment::{Containment, Draw, Ledger};
 use crate::contract::TaskContract;
 use crate::error::Result;
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
-use crate::state::{AgentEvent, StepRecord, Store};
+use crate::state::{AgentEvent, RunStatus, StepRecord, Store};
 use crate::approve::{ApproveAll, Approver, Decision, Request};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::state::PolicyEvent;
@@ -147,7 +146,21 @@ pub async fn resume<P: Provider>(
     store: &Store,
     run_id: i64,
 ) -> Result<RunResult> {
-    let start_step = store.last_step(run_id)? + 1;
+    // Refuse a store from a newer checkpoint format or a missing run with a
+    // typed error, rather than misreading it or panicking.
+    store.check_resumable(run_id)?;
+
+    // Idempotent by construction: a run that already finished is returned as-is,
+    // so re-running resume twice does not re-drive the loop or re-charge the
+    // budget. A run still `Running` (its process died mid-loop) falls through and
+    // is resumed from its last committed step.
+    if store.run_status(run_id)? == Some(RunStatus::Completed) {
+        if let Some(o) = terminal_outcome(store, run_id)? {
+            return Ok(RunResult::new(o, run_id));
+        }
+    }
+
+    let start_step = record_resume_markers(store, run_id)?;
     store.set_provider(run_id, provider.name())?;
     match contract.root.clone() {
         Some(root) => {
@@ -292,6 +305,162 @@ pub async fn resume_with_decision<P: Provider>(
     }
 }
 
+/// Continue an agent *tree* that paused at [`RunOutcome::AwaitingApproval`],
+/// once a human has decided — the tree counterpart of [`resume_with_decision`].
+///
+/// The pending action belongs to whichever agent in the tree deferred (often a
+/// child, not the root), so the decision is validated against the whole tree,
+/// not just the root run id. On approve the deferred action is performed once,
+/// the pending is resolved, and the tree is resumed from the store exactly as
+/// [`resume_tree`] does: the root replays its (deliberately uncommitted) pause
+/// step, re-adopts the paused child, and the child continues past the
+/// now-applied action. A denial stops the tree.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_with_decision<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    request_id: i64,
+    decision: Decision,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+) -> Result<RunResult> {
+    store.check_resumable(run_id)?;
+    let pending = store
+        .pending(request_id)?
+        .ok_or_else(|| crate::error::Error::Config(format!("no pending request {request_id}")))?;
+    // The pending may belong to any agent in this tree, not only the root.
+    if !store.tree_run_ids(run_id)?.contains(&pending.run_id) {
+        return Err(crate::error::Error::Config(format!(
+            "request {request_id} belongs to run {}, which is not in the tree rooted at {run_id}",
+            pending.run_id
+        )));
+    }
+    let root = contract.root.clone().ok_or_else(|| {
+        crate::error::Error::Config("resume_tree_with_decision needs a workspace".into())
+    })?;
+    let step = pending.step;
+
+    match decision {
+        Decision::Defer => Ok(RunResult::new(
+            RunOutcome::AwaitingApproval { request_id, steps: step },
+            run_id,
+        )),
+        Decision::Deny { reason } => {
+            store.resolve_pending(request_id, "deny")?;
+            store.record_event(
+                pending.run_id,
+                &PolicyEvent::decision(
+                    step,
+                    &pending.act,
+                    &pending.target,
+                    "deny",
+                    format!("resumed:{request_id}"),
+                ),
+            )?;
+            info!(run_id, request_id, %reason, "deferred tree action denied; tree stops");
+            store.finish_run(run_id, "denied")?;
+            Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id))
+        }
+        Decision::Approve { modified, remember } => {
+            let target = modified
+                .as_ref()
+                .map(|m| m.target.clone())
+                .unwrap_or_else(|| pending.target.clone());
+            let content = modified
+                .as_ref()
+                .and_then(|m| m.content.clone())
+                .or_else(|| pending.content.clone());
+
+            // ponytail: the deferred write is re-checked against the tree policy,
+            // not the child's narrowed policy (not reconstructed here). A denial
+            // beneath still holds; a narrower child allow is not re-enforced on
+            // this one performed action. Tighten if child-specific deny of an
+            // approved action becomes a requirement.
+            let ws = Workspace::with_policy(&root, policy.clone());
+            let act = if pending.act == "read" { Act::Read } else { Act::Write };
+            if ws.check_path(act, &target).effect == Effect::Deny {
+                store.resolve_pending(request_id, "deny")?;
+                store.finish_run(run_id, "denied")?;
+                return Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id));
+            }
+            if act == Act::Write {
+                ws.write_file(&target, content.as_deref().unwrap_or_default())?;
+            }
+            store.resolve_pending(request_id, "approve")?;
+            store.record_event(
+                pending.run_id,
+                &PolicyEvent::decision(
+                    step,
+                    &pending.act,
+                    &pending.target,
+                    "approve",
+                    format!("resumed:{request_id}"),
+                ),
+            )?;
+
+            // Resume the whole tree; the root replays its uncommitted pause step
+            // and re-adopts the (now-unblocked) child.
+            let mut effective = policy.clone();
+            if !remember.is_empty() {
+                let mut layer = Policy::permissive().layer("remembered");
+                for r in &remember {
+                    layer = layer.rule(r.act, r.effect, r.pattern.clone());
+                }
+                effective = effective.merge(layer);
+            }
+            let ledger = Arc::new(Ledger::from_state(
+                containment,
+                store.spent_tokens_tree(run_id)?,
+                store.agent_count_tree(run_id)?,
+            ));
+            let start_step = record_resume_markers(store, run_id)?;
+            store.set_provider(run_id, provider.name())?;
+            let tree = Tree { provider, store, approver, ledger, containment, root };
+            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await?;
+            Ok(RunResult::new(outcome, run_id).with_remembered(remember))
+        }
+    }
+}
+
+/// Reconstruct the *final* [`RunOutcome`] of a run that cannot be meaningfully
+/// re-driven, so a resume of such a run is a faithful no-op. Only genuinely
+/// final outcomes are returned: `success`, `denied` (a human's no), and a tree
+/// `budget_ceiling_reached`. A run that merely ran out of step / token / time
+/// budget is deliberately NOT final — a caller resumes it with a larger budget
+/// to continue — so those return `None` and resume re-drives the loop (which is
+/// itself idempotent: re-running with the same budget skips the exhausted loop
+/// and reports the same outcome without spending anything). `awaiting_approval`
+/// is `Paused`, not `Completed`, and resumes via [`resume_with_decision`].
+/// Record the resume marker and one skipped marker per already-committed step,
+/// so a multi-crash run's full history is reconstructable from the store alone.
+/// Returns the step to resume from (last committed + 1).
+fn record_resume_markers(store: &Store, run_id: i64) -> Result<u32> {
+    let last = store.last_step(run_id)?;
+    let start_step = last + 1;
+    store.record_checkpoint_event(&crate::state::CheckpointEvent::resume(
+        run_id,
+        start_step,
+        format!("resuming at step {start_step}, {last} committed step(s) skipped"),
+    ))?;
+    for s in 1..=last {
+        store.record_checkpoint_event(&crate::state::CheckpointEvent::skipped(run_id, s))?;
+    }
+    Ok(start_step)
+}
+
+fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
+    let last = store.last_step(run_id)?;
+    Ok(store.outcome(run_id)?.and_then(|o| match o.as_str() {
+        "success" => Some(RunOutcome::Success { steps: last }),
+        "denied" => Some(RunOutcome::Denied { steps: last }),
+        "budget_ceiling_reached" => Some(RunOutcome::BudgetCeilingReached { steps: last }),
+        _ => None,
+    }))
+}
+
 async fn run_from<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -302,17 +471,19 @@ async fn run_from<P: Provider>(
     let fs = FsTool::new(&contract.file);
     let system = system_prompt();
     let tool = write_file_tool();
-    let started = Instant::now();
-    let mut tokens_used: u64 = 0;
+    // Durable budget: spend and elapsed time are restored from the store, so a
+    // resume continues one continuous budget instead of restarting it at zero.
+    let mut tokens_used: u64 = store.spent_tokens(run_id)?;
     // Single-file mode is not policy-enforced (0.4.0), but the verify gate is
     // still sandboxed (0.6.0). A permissive guard carries the trace so the
     // sandbox lifecycle is recorded for single-file runs too.
     let permissive = Policy::permissive();
 
     for step in start_step..=contract.max_steps {
-        // Time budget: checked before doing the step's work.
+        // Time budget: checked before doing the step's work, against real
+        // wall-clock elapsed since the run started (durable across a restart).
         if let Some(max) = contract.max_duration {
-            if started.elapsed() > max {
+            if store.elapsed_secs(run_id)? > max.as_secs_f64() {
                 store.finish_run(run_id, "time_budget_exceeded")?;
                 return Ok(RunResult::new(RunOutcome::TimeBudgetExceeded { steps: step - 1 }, run_id));
             }
@@ -347,7 +518,11 @@ async fn run_from<P: Provider>(
             }
             None => ("no tool call", response.text.clone().unwrap_or_default()),
         };
-        store.record(
+        // The file write (if any) is already applied above, before this commit:
+        // a crash between the write and the commit replays this step, and the
+        // model re-observes the already-written file, so the edit lands exactly
+        // once. The committed checkpoint is the step's completion marker.
+        store.checkpoint_step(
             run_id,
             &StepRecord::new(step, decision, result_text).with_trace(
                 user,
@@ -406,13 +581,14 @@ async fn run_workspace_from<P: Provider>(
     let mut ws = Workspace::with_policy(root, effective.clone());
     let system = workspace_system_prompt();
     let tools = workspace_tools();
-    let started = Instant::now();
-    let mut tokens_used: u64 = 0;
+    // Durable budget: restored from the store so a resume continues the same
+    // token and wall-clock budget rather than restarting it at zero.
+    let mut tokens_used: u64 = store.spent_tokens(run_id)?;
     let mut observations = String::new();
 
     for step in start_step..=contract.max_steps {
         if let Some(max) = contract.max_duration {
-            if started.elapsed() > max {
+            if store.elapsed_secs(run_id)? > max.as_secs_f64() {
                 store.finish_run(run_id, "time_budget_exceeded")?;
                 return Ok(RunResult::new(RunOutcome::TimeBudgetExceeded { steps: step - 1 }, run_id).with_remembered(remembered));
             }
@@ -463,7 +639,7 @@ async fn run_workspace_from<P: Provider>(
             }
         }
 
-        store.record(
+        store.checkpoint_step(
             run_id,
             &StepRecord::new(step, decisions.join("; "), tail(&observations, OBS_READ_CAP))
                 .with_trace(user, calls_json.join(" | "), step_tokens),
@@ -570,6 +746,55 @@ pub async fn run_tree<P: Provider>(
     Ok(RunResult::new(outcome, run_id))
 }
 
+/// Resume a crashed agent tree under its original root `run_id`. Reconstructs
+/// the whole 0.5.0 tree from the store: the shared spend ledger is restored from
+/// the tree's durable total spend and agent count (so the resumed tree draws
+/// against one continuous ceiling, never a reset one), and the root agent
+/// resumes from its last committed step. As it replays its crashed step it
+/// adopts the children it had already spawned and resumes each from that child's
+/// own checkpoint (see `spawn_child`), so every agent in the tree continues
+/// where it stopped rather than restarting.
+///
+/// Additive to [`run_tree`], mirroring how [`resume`] complements [`run_with`].
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+) -> Result<RunResult> {
+    store.check_resumable(run_id)?;
+
+    // A finished tree is returned as-is — resume is idempotent for the whole tree.
+    if store.run_status(run_id)? == Some(RunStatus::Completed) {
+        if let Some(o) = terminal_outcome(store, run_id)? {
+            return Ok(RunResult::new(o, run_id));
+        }
+    }
+
+    let root = contract.root.clone().ok_or_else(|| {
+        crate::error::Error::Config(
+            "resume_tree needs a workspace contract — build it with TaskContract::workspace".into(),
+        )
+    })?;
+
+    // Restore the shared ledger from durable tree-wide totals, so the budget is
+    // continuous across the crash rather than reset to zero.
+    let ledger = Arc::new(Ledger::from_state(
+        containment,
+        store.spent_tokens_tree(run_id)?,
+        store.agent_count_tree(run_id)?,
+    ));
+    let start_step = record_resume_markers(store, run_id)?;
+    store.set_provider(run_id, provider.name())?;
+    let tree = Tree { provider, store, approver, ledger, containment, root };
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await?;
+    Ok(RunResult::new(outcome, run_id))
+}
+
 /// One agent's loop, reused for the root and every child. Identical to the
 /// workspace loop, plus: it may spawn children (recursively, via [`SPAWN_TOOL`]),
 /// and its token spend is drawn from the tree's shared ledger rather than only
@@ -594,13 +819,13 @@ fn run_agent<'f, P: Provider>(
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
-        let started = Instant::now();
-        let mut tokens_used: u64 = 0;
+        // Durable per-agent budget, restored across a restart.
+        let mut tokens_used: u64 = tree.store.spent_tokens(run_id)?;
         let mut observations = String::new();
 
         for step in start_step..=contract.max_steps {
             if let Some(max) = contract.max_duration {
-                if started.elapsed() > max {
+                if tree.store.elapsed_secs(run_id)? > max.as_secs_f64() {
                     tree.store.finish_run(run_id, "time_budget_exceeded")?;
                     return Ok(RunOutcome::TimeBudgetExceeded { steps: step - 1 });
                 }
@@ -636,6 +861,7 @@ fn run_agent<'f, P: Provider>(
             // they run in order. Spawn calls are independent sub-agents, so they
             // fan out concurrently, bounded by the tree's `max_concurrent`.
             let mut paused: Option<i64> = None;
+            let mut paused_by_child = false;
             let mut spawn_calls: Vec<&ToolCall> = Vec::new();
             for call in &response.tool_calls {
                 calls_json.push(format!("{}:{}", call.name, call.arguments));
@@ -676,17 +902,27 @@ fn run_agent<'f, P: Provider>(
                         SpawnResult::Paused { request_id } => {
                             decisions.push(format!("child awaiting approval (request {request_id})"));
                             paused = Some(request_id);
+                            paused_by_child = true;
                         }
                     }
                 }
             }
 
-            tree.store.record(
-                run_id,
-                &StepRecord::new(step, decisions.join("; "), tail(&observations, OBS_READ_CAP))
-                    .with_trace(user, calls_json.join(" | "), step_tokens),
-            )?;
-            info!(run_id, depth, step, decisions = %decisions.join("; "), tokens = step_tokens, "agent step");
+            // An agent paused because one of its CHILDREN deferred does NOT commit
+            // this step: on resume it must replay it to re-adopt and resume that
+            // paused child (only the parent re-entering `spawn_child` can wait on
+            // the child again). An agent paused by its OWN gate commits normally —
+            // it resumes from the step after, past the now-approved action.
+            if paused.is_some() && paused_by_child {
+                info!(run_id, depth, step, "tree paused for a child's approval (step left uncommitted for replay)");
+            } else {
+                tree.store.checkpoint_step(
+                    run_id,
+                    &StepRecord::new(step, decisions.join("; "), tail(&observations, OBS_READ_CAP))
+                        .with_trace(user, calls_json.join(" | "), step_tokens),
+                )?;
+                info!(run_id, depth, step, decisions = %decisions.join("; "), tokens = step_tokens, "agent step");
+            }
 
             if let Some(request_id) = paused {
                 tree.store.finish_run(run_id, "awaiting_approval")?;
@@ -763,15 +999,6 @@ async fn spawn_child<P: Provider>(
     }
 
     let child_depth = depth + 1;
-    // The containment boundary decides whether this child may exist at all.
-    if let Err(refusal) = tree.ledger.register_agent(child_depth) {
-        tree.store
-            .record_agent_event(&AgentEvent::spawn_refused(parent_run_id, step, refusal.cap()))?;
-        return Ok(SpawnResult::Composed {
-            decision: format!("spawn refused ({})", refusal.cap()),
-            obs: format!("\n[spawn refused] {refusal} — adapt or finish with what you have\n"),
-        });
-    }
 
     // A child inherits the parent policy and may only narrow it. Optional
     // `deny_write` globs let the parent tighten the child further.
@@ -792,13 +1019,62 @@ async fn spawn_child<P: Provider>(
         child_contract = child_contract.with_max_steps(n as u32);
     }
 
-    let child_run =
-        tree.store
-            .start_child_run(goal, &tree.root.display().to_string(), parent_run_id, child_depth)?;
-    tree.store
-        .record_agent_event(&AgentEvent::spawn(parent_run_id, step, child_run, goal))?;
+    // Spawn-or-adopt. On a fresh run this spawn has no persisted record, so a new
+    // child is created. On a tree resume the parent replays the same spawn step
+    // and finds the child it already spawned (keyed by parent+step+goal): it
+    // adopts that child and resumes it from its OWN last committed step instead
+    // of creating a duplicate or restarting it. This is what lets every agent in
+    // a crashed tree continue from its own checkpoint.
+    let (child_run, child_start) = match tree.store.find_spawn(parent_run_id, step, goal)? {
+        Some(row) => {
+            // Adopted: already counted in the reconstructed ledger, so do NOT
+            // register it again. A finished child is composed from its recorded
+            // outcome without re-running; a mid-flight child resumes from its
+            // next step.
+            if let Some(o) = terminal_outcome(tree.store, row.child_run_id)? {
+                return Ok(compose_child(row.child_run_id, goal, o));
+            }
+            (row.child_run_id, tree.store.last_step(row.child_run_id)? + 1)
+        }
+        None => {
+            // Fresh: the containment boundary decides whether it may exist, and
+            // its contract is persisted so a later resume can adopt it.
+            if let Err(refusal) = tree.ledger.register_agent(child_depth) {
+                tree.store.record_agent_event(&AgentEvent::spawn_refused(
+                    parent_run_id,
+                    step,
+                    refusal.cap(),
+                ))?;
+                return Ok(SpawnResult::Composed {
+                    decision: format!("spawn refused ({})", refusal.cap()),
+                    obs: format!("\n[spawn refused] {refusal} — adapt or finish with what you have\n"),
+                });
+            }
+            let child_run = tree.store.start_child_run(
+                goal,
+                &tree.root.display().to_string(),
+                parent_run_id,
+                child_depth,
+            )?;
+            tree.store
+                .record_agent_event(&AgentEvent::spawn(parent_run_id, step, child_run, goal))?;
+            let deny_json = a.get("deny_write").map(|v| v.to_string()).unwrap_or_else(|| "[]".into());
+            tree.store.record_spawn(
+                parent_run_id,
+                step,
+                child_run,
+                goal,
+                file,
+                needle,
+                a.get("max_steps").and_then(|v| v.as_u64()).map(|n| n as u32),
+                &deny_json,
+            )?;
+            (child_run, 1)
+        }
+    };
 
-    let outcome = run_agent(tree, &child_contract, child_run, child_depth, &child_policy, 1).await?;
+    let outcome =
+        run_agent(tree, &child_contract, child_run, child_depth, &child_policy, child_start).await?;
 
     // A child that deferred pauses the whole tree, surfacing its request_id so
     // the caller can resume that child once a human decides.
@@ -806,11 +1082,15 @@ async fn spawn_child<P: Provider>(
         return Ok(SpawnResult::Paused { request_id });
     }
 
-    // Otherwise compose the child's result back for the parent's next turn.
-    Ok(SpawnResult::Composed {
+    Ok(compose_child(child_run, goal, outcome))
+}
+
+/// Fold one child's finished result back into the parent's observation log.
+fn compose_child(child_run: i64, goal: &str, outcome: RunOutcome) -> SpawnResult {
+    SpawnResult::Composed {
         decision: format!("spawned child {child_run}: {outcome:?}"),
         obs: format!("\n[child {child_run} \"{goal}\" -> {outcome:?}]\n"),
-    })
+    }
 }
 
 /// The result of dispatching one tool call.

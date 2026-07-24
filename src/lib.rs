@@ -50,6 +50,23 @@
 //! execution opts it off. A configurable network egress allow-list is deferred to
 //! v0.8; v0.6 is deny-by-default only.
 //!
+//! v0.7 makes a run **durable and unattended**. After every completed step the
+//! harness commits that step's trace, its budget draw, and a checkpoint marker in
+//! one rusqlite transaction, so the committed checkpoint *is* the step's
+//! completion marker: a crash leaves either a whole step or none of it. On a
+//! restart [`resume`] (single/workspace) and [`resume_tree`] (a whole v0.5 tree)
+//! reconstruct the run from the store and continue every agent from its own last
+//! committed step — completed steps are skipped, the aggregate [`Ledger`] budget
+//! is restored from durable totals (never reset or double-charged), and the time
+//! budget counts real wall-clock elapsed across the downtime ([`RunStatus`] and
+//! [`Store::run_status`] report where a run stands). Replay is idempotent: an
+//! irreversible edit already applied is re-observed, not repeated, and re-running
+//! a resume is a no-op. Ephemeral v0.6 sandboxes are never checkpointed — an exec
+//! in flight at crash time simply re-runs in a fresh sandbox. A v0.4 approval
+//! survives a full process exit and resumes the tree via
+//! [`resume_tree_with_decision`]. A resume against a newer-format or missing
+//! checkpoint is a typed [`Error::Resume`], never a panic or a half-resume.
+//!
 //! v0.3 adds repository work: [`TaskContract::workspace`] runs a multi-tool loop
 //! where the agent greps, finds, reads, and writes several files under one root,
 //! verified together ([`Verification::WorkspaceTestPasses`]). It also adds the
@@ -101,9 +118,13 @@ pub use policy::{Act, Effect, Policy, Rule, Verdict};
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
 pub use run::{
-    resume, resume_with_decision, run, run_tree, run_with, RunOutcome, RunResult, SPAWN_TOOL,
+    resume, resume_tree, resume_tree_with_decision, resume_with_decision, run, run_tree, run_with,
+    RunOutcome, RunResult, SPAWN_TOOL,
 };
-pub use state::{Pending, PolicyEvent, SandboxEvent, StepRecord, Store};
+pub use state::{
+    CheckpointEvent, Pending, PolicyEvent, RunStatus, SandboxEvent, StepRecord, Store,
+    CHECKPOINT_FORMAT,
+};
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome, Selected,
 };

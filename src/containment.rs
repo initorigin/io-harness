@@ -143,6 +143,21 @@ impl Ledger {
         }
     }
 
+    /// A ledger restored from durable state, for resuming a crashed tree: the
+    /// spend and agent count are the totals already recorded in the store, so
+    /// the resumed tree draws against the same continuous ceiling instead of
+    /// restarting the budget at zero. `agents` already includes the root and
+    /// every child previously spawned, so an adopted (already-registered) child
+    /// is not re-counted on resume.
+    pub fn from_state(c: &Containment, spent_tokens: u64, agents: u32) -> Self {
+        Self {
+            max_total_tokens: c.max_total_tokens,
+            max_total_agents: c.max_total_agents,
+            max_depth: c.max_depth,
+            state: Mutex::new(State { spent_tokens, agents: agents.max(1) }),
+        }
+    }
+
     /// Tokens still available to the whole tree.
     pub fn remaining_tokens(&self) -> u64 {
         let s = self.state.lock().unwrap();
