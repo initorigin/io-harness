@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.7.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -443,3 +443,111 @@ open_questions:
     timestamp, so a run that was paused-and-exited for hours still counts toward (or is correctly
     excluded from, if paused) its time ceiling per a documented rule, rather than a restart silently
     resetting the clock.
+released_at: '2026-07-24T19:15:23Z'
+mode: published
+delivered: >
+  Durable, unattended runs. After every completed step the harness commits that step's trace row and
+  a checkpoint event in one rusqlite transaction, so the committed checkpoint is the step's completion
+  marker — a crash leaves a whole step or none of it. On restart `resume` (single/workspace) and the
+  new `resume_tree` (a whole 0.5.0 tree) reconstruct the run from the store and continue every agent
+  from its own last committed step: completed steps are skipped (a `skipped` event recorded), the
+  shared `Ledger` budget is restored from durable tree totals via `Ledger::from_state` (never reset or
+  double-charged), and the time budget counts real wall-clock elapsed from a stored `started_at`, not
+  process uptime. Replay is idempotent — an already-applied edit is re-observed and overwritten exactly
+  once (effect committed before the checkpoint), and re-running a resume is a no-op via a terminal
+  short-circuit. `spawn_child` became spawn-or-adopt: on replay a parent adopts the child it already
+  spawned (persisted `spawns` table, keyed parent+step+goal) and resumes it from its own checkpoint
+  rather than duplicating it. A 0.4.0 approval survives a full process exit via
+  `resume_tree_with_decision` (an agent paused by a child leaves that step uncommitted so the parent
+  replays and re-adopts the paused child). Ephemeral 0.6.0 sandboxes are never checkpointed — an exec
+  in flight at crash re-runs in a fresh sandbox. New public surface is SemVer-additive and 0.6.0
+  callers compile unchanged: `resume_tree`, `resume_tree_with_decision`, `RunStatus` +
+  `Store::run_status`, `CheckpointEvent`, `Error::Resume`, `Ledger::from_state`, `CHECKPOINT_FORMAT`.
+  A resume against a newer-format or missing checkpoint is a typed `Error::Resume`, never a panic.
+  Additive rusqlite migration (`checkpoint_events` + `spawns` tables, `status`/`started_at` columns,
+  `PRAGMA user_version` stamp) — a 0.6.0 database migrates in place. Built, tested, documented,
+  packaged, and PUBLISHED to crates.io (v0.7.0 resolves), tagged as the git Release `io-harness 0.7.0`.
+evidence:
+  tests:
+    - >-
+      cargo test — 136 passed, 0 failed across 9 binaries (77 lib + 10 checkpoint + 9 edit_file + 3
+      multi_file + 1 parity + 17 policy + 8 sandbox + 10 subagents + 1 doctest). The unchanged
+      0.1.0–0.6.0 suite is green with checkpointing default on.
+    - >-
+      tests/checkpoint.rs (10): crash_resume_after_a_real_sigkill_reaches_verified_success (REAL tokio
+      Child::kill SIGKILL of examples/crash_fixture then resume to Success — edit occurs exactly once,
+      no duplicate step numbers), no_double_charge_across_a_crash_resume (resumed spend == uninterrupted
+      30), the_time_budget_is_wall_clock_and_durable_across_a_restart, edit_applied_exactly_once_and_
+      resume_is_idempotent, resuming_an_unknown_run_returns_a_typed_error_not_a_panic,
+      a_multi_crash_run_history_is_reconstructable_from_the_store,
+      a_long_unattended_run_sustains_the_loop_and_checkpoints_throughout (250 steps, all checkpointed),
+      a_tree_crash_resumes_every_agent_from_its_checkpoint (adopt, agent_count_tree unchanged),
+      a_tree_approval_survives_a_full_restart, a_sandboxed_verification_is_recreated_on_resume.
+    - >-
+      src/state.rs unit tests (16) incl a_rolled_back_step_leaves_the_prior_checkpoint_intact
+      (atomicity/mid-commit), check_resumable_refuses_a_newer_format_and_a_missing_run (typed failure),
+      status_round_trips_and_a_pre_0_7_database_migrates (additive migration).
+    - 'Full output: .ultraship/products/io-harness/evidence/0.7.0/tests.txt (gitignored)'
+  builds:
+    - cargo clippy --all-targets — 0 warnings, 0 errors.
+    - cargo build --release — Finished release profile, exit 0.
+    - cargo publish --dry-run — Packaged 52 files, verify-compiled io-harness v0.7.0.
+    - 'Full output: .ultraship/products/io-harness/evidence/0.7.0/builds.txt (gitignored)'
+  reviews: []
+  deployments:
+    - >-
+      cargo publish — Uploaded and Published io-harness v0.7.0 to registry crates-io. Resolves:
+      index.crates.io shows vers 0.7.0 yanked False; `cargo search io-harness` → io-harness = "0.7.0".
+    - >-
+      git Release — tag v0.7.0 pushed and GitHub Release "io-harness 0.7.0" created against main
+      (https://github.com/initorigin/io-harness/releases/tag/v0.7.0), notes verbatim from CHANGELOG
+      [0.7.0]. Sequence: git Release first, then cargo publish. Evidence: evidence/0.7.0/deploy.txt.
+  health_checks:
+    - >-
+      LIVE RUN, cargo run --example durable_run against OpenRouter (openai/gpt-5.6-luna): process 1
+      committed a step to a file-backed store then dropped its Store (status Completed); process 2 —
+      a fresh Store over the same file — resumed the same run id idempotently to Success. Proves durable
+      store + idempotent resume across a real process boundary against a live provider. (The model
+      solved in one step, so process 1 reached Success rather than a mid-run cap; the mid-run
+      crash-then-continue path is proven deterministically by the SIGKILL test above.) Evidence:
+      evidence/0.7.0/live_run.txt.
+    - >-
+      Secrets gate: .env is gitignored (.gitignore:9-11) and untracked; no .env/.pem/.key tracked; no
+      real sk-or-/sk-ant- keys in src/examples (placeholders only in doc comments).
+    - >-
+      Excluded-scope gate: grep over src found no network egress allow-list (only the 0.8.0-deferral
+      doc comment), no daemon/systemd/listen/bind, no distributed/cross-machine checkpoint, and no
+      firecracker/gvisor/microvm code — checkpoint + resume are in-process, same-machine, per
+      product.yaml.
+known_limitations:
+  - >-
+    NF5 concurrency has no dedicated 100+-agent timing test asserting non-serialization. Each agent
+    commits its own step independently (per-agent unchecked_transaction, no new global lock over the
+    0.5.0 single-connection model), and the existing subagents fan-out suite now runs green with
+    checkpointing default on — but "checkpointing does not serialize the fan-out" is proven indirectly,
+    not by a dedicated concurrency benchmark.
+  - >-
+    resume_tree_with_decision re-checks the approved write against the tree (root) policy, not the
+    resumed child's narrowed policy (not reconstructed at the decision point; marked with a ponytail
+    comment). A policy deny still blocks, and a remembered-allow cannot defeat a deny beneath it, but a
+    child-specific deny of an action the tree policy allows is not re-enforced on that one performed
+    write.
+  - >-
+    The live example run happened to solve in a single step, so it demonstrates durable-store +
+    idempotent-resume across a real process boundary rather than a live mid-run crash-and-continue. The
+    mid-run continue path is proven deterministically and offline by the real-SIGKILL resume test; a
+    live provider run that is genuinely interrupted mid-task is not part of this release's evidence.
+  - >-
+    The literal 24h+ wall-clock unattended run is out of scope by design (contract excluded scope). The
+    horizon is proven by the real-SIGKILL resume test plus a 250-step long unattended run that
+    checkpoints throughout; a real multi-hour run is not executed here.
+  - >-
+    Resume is single-machine only — checkpoints are the local rusqlite store and resume runs on the
+    same host (product.yaml: local, single-user). No distributed or cross-machine checkpoint/handoff.
+  - >-
+    The crate ships the durable-run mechanism and the trace; there is no daemon, scheduler, or watchdog
+    that re-invokes the process after a crash — who restarts the process (a shell, io-cli, io-studio,
+    systemd) is the caller's job, per the embeddable-library / no-daemon constraint.
+supersedes: '0.6.0'
+next_recommended_version: 0.8.0
+immutable: true

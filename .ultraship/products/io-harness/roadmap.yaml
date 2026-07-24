@@ -65,17 +65,18 @@ versions:
     status: released
   - version: 0.7.0
     outcome: >
-      A developer starts a task and walks away: the harness runs unattended for a long horizon (24h+)
-      with no user input, durably checkpointing after every completed step so a crash or full restart
-      resumes the whole agent tree exactly where it stopped — completed steps are not re-run, the
-      0.5.0 aggregate budget is not double-charged, and an irreversible action already taken is not
-      taken twice. A policy-required approval (0.4.0) pauses the whole tree, persists the pending
-      action, and resumes on the human decision even across a restart in between. Ephemeral 0.6.0
-      sandboxes die with the process and are re-created on resume; an exec in flight at crash time is
-      replayed idempotently. Proven by a real kill-9-then-resume-to-completion crash test plus a
-      time-scaled long unattended run; a literal 24h wall-clock run is noted, not gated on.
+      A developer starts a task and walks away: the harness runs unattended for a long horizon
+      (24h+) with no user input, durably checkpointing after every completed step so a crash or full
+      restart resumes the whole agent tree exactly where it stopped — completed steps are not
+      re-run, the 0.5.0 aggregate budget is not double-charged, and an irreversible action already
+      taken is not taken twice. A policy-required approval (0.4.0) pauses the whole tree, persists
+      the pending action, and resumes on the human decision even across a restart in between.
+      Ephemeral 0.6.0 sandboxes die with the process and are re-created on resume; an exec in flight
+      at crash time is replayed idempotently. Proven by a real kill-9-then-resume-to-completion
+      crash test plus a time-scaled long unattended run; a literal 24h wall-clock run is noted, not
+      gated on.
     detail: specified
-    status: planned
+    status: released
   - version: 0.8.0
     outcome: >
       A developer extends the harness through MCP (rmcp), plugins, and skills, and uses the

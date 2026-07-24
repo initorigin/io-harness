@@ -11,21 +11,21 @@ blockers:
     step, handled at /ultraship:complete.
   - >
     DEFERRED LIVE RUN (not a defect) — examples/durable_run.rs (the live unattended-then-resumed run
-    against OpenRouter) compiles clean but is NOT executed here: it needs the API key and real spend,
-    so it runs at /ultraship:complete, exactly as examples/sandbox_run did for 0.6.0. The literal 24h
-    wall-clock run is out of scope by design (contract excluded scope); the horizon is proven by the
-    real-SIGKILL resume test plus a 250-step long unattended run.
+    against OpenRouter) compiles clean but is NOT executed here: it needs the API key and real
+    spend, so it runs at /ultraship:complete, exactly as examples/sandbox_run did for 0.6.0. The
+    literal 24h wall-clock run is out of scope by design (contract excluded scope); the horizon is
+    proven by the real-SIGKILL resume test plus a 250-step long unattended run.
 release_fit:
   assessment: probable
   reasons:
     - >
       The foundation for durable resume already exists and is well shaped. The store persists a
-      per-step `steps` row (with `tokens`) via `record()`, `last_step(run_id)` is already the
-      resume cursor for single/workspace runs, `pending_approvals` already persists a paused
-      action, and the schema migrates by additive idempotent DDL (`CREATE TABLE IF NOT EXISTS` +
-      best-effort `ALTER`) with no version table to fight. So "checkpoint after every step" is not
-      new machinery — the step record IS the checkpoint; 0.7.0 makes it the transactional
-      completion marker and adds the read-back path, rather than inventing persistence from zero.
+      per-step `steps` row (with `tokens`) via `record()`, `last_step(run_id)` is already the resume
+      cursor for single/workspace runs, `pending_approvals` already persists a paused action, and
+      the schema migrates by additive idempotent DDL (`CREATE TABLE IF NOT EXISTS` + best-effort
+      `ALTER`) with no version table to fight. So "checkpoint after every step" is not new machinery
+      — the step record IS the checkpoint; 0.7.0 makes it the transactional completion marker and
+      adds the read-back path, rather than inventing persistence from zero.
     - >
       The durable-budget gap is real but cheaply closable. Today `tokens_used`/`started: Instant`
       are stack locals reset to zero on restart and the tree `Ledger` is in-memory only — but
