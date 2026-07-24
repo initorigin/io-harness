@@ -18,6 +18,22 @@ pub enum Error {
     /// Configuration was missing or invalid (e.g. no API key).
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// The permission policy refused the action. Typed separately from
+    /// [`Error::Config`] so a refusal is distinguishable from a malfunction —
+    /// a verification that was refused is not a verification that ran and
+    /// failed, and the model is told the difference.
+    #[error("refused by policy: {act} {target}{}", .rule.as_ref().map(|r| format!(" (rule {r} in layer {})", .layer.as_deref().unwrap_or("?"))).unwrap_or_default())]
+    Refused {
+        /// The action attempted.
+        act: String,
+        /// The path or binary it targeted.
+        target: String,
+        /// The glob that refused it, when a rule rather than a default did.
+        rule: Option<String>,
+        /// The layer that rule came from.
+        layer: Option<String>,
+    },
 }
 
 /// Crate result alias.

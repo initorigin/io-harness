@@ -26,6 +26,78 @@ notes are produced from it.
 
 ### Security
 
+## [0.4.0] - 2026-07-24
+
+### Added
+
+- **Permission policy.** `Policy` is a stack of named layers plus a per-action
+  default, evaluated deny-first across the whole stack, so a layer can add
+  capability but can never re-allow what a layer beneath it denied. Rules cover
+  reads, writes, and command execution.
+- **Enforcement in the tool layer, not the prompt.** `grep`, `find`, `read_file`,
+  and `write_file` consult the policy before touching the filesystem, so a model
+  that ignores its instructions still cannot act outside it. Denied paths produce
+  no search results, so they cannot be exfiltrated into the model's context.
+- **Canonical path and symlink rules.** Paths are evaluated after `..`
+  resolution, and a deny matches when either a symlink's own path or its resolved
+  target matches. A link resolving outside the workspace root is refused.
+- **Secret paths denied by default.** `.env`, `*.pem`, `id_rsa`, `id_ed25519`,
+  and `*.key` are denied on read and write under `Policy::default()`, even inside
+  an otherwise readable tree.
+- **Command execution policy.** `ExecGuard` gates what verification may spawn.
+  `rustc` and `TEST_BINARY` are allowed by default; denying `TEST_BINARY` while
+  allowing `rustc` type-checks produced code without ever running it. Every spawn
+  is recorded with its full argv.
+- **Human-approval gate.** `Approver` is one object-safe trait with three
+  decisions — approve, deny, defer. The decision future may stay pending
+  indefinitely; the run waits rather than timing out. Built-ins: `ApproveAll`,
+  `DenyAll`, `StdinApprover`.
+- **Approve-with-changes and approve-and-remember.** An approval may rewrite the
+  action or remember rules for the rest of the run. Both are re-checked against
+  the policy: an approval cannot move an action across a deny, and a remembered
+  allow cannot override one. Remembered rules are returned on
+  `RunResult::remembered` for the caller to persist.
+- **Deferred approval across processes.** `Decision::Defer` stops the run with
+  `RunOutcome::AwaitingApproval { request_id, steps }` and persists the pending
+  action, including the content the human was shown. `resume_with_decision`
+  continues the run under its original id once a decision arrives, re-checking
+  the policy so a deny that landed while it waited still holds.
+- **Policy in the trace.** Refusals record the action, target, rule, and the
+  layer that rule came from; decisions record their value, source, and the
+  performed form when an approval rewrote the action. An action auto-approved by
+  a remembered rule is distinguishable from a fresh approval.
+- **`Policy::explain`** returns the decision for a path with its rule and layer.
+  It *is* the enforcement function, so an explanation can never describe a
+  boundary different from the one enforced.
+- **Serde-serializable policy and `Policy::merge`**, so io-cli and io-studio read
+  one format and compose their own config over a shared base. The crate composes
+  a stack it is handed; it does not discover config files.
+- `run_with`, and `examples/policy_run.rs` driving a live run under a
+  restrictive policy.
+- `Policy::is_permissive`. Passing a non-permissive policy together with a
+  single-file contract now returns an error instead of running unenforced —
+  single-file mode has no policy-aware tool layer in this release, and silently
+  ignoring a policy would leave a caller believing a boundary existed.
+
+### Changed
+
+- The rusqlite schema gains `policy_events` and `pending_approvals`. Additive
+  only — a 0.3.0 database migrates in place and a 0.3.0 binary still reads it.
+- `RunResult` gains a `remembered` field; `RunOutcome` gains `AwaitingApproval`
+  and `Denied`.
+
+### Security
+
+- A refused action is reported to the model as a tool result it can adapt to and
+  consumes a step, so a model repeatedly requesting a denied action reaches the
+  step cap rather than looping.
+- Refusal and decision records carry paths, commands, rules, and decisions only —
+  never file contents or credentials.
+- **The default is permissive.** A caller who passes no policy gets no
+  enforcement and the exact 0.3.0 behaviour. The boundary is opt-in; this is a
+  deliberate backward-compatibility trade-off, and existing 0.3.0 callers compile
+  and behave unchanged.
+
 ## [0.3.0] - 2026-07-24
 
 Repository-wide work and provider choice: the agent can search a whole workspace

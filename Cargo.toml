@@ -1,11 +1,11 @@
 [package]
 name = "io-harness"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Aakash Pawar"]
 license = "Apache-2.0"
-description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI), multi-file edits with grep/find over a workspace, budgets, retry, full trace, resumable runs, and execution-based verification. Embeddable in-process."
+description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI), multi-file edits with grep/find over a workspace, budgets, retry, full trace, resumable runs, execution-based verification, and a layered permission policy with a human-approval gate. Embeddable in-process."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
 keywords = ["agent", "ai", "llm", "anthropic", "harness"]
@@ -28,4 +28,4 @@ tempfile = "3"
 regex = "1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }

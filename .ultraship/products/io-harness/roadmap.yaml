@@ -26,20 +26,30 @@ versions:
     status: released
   - version: 0.4.0
     outcome: >
-      A developer runs an agent on sensitive work with permission boundaries on what it may read,
-      write, and spend, and a human-approval gate that pauses before any sensitive or irreversible
-      action.
-    detail: hypothesis
-    status: planned
+      A developer runs an agent on sensitive work under an explicit permission policy:
+      deny-by-default path rules decide which files it may read and write, and a command policy
+      decides which binaries verification may execute. Out-of-policy actions are refused rather than
+      performed, and actions marked sensitive stop for a human decision before they happen — either
+      through an Approver the caller supplies in-process, or by pausing the run, persisting the
+      pending action, and resuming once a decision arrives. Every refusal and every approve/deny is
+      in the rusqlite trace. The policy is serde-serializable and composes in layers, so io-cli and
+      io-studio each keep their own config over a shared base instead of each building its own
+      permission model.
+    detail: specified
+    status: released
   - version: 0.5.0
     outcome: >
       A developer launches a parent agent that spawns and nests sub-agents with shared context, runs
       generated code in an ephemeral local sandbox, and lets it work unattended for hours (24h+).
-    detail: hypothesis
+      The 0.4.0 policy becomes the containment boundary for spawned agents — a sub-agent inherits
+      its parent's policy and cannot widen it, including a spend ceiling a task contract cannot
+      raise.
+    detail: outline
     status: planned
   - version: 0.6.0
     outcome: >
       A developer extends the harness through MCP (rmcp), plugins, and skills, and uses the
-      office/document and media tool suite from an agent run.
+      office/document and media tool suite from an agent run. Network egress policy lands here, with
+      the first callers that can actually dial an arbitrary host.
     detail: hypothesis
     status: planned

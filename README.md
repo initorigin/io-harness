@@ -7,7 +7,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 **Type:** Rust library crate
 **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
 **License:** Apache-2.0
-**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction.
+**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited.
 
 ## Capabilities
 
@@ -34,7 +34,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
 [docs/CONTRACT.md](docs/CONTRACT.md) for the public contract.
 
-## Usage (v0.3)
+## Usage (v0.4)
 
 Hand the harness a task contract; it runs the loop, verifies the result, records
 every step to rusqlite, and stops on success or a budget. A single-file task uses
@@ -179,6 +179,112 @@ for step in store.steps(result.run_id)? {
 ```
 
 Or run it live end to end: `cargo run --example edit_file`.
+
+## Permissions and approval (v0.4)
+
+A `Policy` is a stack of named layers plus a per-action default. It is evaluated
+**deny-first across the whole stack**: a deny in any layer beats an allow in any
+other, so a layer can add capability but can never re-allow what a layer beneath
+it denied.
+
+```rust
+use io_harness::{run_with, ApproveAll, Policy, Store, TaskContract, Verification};
+
+let policy = Policy::default()          // reads open, writes ask, secrets denied
+    .layer("project")
+    .allow_read("*")
+    .deny_read("secrets/*")
+    .deny_write("secrets/*");
+
+let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+
+// Why was that refused? Same function the tool layer enforces with.
+let verdict = policy.explain(io_harness::Act::Write, "secrets/key.txt");
+println!("{:?} by rule {:?} in layer {:?}", verdict.effect, verdict.rule, verdict.layer);
+```
+
+**The default is permissive.** A caller who passes no policy — plain `run()` —
+gets no enforcement and the exact 0.3.0 behaviour. The boundary is opt-in. This
+is a deliberate trade-off for backward compatibility, not an oversight.
+
+### What asks, what is refused
+
+`Policy::default()` sets the tiers, following the same shape Claude Code uses:
+
+| Action | Default | Note |
+| --- | --- | --- |
+| Read | allow | `.env`, `*.pem`, `id_rsa`, `id_ed25519`, `*.key` denied outright |
+| Write | **ask** | including overwriting a file the path rules already allow |
+| Exec | ask | `rustc` and `<test-binary>` allowed, so verification works |
+
+A **denied** action never reaches the approver — it is refused and reported to
+the model as a tool result it can adapt to, and the refusal consumes a step, so
+a model retrying it reaches the step cap rather than looping. Only the
+**ask** tier prompts.
+
+### The approver
+
+```rust
+use io_harness::approve::{Approver, Decision, DecisionFuture, Request};
+
+impl Approver for MyUi {
+    fn decide<'a>(&'a self, request: &'a Request) -> DecisionFuture<'a> {
+        Box::pin(async move {
+            match self.ask_the_human(request).await {
+                Answer::Yes      => Decision::approve(),
+                Answer::No       => Decision::deny("not this one"),
+                Answer::NotNow   => Decision::Defer,   // persist and decide later
+            }
+        })
+    }
+}
+```
+
+The trait is object-safe (`Box<dyn Approver>`) and the future may stay pending
+indefinitely — the run waits rather than timing out. `Decision::Approve` can
+also carry a rewritten action (`modified`) or rules to `remember` for the rest
+of the run. Both are re-checked against the policy: **an approval cannot move an
+action across a deny, and a remembered allow cannot override one.**
+Remembered rules come back on `RunResult::remembered` for you to persist.
+
+Built-ins: `ApproveAll`, `DenyAll`, `StdinApprover`.
+
+### Deferring past the end of the process
+
+```rust
+match result.outcome {
+    RunOutcome::AwaitingApproval { request_id, .. } => {
+        // ...hours later, another process, same rusqlite file
+        let store = Store::open("runs.db")?;
+        io_harness::resume_with_decision(
+            &contract, &provider, &store, run_id, request_id,
+            Decision::approve(), &policy, &approver,
+        ).await?
+    }
+    _ => result,
+};
+```
+
+The pending action is persisted with the content the human was shown, so the
+resumed action is exactly the one approved. The policy is re-checked on resume,
+so a deny that landed while it waited still holds.
+
+### Sharing one policy between apps
+
+`Policy` is `serde`-serializable, so io-cli and io-studio read the same format
+and neither writes its own parser. Compose layers with `merge`:
+
+```rust
+let effective = shared_base.merge(app_local);
+```
+
+The recommended convention is **user base → project layer → app overlay**, each
+app keeping its own config file over a shared base. The crate composes a stack
+it is handed; **it does not discover config files** — locations and precedence
+are the adopting app's responsibility. Because denies are absolute across
+layers, a shared base stays trustworthy no matter what an app stacks on top.
+
+Run it live: `cargo run --example policy_run`.
 
 ## Part of initorigin
 

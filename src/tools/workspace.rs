@@ -12,6 +12,7 @@ use std::path::{Component, Path, PathBuf};
 use regex::Regex;
 
 use crate::error::{Error, Result};
+use crate::policy::{Act, Effect, Policy, Verdict};
 
 /// Directory names never walked by grep/find — build output and VCS metadata,
 /// which the agent should never search or edit.
@@ -19,10 +20,14 @@ use crate::error::{Error, Result};
 // searching real build trees (open question in the 0.3.0 contract).
 const IGNORE_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
-/// A workspace rooted at one directory. All operations stay under `root`.
+/// A workspace rooted at one directory. All operations stay under `root`, and
+/// every path is additionally checked against a [`Policy`] before it is read or
+/// written — in this layer, not in the system prompt, so a model that ignores
+/// its instructions still cannot act outside the policy.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     root: PathBuf,
+    policy: Policy,
 }
 
 /// One grep hit: file relative to the root, 1-based line number, and the line.
@@ -37,14 +42,78 @@ pub struct Match {
 }
 
 impl Workspace {
-    /// Root the workspace at `root`.
+    /// Root the workspace at `root`, enforcing nothing beyond the root itself.
+    /// This is the 0.3.0 behaviour and what a caller who passes no policy gets.
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            policy: Policy::permissive(),
+        }
+    }
+
+    /// Root the workspace at `root` and enforce `policy` on every path.
+    pub fn with_policy(root: impl Into<PathBuf>, policy: Policy) -> Self {
+        Self {
+            root: root.into(),
+            policy,
+        }
     }
 
     /// The workspace root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The policy this workspace enforces.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    /// Evaluate `act` against a workspace-relative path, returning the strictest
+    /// verdict across every form that path can take.
+    ///
+    /// A symlink is checked by its own path *and* by its resolved target, so a
+    /// link sitting inside an allowed directory but pointing at a denied file is
+    /// refused — the target fails even though the link's own path passes.
+    pub fn check_path(&self, act: Act, rel: &str) -> Verdict {
+        let mut worst = self.policy.check(act, &normalize(rel));
+
+        // The canonical form, when it differs and still lands inside the root.
+        if let Ok(abs) = self.resolve(rel) {
+            if let Ok(canon) = abs.canonicalize() {
+                let root_canon = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+                if let Ok(rel_canon) = canon.strip_prefix(&root_canon) {
+                    let rel_canon = rel_canon.to_string_lossy().replace('\\', "/");
+                    let v = self.policy.check(act, &rel_canon);
+                    if v.effect > worst.effect {
+                        worst = v;
+                    }
+                } else {
+                    // Resolves outside the root: a symlink escape, refused
+                    // regardless of what the policy says about the link itself.
+                    return Verdict {
+                        effect: Effect::Deny,
+                        rule: Some("<resolves outside workspace root>".into()),
+                        layer: None,
+                    };
+                }
+            }
+        }
+        worst
+    }
+
+    /// Refuse the action if the policy denies it, as a typed [`Error::Refused`].
+    fn enforce(&self, act: Act, rel: &str) -> Result<()> {
+        let v = self.check_path(act, rel);
+        if v.effect == Effect::Deny {
+            return Err(Error::Refused {
+                act: format!("{act:?}").to_lowercase(),
+                target: rel.to_string(),
+                rule: v.rule,
+                layer: v.layer,
+            });
+        }
+        Ok(())
     }
 
     /// Resolve a model-supplied relative path under the root, refusing absolute
@@ -84,6 +153,11 @@ impl Workspace {
                     continue;
                 }
             }
+            // A denied file contributes no matches, so its contents cannot be
+            // exfiltrated into the model's context through a search.
+            if self.check_path(Act::Read, &file).effect == Effect::Deny {
+                continue;
+            }
             // Non-UTF-8 / binary files just don't match; skip quietly.
             let Ok(content) = std::fs::read_to_string(self.root.join(&file)) else {
                 continue;
@@ -114,21 +188,27 @@ impl Workspace {
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or(file);
-                re.is_match(base) || re.is_match(file)
+                (re.is_match(base) || re.is_match(file))
+                    // A denied path is not even named back to the model.
+                    && self.check_path(Act::Read, file).effect != Effect::Deny
             })
             .collect())
     }
 
     /// Read a file under the root. A missing file reads as empty, so the agent
-    /// can create it (matching the 0.1/0.2 `FsTool` behaviour).
+    /// can create it (matching the 0.1/0.2 `FsTool` behaviour). A path the
+    /// policy denies is refused before anything is read.
     pub fn read_file(&self, rel: &str) -> Result<String> {
         let abs = self.resolve(rel)?;
+        self.enforce(Act::Read, rel)?;
         Ok(std::fs::read_to_string(abs).unwrap_or_default())
     }
 
-    /// Write a file under the root, creating parent directories.
+    /// Write a file under the root, creating parent directories. A path the
+    /// policy denies is refused before anything is written.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<()> {
         let abs = self.resolve(rel)?;
+        self.enforce(Act::Write, rel)?;
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -168,6 +248,23 @@ impl Workspace {
 
 fn escape(rel: &str) -> Error {
     Error::Config(format!("path escapes workspace: {rel}"))
+}
+
+/// A model-supplied path in the `/`-separated, `.`-free form policy globs match
+/// against, so `./src/a.rs` and `src/a.rs` are the same target to a rule.
+fn normalize(rel: &str) -> String {
+    let s = rel.replace('\\', "/");
+    let mut out: Vec<&str> = Vec::new();
+    for part in s.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                out.pop();
+            }
+            p => out.push(p),
+        }
+    }
+    out.join("/")
 }
 
 /// Compile a glob (`*` any run including `/`, `?` one char) to a regex.
@@ -249,6 +346,158 @@ mod tests {
         assert!(ws.resolve("src/../../etc/passwd").is_err()); // climbs out
         #[cfg(unix)]
         assert!(ws.resolve("/etc/passwd").is_err()); // absolute
+    }
+
+    /// The policy used across the enforcement tests: src/ is readable and
+    /// writable, secrets/ is denied outright.
+    fn guarded(root: &Path) -> Workspace {
+        Workspace::with_policy(
+            root,
+            Policy::default()
+                .layer("base")
+                .allow_read("*")
+                .allow_write("src/*")
+                .deny_read("secrets/*")
+                .deny_write("secrets/*"),
+        )
+    }
+
+    #[test]
+    fn a_denied_write_is_refused_and_the_file_is_untouched() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/key.txt"), "original").unwrap();
+        let ws = guarded(dir.path());
+
+        let err = ws.write_file("secrets/key.txt", "stolen").unwrap_err();
+        assert!(
+            matches!(&err, Error::Refused { rule, layer, .. }
+                if rule.as_deref() == Some("secrets/*") && layer.as_deref() == Some("base")),
+            "expected an attributable refusal, got {err:?}"
+        );
+        // Nothing was written.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("secrets/key.txt")).unwrap(),
+            "original"
+        );
+        // An in-policy write still succeeds.
+        assert!(ws.write_file("src/a.rs", "pub fn alpha() -> u32 { 9 }\n").is_ok());
+    }
+
+    #[test]
+    fn denied_paths_are_invisible_to_grep_and_find() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/creds.rs"), "alpha token\n").unwrap();
+        let ws = guarded(dir.path());
+
+        // grep would otherwise match secrets/creds.rs — it must not appear.
+        let hits = ws.grep("alpha", None).unwrap();
+        assert!(!hits.iter().any(|m| m.path.starts_with("secrets/")));
+        assert!(hits.iter().any(|m| m.path == "src/a.rs"));
+
+        // find must not even name it.
+        let found = ws.find("*.rs").unwrap();
+        assert!(!found.iter().any(|p| p.starts_with("secrets/")));
+
+        // and a direct read is refused, not silently empty.
+        assert!(matches!(
+            ws.read_file("secrets/creds.rs"),
+            Err(Error::Refused { .. })
+        ));
+    }
+
+    #[test]
+    fn traversal_is_evaluated_on_the_resolved_path_not_the_literal_one() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/key.txt"), "original").unwrap();
+        let ws = guarded(dir.path());
+
+        // Lands inside secrets/ after resolution, so the deny still applies.
+        assert!(matches!(
+            ws.write_file("src/../secrets/key.txt", "stolen"),
+            Err(Error::Refused { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("secrets/key.txt")).unwrap(),
+            "original"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_denied_by_its_target_even_when_its_own_path_is_allowed() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/key.txt"), "secret").unwrap();
+        // A link that lives in the allowed tree but points into the denied one.
+        std::os::unix::fs::symlink(
+            dir.path().join("secrets/key.txt"),
+            dir.path().join("src/link.rs"),
+        )
+        .unwrap();
+        let ws = guarded(dir.path());
+
+        // src/link.rs passes on its own path; its target does not.
+        assert_eq!(
+            ws.check_path(Act::Read, "src/link.rs").effect,
+            Effect::Deny,
+            "a link into a denied path must be refused"
+        );
+        assert!(matches!(
+            ws.read_file("src/link.rs"),
+            Err(Error::Refused { .. })
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_pointing_outside_the_root_is_refused() {
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("passwd"), "root:x:0:0").unwrap();
+        let dir = fixture();
+        std::os::unix::fs::symlink(outside.path().join("passwd"), dir.path().join("src/out.rs"))
+            .unwrap();
+        let ws = guarded(dir.path());
+
+        assert_eq!(ws.check_path(Act::Read, "src/out.rs").effect, Effect::Deny);
+    }
+
+    #[test]
+    fn a_workspace_without_a_policy_behaves_exactly_as_0_3_0_did() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/key.txt"), "x").unwrap();
+        let ws = Workspace::new(dir.path());
+
+        // No policy means no enforcement — the boundary is opt-in.
+        assert!(ws.write_file("secrets/key.txt", "y").is_ok());
+        assert!(ws.read_file("secrets/key.txt").is_ok());
+        assert!(ws.find("*.txt").unwrap().iter().any(|p| p.starts_with("secrets/")));
+    }
+
+    #[test]
+    fn check_path_agrees_with_what_read_and_write_actually_enforce() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/key.txt"), "x").unwrap();
+        let ws = guarded(dir.path());
+
+        for (act, path) in [
+            (Act::Read, "src/a.rs"),
+            (Act::Read, "secrets/key.txt"),
+            (Act::Write, "src/a.rs"),
+            (Act::Write, "secrets/key.txt"),
+        ] {
+            let denied = ws.check_path(act, path).effect == Effect::Deny;
+            let refused = match act {
+                Act::Read => matches!(ws.read_file(path), Err(Error::Refused { .. })),
+                Act::Write => matches!(ws.write_file(path, "x"), Err(Error::Refused { .. })),
+                Act::Exec => unreachable!(),
+            };
+            assert_eq!(denied, refused, "{act:?} {path}");
+        }
     }
 
     #[test]
