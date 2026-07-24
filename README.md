@@ -7,7 +7,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 **Type:** Rust library crate
 **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
 **License:** Apache-2.0
-**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise.
+**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise. v0.6 adds the execution sandbox: every command the verification gate runs — the `rustc` compile and the test binary it has run since v0.2 — executes inside an ephemeral, per-run sandbox (isolated workdir, resource caps that kill, network denied by default, guaranteed teardown), so model-produced code no longer runs on the host directly. The sandbox is OS-native and OS-neutral — one trait, a native backend per platform (macOS `sandbox-exec`, Linux namespaces, Windows Job Objects) over a portable floor that runs everywhere.
 
 ## Capabilities
 
@@ -25,7 +25,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Providers — OpenRouter first, then Anthropic and OpenAI (own HTTP+SSE client)
 - Agent composition — spawn and nest many agents (100+) with shared context
 - Long-running autonomous tasks — 24h+ with no user input
-- Ephemeral local code-exec sandboxes — write, run, capture, destroy
+- Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, Windows Job Objects, portable floor)
 - Built-in tools — filesystem, git, grep, find
 - Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete, PDF watermark, PDF form fill, OCR, barcode/QR read and generate
 - Media — image and video passthrough when the model supports it
@@ -349,6 +349,42 @@ tool result the parent can adapt to, and every spawn, refusal, and budget draw i
 in the rusqlite trace as one reconstructable graph.
 
 Run it live: `cargo run --example subagents`.
+
+## Execution sandbox (v0.6)
+
+Since v0.2 the verification gate has compiled and run model-produced code. Until
+v0.6 that ran **directly on the host** — the "compiles locally, no isolation"
+limitation, made sharper by v0.5's many concurrent agents. v0.6 routes every such
+execution through a `Sandbox`:
+
+- **Ephemeral workdir** — created per run and **destroyed** on every exit path
+  (success, failure, cap kill), so nothing it writes or spawns outlives it.
+- **Resource caps that kill, not throttle** — `SandboxLimits` caps CPU time,
+  wall-clock, and memory; a breach returns a *typed* cap hit, never a hang.
+- **Network denied by default** — a configurable egress allow-list is deferred to
+  v0.8; v0.6 is deny-by-default only.
+- **Trace** — every create, the argv and the backend that ran it, each cap hit,
+  and each teardown land in the rusqlite trace, so an operator can audit *where*
+  each piece of code ran and *how* it was isolated.
+
+### OS-native and OS-neutral
+
+One trait, a real native backend per platform, over a portable floor that runs
+everywhere — so a task isolates the same way on mac, linux, and windows:
+
+| Backend | Isolation |
+| --- | --- |
+| **macOS `sandbox-exec`** | profile confines writes to the workdir and **denies network**; rlimits cap CPU/fds; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
+| **Linux namespaces** | user/mount/pid/**net** namespaces — a *hard* network boundary and a private root — plus rlimits *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
+| **Windows Job Object** | kill-on-close + memory / active-process / CPU limits and a restricted token *(cfg-gated; compiled + unit-tested, not live-run here)* |
+| **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
+
+`select` picks the strongest backend available on the running OS and records which
+ran. Sandboxing is the **new default** for the verification gate and is transparent
+to it — the same code passes or fails as before — and a caller who wants the exact
+v0.5 direct-host execution can opt it off, so the change is additive and reversible.
+
+Run it live: `cargo run --example sandbox_run`.
 
 ## Part of initorigin
 

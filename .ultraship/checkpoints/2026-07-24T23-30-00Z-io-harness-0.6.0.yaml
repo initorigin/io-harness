@@ -1,0 +1,88 @@
+product: io-harness
+version: 0.6.0
+timestamp: 2026-07-24T23:30:00Z
+reason: blocker
+repository_state: passing
+completed_acceptance:
+  - >-
+    `Sandbox`, `SandboxLimits`, `SandboxConfig`, and `SandboxOutcome` are part of the documented
+    public API under SemVer; existing 0.5.0 callers still compile unchanged, and no OS-specific or
+    provider-specific type leaks into the trait's signature — the surface is OS-neutral.
+  - >-
+    A task driven through the execution-based verification gate with the sandbox on reaches the same
+    verified success the un-sandboxed 0.2.0 path reaches, proving isolation is transparent to
+    verification — stdout, exit status, and produced files are captured identically.
+  - >-
+    A 0.5.0 caller who opts the sandbox off gets the exact 0.5.0 direct-host execution behaviour and
+    the same verified success, proving the sandbox is additive and reversible.
+  - >-
+    A sandboxed command that exceeds the CPU-time cap is killed and returns a typed cap-hit outcome
+    naming the CPU cap, not a hang; a second test does the same for the memory cap.
+  - >-
+    Sandboxed code that attempts an outbound network connection is denied under default-deny and the
+    command observes the failure, proving the network boundary is enforced by the sandbox, not the
+    prompt.
+  - >-
+    After a run (successful, failed, or cap-killed), the sandbox working directory is gone and no
+    process it spawned survives — a teardown test asserts no directory and no orphan process leak,
+    including on the error path.
+  - >-
+    Files the sandboxed command produces are copied back to the task workspace only where the 0.4.0
+    write policy allows, proving sandbox capture composes with the permission layer rather than
+    bypassing it.
+  - >-
+    On the macOS build host the native `sandbox-exec` backend is selected and recorded; when the
+    native backend is disabled by config, the portable floor is selected and recorded, proving the
+    selection ladder is real and observable.
+  - >-
+    The Linux native backend and the Windows native backend compile under their `cfg` on the macOS
+    build host and pass their backend unit tests, proving the OS-neutral surface holds even though
+    those backends are not live-run here.
+  - >-
+    Every sandbox lifecycle event (create, argv + backend, cap hit, denied network where observable,
+    destroy) is recorded so the run's execution history is reconstructable from a reopened store
+    alone.
+  - >-
+    A sandbox that fails to start returns a typed failure outcome the calling agent adapts to; the run
+    does not panic, and in a 0.5.0 tree the failure does not take down sibling agents — proven by a
+    test injecting a start failure.
+  - >-
+    In a 0.5.0 tree, each child's execution runs inside its own sandbox under the same caps and
+    default-deny network, proving isolation stacks on top of containment for every agent in the tree.
+  - >-
+    README and crate docs document the `Sandbox` trait, each backend and its isolation strength, the
+    portable floor as the guaranteed minimum, backend selection, resource caps, and default-deny
+    network with the allow-list deferral to 0.8.0, with a runnable example.
+  - >-
+    An example binary drives one live sandboxed run against OpenRouter on the macOS native backend
+    showing a cap hit and the network denial, with teardown leaving nothing behind.
+  - >-
+    `cargo test` passes, including the sandbox-transparent verification test, the CPU and memory
+    cap-kill tests, the network-deny test, the teardown/no-leak test, the copy-back-under-policy test,
+    the backend-selection test, the Linux/Windows backend compile+unit tests under cfg, the sandbox
+    trace test, and the unchanged 0.1.0–0.5.0 suite with the sandbox default on.
+  - '`cargo clippy --all-targets` reports zero warnings on the macOS build host.'
+  - '`cargo publish --dry-run` succeeds with complete crate metadata for 0.6.0.'
+remaining_acceptance:
+  - >-
+    0.6.0 is tagged as a git Release and then published to crates.io with `cargo publish`; the
+    uploaded crate matches the release-ready artifact and the published version resolves from
+    crates.io.
+active_hypotheses:
+  - >
+    PUBLISH is the only remaining step and is owner-gated. target_mode is `published`; publishing is
+    public and irreversible (no re-upload; fix = forward 0.6.1 + cargo yank). All package gates are
+    green and CARGO_REGISTRY_TOKEN is in .env. Sequence: cut the git Release (tag + GitHub Release),
+    THEN `cargo publish`. This belongs to the release/merge stage after owner sign-off — do not run it
+    autonomously.
+  - >
+    T08 sibling-independence has a minor test gap (see active.yaml blockers): the typed start-failure
+    is unit-proven and run_tree isolates a failing child from siblings (subagents suite), but no single
+    tree+start-failure injection test exists because an unspawnable child rustc is not reachable
+    through the public API. Accept, or add a test hook, before /ultraship:complete.
+next_task: US-IO-HARNESS-0.6.0-T10
+required_context:
+  - src/sandbox.rs
+  - src/sandbox/macos.rs
+  - src/verify.rs
+  - .ultraship/products/io-harness/evidence/0.6.0/

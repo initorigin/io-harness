@@ -56,8 +56,12 @@ versions:
       is created, run, captured, and destroyed per run, so execution-based verification and any
       agent-run command no longer compile and run model-produced code directly on the host — closing
       the "compiles locally, no isolation" limitation carried since 0.2.0 and made sharper by
-      0.5.0's many concurrent agents.
-    detail: outline
+      0.5.0's many concurrent agents. The sandbox is both OS-native and OS-neutral: a single
+      `Sandbox` trait with a real native backend per platform (macOS sandbox-exec, Linux
+      namespaces+seccomp, Windows Job Objects) over a portable floor (ephemeral tempdir, resource
+      caps, network denied) that compiles and runs on all three, so the same harness isolates code
+      the same way on mac, linux, and windows.
+    detail: specified
     status: planned
   - version: 0.7.0
     outcome: >

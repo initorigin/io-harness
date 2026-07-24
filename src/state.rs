@@ -222,6 +222,55 @@ impl AgentEvent {
     }
 }
 
+/// One event in the life of a sandboxed execution: the sandbox created for a
+/// run, a command run in it (with the backend that isolated it), a resource cap
+/// that killed it, a denied network attempt, or the sandbox torn down.
+///
+/// Together these let an operator audit not just *what* code ran but *where* and
+/// *how* it was isolated, reconstructable from the store alone after the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxEvent {
+    /// The run this execution belongs to.
+    pub run_id: i64,
+    /// The step it occurred on.
+    pub step: u32,
+    /// `"create"`, `"exec"`, `"cap_hit"`, `"net_deny"`, or `"destroy"`.
+    pub kind: String,
+    /// The backend that isolated the run (e.g. `"macos-sandbox-exec"`).
+    pub backend: Option<String>,
+    /// The argv for an `"exec"`, or the breached cap for a `"cap_hit"`. Never
+    /// file contents or credentials — the command line only.
+    pub detail: Option<String>,
+}
+
+impl SandboxEvent {
+    /// A sandbox was created for a run, isolated by `backend`.
+    pub fn create(run_id: i64, step: u32, backend: &str) -> Self {
+        Self { run_id, step, kind: "create".into(), backend: Some(backend.into()), detail: None }
+    }
+
+    /// A command ran in the sandbox under `backend`.
+    pub fn exec(run_id: i64, step: u32, backend: &str, argv: &str) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "exec".into(),
+            backend: Some(backend.into()),
+            detail: Some(argv.into()),
+        }
+    }
+
+    /// A resource cap killed the run.
+    pub fn cap_hit(run_id: i64, step: u32, cap: &str) -> Self {
+        Self { run_id, step, kind: "cap_hit".into(), backend: None, detail: Some(cap.into()) }
+    }
+
+    /// The sandbox was torn down (workdir removed, processes reaped).
+    pub fn destroy(run_id: i64, step: u32) -> Self {
+        Self { run_id, step, kind: "destroy".into(), backend: None, detail: None }
+    }
+}
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -311,6 +360,20 @@ impl Store {
                  detail       TEXT,
                  tokens       INTEGER,
                  remaining    INTEGER
+             );",
+        )?;
+
+        // 0.6.0: sandbox lifecycle events (create, exec+backend, cap hit, net
+        // deny, destroy). New table only — a 0.5.0 database gains it and a 0.5.0
+        // binary, which never queries it, still reads a migrated database.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sandbox_events (
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id   INTEGER NOT NULL,
+                 step     INTEGER NOT NULL,
+                 kind     TEXT NOT NULL,
+                 backend  TEXT,
+                 detail   TEXT
              );",
         )?;
 
@@ -463,6 +526,34 @@ impl Store {
                 detail: r.get(4)?,
                 tokens: r.get::<_, Option<i64>>(5)?.map(|n| n as u64),
                 remaining: r.get::<_, Option<i64>>(6)?.map(|n| n as u64),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record one sandbox lifecycle event against a run.
+    pub fn record_sandbox_event(&self, e: &SandboxEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO sandbox_events (run_id, step, kind, backend, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (e.run_id, e.step, &e.kind, &e.backend, &e.detail),
+        )?;
+        Ok(())
+    }
+
+    /// Every sandbox event recorded for a run, in order.
+    pub fn sandbox_events(&self, run_id: i64) -> Result<Vec<SandboxEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, step, kind, backend, detail
+             FROM sandbox_events WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(SandboxEvent {
+                run_id: r.get(0)?,
+                step: r.get::<_, i64>(1)? as u32,
+                kind: r.get(2)?,
+                backend: r.get(3)?,
+                detail: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)

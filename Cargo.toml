@@ -1,11 +1,11 @@
 [package]
 name = "io-harness"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Aakash Pawar"]
 license = "Apache-2.0"
-description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI), multi-file edits with grep/find over a workspace, budgets, retry, full trace, resumable runs, execution-based verification, and a layered permission policy with a human-approval gate. Embeddable in-process."
+description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI), multi-file edits with grep/find over a workspace, budgets, retry, full trace, resumable runs, execution-based verification, a layered permission policy with a human-approval gate, contained sub-agent composition, and an OS-native/OS-neutral execution sandbox (macOS sandbox-exec, Linux namespaces, Windows Job Objects, portable floor) that isolates model-produced code per run. Embeddable in-process."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
 keywords = ["agent", "ai", "llm", "anthropic", "harness"]
@@ -26,6 +26,11 @@ tracing = "0.1"
 tempfile = "3"
 # grep tool: regex matching, and glob->regex for the find tool's patterns.
 regex = "1"
+
+# Sandbox backends: setrlimit (CPU cap), kill, and signal constants on unix; the
+# macOS/Linux native backends and the portable floor's rlimit caps use it.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
