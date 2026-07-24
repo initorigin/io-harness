@@ -1,116 +1,307 @@
 product: io-harness
-version: 0.3.0
+version: 0.4.0
 tasks:
-  - id: US-IO-HARNESS-0.3.0-T01
-    summary: Workspace root + grep, find, and read_file tools, scoped and escape-safe.
-    why_required: Without cross-repo search the agent cannot locate what to change; every multi-file task starts by grepping/finding, and the workspace root is what keeps that search inside the project.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - Given a task over a multi-file fixture repo, the agent uses the grep tool to locate matches by regex/substring and receives file+line results it can act on.
-      - The find tool locates files by path/name/glob across the workspace and returns matching paths.
-      - grep and find operate only within the configured workspace root and do not traverse outside it.
-    files:
-      - src/tools/workspace.rs
-      - src/tools/mod.rs
-    evidence:
-      - "cargo test --lib tools::workspace — 5 passed: grep_finds_matches_by_regex_across_files_skipping_ignored, grep_path_glob_restricts_to_matching_files, find_matches_by_basename_and_path_glob, resolve_refuses_escapes_but_allows_inner_paths, read_missing_is_empty_then_write_roundtrips_within_root."
-
-  - id: US-IO-HARNESS-0.3.0-T02
-    summary: Multi-tool, multi-file loop with an observation log, plus multi-file execution-based verification.
-    why_required: The release outcome is editing several files in one run; the single-file loop and single-file verify gate cannot express or check that, so both must become set-aware.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.3.0-T01
-    acceptance_criteria:
-      - The harness edits several distinct files in a single run and the execution-based gate verifies the full set — the run only succeeds when every edited file meets its spec.
-    files:
-      - src/run.rs
-      - src/verify.rs
-      - src/contract.rs
-      - src/tools/mod.rs
-      - tests/multi_file.rs
-    evidence:
-      - "cargo test --test multi_file — 3 passed: agent_finds_then_edits_several_files_and_the_set_verifies (Success{steps:5}, both files written, trace records find/grep/write per file), run_fails_when_one_of_the_edited_files_is_wrong (b=99 -> StepCapReached{4}, set gate rejects partial correctness), write_outside_the_workspace_is_refused_not_crashing_the_run."
-      - "cargo test — full suite 16 unit + 9 (0.2.0 integration, unchanged) + 3 multi_file + 1 doctest, all pass; no 0.2.0 single-file regression."
-      - "verify.rs units: each_compiles_rust_fails_if_any_file_fails, workspace_test_passes_only_when_files_work_together, multi_file_variant_errors_in_single_file_mode."
-
-  - id: US-IO-HARNESS-0.3.0-T03
-    summary: Anthropic provider over the own HTTP + SSE client, behind the Provider trait.
-    why_required: Anthropic is one of the two providers this release adds; its /v1/messages wire format is the genuinely new transport work and must parse tool calls from that vendor's stream.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - The Anthropic and OpenAI providers send requests and stream responses over the own HTTP + SSE client, and the harness parses tool calls from each vendor's wire format.
-      - Each provider's API key is read from configuration/environment, never hard-coded or logged.
-    files:
-      - src/provider/anthropic.rs
-      - src/provider/mod.rs
-    evidence:
-      - "cargo test --lib provider::anthropic — 3 passed: body_maps_tools_to_input_schema_and_system_top_level (system top-level, tools->input_schema, max_tokens set), accumulates_tool_use_from_input_json_deltas_and_usage (tool_use name + partial_json fragments -> {path,content}, input+output tokens summed), accumulates_plain_text."
-      - "Key read from ANTHROPIC_API_KEY via from_env(); sent as x-api-key header, never logged. Shared SSE reader added to provider/mod.rs (read_sse)."
-
-  - id: US-IO-HARNESS-0.3.0-T04
-    summary: OpenAI provider over the own HTTP + SSE client, sharing the OpenAI-style transport with OpenRouter.
-    why_required: OpenAI is the second provider this release adds; its chat/completions format matches OpenRouter's, so the shared code is factored out and reused rather than duplicated.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.3.0-T03
-    acceptance_criteria:
-      - The Anthropic and OpenAI providers send requests and stream responses over the own HTTP + SSE client, and the harness parses tool calls from each vendor's wire format.
-      - Each provider's API key is read from configuration/environment, never hard-coded or logged.
-    files:
-      - src/provider/openai.rs
-      - src/provider/openrouter.rs
-      - src/provider/openai_wire.rs
-      - src/provider/mod.rs
-    evidence:
-      - "Factored OpenAI-style wire (body + SSE parse + tool-call accumulator) into src/provider/openai_wire.rs; OpenRouter and OpenAI both delegate to it, differing only in endpoint/auth/model."
-      - "cargo test --lib provider — 5 passed incl. openai_wire::accumulates_tool_call_fragments_across_deltas and body_maps_tools_to_function_schema. OpenAi reads OPENAI_API_KEY via from_env(), bearer auth, key never logged."
-      - "cargo clippy --all-targets — clean, no warnings."
-
-  - id: US-IO-HARNESS-0.3.0-T05
-    summary: Provider selection at run construction, provider recorded in the trace, and the provider-agnostic public surface, proven by a three-provider parity test.
-    why_required: The outcome lets a developer choose the provider without touching the contract; this task wires selection through the generic run, records which provider ran, and proves no vendor type leaks — the release's central thesis.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.3.0-T02
-      - US-IO-HARNESS-0.3.0-T04
-    acceptance_criteria:
-      - The same task contract runs to verified success under OpenRouter, Anthropic, and OpenAI, selected only at run construction with no change to the contract itself.
-      - The rusqlite trace records which provider ran and the per-file tool calls and edits of the multi-file run.
-      - Provider selection and the grep/find tools are part of the documented public API under SemVer; existing 0.2.0 callers still compile, or a documented migration is provided.
-      - No Anthropic-, OpenAI-, or OpenRouter-specific type appears in the public task-contract, tool, verification, or trace API (provider-agnostic surface preserved).
-    files:
-      - src/lib.rs
-      - src/run.rs
-      - src/state.rs
-      - tests/parity.rs
-    evidence:
-      - "tests/parity.rs the_same_contract_verifies_under_every_provider_and_records_which_ran — the identical TaskContract reaches Success{steps:1} through three Provider impls named openrouter/anthropic/openai (selection = which impl is passed to run), and store.provider(run_id) returns the right label each time."
-      - "Provider::name() added as a defaulted trait method (existing impls keep compiling — 0.2.0 back-compat); runs table gains a provider column via additive ALTER (0.1/0.2 DBs migrate in place). state tests: provider_is_recorded_and_read_back, migrates_a_pre_0_3_runs_table_adding_provider."
-      - "Agnostic surface: run()/TaskContract/Verification/CompletionRequest/Store carry no vendor type; providers are selected only by which impl is constructed. lib.rs exports Anthropic, OpenAi, OpenRouter behind the Provider trait."
-      - "Full suite green: 22 unit + 9 (0.2.0 integration, unchanged) + 3 multi_file + 1 parity + 1 doctest. cargo clippy --all-targets clean."
-
-  - id: US-IO-HARNESS-0.3.0-T06
-    summary: .env provider-key placeholders, README/docs, version bump, packaging, and full green suite.
-    why_required: The release is only shippable once the new surface is documented, the crate metadata is 0.3.0, publish dry-run passes, and the whole suite (multi-file + parity) is green.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.3.0-T05
-    acceptance_criteria:
-      - "`cargo test` passes, including the multi-file find-then-edit integration test and the three-provider parity test."
-      - "`cargo publish --dry-run` succeeds with complete crate metadata for 0.3.0."
-      - README documents the grep and find tools, multi-file edits, and selecting each of the three providers, with an example.
-    files:
-      - .env
-      - .env.example
-      - README.md
-      - CHANGELOG.md
-      - Cargo.toml
-      - examples/edit_repo.rs
-    evidence:
-      - "cargo test — 22 unit + 9 (0.2.0) + 3 multi_file + 1 parity + 1 doctest, all pass. cargo clippy --all-targets clean."
-      - "cargo publish --dry-run --allow-dirty — Packaged io-harness v0.3.0, 36 files, verify-compiled, upload aborted (dry run). Real .env (secrets) excluded from the package; only .env.example ships."
-      - "README updated: Usage (v0.3) with provider selection (OpenRouter/Anthropic/OpenAI from_env), and a repository-task section showing grep/find + multi-file WorkspaceTestPasses. CHANGELOG 0.3.0 entry + migration note. Cargo.toml bumped to 0.3.0."
-      - ".env gained ANTHROPIC_API_KEY/ANTHROPIC_MODEL/OPENAI_API_KEY/OPENAI_MODEL as empty placeholders (per user: filled later, no live testing). examples/edit_repo.rs added for a live OpenRouter workspace run."
+- id: US-IO-HARNESS-0.4.0-T01
+  summary: 'Policy type: rules, tiers, serde, layered merge, and explain.'
+  why_required: Every other task in the release evaluates a policy; without the type, its merge precedence,
+    and one shared evaluation function there is nothing to enforce, serialise, or explain.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - Deny beats allow — a path matched by both an allow glob and a deny glob is refused.
+  - A read of `.env` inside the workspace is denied under the default policy even though the surrounding
+    directory is readable.
+  - A `Policy` round-trips through serde — serialize, deserialize, and the result enforces identically
+    to the original, proven by running the same refusal test against both.
+  - A deny in a base layer is not re-allowed by an overlay that allows the same path — the merged policy
+    still refuses, and a test asserts this specifically, since it is the rule that makes a shared base
+    trustworthy.
+  - An allow present only in an overlay grants that capability in the merged policy, so an app can extend
+    a shared base without editing it.
+  - Merging is deterministic and order-explicit — the same stack of layers always produces the same effective
+    policy, and merging a layer with itself changes nothing.
+  - An empty or absent overlay leaves the base policy unchanged, so an app that ships no config of its
+    own still gets the shared base intact.
+  - '`Policy::explain` names the layer responsible, so a path denied by a base layer is explainable without
+    running the agent.'
+  files:
+  - src/policy.rs
+  - src/lib.rs
+  evidence:
+  - 'cargo test --lib policy — 9 passed: deny_beats_allow_even_when_both_match, default_policy_denies_dotenv_read_inside_a_readable_tree,
+    serde_roundtrip_enforces_identically, an_overlay_cannot_reallow_what_the_base_denied, an_overlay_only_allow_grants_capability_the_base_lacked,
+    merging_is_deterministic_and_merging_a_layer_with_itself_changes_nothing, an_empty_overlay_leaves_the_base_unchanged,
+    explain_names_the_rule_and_the_layer_that_decided, explain_and_check_never_disagree.'
+  - check() is literally explain() (src/policy.rs), so enforcement and explanation cannot drift; asserted
+    by explain_and_check_never_disagree.
+  - merge is layer concatenation with deny-first evaluation across the whole stack, which is what makes
+    an overlay structurally unable to re-allow a base deny.
+- id: US-IO-HARNESS-0.4.0-T02
+  summary: Trace schema for refusals, decisions, and layer attribution, with an additive migration.
+  why_required: Refusals and decisions are recorded from the moment enforcement exists, so the schema
+    must land before the enforcement task rather than being retrofitted across every call site afterwards.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T01
+  acceptance_criteria:
+  - The rusqlite trace records each refusal with the action, the target path or command, the rule that
+    refused it, and which layer that rule came from, and each decision with its approve/deny value and
+    its source.
+  - Refusal and decision records never log file contents or API keys — path, command, rule, and decision
+    only.
+  files:
+  - src/state.rs
+  evidence:
+  - cargo test --lib state — 8 passed, including the two pre-existing 0.1/0.3 migration tests unchanged.
+  - 'New: refusals_record_action_target_rule_and_layer, decisions_record_their_value_source_and_any_altered_target,
+    a_pre_0_4_database_migrates_in_place_and_keeps_its_rows, a_pending_approval_survives_the_store_being_reopened.'
+  - Migration is additive (CREATE TABLE IF NOT EXISTS policy_events, pending_approvals); a 0.3.0 database
+    gains them and a 0.3.0 binary still reads it.
+- id: US-IO-HARNESS-0.4.0-T03
+  summary: 'Path enforcement in the tool layer: canonical resolution, symlink rule, grep/find filtering,
+    refusal as tool result.'
+  why_required: This is the first complete vertical slice — a real run refuses an out-of-policy write,
+    tells the model why, and still reaches a verified success on its in-policy edits. Without it the release
+    has a policy that governs nothing.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T01
+  - US-IO-HARNESS-0.4.0-T02
+  acceptance_criteria:
+  - Given a policy that allows writes under `src/**` and denies `secrets/**`, a workspace run that attempts
+    to write `secrets/key.txt` does not modify that file, receives a typed refusal as its tool result,
+    and still completes its in-policy edits to a verified success.
+  - '`grep`, `find`, and `read_file` return no results from paths outside the read allow list, so a denied
+    path cannot be exfiltrated into the model''s context.'
+  - Path rules are evaluated on the resolved canonical path, so `..` traversal cannot reach outside the
+    allow list.
+  - A deny rule matches when either the symlink's own path or its resolved target matches, so a symlink
+    inside the allow list pointing at a denied path is refused — following Claude Code's symlink rule,
+    where a link in an allowed directory pointing at `~/.ssh/id_rsa` is blocked.
+  - '`Policy::explain(path)` returns the same decision the tool layer would enforce for that path, proven
+    by a test that asserts the two agree across allowed, denied, and sensitive paths — an explain that
+    can disagree with enforcement is worse than none.'
+  - A refusal caused by a base layer is attributable to that layer in the trace, so a user whose own app
+    config does not mention the path can still find out what refused it.
+  - A 0.3.0 workspace run constructed without any policy still reaches the same verified success it did
+    in 0.3.0, because the default policy applied when none is passed is permissive.
+  - A refused action consumes a step — a run whose model repeatedly requests a denied write stops at `StepCapReached`
+    rather than looping, and the trace shows one refusal record per consumed step.
+  - Enforcement lives in the tool and verification layers, never only in the system prompt — a test asserts
+    refusal holds when the model requests an out-of-policy action directly.
+  files:
+  - src/tools/workspace.rs
+  - src/tools/fs.rs
+  - src/run.rs
+  - tests/policy.rs
+  evidence:
+  - cargo test --lib tools::workspace — 12 passed, 5 pre-existing 0.3.0 tests unchanged.
+  - 'New: a_denied_write_is_refused_and_the_file_is_untouched, denied_paths_are_invisible_to_grep_and_find,
+    traversal_is_evaluated_on_the_resolved_path_not_the_literal_one, a_symlink_is_denied_by_its_target_even_when_its_own_path_is_allowed,
+    a_symlink_pointing_outside_the_root_is_refused, a_workspace_without_a_policy_behaves_exactly_as_0_3_0_did,
+    check_path_agrees_with_what_read_and_write_actually_enforce.'
+  - cargo test --test policy — 11 passed at the run level, including a_denied_write_is_refused_and_the_run_still_reaches_its_goal
+    (Success{steps:2}, secret untouched, refusal attributed to rule secrets/* in layer base) and a_refused_action_consumes_a_step_so_retrying_it_hits_the_cap
+    (StepCapReached{3}, 3 refusal records).
+  - Enforcement is in Workspace::enforce/check_path and the loop's gate(), never in the prompt; a_run_with_no_policy_behaves_exactly_as_0_3_0_did
+    proves the permissive default.
+- id: US-IO-HARNESS-0.4.0-T04
+  summary: Command execution policy gating what verification may spawn.
+  why_required: Verification shells out to rustc and a compiled test binary; without a command allow list
+    the policy governs files but not process execution, leaving the release half a boundary.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T01
+  acceptance_criteria:
+  - Verification refuses to spawn a binary absent from the command allow list, and the refusal is distinguishable
+    in the result from a verification that ran and failed.
+  - The command policy gates the binary name; the trace records the full argv of every spawn, so argument-level
+    enforcement can be added in 0.6.0 against a recorded baseline rather than a guess.
+  files:
+  - src/verify.rs
+  evidence:
+  - cargo test --lib verify — 10 passed, 7 pre-existing 0.3.0 tests unchanged.
+  - a_command_absent_from_the_allow_list_is_refused_not_failed — deny_exec("rustc") yields Err(Error::Refused{target:"rustc"}),
+    while the identical source under the default policy compiles and returns true, so a refusal is distinguishable
+    from a verification that ran and failed.
+  - denying_the_test_binary_type_checks_without_running_it — allowing rustc but denying TEST_BINARY refuses
+    the run of the produced binary, giving compile-only verification.
+  - ExecGuard records every spawn's full argv (metadata_args/test_build_args); tests/policy.rs a_run_with_no_policy_behaves_exactly_as_0_3_0_did
+    asserts an exec event whose target starts with "rustc ".
+  - Policy::default() ships a builtin-exec layer allowing rustc and <test-binary>, so constructing a policy
+    does not break the verify gate.
+- id: US-IO-HARNESS-0.4.0-T05
+  summary: Approver trait with Approve/Deny, the sensitive tiers, and the DenyAll/ApproveAll/stdin built-ins.
+  why_required: The human gate is the half of the outcome that enforcement alone cannot deliver; the tiers
+    decide what reaches it, and the built-ins are what let io-cli wire a prompt without writing one.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T03
+  acceptance_criteria:
+  - A sensitive action reaches the `Approver`, but an out-of-policy action does not — a refusal is returned
+    without the approver being consulted, and a test asserts the approver was never called for it.
+  - A sensitive action with an `ApproveAll` approver proceeds; the identical run with `DenyAll` does not
+    perform the action and stops with a distinct outcome.
+  - Reads inside the allow list proceed without consulting the approver, while every write consults it
+    — including an overwrite of a file the path rules already allow.
+  - '`Approver` can be held as `Box<dyn Approver>` and used from a non-terminal caller, proven by a test
+    approver backed by a channel rather than stdin.'
+  - '`Approver` is `Send + Sync` and awaited without blocking the tokio runtime.'
+  files:
+  - src/approve.rs
+  - src/run.rs
+  - tests/approval.rs
+  evidence:
+  - 'cargo test --lib approve — 3 passed: built_in_approvers_decide_as_advertised, an_approver_can_be_held_as_a_trait_object_and_answer_out_of_band
+    (Box<dyn Approver> answering from a oneshot channel, io-studio''s shape), a_slow_approver_keeps_the_caller_waiting_rather_than_timing_out.'
+  - Approver is object-safe via a boxed DecisionFuture rather than an async-trait dependency — no new
+    crate added.
+  - 'cargo test --test policy: a_denied_action_never_reaches_the_approver (approver call count 0), approve_all_proceeds_where_deny_all_does_not,
+    reads_do_not_prompt_but_every_write_does_including_an_allowed_overwrite (count 1).'
+- id: US-IO-HARNESS-0.4.0-T06
+  summary: Approve-with-changes, with the modified action re-evaluated against the policy.
+  why_required: An approver that can alter an action after the policy has seen it is a bypass for every
+    deny in the stack unless the modified form is re-checked; the feature and its re-check are the same
+    piece of work.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T05
+  acceptance_criteria:
+  - An approver that approves with a modified action causes the modified action to run, and the trace
+    shows both the requested and the performed form.
+  - An approver that rewrites an action onto a denied path does not cause that action to run — the modified
+    action is refused by the policy exactly as the original would have been.
+  files:
+  - src/approve.rs
+  - src/run.rs
+  - tests/approval.rs
+  evidence:
+  - cargo test --test policy — an_approver_can_redirect_the_write_and_the_trace_shows_both_forms (src/redirected.rs
+    written, src/a.rs untouched, decision row target=src/a.rs performed=src/redirected.rs).
+  - an_approved_rewrite_cannot_move_an_action_across_a_deny — a rogue approver redirecting onto secrets/key.txt
+    is refused and recorded; the file keeps its original contents. The re-check lives in gate() with the
+    action, not at the approver call site.
+- id: US-IO-HARNESS-0.4.0-T07
+  summary: Approve-and-remember as a run-scoped top layer, returned on RunResult.
+  why_required: Without remembering, a long run prompts for every repeated action and the gate becomes
+    unusable; implementing it as a merge layer is what keeps deny-is-absolute true while it does so.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T06
+  acceptance_criteria:
+  - An approver that approves and remembers a rule stops being consulted for later actions matching that
+    rule within the same run, and the trace marks those actions as auto-approved by the remembered rule.
+  - A remembered allow does not override a base-layer deny — remembering a rule that conflicts with a
+    deny leaves the deny in force.
+  - Remembered rules are readable from `RunResult` after the run, so a caller can persist them; the crate
+    itself writes no config file.
+  files:
+  - src/approve.rs
+  - src/policy.rs
+  - src/run.rs
+  - tests/approval.rs
+  evidence:
+  - cargo test --test policy — remembering_a_rule_stops_the_prompting_and_is_returned_to_the_caller (approver
+    consulted once for two writes; result.remembered carries the src/* rule).
+  - a_remembered_allow_cannot_override_a_base_deny — remembering allow '*' still leaves secrets/key.txt
+    unwritten, because remembering merges a layer rather than mutating the policy.
+  - The crate writes no config file; remembered rules are returned on RunResult for the caller to persist.
+- id: US-IO-HARNESS-0.4.0-T08
+  summary: Decision::Defer, persisted AwaitingApproval, and resume_with_decision.
+  why_required: A decision that outlives the process is what lets an approval wait for a human who is
+    not at the terminal, and it is the mechanism 0.5.0 unattended runs depend on.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T05
+  acceptance_criteria:
+  - An `Approver` returning `Defer` stops the run with `RunOutcome::AwaitingApproval { request_id }` and
+    the pending action is readable from the store after the process that created it has ended.
+  - An `Approver` that does not resolve immediately keeps the run paused rather than timing out — a test
+    holds the decision across an await and the run continues correctly once it resolves.
+  - '`resume_with_decision` with an approval performs the pending action and continues the run to a verified
+    success under the original `run_id`; with a denial it does not perform the action and closes the run.'
+  files:
+  - src/approve.rs
+  - src/run.rs
+  - src/state.rs
+  - tests/defer.rs
+  evidence:
+  - cargo test --test policy — 14 passed, including the three resume tests.
+  - deferring_pauses_the_run_and_persists_the_pending_action — run stops at RunOutcome::AwaitingApproval{steps:1},
+    nothing written, pending row readable from a reopened Store with act/target/content intact.
+  - resuming_an_approval_performs_the_pending_action_and_finishes_the_run — a different Store over the
+    same file resumes to Success{steps:2} under the ORIGINAL run_id; src/a.rs holds exactly the content
+    the human was shown; pending resolved=approve; a decision event carries source=resumed:<id>.
+  - resuming_a_denial_does_not_perform_the_action_and_closes_the_run — RunOutcome::Denied{steps:1}, file
+    untouched, pending resolved=deny.
+  - a_deny_that_lands_while_paused_still_holds_on_resume — the policy is re-checked on resume, so an approval
+    cannot perform an action a deny now covers.
+  - a_slow_approver_keeps_the_caller_waiting_rather_than_timing_out (src/approve.rs) proves the future
+    may stay pending.
+- id: US-IO-HARNESS-0.4.0-T09
+  summary: Public API surface, backward compatibility, docs, example, and packaging for 0.4.0.
+  why_required: The release is consumed as a crate by two other products; an API that breaks 0.3.0 callers
+    or ships undocumented is not deliverable regardless of how well the policy works.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.4.0-T03
+  - US-IO-HARNESS-0.4.0-T04
+  - US-IO-HARNESS-0.4.0-T07
+  - US-IO-HARNESS-0.4.0-T08
+  acceptance_criteria:
+  - Policy, `Approver`, `Decision`, and `resume_with_decision` are part of the documented public API under
+    SemVer; existing 0.3.0 callers still compile, or a documented migration is provided.
+  - No provider-specific type appears in the policy, approval, or trace API; the provider-agnostic surface
+    is preserved.
+  - The default policy applied when a caller passes none is permissive, preserving 0.3.0 behaviour — the
+    boundary is opt-in. This is a decided trade-off, not an oversight, and the README states plainly that
+    a caller who constructs no policy gets no enforcement.
+  - '`cargo test` passes, including the policy units, approve/deny integration tests, the persisted pause/restart/resume
+    test, and the unchanged 0.1.0–0.3.0 suite.'
+  - '`cargo clippy --all-targets` reports zero warnings.'
+  - '`cargo publish --dry-run` succeeds with complete crate metadata for 0.4.0.'
+  - README and crate docs document policy construction, the approval decisions, the sensitive-action classes,
+    and the permissive default, with a runnable example.
+  - README documents the recommended layering convention (user base, project layer, app overlay) and states
+    that the crate composes a stack it is handed rather than discovering files, so an adopting app knows
+    what is its responsibility.
+  - An example binary (as `examples/edit_repo` did for 0.3.0) drives one live run under a restrictive
+    policy showing a refusal and an approval end to end.
+  files:
+  - src/lib.rs
+  - README.md
+  - Cargo.toml
+  - examples/policy_run.rs
+  evidence:
+  - cargo test — 76 passed, 0 failed (48 unit + 9 edit_file + 3 multi_file + 1 parity + 14 policy + 1
+    doctest). The 0.1.0-0.3.0 suite is unchanged and green.
+  - cargo clippy --all-targets — 0 warnings, 0 errors.
+  - cargo publish --dry-run --allow-dirty — Packaged 40 files, 277.6KiB (73.4KiB compressed), verify-compiled
+    io-harness v0.4.0, upload aborted (dry run).
+  - Cargo.toml bumped to 0.4.0 with an updated description; no new dependency was added for this release
+    (Approver is object-safe via a boxed DecisionFuture rather than async-trait), and tokio's `sync` feature
+    was pinned explicitly in dev-dependencies where it had been relying on another crate's feature unification.
+  - 'README gained a ''Permissions and approval (v0.4)'' section: policy construction, the deny-first
+    tier table, the approver with all three decisions, deferring across processes, and the recommended
+    user-base/project/app layering convention with an explicit statement that the crate composes a stack
+    it is handed rather than discovering files.'
+  - Crate docs (src/lib.rs) updated with the 0.4 paragraph and a run_with + Policy example; doctest passes.
+  - examples/policy_run.rs builds and drives a live run under a restrictive policy, printing refusals
+    and approvals from the trace.
+  - CHANGELOG.md 0.4.0 section written, including the permissive-default trade-off under Security.
+  - 'Backward compatibility: run() and resume() keep their 0.3.0 signatures and delegate through Policy::permissive;
+    tests/policy.rs a_run_with_no_policy_behaves_exactly_as_0_3_0_did and the untouched edit_file/multi_file/parity
+    suites are the proof.'
+  - cargo test — 78 passed, 0 failed after the final two tests (a_slow_approver_keeps_the_whole_run_waiting_and_it_then_completes,
+    refusal_and_decision_records_never_carry_file_contents).
+  - 'LIVE RUN, cargo run --example policy_run against OpenRouter (openai/gpt-5.6-luna): outcome Success{steps:4};
+    trace shows ''refused step 2 read secrets/key.txt (rule secrets/* in layer example)'' and ''approve
+    step 4 write src/a.rs'' + ''approve step 4 write src/b.rs''; the secret file still reads do-not-touch.
+    One live run showing a refusal and an approval end to end.'
+  - 'FINDING from the live run: with no guidance, the model retried the denied read on steps 2, 4, 7,
+    and 8 and exhausted the step budget without doing the work (StepCapReached). The step cap bounded
+    it as designed, but the run was wasted. This is the risk the contract logged (''refusal-as-tool-result
+    lets the model spend the whole step budget retrying a denied action''), confirmed against a real model.
+    Mitigated in the example with a TaskContract constraint telling the model not to retry refused actions;
+    with it the same task reaches Success{steps:4}. A repeated-refusal early stop remains the contract''s
+    named follow-up.'

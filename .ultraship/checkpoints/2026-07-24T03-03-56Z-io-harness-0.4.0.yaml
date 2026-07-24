@@ -1,0 +1,104 @@
+product: io-harness
+version: 0.4.0
+timestamp: '2026-07-24T03:03:56Z'
+reason: capacity
+repository_state: passing
+completed_acceptance:
+- Given a policy that allows writes under `src/**` and denies `secrets/**`, a workspace run that attempts
+  to write `secrets/key.txt` does not modify that file, receives a typed refusal as its tool result, and
+  still completes its in-policy edits to a verified success.
+- Deny beats allow — a path matched by both an allow glob and a deny glob is refused.
+- '`grep`, `find`, and `read_file` return no results from paths outside the read allow list, so a denied
+  path cannot be exfiltrated into the model''s context.'
+- Path rules are evaluated on the resolved canonical path, so `..` traversal cannot reach outside the
+  allow list.
+- A deny rule matches when either the symlink's own path or its resolved target matches, so a symlink
+  inside the allow list pointing at a denied path is refused — following Claude Code's symlink rule, where
+  a link in an allowed directory pointing at `~/.ssh/id_rsa` is blocked.
+- A sensitive action reaches the `Approver`, but an out-of-policy action does not — a refusal is returned
+  without the approver being consulted, and a test asserts the approver was never called for it.
+- A sensitive action with an `ApproveAll` approver proceeds; the identical run with `DenyAll` does not
+  perform the action and stops with a distinct outcome.
+- An `Approver` returning `Defer` stops the run with `RunOutcome::AwaitingApproval { request_id }` and
+  the pending action is readable from the store after the process that created it has ended.
+- An `Approver` that does not resolve immediately keeps the run paused rather than timing out — a test
+  holds the decision across an await and the run continues correctly once it resolves.
+- Reads inside the allow list proceed without consulting the approver, while every write consults it —
+  including an overwrite of a file the path rules already allow.
+- A read of `.env` inside the workspace is denied under the default policy even though the surrounding
+  directory is readable.
+- A `Policy` round-trips through serde — serialize, deserialize, and the result enforces identically to
+  the original, proven by running the same refusal test against both.
+- A deny in a base layer is not re-allowed by an overlay that allows the same path — the merged policy
+  still refuses, and a test asserts this specifically, since it is the rule that makes a shared base trustworthy.
+- An allow present only in an overlay grants that capability in the merged policy, so an app can extend
+  a shared base without editing it.
+- Merging is deterministic and order-explicit — the same stack of layers always produces the same effective
+  policy, and merging a layer with itself changes nothing.
+- An empty or absent overlay leaves the base policy unchanged, so an app that ships no config of its own
+  still gets the shared base intact.
+- '`Policy::explain(path)` returns the same decision the tool layer would enforce for that path, proven
+  by a test that asserts the two agree across allowed, denied, and sensitive paths — an explain that can
+  disagree with enforcement is worse than none.'
+- '`Policy::explain` names the layer responsible, so a path denied by a base layer is explainable without
+  running the agent.'
+- An approver that approves with a modified action causes the modified action to run, and the trace shows
+  both the requested and the performed form.
+- An approver that rewrites an action onto a denied path does not cause that action to run — the modified
+  action is refused by the policy exactly as the original would have been.
+- An approver that approves and remembers a rule stops being consulted for later actions matching that
+  rule within the same run, and the trace marks those actions as auto-approved by the remembered rule.
+- A remembered allow does not override a base-layer deny — remembering a rule that conflicts with a deny
+  leaves the deny in force.
+- Remembered rules are readable from `RunResult` after the run, so a caller can persist them; the crate
+  itself writes no config file.
+- '`Approver` can be held as `Box<dyn Approver>` and used from a non-terminal caller, proven by a test
+  approver backed by a channel rather than stdin.'
+- The rusqlite trace records each refusal with the action, the target path or command, the rule that refused
+  it, and which layer that rule came from, and each decision with its approve/deny value and its source.
+- A refusal caused by a base layer is attributable to that layer in the trace, so a user whose own app
+  config does not mention the path can still find out what refused it.
+- A 0.3.0 workspace run constructed without any policy still reaches the same verified success it did
+  in 0.3.0, because the default policy applied when none is passed is permissive.
+- A refused action consumes a step — a run whose model repeatedly requests a denied write stops at `StepCapReached`
+  rather than looping, and the trace shows one refusal record per consumed step.
+- Enforcement lives in the tool and verification layers, never only in the system prompt — a test asserts
+  refusal holds when the model requests an out-of-policy action directly.
+- No provider-specific type appears in the policy, approval, or trace API; the provider-agnostic surface
+  is preserved.
+- The default policy applied when a caller passes none is permissive, preserving 0.3.0 behaviour — the
+  boundary is opt-in. This is a decided trade-off, not an oversight, and the README states plainly that
+  a caller who constructs no policy gets no enforcement.
+- Refusal and decision records never log file contents or API keys — path, command, rule, and decision
+  only.
+- '`Approver` is `Send + Sync` and awaited without blocking the tokio runtime.'
+remaining_acceptance:
+- Verification refuses to spawn a binary absent from the command allow list, and the refusal is distinguishable
+  in the result from a verification that ran and failed.
+- '`resume_with_decision` with an approval performs the pending action and continues the run to a verified
+  success under the original `run_id`; with a denial it does not perform the action and closes the run.'
+- Policy, `Approver`, `Decision`, and `resume_with_decision` are part of the documented public API under
+  SemVer; existing 0.3.0 callers still compile, or a documented migration is provided.
+- The command policy gates the binary name; the trace records the full argv of every spawn, so argument-level
+  enforcement can be added in 0.6.0 against a recorded baseline rather than a guess.
+- '`cargo test` passes, including the policy units, approve/deny integration tests, the persisted pause/restart/resume
+  test, and the unchanged 0.1.0–0.3.0 suite.'
+- '`cargo clippy --all-targets` reports zero warnings.'
+- '`cargo publish --dry-run` succeeds with complete crate metadata for 0.4.0.'
+- README and crate docs document policy construction, the approval decisions, the sensitive-action classes,
+  and the permissive default, with a runnable example.
+- README documents the recommended layering convention (user base, project layer, app overlay) and states
+  that the crate composes a stack it is handed rather than discovering files, so an adopting app knows
+  what is its responsibility.
+- An example binary (as `examples/edit_repo` did for 0.3.0) drives one live run under a restrictive policy
+  showing a refusal and an approval end to end.
+active_hypotheses: []
+next_task: US-IO-HARNESS-0.4.0-T04
+required_context:
+- src/policy.rs
+- src/approve.rs
+- src/run.rs
+- src/tools/workspace.rs
+- src/state.rs
+- src/verify.rs
+- tests/policy.rs
