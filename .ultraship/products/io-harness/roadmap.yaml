@@ -62,7 +62,7 @@ versions:
       caps, network denied) that compiles and runs on all three, so the same harness isolates code
       the same way on mac, linux, and windows.
     detail: specified
-    status: planned
+    status: released
   - version: 0.7.0
     outcome: >
       A developer starts a task and leaves it: the harness runs unattended for 24h+ with no user

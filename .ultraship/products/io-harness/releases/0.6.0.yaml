@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.6.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -438,3 +438,117 @@ open_questions:
     namespace-level net boundary? Proposed: document it honestly as best-effort (env strip + no
     configured proxy) on those backends versus hard denial on Linux, and treat a real per-host egress
     boundary as 0.8.0 work, not a 0.6.0 claim.
+released_at: '2026-07-24T18:05:00Z'
+mode: published
+delivered: >
+  Every command the verification gate runs — the `rustc` compile and the produced test binary, run on
+  the host since 0.2.0 — now executes inside an ephemeral, per-run sandbox, so model-produced code no
+  longer runs on the host directly. One OS-neutral `Sandbox` trait (RPITIT, no OS type in its
+  signature) routes the exec, with a real native backend per platform over a portable floor that runs
+  everywhere; `select` picks the strongest available and records which ran. macOS `sandbox-exec` is
+  live-run (profile confines writes to the workdir and denies network; RLIMIT_CPU caps CPU and an RSS
+  monitor caps memory, since macOS does not enforce address-space rlimits); Linux namespaces
+  (user/mount/pid/net) and Windows Job Objects are cfg-gated, compiled, and unit-tested on the macOS
+  host but not live-run. `SandboxLimits` caps CPU (SIGXCPU), memory (RSS poll-and-kill), and
+  wall-clock, killing rather than throttling and returning a typed `Cap` hit. Network is denied by
+  default (egress allow-list deferred to 0.8.0). The workdir is torn down on every exit path and the
+  child is kill-on-drop, so nothing leaks; produced files copy back only where the 0.4.0 write policy
+  allows. An additive rusqlite `sandbox_events` table records create/exec+backend/cap_hit/destroy,
+  reconstructable from a reopened store, and a 0.5.0 database migrates in place. Sandboxing is the new
+  default for the gate and transparent to it; a caller opts out with `ExecGuard::no_sandbox()` for the
+  exact 0.5.0 direct path, and in a 0.5.0 tree each child is sandboxed. A sandbox start failure is a
+  typed `Error::Sandbox`, so one failed child never takes down its siblings. Built, tested,
+  documented, packaged, and PUBLISHED to crates.io (v0.6.0 resolves), tagged as the git Release
+  `io-harness 0.6.0` — the first release taken all the way to published.
+evidence:
+  tests:
+    - >-
+      cargo test — 120 passed, 0 failed (71 lib + 9 edit_file + 3 multi_file + 1 parity + 17 policy +
+      8 sandbox + 10 subagents + 1 doctest). The unchanged 0.1.0–0.5.0 suite is green with the sandbox
+      default on, proving isolation is transparent to verification.
+    - >-
+      tests/sandbox.rs (8): selection_picks_native_on_this_host_and_floor_when_forced,
+      sandbox_on_reaches_the_same_verified_success_as_direct,
+      sandbox_on_runs_the_produced_test_binary_transparently,
+      the_selected_backend_denies_outbound_network_by_default (real curl blocked by macOS native),
+      a_gate_run_leaves_no_workdir_behind, sandbox_lifecycle_is_recorded_and_reconstructable,
+      a_cap_hit_in_the_gate_is_recorded, a_sandbox_that_cannot_start_returns_a_typed_failure.
+    - >-
+      CPU + memory cap kills (sandbox::tests::cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap,
+      ::memory_cap_kills_a_heap_hog_and_names_the_memory_cap), copy-back-under-policy, teardown-on-drop,
+      serde round-trip, and the Linux/Windows backend unit tests (linux::tests net-namespace argv,
+      windows::tests JobLimits mapping) all pass on the macOS host.
+    - 'Full output: .ultraship/products/io-harness/evidence/0.6.0/tests.txt (gitignored)'
+  builds:
+    - cargo clippy --all-targets — 0 warnings, 0 errors.
+    - cargo build --release — Finished release profile, exit 0.
+    - >-
+      cargo publish --dry-run — Packaged 49 files, 421.4KiB (112.1KiB compressed), verify-compiled
+      io-harness v0.6.0.
+    - 'Full output: .ultraship/products/io-harness/evidence/0.6.0/builds.txt (gitignored)'
+  reviews: []
+  deployments:
+    - >-
+      cargo publish — Uploaded and Published io-harness v0.6.0 to registry crates-io. Resolves:
+      crates.io max_version 0.6.0; `cargo search io-harness` → io-harness = "0.6.0".
+    - >-
+      git Release — tag v0.6.0 pushed and GitHub Release "io-harness 0.6.0" created against main,
+      notes taken verbatim from CHANGELOG [0.6.0]. Sequence: git Release first, then cargo publish.
+  health_checks:
+    - >-
+      LIVE RUN, cargo run --example sandbox_run against OpenRouter (openai/gpt-5.6-luna): outcome
+      Success{steps:1}; selected backend macos-sandbox-exec; sandbox trace create → exec (rustc argv)
+      → destroy recorded; a runaway hit Cap::Cpu (killed, not hung); outbound network denied under
+      default-deny; every workdir torn down. Evidence: evidence/0.6.0/live_run.txt (gitignored).
+    - >-
+      Secrets gate: .env is gitignored (.gitignore:10) and untracked; no .env/.pem/.key in the packaged
+      crate (.env.example is placeholder-only); the sk-or-/sk-ant- matches in examples are placeholders
+      in doc comments, not real keys. Evidence: evidence/0.6.0/gates.txt.
+    - >-
+      Excluded-scope gate: grep over src found no network egress allow-list (only doc-comment deferral
+      references), no daemon/listen/bind, and no docker/firecracker/gvisor/container code — the sandbox
+      is in-process on the host, per product.yaml. Evidence: evidence/0.6.0/gates.txt.
+known_limitations:
+  - >-
+    The Linux (namespaces + seccomp) and Windows (Job Object + restricted token) native backends are
+    compiled and unit-tested on the macOS build host but NOT live-run on real Linux/Windows hardware.
+    A full target-triple cross-check is additionally blocked only by rusqlite's bundled-C cross
+    toolchain (an environment limit, not a limit of the sandbox code). The portable floor is real on
+    all three OSes, so isolation is never absent — but the native backends' runtime behaviour on their
+    own OS is unverified here.
+  - >-
+    macOS does not enforce address-space rlimits (RLIMIT_AS/RLIMIT_DATA — verified empirically), so the
+    memory cap is an RSS poll-and-kill monitor (~40ms sampling), not a hard kernel limit; a very fast
+    allocation spike could briefly exceed the cap before the monitor kills it.
+  - >-
+    RLIMIT_NPROC is deliberately NOT applied by the portable floor — it is per-real-uid, not
+    per-sandbox, so capping it there would throttle the operator's whole login session. Per-sandbox
+    process-count limiting exists only in the native pid-namespace (Linux) and Job-Object (Windows)
+    backends.
+  - >-
+    Network is deny-by-default only. A configurable egress allow-list (letting a run reach a named
+    host) is 0.8.0. On the portable floor and the Windows backend, "network denied" is best-effort
+    (proxy env stripped), not a kernel boundary; Linux (net namespace) and macOS (sandbox-exec profile)
+    deny for real.
+  - >-
+    The portable floor is the weakest backend by design — filesystem-scoped (a fresh ephemeral workdir)
+    and resource-capped, NOT a full syscall jail. It is the guaranteed-present minimum, not a
+    substitute for a native backend where one exists.
+  - >-
+    Isolation is in-process on one host using OS-native primitives and a portable floor — no container,
+    microVM (firecracker/gVisor), or remote/multi-machine sandbox, per product.yaml (local, single-user,
+    embeddable library).
+  - >-
+    The Windows Job Object backend maps SandboxLimits to Job-Object fields (unit-tested) but the actual
+    Job-Object syscall enforcement is not exercised here; on Windows the backend currently provides
+    wall-clock capping, output capture, and kill-on-drop via the shared path, with full Job-Object
+    enforcement to be verified when live-run.
+  - >-
+    T08 sibling-independence test gap (accepted by owner): "a child sandbox start-failure does not take
+    down siblings" is proven indirectly (typed Error::Sandbox start-failure unit test + run_tree's
+    existing child-error isolation shown by the subagents suite), with no single tree+start-failure
+    injection test, because making one child's rustc unspawnable is not reachable through the public
+    API.
+supersedes: null
+next_recommended_version: 0.7.0
+immutable: true
