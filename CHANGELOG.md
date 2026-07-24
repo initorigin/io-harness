@@ -26,6 +26,61 @@ notes are produced from it.
 
 ### Security
 
+## [0.7.0] - 2026-07-25
+
+Durable, unattended runs. A run can be left alone for a long horizon and survive
+a crash or a full process restart: after every completed step the harness commits
+that step and a checkpoint marker in one rusqlite transaction, and on restart it
+resumes every agent — a single run or a whole 0.5.0 tree — from its own last
+committed step, without re-running finished work, double-charging the budget, or
+re-applying an edit already made.
+
+### Added
+
+- **Durable step-level checkpoint.** After every completed step, the step's trace
+  row and a `checkpoint` event are written in one rusqlite transaction, so the
+  committed checkpoint *is* the step's completion marker: a crash leaves either a
+  whole step or none of it, never a torn half recorded as done. Backed by an
+  additive `checkpoint_events` table and a `PRAGMA user_version` format stamp; a
+  0.6.0 database migrates in place.
+- **Whole-tree resume — `resume_tree`.** Reconstructs a crashed 0.5.0 tree from
+  the store (parent/child edges, shared workspace, shared trace) and re-drives
+  every unfinished agent from its own checkpoint. On replay a parent *adopts* the
+  children it had already spawned — keyed by (parent, step, goal) and persisted in
+  a new `spawns` table — and resumes each from its own last step instead of
+  duplicating it.
+- **Durable aggregate budget.** The shared `Ledger` is restored on resume from the
+  tree's durable totals (`Ledger::from_state`), so a resumed run draws against one
+  continuous ceiling rather than a reset one. The time budget counts real
+  wall-clock elapsed across the downtime (from a stored `started_at`), not just the
+  current process's uptime.
+- **`RunStatus` + `Store::run_status`.** A durable `running` / `paused` /
+  `completed` / `failed` status, so a caller can tell a crashed run (still
+  `running`, the resume target) from one paused for a human or already finished.
+- **Approval across a full restart — `resume_tree_with_decision`.** A 0.4.0
+  sensitive action that pauses a tree now survives the process exiting entirely; a
+  fresh process delivers the decision and resumes the whole tree from the persisted
+  pending action.
+- **`Error::Resume`.** A resume against a newer-format or missing checkpoint returns
+  a typed error the caller handles — never a panic and never a silent half-resume.
+- **`examples/durable_run.rs`.** A live unattended run against OpenRouter that is
+  killed mid-run and resumed in a fresh process to a verified result.
+
+### Changed
+
+- **Checkpointing is on by default and is idempotent.** A completed step is skipped
+  on resume (recorded as a `skipped` event), an irreversible edit is re-observed
+  rather than repeated, and re-running a resume is a no-op. Ephemeral 0.6.0
+  sandboxes are never checkpointed — an exec in flight at crash time simply re-runs
+  in a fresh sandbox. Existing 0.6.0 callers compile unchanged and reach the same
+  verified result.
+
+### Security
+
+- **A run can now be left unattended safely.** The whole tree pauses for a human
+  only when the policy demands and continues once a decision arrives, even across a
+  restart; nothing about a crashed run is lost or silently re-executed.
+
 ## [0.6.0] - 2026-07-24
 
 Execution sandbox. Every command the verification gate runs — the `rustc`

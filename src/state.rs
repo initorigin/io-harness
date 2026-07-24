@@ -8,12 +8,92 @@
 
 use rusqlite::Connection;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+/// The checkpoint layout version stamped into `PRAGMA user_version`. Bump when
+/// the on-disk checkpoint format changes incompatibly. A store whose version is
+/// higher than this is from a newer binary and is refused on resume.
+pub const CHECKPOINT_FORMAT: i64 = 7;
+
+/// The durable lifecycle status of a run, so a caller can tell a crashed run
+/// (still `Running`) from one paused for a human (`Paused`) or finished
+/// (`Completed`). OS- and rusqlite-free, so it is safe in the public API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    /// The run is in progress — or was, until the process died mid-loop. A
+    /// `Running` run found in a store is the resume target.
+    Running,
+    /// The run paused for a human decision and can be resumed once it arrives.
+    Paused,
+    /// The run finished (with success or a terminal budget/deny outcome).
+    Completed,
+    /// The run ended in an error.
+    Failed,
+}
+
+impl RunStatus {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "paused" => RunStatus::Paused,
+            "completed" => RunStatus::Completed,
+            "failed" => RunStatus::Failed,
+            _ => RunStatus::Running,
+        }
+    }
+}
+
+/// A persisted spawned-child contract, enough to rebuild and resume that exact
+/// child on a tree resume rather than spawning a duplicate.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpawnRow {
+    /// The child run id already allocated for this spawn.
+    pub child_run_id: i64,
+    /// The child's goal.
+    pub goal: String,
+    /// The workspace-relative file the child's verification reads.
+    pub verify_file: String,
+    /// The substring the child's verification requires.
+    pub needle: String,
+    /// The child's step cap, if the parent set one.
+    pub max_steps: Option<u32>,
+    /// JSON array of `deny_write` globs the parent narrowed the child with.
+    pub deny_write: String,
+}
 
 /// A persisted run store. Use [`Store::open`] for a file, or [`Store::memory`]
 /// for an ephemeral in-memory database.
 pub struct Store {
     conn: Connection,
+}
+
+/// One durable checkpoint-lifecycle event: a step was checkpointed, a run was
+/// resumed, or an already-committed step was skipped on resume. Together they
+/// make a crashed-and-resumed run's history reconstructable from the store.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckpointEvent {
+    /// The run this event belongs to.
+    pub run_id: i64,
+    /// The step it concerns.
+    pub step: u32,
+    /// `"checkpoint"`, `"resume"`, or `"skipped"`.
+    pub kind: String,
+    /// Optional human-readable detail (never file contents or secrets).
+    pub detail: Option<String>,
+}
+
+impl CheckpointEvent {
+    /// A step was durably checkpointed.
+    pub fn checkpoint(run_id: i64, step: u32) -> Self {
+        Self { run_id, step, kind: "checkpoint".into(), detail: None }
+    }
+    /// A run was resumed, re-driving from `step`.
+    pub fn resume(run_id: i64, step: u32, detail: impl Into<String>) -> Self {
+        Self { run_id, step, kind: "resume".into(), detail: Some(detail.into()) }
+    }
+    /// An already-committed step was skipped on resume.
+    pub fn skipped(run_id: i64, step: u32) -> Self {
+        Self { run_id, step, kind: "skipped".into(), detail: None }
+    }
 }
 
 /// One recorded loop step — the full trace entry, as written and read back.
@@ -377,6 +457,45 @@ impl Store {
              );",
         )?;
 
+        // 0.7.0: durable checkpoint + resume. `runs` gains a resumable status and
+        // a start timestamp so wall-clock elapsed survives a restart; a new table
+        // records checkpoint / resume / step-skipped events so a multi-crash run's
+        // history is reconstructable from the store alone. All additive — a 0.6.0
+        // database gains the columns/table and a 0.6.0 binary still reads it.
+        let _ =
+            conn.execute("ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'running'", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN started_at TEXT", []);
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS checkpoint_events (
+                 id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id INTEGER NOT NULL,
+                 step   INTEGER NOT NULL,
+                 kind   TEXT NOT NULL,
+                 detail TEXT
+             );
+             CREATE TABLE IF NOT EXISTS spawns (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 parent_run_id INTEGER NOT NULL,
+                 step          INTEGER NOT NULL,
+                 child_run_id  INTEGER NOT NULL,
+                 goal          TEXT NOT NULL,
+                 verify_file   TEXT NOT NULL,
+                 needle        TEXT NOT NULL,
+                 max_steps     INTEGER,
+                 deny_write    TEXT NOT NULL DEFAULT '[]'
+             );",
+        )?;
+
+        // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
+        // back 0; we bump it to the current format. A database written by a NEWER
+        // format reads back a higher number and [`Store::check_resumable`] refuses
+        // it with a typed [`Error::Resume`] rather than resuming a layout it does
+        // not understand.
+        let format: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if format < CHECKPOINT_FORMAT {
+            conn.execute_batch(&format!("PRAGMA user_version = {CHECKPOINT_FORMAT}"))?;
+        }
+
         Ok(Self { conn })
     }
 
@@ -470,10 +589,15 @@ impl Store {
         Ok(())
     }
 
-    /// Start a run row; returns its id.
+    /// Start a run row; returns its id. Stamps `started_at` (UTC, from SQLite's
+    /// clock) so a 24h wall-clock budget survives a restart, and marks the run
+    /// `running`.
     pub fn start_run(&self, goal: &str, file: &str) -> Result<i64> {
-        self.conn
-            .execute("INSERT INTO runs (goal, file) VALUES (?1, ?2)", (goal, file))?;
+        self.conn.execute(
+            "INSERT INTO runs (goal, file, status, started_at)
+             VALUES (?1, ?2, 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
+            (goal, file),
+        )?;
         Ok(self.conn.last_insert_rowid())
     }
 
@@ -487,7 +611,8 @@ impl Store {
         depth: u32,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO runs (goal, file, parent_run_id, depth) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO runs (goal, file, parent_run_id, depth, status, started_at)
+             VALUES (?1, ?2, ?3, ?4, 'running', strftime('%Y-%m-%dT%H:%M:%fZ','now'))",
             (goal, file, parent_run_id, depth),
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -603,6 +728,233 @@ impl Store {
         Ok(())
     }
 
+    /// Durably checkpoint one completed step: the step's trace row and its
+    /// checkpoint event are written in a single transaction, so a crash leaves
+    /// either both (the step is done) or neither (it replays) — never a torn
+    /// half. The committed checkpoint is the step's completion marker.
+    pub fn checkpoint_step(&self, run_id: i64, step: &StepRecord) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO steps (run_id, step, decision, result, prompt, tool_call, tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                run_id,
+                step.step,
+                &step.decision,
+                &step.result,
+                &step.prompt,
+                &step.tool_call,
+                step.tokens,
+            ),
+        )?;
+        tx.execute(
+            "INSERT INTO checkpoint_events (run_id, step, kind, detail)
+             VALUES (?1, ?2, 'checkpoint', NULL)",
+            (run_id, step.step),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record a checkpoint/resume/skipped event on its own (not tied to a step
+    /// commit) — used for resume and skip markers.
+    pub fn record_checkpoint_event(&self, e: &CheckpointEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO checkpoint_events (run_id, step, kind, detail) VALUES (?1, ?2, ?3, ?4)",
+            (e.run_id, e.step, &e.kind, &e.detail),
+        )?;
+        Ok(())
+    }
+
+    /// Every checkpoint-lifecycle event recorded for a run, in order.
+    pub fn checkpoint_events(&self, run_id: i64) -> Result<Vec<CheckpointEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, step, kind, detail
+             FROM checkpoint_events WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(CheckpointEvent {
+                run_id: r.get(0)?,
+                step: r.get::<_, i64>(1)? as u32,
+                kind: r.get(2)?,
+                detail: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Set the durable run status (`running`, `paused`, `completed`, `failed`).
+    pub fn set_status(&self, run_id: i64, status: &str) -> Result<()> {
+        self.conn
+            .execute("UPDATE runs SET status = ?1 WHERE id = ?2", (status, run_id))?;
+        Ok(())
+    }
+
+    /// The durable run status, if the run exists.
+    pub fn status(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT status FROM runs WHERE id = ?1", [run_id], |r| {
+                r.get(0)
+            })
+            .ok())
+    }
+
+    /// Real wall-clock seconds elapsed since the run's `started_at`, from the
+    /// database clock — so a budget over duration counts time that passed while
+    /// the process was down, not just this process's uptime. Zero if the run has
+    /// no start stamp (a pre-0.7.0 run).
+    pub fn elapsed_secs(&self, run_id: i64) -> Result<f64> {
+        let secs: Option<f64> = self.conn.query_row(
+            "SELECT (julianday('now') - julianday(started_at)) * 86400.0
+             FROM runs WHERE id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        Ok(secs.unwrap_or(0.0).max(0.0))
+    }
+
+    /// Total tokens recorded across this run's steps — the durable spend, so a
+    /// resume restores the token budget instead of restarting it at zero.
+    pub fn spent_tokens(&self, run_id: i64) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COALESCE(SUM(tokens), 0) FROM steps WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Every run id in the tree rooted at `root` (the root plus all descendants),
+    /// via the `parent_run_id` edge — the set a tree-level resume re-drives.
+    pub fn tree_run_ids(&self, root: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT id FROM tree ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([root], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Total tokens spent across the whole tree rooted at `root` — the durable
+    /// aggregate-ledger spend restored on a tree resume.
+    pub fn spent_tokens_tree(&self, root: i64) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT COALESCE(SUM(s.tokens), 0)
+             FROM steps s JOIN tree ON s.run_id = tree.id",
+            [root],
+            |r| r.get(0),
+        )?;
+        Ok(n as u64)
+    }
+
+    /// Number of agents (run rows) in the tree rooted at `root` — the durable
+    /// agent count restored on a tree resume.
+    pub fn agent_count_tree(&self, root: i64) -> Result<u32> {
+        let n: i64 = self.conn.query_row(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT COUNT(*) FROM tree",
+            [root],
+            |r| r.get(0),
+        )?;
+        Ok(n as u32)
+    }
+
+    /// Persist a spawned child's contract so a crashed tree can rebuild and
+    /// resume that exact child on resume instead of spawning a duplicate. Keyed
+    /// by (parent, step, goal) so a replayed spawn step adopts the existing child.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_spawn(
+        &self,
+        parent_run_id: i64,
+        step: u32,
+        child_run_id: i64,
+        goal: &str,
+        verify_file: &str,
+        needle: &str,
+        max_steps: Option<u32>,
+        deny_write_json: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO spawns
+                 (parent_run_id, step, child_run_id, goal, verify_file, needle, max_steps, deny_write)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                parent_run_id,
+                step,
+                child_run_id,
+                goal,
+                verify_file,
+                needle,
+                max_steps,
+                deny_write_json,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Find the child spawned by `parent_run_id` at `step` for `goal`, if any —
+    /// the adopt-on-resume lookup that makes a replayed spawn step idempotent.
+    pub fn find_spawn(&self, parent_run_id: i64, step: u32, goal: &str) -> Result<Option<SpawnRow>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT child_run_id, goal, verify_file, needle, max_steps, deny_write
+                 FROM spawns WHERE parent_run_id = ?1 AND step = ?2 AND goal = ?3
+                 ORDER BY id ASC LIMIT 1",
+                (parent_run_id, step, goal),
+                |r| {
+                    Ok(SpawnRow {
+                        child_run_id: r.get(0)?,
+                        goal: r.get(1)?,
+                        verify_file: r.get(2)?,
+                        needle: r.get(3)?,
+                        max_steps: r.get::<_, Option<i64>>(4)?.map(|n| n as u32),
+                        deny_write: r.get(5)?,
+                    })
+                },
+            )
+            .ok())
+    }
+
+    /// Check a run can be resumed from its checkpoint, or return a typed
+    /// [`Error::Resume`]. Refuses a store written by a newer checkpoint format
+    /// (rather than misreading a layout it does not understand) and a run id that
+    /// does not exist. An already-`completed` run is resumable as a no-op, so it
+    /// is not refused here.
+    pub fn check_resumable(&self, run_id: i64) -> Result<()> {
+        let format: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if format > CHECKPOINT_FORMAT {
+            return Err(Error::Resume {
+                reason: format!(
+                    "checkpoint format {format} is newer than supported {CHECKPOINT_FORMAT}; \
+                     upgrade io-harness to resume this run"
+                ),
+            });
+        }
+        let exists: bool = self
+            .conn
+            .query_row("SELECT 1 FROM runs WHERE id = ?1", [run_id], |_| Ok(true))
+            .unwrap_or(false);
+        if !exists {
+            return Err(Error::Resume { reason: format!("no run with id {run_id} in the store") });
+        }
+        Ok(())
+    }
+
     /// Record which provider ran this run, for the audit trace.
     pub fn set_provider(&self, run_id: i64, provider: &str) -> Result<()> {
         self.conn.execute(
@@ -621,11 +973,37 @@ impl Store {
             })?)
     }
 
-    /// Record the run's final outcome.
+    /// Record the run's final outcome, and derive the durable status from it:
+    /// `success` completes the run, `awaiting_approval` pauses it, any other
+    /// terminal outcome completes it (finished, just not with success). A run
+    /// that crashed mid-loop never reaches here, so it stays `running` and is
+    /// resumable.
     pub fn finish_run(&self, run_id: i64, outcome: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE runs SET outcome = ?1 WHERE id = ?2", (outcome, run_id))?;
+        let status = match outcome {
+            "awaiting_approval" => "paused",
+            _ => "completed",
+        };
+        self.conn.execute(
+            "UPDATE runs SET outcome = ?1, status = ?2 WHERE id = ?3",
+            (outcome, status, run_id),
+        )?;
         Ok(())
+    }
+
+    /// The recorded final outcome string of a run, if it has finished.
+    pub fn outcome(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT outcome FROM runs WHERE id = ?1", [run_id], |r| {
+                r.get(0)
+            })
+            .ok()
+            .flatten())
+    }
+
+    /// The durable run status as a typed [`RunStatus`], if the run exists.
+    pub fn run_status(&self, run_id: i64) -> Result<Option<RunStatus>> {
+        Ok(self.status(run_id)?.map(|s| RunStatus::from_str(&s)))
     }
 
     /// The highest step number recorded for a run, or 0 if none — the resume
@@ -925,5 +1303,122 @@ mod tests {
         assert_eq!(store.provider(1).unwrap(), None);
         store.set_provider(1, "openai").unwrap();
         assert_eq!(store.provider(1).unwrap().as_deref(), Some("openai"));
+    }
+
+    // ---- 0.7.0: durable checkpoint + resume ----
+
+    #[test]
+    fn checkpoint_step_commits_the_step_and_its_event_together() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store.checkpoint_step(run, &StepRecord::new(1, "act", "ok")).unwrap();
+        store.checkpoint_step(run, &StepRecord::new(2, "act", "ok")).unwrap();
+
+        assert_eq!(store.last_step(run).unwrap(), 2);
+        assert_eq!(store.steps(run).unwrap().len(), 2);
+        let cps: Vec<_> = store
+            .checkpoint_events(run)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "checkpoint")
+            .collect();
+        assert_eq!(cps.len(), 2);
+        // NF4: a checkpoint event carries no file content — only step metadata.
+        assert!(cps.iter().all(|e| e.detail.is_none()));
+    }
+
+    #[test]
+    fn a_rolled_back_step_leaves_the_prior_checkpoint_intact() {
+        // The committed checkpoint is the completion marker: a step whose
+        // transaction never commits (a crash mid-commit) vanishes entirely and
+        // the prior checkpoint stands — never a torn half recorded as done.
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store.checkpoint_step(run, &StepRecord::new(1, "act", "ok")).unwrap();
+
+        // Simulate a crash mid-commit: open the step's transaction, write both
+        // rows, then drop without committing (as a killed process would).
+        {
+            let tx = store.conn.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO steps (run_id, step, decision, result) VALUES (?1, 2, 'act', 'ok')",
+                [run],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO checkpoint_events (run_id, step, kind) VALUES (?1, 2, 'checkpoint')",
+                [run],
+            )
+            .unwrap();
+            // no tx.commit() — dropped here, rolling back.
+        }
+
+        assert_eq!(store.last_step(run).unwrap(), 1, "the torn step must not survive");
+        assert_eq!(store.steps(run).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn check_resumable_refuses_a_newer_format_and_a_missing_run() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        assert!(store.check_resumable(run).is_ok());
+
+        // A run id that does not exist is a typed Resume error, not a panic.
+        assert!(matches!(store.check_resumable(9999), Err(Error::Resume { .. })));
+
+        // A store written by a newer checkpoint format is refused rather than
+        // misread.
+        store
+            .conn
+            .execute_batch(&format!("PRAGMA user_version = {}", CHECKPOINT_FORMAT + 1))
+            .unwrap();
+        assert!(matches!(store.check_resumable(run), Err(Error::Resume { .. })));
+    }
+
+    #[test]
+    fn spent_tokens_and_elapsed_are_durable_reads() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .checkpoint_step(run, &StepRecord::new(1, "a", "ok").with_trace("p", "t", 30))
+            .unwrap();
+        store
+            .checkpoint_step(run, &StepRecord::new(2, "a", "ok").with_trace("p", "t", 12))
+            .unwrap();
+        assert_eq!(store.spent_tokens(run).unwrap(), 42);
+        assert!(store.elapsed_secs(run).unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn tree_aggregate_reads_span_root_and_descendants() {
+        let store = Store::memory().unwrap();
+        let root = store.start_run("goal", "root").unwrap();
+        let child = store.start_child_run("sub", "root", root, 1).unwrap();
+        let grandchild = store.start_child_run("subsub", "root", child, 2).unwrap();
+        store.checkpoint_step(root, &StepRecord::new(1, "a", "ok").with_trace("p", "t", 10)).unwrap();
+        store.checkpoint_step(child, &StepRecord::new(1, "a", "ok").with_trace("p", "t", 20)).unwrap();
+        store
+            .checkpoint_step(grandchild, &StepRecord::new(1, "a", "ok").with_trace("p", "t", 5))
+            .unwrap();
+
+        assert_eq!(store.tree_run_ids(root).unwrap(), vec![root, child, grandchild]);
+        assert_eq!(store.spent_tokens_tree(root).unwrap(), 35);
+        assert_eq!(store.agent_count_tree(root).unwrap(), 3);
+    }
+
+    #[test]
+    fn status_round_trips_and_a_pre_0_7_database_migrates() {
+        // A 0.6.0-shaped database: runs without status/started_at.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE runs (id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL, file TEXT NOT NULL, outcome TEXT, provider TEXT, parent_run_id INTEGER, depth INTEGER NOT NULL DEFAULT 0);
+             INSERT INTO runs (goal, file) VALUES ('g', 'f');",
+        )
+        .unwrap();
+        let store = Store::from_conn(conn).unwrap();
+        // The old row gains a default status and no start stamp.
+        assert_eq!(store.status(1).unwrap().as_deref(), Some("running"));
+        store.set_status(1, "completed").unwrap();
+        assert_eq!(store.status(1).unwrap().as_deref(), Some("completed"));
     }
 }
