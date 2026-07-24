@@ -26,6 +26,67 @@ notes are produced from it.
 
 ### Security
 
+## [0.6.0] - 2026-07-24
+
+Execution sandbox. Every command the verification gate runs — the `rustc`
+compile and the test binary it has run since 0.2.0 — now executes inside an
+ephemeral, per-run sandbox, so model-produced code no longer runs on the host
+directly. The sandbox is OS-native and OS-neutral: one trait, a native backend
+per platform over a portable floor that runs everywhere.
+
+### Added
+
+- **`Sandbox` trait + `select`.** One OS-neutral execution abstraction (RPITIT,
+  no OS-specific type in its signature) that every external command routes
+  through. `select` picks the strongest backend available on the running OS and
+  records which ran, so an audit shows not just what code ran but how it was
+  isolated.
+- **A native backend per OS, over a portable floor.**
+  - **macOS `sandbox-exec`** — a generated profile confines filesystem writes to
+    the run's workdir and denies outbound network; `RLIMIT_CPU` caps CPU and an
+    RSS monitor caps memory (macOS does not enforce address-space rlimits). Live-run.
+  - **Linux namespaces** — user/mount/pid/**net** namespaces (a hard network
+    boundary) plus rlimits. cfg-gated; compiled and unit-tested, not live-run.
+  - **Windows Job Object** — kill-on-close plus memory / active-process / CPU
+    limits and a restricted token. cfg-gated; compiled and unit-tested, not live-run.
+  - **Portable floor** — the guaranteed minimum on every OS: fresh subprocess,
+    ephemeral workdir, resource caps, network env stripped. Deliberately the
+    weakest backend (filesystem-scoped + resource-capped, not a syscall jail).
+- **`SandboxLimits` — resource caps that kill, not throttle.** CPU time (SIGXCPU
+  via `RLIMIT_CPU`), memory (RSS poll-and-kill), and wall-clock (timeout). A breach
+  returns a typed `Cap` hit, never a hang. Serde-serializable like `Policy` and
+  `Containment` so io-cli and io-studio load it from config.
+- **Default-deny network.** Every backend denies outbound network by default,
+  enforced by the sandbox and not the prompt. A configurable egress allow-list is
+  deferred to 0.8.0.
+- **Guaranteed per-run teardown.** The workdir is a `tempfile::TempDir` removed on
+  every exit path (success, failure, cap kill), and the child is `kill_on_drop`, so
+  no directory and no orphan process leak.
+- **Policy-filtered copy-back.** Files a sandboxed command produces are copied back
+  to the task workspace only where the 0.4.0 write policy allows, so isolation
+  composes with the permission layer instead of bypassing it.
+- **Sandbox trace.** An additive rusqlite `sandbox_events` table records create,
+  the argv and backend that ran it, cap hits, and destroy — reconstructable from a
+  reopened store. A 0.5.0 database migrates in place.
+- **`examples/sandbox_run.rs`.** A live run showing a model's code compiled inside
+  the sandbox, a resource cap killing a runaway, network denied, and teardown
+  leaving nothing behind.
+
+### Changed
+
+- **Sandboxed execution is the new default for the verification gate**, and it is
+  transparent — the same code passes or fails as before. A caller who wants the
+  exact 0.5.0 direct-host execution opts it off with `ExecGuard::no_sandbox()`, so
+  the change is additive and reversible. In a 0.5.0 tree, each child's verification
+  runs in its own sandbox, so isolation stacks on top of containment.
+
+### Security
+
+- **Model-produced code no longer executes directly on the host** — the
+  "compiles locally, no isolation" limitation carried since 0.2.0 and made sharper
+  by 0.5.0's concurrent agents is closed. A sandbox that fails to start returns a
+  typed `Error::Sandbox`, so one failed child never takes down its siblings.
+
 ## [0.5.0] - 2026-07-24
 
 Sub-agent composition: a parent decomposes a task at run time and spawns
