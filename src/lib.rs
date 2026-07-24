@@ -38,6 +38,18 @@
 //! is a reconstructable graph. Sub-agents are opt-in: [`run`] and [`run_with`]
 //! never expose the spawn tool.
 //!
+//! v0.6 adds the execution [`sandbox`]. Every command the verification gate runs
+//! — the `rustc` compile and the test binary it has run since v0.2 — now executes
+//! inside an ephemeral [`Sandbox`]: an isolated workdir, resource caps that
+//! *kill* rather than throttle ([`SandboxLimits`]), outbound network denied by
+//! default, and guaranteed teardown. It is **OS-native and OS-neutral**: one
+//! trait with a native backend per platform (macOS `sandbox-exec`, Linux
+//! namespaces, Windows Job Objects) over a portable floor that runs everywhere,
+//! chosen by [`select`] and recorded in the trace. Sandboxing is the new default
+//! and is transparent to verification; a caller who wants the exact v0.5 direct
+//! execution opts it off. A configurable network egress allow-list is deferred to
+//! v0.8; v0.6 is deny-by-default only.
+//!
 //! v0.3 adds repository work: [`TaskContract::workspace`] runs a multi-tool loop
 //! where the agent greps, finds, reads, and writes several files under one root,
 //! verified together ([`Verification::WorkspaceTestPasses`]). It also adds the
@@ -74,6 +86,7 @@ mod error;
 pub mod policy;
 pub mod provider;
 mod run;
+pub mod sandbox;
 mod state;
 pub mod tools;
 mod verify;
@@ -90,5 +103,8 @@ pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprove
 pub use run::{
     resume, resume_with_decision, run, run_tree, run_with, RunOutcome, RunResult, SPAWN_TOOL,
 };
-pub use state::{Pending, PolicyEvent, StepRecord, Store};
+pub use state::{Pending, PolicyEvent, SandboxEvent, StepRecord, Store};
+pub use sandbox::{
+    copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome, Selected,
+};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

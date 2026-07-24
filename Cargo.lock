@@ -457,9 +457,10 @@ dependencies = [
 
 [[package]]
 name = "io-harness"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "futures-util",
+ "libc",
  "regex",
  "reqwest",
  "rusqlite",

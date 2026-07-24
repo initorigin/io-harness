@@ -19,6 +19,16 @@ pub enum Error {
     #[error("configuration error: {0}")]
     Config(String),
 
+    /// The sandbox failed to start (e.g. the backend or the program could not be
+    /// spawned). Typed separately from [`Error::Io`] so a calling agent can tell
+    /// "the sandbox never ran the code" apart from "the code ran and failed", and
+    /// adapt — one failed child does not take down its siblings or the tree.
+    #[error("sandbox failed to start: {reason}")]
+    Sandbox {
+        /// Why the sandbox could not start the command.
+        reason: String,
+    },
+
     /// The permission policy refused the action. Typed separately from
     /// [`Error::Config`] so a refusal is distinguishable from a malfunction —
     /// a verification that was refused is not a verification that ran and

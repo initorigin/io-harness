@@ -20,6 +20,7 @@ use tokio::process::Command;
 
 use crate::error::{Error, Result};
 use crate::policy::{Act, Effect, Policy};
+use crate::sandbox::{self, RunSpec, Sandbox, SandboxConfig};
 use crate::state::{PolicyEvent, Store};
 
 /// How the harness decides a task is done.
@@ -73,12 +74,20 @@ pub enum Verification {
 pub struct ExecGuard<'a> {
     policy: &'a Policy,
     trace: Option<(&'a Store, i64, u32)>,
+    /// How to sandbox the spawn. `Some` (the default) runs the compile inside an
+    /// ephemeral sandbox — the 0.6.0 default; `None` opts back to direct host
+    /// execution, the exact 0.5.0 behaviour.
+    sandbox: Option<SandboxConfig>,
 }
 
 impl<'a> ExecGuard<'a> {
-    /// Guard spawns with `policy`, recording nothing.
+    /// Guard spawns with `policy`, recording nothing. Sandboxed by default.
     pub fn new(policy: &'a Policy) -> Self {
-        Self { policy, trace: None }
+        Self {
+            policy,
+            trace: None,
+            sandbox: Some(SandboxConfig::default()),
+        }
     }
 
     /// Also record every spawn's full argv against `run_id` at `step`, so
@@ -88,12 +97,28 @@ impl<'a> ExecGuard<'a> {
         self
     }
 
+    /// Run the compile inside `config`'s sandbox instead of the default one.
+    pub fn sandboxed(mut self, config: SandboxConfig) -> Self {
+        self.sandbox = Some(config);
+        self
+    }
+
+    /// Opt out of the sandbox: run the compile directly on the host, exactly as
+    /// 0.5.0 did. Additive and reversible — the sandbox is the default, not a
+    /// forced change.
+    pub fn no_sandbox(mut self) -> Self {
+        self.sandbox = None;
+        self
+    }
+
     /// Allow nothing beyond what a permissive policy permits (the 0.3.0 path).
+    /// Sandboxed by default, like [`ExecGuard::new`].
     fn permissive() -> ExecGuard<'static> {
         static PERMISSIVE: std::sync::OnceLock<Policy> = std::sync::OnceLock::new();
         ExecGuard {
             policy: PERMISSIVE.get_or_init(Policy::permissive),
             trace: None,
+            sandbox: Some(SandboxConfig::default()),
         }
     }
 
@@ -120,6 +145,68 @@ impl<'a> ExecGuard<'a> {
                 rule: verdict.rule,
                 layer: verdict.layer,
             })
+        }
+    }
+
+    /// Execute an already-policy-checked `argv` in `workdir`, returning whether
+    /// it succeeded. Routes through the sandbox when one is configured (the
+    /// 0.6.0 default) — so model-produced code never runs on the host directly —
+    /// and falls back to a direct spawn when the sandbox is opted out (0.5.0).
+    async fn exec(&self, argv: &[String], workdir: &Path) -> Result<bool> {
+        match &self.sandbox {
+            Some(cfg) => {
+                let sb = sandbox::select(cfg);
+                let backend = sb.backend();
+                // Record the sandbox lifecycle so an audit shows where code ran.
+                if let Some((store, run_id, step)) = self.trace {
+                    let _ = store.record_sandbox_event(&crate::state::SandboxEvent::create(
+                        run_id,
+                        step,
+                        backend.as_str(),
+                    ));
+                    let _ = store.record_sandbox_event(&crate::state::SandboxEvent::exec(
+                        run_id,
+                        step,
+                        backend.as_str(),
+                        &argv.join(" "),
+                    ));
+                }
+                let outcome = sb
+                    .run(RunSpec {
+                        argv,
+                        workdir,
+                        limits: &cfg.limits,
+                        allow_network: cfg.allow_network,
+                    })
+                    .await?;
+                if let Some((store, run_id, step)) = self.trace {
+                    if let Some(cap) = outcome.cap_hit {
+                        let _ = store.record_sandbox_event(&crate::state::SandboxEvent::cap_hit(
+                            run_id,
+                            step,
+                            cap.as_str(),
+                        ));
+                    }
+                    // The workdir is torn down when this call returns (tempdir
+                    // drop in the caller); record the destroy now.
+                    let _ = store.record_sandbox_event(&crate::state::SandboxEvent::destroy(
+                        run_id, step,
+                    ));
+                }
+                // A cap hit is a real failure of the gate, not a pass.
+                Ok(outcome.success())
+            }
+            None => {
+                // Direct host execution — the exact 0.5.0 path.
+                let status = Command::new(&argv[0])
+                    .args(&argv[1..])
+                    .current_dir(workdir)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .await?;
+                Ok(status.success())
+            }
         }
     }
 }
@@ -269,16 +356,10 @@ async fn compile_source(
             tokio::fs::write(&lib, source).await?;
             let args = metadata_args(dir.path(), &lib);
             guard.check("rustc", &args)?;
-            let status = Command::new("rustc")
-                .args(["--edition", "2021", "--crate-type", "lib", "--emit", "metadata"])
-                .arg("--out-dir")
-                .arg(dir.path())
-                .arg(&lib)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await?;
-            Ok(status.success())
+            let argv = std::iter::once("rustc".to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            guard.exec(&argv, dir.path()).await
         }
         Some(test) => {
             let combined = dir.path().join("combined.rs");
@@ -287,28 +368,17 @@ async fn compile_source(
 
             let args = test_build_args(&combined, &bin);
             guard.check("rustc", &args)?;
-            let built = Command::new("rustc")
-                .args(["--edition", "2021", "--test"])
-                .arg(&combined)
-                .arg("-o")
-                .arg(&bin)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await?;
-            if !built.success() {
+            let build_argv = std::iter::once("rustc".to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            if !guard.exec(&build_argv, dir.path()).await? {
                 return Ok(false);
             }
 
             // The produced binary is its own spawn: denying TEST_BINARY while
             // allowing rustc type-checks the code without ever running it.
             guard.check(TEST_BINARY, &[bin.display().to_string()])?;
-            let run = Command::new(&bin)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .await?;
-            Ok(run.success())
+            guard.exec(&[bin.display().to_string()], dir.path()).await
         }
     }
 }
