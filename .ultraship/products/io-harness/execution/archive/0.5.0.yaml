@@ -1,0 +1,31 @@
+product: io-harness
+version: 0.5.0
+execution_state: COMPLETING
+checkpoint: .ultraship/checkpoints/2026-07-24T12-32-01Z-io-harness-0.5.0.yaml
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The 0.5.0 contract is one large but coherent slice — agent composition plus a containment
+      boundary — built on a loop, a policy, and a trace that already exist and already pass.
+      Children reuse the 0.1.0–0.4.0 loop rather than re-implementing it.
+    - >
+      No time, budget, or capacity constraint is recorded (ultraship constraints show reports none),
+      so this assessment is made against the code's condition, not against a stated limit. If the
+      owner records a tight limit, the fallback_scope (sequential, single-level) is the smaller
+      landing.
+    - >
+      The containment merge and the aggregate spend ledger are pure, self-contained logic that can
+      be proven with unit tests before any provider or concurrency is involved — the risky
+      guarantees are testable early.
+  major_cost_drivers:
+    - >
+      Thread-safe shared store access for 100+ concurrent children — rusqlite's Connection is not
+      Sync, so concurrent fan-out needs a sharing strategy the single-agent loop never did. This is
+      the one architectural change and the reason concurrency is the first fallback drop.
+    - Keeping the containment merge (allows intersect) a separate code path from 0.4.0's layer merge
+      (allows union), so neither is used in the other's place.
+    - A tree-wide spend ledger that halts the whole tree without a race and without a spawned
+      contract raising it.
+  recommended_scope_change: null

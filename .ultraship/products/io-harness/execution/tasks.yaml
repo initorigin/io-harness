@@ -1,307 +1,164 @@
 product: io-harness
-version: 0.4.0
+version: 0.5.0
 tasks:
-- id: US-IO-HARNESS-0.4.0-T01
-  summary: 'Policy type: rules, tiers, serde, layered merge, and explain.'
-  why_required: Every other task in the release evaluates a policy; without the type, its merge precedence,
-    and one shared evaluation function there is nothing to enforce, serialise, or explain.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - Deny beats allow — a path matched by both an allow glob and a deny glob is refused.
-  - A read of `.env` inside the workspace is denied under the default policy even though the surrounding
-    directory is readable.
-  - A `Policy` round-trips through serde — serialize, deserialize, and the result enforces identically
-    to the original, proven by running the same refusal test against both.
-  - A deny in a base layer is not re-allowed by an overlay that allows the same path — the merged policy
-    still refuses, and a test asserts this specifically, since it is the rule that makes a shared base
-    trustworthy.
-  - An allow present only in an overlay grants that capability in the merged policy, so an app can extend
-    a shared base without editing it.
-  - Merging is deterministic and order-explicit — the same stack of layers always produces the same effective
-    policy, and merging a layer with itself changes nothing.
-  - An empty or absent overlay leaves the base policy unchanged, so an app that ships no config of its
-    own still gets the shared base intact.
-  - '`Policy::explain` names the layer responsible, so a path denied by a base layer is explainable without
-    running the agent.'
-  files:
-  - src/policy.rs
-  - src/lib.rs
-  evidence:
-  - 'cargo test --lib policy — 9 passed: deny_beats_allow_even_when_both_match, default_policy_denies_dotenv_read_inside_a_readable_tree,
-    serde_roundtrip_enforces_identically, an_overlay_cannot_reallow_what_the_base_denied, an_overlay_only_allow_grants_capability_the_base_lacked,
-    merging_is_deterministic_and_merging_a_layer_with_itself_changes_nothing, an_empty_overlay_leaves_the_base_unchanged,
-    explain_names_the_rule_and_the_layer_that_decided, explain_and_check_never_disagree.'
-  - check() is literally explain() (src/policy.rs), so enforcement and explanation cannot drift; asserted
-    by explain_and_check_never_disagree.
-  - merge is layer concatenation with deny-first evaluation across the whole stack, which is what makes
-    an overlay structurally unable to re-allow a base deny.
-- id: US-IO-HARNESS-0.4.0-T02
-  summary: Trace schema for refusals, decisions, and layer attribution, with an additive migration.
-  why_required: Refusals and decisions are recorded from the moment enforcement exists, so the schema
-    must land before the enforcement task rather than being retrofitted across every call site afterwards.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T01
-  acceptance_criteria:
-  - The rusqlite trace records each refusal with the action, the target path or command, the rule that
-    refused it, and which layer that rule came from, and each decision with its approve/deny value and
-    its source.
-  - Refusal and decision records never log file contents or API keys — path, command, rule, and decision
-    only.
-  files:
-  - src/state.rs
-  evidence:
-  - cargo test --lib state — 8 passed, including the two pre-existing 0.1/0.3 migration tests unchanged.
-  - 'New: refusals_record_action_target_rule_and_layer, decisions_record_their_value_source_and_any_altered_target,
-    a_pre_0_4_database_migrates_in_place_and_keeps_its_rows, a_pending_approval_survives_the_store_being_reopened.'
-  - Migration is additive (CREATE TABLE IF NOT EXISTS policy_events, pending_approvals); a 0.3.0 database
-    gains them and a 0.3.0 binary still reads it.
-- id: US-IO-HARNESS-0.4.0-T03
-  summary: 'Path enforcement in the tool layer: canonical resolution, symlink rule, grep/find filtering,
-    refusal as tool result.'
-  why_required: This is the first complete vertical slice — a real run refuses an out-of-policy write,
-    tells the model why, and still reaches a verified success on its in-policy edits. Without it the release
-    has a policy that governs nothing.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T01
-  - US-IO-HARNESS-0.4.0-T02
-  acceptance_criteria:
-  - Given a policy that allows writes under `src/**` and denies `secrets/**`, a workspace run that attempts
-    to write `secrets/key.txt` does not modify that file, receives a typed refusal as its tool result,
-    and still completes its in-policy edits to a verified success.
-  - '`grep`, `find`, and `read_file` return no results from paths outside the read allow list, so a denied
-    path cannot be exfiltrated into the model''s context.'
-  - Path rules are evaluated on the resolved canonical path, so `..` traversal cannot reach outside the
-    allow list.
-  - A deny rule matches when either the symlink's own path or its resolved target matches, so a symlink
-    inside the allow list pointing at a denied path is refused — following Claude Code's symlink rule,
-    where a link in an allowed directory pointing at `~/.ssh/id_rsa` is blocked.
-  - '`Policy::explain(path)` returns the same decision the tool layer would enforce for that path, proven
-    by a test that asserts the two agree across allowed, denied, and sensitive paths — an explain that
-    can disagree with enforcement is worse than none.'
-  - A refusal caused by a base layer is attributable to that layer in the trace, so a user whose own app
-    config does not mention the path can still find out what refused it.
-  - A 0.3.0 workspace run constructed without any policy still reaches the same verified success it did
-    in 0.3.0, because the default policy applied when none is passed is permissive.
-  - A refused action consumes a step — a run whose model repeatedly requests a denied write stops at `StepCapReached`
-    rather than looping, and the trace shows one refusal record per consumed step.
-  - Enforcement lives in the tool and verification layers, never only in the system prompt — a test asserts
-    refusal holds when the model requests an out-of-policy action directly.
-  files:
-  - src/tools/workspace.rs
-  - src/tools/fs.rs
-  - src/run.rs
-  - tests/policy.rs
-  evidence:
-  - cargo test --lib tools::workspace — 12 passed, 5 pre-existing 0.3.0 tests unchanged.
-  - 'New: a_denied_write_is_refused_and_the_file_is_untouched, denied_paths_are_invisible_to_grep_and_find,
-    traversal_is_evaluated_on_the_resolved_path_not_the_literal_one, a_symlink_is_denied_by_its_target_even_when_its_own_path_is_allowed,
-    a_symlink_pointing_outside_the_root_is_refused, a_workspace_without_a_policy_behaves_exactly_as_0_3_0_did,
-    check_path_agrees_with_what_read_and_write_actually_enforce.'
-  - cargo test --test policy — 11 passed at the run level, including a_denied_write_is_refused_and_the_run_still_reaches_its_goal
-    (Success{steps:2}, secret untouched, refusal attributed to rule secrets/* in layer base) and a_refused_action_consumes_a_step_so_retrying_it_hits_the_cap
-    (StepCapReached{3}, 3 refusal records).
-  - Enforcement is in Workspace::enforce/check_path and the loop's gate(), never in the prompt; a_run_with_no_policy_behaves_exactly_as_0_3_0_did
-    proves the permissive default.
-- id: US-IO-HARNESS-0.4.0-T04
-  summary: Command execution policy gating what verification may spawn.
-  why_required: Verification shells out to rustc and a compiled test binary; without a command allow list
-    the policy governs files but not process execution, leaving the release half a boundary.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T01
-  acceptance_criteria:
-  - Verification refuses to spawn a binary absent from the command allow list, and the refusal is distinguishable
-    in the result from a verification that ran and failed.
-  - The command policy gates the binary name; the trace records the full argv of every spawn, so argument-level
-    enforcement can be added in 0.6.0 against a recorded baseline rather than a guess.
-  files:
-  - src/verify.rs
-  evidence:
-  - cargo test --lib verify — 10 passed, 7 pre-existing 0.3.0 tests unchanged.
-  - a_command_absent_from_the_allow_list_is_refused_not_failed — deny_exec("rustc") yields Err(Error::Refused{target:"rustc"}),
-    while the identical source under the default policy compiles and returns true, so a refusal is distinguishable
-    from a verification that ran and failed.
-  - denying_the_test_binary_type_checks_without_running_it — allowing rustc but denying TEST_BINARY refuses
-    the run of the produced binary, giving compile-only verification.
-  - ExecGuard records every spawn's full argv (metadata_args/test_build_args); tests/policy.rs a_run_with_no_policy_behaves_exactly_as_0_3_0_did
-    asserts an exec event whose target starts with "rustc ".
-  - Policy::default() ships a builtin-exec layer allowing rustc and <test-binary>, so constructing a policy
-    does not break the verify gate.
-- id: US-IO-HARNESS-0.4.0-T05
-  summary: Approver trait with Approve/Deny, the sensitive tiers, and the DenyAll/ApproveAll/stdin built-ins.
-  why_required: The human gate is the half of the outcome that enforcement alone cannot deliver; the tiers
-    decide what reaches it, and the built-ins are what let io-cli wire a prompt without writing one.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T03
-  acceptance_criteria:
-  - A sensitive action reaches the `Approver`, but an out-of-policy action does not — a refusal is returned
-    without the approver being consulted, and a test asserts the approver was never called for it.
-  - A sensitive action with an `ApproveAll` approver proceeds; the identical run with `DenyAll` does not
-    perform the action and stops with a distinct outcome.
-  - Reads inside the allow list proceed without consulting the approver, while every write consults it
-    — including an overwrite of a file the path rules already allow.
-  - '`Approver` can be held as `Box<dyn Approver>` and used from a non-terminal caller, proven by a test
-    approver backed by a channel rather than stdin.'
-  - '`Approver` is `Send + Sync` and awaited without blocking the tokio runtime.'
-  files:
-  - src/approve.rs
-  - src/run.rs
-  - tests/approval.rs
-  evidence:
-  - 'cargo test --lib approve — 3 passed: built_in_approvers_decide_as_advertised, an_approver_can_be_held_as_a_trait_object_and_answer_out_of_band
-    (Box<dyn Approver> answering from a oneshot channel, io-studio''s shape), a_slow_approver_keeps_the_caller_waiting_rather_than_timing_out.'
-  - Approver is object-safe via a boxed DecisionFuture rather than an async-trait dependency — no new
-    crate added.
-  - 'cargo test --test policy: a_denied_action_never_reaches_the_approver (approver call count 0), approve_all_proceeds_where_deny_all_does_not,
-    reads_do_not_prompt_but_every_write_does_including_an_allowed_overwrite (count 1).'
-- id: US-IO-HARNESS-0.4.0-T06
-  summary: Approve-with-changes, with the modified action re-evaluated against the policy.
-  why_required: An approver that can alter an action after the policy has seen it is a bypass for every
-    deny in the stack unless the modified form is re-checked; the feature and its re-check are the same
-    piece of work.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T05
-  acceptance_criteria:
-  - An approver that approves with a modified action causes the modified action to run, and the trace
-    shows both the requested and the performed form.
-  - An approver that rewrites an action onto a denied path does not cause that action to run — the modified
-    action is refused by the policy exactly as the original would have been.
-  files:
-  - src/approve.rs
-  - src/run.rs
-  - tests/approval.rs
-  evidence:
-  - cargo test --test policy — an_approver_can_redirect_the_write_and_the_trace_shows_both_forms (src/redirected.rs
-    written, src/a.rs untouched, decision row target=src/a.rs performed=src/redirected.rs).
-  - an_approved_rewrite_cannot_move_an_action_across_a_deny — a rogue approver redirecting onto secrets/key.txt
-    is refused and recorded; the file keeps its original contents. The re-check lives in gate() with the
-    action, not at the approver call site.
-- id: US-IO-HARNESS-0.4.0-T07
-  summary: Approve-and-remember as a run-scoped top layer, returned on RunResult.
-  why_required: Without remembering, a long run prompts for every repeated action and the gate becomes
-    unusable; implementing it as a merge layer is what keeps deny-is-absolute true while it does so.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T06
-  acceptance_criteria:
-  - An approver that approves and remembers a rule stops being consulted for later actions matching that
-    rule within the same run, and the trace marks those actions as auto-approved by the remembered rule.
-  - A remembered allow does not override a base-layer deny — remembering a rule that conflicts with a
-    deny leaves the deny in force.
-  - Remembered rules are readable from `RunResult` after the run, so a caller can persist them; the crate
-    itself writes no config file.
-  files:
-  - src/approve.rs
-  - src/policy.rs
-  - src/run.rs
-  - tests/approval.rs
-  evidence:
-  - cargo test --test policy — remembering_a_rule_stops_the_prompting_and_is_returned_to_the_caller (approver
-    consulted once for two writes; result.remembered carries the src/* rule).
-  - a_remembered_allow_cannot_override_a_base_deny — remembering allow '*' still leaves secrets/key.txt
-    unwritten, because remembering merges a layer rather than mutating the policy.
-  - The crate writes no config file; remembered rules are returned on RunResult for the caller to persist.
-- id: US-IO-HARNESS-0.4.0-T08
-  summary: Decision::Defer, persisted AwaitingApproval, and resume_with_decision.
-  why_required: A decision that outlives the process is what lets an approval wait for a human who is
-    not at the terminal, and it is the mechanism 0.5.0 unattended runs depend on.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T05
-  acceptance_criteria:
-  - An `Approver` returning `Defer` stops the run with `RunOutcome::AwaitingApproval { request_id }` and
-    the pending action is readable from the store after the process that created it has ended.
-  - An `Approver` that does not resolve immediately keeps the run paused rather than timing out — a test
-    holds the decision across an await and the run continues correctly once it resolves.
-  - '`resume_with_decision` with an approval performs the pending action and continues the run to a verified
-    success under the original `run_id`; with a denial it does not perform the action and closes the run.'
-  files:
-  - src/approve.rs
-  - src/run.rs
-  - src/state.rs
-  - tests/defer.rs
-  evidence:
-  - cargo test --test policy — 14 passed, including the three resume tests.
-  - deferring_pauses_the_run_and_persists_the_pending_action — run stops at RunOutcome::AwaitingApproval{steps:1},
-    nothing written, pending row readable from a reopened Store with act/target/content intact.
-  - resuming_an_approval_performs_the_pending_action_and_finishes_the_run — a different Store over the
-    same file resumes to Success{steps:2} under the ORIGINAL run_id; src/a.rs holds exactly the content
-    the human was shown; pending resolved=approve; a decision event carries source=resumed:<id>.
-  - resuming_a_denial_does_not_perform_the_action_and_closes_the_run — RunOutcome::Denied{steps:1}, file
-    untouched, pending resolved=deny.
-  - a_deny_that_lands_while_paused_still_holds_on_resume — the policy is re-checked on resume, so an approval
-    cannot perform an action a deny now covers.
-  - a_slow_approver_keeps_the_caller_waiting_rather_than_timing_out (src/approve.rs) proves the future
-    may stay pending.
-- id: US-IO-HARNESS-0.4.0-T09
-  summary: Public API surface, backward compatibility, docs, example, and packaging for 0.4.0.
-  why_required: The release is consumed as a crate by two other products; an API that breaks 0.3.0 callers
-    or ships undocumented is not deliverable regardless of how well the policy works.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.4.0-T03
-  - US-IO-HARNESS-0.4.0-T04
-  - US-IO-HARNESS-0.4.0-T07
-  - US-IO-HARNESS-0.4.0-T08
-  acceptance_criteria:
-  - Policy, `Approver`, `Decision`, and `resume_with_decision` are part of the documented public API under
-    SemVer; existing 0.3.0 callers still compile, or a documented migration is provided.
-  - No provider-specific type appears in the policy, approval, or trace API; the provider-agnostic surface
-    is preserved.
-  - The default policy applied when a caller passes none is permissive, preserving 0.3.0 behaviour — the
-    boundary is opt-in. This is a decided trade-off, not an oversight, and the README states plainly that
-    a caller who constructs no policy gets no enforcement.
-  - '`cargo test` passes, including the policy units, approve/deny integration tests, the persisted pause/restart/resume
-    test, and the unchanged 0.1.0–0.3.0 suite.'
-  - '`cargo clippy --all-targets` reports zero warnings.'
-  - '`cargo publish --dry-run` succeeds with complete crate metadata for 0.4.0.'
-  - README and crate docs document policy construction, the approval decisions, the sensitive-action classes,
-    and the permissive default, with a runnable example.
-  - README documents the recommended layering convention (user base, project layer, app overlay) and states
-    that the crate composes a stack it is handed rather than discovering files, so an adopting app knows
-    what is its responsibility.
-  - An example binary (as `examples/edit_repo` did for 0.3.0) drives one live run under a restrictive
-    policy showing a refusal and an approval end to end.
-  files:
-  - src/lib.rs
-  - README.md
-  - Cargo.toml
-  - examples/policy_run.rs
-  evidence:
-  - cargo test — 76 passed, 0 failed (48 unit + 9 edit_file + 3 multi_file + 1 parity + 14 policy + 1
-    doctest). The 0.1.0-0.3.0 suite is unchanged and green.
-  - cargo clippy --all-targets — 0 warnings, 0 errors.
-  - cargo publish --dry-run --allow-dirty — Packaged 40 files, 277.6KiB (73.4KiB compressed), verify-compiled
-    io-harness v0.4.0, upload aborted (dry run).
-  - Cargo.toml bumped to 0.4.0 with an updated description; no new dependency was added for this release
-    (Approver is object-safe via a boxed DecisionFuture rather than async-trait), and tokio's `sync` feature
-    was pinned explicitly in dev-dependencies where it had been relying on another crate's feature unification.
-  - 'README gained a ''Permissions and approval (v0.4)'' section: policy construction, the deny-first
-    tier table, the approver with all three decisions, deferring across processes, and the recommended
-    user-base/project/app layering convention with an explicit statement that the crate composes a stack
-    it is handed rather than discovering files.'
-  - Crate docs (src/lib.rs) updated with the 0.4 paragraph and a run_with + Policy example; doctest passes.
-  - examples/policy_run.rs builds and drives a live run under a restrictive policy, printing refusals
-    and approvals from the trace.
-  - CHANGELOG.md 0.4.0 section written, including the permissive-default trade-off under Security.
-  - 'Backward compatibility: run() and resume() keep their 0.3.0 signatures and delegate through Policy::permissive;
-    tests/policy.rs a_run_with_no_policy_behaves_exactly_as_0_3_0_did and the untouched edit_file/multi_file/parity
-    suites are the proof.'
-  - cargo test — 78 passed, 0 failed after the final two tests (a_slow_approver_keeps_the_whole_run_waiting_and_it_then_completes,
-    refusal_and_decision_records_never_carry_file_contents).
-  - 'LIVE RUN, cargo run --example policy_run against OpenRouter (openai/gpt-5.6-luna): outcome Success{steps:4};
-    trace shows ''refused step 2 read secrets/key.txt (rule secrets/* in layer example)'' and ''approve
-    step 4 write src/a.rs'' + ''approve step 4 write src/b.rs''; the secret file still reads do-not-touch.
-    One live run showing a refusal and an approval end to end.'
-  - 'FINDING from the live run: with no guidance, the model retried the denied read on steps 2, 4, 7,
-    and 8 and exhausted the step budget without doing the work (StepCapReached). The step cap bounded
-    it as designed, but the run was wasted. This is the risk the contract logged (''refusal-as-tool-result
-    lets the model spend the whole step budget retrying a denied action''), confirmed against a real model.
-    Mitigated in the example with a TaskContract constraint telling the model not to retry refused actions;
-    with it the same task reaches Success{steps:4}. A repeated-refusal early stop remains the contract''s
-    named follow-up.'
+  - id: US-IO-HARNESS-0.5.0-T01
+    summary: Containment merge — a child inherits the parent policy and can only narrow it.
+    why_required: >
+      Without inherit-and-narrow the whole release is unsafe: a spawned agent could grant itself
+      read, write, or execute the parent lacked. This is the one new permission rule and everything
+      that spawns depends on it, so it comes first and is proven with pure unit tests.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - A child whose overlay allows a path the parent denies does not gain that path — a write the child attempts there is refused exactly as it would be for the parent, proving allows intersect downward.
+      - A child whose overlay adds a deny the parent lacked is refused on that path, proving denies union downward and that a child may narrow.
+    files:
+      - src/policy.rs
+      - src/lib.rs
+    evidence:
+      - "cargo test --lib policy (15 pass): allow_cannot_reach_a_parent_deny, allow_cannot_widen_a_parent_default, deny_narrows_the_parent, containment_holds_downward_through_depth"
+
+  - id: US-IO-HARNESS-0.5.0-T02
+    summary: Containment value (caps + serde) and the tree-wide aggregate spend ledger.
+    why_required: >
+      The spend ceiling and agent/depth caps are the operator-held boundary a swarm cannot vote
+      itself past. The ledger is pure, single-threaded-testable logic; building it before the spawn
+      path lets the ceiling be proven before concurrency is involved.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T01
+    acceptance_criteria:
+      - A tree whose combined token draw crosses the aggregate `max_total_tokens` halts as a whole with the halt attributed to the containment budget, and no single child had individually exceeded its own contract budget — proving the ceiling is tree-wide, not per-agent.
+      - A child `TaskContract` setting a larger `max_tokens` than the tree has remaining does not get the larger budget — the effective budget is the tree's remaining, proving a contract cannot raise the ceiling.
+    files:
+      - src/containment.rs
+      - src/lib.rs
+    evidence:
+      - "cargo test --lib containment (5 pass): the_ceiling_is_tree_wide_not_per_agent, a_contract_cannot_raise_the_ceiling, concurrent_draws_never_overspend_the_ceiling"
+      - "cargo test --test subagents: the_aggregate_ceiling_halts_the_whole_tree"
+
+  - id: US-IO-HARNESS-0.5.0-T03
+    summary: Graph trace — parent_run_id, spawn events, and budget-draw records, migrated additively.
+    why_required: >
+      A composed tree that cannot be reconstructed after the fact is unauditable; the graph trace is
+      how an operator sees what the fleet did and what it spent. Additive migration keeps 0.4.0
+      databases opening.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T02
+    acceptance_criteria:
+      - Every spawn, refusal, and budget draw is recorded so the tree is reconstructable from the store alone after the process ends — a test rebuilds the parent/child graph from a reopened store.
+    files:
+      - src/state.rs
+    evidence:
+      - "cargo test --lib state (10 pass): the_tree_is_reconstructable_from_a_reopened_store, a_pre_0_5_database_migrates_and_keeps_its_rows"
+
+  - id: US-IO-HARNESS-0.5.0-T04
+    summary: spawn_agent tool and the child loop, reused from the single-agent loop, with compose-back (sequential).
+    why_required: >
+      This is the release's core outcome — a parent decomposes a task into contained children over a
+      shared workspace and continues from what they produced. Sequential first so the boundary and
+      compose-back are correct before concurrency is added.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T03
+    acceptance_criteria:
+      - A parent contract that spawns three children over a shared workspace reaches a verified success; each child's edit is present, the parent's compose-back used the children's results, and the trace contains the parent, all three children, and the parent/child edges.
+      - "`spawn_agent` returns the child's outcome and a result summary to the parent, proven by a test where the parent's success depends on a value only a child produced."
+    files:
+      - src/run.rs
+      - src/lib.rs
+    evidence:
+      - "cargo test --test subagents: a_parent_spawns_three_children_over_a_shared_workspace, spawn_agent_composes_the_childs_result_back"
+  - id: US-IO-HARNESS-0.5.0-T05
+    summary: Spawn refusal semantics — agent-count and depth caps, depth counted from the root.
+    why_required: >
+      Caps without enforcement are decoration. A spawn past a cap must be refused as a typed tool
+      result the parent can adapt to, and depth must count from the root so a chain cannot reset it.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T04
+    acceptance_criteria:
+      - A spawn beyond `max_total_agents` is refused as a typed tool result while the children spawned within the cap still complete to success; the refusal is in the trace attributed to the agent cap.
+      - A spawn beyond `max_depth` is refused, and depth is counted from the root so a chain of children cannot reset it — a test drives a nesting chain to the cap and asserts the next spawn is refused.
+    files:
+      - src/run.rs
+    evidence:
+      - "cargo test --test subagents: a_spawn_beyond_the_agent_cap_is_refused_but_the_rest_complete, a_spawn_beyond_max_depth_is_refused_and_depth_counts_from_the_root"
+  - id: US-IO-HARNESS-0.5.0-T06
+    summary: Concurrent fan-out to 100+ under max_concurrent, with the aggregate-ledger race closed.
+    why_required: >
+      The 100+ concurrent target is the throughput property that makes composition worth doing at
+      scale; the ledger must stay correct under concurrent draws or the ceiling is a lie. This is the
+      first fallback drop, so it lands after the sequential boundary is proven.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T05
+    acceptance_criteria:
+      - With `max_concurrent` set below the number of children requested in one step, no more than `max_concurrent` children run at once (asserted by an observed concurrency counter) and all requested children eventually complete.
+      - A run configured at the 100+ concurrent target spawns and completes within its containment caps without deadlock or overspend, proving the fan-out target is real and bounded.
+      - Concurrent draws on the aggregate budget by many children do not overspend past the ceiling — a stress test with many small concurrent children asserts total recorded spend never exceeds `max_total_tokens`, proving the ledger race is closed.
+    files:
+      - src/run.rs
+      - src/containment.rs
+    evidence:
+      - "cargo test --test subagents: concurrent_fanout_to_over_100_stays_bounded_and_completes (120 children, peak <= 16)"
+      - "cargo test --lib containment: concurrent_draws_never_overspend_the_ceiling (64 threads x 100 draws)"
+
+  - id: US-IO-HARNESS-0.5.0-T07
+    summary: One approver serves the whole tree; a child's defer persists and resumes unchanged.
+    why_required: >
+      Containment and human approval must compose rather than become two gates. A sensitive action in
+      any child routes to the root's approver, and 0.4.0's defer/resume still holds inside the tree.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T04
+    acceptance_criteria:
+      - A sensitive action inside a child reaches the same `Approver` the root was given; `ApproveAll` lets it proceed and `DenyAll` stops that child, with the decision recorded against the child's run, proving one approver serves the tree.
+      - A child that defers a sensitive action persists an `AwaitingApproval` pending action resumable by `resume_with_decision`, unchanged from 0.4.0.
+    files:
+      - src/run.rs
+    evidence:
+      - "cargo test --test subagents: one_approver_serves_the_whole_tree_approve, one_approver_serves_the_whole_tree_deny"
+      - "cargo test --test subagents: a_child_defer_persists_and_resumes_via_resume_with_decision (tree pauses surfacing request_id; resume_with_decision on the child run performs the write and finishes it)"
+  - id: US-IO-HARNESS-0.5.0-T08
+    summary: Backward compatibility — sub-agents are strictly opt-in and additive.
+    why_required: >
+      A 0.4.0 caller that constructs no Containment must see the exact 0.4.0 surface and behaviour;
+      if spawning leaks into a plain run, the release breaks existing callers.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T04
+    acceptance_criteria:
+      - A 0.4.0 single-agent run constructed without a `Containment` exposes no `spawn_agent` tool and reaches the same verified success it did in 0.4.0, proving sub-agents are opt-in and additive.
+    files:
+      - src/run.rs
+      - src/lib.rs
+    evidence:
+      - "cargo test --test subagents: sub_agents_are_opt_in_a_plain_run_never_exposes_spawn"
+  - id: US-IO-HARNESS-0.5.0-T09
+    summary: Docs, example binary, and a live end-to-end run; package for 0.5.0.
+    why_required: >
+      The release is release-ready only when a caller can learn the surface and one live run proves
+      compose-back and a containment refusal end to end against a real provider.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.5.0-T06
+      - US-IO-HARNESS-0.5.0-T07
+      - US-IO-HARNESS-0.5.0-T08
+    acceptance_criteria:
+      - "`cargo test` passes, including the containment merge units, spawn/compose-back integration, the agent-count/depth/budget refusal tests, the concurrency and overspend-race tests, the graph-trace test, and the unchanged 0.1.0–0.4.0 suite."
+      - "`cargo clippy --all-targets` reports zero warnings."
+      - "`cargo publish --dry-run` succeeds with complete crate metadata for 0.5.0."
+      - "README and crate docs document `spawn_agent`, `Containment` and every cap, the containment merge versus 0.4.0 layer merge, and the tree-wide spend ceiling, with a runnable example."
+      - An example binary drives one live run where a parent spawns children over a shared workspace under a `Containment`, showing compose-back and one containment refusal end to end.
+    files:
+      - README.md
+      - examples/subagents.rs
+      - Cargo.toml
+    evidence:
+      - "cargo test: 99 passing, 0 failing (58 unit + 9 subagents + 3 multi_file + 1 parity + 17 policy + 10 edit_file + 1 doctest), unchanged 0.1.0-0.4.0 suite green."
+      - "cargo clippy --all-targets: 0 warnings."
+      - "cargo publish --dry-run: packaged io-harness v0.5.0 (43 files), verify-compiled, upload aborted (dry run)."
+      - "README + crate docs: v0.5 section on spawn_agent, Containment caps, contain vs merge, tree-wide ceiling; examples/subagents.rs runnable."
+      - "LIVE RUN (cargo run --example subagents, OpenRouter openai/gpt-5.6-luna): outcome Success{steps:7}; parent spawned child runs 2 & 3 (a.txt=ALPHA, b.txt=BETA), composed summary.txt=DONE; agent cap refused the model's extra spawns (spawn REFUSED cap agents); budget draws traced. Evidence: evidence/0.5.0/live_run.txt"

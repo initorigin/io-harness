@@ -39,6 +39,17 @@ pub enum Verification {
         /// Rust source appended after the file's contents, e.g. a `#[test] fn`.
         test_src: String,
     },
+    /// (workspace/multi-file) A named file under the workspace root must contain
+    /// this text. Deterministic and language-agnostic — no compilation — so a
+    /// task whose success is "a file now holds X" can be verified directly. Like
+    /// [`Verification::FileContains`] it is gameable; use it when the outcome is
+    /// genuinely about content, or as a composed-tree checkpoint a parent reads.
+    WorkspaceFileContains {
+        /// File to read, relative to the workspace root.
+        file: PathBuf,
+        /// Text that must be present in it.
+        needle: String,
+    },
     /// (workspace/multi-file) Every listed file — relative to the workspace root
     /// — must compile on its own as a Rust library. The run only succeeds when
     /// all of them do, so one wrong file fails the whole set.
@@ -142,9 +153,11 @@ impl Verification {
             Verification::RustTestPasses { test_src } => {
                 compile_source(contents, Some(test_src), guard).await
             }
-            Verification::EachCompilesRust(_) | Verification::WorkspaceTestPasses { .. } => Err(
-                Error::Config("multi-file verification requires a workspace root".into()),
-            ),
+            Verification::EachCompilesRust(_)
+            | Verification::WorkspaceTestPasses { .. }
+            | Verification::WorkspaceFileContains { .. } => Err(Error::Config(
+                "multi-file verification requires a workspace root".into(),
+            )),
         }
     }
 
@@ -157,6 +170,10 @@ impl Verification {
     /// [`Verification::passes_in`], with every spawn checked against a policy.
     pub async fn passes_in_guarded(&self, root: &Path, guard: &ExecGuard<'_>) -> Result<bool> {
         match self {
+            Verification::WorkspaceFileContains { file, needle } => {
+                let src = tokio::fs::read_to_string(root.join(file)).await.unwrap_or_default();
+                Ok(src.contains(needle))
+            }
             Verification::EachCompilesRust(files) => {
                 for f in files {
                     let src = tokio::fs::read_to_string(root.join(f)).await.unwrap_or_default();
@@ -197,6 +214,9 @@ impl Verification {
             }
             Verification::RustTestPasses { test_src } => {
                 format!("the file must compile and pass this test:\n{test_src}")
+            }
+            Verification::WorkspaceFileContains { file, needle } => {
+                format!("the file {file:?} must contain exactly this text: {needle:?}")
             }
             Verification::EachCompilesRust(files) => {
                 format!("each of these files must compile as Rust: {files:?}")
