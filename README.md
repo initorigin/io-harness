@@ -386,6 +386,40 @@ v0.5 direct-host execution can opt it off, so the change is additive and reversi
 
 Run it live: `cargo run --example sandbox_run`.
 
+## Durable, unattended runs (v0.7)
+
+Start a long task and walk away. v0.7 makes a run survive a crash or a full
+process restart, so the harness can run unattended for a long horizon (24h+) with
+no user input and pick up exactly where it stopped.
+
+- **Checkpoint after every step, transactionally** — each completed step's trace
+  row, its budget draw, and a checkpoint marker are committed in one rusqlite
+  transaction. The committed checkpoint *is* the step's completion marker: a crash
+  mid-commit leaves either a whole step or none of it, never a torn half.
+- **Resume the whole tree** — `resume` continues a single or workspace run;
+  `resume_tree` reconstructs a crashed v0.5 tree and continues **every** agent from
+  its own last committed step. A parent *adopts* the children it had already
+  spawned and resumes each from its checkpoint, rather than duplicating or
+  restarting them.
+- **Idempotent by construction** — a completed step is skipped (recorded as a
+  `skipped` event), the aggregate `Ledger` budget is restored from durable totals
+  (never reset, never double-charged), the time budget counts real wall-clock
+  elapsed across the downtime, an already-applied edit is re-observed rather than
+  repeated, and re-running a resume is a no-op.
+- **Approval survives a restart** — a v0.4 sensitive action that pauses the tree
+  outlives the process; a fresh process delivers the decision with
+  `resume_tree_with_decision` and the tree continues.
+- **Sandboxes are re-created, never resumed** — an ephemeral v0.6 sandbox is never
+  checkpointed, so an exec in flight at crash time simply re-runs in a fresh
+  sandbox; a committed sandboxed step is skipped.
+- **Typed failure** — a resume against a newer-format or missing checkpoint is an
+  `Error::Resume`, not a panic or a half-resume.
+
+The 24h horizon is proven by a real `kill -9`-then-resume test plus a time-scaled
+long unattended run; a literal 24h wall-clock run is noted, not gated on.
+
+Run it live: `cargo run --example durable_run` (kills itself mid-run and resumes).
+
 ## Part of initorigin
 
 `IO Harness` is one of the [initorigin](https://github.com/initorigin) products:

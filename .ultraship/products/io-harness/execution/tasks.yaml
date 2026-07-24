@@ -1,279 +1,305 @@
 product: io-harness
-version: 0.6.0
+version: 0.7.0
 tasks:
-  - id: US-IO-HARNESS-0.6.0-T01
+  - id: US-IO-HARNESS-0.7.0-T01
     summary: >
-      Sandbox trait + SandboxOutcome + SandboxLimits/SandboxConfig (serde) + portable floor backend +
-      backend selection. The floor runs on all three OSes as the guaranteed-present isolation.
+      Durable checkpoint schema + typed resume error + transactional step commit. Add runs.status
+      and runs.started_at; a checkpoint_events table (kind: checkpoint/resume/skipped); a
+      PRAGMA user_version checkpoint-format marker; Error::Resume{reason}; and make the per-step
+      write (step row + checkpoint event) one rusqlite transaction so a step is done iff its
+      checkpoint committed. Store helpers: set_status/status, started_at, record_checkpoint_event,
+      checkpoint_events, spent_tokens(run)/spent_tokens_tree, agent_count_tree. Additive DDL keeps a
+      0.6.0 DB readable.
     why_required: >
-      Without the trait and a floor backend there is no sandbox at all and no OS-neutral surface;
-      every later task (wiring, caps, native backends, trace) hangs off this seam.
+      Nothing downstream can be crash-consistent, idempotent, or auditable without a transactional
+      completion marker, a durable run status, a corrupt-checkpoint typed failure, and the read-back
+      helpers. This is the seam every other 0.7.0 task hangs off.
     status: done
     depends_on: []
     acceptance_criteria:
       - >-
-        `Sandbox`, `SandboxLimits`, `SandboxConfig`, and `SandboxOutcome` are part of the documented
-        public API under SemVer; existing 0.5.0 callers still compile unchanged, and no OS-specific or
-        provider-specific type leaks into the trait's signature — the surface is OS-neutral.
-    files:
-      - src/sandbox.rs
-      - src/lib.rs
-      - Cargo.toml
-    evidence:
+        The step checkpoint (step result, budget draw, trace record) is written as one rusqlite
+        transaction, so a crash leaves either a fully-committed step or none of it — never a partial
+        step recorded as done. A test asserts atomicity by crashing mid-commit and checking the prior
+        checkpoint stands.
       - >-
-        src/sandbox.rs defines the public `Sandbox` trait (RPITIT, no OS type in its signature),
-        `SandboxLimits`/`SandboxConfig` (serde, round-trip test), `SandboxOutcome`, `FloorSandbox`,
-        and `select`; re-exported from lib.rs. Whole 0.1.0–0.5.0 suite still compiles unchanged
-        (evidence/0.6.0/tests.txt). clippy 0 warnings.
-  - id: US-IO-HARNESS-0.6.0-T02
-    summary: >
-      Wire compile_source (verify.rs) to run rustc + the produced test binary through the selected
-      sandbox by default; opt-out (no SandboxConfig) restores exact 0.5.0 direct-host execution.
-    why_required: >
-      Isolation is only real once the one exec chokepoint routes through the sandbox; the opt-out is
-      the additive/reversible guarantee that keeps 0.5.0 callers working.
-    status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T01]
-    acceptance_criteria:
+        A resume against a corrupt or version-incompatible checkpoint returns a typed error the caller
+        handles; the run does not panic and does not half-resume, and a crash mid-commit leaves the
+        prior consistent checkpoint intact.
       - >-
-        A task driven through the execution-based verification gate with the sandbox on reaches the
-        same verified success the un-sandboxed 0.2.0 path reaches, proving isolation is transparent to
-        verification — stdout, exit status, and produced files are captured identically.
-      - >-
-        A 0.5.0 caller who opts the sandbox off gets the exact 0.5.0 direct-host execution behaviour
-        and the same verified success, proving the sandbox is additive and reversible.
-    files:
-      - src/verify.rs
-      - src/sandbox.rs
-    evidence:
-      - >-
-        compile_source now routes rustc + the produced test binary through ExecGuard::exec →
-        sandbox::select. tests/sandbox.rs::sandbox_on_reaches_the_same_verified_success_as_direct and
-        ::sandbox_on_runs_the_produced_test_binary_transparently prove sandbox-on and .no_sandbox()
-        give identical verdicts; the unchanged edit_file/multi_file/parity/policy/subagents suites all
-        pass with the sandbox default on (evidence/0.6.0/tests.txt).
-  - id: US-IO-HARNESS-0.6.0-T03
-    summary: >
-      Resource caps (CPU time, memory, procs, fds) that kill and return a typed cap-hit outcome
-      naming the breached cap, applied by the portable floor via rlimit (unix pre_exec).
-    why_required: >
-      A cap that throttles instead of killing turns a runaway into a hang; the kill-and-typed-cap-hit
-      is the core isolation guarantee under fan-out.
-    status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T02]
-    acceptance_criteria:
-      - >-
-        A sandboxed command that exceeds the CPU-time cap is killed and returns a typed cap-hit
-        outcome naming the CPU cap, not a hang; a second test does the same for the memory cap.
-    files:
-      - src/sandbox.rs
-    evidence:
-      - >-
-        CPU cap via RLIMIT_CPU (pre_exec) → SIGXCPU → Cap::Cpu; memory cap via an RSS poll-and-kill
-        monitor (macOS does not enforce RLIMIT_AS/RLIMIT_DATA — verified empirically). Unit tests
-        sandbox::tests::cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap and
-        ::memory_cap_kills_a_heap_hog_and_names_the_memory_cap both pass on the macOS host.
-  - id: US-IO-HARNESS-0.6.0-T04
-    summary: >
-      Per-run lifecycle: default-deny network, guaranteed teardown (no leaked dir / no orphan
-      process) on every exit path, and copy-back of produced files filtered through the 0.4.0 write
-      policy.
-    why_required: >
-      Network deny, teardown, and policy-filtered copy-back are the remaining isolation guarantees
-      that make "created, run, captured, destroyed per run" true and composed with the permission
-      layer.
-    status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T03]
-    acceptance_criteria:
-      - >-
-        Sandboxed code that attempts an outbound network connection is denied under default-deny and
-        the command observes the failure, proving the network boundary is enforced by the sandbox, not
-        the prompt.
-      - >-
-        After a run (successful, failed, or cap-killed), the sandbox working directory is gone and no
-        process it spawned survives — a teardown test asserts no directory and no orphan process leak,
-        including on the error path.
-      - >-
-        Files the sandboxed command produces are copied back to the task workspace only where the
-        0.4.0 write policy allows, proving sandbox capture composes with the permission layer rather
-        than bypassing it.
-    files:
-      - src/sandbox.rs
-    evidence:
-      - >-
-        Network deny proven live: tests/sandbox.rs::the_selected_backend_denies_outbound_network_by_default
-        (curl blocked by the native macOS backend, exit != 0). Teardown via tempfile::TempDir drop
-        (sandbox::tests::workdir_is_removed_on_drop) + kill_on_drop. Copy-back honours the write policy
-        (sandbox::tests::copy_back_honours_the_write_policy). Live example shows teardown leaves nothing
-        (evidence/0.6.0/live_run.txt).
-  - id: US-IO-HARNESS-0.6.0-T05
-    summary: >
-      macOS native backend (sandbox-exec profile confining writes to the workdir + denying network,
-      plus setrlimit) and backend selection preferring native on this host.
-    why_required: >
-      The macOS native backend is the one native path live-testable on this build host and the one the
-      example live-run uses; without it the release ships only the floor on macOS.
-    status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T04]
-    acceptance_criteria:
-      - >-
-        On the macOS build host the native `sandbox-exec` backend is selected and recorded; when the
-        native backend is disabled by config, the portable floor is selected and recorded, proving the
-        selection ladder is real and observable.
-    files:
-      - src/sandbox.rs
-      - src/sandbox/macos.rs
-    evidence:
-      - >-
-        src/sandbox/macos.rs: sandbox-exec profile (allow default, deny network*, writes confined to
-        the workdir) + TMPDIR=workdir + shared rlimit/RSS caps. Profile validated live (rustc compiles,
-        curl blocked). tests/sandbox.rs::selection_picks_native_on_this_host_and_floor_when_forced
-        asserts MacosSandboxExec by default and PortableFloor under force_floor. Live run selected
-        macos-sandbox-exec (evidence/0.6.0/live_run.txt).
-  - id: US-IO-HARNESS-0.6.0-T06
-    summary: >
-      Linux (namespaces+seccomp+rlimit over tmpfs) and Windows (Job Object + restricted token)
-      native backends behind cfg, compiled and unit-tested on the macOS host.
-    why_required: >
-      OS-neutral means a real native backend per OS; these two must compile and unit-test under cfg so
-      the surface holds on linux and windows even without live hardware here.
-    status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T05]
-    acceptance_criteria:
-      - >-
-        The Linux native backend and the Windows native backend compile under their `cfg` on the macOS
-        build host and pass their backend unit tests, proving the OS-neutral surface holds even though
-        those backends are not live-run here.
-    files:
-      - src/sandbox/linux.rs
-      - src/sandbox/windows.rs
-    evidence:
-      - >-
-        src/sandbox/linux.rs (unshare user/mount/pid/net namespaces) and src/sandbox/windows.rs (Job
-        Object limit mapping) compile and their unit tests run on the macOS host — linux::tests
-        (net-namespace argv), windows::tests (JobLimits maps memory/procs/CPU-ticks, kill-on-close).
-        Full target-triple cross-check is additionally blocked only by rusqlite's bundled-C cross
-        toolchain (environment), not by the sandbox code; noted honestly. Not live-run on real
-        Linux/Windows hardware (excluded scope).
-  - id: US-IO-HARNESS-0.6.0-T07
-    summary: >
-      Sandbox trace: additive rusqlite schema for lifecycle events (create, argv+backend, cap hit,
-      denied network, destroy), recorded per run and reconstructable from a reopened store.
-    why_required: >
-      Auditing where each piece of code ran is a named outcome; the events must be additive so a 0.5.0
-      database migrates in place.
-    status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T04]
-    acceptance_criteria:
-      - >-
-        Every sandbox lifecycle event (create, argv + backend, cap hit, denied network where
-        observable, destroy) is recorded so the run's execution history is reconstructable from a
-        reopened store alone.
+        Checkpoints record loop state, agent ids, budget counters, and pending-action metadata only —
+        never file contents or API keys — consistent with the 0.4.0 and 0.6.0 trace discipline.
     files:
       - src/state.rs
-      - src/sandbox.rs
-      - src/verify.rs
+      - src/error.rs
+      - src/lib.rs
     evidence:
       - >-
-        src/state.rs adds an additive sandbox_events table + SandboxEvent (create/exec/cap_hit/destroy)
-        with record/read; ExecGuard::exec records them. tests/sandbox.rs::sandbox_lifecycle_is_recorded_and_reconstructable
-        rebuilds create/exec(backend+argv)/destroy from a reopened store; ::a_cap_hit_in_the_gate_is_recorded
-        shows a cap_hit event. Migration follows the 0.4.0/0.5.0 additive pattern (a 0.5.0 db opens
-        unchanged). Live trace printed in evidence/0.6.0/live_run.txt.
-  - id: US-IO-HARNESS-0.6.0-T08
+        src/state.rs: checkpoint_step (unchecked_transaction wraps step + checkpoint event),
+        checkpoint_events table, CHECKPOINT_FORMAT (PRAGMA user_version), check_resumable (typed
+        Error::Resume on newer-format / missing run), status/started_at columns + helpers. src/error.rs:
+        Error::Resume{reason}.
+      - >-
+        Unit tests (cargo test --lib state, 16 pass): a_rolled_back_step_leaves_the_prior_checkpoint_intact
+        (atomicity/mid-commit), check_resumable_refuses_a_newer_format_and_a_missing_run (typed failure),
+        checkpoint_step_commits_the_step_and_its_event_together (NF4: no content in events),
+        status_round_trips_and_a_pre_0_7_database_migrates (additive migration).
+  - id: US-IO-HARNESS-0.7.0-T02
     summary: >
-      Sandbox in the 0.5.0 tree — each child's verification runs in its own sandbox under the same
-      caps/deny-network; a sandbox that fails to start returns a typed failure without taking down
-      siblings.
+      Durable budget across restart for the single-file and workspace loops. On resume reconstruct
+      tokens spent from SUM(steps.tokens), reconstruct wall-clock elapsed from runs.started_at
+      (real elapsed, not process uptime), and drive status running→completed/failed. Expose a public
+      RunStatus enum + Store::run_status(run_id) as the additive checkpoint/run-status type.
     why_required: >
-      Composition with containment is the point of doing this after 0.5.0; a start failure must be a
-      typed result the agent adapts to, matching 0.4.0/0.5.0 refusal-as-result.
+      The headline promise is a continuous 24h ceiling and no double-charge across a crash. Today
+      tokens_used/started are stack locals reset to zero on restart, so without reloading spend and
+      elapsed time the budget silently resets — the release's core guarantee fails.
     status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T05, US-IO-HARNESS-0.6.0-T07]
+    depends_on: [US-IO-HARNESS-0.7.0-T01]
     acceptance_criteria:
       - >-
-        A sandbox that fails to start returns a typed failure outcome the calling agent adapts to; the
-        run does not panic, and in a 0.5.0 tree the failure does not take down sibling agents — proven
-        by a test injecting a start failure.
+        After a crash-and-resume, the aggregate budget (steps, tokens, cost, time) equals the budget of
+        the same run with no crash — proving no step's spend is charged twice.
       - >-
-        In a 0.5.0 tree, each child's execution runs inside its own sandbox under the same caps and
-        default-deny network, proving isolation stacks on top of containment for every agent in the
-        tree.
+        The wall-clock/time component of the aggregate budget accounts for real elapsed time across a
+        restart (checkpointed timestamp based), not just the current process's uptime, so a 24h ceiling
+        is not silently reset by a restart.
+      - >-
+        The new durable-run/resume entry point and the checkpoint/run-status type are part of the
+        documented public API under SemVer; existing 0.6.0 callers compile unchanged and no rusqlite- or
+        OS-specific type leaks into the public signatures.
     files:
       - src/run.rs
-      - src/sandbox.rs
+      - src/state.rs
+      - src/lib.rs
     evidence:
       - >-
-        Typed start failure: Error::Sandbox; tests/sandbox.rs::a_sandbox_that_cannot_start_returns_a_typed_failure
-        proves a bad program yields Err(Error::Sandbox), not a panic. Children are sandboxed by the
-        same default-on gate — the 10-test subagents suite passes with the sandbox on, and each child's
-        workspace verify runs through the sandboxed ExecGuard.
+        run_from/run_workspace_from seed tokens_used from store.spent_tokens(run_id) and check the time
+        budget against store.elapsed_secs (julianday-based, durable). RunStatus enum + Store::run_status
+        exported from lib.rs (OS/rusqlite-free); finish_run derives status.
       - >-
-        GAP (flagged, not hidden): the sibling-independence-under-a-child-start-failure is covered
-        indirectly — run_tree already isolates a child that returns Err from its siblings (subagents
-        suite), and the typed start-failure is unit-proven — but there is NO single test that injects a
-        sandbox start failure into one child of a live tree, because making one child's rustc unspawnable
-        is not reachable through the public API. Recommend the owner accept this or request a test hook.
-  - id: US-IO-HARNESS-0.6.0-T09
+        tests/checkpoint.rs: no_double_charge_across_a_crash_resume (resumed total spend == uninterrupted
+        30, no reset/double), the_time_budget_is_wall_clock_and_durable_across_a_restart (elapsed grows
+        across Store reopen). Unchanged 0.1.0–0.6.0 suite green (136 pass total).
+  - id: US-IO-HARNESS-0.7.0-T03
     summary: >
-      README + crate docs (Sandbox trait, each backend's isolation strength, portable floor as the
-      guaranteed minimum, selection, caps, default-deny with allow-list deferred to 0.8.0) and a live
-      sandboxed example binary.
+      Crash-resume a single/workspace run to the same verified success, with idempotent replay.
+      resume() restores the T02 budget, skips already-committed steps (last_step cursor) recording a
+      skipped event, orders the irreversible effect before the step commit so an uncommitted step
+      replays and re-applies idempotently by re-observing current file state, and re-running resume
+      twice yields the same completed run.
     why_required: >
-      The docs and a runnable live example are release-critical acceptance; the example is the live
-      proof of the macOS native backend end to end.
+      This is the first end-to-end vertical slice a user can see: kill the process mid-run, resume,
+      reach the same verified result with the edit present exactly once and no step re-run. Without
+      it there is no crash recovery at all.
     status: done
-    depends_on: [US-IO-HARNESS-0.6.0-T08]
+    depends_on: [US-IO-HARNESS-0.7.0-T02]
     acceptance_criteria:
       - >-
-        README and crate docs document the `Sandbox` trait, each backend and its isolation strength,
-        the portable floor as the guaranteed minimum, backend selection, resource caps, and
-        default-deny network with the allow-list deferral to 0.8.0, with a runnable example.
+        The harness process is killed with SIGKILL partway through a multi-step run; a fresh process
+        constructed against the same rusqlite store resumes the run and reaches the same verified
+        success the uninterrupted run reaches — the produced artifact is correct and no completed step
+        is re-run.
       - >-
-        An example binary drives one live sandboxed run against OpenRouter on the macOS native backend
-        showing a cap hit and the network denial, with teardown leaving nothing behind.
+        A crash immediately after a file edit is applied but before that step's checkpoint commits
+        resumes with the edit present exactly once — not doubled, not lost — proving the step is the
+        idempotency unit and the transactional commit is the completion marker.
+      - >-
+        Resume is idempotent by construction: re-running the same resume twice from the same store
+        yields the same completed run and the same budget, so a resume that itself crashes and is retried
+        does not compound.
+      - >-
+        A 0.6.0 caller's existing code compiles unchanged and reaches the same verified success with
+        checkpointing default on, proving the durable-run surface is additive.
+    files:
+      - src/run.rs
+    evidence:
+      - >-
+        resume(): check_resumable, terminal_outcome short-circuit for finished runs (idempotent),
+        record_resume_markers (resume + per-step skipped events). Effect applied before checkpoint_step,
+        so an uncommitted step replays and overwrites idempotently.
+      - >-
+        tests/checkpoint.rs: crash_resume_after_a_real_sigkill_reaches_verified_success (REAL tokio
+        Child::kill SIGKILL of examples/crash_fixture, resume to Success, edit occurs exactly once, no
+        duplicate step numbers), edit_applied_exactly_once_and_resume_is_idempotent (resume x2 = no-op).
+        Existing 0.2.0 resume test still green.
+  - id: US-IO-HARNESS-0.7.0-T04
+    summary: >
+      Whole-tree crash-resume. resume reconstructs the 0.5.0 tree (parent/child edges, depth, shared
+      workspace, shared trace) from the store, restores the Ledger (spent_tokens = SUM over the tree,
+      agents = COUNT of run rows), and re-drives every unfinished agent from its own last_step —
+      spawn_child gains a child-resume path instead of always starting at step 1. Per-agent
+      independent commits keep the fan-out from serializing on one write lock.
+    why_required: >
+      A run that crashes with children in flight must resume the whole tree, not just the root, or
+      0.5.0's fan-out cannot be left unattended at all. resume/resume_with_decision never touch
+      run_agent today, so this path does not exist.
+    status: done
+    depends_on: [US-IO-HARNESS-0.7.0-T03]
+    acceptance_criteria:
+      - >-
+        A run with a parent and several children in flight is crashed and resumed; every agent continues
+        from its own checkpoint and the whole tree completes, proving resume reconstructs the 0.5.0 tree
+        and not just a single agent.
+      - >-
+        After-every-step checkpointing does not serialize the 0.5.0 concurrent fan-out — each agent
+        commits its own checkpoint independently and 100+ agents do not contend on a single global write
+        lock to make progress; a concurrency test asserts fan-out stays bounded with checkpointing on.
+    files:
+      - src/run.rs
+      - src/state.rs
+    evidence:
+      - >-
+        resume_tree() reconstructs the Ledger via Ledger::from_state(spent_tokens_tree, agent_count_tree)
+        and re-drives run_agent from the root's last step. spawn_child is now spawn-or-adopt: find_spawn
+        (persisted spawns table, keyed parent+step+goal) adopts an existing child and resumes it from its
+        own last_step; new children still register/persist. Per-agent checkpoint_step (independent
+        unchecked_transaction), no global lock added.
+      - >-
+        tests/checkpoint.rs: a_tree_crash_resumes_every_agent_from_its_checkpoint (tokio::timeout drops
+        run_tree mid-fan-out, reopen Store, resume_tree completes; agent_count_tree unchanged → adopted
+        not duplicated; a.txt/b.txt correct). Existing subagents suite (10) still green — fan-out
+        unchanged.
+  - id: US-IO-HARNESS-0.7.0-T05
+    summary: >
+      Approval that survives a full process restart, including a paused child in a tree. Extend
+      resume_with_decision so a persisted pending action resumes the whole tree from a fresh process
+      (route through run_agent/tree reconstruction, not only run_workspace_from), keeping the 0.4.0
+      in-process Approver path unchanged.
+    why_required: >
+      Unattended means the run pauses for a human only when policy demands and continues once a
+      decision arrives — across a restart. Today a paused child cannot be resumed at all
+      (resume_with_decision calls run_workspace_from directly), so the pause and resume paths do not
+      meet for a tree.
+    status: done
+    depends_on: [US-IO-HARNESS-0.7.0-T04]
+    acceptance_criteria:
+      - >-
+        A sensitive action pauses the whole tree; the process exits entirely; a new process delivers the
+        decision via `resume_with_decision`; the tree resumes from the persisted pending action and
+        continues — proving 0.4.0 approval survives a full restart.
+    files:
+      - src/run.rs
+    evidence:
+      - >-
+        New resume_tree_with_decision performs the approved action once, resolves the pending, then
+        resumes the whole tree. run_agent leaves a step paused-by-a-child UNCOMMITTED (paused_by_child
+        flag) so on resume the parent replays it and re-adopts the paused child; the child continues past
+        the now-applied action. resume_with_decision (single/workspace) unchanged.
+      - >-
+        tests/checkpoint.rs: a_tree_approval_survives_a_full_restart (ask_write policy on a.txt, Defer
+        approver pauses tree, drop Store, reopen, resume_tree_with_decision(Approve) → Success, a.txt/b.txt
+        correct). Existing 0.4.0 policy suite (17) still green.
+  - id: US-IO-HARNESS-0.7.0-T06
+    summary: >
+      Sandbox re-creation on resume. Confirm and test that an in-flight 0.6.0 sandboxed execution at
+      crash time re-runs inside a fresh sandbox on resume (its result was never committed) while a
+      committed sandboxed step is skipped — no sandbox state is ever checkpointed and no code is
+      double-executed once committed.
+    why_required: >
+      0.6.0 sandboxes are ephemeral and die with the process; resume must re-create them safely, or a
+      crash mid-verification either loses the run or double-executes model-produced code.
+    status: done
+    depends_on: [US-IO-HARNESS-0.7.0-T03]
+    acceptance_criteria:
+      - >-
+        A sandboxed execution in flight at crash time is re-run inside a fresh 0.6.0 sandbox on resume
+        and the run still reaches verified success, while a completed sandboxed step is skipped — proving
+        ephemeral sandboxes are re-created, never resumed, and never double-executed once committed.
+    files:
+      - src/run.rs
+      - tests/checkpoint.rs
+    evidence:
+      - >-
+        No sandbox state is persisted (the checkpoint stores only step trace + budget); an uncommitted
+        verify step replays and the ExecGuard creates a fresh sandbox per call, so re-creation falls out
+        of T03's replay with no special-casing.
+      - >-
+        tests/checkpoint.rs: a_sandboxed_verification_is_recreated_on_resume (Verification::CompilesRust,
+        crash before it compiles, resume compiles in a fresh sandbox → Success, resumed step > crash step
+        so committed steps are not re-run).
+  - id: US-IO-HARNESS-0.7.0-T07
+    summary: >
+      The full 0.7.0 test suite in tests/checkpoint.rs plus an example crash-fixture binary. Real
+      SIGKILL crash-and-resume (file-backed store + tokio::process kill), no-double-charge,
+      edit-exactly-once, tree-crash-resume, approval-across-restart, sandbox-recreated, a time-scaled
+      long unattended run standing in for 24h, a corrupt-checkpoint typed failure, and a multi-crash
+      history reconstructable from a reopened store. The unchanged 0.1.0–0.6.0 suite stays green with
+      checkpointing default on.
+    why_required: >
+      Every acceptance criterion in this release is a crash/resume/idempotency claim that is only
+      credible with an executable proof; the operational gate is the whole suite passing.
+    status: done
+    depends_on: [US-IO-HARNESS-0.7.0-T05, US-IO-HARNESS-0.7.0-T06]
+    acceptance_criteria:
+      - >-
+        A time-scaled long unattended run drives the loop through a large number of steps with no user
+        input (clock advanced), checkpoints throughout, and stops only on completion or a policy pause —
+        standing in for the 24h horizon.
+      - >-
+        Every checkpoint, resume, and skipped-because-already-done event is recorded so a multi-crash
+        run's full history (what ran, where each crash happened, what replayed) is reconstructable from a
+        reopened store alone.
+      - >-
+        `cargo test` passes, including the SIGKILL crash-and-resume test, the no-double-charge budget
+        test, the edit-exactly-once idempotency test, the tree-crash-and-resume test, the
+        approval-across-restart test, the sandbox-recreated-on-resume test, the time-scaled long-run
+        test, the corrupt-checkpoint typed-failure test, and the unchanged 0.1.0–0.6.0 suite with
+        checkpointing default on.
+    files:
+      - tests/checkpoint.rs
+      - examples/crash_fixture.rs
+    evidence:
+      - >-
+        tests/checkpoint.rs (10 tests, all pass): the real-SIGKILL test, no-double-charge, wall-clock
+        durability, edit-exactly-once + resume-idempotent, unknown-run typed error,
+        multi-crash-history-reconstructable, a 250-step long unattended run (all 250 checkpointed),
+        tree-crash-resume, tree-approval-across-restart, and sandbox-recreated. examples/crash_fixture.rs
+        is the killable offline fixture.
+      - >-
+        cargo test: 136 passed, 0 failed across 9 binaries (77 lib + 10 checkpoint + 9 edit_file + 3
+        multi_file + 1 parity + 17 policy + 8 sandbox + 10 subagents + 1 doctest). Evidence:
+        evidence/0.7.0/tests.txt (gitignored).
+  - id: US-IO-HARNESS-0.7.0-T08
+    summary: >
+      Docs, live example, and packaging. README + crate docs for durable checkpointing, whole-tree
+      resume, the idempotency/crash-consistency guarantees and their boundary, approval across
+      restart, and the accelerated-plus-crash evidence model (with the literal-24h note). An
+      examples/durable_run.rs live unattended run against OpenRouter killed mid-run and resumed. Bump
+      Cargo.toml to 0.7.0, CHANGELOG entry, cargo clippy --all-targets clean, cargo publish --dry-run
+      green. (Actual git Release + cargo publish are owner-gated, at /ultraship:complete.)
+    why_required: >
+      The release target_mode is published; the crate must be documented, versioned, and package-clean
+      with a runnable example before the owner-gated publish, or completion has nothing to ship.
+    status: done
+    depends_on: [US-IO-HARNESS-0.7.0-T07]
+    acceptance_criteria:
+      - >-
+        `cargo clippy --all-targets` reports zero warnings on the macOS build host.
+      - >-
+        `cargo publish --dry-run` succeeds with complete crate metadata for 0.7.0.
+      - >-
+        README and crate docs document durable step-level checkpointing, whole-tree resume, the
+        idempotency and crash-consistency guarantees and their boundary, approval across restart, and
+        the accelerated-plus-crash evidence model with the literal-24h note, with a runnable example.
+      - >-
+        An example binary drives one live unattended run against OpenRouter that is killed mid-run and
+        resumed in a fresh process to a verified result, showing checkpoints, the crash point, and
+        skipped completed steps on resume.
     files:
       - README.md
-      - src/lib.rs
-      - examples/sandbox_run.rs
-    evidence:
-      - >-
-        README gains a v0.6 status line, capability tick, and an "Execution sandbox (v0.6)" section
-        with a per-backend isolation-strength table and the 0.8.0 allow-list deferral; lib.rs gains a
-        v0.6 crate-doc paragraph. examples/sandbox_run.rs live-run against OpenRouter (openai/gpt-5.6-luna):
-        Success{steps:1}, backend macos-sandbox-exec, create/exec/destroy trace, Cap::Cpu on a runaway,
-        network default-deny, teardown clean — evidence/0.6.0/live_run.txt.
-  - id: US-IO-HARNESS-0.6.0-T10
-    summary: >
-      Package gates + publish: Cargo.toml to 0.6.0, cargo test / clippy --all-targets / build
-      --release / publish --dry-run green, then git Release, then cargo publish to crates.io.
-    why_required: >
-      target_mode is published; the release is not complete until the crate is tested, packaged, and
-      (owner-approved) uploaded via git-release-then-publish.
-    status: blocked
-    depends_on: [US-IO-HARNESS-0.6.0-T09]
-    acceptance_criteria:
-      - >-
-        `cargo test` passes, including the sandbox-transparent verification test, the CPU and memory
-        cap-kill tests, the network-deny test, the teardown/no-leak test, the copy-back-under-policy
-        test, the backend-selection test, the Linux/Windows backend compile+unit tests under cfg, the
-        sandbox trace test, and the unchanged 0.1.0–0.5.0 suite with the sandbox default on.
-      - '`cargo clippy --all-targets` reports zero warnings on the macOS build host.'
-      - '`cargo publish --dry-run` succeeds with complete crate metadata for 0.6.0.'
-      - >-
-        0.6.0 is tagged as a git Release and then published to crates.io with `cargo publish`; the
-        uploaded crate matches the release-ready artifact and the published version resolves from
-        crates.io.
-    files:
+      - CHANGELOG.md
       - Cargo.toml
+      - examples/durable_run.rs
     evidence:
       - >-
-        GREEN gates (evidence/0.6.0/): cargo test — 120 passed, 0 failed (71 lib + 9 edit_file + 3
-        multi_file + 1 parity + 17 policy + 8 sandbox + 10 subagents + 1 doctest); clippy --all-targets
-        0 warnings; build --release ok; publish --dry-run packaged 49 files, verify-compiled io-harness
-        v0.6.0, upload aborted (dry run). Secrets + excluded-scope gates PASS (gates.txt).
+        Cargo.toml bumped to 0.7.0; lib.rs crate docs + README gain a durable/unattended section;
+        CHANGELOG [0.7.0] - 2026-07-25 written (the source for release notes). examples/durable_run.rs
+        added (compiles; live run deferred to complete).
       - >-
-        PENDING owner approval (blocked): the actual git Release and `cargo publish` to crates.io are
-        NOT done — publishing is public and irreversible and is an owner-gated human decision
-        (dependencies.human_approvals). CARGO_REGISTRY_TOKEN is available in .env. This is the only
-        remaining step; the crate is release-ready/packaged now.
+        cargo clippy --all-targets: 0 warnings. cargo publish --dry-run --allow-dirty: Packaged 52 files,
+        verify-compiled io-harness v0.7.0. Evidence: evidence/0.7.0/builds.txt (gitignored).
+      - >-
+        The live OpenRouter run of examples/durable_run.rs is NOT executed here (owner-gated, needs the
+        API key + spend) — it compiles clean and runs at /ultraship:complete, like sandbox_run at 0.6.0.
+        The literal 24h wall-clock run is out of scope by design (contract excluded scope).

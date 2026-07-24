@@ -1,0 +1,78 @@
+product: io-harness
+version: 0.7.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers:
+  - >
+    OWNER APPROVAL — the git Release and `cargo publish` to crates.io (target_mode: published) are
+    owner-gated and NOT done. Publishing is public and irreversible. The crate is release-ready and
+    all package gates are green (cargo test 136 passed / clippy 0 / build --release / publish
+    --dry-run for v0.7.0). CARGO_REGISTRY_TOKEN is in .env. This is the remaining implementation
+    step, handled at /ultraship:complete.
+  - >
+    DEFERRED LIVE RUN (not a defect) — examples/durable_run.rs (the live unattended-then-resumed run
+    against OpenRouter) compiles clean but is NOT executed here: it needs the API key and real spend,
+    so it runs at /ultraship:complete, exactly as examples/sandbox_run did for 0.6.0. The literal 24h
+    wall-clock run is out of scope by design (contract excluded scope); the horizon is proven by the
+    real-SIGKILL resume test plus a 250-step long unattended run.
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The foundation for durable resume already exists and is well shaped. The store persists a
+      per-step `steps` row (with `tokens`) via `record()`, `last_step(run_id)` is already the
+      resume cursor for single/workspace runs, `pending_approvals` already persists a paused
+      action, and the schema migrates by additive idempotent DDL (`CREATE TABLE IF NOT EXISTS` +
+      best-effort `ALTER`) with no version table to fight. So "checkpoint after every step" is not
+      new machinery — the step record IS the checkpoint; 0.7.0 makes it the transactional
+      completion marker and adds the read-back path, rather than inventing persistence from zero.
+    - >
+      The durable-budget gap is real but cheaply closable. Today `tokens_used`/`started: Instant`
+      are stack locals reset to zero on restart and the tree `Ledger` is in-memory only — but
+      `steps.tokens` is already persisted per step and every run/child is a `runs` row, so the
+      aggregate budget reconstructs on resume with `SUM(steps.tokens)` and `COUNT` over the tree
+      plus a stored `started_at` for wall-clock elapsed. No new budget table is required; the data
+      is already on disk, only the reload path is missing.
+    - >
+      No time, budget, or capacity constraint is recorded (`ultraship state` reports
+      `active.constraints` absent and `ultraship constraints show` reports none), so this assessment
+      is made against the code's condition and product.yaml's constraints (Rust crate, tokio,
+      rusqlite, embeddable in-process, local single-user, single-machine), not against a stated
+      limit. Single-machine resume is a favorable constraint here — there is no distributed
+      checkpoint or cross-host handoff problem to solve. If the owner records a tight limit, the
+      contract's fallback_scope (transactional checkpoint + single/small-tree resume + idempotent
+      replay + approval-across-restart, publish held to release-ready) is the smaller landing.
+    - >
+      Deterministic offline test doubles already exist — `MockWriter`, `MockNoop`, `MockScript`
+      (multi-step), and there is already a 0.2.0 "resume an interrupted run" test — so the crash and
+      idempotency proofs need no network and no real model. A real SIGKILL crash is provable with a
+      file-backed store, an example crash-fixture binary driven by a scripted provider, and
+      `tokio::process` kill-then-resume, which is standard.
+  major_cost_drivers:
+    - >
+      Tree crash-resume has no existing path. `resume`/`resume_with_decision` only drive
+      `run_workspace_from`/`run_from`, never `run_agent`; `spawn_child` always starts children at
+      step 1; and the in-memory `Ledger` is rebuilt fresh each `run_tree`. Reconstructing the whole
+      0.5.0 tree (parent/child edges, per-agent resume cursor, restored ledger) from the store and
+      re-driving every unfinished agent from its own checkpoint is the single largest piece of new
+      work.
+    - >
+      The idempotency invariant on the irreversible-effect path. A file write cannot literally join
+      the rusqlite transaction, so the guarantee is "committed step ⇒ effect already applied; an
+      uncommitted step replays and re-applies idempotently by re-observing current file state."
+      Ordering (apply-and-fsync effect, then commit the step) and proving edit-exactly-once across a
+      real crash window is the sharpest correctness risk.
+    - >
+      Approval across a full process restart in a tree. Today `resume_with_decision` cannot resume a
+      paused child (it calls `run_workspace_from` directly, not `run_agent`), so the pause-in-tree
+      and the resume-of-tree paths do not currently meet. Making a persisted pending action resume
+      the whole tree from a fresh process is new plumbing over the 0.4.0 mechanism.
+    - >
+      After-every-step checkpoint writes must not serialize the 0.5.0 100+ concurrent fan-out — each
+      agent must commit its own step independently (WAL, per-agent), not through one global write
+      lock, or durability undoes concurrency.
+    - >
+      Proving the 24h horizon honestly without a literal 24h run — a time-scaled long run plus a
+      real crash-resume test designed so the substitution is defensible, with the literal wall-clock
+      run named in excluded scope as not-live-run.
+  recommended_scope_change: null
