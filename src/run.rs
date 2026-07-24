@@ -304,6 +304,10 @@ async fn run_from<P: Provider>(
     let tool = write_file_tool();
     let started = Instant::now();
     let mut tokens_used: u64 = 0;
+    // Single-file mode is not policy-enforced (0.4.0), but the verify gate is
+    // still sandboxed (0.6.0). A permissive guard carries the trace so the
+    // sandbox lifecycle is recorded for single-file runs too.
+    let permissive = Policy::permissive();
 
     for step in start_step..=contract.max_steps {
         // Time budget: checked before doing the step's work.
@@ -362,7 +366,12 @@ async fn run_from<P: Provider>(
         }
 
         let contents = fs.read().await?;
-        if contract.verify.passes(&contract.file, &contents).await? {
+        let guard = ExecGuard::new(&permissive).tracing(store, run_id, step);
+        if contract
+            .verify
+            .passes_guarded(&contract.file, &contents, &guard)
+            .await?
+        {
             store.finish_run(run_id, "success")?;
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id));
         }
