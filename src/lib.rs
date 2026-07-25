@@ -67,6 +67,64 @@
 //! [`resume_tree_with_decision`]. A resume against a newer-format or missing
 //! checkpoint is a typed [`Error::Resume`], never a panic or a half-resume.
 //!
+//! v0.8 makes the harness **extensible, and its network reach governed**. It is
+//! an MCP client: [`TaskContract::with_mcp`] connects [`McpServer`]s — spawned as
+//! child processes ([`McpTransport::Stdio`]) or dialled over streamable HTTP
+//! ([`McpTransport::Http`]) — and their tools are offered to the model beside the
+//! built-ins under `mcp__<server>__<tool>`, so a server can never shadow
+//! `write_file`. A capability the crate lacks is added by pointing it at a
+//! server, not by forking it. Tool calls carry a timeout, results are size-capped,
+//! and one session serves a whole v0.5 tree.
+//!
+//! Because a configured server is the first thing here that can dial an arbitrary
+//! host, the v0.4 policy gains a fourth act: [`Act::Net`]. An outbound connection
+//! has a target (`host` or `host:port`) decided by the same deny-first stack that
+//! decides paths and binaries — [`Policy::allow_net`], [`Policy::deny_net`],
+//! [`Policy::ask_net`] — and *every* connection the harness opens passes one
+//! checked entry point before a socket exists. Network defaults to deny; the
+//! harness contributes the configured provider's host as a visible layer named
+//! `provider`, so a deny-all base still reaches its model and the trace says why.
+//! An explicit deny of that host still wins. A v0.5 child inherits its parent's
+//! network rules and can only narrow them, and a network `Ask` survives a full
+//! restart on the v0.7 durable path.
+//!
+//! What it does **not** govern: a stdio server is a separate process, and once
+//! running it dials what it likes. The harness decides whether it may start (an
+//! [`Act::Exec`] check on its binary) and which of its tools may be called (an
+//! [`Act::Exec`] check on the namespaced name) — not what it does afterwards.
+//!
+//! ```no_run
+//! use io_harness::{run_with, ApproveAll, McpServer, OpenRouter, Policy, Store,
+//!                  TaskContract, Verification};
+//!
+//! # async fn mcp_demo() -> io_harness::Result<()> {
+//! let contract = TaskContract::workspace(
+//!     "summarise the repo's README into NOTES.md",
+//!     "/path/to/repo",
+//!     Verification::WorkspaceFileContains { file: "NOTES.md".into(), needle: "#".into() },
+//! )
+//! .with_mcp([McpServer::stdio("files", "my-mcp-file-server")]);
+//!
+//! // Deny-by-default egress. The provider's own host is allowed by the harness's
+//! // `provider` layer; nothing else is reachable, and a stdio server may start
+//! // only because the exec rule names it.
+//! let policy = Policy::default()
+//!     .layer("app")
+//!     .allow_read("*")
+//!     .allow_write("*")
+//!     .allow_exec("my-mcp-file-server");
+//!
+//! let result = run_with(&contract, &OpenRouter::from_env()?, &Store::memory()?,
+//!                       &policy, &ApproveAll).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! A refusal is not an error the caller has to catch mid-loop: an out-of-policy
+//! *tool call* comes back to the model as an observation it can adapt to, while a
+//! denied host or an unstartable server fails the run with [`Error::Refused`] or
+//! [`Error::Mcp`] before anything happens.
+//!
 //! v0.3 adds repository work: [`TaskContract::workspace`] runs a multi-tool loop
 //! where the agent greps, finds, reads, and writes several files under one root,
 //! verified together ([`Verification::WorkspaceTestPasses`]). It also adds the
@@ -100,6 +158,8 @@ pub mod approve;
 pub mod containment;
 mod contract;
 mod error;
+pub mod mcp;
+mod net;
 pub mod policy;
 pub mod provider;
 mod run;
@@ -122,10 +182,11 @@ pub use run::{
     RunOutcome, RunResult, SPAWN_TOOL,
 };
 pub use state::{
-    CheckpointEvent, Pending, PolicyEvent, RunStatus, SandboxEvent, StepRecord, Store,
+    CheckpointEvent, McpEvent, Pending, PolicyEvent, RunStatus, SandboxEvent, StepRecord, Store,
     CHECKPOINT_FORMAT,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome, Selected,
 };
+pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

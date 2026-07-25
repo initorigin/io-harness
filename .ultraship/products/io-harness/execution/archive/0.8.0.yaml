@@ -1,0 +1,90 @@
+product: io-harness
+version: 0.8.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers:
+  - >
+    OWNER APPROVAL — the git Release and `cargo publish` to crates.io (target_mode: published) are
+    owner-gated and NOT done during develop. Publishing is public and irreversible. Handled at
+    /ultraship:complete, after the feat→develop and develop→main PRs the owner merges by hand.
+  - >
+    DEFERRED LIVE RUN (not a defect) — examples/mcp_run.rs, which performs both evidence_of_value
+    runs (a real MCP server used under a network-deny policy, then the same task with the MCP host
+    denied and refused before a socket exists), is written and compiles clean but is NOT executed
+    here: it needs OPENROUTER_API_KEY and real spend, so it runs at /ultraship:complete, exactly as
+    examples/sandbox_run did for 0.6.0 and examples/durable_run for 0.7.0. O4 is the only unmet
+    acceptance criterion at the end of develop.
+  - >
+    OWNER DECISION PENDING — F9 says a server whose binary does not start is "handled by the 0.2.0
+    retry/recovery path". The implementation instead fails the run with a typed Error::Mcp at
+    session construction, because connecting happens before step 1, retrying a missing binary cannot
+    make it appear, and proceeding without a configured capability is the worse failure. The other
+    three F9 legs (tool error, timeout, mid-run death) DO go through the loop as recoverable
+    observations. Read F9 as "typed error, traced, no panic" and it is met; require the retry path
+    and this needs /ultraship:iterate. Not a decision to take quietly.
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The permission model is already the right shape for a fourth act, and that is the half of the
+      release that carries the correctness risk. `Act` is a plain 3-variant enum, `Defaults` is a
+      3-field struct, and `Policy::check`/`explain`/`merge`/`contain` are act-generic — they match
+      on `act` to pick a default and otherwise treat rules uniformly, and `contain` already computes
+      "allows intersect, denies union" without enumerating acts. So network becomes a fourth act
+      threaded through existing machinery, not a parallel egress subsystem. Containment (F7) and
+      layer attribution (F8) largely fall out of code that already exists and is already tested.
+    - >
+      The enforcement point is genuinely narrow, which is what makes F4 provable rather than
+      aspirational. Every outbound call in the crate today is one of three provider `complete()`
+      implementations, each using one `reqwest::Client`; nothing else dials out. Adding MCP adds
+      exactly one more (the streamable-HTTP transport), and that transport accepts a caller-supplied
+      `reqwest::Client`, so it funnels through the same construction path. "Find every place a
+      connection is opened" is a bounded search across four sites, not an audit of the whole crate.
+    - >
+      The two largest technical unknowns were retired before this assessment rather than assumed
+      away. A compiled spike against rmcp 2.2.0 confirms the client API this release needs
+      (`().serve(transport)`, `list_all_tools`, `call_tool`, `cancel`) for both the child-process
+      and streamable-HTTP transports, and confirms the transport takes our own `reqwest::Client` so
+      the redirect-hop bypass is closable. The forced `reqwest` 0.12→0.13 bump (rmcp 2.2.0 requires
+      0.13.2) was applied to the real crate and it builds with no source change — only the
+      `rustls-tls`→`rustls` feature rename. What is left is integration work, not discovery.
+    - >
+      No time, budget, or capacity constraint is recorded (`ultraship state` reports no
+      `active.constraints`; `ultraship constraints show` reported none before this release was made
+      active), so this assessment is made against the code's condition and product.yaml's
+      constraints — Rust crate, tokio, rusqlite, own HTTP+SSE client, embeddable in-process, local
+      single-user — not against a stated limit. Nothing here is measured: UltraShip has no provider
+      telemetry, and `probable` is a judgement about the shape of the work, not a number. If the
+      owner records a tight limit, the contract's `fallback_scope` (stdio transport only, dropping
+      streamable HTTP and durable network approval) is the smaller landing.
+    - >
+      The offline test doubles this release needs already exist or are cheap.
+      `MockScript`/`MockNoop` drive the loop without a provider, and the 0.4.0 policy suite plus the
+      0.5.0 fan-out suite pin the behaviour that must not regress. The two genuinely new fixtures —
+      a stdio MCP server and a connection-attempt listener that proves a refused call opened no
+      socket — are small standalone binaries, not infrastructure.
+  major_cost_drivers:
+    - >
+      Threading a fourth act through every serde and trace surface without regressing
+      read/write/exec. `Act` and `Defaults` are public and serialized; `Defaults` has no
+      `#[serde(default)]` today, so a 0.7.0-era policy JSON must be made to deserialize to the
+      owner-decided network default (Deny) rather than fail, and every existing policy test must
+      stay green.
+    - >
+      MCP session lifetime against the 0.5.0 tree. One connection per run shared by every agent is
+      the decided model, but `run_agent` is recursive and children are spawned concurrently, so the
+      session has to be shared by reference through `Tree` without becoming a lock that serializes
+      the fan-out (NF2).
+    - >
+      MCP failure modes are the widest new surface (F9): a server binary that does not exist, a
+      server killed mid-run, a tool returning `is_error`, and a call that never returns each have to
+      land as a typed error on the existing 0.2.0 retry path — and the timeout case needs a real
+      timeout wrapper the crate does not have today.
+    - >
+      Proving a refusal opened no socket. F4 is only meaningful if asserted against something that
+      would notice a connection; that needs a listener fixture and a check placed before the client
+      is ever handed the URL, including on the redirect path.
+    - >
+      The `reqwest` 0.13 bump is a public dependency change for a published crate. It builds clean,
+      but it reaches every provider and is inherited by io-cli and io-studio.
+  recommended_scope_change: null

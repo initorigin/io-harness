@@ -36,6 +36,14 @@ pub struct TaskContract {
     /// How many times a failing provider/tool step is retried before the run
     /// escalates the error. Defaults to 2.
     pub max_retries: u32,
+    /// MCP servers to connect for this run. Their tools are offered to the model
+    /// beside the built-ins, namespaced `mcp__<server>__<tool>`.
+    ///
+    /// Empty by default, so a 0.7.0-era contract behaves exactly as before.
+    /// Workspace mode only: single-file mode has one tool and no tool layer to
+    /// extend.
+    #[allow(clippy::doc_markdown)]
+    pub mcp: Vec<crate::mcp::McpServer>,
 }
 
 impl TaskContract {
@@ -52,6 +60,7 @@ impl TaskContract {
             max_duration: None,
             max_tokens: None,
             max_retries: 2,
+            mcp: Vec::new(),
         }
     }
 
@@ -76,7 +85,21 @@ impl TaskContract {
             max_duration: None,
             max_tokens: None,
             max_retries: 2,
+            mcp: Vec::new(),
         }
+    }
+
+    /// Connect these MCP servers for the run and offer their tools to the model.
+    ///
+    /// Each server is authorized before it is reached — spawning a stdio server
+    /// is an exec check on its binary, dialling an HTTP one is a network check
+    /// on its host — so configuring a server here does not grant access to it.
+    pub fn with_mcp<I>(mut self, servers: I) -> Self
+    where
+        I: IntoIterator<Item = crate::mcp::McpServer>,
+    {
+        self.mcp = servers.into_iter().collect();
+        self
     }
 
     /// Override the step budget.

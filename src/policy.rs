@@ -25,6 +25,9 @@ pub enum Act {
     Write,
     /// Spawn a binary (the verification layer's compile/test commands).
     Exec,
+    /// Open an outbound connection. The target is a host, normally in
+    /// `host:port` form — see [`Policy::check`] for how a rule matches one.
+    Net,
 }
 
 /// What a rule does. Ordered by strictness: `Allow` < `Ask` < `Deny`.
@@ -73,6 +76,21 @@ pub struct Defaults {
     pub write: Effect,
     /// Default for spawning a binary.
     pub exec: Effect,
+    /// Default for opening an outbound connection.
+    ///
+    /// `#[serde(default)]` is load-bearing: a policy serialized by 0.7.0 or
+    /// earlier has no `net` field at all, and it deserializes here to `Deny`.
+    /// That is a deliberate behaviour change — an old config that made outbound
+    /// calls stops making them until it carries a `net` allow — chosen because
+    /// the alternative silently leaves egress ungoverned for exactly the callers
+    /// who upgraded to govern it.
+    #[serde(default = "deny")]
+    pub net: Effect,
+}
+
+/// The `net` default for a policy that predates the field. See [`Defaults::net`].
+fn deny() -> Effect {
+    Effect::Deny
 }
 
 /// The outcome of evaluating a policy, with the rule and layer that produced it.
@@ -139,6 +157,11 @@ impl Default for Policy {
                 read: Effect::Allow,
                 write: Effect::Ask,
                 exec: Effect::Ask,
+                // Deny, not Ask: an outbound host is not a thing a human can
+                // meaningfully approve on sight mid-run without knowing why it
+                // is being dialled, and the caller naming its hosts up front is
+                // the whole point of the act.
+                net: Effect::Deny,
             },
         }
     }
@@ -154,6 +177,7 @@ impl Policy {
                 read: Effect::Allow,
                 write: Effect::Allow,
                 exec: Effect::Allow,
+                net: Effect::Allow,
             },
         }
     }
@@ -165,6 +189,7 @@ impl Policy {
             && self.defaults.read == Effect::Allow
             && self.defaults.write == Effect::Allow
             && self.defaults.exec == Effect::Allow
+            && self.defaults.net == Effect::Allow
     }
 
     /// Start a new named layer. Subsequent rule builders append to it.
@@ -219,6 +244,18 @@ impl Policy {
     pub fn deny_exec(self, pattern: impl Into<String>) -> Self {
         self.rule(Act::Exec, Effect::Deny, pattern)
     }
+    /// Allow outbound connections to hosts matching `pattern`.
+    pub fn allow_net(self, pattern: impl Into<String>) -> Self {
+        self.rule(Act::Net, Effect::Allow, pattern)
+    }
+    /// Deny outbound connections to hosts matching `pattern`.
+    pub fn deny_net(self, pattern: impl Into<String>) -> Self {
+        self.rule(Act::Net, Effect::Deny, pattern)
+    }
+    /// Require approval for outbound connections to hosts matching `pattern`.
+    pub fn ask_net(self, pattern: impl Into<String>) -> Self {
+        self.rule(Act::Net, Effect::Ask, pattern)
+    }
 
     /// Stack `overlay` on top of this policy.
     ///
@@ -232,6 +269,7 @@ impl Policy {
             read: self.defaults.read.max(overlay.defaults.read),
             write: self.defaults.write.max(overlay.defaults.write),
             exec: self.defaults.exec.max(overlay.defaults.exec),
+            net: self.defaults.net.max(overlay.defaults.net),
         };
         self
     }
@@ -272,6 +310,7 @@ impl Policy {
                 read: self.defaults.read.max(child.defaults.read),
                 write: self.defaults.write.max(child.defaults.write),
                 exec: self.defaults.exec.max(child.defaults.exec),
+                net: self.defaults.net.max(child.defaults.net),
             },
         }
     }
@@ -283,10 +322,23 @@ impl Policy {
     /// default. Specificity does not matter — a broad deny beats a narrow
     /// allow, matching Claude Code's precedence.
     pub fn explain(&self, act: Act, target: &str) -> Verdict {
+        // A network target arrives as `host:port`; a rule may name either form.
+        // Trying both is what lets `allow_net("api.example.com")` cover whatever
+        // port the URL resolved to, while `allow_net("api.example.com:443")`
+        // still means that port and no other.
+        let forms: Vec<&str> = match (act, target.rsplit_once(':')) {
+            (Act::Net, Some((host, port))) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+                vec![target, host]
+            }
+            _ => vec![target],
+        };
         for effect in [Effect::Deny, Effect::Ask, Effect::Allow] {
             for layer in &self.layers {
                 for rule in &layer.rules {
-                    if rule.act == act && rule.effect == effect && matches(&rule.pattern, target) {
+                    if rule.act == act
+                        && rule.effect == effect
+                        && forms.iter().any(|t| matches(&rule.pattern, t))
+                    {
                         return Verdict {
                             effect,
                             rule: Some(rule.pattern.clone()),
@@ -301,6 +353,7 @@ impl Policy {
                 Act::Read => self.defaults.read,
                 Act::Write => self.defaults.write,
                 Act::Exec => self.defaults.exec,
+                Act::Net => self.defaults.net,
             },
             rule: None,
             layer: None,
@@ -529,6 +582,74 @@ mod tests {
         assert_eq!(effective.check(Act::Write, "docs/x.md").effect, Effect::Ask);
         assert_eq!(effective.check(Act::Write, "src/vendor/x.rs").effect, Effect::Deny);
         assert_eq!(effective.check(Act::Write, "src/a.rs").effect, Effect::Allow);
+    }
+
+    #[test]
+    fn net_is_denied_by_default_and_allowed_only_where_a_rule_says_so() {
+        let p = Policy::default().layer("egress").allow_net("api.example.com");
+        assert_eq!(p.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
+        assert_eq!(p.check(Act::Net, "evil.example.com:443").effect, Effect::Deny);
+        // Deny is absolute across layers, network included.
+        let tighter = p.layer("lockdown").deny_net("api.example.com");
+        assert_eq!(tighter.check(Act::Net, "api.example.com:443").effect, Effect::Deny);
+    }
+
+    #[test]
+    fn a_net_rule_matches_with_or_without_the_port() {
+        let bare = Policy::default().layer("l").allow_net("api.example.com");
+        assert_eq!(bare.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
+        assert_eq!(bare.check(Act::Net, "api.example.com:8080").effect, Effect::Allow);
+
+        // A rule that names a port is honoured as written: that port only.
+        let ported = Policy::default().layer("l").allow_net("api.example.com:443");
+        assert_eq!(ported.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
+        assert_eq!(ported.check(Act::Net, "api.example.com:8080").effect, Effect::Deny);
+
+        // Wildcards work on hosts the way they work on paths.
+        let wild = Policy::default().layer("l").allow_net("*.example.com");
+        assert_eq!(wild.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
+        assert_eq!(wild.check(Act::Net, "example.org:443").effect, Effect::Deny);
+    }
+
+    #[test]
+    fn net_narrows_downward_and_never_widens() {
+        let root = Policy::default().layer("root").allow_net("api.example.com");
+        let child = Policy::permissive()
+            .layer("child")
+            .allow_net("evil.example.com") // a child allow grants nothing
+            .deny_net("api.example.com"); // a child deny binds
+        let effective = root.contain(&child);
+        assert_eq!(effective.check(Act::Net, "evil.example.com:443").effect, Effect::Deny);
+        assert_eq!(effective.check(Act::Net, "api.example.com:443").effect, Effect::Deny);
+    }
+
+    #[test]
+    fn a_pre_0_8_policy_deserialises_with_network_denied() {
+        // Exactly what 0.7.0 wrote: defaults with no `net` field at all.
+        let old = r#"{"layers":[],"defaults":{"read":"allow","write":"ask","exec":"ask"}}"#;
+        let p: Policy = serde_json::from_str(old).unwrap();
+        assert_eq!(p.defaults.net, Effect::Deny);
+        assert_eq!(p.check(Act::Net, "anywhere.example.com:443").effect, Effect::Deny);
+    }
+
+    #[test]
+    fn net_rules_survive_a_serde_roundtrip() {
+        let p = Policy::default()
+            .layer("egress")
+            .allow_net("api.example.com")
+            .deny_net("evil.example.com")
+            .ask_net("maybe.example.com");
+        let back: Policy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        for host in ["api.example.com:443", "evil.example.com:443", "maybe.example.com:443"] {
+            assert_eq!(p.check(Act::Net, host), back.check(Act::Net, host));
+        }
+    }
+
+    #[test]
+    fn permissive_still_enforces_nothing_including_the_network() {
+        let p = Policy::permissive();
+        assert!(p.is_permissive());
+        assert_eq!(p.check(Act::Net, "anywhere.example.com:443").effect, Effect::Allow);
     }
 
     #[test]
