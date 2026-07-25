@@ -494,7 +494,9 @@ mod tests {
             let refused = match act {
                 Act::Read => matches!(ws.read_file(path), Err(Error::Refused { .. })),
                 Act::Write => matches!(ws.write_file(path, "x"), Err(Error::Refused { .. })),
-                Act::Exec => unreachable!(),
+                // The workspace only ever performs reads and writes; exec is the
+                // verify gate's and net is the connection point's.
+                Act::Exec | Act::Net => unreachable!(),
             };
             assert_eq!(denied, refused, "{act:?} {path}");
         }

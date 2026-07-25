@@ -45,6 +45,23 @@ pub enum Error {
         layer: Option<String>,
     },
 
+    /// An MCP server could not be reached or set up. Typed separately from
+    /// [`Error::Provider`] so a caller can tell "the model call failed" from
+    /// "the tool server the operator configured never came up" — the second is a
+    /// configuration problem, and the run fails on it rather than quietly
+    /// proceeding without a capability it was told it had.
+    ///
+    /// Failures *during* a call — a timeout, a dead transport, a tool reporting
+    /// its own error — are not this. They come back to the model as observations
+    /// it can adapt to, like a refused path or a bad regex.
+    #[error("mcp server {server}: {reason}")]
+    Mcp {
+        /// The configured server's id.
+        server: String,
+        /// What went wrong.
+        reason: String,
+    },
+
     /// A durable run could not be resumed from its checkpoint — the checkpoint
     /// format is newer than this binary supports, the run row is missing or
     /// corrupt, or the run has already finished. Typed separately so a caller

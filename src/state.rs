@@ -351,6 +351,91 @@ impl SandboxEvent {
     }
 }
 
+/// One event in the life of an MCP connection: a server connected, a tool it
+/// offered, a tool called (with how long it took and whether it worked), or a
+/// server disconnected.
+///
+/// The `net` half of a run's egress history lives in [`PolicyEvent`] — an MCP
+/// server's host is checked by the same policy as any other outbound call — so
+/// this table is about the MCP conversation itself, not about permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpEvent {
+    /// The step it occurred on. `0` for connect/discover, which happen before
+    /// the run's first step.
+    pub step: u32,
+    /// `"connected"`, `"discovered"`, `"called"`, or `"disconnected"`.
+    pub kind: String,
+    /// The configured server's id.
+    pub server: String,
+    /// The namespaced tool name, for `"discovered"` and `"called"`.
+    pub tool: Option<String>,
+    /// Whether a `"called"` tool succeeded.
+    pub ok: Option<bool>,
+    /// How long a connect or call took, in milliseconds.
+    pub millis: Option<u64>,
+    /// Transport for a connect, or a note such as `"truncated"`. Never tool
+    /// arguments or results — those can carry secrets.
+    pub detail: Option<String>,
+}
+
+impl McpEvent {
+    fn new(kind: &str, server: &str) -> Self {
+        Self {
+            step: 0,
+            kind: kind.into(),
+            server: server.into(),
+            tool: None,
+            ok: None,
+            millis: None,
+            detail: None,
+        }
+    }
+
+    /// A server connected over `transport`.
+    pub fn connected(server: &str, transport: &str) -> Self {
+        Self::new("connected", server).with_detail(transport)
+    }
+
+    /// A server offered a tool, under its namespaced name.
+    pub fn discovered(server: &str, tool: &str) -> Self {
+        let mut e = Self::new("discovered", server);
+        e.tool = Some(tool.into());
+        e
+    }
+
+    /// A tool was called, and whether it worked.
+    pub fn called(server: &str, tool: &str, ok: bool) -> Self {
+        let mut e = Self::new("called", server);
+        e.tool = Some(tool.into());
+        e.ok = Some(ok);
+        e
+    }
+
+    /// A server was disconnected.
+    pub fn disconnected(server: &str) -> Self {
+        Self::new("disconnected", server)
+    }
+
+    /// Attach the step this happened on.
+    pub fn at_step(mut self, step: u32) -> Self {
+        self.step = step;
+        self
+    }
+
+    /// Attach a duration in milliseconds.
+    pub fn with_millis(mut self, millis: u64) -> Self {
+        self.millis = Some(millis);
+        self
+    }
+
+    /// Attach a short note. An empty note is dropped rather than stored blank.
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        let detail = detail.into();
+        self.detail = (!detail.is_empty()).then_some(detail);
+        self
+    }
+}
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -483,6 +568,27 @@ impl Store {
                  needle        TEXT NOT NULL,
                  max_steps     INTEGER,
                  deny_write    TEXT NOT NULL DEFAULT '[]'
+             );",
+        )?;
+
+        // 0.8.0: the MCP conversation — connects, tool discovery, tool calls,
+        // disconnects. New table only, so a 0.7.0 database gains it and a 0.7.0
+        // binary, which never queries it, still reads a migrated database. The
+        // network *verdicts* deliberately do not live here: they go to
+        // policy_events beside every other permission decision, because an
+        // operator auditing "what was this run allowed to do" should find them
+        // in one place.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS mcp_events (
+                 id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id INTEGER NOT NULL,
+                 step   INTEGER NOT NULL,
+                 kind   TEXT NOT NULL,
+                 server TEXT NOT NULL,
+                 tool   TEXT,
+                 ok     INTEGER,
+                 millis INTEGER,
+                 detail TEXT
              );",
         )?;
 
@@ -664,6 +770,45 @@ impl Store {
             (e.run_id, e.step, &e.kind, &e.backend, &e.detail),
         )?;
         Ok(())
+    }
+
+    /// Record one MCP event.
+    pub fn record_mcp(&self, run_id: i64, e: &McpEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO mcp_events (run_id, step, kind, server, tool, ok, millis, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                run_id,
+                e.step,
+                &e.kind,
+                &e.server,
+                &e.tool,
+                e.ok,
+                e.millis.map(|m| m as i64),
+                &e.detail,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Every MCP event recorded for a run, in order.
+    pub fn mcp_events(&self, run_id: i64) -> Result<Vec<McpEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT step, kind, server, tool, ok, millis, detail
+             FROM mcp_events WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(McpEvent {
+                step: r.get::<_, i64>(0)? as u32,
+                kind: r.get(1)?,
+                server: r.get(2)?,
+                tool: r.get(3)?,
+                ok: r.get(4)?,
+                millis: r.get::<_, Option<i64>>(5)?.map(|m| m as u64),
+                detail: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Every sandbox event recorded for a run, in order.
@@ -1230,6 +1375,46 @@ mod tests {
         // The new table is usable.
         let child = store.start_child_run("c", "ws", 1, 1).unwrap();
         assert_eq!(store.children(1).unwrap(), vec![child]);
+    }
+
+    #[test]
+    fn a_pre_0_8_database_migrates_in_place_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        // A 0.7.0-shaped database: everything through checkpoints, and no
+        // mcp_events table.
+        {
+            let store = Store::open(&path).unwrap();
+            let run = store.start_run("old goal", "old.txt").unwrap();
+            store
+                .checkpoint_step(run, &StepRecord::new(1, "wrote", "ok"))
+                .unwrap();
+            store
+                .record_event(run, &PolicyEvent::refusal(1, "write", "secrets/k"))
+                .unwrap();
+            store
+                .conn
+                .execute("DROP TABLE IF EXISTS mcp_events", [])
+                .unwrap();
+        }
+
+        // Reopening migrates it: the old rows are intact and the new table works.
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.last_step(1).unwrap(), 1);
+        assert_eq!(store.events(1).unwrap().len(), 1);
+        assert!(store.mcp_events(1).unwrap().is_empty());
+        store
+            .record_mcp(1, &McpEvent::connected("files", "stdio"))
+            .unwrap();
+        let events = store.mcp_events(1).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].detail.as_deref(), Some("stdio"));
+
+        // And a 0.7.0 binary, which never queries mcp_events, still reads it —
+        // nothing it knows about was altered or rewritten.
+        assert_eq!(store.steps(1).unwrap().len(), 1);
+        assert_eq!(store.run_status(1).unwrap(), Some(RunStatus::Running));
     }
 
     #[test]

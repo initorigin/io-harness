@@ -1,0 +1,112 @@
+product: io-harness
+version: 0.8.0
+timestamp: 2026-07-25T00:00:00Z
+reason: capacity
+repository_state: passing
+completed_acceptance:
+  - >
+    F4 — under a policy whose network default is Deny, a connection to an unlisted host is refused:
+    the call returns a typed error, no connection is opened (asserted against a listener that
+    records connection attempts), and the refusal is in the trace with the deciding layer.
+  - >
+    F5 — a network rule with effect Ask routes to the approval gate: a Deny decision blocks the call
+    and a run continues or fails per the existing gate semantics; an Allow decision performs it
+    exactly once.
+  - >
+    F6 — a network Ask survives a full process restart: the tree pauses, the process exits, and
+    `resume_with_decision` on a fresh process against the same store performs the approved call and
+    completes the run.
+  - >
+    F7 — a 0.5.0 child inherits its parent's network rules; a child task contract that tries to
+    allow a host its parent denies is refused by containment, and the refusal is recorded. A child
+    that narrows (denies more) is honoured.
+  - >
+    F8 — a run under a base policy that denies all network still reaches its configured provider,
+    via the named provider layer, and `explain` attributes the allowance to that layer. A caller
+    rule that explicitly denies the provider host wins and the run fails as a refusal, not a hang.
+  - >
+    F10 — a `Policy` carrying network rules round-trips through serde unchanged, and an MCP server
+    configuration round-trips through serde unchanged.
+  - >
+    NF1 — MCP is implemented via the rmcp crate. No hand-rolled JSON-RPC framing or protocol
+    version negotiation in this repo.
+remaining_acceptance:
+  - >
+    F1 — with a stdio MCP server configured, a run discovers its tools, the model is offered them
+    under `mcp__<server>__<tool>` names, the agent invokes one, and the result reaches the next loop
+    step. Asserted by a test using a fixture server and by the live run.
+  - >
+    F2 — with a streamable-HTTP MCP server configured, the same holds end to end against a test HTTP
+    server.
+  - >
+    F3 — a server advertising a tool named `write_file` does not shadow the built-in: both are
+    callable, the built-in keeps its name, and the server's is reachable only under its namespaced
+    name.
+  - >
+    F9 — MCP server failure paths: a server whose binary does not start, a server killed mid-run,
+    a tool returning an error, and a tool call exceeding its timeout each produce a typed error
+    handled by the 0.2.0 retry/recovery path, with the failure in the trace and no panic.
+  - >
+    F11 — a 0.7.0-era caller that configures no MCP servers compiles against 0.8.0 and reaches the
+    same verified success, with network governed by whatever its policy says (permissive policies
+    stay permissive).
+  - >
+    NF2 — the network check is a policy lookup on the existing matcher and introduces no new global
+    lock. The 0.5.0 fan-out suite runs green with the network act enabled, so containment of egress
+    does not serialize concurrent agents.
+  - >
+    NF3 — the public API additions (the network `Act` variant, the `Defaults` network field, the MCP
+    configuration type names) are owner-signed-off before packaging, because io-cli and io-studio
+    will serialize them and a rename is a coordinated cross-repo break.
+  - >
+    NF4 — `cargo test`, `cargo clippy --all-targets` (no warnings), and `cargo build --release` are
+    green; every new public item has rustdoc; `cargo publish --dry-run` passes with complete 0.8.0
+    metadata.
+  - >
+    NF5 — the crate compiles on macOS, Linux, and Windows. Stdio server spawning uses portable tokio
+    process APIs; no unix-only path in the MCP layer.
+  - >
+    NF6 — adding a network variant to the public `Act` enum and a field to `Defaults` is a breaking
+    change under strict SemVer and is taken deliberately in a 0.x minor, which cargo already treats
+    as incompatible. It is stated in the CHANGELOG as a breaking change with the one-line migration,
+    not glossed as additive.
+  - >
+    O1 — the trace records, for each run: every MCP server connect and disconnect with its
+    transport, the tool list discovered per server, each MCP tool call with latency and outcome, and
+    each network verdict with target, effect, and deciding layer. All queryable from a reopened
+    store.
+  - >
+    O2 — the rusqlite migration is additive; a database written by 0.7.0 opens and migrates in
+    place, and a 0.7.0 binary still reads a migrated database. Asserted by a migration test.
+  - >
+    O3 — README and rustdoc carry a runnable example of a run with an MCP server under a
+    deny-by-default egress policy, including what a refusal looks like.
+  - >
+    O4 — the live run and the refusal run are both executed against a real MCP server and a real
+    provider, and their output is stored as release evidence.
+  - >
+    O5 — the documented limit is explicit: the harness governs the connections it opens, not the
+    connections a running stdio server opens for itself.
+active_hypotheses:
+  - >
+    F9's wording says a server whose binary does not start is "handled by the 0.2.0 retry/recovery
+    path". The implementation instead fails the run with a typed `Error::Mcp` at session
+    construction, because connecting happens before step 1 and because silently running without a
+    tool the operator configured is the worse failure. In-call failures (timeout, dead transport, a
+    tool reporting its own error) DO go to the model as observations. Either F9 should be read as
+    "typed error, traced, no panic" — which the implementation meets — or connection needs to become
+    lazy so a start failure lands inside a step. This is a plan question for the owner, not a coding
+    decision to take quietly.
+  - >
+    F4's "unlisted host under default deny" is currently proven only for an explicitly denied host,
+    because the only connection a run opens today is the provider's own, and the provider layer
+    allows that by design (F8). The unlisted-host case needs the MCP HTTP transport to be reachable,
+    so it moves to T08's test rather than being claimed early. The no-socket-opened assertion itself
+    is already real: tests/net.rs counts accepts on a live TcpListener.
+next_task: US-IO-HARNESS-0.8.0-T07
+required_context:
+  - src/mcp.rs
+  - src/net.rs
+  - src/run.rs
+  - tests/net.rs
+  - .ultraship/products/io-harness/execution/tasks.yaml

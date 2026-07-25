@@ -21,7 +21,7 @@ impl OpenAi {
     /// Build from an explicit key and model slug (e.g. `gpt-4o`).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::net::http_client(),
             api_key: api_key.into(),
             model: model.into(),
         }
@@ -41,6 +41,10 @@ impl OpenAi {
 impl Provider for OpenAi {
     fn name(&self) -> &str {
         "openai"
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(ENDPOINT)
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {

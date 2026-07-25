@@ -26,6 +26,94 @@ notes are produced from it.
 
 ### Security
 
+## [0.8.0] - 2026-07-25
+
+MCP, and the network boundary it made necessary. The harness is now an MCP client:
+point it at servers and their tools reach the agent beside the built-ins, so a
+capability the crate lacks is added by configuration rather than by a fork. Because
+those servers are the first thing in the crate that can dial an arbitrary host, the
+0.4.0 permission model gains a fourth act — outbound connections are now governed
+by the same layered, deny-by-default policy that already governs reads, writes, and
+executions.
+
+### Added
+
+- **MCP client over [rmcp](https://crates.io/crates/rmcp), two transports.**
+  `McpServer::stdio` spawns a server as a child process; `McpServer::http` dials a
+  streamable-HTTP endpoint. Configure them with `TaskContract::with_mcp`, and their
+  tools are offered to the model under `mcp__<server>__<tool>` — namespaced, so a
+  server advertising `write_file` cannot shadow the built-in. Per-call timeouts,
+  result-size capping, and one session shared by a whole 0.5.0 agent tree.
+- **`Act::Net` — the network act.** An outbound connection is now a policy decision
+  with a target (`host` or `host:port`), matched by the same glob matcher that
+  matches paths and binaries, and decided by the same deny-first stack:
+  `allow_net`, `deny_net`, `ask_net`. `Ask` routes to the `Approver` and, when
+  deferred, persists across a full process restart like any other 0.4.0 approval. A
+  0.5.0 child inherits its parent's network rules and can only narrow them — the
+  spawn tool gained a `deny_net` argument to do so.
+- **The named `provider` layer.** The harness contributes its configured provider's
+  host as one visible policy layer, so a run under a deny-all-network base still
+  reaches its model without the caller listing hosts, and `Policy::explain`
+  attributes the allowance to that layer instead of it being a hidden exemption. An
+  explicit `deny_net` of your own provider still wins, and fails fast as a refusal
+  rather than hanging.
+- **`Error::Mcp`.** A configured server that will not start or complete its
+  handshake fails the run with a typed error, rather than the run proceeding
+  quietly without a capability it was told it had.
+- **MCP and network tracing.** A new additive `mcp_events` table records every
+  connect (with transport), tool discovered, tool call (with latency and outcome),
+  and disconnect. Network verdicts — allows, asks, and refusals alike, each with
+  the layer that decided — go to `policy_events` beside every other permission
+  decision, so one query answers "what was this run allowed to do". A 0.7.0
+  database migrates in place.
+
+### Changed
+
+- **BREAKING — `Act` has a fourth variant and `Defaults` a fourth field.** A
+  downstream `match` on `Act` that was exhaustive no longer is, and a `Defaults`
+  struct literal now misses a field. Migration: add an `Act::Net` arm (or a `_`
+  arm) and a `net:` field. Taken deliberately in a 0.x minor, which Cargo already
+  treats as incompatible.
+- **BREAKING (behaviour) — a policy serialized before 0.8.0 deserializes with
+  `net: Deny`.** `Defaults.net` is `#[serde(default)]`, so an older config parses
+  rather than failing, but it parses as deny-by-default. An existing config whose
+  run makes outbound calls needs an `allow_net` for the hosts it uses; the
+  provider's own host is covered by the `provider` layer and needs nothing. The
+  alternative — defaulting to allow — would have left egress ungoverned for exactly
+  the callers who upgraded to govern it.
+- **The system prompt now names the tools it does not enumerate.** The workspace
+  and tree prompts described a world of exactly four (or five) built-in tools while
+  the request carried more, so a model trusting the prose over the schema could
+  ignore an MCP tool — or call one repeatedly without noticing it had already
+  answered. Extra tools are now listed, with a line saying results appear in the
+  observations. Found by a live run that looped on one tool for its whole step
+  budget.
+- **Agents inside a `run_tree` are offered the session's MCP tools.** The tree
+  shares one MCP session; it connected but never put those tools in the request, so
+  no agent in a tree could call one.
+- **Redirects are off on every built-in provider's HTTP client.** A 3xx is a host
+  change, and a host change after the policy has decided would be a hole in the
+  boundary. A redirect now surfaces as a non-success status instead.
+- **`reqwest` 0.12 → 0.13, and the minimum supported Rust version 1.75 → 1.87.**
+  rmcp 2.2.0 requires reqwest 0.13, and its child-process transport requires Rust
+  1.87. Carrying two reqwest versions would have meant two TLS stacks and would
+  have stopped the streamable-HTTP transport from accepting our own (no-redirect)
+  client.
+
+### Security
+
+- **Egress is governed for the first time.** Every outbound connection the harness
+  opens — the provider, an HTTP MCP server, any harness-initiated fetch — passes one
+  checked entry point before a socket exists, and a denial is refused rather than
+  performed. Spawning a stdio MCP server is an exec check on its binary; invoking
+  one of its tools is an exec check on the namespaced tool name, so a policy can
+  allow a server generally and still deny one of its tools.
+- **Known limit, stated plainly.** The harness governs the connections *it* opens.
+  A stdio MCP server is a separate process, and once running it dials whatever it
+  likes; the harness decides only whether it may start and which of its tools may
+  be called. Isolating a server's own egress would need OS-level containment, which
+  0.8.0 does not build.
+
 ## [0.7.0] - 2026-07-25
 
 Durable, unattended runs. A run can be left alone for a long horizon and survive

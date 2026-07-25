@@ -17,6 +17,8 @@ use tracing::info;
 use crate::containment::{Containment, Draw, Ledger};
 use crate::contract::TaskContract;
 use crate::error::Result;
+use crate::mcp::McpSession;
+use crate::net::{self, NetGuard};
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
 use crate::state::{AgentEvent, RunStatus, StepRecord, Store};
 use crate::approve::{ApproveAll, Approver, Decision, Request};
@@ -116,18 +118,37 @@ pub async fn run_with<P: Provider>(
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
     store.set_provider(run_id, provider.name())?;
+    // Decided against the *caller's* policy, before the provider layer is merged
+    // in: the harness adding a network layer of its own must not turn a
+    // permissive caller into a policy-bearing one and push it off the
+    // single-file path.
+    let caller_enforces = !policy.is_permissive();
+    let policy = &match authorize_provider(provider, policy, store, run_id, approver).await? {
+        ProviderAccess::Granted(p) => p,
+        ProviderAccess::Pending(request_id) => {
+            return Ok(RunResult::new(
+                RunOutcome::AwaitingApproval {
+                    request_id,
+                    steps: 0,
+                },
+                run_id,
+            ))
+        }
+    };
     match contract.root.clone() {
         Some(root) => {
-            run_workspace_from(
-                contract, provider, store, run_id, &root, 1, policy, approver,
-            )
-            .await
+            let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+            let result =
+                run_workspace_from(contract, provider, store, run_id, &root, 1, policy, approver, &mcp)
+                    .await;
+            mcp.shutdown(store, run_id).await;
+            result
         }
         // Single-file mode has no policy-aware tool layer in 0.4.0. Silently
         // ignoring a policy here would be worse than not supporting it: the
         // caller would believe a boundary was enforced when nothing was
         // checking. Refuse loudly instead.
-        None if !policy.is_permissive() => Err(crate::error::Error::Config(
+        None if caller_enforces => Err(crate::error::Error::Config(
             "a permission policy requires workspace mode — build the contract \
              with TaskContract::workspace(goal, root, verify). Single-file \
              contracts are not policy-enforced in 0.4.0."
@@ -164,17 +185,14 @@ pub async fn resume<P: Provider>(
     store.set_provider(run_id, provider.name())?;
     match contract.root.clone() {
         Some(root) => {
-            run_workspace_from(
-                contract,
-                provider,
-                store,
-                run_id,
-                &root,
-                start_step,
-                &Policy::permissive(),
-                &ApproveAll,
+            let policy = Policy::permissive();
+            let mcp = McpSession::connect(&contract.mcp, &policy, store, run_id).await?;
+            let result = run_workspace_from(
+                contract, provider, store, run_id, &root, start_step, &policy, &ApproveAll, &mcp,
             )
-            .await
+            .await;
+            mcp.shutdown(store, run_id).await;
+            result
         }
         None => run_from(contract, provider, store, run_id, start_step).await,
     }
@@ -239,6 +257,36 @@ pub async fn resume_with_decision<P: Provider>(
             store.finish_run(run_id, "denied")?;
             Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id))
         }
+        // A deferred *network* action has no filesystem effect to replay: the
+        // run paused before its first step, so approving it grants the host and
+        // starts the loop. Routing it through the write path below would check
+        // a host against the path policy and then try to create a file named
+        // after it.
+        Decision::Approve { ref remember, .. } if pending.act == "net" => {
+            let effective = policy
+                .clone()
+                .merge(net::provider_layer(&pending.target))
+                .merge(remembered_layer(remember));
+            store.resolve_pending(request_id, "approve")?;
+            store.record_event(
+                run_id,
+                &PolicyEvent::decision(
+                    step,
+                    "net",
+                    &pending.target,
+                    "approve",
+                    format!("resumed:{request_id}"),
+                ),
+            )?;
+            let remember = remember.clone();
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let result = run_workspace_from(
+                contract, provider, store, run_id, &root, step + 1, &effective, approver, &mcp,
+            )
+            .await;
+            mcp.shutdown(store, run_id).await;
+            result.map(|r| r.with_remembered(remember))
+        }
         Decision::Approve { modified, remember } => {
             let target = modified
                 .as_ref()
@@ -289,18 +337,13 @@ pub async fn resume_with_decision<P: Provider>(
             store.record_event(run_id, &ev)?;
 
             // Continue the run under its original id, from the next step.
-            run_workspace_from(
-                contract,
-                provider,
-                store,
-                run_id,
-                &root,
-                step + 1,
-                &effective,
-                approver,
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let result = run_workspace_from(
+                contract, provider, store, run_id, &root, step + 1, &effective, approver, &mcp,
             )
-            .await
-            .map(|r| r.with_remembered(remember))
+            .await;
+            mcp.shutdown(store, run_id).await;
+            result.map(|r| r.with_remembered(remember))
         }
     }
 }
@@ -364,6 +407,37 @@ pub async fn resume_tree_with_decision<P: Provider>(
             store.finish_run(run_id, "denied")?;
             Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id))
         }
+        // As in `resume_with_decision`: an approved network action grants the
+        // host and starts the tree, with no filesystem effect to replay.
+        Decision::Approve { ref remember, .. } if pending.act == "net" => {
+            let effective = policy
+                .clone()
+                .merge(net::provider_layer(&pending.target))
+                .merge(remembered_layer(remember));
+            store.resolve_pending(request_id, "approve")?;
+            store.record_event(
+                pending.run_id,
+                &PolicyEvent::decision(
+                    step,
+                    "net",
+                    &pending.target,
+                    "approve",
+                    format!("resumed:{request_id}"),
+                ),
+            )?;
+            let ledger = Arc::new(Ledger::from_state(
+                containment,
+                store.spent_tokens_tree(run_id)?,
+                store.agent_count_tree(run_id)?,
+            ));
+            let start_step = record_resume_markers(store, run_id)?;
+            store.set_provider(run_id, provider.name())?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let tree = Tree { mcp: &mcp, provider, store, approver, ledger, containment, root };
+            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
+            mcp.shutdown(store, run_id).await;
+            Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
+        }
         Decision::Approve { modified, remember } => {
             let target = modified
                 .as_ref()
@@ -418,9 +492,11 @@ pub async fn resume_tree_with_decision<P: Provider>(
             ));
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
-            let tree = Tree { provider, store, approver, ledger, containment, root };
-            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await?;
-            Ok(RunResult::new(outcome, run_id).with_remembered(remember))
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let tree = Tree { mcp: &mcp, provider, store, approver, ledger, containment, root };
+            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
+            mcp.shutdown(store, run_id).await;
+            Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
         }
     }
 }
@@ -573,14 +649,19 @@ async fn run_workspace_from<P: Provider>(
     start_step: u32,
     policy: &Policy,
     approver: &dyn Approver,
+    mcp: &McpSession,
 ) -> Result<RunResult> {
     // The effective policy grows as approvers remember rules; it is rebuilt as a
     // merge so a remembered allow can still never defeat a deny beneath it.
     let mut effective = policy.clone();
     let mut remembered: Vec<Rule> = Vec::new();
     let mut ws = Workspace::with_policy(root, effective.clone());
-    let system = workspace_system_prompt();
-    let tools = workspace_tools();
+    // MCP tools sit beside the built-ins under their namespaced names, so the
+    // model chooses between them the same way it chooses between grep and find.
+    let mcp_tools = mcp.tool_specs();
+    let system = with_extra_tools(workspace_system_prompt(), &mcp_tools);
+    let mut tools = workspace_tools();
+    tools.extend(mcp_tools);
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -621,7 +702,7 @@ async fn run_workspace_from<P: Provider>(
         let mut new_rules: Vec<Rule> = Vec::new();
         for call in &response.tool_calls {
             calls_json.push(format!("{}:{}", call.name, call.arguments));
-            match dispatch(&ws, call, approver, store, run_id, step).await? {
+            match dispatch(&ws, call, approver, store, run_id, step, mcp).await? {
                 Dispatched::Continue {
                     decision,
                     obs,
@@ -700,6 +781,10 @@ async fn run_workspace_from<P: Provider>(
 /// draws on — the provider, the store, the one approver, the shared spend
 /// ledger, the containment caps, and the workspace root.
 struct Tree<'a, P: Provider> {
+    /// One MCP session for the whole tree. A server is a stateful process, so
+    /// 100 concurrent agents get 100 views of one connection, not 100 of their
+    /// own — the same reason the ledger and the store are shared here.
+    mcp: &'a McpSession,
     provider: &'a P,
     store: &'a Store,
     approver: &'a dyn Approver,
@@ -734,7 +819,24 @@ pub async fn run_tree<P: Provider>(
     let ledger = Arc::new(Ledger::new(containment));
     let run_id = store.start_run(&contract.goal, &root.display().to_string())?;
     store.set_provider(run_id, provider.name())?;
+    // Authorized once at the root. Children inherit the root's policy through
+    // `Policy::contain`, so the provider layer flows down the tree and no child
+    // needs (or gets) its own chance to widen network access.
+    let policy = &match authorize_provider(provider, policy, store, run_id, approver).await? {
+        ProviderAccess::Granted(p) => p,
+        ProviderAccess::Pending(request_id) => {
+            return Ok(RunResult::new(
+                RunOutcome::AwaitingApproval {
+                    request_id,
+                    steps: 0,
+                },
+                run_id,
+            ))
+        }
+    };
+    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
     let tree = Tree {
+        mcp: &mcp,
         provider,
         store,
         approver,
@@ -742,8 +844,9 @@ pub async fn run_tree<P: Provider>(
         containment,
         root,
     };
-    let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await?;
-    Ok(RunResult::new(outcome, run_id))
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await;
+    mcp.shutdown(store, run_id).await;
+    Ok(RunResult::new(outcome?, run_id))
 }
 
 /// Resume a crashed agent tree under its original root `run_id`. Reconstructs
@@ -790,9 +893,26 @@ pub async fn resume_tree<P: Provider>(
     ));
     let start_step = record_resume_markers(store, run_id)?;
     store.set_provider(run_id, provider.name())?;
-    let tree = Tree { provider, store, approver, ledger, containment, root };
-    let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await?;
-    Ok(RunResult::new(outcome, run_id))
+    // Re-authorized on resume rather than trusted from the crashed run: the
+    // policy handed to the resume is the one that governs it, and a host allowed
+    // before a crash may not be allowed after.
+    let policy = &match authorize_provider(provider, policy, store, run_id, approver).await? {
+        ProviderAccess::Granted(p) => p,
+        ProviderAccess::Pending(request_id) => {
+            return Ok(RunResult::new(
+                RunOutcome::AwaitingApproval {
+                    request_id,
+                    steps: start_step.saturating_sub(1),
+                },
+                run_id,
+            ))
+        }
+    };
+    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+    let tree = Tree { mcp: &mcp, provider, store, approver, ledger, containment, root };
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await;
+    mcp.shutdown(store, run_id).await;
+    Ok(RunResult::new(outcome?, run_id))
 }
 
 /// One agent's loop, reused for the root and every child. Identical to the
@@ -814,8 +934,14 @@ fn run_agent<'f, P: Provider>(
     // Boxed so the loop can recurse into itself when an agent spawns a child.
     Box::pin(async move {
         let ws = Workspace::with_policy(&tree.root, policy.clone());
-        let system = tree_system_prompt();
-        let tools = tree_tools();
+        // The tree shares one MCP session, so every agent in it — root or child —
+        // is offered the same server tools beside its built-ins. Connecting a
+        // session and then not offering its tools would leave the model unable to
+        // call something the run had already paid to set up.
+        let mcp_tools = tree.mcp.tool_specs();
+        let system = with_extra_tools(tree_system_prompt(), &mcp_tools);
+        let mut tools = tree_tools();
+        tools.extend(mcp_tools);
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
@@ -869,7 +995,7 @@ fn run_agent<'f, P: Provider>(
                     spawn_calls.push(call);
                     continue;
                 }
-                match dispatch(&ws, call, tree.approver, tree.store, run_id, step).await? {
+                match dispatch(&ws, call, tree.approver, tree.store, run_id, step, tree.mcp).await? {
                     Dispatched::Continue { decision, obs, .. } => {
                         observations.push_str(&obs);
                         decisions.push(decision);
@@ -1008,6 +1134,11 @@ async fn spawn_child<P: Provider>(
             overlay = overlay.deny_write(d);
         }
     }
+    if let Some(denies) = a.get("deny_net").and_then(|v| v.as_array()) {
+        for d in denies.iter().filter_map(|v| v.as_str()) {
+            overlay = overlay.deny_net(d);
+        }
+    }
     let child_policy = parent_policy.contain(&overlay);
 
     let verify = Verification::WorkspaceFileContains {
@@ -1093,6 +1224,106 @@ fn compose_child(child_run: i64, goal: &str, outcome: RunOutcome) -> SpawnResult
     }
 }
 
+/// The rules an approver asked to remember, as a mergeable top layer.
+///
+/// A layer rather than an edit: merging is what keeps a remembered allow from
+/// defeating a deny beneath it, since deny is absolute across the stack.
+fn remembered_layer(rules: &[Rule]) -> Policy {
+    let mut layer = Policy::permissive().layer("remembered");
+    for r in rules {
+        layer = layer.rule(r.act, r.effect, r.pattern.clone());
+    }
+    layer
+}
+
+/// The outcome of authorizing the provider's own endpoint, before a run makes
+/// its first outbound call.
+enum ProviderAccess {
+    /// Cleared to run, under the policy the provider layer has been merged into.
+    Granted(Policy),
+    /// An approver deferred; the pending decision is persisted under this id and
+    /// the run stops before it ever dials.
+    Pending(i64),
+}
+
+/// Authorize the provider's endpoint once, before the first completion.
+///
+/// Once per run rather than once per step: a provider's endpoint is fixed for
+/// the life of the provider, so re-asking each step would be the same question
+/// with the same answer — and asking a human it repeatedly would train them to
+/// wave it through.
+///
+/// The provider layer is merged *before* the check, not consulted after it. That
+/// ordering is what makes a network-deny base usable: the `net` default denies,
+/// the provider layer's allow rule beats a default, and a caller's explicit
+/// `deny_net` still beats the allow because deny is absolute across layers. So
+/// "deny everything but the model" needs no host list from the caller, while
+/// "deny even the model" remains expressible — and fails fast as a refusal
+/// rather than hanging on a call that is never made.
+async fn authorize_provider<P: Provider>(
+    provider: &P,
+    policy: &Policy,
+    store: &Store,
+    run_id: i64,
+    approver: &dyn Approver,
+) -> Result<ProviderAccess> {
+    // A provider that opens no connection (the mock providers tests drive the
+    // loop with) has no endpoint to authorize.
+    let Some(url) = provider.endpoint() else {
+        return Ok(ProviderAccess::Granted(policy.clone()));
+    };
+    let Some(target) = net::target(url) else {
+        return Err(crate::error::Error::Refused {
+            act: "net".into(),
+            target: url.to_string(),
+            rule: None,
+            layer: None,
+        });
+    };
+
+    let effective = policy.clone().merge(net::provider_layer(&target));
+    // Step 0: the authorization happens before the run's first step.
+    let verdict = NetGuard::new(&effective)
+        .tracing(store, run_id, 0)
+        .check_target(&target)?;
+
+    if verdict.effect != Effect::Ask {
+        return Ok(ProviderAccess::Granted(effective));
+    }
+
+    match approver.decide(&Request::new(Act::Net, &target)).await {
+        Decision::Approve { .. } => {
+            store.record_event(
+                run_id,
+                &PolicyEvent::decision(0, "net", &target, "approve", "approver"),
+            )?;
+            Ok(ProviderAccess::Granted(effective))
+        }
+        Decision::Deny { reason } => {
+            store.record_event(
+                run_id,
+                &PolicyEvent::decision(0, "net", &target, "deny", "approver"),
+            )?;
+            store.finish_run(run_id, "refused")?;
+            Err(crate::error::Error::Refused {
+                act: "net".into(),
+                target: format!("{target} — {reason}"),
+                rule: verdict.rule,
+                layer: verdict.layer,
+            })
+        }
+        Decision::Defer => {
+            store.record_event(
+                run_id,
+                &PolicyEvent::decision(0, "net", &target, "defer", "approver"),
+            )?;
+            let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
+            store.finish_run(run_id, "awaiting_approval")?;
+            Ok(ProviderAccess::Pending(request_id))
+        }
+    }
+}
+
 /// The result of dispatching one tool call.
 enum Dispatched {
     /// The call resolved; fold `obs` into the observation log and carry any
@@ -1123,6 +1354,7 @@ impl Dispatched {
 /// Tool-level failures (bad regex, path escape, a policy refusal) become
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch(
     ws: &Workspace,
     call: &ToolCall,
@@ -1130,6 +1362,7 @@ async fn dispatch(
     store: &Store,
     run_id: i64,
     step: u32,
+    mcp: &McpSession,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -1200,6 +1433,28 @@ async fn dispatch(
                     }
                 }
             }
+        }
+        // An MCP tool. Invoking it is an exec check on its namespaced name, so a
+        // policy can allow a server generally and still deny one of its tools.
+        name if mcp.owns(name) => {
+            let verdict = ws.policy().check(Act::Exec, name);
+            if verdict.effect != Effect::Allow {
+                let mut ev = PolicyEvent::refusal(step, "exec", name);
+                ev.rule = verdict.rule.clone();
+                ev.layer = verdict.layer.clone();
+                store.record_event(run_id, &ev)?;
+                let why = verdict
+                    .rule
+                    .as_deref()
+                    .map(|r| format!(" (rule {r})"))
+                    .unwrap_or_default();
+                return Ok(Dispatched::go(
+                    format!("{name} refused"),
+                    format!("\n[{name} refused]{why} — the policy forbids calling this tool\n"),
+                ));
+            }
+            let out = mcp.call(name, &call.arguments, store, run_id, step).await?;
+            Dispatched::go(format!("called {name}"), format!("\n[{name}]\n{out}\n"))
         }
         other => Dispatched::go(
             format!("unknown tool {other}"),
@@ -1414,6 +1669,26 @@ fn workspace_system_prompt() -> String {
         .to_string()
 }
 
+/// Tell the model about tools the built-in prompt does not enumerate.
+///
+/// Without this the system prompt describes a world of exactly four tools while
+/// the request carries more, and a model that trusts the prose over the schema
+/// either ignores an MCP tool or, worse, calls one repeatedly without noticing
+/// it already answered. Naming them — and saying plainly that a result lands in
+/// the observations — is what turns a discovered tool into a usable one.
+fn with_extra_tools(base: String, extra: &[ToolSpec]) -> String {
+    if extra.is_empty() {
+        return base;
+    }
+    let names: Vec<&str> = extra.iter().map(|t| t.name.as_str()).collect();
+    format!(
+        "{base} These extra tools are also available and work the same way: {}. \
+         Each tool's result appears in the observations below; once a tool has \
+         returned what you asked for, move on rather than calling it again.",
+        names.join(", ")
+    )
+}
+
 fn workspace_user_prompt(contract: &TaskContract, observations: &str) -> String {
     let constraints = if contract.constraints.is_empty() {
         "(none)".to_string()
@@ -1462,6 +1737,7 @@ fn tree_tools() -> Vec<ToolSpec> {
                 "verify_file": { "type": "string", "description": "File (relative to the workspace root) whose contents decide the sub-agent's success." },
                 "verify_contains": { "type": "string", "description": "Text that file must contain for the sub-agent to succeed." },
                 "deny_write": { "type": "array", "items": { "type": "string" }, "description": "Optional globs the sub-agent must not write — tightens its inherited policy." },
+                "deny_net": { "type": "array", "items": { "type": "string" }, "description": "Optional host globs (host or host:port) the sub-agent must not reach — tightens its inherited policy." },
                 "max_steps": { "type": "integer", "description": "Optional step budget for the sub-agent." }
             },
             "required": ["goal", "verify_file", "verify_contains"]

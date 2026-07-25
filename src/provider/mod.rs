@@ -124,4 +124,18 @@ pub trait Provider {
     fn name(&self) -> &str {
         "provider"
     }
+
+    /// The URL this provider dials, if it dials one.
+    ///
+    /// The run authorizes this against the policy's [`crate::Act::Net`] rules
+    /// before the first completion, and contributes its host as the named
+    /// `provider` layer so a network-deny base can still reach its model.
+    ///
+    /// Defaults to `None`, which means "opens no connection" — the honest answer
+    /// for the mock providers tests drive the loop with, and what keeps every
+    /// existing implementer compiling. A `None` provider is not exempt from the
+    /// boundary; it simply has no connection for the boundary to govern.
+    fn endpoint(&self) -> Option<&str> {
+        None
+    }
 }
