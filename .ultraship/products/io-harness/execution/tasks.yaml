@@ -1,305 +1,560 @@
 product: io-harness
-version: 0.7.0
+version: 0.8.0
 tasks:
-  - id: US-IO-HARNESS-0.7.0-T01
+  - id: US-IO-HARNESS-0.8.0-T01
     summary: >
-      Durable checkpoint schema + typed resume error + transactional step commit. Add runs.status
-      and runs.started_at; a checkpoint_events table (kind: checkpoint/resume/skipped); a
-      PRAGMA user_version checkpoint-format marker; Error::Resume{reason}; and make the per-step
-      write (step row + checkpoint event) one rusqlite transaction so a step is done iff its
-      checkpoint committed. Store helpers: set_status/status, started_at, record_checkpoint_event,
-      checkpoint_events, spent_tokens(run)/spent_tokens_tree, agent_count_tree. Additive DDL keeps a
-      0.6.0 DB readable.
+      Dependency baseline. Add rmcp 2.2.0 with default-features off and features
+      client + transport-child-process + transport-streamable-http-client-reqwest; bump reqwest
+      0.12 → 0.13 (feature rustls-tls → rustls) because rmcp 2.2.0 requires reqwest 0.13.2; give
+      every built-in provider's reqwest client an explicit no-redirect policy so a 3xx cannot move a
+      request to a host the policy never saw. Crate builds and the whole existing suite stays green.
     why_required: >
-      Nothing downstream can be crash-consistent, idempotent, or auditable without a transactional
-      completion marker, a durable run status, a corrupt-checkpoint typed failure, and the read-back
-      helpers. This is the seam every other 0.7.0 task hangs off.
+      rmcp pins reqwest 0.13. Staying on 0.12 means two reqwest versions and two TLS stacks in a
+      published crate, and — decisively — the streamable-HTTP transport would refuse our own
+      reqwest::Client, so redirect control on the MCP path would be lost and the egress guarantee
+      would have a documented hole. Nothing else in the release can be built until the dependency
+      floor is settled.
     status: done
     depends_on: []
     acceptance_criteria:
-      - >-
-        The step checkpoint (step result, budget draw, trace record) is written as one rusqlite
-        transaction, so a crash leaves either a fully-committed step or none of it — never a partial
-        step recorded as done. A test asserts atomicity by crashing mid-commit and checking the prior
-        checkpoint stands.
-      - >-
-        A resume against a corrupt or version-incompatible checkpoint returns a typed error the caller
-        handles; the run does not panic and does not half-resume, and a crash mid-commit leaves the
-        prior consistent checkpoint intact.
-      - >-
-        Checkpoints record loop state, agent ids, budget counters, and pending-action metadata only —
-        never file contents or API keys — consistent with the 0.4.0 and 0.6.0 trace discipline.
+      - >
+        NF1 — MCP is implemented via the rmcp crate. No hand-rolled JSON-RPC framing or protocol
+        version negotiation in this repo.
+      - >
+        NF5 — the crate compiles on macOS, Linux, and Windows. Stdio server spawning uses portable tokio
+        process APIs; no unix-only path in the MCP layer.
     files:
+      - Cargo.toml
+      - src/provider/openrouter.rs
+      - src/provider/anthropic.rs
+      - src/provider/openai.rs
+    evidence:
+      - >-
+        Cargo.toml: rmcp 2.2.0 (default-features off; client + transport-child-process +
+        transport-streamable-http-client-reqwest), reqwest 0.12 -> 0.13 (feature rustls-tls -> rustls),
+        rust-version 1.75 -> 1.87 (process-wrap needs 1.87, reqwest 0.13 needs 1.85 — the old floor would
+        have been a false claim).
+      - >-
+        src/net.rs: http_client() is now the crate's only reqwest::Client constructor, built with
+        redirect::Policy::none() so a 3xx cannot move a request to a host the policy never checked. All
+        three providers (openrouter/openai/anthropic) construct through it.
+      - >-
+        cargo test after the bump: 136 passed, 0 failed, across all 9 binaries — the dependency change
+        needed no source change beyond the feature rename.
+
+  - id: US-IO-HARNESS-0.8.0-T02
+    summary: >
+      The network act in the permission model. Add `Act::Net`, a `net` field on `Defaults` defaulting
+      to Deny, and `allow_net`/`deny_net`/`ask_net` builders. Targets are `host` or `host:port`,
+      matched by the existing glob matcher against both forms (so `api.openai.com` and
+      `api.openai.com:443` both match). `Policy::default()` denies network; `Policy::permissive()`
+      allows it. `Defaults` gains serde defaults so a 0.7.0-era policy JSON deserializes with network
+      Deny rather than failing.
+    why_required: >
+      Every other egress task checks against this act. Without it there is nothing to enforce, nothing
+      to contain, and nothing to attribute in the trace.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F10 — a `Policy` carrying network rules round-trips through serde unchanged, and an MCP server
+        configuration round-trips through serde unchanged.
+      - >
+        NF6 — adding a network variant to the public `Act` enum and a field to `Defaults` is a breaking
+        change under strict SemVer and is taken deliberately in a 0.x minor, which cargo already treats
+        as incompatible. It is stated in the CHANGELOG as a breaking change with the one-line migration,
+        not glossed as additive.
+    files:
+      - src/policy.rs
+      - tests/policy.rs
+    evidence:
+      - >-
+        src/policy.rs: Act::Net; Defaults.net with #[serde(default = "deny")]; allow_net/deny_net/ask_net;
+        Policy::default() denies net, Policy::permissive() allows it, is_permissive() accounts for it;
+        merge/contain tighten net like every other act; explain() has the Act::Net default arm.
+      - >-
+        Host matching: explain() tries the target as given and with a numeric :port stripped, so
+        allow_net("api.example.com") covers any port while allow_net("api.example.com:443") means that port
+        only. Wildcards work as on paths.
+      - >-
+        src/policy.rs unit tests (6 new): net_is_denied_by_default_and_allowed_only_where_a_rule_says_so,
+        a_net_rule_matches_with_or_without_the_port, net_narrows_downward_and_never_widens,
+        a_pre_0_8_policy_deserialises_with_network_denied (the owner-decided Deny for 0.7.0-era JSON),
+        net_rules_survive_a_serde_roundtrip, permissive_still_enforces_nothing_including_the_network.
+
+  - id: US-IO-HARNESS-0.8.0-T03
+    summary: >
+      One checked entry point for outbound connections. Add a `NetGuard` that evaluates a host (or a
+      URL's host) against a policy, records the verdict to the store, and returns `Error::Refused` on
+      Deny. Add `Provider::endpoint_host()` (defaulting to `None`, like `name()`) implemented by the
+      three built-in providers, and check it in the run loop before every completion so a denied
+      provider host fails the run as a refusal before any request is built.
+    why_required: >
+      A check spread across call sites is a policy that looks enforced and is not. Funnelling every
+      outbound call through one guard is what makes "no connection is opened" testable instead of
+      assumed, and it is the single largest correctness risk named in the contract.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T01
+      - US-IO-HARNESS-0.8.0-T02
+    acceptance_criteria:
+      - >
+        F4 — under a policy whose network default is Deny, a connection to an unlisted host is refused:
+        the call returns a typed error, no connection is opened (asserted against a listener that
+        records connection attempts), and the refusal is in the trace with the deciding layer.
+    files:
+      - src/net.rs
+      - src/provider/mod.rs
+      - src/run.rs
+      - tests/net.rs
+    evidence:
+      - >-
+        src/net.rs: NetGuard { policy, trace } mirroring ExecGuard — check(url) / check_target(host:port),
+        Deny returns Error::Refused (not a verdict the caller can ignore), Allow/Ask return the Verdict.
+        target(url) normalises to host:port, filling the port from the scheme, handling userinfo and IPv6
+        literals; an unparseable URL is refused rather than waved through.
+      - >-
+        src/provider/mod.rs: Provider::endpoint() -> Option<&str>, defaulting to None ("opens no
+        connection") so every existing implementer still compiles; the three built-ins return their
+        ENDPOINT. Named endpoint() rather than the endpoint_host() of this task's summary — the guard
+        does the host normalisation, so one parser exists rather than three.
+      - >-
+        src/run.rs: authorize_provider() runs once per run in run_with / run_tree / resume_tree, records
+        the verdict at step 0, and returns the effective policy. Every verdict — allow, ask, refusal —
+        goes to policy_events, so no new DDL was needed for the network half of O1.
+      - >-
+        tests/net.rs: a_refusal_is_recorded_in_the_trace (layer and rule attributed). The no-socket proof
+        is asserted by a real TcpListener that counts accepts, against a provider that really dials TCP.
+
+  - id: US-IO-HARNESS-0.8.0-T04
+    summary: >
+      The provider-host layer. The harness merges the configured provider's host as one named policy
+      layer ("provider") beneath the caller's layers, so a run under a network-deny base reaches its
+      model and `explain` attributes the allowance to that named layer. An explicit caller Deny of
+      that host still wins (Deny is absolute) and the run fails fast as a refusal, not a hang.
+    why_required: >
+      Without it, deny-by-default network makes every existing caller's run fail against its own
+      provider, and the release ships a feature nobody can turn on. Making the allowance a visible
+      named layer rather than a hidden exemption is what keeps the trace honest.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T03
+    acceptance_criteria:
+      - >
+        F8 — a run under a base policy that denies all network still reaches its configured provider,
+        via the named provider layer, and `explain` attributes the allowance to that layer. A caller
+        rule that explicitly denies the provider host wins and the run fails as a refusal, not a hang.
+    files:
+      - src/net.rs
+      - src/run.rs
+      - tests/net.rs
+    evidence:
+      - >-
+        src/net.rs: provider_layer(target) + PROVIDER_LAYER ("provider"). Merged BEFORE the check, not
+        consulted after it: the net default denies, the layer's allow rule beats a default, and a caller's
+        explicit deny_net still beats the allow because deny is absolute across layers.
+      - >-
+        tests/net.rs: a_deny_all_base_still_reaches_its_provider_through_the_provider_layer (Success, the
+        socket really opened, and the trace attributes the allowance to layer "provider"), and
+        denying_your_own_provider_is_legal_and_fails_as_a_refusal (Error::Refused, zero connections).
+      - >-
+        Bug found and fixed while wiring this: merging the provider layer turned a permissive caller's
+        policy non-permissive, which pushed single-file runs into run_with's "policy requires workspace
+        mode" refusal. The guard now reads the caller's policy before the merge (caller_enforces).
+
+  - id: US-IO-HARNESS-0.8.0-T05
+    summary: >
+      Network `Ask` through the existing approval gate, and durably across a restart. An Ask verdict
+      on a network action builds a `Request` for `Act::Net`, consults the `Approver`, performs the
+      call exactly once on Approve, blocks on Deny, and on Defer persists the pending action so
+      `resume_with_decision` / `resume_tree_with_decision` on a fresh process performs it.
+    why_required: >
+      Ask is one of the three effects the contract promises for network, and 0.7.0's durable pause is
+      what makes it usable for an unattended run. Without this, network policy is only allow/deny and
+      the release under-delivers its stated outcome.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T03
+    acceptance_criteria:
+      - >
+        F5 — a network rule with effect Ask routes to the approval gate: a Deny decision blocks the call
+        and a run continues or fails per the existing gate semantics; an Allow decision performs it
+        exactly once.
+      - >
+        F6 — a network Ask survives a full process restart: the tree pauses, the process exits, and
+        `resume_with_decision` on a fresh process against the same store performs the approved call and
+        completes the run.
+    files:
+      - src/net.rs
+      - src/run.rs
       - src/state.rs
-      - src/error.rs
+      - tests/net.rs
+    evidence:
+      - >-
+        src/run.rs: an Ask on the provider host consults the Approver at step 0. Approve proceeds, Deny
+        returns Error::Refused and finishes the run, Defer persists the pending action (act "net") and
+        returns RunOutcome::AwaitingApproval { steps: 0 }.
+      - >-
+        resume_with_decision and resume_tree_with_decision gained a pending.act == "net" branch. This was
+        a real defect the Pending path opened: the existing code maps any non-"read" pending to Act::Write,
+        so an approved network action would have been re-checked against the path policy and then written
+        to disk as a file named after the host. The net branch grants the host and starts the loop, which
+        is correct because the pause happens before the first step and has no effect to replay.
+      - >-
+        tests/net.rs: an_ask_on_the_network_is_approved_and_dials (exactly one dial),
+        an_ask_denied_at_the_gate_never_dials (zero), and a_deferred_network_decision_persists_and_resumes
+        — which pauses under one Store handle, drops it, reopens the file, reads the persisted pending, and
+        delivers the decision to a fresh provider, so it crosses a real process-shaped boundary.
+
+  - id: US-IO-HARNESS-0.8.0-T06
+    summary: >
+      Containment of network under 0.5.0. Confirm and pin that `Policy::contain` treats network rules
+      like every other act — a child inherits its parent's network rules and can only narrow them —
+      and that a child task contract attempting to widen is refused and recorded.
+    why_required: >
+      A sub-agent that could reach a host its parent cannot would make the containment boundary a
+      claim rather than a boundary, and 0.5.0's whole safety story rests on narrow-only.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T02
+    acceptance_criteria:
+      - >
+        F7 — a 0.5.0 child inherits its parent's network rules; a child task contract that tries to
+        allow a host its parent denies is refused by containment, and the refusal is recorded. A child
+        that narrows (denies more) is honoured.
+    files:
+      - src/containment.rs
+      - src/policy.rs
+      - tests/subagents.rs
+    evidence:
+      - >-
+        src/policy.rs: Policy::contain already treats every act uniformly, so net inheritance and
+        narrow-only fell out of existing code. Pinned by net_narrows_downward_and_never_widens (a child
+        allow of a host the parent denies grants nothing; a child deny binds).
+      - >-
+        src/run.rs: the spawn tool gained a deny_net argument beside deny_write, so a parent can narrow a
+        child's reachable hosts and not only its writable paths. Widening is structurally impossible: the
+        spawn tool exposes no allow of any kind, so a child cannot even express the request.
+      - >-
+        Not yet proven at run level: the only thing a child can dial is an MCP server, so the end-to-end
+        child-refused-a-host test belongs with T09 and is not claimed here.
+
+  - id: US-IO-HARNESS-0.8.0-T07
+    summary: >
+      MCP client over stdio. Add `McpServer` config (serde: id, transport, command/args/env, timeout)
+      and a session that connects over `TokioChildProcess`, initializes, lists tools, calls a tool,
+      and shuts down. Spawning the server binary is an `Act::Exec` check; discovered tools convert to
+      `ToolSpec` under `mcp__<server>__<tool>` with their JSON Schema passed through unchanged.
+    why_required: >
+      This is the release's capability half. Without a connected server offering tools there is
+      nothing for the agent to invoke and nothing for the egress policy to be interesting about.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T01
+      - US-IO-HARNESS-0.8.0-T02
+    acceptance_criteria:
+      - >
+        F1 — with a stdio MCP server configured, a run discovers its tools, the model is offered them
+        under `mcp__<server>__<tool>` names, the agent invokes one, and the result reaches the next loop
+        step. Asserted by a test using a fixture server and by the live run.
+      - >
+        F3 — a server advertising a tool named `write_file` does not shadow the built-in: both are
+        callable, the built-in keeps its name, and the server's is reachable only under its namespaced
+        name.
+    files:
+      - src/mcp.rs
       - src/lib.rs
+      - tests/mcp.rs
     evidence:
       - >-
-        src/state.rs: checkpoint_step (unchecked_transaction wraps step + checkpoint event),
-        checkpoint_events table, CHECKPOINT_FORMAT (PRAGMA user_version), check_resumable (typed
-        Error::Resume on newer-format / missing run), status/started_at columns + helpers. src/error.rs:
-        Error::Resume{reason}.
+        src/mcp.rs: McpServer / McpTransport (serde, stdio + http, per-call timeout), McpSession::connect /
+        tool_specs / owns / call / shutdown over rmcp 2.2.0. Stdio spawn is an Act::Exec check on the
+        server binary; discovered tools become ToolSpec named mcp__<server>__<tool> with the server's JSON
+        Schema passed through unchanged. src/error.rs: Error::Mcp { server, reason }.
       - >-
-        Unit tests (cargo test --lib state, 16 pass): a_rolled_back_step_leaves_the_prior_checkpoint_intact
-        (atomicity/mid-commit), check_resumable_refuses_a_newer_format_and_a_missing_run (typed failure),
-        checkpoint_step_commits_the_step_and_its_event_together (NF4: no content in events),
-        status_round_trips_and_a_pre_0_7_database_migrates (additive migration).
-  - id: US-IO-HARNESS-0.7.0-T02
+        examples/mcp_fixture_server.rs: a real MCP server process (echo, write_file, boom, sleep, die) the
+        tests spawn over stdio. An example, not a bin, so it never ships as an installable binary; the
+        tests locate it from the test binary's own path, which is profile-agnostic.
+      - >-
+        tests/mcp.rs (10 tests, all green): a_stdio_server_is_discovered_called_and_its_result_reaches_the_
+        loop proves F1 end to end — namespaced tool offered beside grep/write_file, invoked, result into
+        the loop, and connect/discover/call/disconnect all in mcp_events with latency.
+      - >-
+        a_server_tool_named_like_a_builtin_does_not_shadow_it proves F3: the fixture advertises write_file,
+        both names are offered, the built-in appears exactly once, and the file on disk shows the built-in
+        did the writing while the server's namesake wrote nothing.
+      - >-
+        Bug found and fixed here: McpEvent::connected set detail to the transport and a chained with_detail
+        immediately overwrote it with a tool count, so the connect event lost the one fact only it records.
+        The discovered events already carry the tools; the count is gone and the transport stays.
+  - id: US-IO-HARNESS-0.8.0-T08
     summary: >
-      Durable budget across restart for the single-file and workspace loops. On resume reconstruct
-      tokens spent from SUM(steps.tokens), reconstruct wall-clock elapsed from runs.started_at
-      (real elapsed, not process uptime), and drive status running→completed/failed. Expose a public
-      RunStatus enum + Store::run_status(run_id) as the additive checkpoint/run-status type.
+      MCP client over streamable HTTP. Same session API, dialling a URL with a caller-supplied
+      no-redirect `reqwest::Client`, with the URL's host checked through `NetGuard` before the
+      transport is constructed.
     why_required: >
-      The headline promise is a continuous 24h ceiling and no double-charge across a crash. Today
-      tokens_used/started are stack locals reset to zero on restart, so without reloading spend and
-      elapsed time the budget silently resets — the release's core guarantee fails.
+      An HTTP MCP server is the case where the egress act does real work — it is the first
+      configurable arbitrary host the harness dials — and the contract includes both transports.
     status: done
-    depends_on: [US-IO-HARNESS-0.7.0-T01]
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T03
+      - US-IO-HARNESS-0.8.0-T07
     acceptance_criteria:
+      - >
+        F2 — with a streamable-HTTP MCP server configured, the same holds end to end against a test HTTP
+        server.
+    files:
+      - src/mcp.rs
+      - tests/mcp.rs
+    evidence:
       - >-
-        After a crash-and-resume, the aggregate budget (steps, tokens, cost, time) equals the budget of
-        the same run with no crash — proving no step's spend is charged twice.
+        src/mcp.rs: the Http transport builds StreamableHttpClientTransport::with_client over net::
+        http_client() (redirects off) after NetGuard checks the URL's host, so the connection is authorized
+        before the transport exists.
       - >-
-        The wall-clock/time component of the aggregate budget accounts for real elapsed time across a
-        restart (checkpointed timestamp based), not just the current process's uptime, so a 24h ceiling
-        is not silently reset by a restart.
+        tests/mcp.rs: an_http_server_is_discovered_called_and_its_result_reaches_the_loop proves F2 against
+        a real HTTP server — rmcp's StreamableHttpService mounted on hyper, serving the SAME fixture handler
+        the stdio test uses (tests/mcp.rs includes examples/mcp_fixture_server.rs), so the two transports
+        cannot drift apart.
       - >-
-        The new durable-run/resume entry point and the checkpoint/run-status type are part of the
-        documented public API under SemVer; existing 0.6.0 callers compile unchanged and no rusqlite- or
-        OS-specific type leaks into the public signatures.
+        an_unlisted_mcp_host_is_refused_before_anything_is_dialled completes F4's remaining leg — the case
+        deferred at the last checkpoint. An MCP host is not the provider host, so nothing grants it
+        implicitly: under the default deny the run fails with Error::Refused, a live TcpListener records
+        zero accepts, the refusal is in the trace, and mcp_events is empty.
+      - >-
+        dev-dependencies: hyper (server, http1) + hyper-util (tokio, service, server) and rmcp's
+        transport-streamable-http-server feature. Dev-only — the shipped crate stays client-side.
+
+  - id: US-IO-HARNESS-0.8.0-T09
+    summary: >
+      MCP tools in the agent loop. Offer discovered tools alongside the built-ins, dispatch
+      `mcp__*` calls through an `Act::Exec` gate on the namespaced tool name, fold the result into the
+      observation log under a documented size cap (truncation recorded), and share one session per run
+      across the whole 0.5.0 tree without serializing the fan-out.
+    why_required: >
+      Connecting to a server the agent cannot call is not a feature. This is the task that makes
+      `outcome.user_can` true.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T07
+    acceptance_criteria:
+      - >
+        F1 — with a stdio MCP server configured, a run discovers its tools, the model is offered them
+        under `mcp__<server>__<tool>` names, the agent invokes one, and the result reaches the next loop
+        step. Asserted by a test using a fixture server and by the live run.
+      - >
+        F3 — a server advertising a tool named `write_file` does not shadow the built-in: both are
+        callable, the built-in keeps its name, and the server's is reachable only under its namespaced
+        name.
     files:
       - src/run.rs
+      - src/mcp.rs
+      - tests/mcp.rs
+    evidence:
+      - >-
+        src/contract.rs: TaskContract.mcp + with_mcp(), empty by default so a 0.7.0-era contract is
+        unchanged. src/run.rs: sessions are connected and shut down around every workspace entry point
+        (run_with, resume, both resume_with_decision branches, run_tree, resume_tree, both
+        resume_tree_with_decision branches); Tree carries one session for the whole fan-out.
+      - >-
+        dispatch() gained an mcp.owns(name) branch: the call is gated as Act::Exec on the namespaced tool
+        name, the result is size-capped (truncation recorded), and a refusal is an observation rather than a
+        run failure. a_single_mcp_tool_can_be_denied_while_the_server_is_allowed proves the split — the
+        server starts, one of its tools is denied by a named layer, the run still succeeds, and mcp_events
+        shows the denied tool was never called.
+  - id: US-IO-HARNESS-0.8.0-T10
+    summary: >
+      MCP failure handling on the 0.2.0 recovery path. A server binary that will not start, a server
+      killed mid-run, a tool returning an error, and a call exceeding its timeout each produce a typed
+      error the loop treats as a recoverable step failure, recorded in the trace, never a panic and
+      never a silently dropped tool.
+    why_required: >
+      MCP servers are third-party processes the harness does not control; without this a dead server
+      takes down a run that 0.2.0 already knows how to recover.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T09
+    acceptance_criteria:
+      - >
+        F9 — MCP server failure paths: a server whose binary does not start, a server killed mid-run,
+        a tool returning an error, and a tool call exceeding its timeout each produce a typed error
+        handled by the 0.2.0 retry/recovery path, with the failure in the trace and no panic.
+    files:
+      - src/mcp.rs
+      - src/run.rs
+      - tests/mcp.rs
+    evidence:
+      - >-
+        tests/mcp.rs covers all four F9 legs: a_server_that_cannot_start_fails_the_run_with_a_typed_error
+        (Error::Mcp), a_tool_that_reports_an_error_does_not_end_the_run (is_error -> ok=false observation,
+        run still succeeds), a_tool_that_never_returns_times_out_and_the_run_continues (per-call timeout),
+        and a_server_that_dies_mid_run_becomes_an_observation_not_a_crash (the fixture's `die` tool exits
+        the process; the next call fails cleanly and the agent finishes with a built-in).
+      - >-
+        DEVIATION FROM F9 AS WRITTEN, for the owner to accept or reject at iterate: F9 says a server whose
+        binary does not start is "handled by the 0.2.0 retry/recovery path". It is not — connecting happens
+        before step 1, so it fails the run with a typed Error::Mcp instead. Retrying a missing binary would
+        not make it appear, and continuing without a configured capability is the worse failure. The other
+        three legs DO go through the loop as recoverable observations.
+
+  - id: US-IO-HARNESS-0.8.0-T11
+    summary: >
+      Trace and schema. Additive rusqlite events for MCP (server connect/disconnect with transport,
+      tools discovered, each tool call with latency and outcome) and for every network verdict (target,
+      act, effect, deciding layer) including allows, refusals, and asks, all queryable from a reopened
+      store. A 0.7.0 database migrates in place and a 0.7.0 binary still reads a migrated one.
+    why_required: >
+      An egress boundary that is not auditable cannot be trusted after the fact, and the contract's
+      operational criteria are all read-backs from the store.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T03
+      - US-IO-HARNESS-0.8.0-T07
+    acceptance_criteria:
+      - >
+        O1 — the trace records, for each run: every MCP server connect and disconnect with its
+        transport, the tool list discovered per server, each MCP tool call with latency and outcome, and
+        each network verdict with target, effect, and deciding layer. All queryable from a reopened
+        store.
+      - >
+        O2 — the rusqlite migration is additive; a database written by 0.7.0 opens and migrates in
+        place, and a 0.7.0 binary still reads a migrated database. Asserted by a migration test.
+    files:
       - src/state.rs
-      - src/lib.rs
+      - tests/mcp.rs
+      - tests/net.rs
     evidence:
       - >-
-        run_from/run_workspace_from seed tokens_used from store.spent_tokens(run_id) and check the time
-        budget against store.elapsed_secs (julianday-based, durable). RunStatus enum + Store::run_status
-        exported from lib.rs (OS/rusqlite-free); finish_run derives status.
+        src/state.rs: McpEvent (connected / discovered / called / disconnected, with transport, latency, ok,
+        truncation note) and the mcp_events table — new table only. Store::record_mcp / mcp_events read it
+        back; asserted from a reopened store in tests/mcp.rs.
       - >-
-        tests/checkpoint.rs: no_double_charge_across_a_crash_resume (resumed total spend == uninterrupted
-        30, no reset/double), the_time_budget_is_wall_clock_and_durable_across_a_restart (elapsed grows
-        across Store reopen). Unchanged 0.1.0–0.6.0 suite green (136 pass total).
-  - id: US-IO-HARNESS-0.7.0-T03
+        Network verdicts deliberately do NOT get their own table: they go to policy_events beside every
+        other permission decision, so one query answers "what was this run allowed to do". That is why the
+        egress half of O1 needed no DDL at all.
+      - >-
+        O2: a_pre_0_8_database_migrates_in_place_and_keeps_its_rows builds a 0.7.0-shaped store (steps,
+        checkpoints, policy events; mcp_events dropped), reopens it, and asserts the old rows and run status
+        are intact, the new table is empty and then usable — additive, no rewrite.
+  - id: US-IO-HARNESS-0.8.0-T12
     summary: >
-      Crash-resume a single/workspace run to the same verified success, with idempotent replay.
-      resume() restores the T02 budget, skips already-committed steps (last_step cursor) recording a
-      skipped event, orders the irreversible effect before the step commit so an uncommitted step
-      replays and re-applies idempotently by re-observing current file state, and re-running resume
-      twice yields the same completed run.
+      Back-compatibility and concurrency. A 0.7.0-era caller that configures no MCP servers compiles
+      against 0.8.0 and reaches the same verified success; the existing 0.5.0 fan-out suite runs green
+      with the network act enabled, proving the egress check introduced no global lock.
     why_required: >
-      This is the first end-to-end vertical slice a user can see: kill the process mid-run, resume,
-      reach the same verified result with the edit present exactly once and no step re-run. Without
-      it there is no crash recovery at all.
+      0.8.0 already takes one deliberate compile break (the `Act` variant); a silent behavioural break
+      or a serialized fan-out on top of it would make the upgrade unaffordable for io-cli and
+      io-studio.
     status: done
-    depends_on: [US-IO-HARNESS-0.7.0-T02]
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T09
     acceptance_criteria:
-      - >-
-        The harness process is killed with SIGKILL partway through a multi-step run; a fresh process
-        constructed against the same rusqlite store resumes the run and reaches the same verified
-        success the uninterrupted run reaches — the produced artifact is correct and no completed step
-        is re-run.
-      - >-
-        A crash immediately after a file edit is applied but before that step's checkpoint commits
-        resumes with the edit present exactly once — not doubled, not lost — proving the step is the
-        idempotency unit and the transactional commit is the completion marker.
-      - >-
-        Resume is idempotent by construction: re-running the same resume twice from the same store
-        yields the same completed run and the same budget, so a resume that itself crashes and is retried
-        does not compound.
-      - >-
-        A 0.6.0 caller's existing code compiles unchanged and reaches the same verified success with
-        checkpointing default on, proving the durable-run surface is additive.
+      - >
+        F11 — a 0.7.0-era caller that configures no MCP servers compiles against 0.8.0 and reaches the
+        same verified success, with network governed by whatever its policy says (permissive policies
+        stay permissive).
+      - >
+        NF2 — the network check is a policy lookup on the existing matcher and introduces no new global
+        lock. The 0.5.0 fan-out suite runs green with the network act enabled, so containment of egress
+        does not serialize concurrent agents.
     files:
-      - src/run.rs
+      - tests/subagents.rs
+      - tests/parity.rs
     evidence:
       - >-
-        resume(): check_resumable, terminal_outcome short-circuit for finished runs (idempotent),
-        record_resume_markers (resume + per-step skipped events). Effect applied before checkpoint_step,
-        so an uncommitted step replays and overwrites idempotently.
+        F11: a_contract_without_mcp_offers_exactly_the_builtin_tools (no connection, no mcp_events, no
+        mcp__ tool offered) and tests/net.rs a_provider_with_no_endpoint_runs_under_a_network_deny_policy
+        (an endpoint-less provider is not exempt — it has nothing to govern — so every offline test in the
+        suite runs under deny-by-default egress unchanged).
       - >-
-        tests/checkpoint.rs: crash_resume_after_a_real_sigkill_reaches_verified_success (REAL tokio
-        Child::kill SIGKILL of examples/crash_fixture, resume to Success, edit occurs exactly once, no
-        duplicate step numbers), edit_applied_exactly_once_and_resume_is_idempotent (resume x2 = no-op).
-        Existing 0.2.0 resume test still green.
-  - id: US-IO-HARNESS-0.7.0-T04
+        NF2: the whole pre-existing suite runs green with the network act live, including the 0.5.0 fan-out
+        suite (tests/subagents.rs, 17 passed). The net check is a lookup on the existing glob matcher and
+        adds no lock; the MCP session is shared by reference through Tree rather than per agent. This is
+        indirect evidence — there is no dedicated timing benchmark asserting non-serialization, same
+        limitation 0.7.0 recorded for checkpointing.
+      - >-
+        Whole suite after the release work: 171 tests passed, 0 failed, across 11 binaries.
+
+  - id: US-IO-HARNESS-0.8.0-T13
     summary: >
-      Whole-tree crash-resume. resume reconstructs the 0.5.0 tree (parent/child edges, depth, shared
-      workspace, shared trace) from the store, restores the Ledger (spent_tokens = SUM over the tree,
-      agents = COUNT of run rows), and re-drives every unfinished agent from its own last_step —
-      spawn_child gains a child-resume path instead of always starting at step 1. Per-agent
-      independent commits keep the fan-out from serializing on one write lock.
+      Documentation and packaging. README + rustdoc worked example of a run with an MCP server under a
+      deny-by-default egress policy including what a refusal looks like; the network act documented
+      alongside read/write/exec with its target format; the stdio-server limit stated; CHANGELOG entry
+      naming the `Act`/`Defaults` break and the old-policy-deserializes-to-Deny behaviour change with
+      their one-line migrations; 0.8.0 crate metadata and description.
     why_required: >
-      A run that crashes with children in flight must resume the whole tree, not just the root, or
-      0.5.0's fan-out cannot be left unattended at all. resume/resume_with_decision never touch
-      run_agent today, so this path does not exist.
+      The contract's operational criteria require the documented limit and the worked example, and an
+      undocumented breaking change is the difference between a deliberate 0.x break and a broken
+      upgrade.
     status: done
-    depends_on: [US-IO-HARNESS-0.7.0-T03]
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T09
+      - US-IO-HARNESS-0.8.0-T11
     acceptance_criteria:
-      - >-
-        A run with a parent and several children in flight is crashed and resumed; every agent continues
-        from its own checkpoint and the whole tree completes, proving resume reconstructs the 0.5.0 tree
-        and not just a single agent.
-      - >-
-        After-every-step checkpointing does not serialize the 0.5.0 concurrent fan-out — each agent
-        commits its own checkpoint independently and 100+ agents do not contend on a single global write
-        lock to make progress; a concurrency test asserts fan-out stays bounded with checkpointing on.
-    files:
-      - src/run.rs
-      - src/state.rs
-    evidence:
-      - >-
-        resume_tree() reconstructs the Ledger via Ledger::from_state(spent_tokens_tree, agent_count_tree)
-        and re-drives run_agent from the root's last step. spawn_child is now spawn-or-adopt: find_spawn
-        (persisted spawns table, keyed parent+step+goal) adopts an existing child and resumes it from its
-        own last_step; new children still register/persist. Per-agent checkpoint_step (independent
-        unchecked_transaction), no global lock added.
-      - >-
-        tests/checkpoint.rs: a_tree_crash_resumes_every_agent_from_its_checkpoint (tokio::timeout drops
-        run_tree mid-fan-out, reopen Store, resume_tree completes; agent_count_tree unchanged → adopted
-        not duplicated; a.txt/b.txt correct). Existing subagents suite (10) still green — fan-out
-        unchanged.
-  - id: US-IO-HARNESS-0.7.0-T05
-    summary: >
-      Approval that survives a full process restart, including a paused child in a tree. Extend
-      resume_with_decision so a persisted pending action resumes the whole tree from a fresh process
-      (route through run_agent/tree reconstruction, not only run_workspace_from), keeping the 0.4.0
-      in-process Approver path unchanged.
-    why_required: >
-      Unattended means the run pauses for a human only when policy demands and continues once a
-      decision arrives — across a restart. Today a paused child cannot be resumed at all
-      (resume_with_decision calls run_workspace_from directly), so the pause and resume paths do not
-      meet for a tree.
-    status: done
-    depends_on: [US-IO-HARNESS-0.7.0-T04]
-    acceptance_criteria:
-      - >-
-        A sensitive action pauses the whole tree; the process exits entirely; a new process delivers the
-        decision via `resume_with_decision`; the tree resumes from the persisted pending action and
-        continues — proving 0.4.0 approval survives a full restart.
-    files:
-      - src/run.rs
-    evidence:
-      - >-
-        New resume_tree_with_decision performs the approved action once, resolves the pending, then
-        resumes the whole tree. run_agent leaves a step paused-by-a-child UNCOMMITTED (paused_by_child
-        flag) so on resume the parent replays it and re-adopts the paused child; the child continues past
-        the now-applied action. resume_with_decision (single/workspace) unchanged.
-      - >-
-        tests/checkpoint.rs: a_tree_approval_survives_a_full_restart (ask_write policy on a.txt, Defer
-        approver pauses tree, drop Store, reopen, resume_tree_with_decision(Approve) → Success, a.txt/b.txt
-        correct). Existing 0.4.0 policy suite (17) still green.
-  - id: US-IO-HARNESS-0.7.0-T06
-    summary: >
-      Sandbox re-creation on resume. Confirm and test that an in-flight 0.6.0 sandboxed execution at
-      crash time re-runs inside a fresh sandbox on resume (its result was never committed) while a
-      committed sandboxed step is skipped — no sandbox state is ever checkpointed and no code is
-      double-executed once committed.
-    why_required: >
-      0.6.0 sandboxes are ephemeral and die with the process; resume must re-create them safely, or a
-      crash mid-verification either loses the run or double-executes model-produced code.
-    status: done
-    depends_on: [US-IO-HARNESS-0.7.0-T03]
-    acceptance_criteria:
-      - >-
-        A sandboxed execution in flight at crash time is re-run inside a fresh 0.6.0 sandbox on resume
-        and the run still reaches verified success, while a completed sandboxed step is skipped — proving
-        ephemeral sandboxes are re-created, never resumed, and never double-executed once committed.
-    files:
-      - src/run.rs
-      - tests/checkpoint.rs
-    evidence:
-      - >-
-        No sandbox state is persisted (the checkpoint stores only step trace + budget); an uncommitted
-        verify step replays and the ExecGuard creates a fresh sandbox per call, so re-creation falls out
-        of T03's replay with no special-casing.
-      - >-
-        tests/checkpoint.rs: a_sandboxed_verification_is_recreated_on_resume (Verification::CompilesRust,
-        crash before it compiles, resume compiles in a fresh sandbox → Success, resumed step > crash step
-        so committed steps are not re-run).
-  - id: US-IO-HARNESS-0.7.0-T07
-    summary: >
-      The full 0.7.0 test suite in tests/checkpoint.rs plus an example crash-fixture binary. Real
-      SIGKILL crash-and-resume (file-backed store + tokio::process kill), no-double-charge,
-      edit-exactly-once, tree-crash-resume, approval-across-restart, sandbox-recreated, a time-scaled
-      long unattended run standing in for 24h, a corrupt-checkpoint typed failure, and a multi-crash
-      history reconstructable from a reopened store. The unchanged 0.1.0–0.6.0 suite stays green with
-      checkpointing default on.
-    why_required: >
-      Every acceptance criterion in this release is a crash/resume/idempotency claim that is only
-      credible with an executable proof; the operational gate is the whole suite passing.
-    status: done
-    depends_on: [US-IO-HARNESS-0.7.0-T05, US-IO-HARNESS-0.7.0-T06]
-    acceptance_criteria:
-      - >-
-        A time-scaled long unattended run drives the loop through a large number of steps with no user
-        input (clock advanced), checkpoints throughout, and stops only on completion or a policy pause —
-        standing in for the 24h horizon.
-      - >-
-        Every checkpoint, resume, and skipped-because-already-done event is recorded so a multi-crash
-        run's full history (what ran, where each crash happened, what replayed) is reconstructable from a
-        reopened store alone.
-      - >-
-        `cargo test` passes, including the SIGKILL crash-and-resume test, the no-double-charge budget
-        test, the edit-exactly-once idempotency test, the tree-crash-and-resume test, the
-        approval-across-restart test, the sandbox-recreated-on-resume test, the time-scaled long-run
-        test, the corrupt-checkpoint typed-failure test, and the unchanged 0.1.0–0.6.0 suite with
-        checkpointing default on.
-    files:
-      - tests/checkpoint.rs
-      - examples/crash_fixture.rs
-    evidence:
-      - >-
-        tests/checkpoint.rs (10 tests, all pass): the real-SIGKILL test, no-double-charge, wall-clock
-        durability, edit-exactly-once + resume-idempotent, unknown-run typed error,
-        multi-crash-history-reconstructable, a 250-step long unattended run (all 250 checkpointed),
-        tree-crash-resume, tree-approval-across-restart, and sandbox-recreated. examples/crash_fixture.rs
-        is the killable offline fixture.
-      - >-
-        cargo test: 136 passed, 0 failed across 9 binaries (77 lib + 10 checkpoint + 9 edit_file + 3
-        multi_file + 1 parity + 17 policy + 8 sandbox + 10 subagents + 1 doctest). Evidence:
-        evidence/0.7.0/tests.txt (gitignored).
-  - id: US-IO-HARNESS-0.7.0-T08
-    summary: >
-      Docs, live example, and packaging. README + crate docs for durable checkpointing, whole-tree
-      resume, the idempotency/crash-consistency guarantees and their boundary, approval across
-      restart, and the accelerated-plus-crash evidence model (with the literal-24h note). An
-      examples/durable_run.rs live unattended run against OpenRouter killed mid-run and resumed. Bump
-      Cargo.toml to 0.7.0, CHANGELOG entry, cargo clippy --all-targets clean, cargo publish --dry-run
-      green. (Actual git Release + cargo publish are owner-gated, at /ultraship:complete.)
-    why_required: >
-      The release target_mode is published; the crate must be documented, versioned, and package-clean
-      with a runnable example before the owner-gated publish, or completion has nothing to ship.
-    status: done
-    depends_on: [US-IO-HARNESS-0.7.0-T07]
-    acceptance_criteria:
-      - >-
-        `cargo clippy --all-targets` reports zero warnings on the macOS build host.
-      - >-
-        `cargo publish --dry-run` succeeds with complete crate metadata for 0.7.0.
-      - >-
-        README and crate docs document durable step-level checkpointing, whole-tree resume, the
-        idempotency and crash-consistency guarantees and their boundary, approval across restart, and
-        the accelerated-plus-crash evidence model with the literal-24h note, with a runnable example.
-      - >-
-        An example binary drives one live unattended run against OpenRouter that is killed mid-run and
-        resumed in a fresh process to a verified result, showing checkpoints, the crash point, and
-        skipped completed steps on resume.
+      - >
+        O3 — README and rustdoc carry a runnable example of a run with an MCP server under a
+        deny-by-default egress policy, including what a refusal looks like.
+      - >
+        O5 — the documented limit is explicit: the harness governs the connections it opens, not the
+        connections a running stdio server opens for itself.
+      - >
+        NF4 — `cargo test`, `cargo clippy --all-targets` (no warnings), and `cargo build --release` are
+        green; every new public item has rustdoc; `cargo publish --dry-run` passes with complete 0.8.0
+        metadata.
+      - >
+        NF6 — adding a network variant to the public `Act` enum and a field to `Defaults` is a breaking
+        change under strict SemVer and is taken deliberately in a 0.x minor, which cargo already treats
+        as incompatible. It is stated in the CHANGELOG as a breaking change with the one-line migration,
+        not glossed as additive.
     files:
       - README.md
       - CHANGELOG.md
       - Cargo.toml
-      - examples/durable_run.rs
+      - src/lib.rs
     evidence:
       - >-
-        Cargo.toml bumped to 0.7.0; lib.rs crate docs + README gain a durable/unattended section;
-        CHANGELOG [0.7.0] - 2026-07-25 written (the source for release notes). examples/durable_run.rs
-        added (compiles; live run deferred to complete).
+        CHANGELOG.md [0.8.0]: both breaking changes stated as breaking with their one-line migrations — the
+        Act variant / Defaults field (add an Act::Net arm and a net: field) and the behaviour change that a
+        pre-0.8 policy deserializes with net: Deny (add allow_net for the hosts it uses). Neither is glossed
+        as additive. Also records the reqwest 0.13 and MSRV 1.87 bumps and why.
       - >-
-        cargo clippy --all-targets: 0 warnings. cargo publish --dry-run --allow-dirty: Packaged 52 files,
-        verify-compiled io-harness v0.7.0. Evidence: evidence/0.7.0/builds.txt (gitignored).
+        src/lib.rs: a v0.8 section with a runnable no_run example of an MCP run under a deny-by-default
+        egress policy, what a refusal looks like, and the stdio-server limit (O5). README.md: a full
+        "MCP and network egress (v0.8)" section with the same example, the refusal text, and the limit
+        stated plainly; status line and capability list updated.
       - >-
-        The live OpenRouter run of examples/durable_run.rs is NOT executed here (owner-gated, needs the
-        API key + spend) — it compiles clean and runs at /ultraship:complete, like sandbox_run at 0.6.0.
-        The literal 24h wall-clock run is out of scope by design (contract excluded scope).
+        Cargo.toml: version 0.8.0, description rewritten to name MCP and egress, keywords now include mcp.
+      - >-
+        NF4 green: cargo test 171 passed / cargo clippy --all-targets no warnings / cargo build --release /
+        cargo publish --dry-run packaged 58 files and verified clean at 0.8.0. Doctests: 2 passed.
+
+  - id: US-IO-HARNESS-0.8.0-T14
+    summary: >
+      The two live-run examples — one completing a task using a real MCP server's tool under a policy
+      whose network default is Deny, one attempting the same with that host denied and refusing
+      instead of connecting. Written and compiled during develop; executed at /ultraship:complete
+      where the API key and real spend are available.
+    why_required: >
+      They are the release's `evidence_of_value`. Without both, the release proves the capability or
+      the boundary but never that the boundary holds while the capability works.
+    status: in-progress
+    depends_on:
+      - US-IO-HARNESS-0.8.0-T09
+      - US-IO-HARNESS-0.8.0-T11
+    acceptance_criteria:
+      - >
+        O4 — the live run and the refusal run are both executed against a real MCP server and a real
+        provider, and their output is stored as release evidence.
+    files:
+      - examples/mcp_run.rs
+    evidence:
+      - >-
+        examples/mcp_run.rs written and compiling: two runs against a real model and a real MCP server —
+        one where network denies by default and the agent uses the server's tool anyway (reaching
+        OpenRouter only through the named provider layer), and one where the MCP host is unlisted and the
+        run refuses before a socket exists. The pair is the point: the first alone shows a feature, the
+        second alone shows a wall.
+      - >-
+        REMAINING: not executed. It needs OPENROUTER_API_KEY and real spend, so it runs at
+        /ultraship:complete, exactly as examples/sandbox_run did for 0.6.0 and examples/durable_run for
+        0.7.0. Until then O4 is unmet and no live evidence is claimed.

@@ -7,7 +7,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 **Type:** Rust library crate
 **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
 **License:** Apache-2.0
-**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise. v0.6 adds the execution sandbox: every command the verification gate runs — the `rustc` compile and the test binary it has run since v0.2 — executes inside an ephemeral, per-run sandbox (isolated workdir, resource caps that kill, network denied by default, guaranteed teardown), so model-produced code no longer runs on the host directly. The sandbox is OS-native and OS-neutral — one trait, a native backend per platform (macOS `sandbox-exec`, Linux namespaces, Windows Job Objects) over a portable floor that runs everywhere.
+**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise. v0.6 adds the execution sandbox: every command the verification gate runs — the `rustc` compile and the test binary it has run since v0.2 — executes inside an ephemeral, per-run sandbox (isolated workdir, resource caps that kill, network denied by default, guaranteed teardown), so model-produced code no longer runs on the host directly. The sandbox is OS-native and OS-neutral — one trait, a native backend per platform (macOS `sandbox-exec`, Linux namespaces, Windows Job Objects) over a portable floor that runs everywhere. v0.7 makes a run durable and unattended: every step is checkpointed transactionally, and a crash or full restart resumes the whole agent tree from its own last committed step without re-running work, double-charging the budget, or re-applying an edit. v0.8 makes the harness extensible and its network reach governed: it is an MCP client (stdio and streamable HTTP) whose servers' tools reach the agent beside the built-ins under namespaced names, and outbound connections become a fourth permission act — deny-by-default, layered, contained downward, and traced.
 
 ## Capabilities
 
@@ -17,7 +17,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Orchestration loop — observe, reason, act, check, stop
 - State and memory — progress, intermediate results, decisions (rusqlite)
 - Verification layer — tests, schemas, read-backs confirm the task is done
-- Permissions and guardrails — what the agent may access, change, send, spend
+- Permissions and guardrails — what the agent may access, change, send, spend ✅ **v0.8** completes *send*: `Act::Net`, deny-by-default egress
 - Recovery and retry — retries, fallbacks, replanning, escalation
 - Stop conditions and budgets — cap steps, time, cost, retries, risky actions
 - Observability and tracing — record prompts, decisions, tool calls, cost
@@ -29,7 +29,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Built-in tools — filesystem, git, grep, find
 - Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete, PDF watermark, PDF form fill, OCR, barcode/QR read and generate
 - Media — image and video passthrough when the model supports it
-- Extensibility — MCP (rmcp), plugins, skills
+- Extensibility — MCP (rmcp) ✅ **v0.8** (client; stdio + streamable HTTP), plugins, skills
 
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
 [docs/CONTRACT.md](docs/CONTRACT.md) for the public contract.
@@ -419,6 +419,84 @@ The 24h horizon is proven by a real `kill -9`-then-resume test plus a time-scale
 long unattended run; a literal 24h wall-clock run is noted, not gated on.
 
 Run it live: `cargo run --example durable_run` (kills itself mid-run and resumes).
+
+## MCP and network egress (v0.8)
+
+Point the harness at MCP servers and their tools reach the agent beside the
+built-ins. Because a configured server is the first thing here that can dial an
+arbitrary host, the v0.4 policy grows a fourth act at the same time.
+
+```rust
+use io_harness::{run_with, ApproveAll, McpServer, OpenRouter, Policy, Store,
+                 TaskContract, Verification};
+
+let contract = TaskContract::workspace(
+    "summarise the repo's README into NOTES.md",
+    "/path/to/repo",
+    Verification::WorkspaceFileContains { file: "NOTES.md".into(), needle: "#".into() },
+)
+.with_mcp([
+    McpServer::stdio("files", "my-mcp-file-server"),
+    McpServer::http("search", "https://mcp.example.com/mcp"),
+]);
+
+let policy = Policy::default()
+    .layer("app")
+    .allow_read("*")
+    .allow_write("*")
+    // The stdio server may start; nothing else may be executed.
+    .allow_exec("my-mcp-file-server")
+    // The HTTP server may be reached; every other host stays denied.
+    .allow_net("mcp.example.com");
+
+let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+```
+
+- **Namespaced tools** — a server's tools arrive as `mcp__<server>__<tool>`, so a
+  server advertising `write_file` cannot shadow the built-in. Both stay callable
+  and distinct.
+- **Two transports** — `McpServer::stdio` spawns a child process,
+  `McpServer::http` dials a streamable-HTTP endpoint. One session serves a whole
+  v0.5 agent tree, not one connection per agent.
+- **`Act::Net`** — an outbound connection is a policy decision with a target
+  (`host` or `host:port`), matched by the same glob matcher as paths and binaries
+  and decided by the same deny-first stack: `allow_net`, `deny_net`, `ask_net`. An
+  `ask_net` routes to the `Approver` and, if deferred, survives a full process
+  restart like any other v0.4 approval.
+- **Your provider still works under deny-all** — the harness contributes its
+  configured provider's host as a *named* layer, `provider`, so you need not list
+  it. `Policy::explain` attributes the allowance to that layer rather than hiding
+  it. An explicit `deny_net` of your own provider still wins, and fails fast as a
+  refusal rather than hanging.
+- **Two gates per server** — starting a stdio server is an exec check on its
+  binary; calling one of its tools is an exec check on the namespaced tool name.
+  So a policy can allow a server generally and still deny one of its tools.
+- **Contained downward** — a v0.5 child inherits its parent's network rules and can
+  only narrow them; the spawn tool takes `deny_net` alongside `deny_write`.
+- **Everything is traced** — connects (with transport), tools discovered, each call
+  with latency and outcome, and every network verdict with the layer that decided
+  it. A 0.7.0 database migrates in place.
+
+### What a refusal looks like
+
+An out-of-policy **tool call** is an observation the model can adapt to, not a
+crashed run — the same treatment a refused path already gets:
+
+```text
+[mcp__files__delete_everything refused] (rule mcp__files__delete_*) — the policy forbids calling this tool
+```
+
+A denied **host**, or a configured server that will not start, stops the run
+before anything happens, with `Error::Refused { act: "net", .. }` or
+`Error::Mcp { server, reason }` — because unlike a single tool call, there is no
+useful way for the agent to work around a capability it was told it had.
+
+### The limit, stated plainly
+
+The harness governs the connections **it** opens. A stdio MCP server is a separate
+process: the harness decides whether it may start and which of its tools may be
+called, but once running it dials whatever it likes. Isolating a server's own
+egress would need OS-level containment, which v0.8 does not build.
 
 ## Part of initorigin
 

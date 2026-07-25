@@ -1,21 +1,25 @@
 [package]
 name = "io-harness"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
-rust-version = "1.75"
+# 0.8.0 raises the floor: rmcp's child-process transport pulls process-wrap (1.87)
+# and reqwest 0.13 requires 1.85. Declaring the old 1.75 would be a false claim.
+rust-version = "1.87"
 authors = ["Aakash Pawar"]
 license = "Apache-2.0"
-description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI), multi-file edits with grep/find over a workspace, budgets, retry, full trace, resumable runs, execution-based verification, a layered permission policy with a human-approval gate, contained sub-agent composition, and an OS-native/OS-neutral execution sandbox (macOS sandbox-exec, Linux namespaces, Windows Job Objects, portable floor) that isolates model-produced code per run. Embeddable in-process."
+description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI), multi-file edits with grep/find over a workspace, budgets, retry, full trace, resumable runs, execution-based verification, a layered permission policy with a human-approval gate, contained sub-agent composition, an OS-native/OS-neutral execution sandbox (macOS sandbox-exec, Linux namespaces, Windows Job Objects, portable floor) that isolates model-produced code per run, durable checkpoint/resume for unattended runs, an MCP client (stdio and streamable HTTP) whose tools reach the agent beside the built-ins, and a deny-by-default network egress policy. Embeddable in-process."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
-keywords = ["agent", "ai", "llm", "anthropic", "harness"]
+keywords = ["agent", "ai", "llm", "mcp", "harness"]
 categories = ["asynchronous", "api-bindings"]
 # Ship only crate consumers' files; keep internal planning/CI out of the package.
 exclude = [".ultraship/", ".github/"]
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# 0.13 (not 0.12) because rmcp 2.2.0 requires it, and the streamable-HTTP MCP
+# transport only accepts a Client of the same version — one reqwest, one TLS stack.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -26,6 +30,13 @@ tracing = "0.1"
 tempfile = "3"
 # grep tool: regex matching, and glob->regex for the find tool's patterns.
 regex = "1"
+# MCP client only — no server mode, no macros. Stdio servers over the child-process
+# transport, remote servers over streamable HTTP with our own (no-redirect) Client.
+rmcp = { version = "2.2.0", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+] }
 
 # Sandbox backends: setrlimit (CPU cap), kill, and signal constants on unix; the
 # macOS/Linux native backends and the portable floor's rlimit caps use it.
@@ -33,4 +44,9 @@ regex = "1"
 libc = "0.2"
 
 [dev-dependencies]
+hyper = { version = "1.11.0", features = ["server", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "service", "server"] }
+# The server half of rmcp, for examples/mcp_fixture_server.rs — the deterministic
+# MCP server the tests drive. Dev-only: the crate itself ships client-side only.
+rmcp = { version = "2.2.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }

@@ -79,8 +79,46 @@ versions:
     status: released
   - version: 0.8.0
     outcome: >
-      A developer extends the harness through MCP (rmcp), plugins, and skills, and uses the
-      office/document and media tool suite from an agent run. Network egress policy lands here, with
-      the first callers (MCP servers, plugins) that can actually dial an arbitrary host.
+      A developer points the harness at MCP servers and the agent uses their tools alongside the
+      built-ins, in the same observe/reason/act/verify/stop loop — the crate becomes extensible
+      without a fork. Because MCP servers are the first callers that can dial an arbitrary host,
+      network egress stops being ungoverned: the 0.4.0 permission model gains a network act, so
+      outbound calls (the provider, an HTTP MCP server, an MCP tool's own reach) are
+      deny-by-default, layered, and either allowed, refused, or paused for a human decision by the
+      same policy that already governs read, write, and exec. Refusals and decisions are in the
+      rusqlite trace, a 0.5.0 child can only narrow its parent's network rules, and a network
+      approval survives a restart under 0.7.0 durable pause.
+    detail: specified
+    status: released
+  - version: 0.9.0
+    outcome: >
+      A developer extends the harness in-process without MCP: registering their own typed tools
+      (plugins) against a public tool trait, and loading skills — instruction files that shape how
+      an agent approaches a class of task — so io-cli and io-studio each add their own capabilities
+      and behaviour over the shared engine. Plugin tools are governed by the same 0.4.0/0.8.0 policy
+      and appear in the trace exactly like built-ins.
+    detail: outline
+    status: planned
+  - version: 0.10.0
+    outcome: >
+      A developer runs a task over real documents: the agent creates and edits Word, Excel,
+      PowerPoint, and PDF files, watermarks and fills PDF forms, and reads text and codes off a page
+      through OCR and barcode/QR — with the same path policy, sandboxing, and verification that
+      govern source edits.
+    detail: outline
+    status: planned
+  - version: 0.11.0
+    outcome: >
+      A developer hands the agent an image or video alongside the task and the harness passes it
+      through to any provider whose model accepts it, and the agent works a real git repository —
+      reading history, staging, and committing its own work — so a run ends as reviewable version
+      control rather than loose file edits.
+    detail: hypothesis
+    status: planned
+  - version: 1.0.0
+    outcome: >
+      A developer depends on io-harness under a stable public contract: the crate API is frozen for
+      1.x, every public item is documented with a worked example, and the SemVer promise the product
+      claims is one an external Rust developer can actually rely on.
     detail: hypothesis
     status: planned

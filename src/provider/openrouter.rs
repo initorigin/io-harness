@@ -20,7 +20,7 @@ impl OpenRouter {
     /// Build from an explicit key and model slug (e.g. `anthropic/claude-sonnet-4`).
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: crate::net::http_client(),
             api_key: api_key.into(),
             model: model.into(),
         }
@@ -41,6 +41,10 @@ impl OpenRouter {
 impl Provider for OpenRouter {
     fn name(&self) -> &str {
         "openrouter"
+    }
+
+    fn endpoint(&self) -> Option<&str> {
+        Some(ENDPOINT)
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
