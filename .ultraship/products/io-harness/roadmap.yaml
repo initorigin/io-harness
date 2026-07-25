@@ -90,13 +90,25 @@ versions:
       approval survives a restart under 0.7.0 durable pause.
     detail: specified
     status: released
+  - version: 0.8.1
+    outcome: >
+      An operator can trust that a passing execution gate was not defeated by the file it verified.
+      The subject file can no longer shadow what the criterion names, so the recorded bypass — a
+      `#[macro_export] macro_rules! assert` making `assert!(false, "this gate can never pass")`
+      report ok — fails, and so does the same attack through `WorkspaceTestPasses`. The crate
+      documents plainly what a passing gate does and does not prove, so io-cli and io-studio stop
+      inheriting a guarantee the gate never made. See iterations/US-IO-HARNESS-0.8.0-I01.
+    detail: specified
+    status: released
   - version: 0.9.0
     outcome: >
-      A developer extends the harness in-process without MCP: registering their own typed tools
-      (plugins) against a public tool trait, and loading skills — instruction files that shape how
-      an agent approaches a class of task — so io-cli and io-studio each add their own capabilities
-      and behaviour over the shared engine. Plugin tools are governed by the same 0.4.0/0.8.0 policy
-      and appear in the trace exactly like built-ins.
+      A developer extends the harness in-process without MCP: their own typed tools registered
+      against a public tool trait, compiled into their binary, offered to the model beside the
+      built-ins and governed by the same 0.4.0/0.8.0 policy and trace; and skills — instruction
+      files discovered from a directory, whose body shapes how the agent approaches a class of task.
+      io-cli and io-studio each add their own capabilities and behaviour over the shared engine. No
+      dynamic loading and no plugin ABI — out-of-process extension is what 0.8.0's MCP client is
+      for. Skills carry instructions, not code.
     detail: outline
     status: planned
   - version: 0.10.0

@@ -12,6 +12,17 @@
 //! produced file with `rustc`. A substring stub fails to compile, so it fails
 //! the gate. Compilation happens in a throwaway temp dir that is removed
 //! afterwards, and `rustc` touches no network.
+//!
+//! v0.8.1 closes the converse hole. Until then the file under verification and
+//! the caller's criterion were compiled as one crate, so the *subject could
+//! defeat its own gate* — shadowing a macro the criterion invoked, or deleting
+//! the criterion with a crate-level `#![cfg(any())]`. They are still one crate —
+//! that is what lets a criterion call a private `fn hello`, and making them two
+//! broke exactly that — but the criterion now sits in a module that re-imports
+//! the prelude macros explicitly, so a shadowing subject makes the name ambiguous
+//! instead of capturing it, and a probe compiled alongside the subject catches
+//! one that deleted its own contents. What a passing gate proves — and what it
+//! does not — is spelled out on [`Verification`].
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,6 +35,41 @@ use crate::sandbox::{self, RunSpec, Sandbox, SandboxConfig};
 use crate::state::{PolicyEvent, Store};
 
 /// How the harness decides a task is done.
+///
+/// # What a passing gate proves
+///
+/// A pass means **the stated criterion was satisfied** under the harness's
+/// compile and run. It is not proof that the artifact is correct, and no
+/// execution gate can be. A criterion checks what it checks: a gate asserting
+/// `hello() == 42` is silent about everything else the file does.
+///
+/// The execution gates ([`Verification::CompilesRust`],
+/// [`Verification::RustTestPasses`], and the workspace variants) are stronger
+/// than the content gates ([`Verification::FileContains`],
+/// [`Verification::FileEquals`]) because a stub cannot compile and run — that is
+/// why 0.2.0 introduced them — but "stronger" is not "sufficient".
+///
+/// # What 0.8.1 changed
+///
+/// Until 0.8.1 the file under verification was compiled into the *same crate* as
+/// the caller's criterion, so it could change how that criterion resolved. A file
+/// defining `#[macro_export] macro_rules! assert` made
+/// `assert!(false, "this gate can never pass")` — which no correct
+/// implementation can satisfy — report a pass; a file opening with
+/// `#![cfg(any())]` deleted the criterion outright and the empty test binary
+/// exited 0. An agent found the first of these unprompted during io-cli 0.1.0's
+/// live runs (see `iterations/US-IO-HARNESS-0.8.0-I01`).
+///
+/// The subject is now compiled as its own crate and the criterion compiles
+/// *against* it, with the prelude macros a criterion is likely to invoke
+/// explicitly re-imported so an exported macro cannot capture them. A subject can
+/// no longer redefine or delete what the criterion names. `test_src` is unchanged
+/// — it still calls the subject's items unqualified, and a macro the subject
+/// legitimately exports still reaches it.
+///
+/// This is a boundary against the file under verification, not against a hostile
+/// author with other tools. Verification runs the produced code, so it remains
+/// governed by the exec [`Policy`] and the 0.6.0 sandbox.
 #[derive(Debug, Clone)]
 pub enum Verification {
     /// The file's contents must contain this text. Cheap, but gameable — a
@@ -31,13 +77,28 @@ pub enum Verification {
     FileContains(String),
     /// The file's contents must equal this text exactly.
     FileEquals(String),
-    /// The file must compile as a Rust library (`rustc --crate-type lib`).
-    /// Execution-based: a non-compiling stub fails.
+    /// The file must compile as a Rust library (`rustc --crate-type lib`), and
+    /// its items must survive to be type-checked. Execution-based: a
+    /// non-compiling stub fails.
+    ///
+    /// Since 0.8.1 the second half of that is enforced. A crate-level attribute
+    /// such as `#![cfg(any())]` strips every item *before* rustc examines it, so
+    /// a file whose body does not type-check compiled clean and passed. A subject
+    /// that deletes its own contents now fails. Legitimate crate-level attributes
+    /// — `#![allow(dead_code)]`, `#![no_std]` — are unaffected.
     CompilesRust,
-    /// The file must compile together with `test_src` (appended after the file)
-    /// and the resulting test binary must pass. Execution-based.
+    /// The file must compile, and `test_src` must compile against it and pass.
+    /// Execution-based.
+    ///
+    /// Since 0.8.1 the file under verification can no longer shadow the names
+    /// `test_src` uses, nor delete it. `test_src` is unchanged: it still refers to
+    /// the file's items unqualified, and still reaches *private* items — the two
+    /// remain one crate, deliberately, so an implementation does not have to be
+    /// `pub` to pass. See the
+    /// [type-level docs](Verification#what-a-passing-gate-proves) for what a
+    /// pass does and does not prove.
     RustTestPasses {
-        /// Rust source appended after the file's contents, e.g. a `#[test] fn`.
+        /// Rust source compiled against the file, e.g. a `#[test] fn`.
         test_src: String,
     },
     /// (workspace/multi-file) A named file under the workspace root must contain
@@ -54,14 +115,21 @@ pub enum Verification {
     /// (workspace/multi-file) Every listed file — relative to the workspace root
     /// — must compile on its own as a Rust library. The run only succeeds when
     /// all of them do, so one wrong file fails the whole set.
+    ///
+    /// Hardened with [`Verification::CompilesRust`] in 0.8.1: each file goes
+    /// through the same check, so no listed file can pass by deleting itself.
     EachCompilesRust(Vec<PathBuf>),
-    /// (workspace/multi-file) All listed files, concatenated in order and
-    /// followed by `test_src`, must compile and the test must pass. This proves
+    /// (workspace/multi-file) All listed files, concatenated in order, must
+    /// compile, and `test_src` must compile against them and pass. This proves
     /// the edited files work *together*, not merely each in isolation.
+    ///
+    /// Hardened with [`Verification::RustTestPasses`] in 0.8.1: a shadowing
+    /// definition in any one of the files cannot defeat the gate, and a private
+    /// item in any of them still reaches `test_src`.
     WorkspaceTestPasses {
-        /// Files (relative to the workspace root) concatenated before the test.
+        /// Files (relative to the workspace root) concatenated into the subject.
         files: Vec<PathBuf>,
-        /// Rust source appended after the files, e.g. a `#[test] fn`.
+        /// Rust source compiled against the files, e.g. a `#[test] fn`.
         test_src: String,
     },
 }
@@ -145,6 +213,18 @@ impl<'a> ExecGuard<'a> {
                 rule: verdict.rule,
                 layer: verdict.layer,
             })
+        }
+    }
+
+    /// Record which phase of an execution gate failed, when a store is attached.
+    /// See [`crate::state::SandboxEvent::gate_phase_failed`] — this is what lets
+    /// an operator tell a criterion that could not compile against the subject
+    /// (the shape a pre-0.8.1 bypass takes) from a test that ran and failed.
+    fn record_gate_failure(&self, phase: &str) {
+        if let Some((store, run_id, step)) = self.trace {
+            let _ = store.record_sandbox_event(&crate::state::SandboxEvent::gate_phase_failed(
+                run_id, step, phase,
+            ));
         }
     }
 
@@ -315,22 +395,18 @@ impl Verification {
     }
 }
 
-/// The argv verification builds for a metadata-only compile. Every element is
-/// harness-constructed — no model or caller output reaches it — which is why
-/// the command policy gates the binary name and records argv rather than
-/// parsing it. See the 0.4.0 contract; argument gating becomes required in
-/// 0.6.0 when plugins can supply argv.
-fn metadata_args(dir: &Path, lib: &Path) -> Vec<String> {
-    [
-        "--edition", "2021", "--crate-type", "lib", "--emit", "metadata", "--out-dir",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .chain([dir.display().to_string(), lib.display().to_string()])
-    .collect()
+/// The argv that compiles the file under verification as its *own* crate, so
+/// nothing it declares can reach the crate the criterion lives in.
+fn subject_lib_args(subject: &Path, rlib: &Path) -> Vec<String> {
+    ["--edition", "2021", "--crate-type", "lib", "--crate-name", SUBJECT_CRATE]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([subject.display().to_string(), "-o".into(), rlib.display().to_string()])
+        .collect()
 }
 
-/// The argv verification builds to compile and link the test binary.
+/// The argv verification builds to compile and link the test binary from the
+/// combined crate — the subject with the criterion module appended.
 fn test_build_args(combined: &Path, bin: &Path) -> Vec<String> {
     ["--edition", "2021", "--test"]
         .iter()
@@ -338,6 +414,76 @@ fn test_build_args(combined: &Path, bin: &Path) -> Vec<String> {
         .chain([combined.display().to_string(), "-o".into(), bin.display().to_string()])
         .collect()
 }
+
+/// The argv that type-checks the probe crate against the compiled subject.
+///
+/// Every element is harness-constructed — no model or caller output reaches it —
+/// which is why the command policy gates the binary name and records argv rather
+/// than parsing it. See the 0.4.0 contract.
+fn probe_args(dir: &Path, probe: &Path, rlib: &Path) -> Vec<String> {
+    ["--edition", "2021", "--crate-type", "lib", "--emit", "metadata", "--extern"]
+        .iter()
+        .map(|s| s.to_string())
+        .chain([
+            format!("{SUBJECT_CRATE}={}", rlib.display()),
+            "--out-dir".into(),
+            dir.display().to_string(),
+            probe.display().to_string(),
+        ])
+        .collect()
+}
+
+/// The crate name the file under verification is compiled under.
+const SUBJECT_CRATE: &str = "subject";
+
+/// Appended to the subject on the compile-only path, and referenced by
+/// [`PROBE_CRATE`]. A subject that deletes its own items — a crate-level
+/// `#![cfg(any())]` — deletes this too, and the reference then fails to resolve.
+/// The name is reserved: a subject defining it as well simply fails to compile.
+const PROBE_ITEM: &str = "pub fn __io_harness_probe() {}\n";
+
+/// The crate root that proves the subject's items actually exist.
+const PROBE_CRATE: &str = "extern crate subject;\n\
+    pub fn __io_harness_check() { subject::__io_harness_probe() }\n";
+
+/// Opens the module the harness wraps the caller's criterion in, appended to the
+/// subject so the two are one crate. Closed by [`CRITERION_CLOSE`].
+///
+/// This preamble is why an execution gate cannot be answered by the file it is
+/// checking. Two properties, both load-bearing:
+///
+/// 1. The criterion is a *child module* of the subject's own crate, so
+///    `use super::*` reaches the subject's items — including private ones.
+///    `test_src` still calls `hello()` exactly as a 0.8.0 caller wrote it, and a
+///    subject that writes an idiomatic non-`pub` `fn hello` still passes. The
+///    0.8.1 development build made the subject a separate crate instead, and that
+///    is precisely what broke: privacy is a wall between crates, so an ordinary
+///    private implementation failed a gate it had always passed. The live run for
+///    F7 caught it — see `iterations/US-IO-HARNESS-0.8.1-I01`.
+/// 2. The prelude macros the criterion is likely to invoke are re-imported
+///    *explicitly*. A subject defining `macro_rules! assert` — exported or not —
+///    then makes the name ambiguous (rustc E0659) rather than capturing it, so
+///    the gate fails to compile instead of passing an impossible criterion. A
+///    macro the subject exports under any *other* name still reaches the
+///    criterion through the glob, which is what keeps this a fix rather than a
+///    restriction.
+///
+/// The deletion attack — a crate-level `#![cfg(any())]` that strips the criterion
+/// along with everything else, leaving a test binary that runs zero tests and
+/// exits 0 — is not this preamble's job. Being one crate again, it cannot be. It
+/// is caught before this point by the same probe the compile-only path uses.
+const CRITERION_OPEN: &str = "\n#[cfg(test)]
+mod __io_harness_criterion {
+#[allow(unused_imports)]
+use ::core::{assert, assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne,
+    matches, panic, todo, unimplemented, unreachable, write, writeln, format_args};
+#[allow(unused_imports)]
+use ::std::{dbg, eprint, eprintln, format, print, println, vec};
+#[allow(unused_imports)] use super::*;
+";
+
+/// Closes [`CRITERION_OPEN`].
+const CRITERION_CLOSE: &str = "\n}\n";
 
 /// Compile `source` with `rustc` in a throwaway temp dir. With `test_src`,
 /// append it and run the resulting test binary. Returns whether the gate
@@ -351,19 +497,101 @@ async fn compile_source(
 
     match test_src {
         None => {
-            // Metadata-only compile: type-checks without linking a binary.
-            let lib = dir.path().join("lib.rs");
-            tokio::fs::write(&lib, source).await?;
-            let args = metadata_args(dir.path(), &lib);
+            // Compile the subject as its own crate, with a probe item appended,
+            // then type-check a second crate that *references* the probe.
+            //
+            // The second compile is what makes the gate honest. Before 0.8.1 the
+            // subject was compiled alone, and "it compiled" was taken to mean its
+            // contents were type-checked. It does not: a crate-level
+            // `#![cfg(any())]` strips every item before rustc examines it, so a
+            // body as ill-typed as `pub fn hello() -> u32 { "not a u32" }`
+            // compiled clean and passed. A subject that deleted itself now fails,
+            // because the probe went with it and the probe crate cannot find it.
+            //
+            // The probe rather than the more obvious `include!` of the subject
+            // from a harness-authored root: that would reject crate-level inner
+            // attributes outright, which also fails an honest file opening with
+            // `#![allow(dead_code)]` or `#![no_std]`. Legitimate attributes keep
+            // working here — only *deleting the crate's contents* is caught.
+            let subject = dir.path().join("subject.rs");
+            tokio::fs::write(&subject, format!("{source}\n{PROBE_ITEM}")).await?;
+            let rlib = dir.path().join("libsubject.rlib");
+            let args = subject_lib_args(&subject, &rlib);
             guard.check("rustc", &args)?;
             let argv = std::iter::once("rustc".to_string())
                 .chain(args.iter().cloned())
                 .collect::<Vec<_>>();
-            guard.exec(&argv, dir.path()).await
+            if !guard.exec(&argv, dir.path()).await? {
+                guard.record_gate_failure("subject-compile");
+                return Ok(false);
+            }
+
+            let probe = dir.path().join("probe.rs");
+            tokio::fs::write(&probe, PROBE_CRATE).await?;
+            let args = probe_args(dir.path(), &probe, &rlib);
+            guard.check("rustc", &args)?;
+            let argv = std::iter::once("rustc".to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            let passed = guard.exec(&argv, dir.path()).await?;
+            if !passed {
+                // The subject compiled but its items are gone.
+                guard.record_gate_failure("subject-emptied");
+            }
+            Ok(passed)
         }
         Some(test) => {
+            // Three defences, because the two attacks this release closes are
+            // different and no single structure stops both without cost.
+            //
+            // The subject is compiled alone first, with the probe appended. That
+            // classifies an ordinary "the file does not compile" failure, and the
+            // probe reference then catches a subject that deleted its own items —
+            // a crate-level `#![cfg(any())]`, which would otherwise strip the
+            // criterion too and leave a test binary that runs zero tests and
+            // exits 0. Same mechanism as the compile-only path above.
+            //
+            // Only then is the criterion appended, as a module of the subject's
+            // own crate. It is deliberately NOT a separate crate: that was tried
+            // during 0.8.1 and it broke an ordinary private implementation, since
+            // privacy is a wall between crates. Shadowing is stopped inside the
+            // module by CRITERION_OPEN instead.
+            let subject = dir.path().join("subject.rs");
+            tokio::fs::write(&subject, format!("{source}\n{PROBE_ITEM}")).await?;
+            let rlib = dir.path().join("libsubject.rlib");
+
+            let args = subject_lib_args(&subject, &rlib);
+            guard.check("rustc", &args)?;
+            let subject_argv = std::iter::once("rustc".to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            if !guard.exec(&subject_argv, dir.path()).await? {
+                // The subject does not compile: the gate fails exactly as it did
+                // in 0.8.0.
+                guard.record_gate_failure("subject-compile");
+                return Ok(false);
+            }
+
+            let probe = dir.path().join("probe.rs");
+            tokio::fs::write(&probe, PROBE_CRATE).await?;
+            let args = probe_args(dir.path(), &probe, &rlib);
+            guard.check("rustc", &args)?;
+            let probe_argv = std::iter::once("rustc".to_string())
+                .chain(args.iter().cloned())
+                .collect::<Vec<_>>();
+            if !guard.exec(&probe_argv, dir.path()).await? {
+                // The subject compiled but its items are gone — so the criterion
+                // would be gone too, and the test binary would pass on nothing.
+                guard.record_gate_failure("subject-emptied");
+                return Ok(false);
+            }
+
             let combined = dir.path().join("combined.rs");
-            tokio::fs::write(&combined, format!("{source}\n{test}\n")).await?;
+            tokio::fs::write(
+                &combined,
+                format!("{source}\n{CRITERION_OPEN}{test}{CRITERION_CLOSE}"),
+            )
+            .await?;
             let bin = dir.path().join("t");
 
             let args = test_build_args(&combined, &bin);
@@ -372,13 +600,21 @@ async fn compile_source(
                 .chain(args.iter().cloned())
                 .collect::<Vec<_>>();
             if !guard.exec(&build_argv, dir.path()).await? {
+                // The interesting failure: the subject compiles on its own, but
+                // the criterion will not compile beside it. A subject shadowing
+                // `assert!` lands here, as an E0659 ambiguity.
+                guard.record_gate_failure("criterion-compile");
                 return Ok(false);
             }
 
             // The produced binary is its own spawn: denying TEST_BINARY while
             // allowing rustc type-checks the code without ever running it.
             guard.check(TEST_BINARY, &[bin.display().to_string()])?;
-            guard.exec(&[bin.display().to_string()], dir.path()).await
+            let passed = guard.exec(&[bin.display().to_string()], dir.path()).await?;
+            if !passed {
+                guard.record_gate_failure("test-run");
+            }
+            Ok(passed)
         }
     }
 }

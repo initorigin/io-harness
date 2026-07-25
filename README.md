@@ -98,7 +98,9 @@ async fn main() -> io_harness::Result<()> {
         "add a `hello` function that returns 42",
         "src/hello.rs",
         // Execution-based: the file must compile AND pass this test. A stub
-        // that only contains the right substring fails the gate.
+        // that only contains the right substring fails the gate. Since v0.8.1
+        // the file is compiled as its own crate and this test compiles against
+        // it, so the file cannot shadow `assert_eq!` or delete the test to pass.
         Verification::RustTestPasses {
             test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
         },
@@ -155,10 +157,41 @@ by writing the literal string `fn hello`, which does not compile. v0.2 adds gate
 that run the artifact:
 
 - `Verification::CompilesRust` — passes only if the file compiles (`rustc --crate-type lib`).
-- `Verification::RustTestPasses { test_src }` — appends `test_src` and passes only if the test binary passes.
+- `Verification::RustTestPasses { test_src }` — compiles `test_src` against the file and passes only if the test binary passes.
 
 Compilation runs locally in a throwaway temp dir (removed afterwards) and touches
 no network.
+
+**What a passing gate proves.** That the stated criterion was satisfied — not
+that the artifact is correct. A gate asserting `hello() == 42` is silent about
+everything else the file does. Execution gates are stronger than content gates
+because a stub cannot compile and run, but stronger is not sufficient.
+
+**The subject cannot defeat its own gate (since v0.8.1).** Until v0.8.1 the file
+under verification and your `test_src` were compiled as one crate, so the file
+could change how your criterion resolved. A file defining `#[macro_export]
+macro_rules! assert` made `assert!(false, "this gate can never pass")` report a
+pass; a file opening with `#![cfg(any())]` deleted the criterion entirely and the
+empty test binary exited 0. An agent found the first of these unprompted during
+io-cli 0.1.0's live runs. Your criterion now sits in a module of the file's crate
+that re-imports the prelude macros explicitly, so a file defining its own `assert`
+makes the name ambiguous instead of capturing it, and the gate fails to compile
+rather than passing; a probe compiled alongside the file catches one that deleted
+its own contents. Nothing changed in what you write: `test_src` still calls the
+file's items unqualified, a macro the file legitimately exports still reaches it,
+and your criterion still reaches the file's **private** items — an implementation
+does not have to be `pub` to pass.
+
+The compile-only gates had the same hole by a different route, needing no
+criterion at all: `#![cfg(any())]` strips a file's items *before* rustc
+type-checks them, so `pub fn hello() -> u32 { "not a u32" }` compiled clean and
+passed. `CompilesRust` and `EachCompilesRust` now confirm the file's items
+survived to be checked. Legitimate crate-level attributes (`#![allow(dead_code)]`,
+`#![no_std]`) are unaffected.
+
+If a run stopped passing when you upgraded to v0.8.1, the gate was being
+defeated. `SandboxEvent::gate_phase_failed` in the trace says which phase failed
+— `subject-compile`, `criterion-compile`, `test-run`, or `subject-emptied`.
 
 ### Trace and resume
 

@@ -26,6 +26,89 @@ notes are produced from it.
 
 ### Security
 
+## [0.8.1] - 2026-07-25
+
+A correctness fix: the execution gate could be defeated by the file it was
+verifying.
+
+`RustTestPasses` and `WorkspaceTestPasses` compiled the file under verification
+and the caller's criterion into one crate. The file was therefore in scope to
+change how the criterion resolved — or to remove it. A file defining
+`#[macro_export] macro_rules! assert` made `assert!(false, "this gate can never
+pass")`, which no correct implementation can satisfy, report `test result: ok`. A
+file opening with `#![cfg(any())]` deleted the whole crate including the
+criterion, and a test binary with zero tests exits 0, which the gate read as a
+pass. The first was found in the wild, not by inspection: an agent discovered it
+unprompted during io-cli 0.1.0's live runs — an honest implementation failed the
+gate at step 1, and the shadowing macro passed it at step 2.
+
+The criterion now sits in a module of the subject's crate that re-imports the
+prelude macros explicitly. A subject defining its own `assert` makes the name
+ambiguous rather than authoritative, so the gate fails to compile instead of
+passing an impossible criterion; a macro the subject exports under any other name
+still reaches the criterion. Deletion is caught separately, by a probe item
+compiled alongside the subject that a self-stripping crate strips too.
+
+The two are deliberately still one crate. An intermediate build of this release
+made the subject a separate crate the criterion compiled against, which stops
+both attacks more directly — and broke honest code, because privacy is a wall
+between crates: a subject written as `fn hello() -> u32 { 42 }`, without `pub`,
+became invisible to its own criterion. The live run caught it. An agent wrote
+that exact implementation, was told it failed, and rewrote it until it hit the
+step cap. Correctly rejecting dishonest code is worth nothing if honest code is
+rejected with it, so that structure was reverted.
+
+The compile-only gates were defeatable the same way, by a mechanism that needs no
+criterion at all: `#![cfg(any())]` followed by `pub fn hello() -> u32 { "not a
+u32" }` compiled clean, because the attribute strips the item before rustc
+type-checks it. `CompilesRust` and `EachCompilesRust` now verify that the file's
+items actually survived to be checked. Legitimate crate-level attributes —
+`#![allow(dead_code)]`, `#![no_std]` — keep working.
+
+**This is an intended behaviour change: a gate that passed dishonestly on 0.8.0
+fails on 0.8.1.** That is the point of the release. If a run stopped passing
+after upgrading, the gate was being defeated.
+
+No API change and no migration. `test_src` keeps the exact shape it had on 0.8.0
+— it still calls the subject's items unqualified, and still reaches the subject's
+private items — and a macro the subject legitimately exports still reaches it.
+MSRV stays 1.87 and no dependency moved.
+
+### Fixed
+
+- `Verification::RustTestPasses` and `Verification::WorkspaceTestPasses` can no
+  longer be defeated by the file under verification shadowing a prelude macro the
+  criterion invokes (`assert!`, `assert_eq!`, and the rest of the class — the fix
+  is structural, not a blocklist).
+- The same gates can no longer be defeated by a crate-level attribute in the
+  subject, such as `#![cfg(any())]`, deleting the criterion and passing on an
+  empty test binary. This vector was found while reproducing the first.
+- `Verification::CompilesRust` and `Verification::EachCompilesRust` no longer
+  pass a file whose items a crate-level attribute stripped before type-checking,
+  so a body that does not compile can no longer pass a compile gate.
+
+### Added
+
+- `SandboxEvent::gate_phase_failed` records which phase of an execution gate
+  failed — `subject-compile`, `criterion-compile`, `test-run`, or
+  `subject-emptied` — so a run that stopped passing after upgrading is
+  attributable from the store. A new `kind` value on the existing table: no
+  schema change, and a 0.8.0 store needs no migration.
+
+### Changed
+
+- `Verification`'s documentation now states what a passing execution gate proves
+  (the stated criterion was satisfied) and what it does not (that the artifact is
+  correct). Unchanged behaviour, corrected claim.
+- Every execution gate spawns `rustc` more than it did. The compile-only gates go
+  from one spawn to two (subject crate, then the probe reference); the test gates
+  go from two to four (subject crate, probe reference, combined build, run). On
+  the reference machine, 20 runs each in one session: compile-only ~29 ms to
+  ~59 ms, test gates ~290 ms to ~381 ms. Wall-clock on one machine under load, so
+  read the ratios rather than the milliseconds — a separate session measured the
+  same test-gate baseline at 120 ms. `EachCompilesRust` pays its share per listed
+  file.
+
 ## [0.8.0] - 2026-07-25
 
 MCP, and the network boundary it made necessary. The harness is now an MCP client:

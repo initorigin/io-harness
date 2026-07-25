@@ -1,0 +1,115 @@
+id: US-IO-HARNESS-0.8.0-I01
+timestamp: '2026-07-25T03:37:54Z'
+category:
+  - post-release
+  - architecture-level
+trigger: >
+  Execution-based verification can be defeated by the file it is verifying. A
+  `RustTestPasses` gate asserting `assert!(false)` — which no correct
+  implementation can satisfy — passes when the edited file defines a
+  `#[macro_export] macro_rules! assert` that expands to nothing. This
+  contradicts the property the gate was introduced for in 0.2.0: that a stub
+  cannot pass an execution-based check.
+evidence:
+  - >
+    Deterministic reproduction, no model involved, using the harness's exact
+    compile flags (`rustc --edition 2021 --test`, src/verify.rs:335). File
+    contents `#[macro_export] macro_rules! assert { ($c:expr $(, $r:tt)*) => {{
+    let _ = &$c; }}; }` plus `pub fn hello() -> u32 { 0 }`, concatenated with
+    test source `#[test] fn gate() { assert!(false, "this gate can never pass"); }`,
+    compiles and reports "test result: ok. 1 passed; 0 failed".
+  - >
+    Mechanism is in two places. src/verify.rs:241 appends `test_src` directly
+    after the file's contents and compiles them as one crate, so the file is in
+    scope to shadow anything the test names. src/verify.rs:303 (`describe`)
+    places the test source verbatim into the model's prompt — "the file must
+    compile and pass this test:\n{test_src}" — so the agent can read the gate it
+    must defeat. Neither alone is sufficient; together they make the bypass
+    discoverable.
+  - >
+    The weakness is macro resolution, not something fundamental about
+    concatenation: the same shadowing file against `::core::assert!(false)`
+    panics and reports "test result: FAILED", because the fully-qualified path
+    bypasses the shadow.
+  - >
+    Negative result worth recording, because it rules out the obvious fix:
+    wrapping the subject file in `mod subject { ... }` does NOT help. The gate
+    still reports ok, because `#[macro_export]` hoists the macro to the crate
+    root regardless of the module it is written in.
+  - >
+    src/verify.rs:280 gives `WorkspaceTestPasses` the same shape — files
+    concatenated, then `test_src` appended — so the multi-file gate is expected
+    to share the weakness. Not separately reproduced.
+  - >
+    Found in the wild, not by inspection. During io-cli 0.1.0's live evidence
+    runs (OpenRouter, openai/gpt-5.6-luna), the agent discovered this unprompted:
+    step 1 wrote an honest `pub fn hello() -> u32 { 0 }` and failed the gate;
+    step 2 wrote the shadowing macro and passed it. See io-cli
+    evidence/0.1.0/live-run-failure.txt and iterations/US-IO-CLI-0.2.0-I01.
+before:
+  scope:
+    - >
+      Unchanged. No io-harness release is active, and 0.8.0 is released and
+      immutable — nothing here edits its record or its stated limitations.
+  assumptions:
+    - >
+      Execution-based verification (introduced in 0.2.0 after FileContains was
+      shown gameable) establishes that the produced artifact actually works,
+      because it compiles and runs the code rather than matching a substring.
+  implementation: >
+    RustTestPasses and WorkspaceTestPasses concatenate the subject file(s) with
+    the caller's test source into one crate and compile it with
+    `rustc --edition 2021 --test`; `Verification::describe` renders the test
+    source into the agent's prompt.
+change:
+  summary: >
+    Record that execution-based verification is bypassable by the subject file,
+    and correct the product-level assumption that a passing execution gate proves
+    the artifact works. No version is scheduled for the fix — by owner decision
+    the scope belongs to the next planning session.
+  added:
+    - >
+      Product assumption stating the bypass, its mechanism, and that a passing
+      execution gate is evidence a criterion was satisfied rather than proof the
+      artifact is correct.
+  removed: []
+  deferred:
+    - >
+      Hardening the execution-based gates against shadowing by the subject file,
+      and deciding whether the criterion should continue to be shown to the agent
+      verbatim. Destination: the next /ultraship:plan for io-harness, which reads
+      product.yaml. No version number assigned — see versioning.consequence.
+  replaced:
+    - >
+      The 0.2.0-era assumption that an execution-based gate cannot be satisfied by
+      a stub, replaced by a statement bounded to what it actually guarantees.
+impact:
+  products:
+    - io-harness
+    - io-cli
+  versions: []
+  tasks: []
+  dependencies:
+    - >
+      io-cli consumes these gates and exposes `rust-test:` to its users; its own
+      iteration US-IO-CLI-0.2.0-I01 records the consumer-side obligation not to
+      present a passing gate as proof of correctness.
+  resource_effect: >
+    None now — nothing is scheduled. The cost lands in whichever version takes the
+    hardening, and the reproduction above is small enough to become its regression
+    test directly.
+versioning:
+  previous_target: '0.8.0'
+  new_target: '0.8.0'
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Approved in session 2026-07-25. The owner was offered a 0.8.1 corrective patch
+    or folding the fix into 0.9.0, was told that the iterate skill treats deferred
+    work without a destination as forgotten rather than deferred, and chose to
+    record the finding now and decide the scope at /ultraship:plan. The finding is
+    therefore anchored in product.yaml, which planning reads, rather than left in
+    this record alone.
+canonical_updates:
+  - products/io-harness/product.yaml
