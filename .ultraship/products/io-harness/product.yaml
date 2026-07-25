@@ -72,3 +72,16 @@ assumptions:
     io-cli, and website are planned separately in their own repos.
   - Intended differentiator is provider-agnosticism plus agent composition plus
     skills/extensibility, together.
+  - >
+    Execution-based verification bounds what it proves. It shows the stated
+    criterion was satisfied, not that the artifact is correct. RustTestPasses
+    (and by inspection WorkspaceTestPasses) compiles the subject file and the
+    caller's test source as one crate, so the subject can shadow macros the test
+    relies on — a file defining `#[macro_export] macro_rules! assert` makes
+    `assert!(false)` report ok under the harness's own `rustc --edition 2021
+    --test`. `Verification::describe` also puts the test source verbatim in the
+    agent's prompt, which is how an agent found this unprompted during io-cli
+    0.1.0's live runs. Wrapping the subject in a module does not fix it;
+    fully-qualified paths such as `::core::assert!` do resist it. Hardening is
+    UNSCHEDULED — no version is assigned. See
+    iterations/US-IO-HARNESS-0.8.0-I01, which the next plan should act on.
