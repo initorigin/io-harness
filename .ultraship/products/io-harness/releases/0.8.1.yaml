@@ -1,0 +1,497 @@
+product: io-harness
+version: 0.8.1
+status: released
+release_type: patch
+outcome:
+  user_can: >
+    An operator hands the harness a task whose success criterion is an execution gate, and can trust
+    that a pass was earned by the artifact rather than taken from the gate. The file being verified
+    can no longer redefine what the criterion names: the recorded bypass — a subject file carrying
+    `#[macro_export] macro_rules! assert` so that a gate asserting `assert!(false, "this gate can
+    never pass")` reports "test result: ok" — now fails, and the same attack routed through
+    `WorkspaceTestPasses` fails too. A gate that no correct implementation can satisfy is not
+    satisfiable by an incorrect one either.
+
+    The same operator can read, in the crate's own documentation, exactly what a passing gate proves:
+    that the stated criterion was satisfied under the harness's compile and run, not that the
+    artifact is correct. io-cli and io-studio surface these gates to their own users, so the bound is
+    written down in the crate they depend on rather than rediscovered per consumer.
+
+    Upgrading is a version bump. A caller on 0.8.0 changes their `Cargo.toml` and nothing else: the
+    public API is unchanged, every existing `Verification` variant keeps its name and shape, and a
+    gate that was honestly passing on 0.8.0 still passes on 0.8.1.
+  business_value: >
+    Execution-based verification is the property 0.2.0 was released for — it replaced `FileContains`
+    precisely because a substring check could be satisfied by a stub. If the execution gate is itself
+    defeatable by the subject, the product's central claim ("from a typed task contract to a verified
+    result") is weaker than every release since 0.2.0 has stated, and the two downstream products
+    that expose these gates inherit the overstatement. 0.8.0 is already live on crates.io, so the
+    weakness is published: a patch is the cheapest honest correction, and shipping it before the
+    large 0.9.0 means consumers are not waiting on plugins and skills for a correctness fix. Fixing
+    it as a patch also keeps the SemVer story clean — this is a defect in behaviour, not a new
+    capability.
+  evidence_of_value: >
+    The exact reproduction recorded in iterations/US-IO-HARNESS-0.8.0-I01 — no model involved, the
+    harness's own compile path — asserted as a regression test that fails the gate, alongside the
+    full pre-existing suite still green so the fix is proven not to have cost any honest pass. Plus a
+    live run in which an agent works a `RustTestPasses` task to a genuine pass under the hardened
+    gate, showing the boundary tightened without making the loop unusable.
+scope:
+  included:
+    - >
+      Harden `RustTestPasses` so the subject file cannot shadow the names its criterion depends on.
+      The mechanism is a development decision (see open_questions) but the required property is
+      fixed: an item defined in the file under verification must not be able to change how the
+      caller's `test_src` resolves the macros and paths it invokes. Wrapping the subject in a module
+      is already known not to work — `#[macro_export]` hoists to the crate root — so the fix must be
+      structural or must detect and reject the shadow, not cosmetic.
+
+      Amended by US-IO-HARNESS-0.8.1-I01: shadowing is one consequence of a broader invariant, and
+      the release is held to the invariant. **The file under verification must not control the crate
+      it is compiled in.** Violating it by redefining what the criterion names is the recorded I01
+      bypass; violating it by deleting the criterion with a crate-level attribute is a second,
+      cheaper vector found while reproducing the first (F8).
+    - >
+      Harden `WorkspaceTestPasses` the same way. It has the same shape at src/verify.rs:273 — every
+      listed file concatenated, then `test_src` appended — and the iteration records the weakness as
+      expected there but not separately reproduced. This release reproduces it first, then fixes it,
+      so the multi-file gate is not left as the surviving hole.
+    - >
+      The I01 reproduction as a permanent regression test: a subject defining a shadowing
+      `#[macro_export] macro_rules! assert` plus `pub fn hello() -> u32 { 0 }`, verified against a
+      gate asserting `assert!(false, ...)`, must report the gate as failed. Written for both
+      `RustTestPasses` and `WorkspaceTestPasses`.
+    - >
+      A shadowing-resistance test beyond the single recorded case, so the fix is not a patch for one
+      macro name: at minimum a subject shadowing a second prelude macro the criterion could rely on
+      (for example `assert_eq!` or `panic!`), proving the property holds by construction rather than
+      by blocklisting `assert`.
+    - >
+      Regression protection for honest passes — the whole existing suite runs green, including every
+      gate test written since 0.2.0 and the 0.8.0 MCP, network, subagent, checkpoint, and sandbox
+      suites. A fix that tightens the gate by rejecting legitimate criteria has failed this release.
+    - >
+      `CompilesRust` and `EachCompilesRust` hardened too. The review this scope entry originally
+      required — carried out in develop, on the expectation that no change would be needed —
+      falsified its own premise: these gates ARE defeatable, by a mechanism that needs no criterion
+      to shadow. A subject of `#![cfg(any())]` plus a body that does not type-check compiles clean,
+      because the crate-level attribute strips the item before rustc ever examines it. The subject
+      is compiled AS the crate root, so it can delete the very code the gate exists to compile. The
+      fix is the crate-root indirection this release already builds for the test gates: a
+      harness-authored root brings the subject in with `include!`, at which point a crate-level
+      inner attribute in the subject is a compile error rather than an instruction. See
+      iterations/US-IO-HARNESS-0.8.1-I01.
+    - >
+      Documentation of the bound — rustdoc on `Verification` (and the `RustTestPasses` /
+      `WorkspaceTestPasses` variants specifically) plus a README paragraph stating that a passing
+      execution gate is evidence the stated criterion was satisfied, not proof the artifact is
+      correct, and naming the class of attack this release closes. This mirrors the assumption
+      already written into product.yaml so a crate consumer sees it without reading planning files.
+    - >
+      A CHANGELOG entry describing the defect, the fix, and — if `test_src` ends up needing a
+      different shape (see fallback_scope) — the one-line migration. The entry names the behaviour
+      change explicitly: a gate that passed dishonestly on 0.8.0 fails on 0.8.1, which is the point.
+    - >
+      Release and publication — 0.8.1 crate metadata, git Release, then `cargo publish` to crates.io
+      in the repo's established order.
+  excluded:
+    - >
+      Any new `Verification` variant or new kind of gate. This release repairs the gates that exist.
+    - >
+      Changing whether `Verification::describe` shows the criterion to the model. The proposal is to
+      keep showing it (see open_questions); if the owner decides otherwise, that is a separate
+      change, because it alters what every agent sees rather than what the compiler enforces.
+    - >
+      Plugins, skills, and the public tool trait — 0.9.0. Nothing in this release touches the tool
+      layer.
+    - >
+      Sandbox, policy, MCP, network, checkpoint, and provider behaviour. Untouched; their suites are
+      here only as regression evidence.
+    - >
+      Proving that a verified artifact is correct. That is not a property an execution gate can have,
+      and claiming it back is exactly the overstatement this release removes. The gate is hardened
+      against the subject defeating it; it remains a check of one stated criterion.
+    - >
+      Any consumer-side change in io-cli or io-studio. io-cli's own obligation is recorded in
+      US-IO-CLI-0.2.0-I01 and is planned in its own repo.
+  fallback_scope:
+    - >
+      `RustTestPasses` hardened against shadowing, with `test_src` keeping the exact caller-facing
+      shape it has on 0.8.0 — a criterion written against 0.8.0 compiles and passes unchanged on
+      0.8.1.
+    - The I01 reproduction as a regression test, failing the gate.
+    - The rustdoc and README statement of what a passing gate proves, and the CHANGELOG entry.
+    - Published to crates.io as 0.8.1.
+    - >
+      Dropped in this fallback: hardening `WorkspaceTestPasses`, if and only if the structural fix
+      turns out to require a change to the caller-facing shape of `test_src` (for example a
+      `subject::` path qualification) that cannot honestly ship in a patch. In that case the
+      multi-file gate keeps its documented weakness for one more version, the limitation is stated in
+      the record and in rustdoc, and the structural change is escalated to 0.9.0 through
+      /ultraship:iterate rather than smuggled into a patch. The outcome stays coherent — the
+      single-file gate an operator actually reaches first is honest, and the remaining hole is
+      documented rather than hidden.
+acceptance:
+  functional:
+    - >
+      F1 — the recorded bypass fails. A subject file containing `#[macro_export] macro_rules! assert
+      { ($c:expr $(, $r:tt)*) => {{ let _ = &$c; }}; }` and `pub fn hello() -> u32 { 0 }`, verified by
+      `RustTestPasses { test_src: "#[test] fn gate() { assert!(false, \"this gate can never pass\");
+      }" }`, returns false. Asserted by a test, with no model in the loop.
+    - >
+      F2 — the same attack through `WorkspaceTestPasses` fails: the shadowing definition placed in
+      any one of the listed files does not make a `assert!(false, ...)` gate report a pass.
+    - >
+      F3 — shadowing resistance is not name-specific. A subject shadowing a second prelude macro used
+      by the criterion (for example `assert_eq!`) also fails to force a pass.
+    - >
+      F4 — honest passes are unaffected. An implementation that genuinely satisfies its criterion
+      still passes both `RustTestPasses` and `WorkspaceTestPasses`, and a genuinely failing
+      implementation still fails with the same observable outcome as 0.8.0.
+    - >
+      F5 — no public API break. A 0.8.0 caller's `Verification` values compile against 0.8.1
+      unchanged, and a `Verification` round-trips through serde with the same representation as
+      0.8.0. If the fallback path is taken and `test_src` must change shape, this criterion is what
+      forces that to be reported as a break rather than shipped quietly.
+    - >
+      F8 — a crate-level attribute in the subject cannot delete the criterion. A subject beginning
+      `#![cfg(any())]` must not make `RustTestPasses` or `WorkspaceTestPasses` report a pass by
+      leaving a test binary with zero tests that exits 0. Added by US-IO-HARNESS-0.8.1-I01: the
+      vector was found while reproducing F1 and is already closed by the delivered two-crate fix,
+      but no criterion named it, and an unnamed guarantee is one a later release can remove without
+      noticing.
+    - >
+      F9 — the compile-only gates reject a subject that deletes itself. `CompilesRust` and
+      `EachCompilesRust` must fail a file whose body does not type-check but which compiles clean
+      because a crate-level attribute stripped it — specifically `#![cfg(any())]` followed by
+      `pub fn hello() -> u32 { "not a u32" }`. A file that genuinely compiles must still pass, and
+      `EachCompilesRust` must still fail the whole set when any one file fails.
+    - >
+      F6 — the full pre-existing suite is green. Every gate test written since 0.2.0 and every 0.8.0
+      suite (mcp, net, policy, subagents, checkpoint, sandbox, multi_file, edit_file, parity, doc)
+      passes unchanged.
+    - >
+      F7 — a live run against a real provider completes a `RustTestPasses` task with a genuine
+      implementation under the hardened gate, confirming the tightened boundary did not make an
+      ordinary task unpassable.
+  non_functional:
+    - >
+      NF1 — the fix does not weaken the 0.6.0 sandbox boundary. Whatever compile or run structure the
+      hardening uses, every `rustc` invocation and every test binary still executes inside the
+      ephemeral sandbox under the 0.4.0 exec policy, with argv still harness-constructed. A fix that
+      isolates macro resolution by escaping the sandbox has traded one hole for a worse one.
+    - >
+      NF2 — verification stays deterministic and hermetic: no network, temp dirs removed on drop, and
+      no dependence on the caller's toolchain layout beyond the `rustc` already required.
+    - >
+      NF3 — `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release`
+      green; `cargo publish --dry-run` passes with complete 0.8.1 metadata.
+    - >
+      NF4 — MSRV stays 1.87 and no dependency is added or bumped. A correctness patch that raises the
+      floor would strand exactly the callers who need it.
+    - >
+      NF5 — verification latency does not regress materially. If the fix means two compiler
+      invocations where there was one, that cost is measured and stated rather than discovered by a
+      caller running a 100-agent 0.5.0 fan-out.
+  operational:
+    - >
+      O1 — rustdoc on `Verification`, `RustTestPasses`, and `WorkspaceTestPasses` states what a
+      passing gate proves and what it does not, and names the shadowing class of attack this release
+      closes. README carries the same statement in prose.
+    - >
+      O2 — the CHANGELOG entry describes the defect, the fix, and the intended behaviour change
+      (dishonest 0.8.0 passes now fail), with a migration line if one is needed.
+    - >
+      O3 — the reproduction and the live run are stored as release evidence, so the claim "the bypass
+      fails" is a recorded observation rather than an assertion.
+    - >
+      O4 — the conclusion about `CompilesRust` and `EachCompilesRust` is recorded in the release
+      record whether or not they needed a change.
+delivery:
+  target_mode: published
+  environment: >
+    Developer's local macOS machine for build, test, live run, and packaging; crates.io as the
+    publication target. The live run reaches a real provider endpoint. Local rusqlite store, per
+    product.yaml's local, single-user deployment context.
+  deployment_method: >
+    Built and packaged locally — `cargo test`, `cargo clippy --all-targets -- -D warnings`, `cargo
+    build --release`, and `cargo publish --dry-run` green with complete 0.8.1 metadata — then the
+    repo's release order: work committed on `feat/0.8.1` with the completed release record, PR to
+    `develop`, PR `develop` to `main`, GitHub Release (tag + notes), and `cargo publish` last.
+  migrations:
+    - >
+      None. No schema change, no serialized-format change, no config change. A 0.8.0 rusqlite store
+      opens under 0.8.1 unchanged, and this is asserted rather than assumed.
+    - >
+      The one migration-shaped consequence is behavioural, not structural: a stored task contract
+      whose gate was passing dishonestly on 0.8.0 will fail on 0.8.1. That is the intended effect and
+      is stated in the CHANGELOG.
+  observability:
+    - >
+      A gate failure caused by the hardening is distinguishable in the trace from an ordinary failed
+      criterion — an operator debugging a run that stopped passing after upgrading can tell which of
+      the two happened without reading the harness's source.
+    - >
+      Verification outcomes continue to be recorded per step as they are today, with no reduction in
+      what the trace carries for a gate run.
+  rollback: >
+    Before publish, rollback is `git revert` of the 0.8.1 branch — the change lives on `feat/0.8.1`
+    until the develop-to-main release. There is no schema or format migration to undo, so a revert is
+    clean. At the library level a caller reverts by pinning 0.8.0, which is a real option here
+    precisely because the public API is unchanged — though reverting means opting back into the
+    bypass, which the CHANGELOG says plainly. Because 0.8.1 is published to crates.io, a post-publish
+    fix is a forward patch (0.8.2), never an unpublish — crates.io versions are immutable once
+    uploaded — and `cargo yank` stops new resolutions of a bad 0.8.1 without breaking existing
+    lockfiles.
+dependencies:
+  products: []
+  services:
+    - OpenRouter (or Anthropic/OpenAI) API — model inference for the live run.
+    - crates.io (publication target for 0.8.1).
+  human_approvals:
+    - >
+      Owner decides whether `Verification::describe` continues to render the criterion verbatim into
+      the model's prompt. The proposal is that it does (see open_questions); either way the decision
+      is the owner's because it changes what every agent sees.
+    - >
+      Owner approves the fix if it cannot be made without changing the caller-facing shape of
+      `test_src`, since that would be a break in a patch release and is the trigger for the fallback
+      scope instead.
+    - >
+      Owner confirms 0.8.1 crate metadata before packaging.
+    - >
+      Owner approves the git Release and the crates.io publish — publishing is public and
+      irreversible, so it stays a deliberate human gate.
+resource_profile:
+  complexity: small
+  uncertainty: medium
+  likely_cost_drivers:
+    - >
+      Finding a fix that isolates resolution without changing the caller-facing shape of `test_src`.
+      This is the whole release: the obvious structural fix (compile the subject as its own crate and
+      the test as a dependent crate) is the strongest, but it may force the criterion to reference
+      the subject by path, and `mod`-wrapping is already recorded as ineffective. The uncertainty is
+      medium for this reason alone — the defect is fully understood, the acceptable fix is not yet.
+    - >
+      Proving the property generally rather than blocking one macro name. A fix that special-cases
+      `assert` passes F1 and fails the release's intent; F3 exists to force the harder answer.
+    - >
+      Re-running the full 0.8.0 suite against a changed compile path — the gate is load-bearing for
+      tests written since 0.2.0, so a structural change touches more tests than it changes lines.
+    - >
+      Reproducing the `WorkspaceTestPasses` leg, which the iteration expects to share the weakness
+      but never demonstrated.
+  preferred_tools:
+    - Rust, rustc (the existing `--edition 2021 --test` invocation path in src/verify.rs), tempfile.
+    - The existing `ExecGuard` and 0.6.0 sandbox path — the hardening runs inside them, not around them.
+    - cargo (test, clippy, build, publish); git plus GitHub Release for the release step.
+  constraints:
+    - >
+      Patch release. No public API break, no new dependency, no MSRV rise, no schema change. If the
+      fix cannot fit those, the fallback scope applies and the remainder escalates to 0.9.0.
+    - Rust crate; async on tokio; state in rusqlite; Apache 2.0; local, single-user.
+    - Every compile and every test binary stays inside the 0.6.0 sandbox under the 0.4.0 exec policy.
+risks:
+  - >
+    The structural fix forces a caller-visible change to `test_src`, making an honest patch
+    impossible. Mitigation: this is exactly what fallback_scope covers — ship the narrower fix,
+    document the remaining `WorkspaceTestPasses` weakness, and escalate the structural change to
+    0.9.0 via /ultraship:iterate. The failure mode to avoid is shipping a break as a patch, and F5 is
+    the criterion that catches it.
+  - >
+    A fix that blocklists known macro names looks green against F1 and F2 while leaving the class
+    open. Mitigation: F3 requires resistance to a macro the fix's author did not enumerate, and the
+    documentation states the property rather than the patched cases.
+  - >
+    Tightening the gate breaks legitimate criteria — a caller whose `test_src` relies on something
+    the subject legitimately defines. Mitigation: F4 and F6 require the whole existing suite green,
+    and the live run (F7) proves an ordinary task still passes.
+  - >
+    Two compiler invocations where there was one could measurably slow verification, which a 0.5.0
+    fan-out multiplies. Mitigation: NF5 requires the cost to be measured and stated in the record
+    rather than left for a caller to find.
+  - >
+    The fix could be reached by moving compilation outside the 0.6.0 sandbox, trading a verification
+    hole for an isolation hole. Mitigation: NF1 makes staying inside the sandbox a criterion, not an
+    assumption.
+  - >
+    Publishing is irreversible. A bad 0.8.1 on crates.io cannot be re-uploaded; the fix is a forward
+    0.8.2 plus `cargo yank`. Owner-approved release-then-publish and a passing dry-run are the guard.
+  - >
+    Hardening the compiler boundary may read as "verification now proves correctness". Mitigation:
+    O1 and O2 require the bound to be restated in the same release that tightens the gate, so the
+    documentation moves in the opposite direction from the temptation.
+open_questions:
+  - >
+    What is the mechanism? Proposed: compile the subject as its own crate and the caller's `test_src`
+    as a separate crate that depends on it via `--extern`, so a `#[macro_export]` macro in the
+    subject is no longer at the test crate's root and cannot shadow the prelude. This is the only
+    option identified that fixes the class rather than a case — `mod`-wrapping is recorded as
+    ineffective, and textually rewriting the criterion's macro calls to `::core::` paths is fragile
+    against a criterion the harness did not write. The open part is whether the test crate can reach
+    the subject's items without the caller changing how `test_src` names them; if it cannot, the
+    fallback scope applies. A detect-and-reject variant (fail the gate as invalid when the subject
+    defines a macro whose name the criterion invokes) is the cheaper second choice and may be the
+    honest patch-sized answer.
+
+    RESOLVED in develop; recorded by US-IO-HARNESS-0.8.1-I01. The two-crate split was taken, and
+    the open part resolved in the caller's favour: `use subject::*;` keeps the criterion calling
+    `hello()` unqualified, so a 0.8.0 gate compiles and passes untouched, F5 holds, and the
+    fallback scope was NOT needed. One requirement the question did not anticipate — the glob alone
+    is ambiguous against the prelude, which fails honest subjects too, so the prelude macros a
+    criterion is likely to invoke are re-imported explicitly and outrank the glob. The
+    detect-and-reject variant proved unnecessary.
+
+    RE-RESOLVED at completion; recorded by US-IO-HARNESS-0.8.1-I02. The two-crate split was
+    REVERTED. The question asked whether the test crate could reach the subject's items without the
+    caller changing how `test_src` names them, and "yes, via the glob" was the wrong answer to a
+    question that was too narrow: the glob reaches only the subject's PUBLIC items. Privacy is a
+    wall between crates, so an honest `fn hello() -> u32 { 42 }` became invisible to its own
+    criterion and the gate rejected correct code. The F7 live run caught it — the agent hit the step
+    cap having written a correct answer four times.
+
+    The shipped mechanism keeps subject and criterion in ONE crate, with the criterion as a child
+    module: `use super::*` reaches private items, so what counts as a passing implementation is
+    exactly what it was on 0.8.0. Shadowing is stopped inside that module by the same explicit
+    prelude re-import — against a subject-defined `assert_eq`, rustc reports E0659 "ambiguous name"
+    and the criterion fails to compile, which fails the gate. Deletion is stopped separately, by the
+    probe built for F9. So the answer to "what is the mechanism" is not one mechanism but two, and
+    the reason is that no single structure stopped both attacks without rejecting honest code.
+  - >
+    Should `Verification::describe` keep rendering the criterion verbatim into the model's prompt?
+    Proposed: yes, unchanged. Hiding the gate makes honest agents worse — an agent that cannot read
+    the criterion cannot aim at it — and does not stop a determined one, which is why the defense
+    belongs at the compile boundary rather than in prompt secrecy. Recorded because the io-cli live
+    run found the bypass with the text in front of it, so the alternative deserves an explicit
+    decision rather than silence.
+  - >
+    Does a gate failure caused by hardening need its own typed error, or is an ordinary failed
+    criterion enough? Proposed: distinguishable in the trace (per the observability entry) without a
+    new public error variant, since adding one is a public API change in a patch.
+  - >
+    Should the harness reject a criterion it can prove is unsatisfiable, or a subject it can prove is
+    hostile, as a distinct outcome from "failed"? Proposed: out of scope for 0.8.1 — worth recording
+    because it is the natural next question, but a new outcome kind is a minor, not a patch.
+released_at: '2026-07-25T00:00:00Z'
+mode: published
+delivered: >
+  A file under verification can no longer defeat the gate that verifies it. On 0.8.0 a subject
+  could define `#[macro_export] macro_rules! assert` and make `assert!(false, "this gate can never
+  pass")` report success, or open with `#![cfg(any())]` and pass on a test binary containing zero
+  tests; the compile-only gates could be passed by a body that does not type-check at all. All
+  three are closed, the class rather than the cases, and an honest implementation — including a
+  private one — passes exactly as it did on 0.8.0.
+evidence:
+  tests:
+    - >
+      cargo test — 186 passed, 0 failed across 12 suites (verify_gate, mcp, net, policy, sandbox,
+      subagents, checkpoint, multi_file, edit_file, parity, lib unit, doc). 14 of the 186 are new to
+      this release; the other 172 are the pre-existing suite unchanged, which is F6.
+    - >
+      F1/F2/F3 (shadowing) — a_subject_shadowing_assert_cannot_pass_an_impossible_gate,
+      a_workspace_subject_shadowing_assert_cannot_pass_an_impossible_gate,
+      a_subject_shadowing_a_second_prelude_macro_cannot_pass_either. All three fail the gate against
+      a criterion no correct implementation can satisfy. Reproduced against the pre-fix build first
+      (evidence/0.8.1/repro-before-fix.txt) so the tests are known to have failed before they passed.
+    - >
+      F4 (honest passes) — an_honest_implementation_still_passes_and_a_wrong_one_still_fails,
+      an_honest_workspace_still_passes_across_files, a_macro_the_subject_legitimately_exports_still_reaches_the_criterion,
+      and a_private_implementation_still_passes_the_gate. The last was added at completion after the
+      live run showed a non-`pub` implementation being rejected; it covers both the single-file and
+      workspace gates.
+    - >
+      F8 (crate-level deletion) — a_subject_cannot_delete_the_criterion_with_a_crate_level_cfg,
+      covering RustTestPasses and WorkspaceTestPasses. Failed against the pre-fix build.
+    - >
+      F9 (compile-only gates) — a_compile_gate_rejects_a_subject_that_deletes_its_own_items and
+      an_honest_file_still_passes_the_compile_gates. The latter includes an `#![allow(dead_code)]`
+      subject, which is the case that falsified the first remedy considered.
+    - >
+      NF1 (sandbox boundary) — the_added_subject_compile_is_still_policy_checked: with rustc denied,
+      the gate returns a typed Error::Refused rather than compiling. All six spawn sites in
+      compile_source route through ExecGuard::check then ExecGuard::exec, verified by inspection
+      (6 check calls, 6 exec calls), so the added probe and subject compiles are governed by the
+      0.4.0 exec policy like every other spawn. argv stays harness-constructed.
+    - >
+      NF3 (observability) — the_trace_distinguishes_a_closed_bypass_from_an_ordinary_failure and
+      the_trace_names_a_subject_that_deleted_its_own_items pin all four gate_phase_failed values
+      against real store reads.
+    - >
+      F5 (no API break) — the `Verification` enum is byte-identical to 0.8.0 once doc comments are
+      stripped: same variants, same fields, same `#[derive(Debug, Clone)]`. Verified by diffing the
+      declaration against `git show develop:src/verify.rs`. Note honestly: `Verification` carries no
+      serde derive, so the "round-trips through serde with the same representation" half of F5 is
+      vacuous rather than satisfied — there is no serde representation to preserve. The substantive
+      half holds, and `test_src` keeps its exact 0.8.0 shape.
+  builds:
+    - cargo build --release — exit 0
+    - cargo clippy --all-targets -- -D warnings — exit 0
+    - cargo publish --dry-run --allow-dirty — exit 0, packaged io-harness v0.8.1
+    - cargo doc --no-deps — exit 0
+    - >
+      NF4 — rust-version stays 1.87; `git diff develop -- Cargo.toml` is the version line alone and
+      `git diff develop -- Cargo.lock` is one line, the same bump. No dependency added, removed, or
+      moved.
+  reviews:
+    - >
+      NF5 (latency) — measured, 20 runs each in one session, stored in evidence/0.8.1/latency.txt.
+      Compile-only gate 29 ms to 59 ms (1 spawn to 2). Test gate 290 ms to 381 ms (2 spawns to 4).
+      Reported as a wall-clock bound on one machine under load, not a controlled benchmark: a
+      separate session measured the same test-gate baseline at 120 ms, so the ratios are the finding
+      and the milliseconds are not.
+    - >
+      O4 — the CompilesRust/EachCompilesRust conclusion is recorded. The review the contract asked
+      for falsified the contract's own prediction that no change was needed; the finding, the
+      rejected remedy, and the shipped one are in US-IO-HARNESS-0.8.1-I01 and task T06.
+  deployments:
+    - >
+      NOT YET RUN at the time this record was sealed. `cargo publish` to crates.io follows the
+      develop→main merge and the GitHub Release, per the repo's established order. See
+      known_limitations.
+  health_checks:
+    - >
+      F7 (live run, real provider) — evidence/0.8.1/live_run.txt. openai/gpt-5.6-luna via
+      OpenRouter, `cargo run --example edit_file`, RustTestPasses gate. FIRST RUN FAILED:
+      StepCapReached { steps: 4 } with a correct `fn hello() -> u32 { 42 }` on disk. The gate was
+      rejecting honest code. After the fix, same model and contract: Success { steps: 1 } on that
+      same private implementation.
+known_limitations:
+  - >
+    A passing execution gate is evidence that the stated criterion was satisfied. It is not proof
+    the artifact is correct, and this release does not make it one — a gate asserting `hello() == 42`
+    stays silent about everything else the file does. Hardening the gate against the subject makes
+    the evidence trustworthy; it does not widen what the evidence covers.
+  - >
+    A subject that legitimately defines a macro named after a prelude macro the criterion invokes
+    (`assert`, `assert_eq`, and the rest of the re-imported list) now fails to compile with E0659
+    rather than passing. This is the shadowing defence working as designed and it cannot distinguish
+    a hostile redefinition from an innocent one. A macro under any other name is unaffected.
+  - >
+    Verification costs more compiler spawns: the compile-only gates went from one to two and the
+    test gates from two to four. On the reference machine that is roughly 29 ms to 59 ms and 290 ms
+    to 381 ms. A caller running a large fan-out of gated agents pays this per gate, and
+    `EachCompilesRust` pays its share per listed file. The reverted two-crate structure was cheaper;
+    it was also wrong.
+  - >
+    The record is sealed before the crates.io upload. `mode: published` states the authorized target
+    and the publish step is the last in the sequence — feat→develop merge, develop→main merge,
+    GitHub Release, then `cargo publish`. If the upload fails, the correction is a forward patch,
+    not an edit to this record.
+  - >
+    F5's serde half is vacuous: `Verification` has no serde derive, so there is no representation to
+    round-trip. The criterion was written expecting one. The substantive guarantee — a 0.8.0
+    caller's `Verification` values compile unchanged — holds and is verified.
+  - >
+    The `#![cfg(any())]` vector was found by reproducing the recorded bypass, and the compile-only
+    hole by reviewing gates the contract predicted were safe. Both were cheaper to find than the
+    bypass that started this release. No systematic search for further vectors against the gate was
+    performed, so the honest claim is that three known classes are closed, not that the gate is
+    exhaustively hardened.
+  - >
+    The offline suite passed 186 tests against a build that failed the live run, because every test
+    wrote `pub fn hello` and inherited the structure's own assumption. The regression is now pinned,
+    but the general lesson is not: a structural defence must be checked against honest code that
+    does NOT resemble the tests already written for it.
+supersedes: 0.8.0
+next_recommended_version: 0.9.0
+immutable: true

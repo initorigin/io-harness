@@ -314,7 +314,8 @@ pub struct SandboxEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"create"`, `"exec"`, `"cap_hit"`, `"net_deny"`, or `"destroy"`.
+    /// `"create"`, `"exec"`, `"cap_hit"`, `"net_deny"`, `"destroy"`, or
+    /// `"gate_phase_failed"` (whose `detail` names the phase).
     pub kind: String,
     /// The backend that isolated the run (e.g. `"macos-sandbox-exec"`).
     pub backend: Option<String>,
@@ -348,6 +349,33 @@ impl SandboxEvent {
     /// The sandbox was torn down (workdir removed, processes reaped).
     pub fn destroy(run_id: i64, step: u32) -> Self {
         Self { run_id, step, kind: "destroy".into(), backend: None, detail: None }
+    }
+
+    /// Which phase of an execution gate failed: `"subject-compile"` (the file
+    /// under verification does not compile), `"criterion-compile"` (the
+    /// criterion does not compile *against* it), `"test-run"` (it compiled and
+    /// the test failed), or `"subject-emptied"` (the file compiled but a
+    /// crate-level attribute stripped its items, so nothing was type-checked —
+    /// the compile-only gates).
+    ///
+    /// 0.8.1 added this because the release deliberately makes some previously
+    /// passing runs fail. `criterion-compile` is the one to look for: before
+    /// 0.8.1 the subject and the criterion were one crate, so a subject could
+    /// shadow the names the criterion used — or delete it outright — and be
+    /// reported as passing. An operator whose run stopped passing on upgrade can
+    /// tell that case from an ordinary failed criterion without reading the
+    /// harness's source.
+    ///
+    /// A new `kind` value, not a new table or column: a 0.8.0 store takes it
+    /// with no migration.
+    pub fn gate_phase_failed(run_id: i64, step: u32, phase: &str) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "gate_phase_failed".into(),
+            backend: None,
+            detail: Some(phase.into()),
+        }
     }
 }
 

@@ -1,560 +1,403 @@
 product: io-harness
-version: 0.8.0
+version: 0.8.1
 tasks:
-  - id: US-IO-HARNESS-0.8.0-T01
-    summary: >
-      Dependency baseline. Add rmcp 2.2.0 with default-features off and features
-      client + transport-child-process + transport-streamable-http-client-reqwest; bump reqwest
-      0.12 → 0.13 (feature rustls-tls → rustls) because rmcp 2.2.0 requires reqwest 0.13.2; give
-      every built-in provider's reqwest client an explicit no-redirect policy so a 3xx cannot move a
-      request to a host the policy never saw. Crate builds and the whole existing suite stays green.
-    why_required: >
-      rmcp pins reqwest 0.13. Staying on 0.12 means two reqwest versions and two TLS stacks in a
-      published crate, and — decisively — the streamable-HTTP transport would refuse our own
-      reqwest::Client, so redirect control on the MCP path would be lost and the egress guarantee
-      would have a documented hole. Nothing else in the release can be built until the dependency
-      floor is settled.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        NF1 — MCP is implemented via the rmcp crate. No hand-rolled JSON-RPC framing or protocol
-        version negotiation in this repo.
-      - >
-        NF5 — the crate compiles on macOS, Linux, and Windows. Stdio server spawning uses portable tokio
-        process APIs; no unix-only path in the MCP layer.
-    files:
-      - Cargo.toml
-      - src/provider/openrouter.rs
-      - src/provider/anthropic.rs
-      - src/provider/openai.rs
-    evidence:
-      - >-
-        Cargo.toml: rmcp 2.2.0 (default-features off; client + transport-child-process +
-        transport-streamable-http-client-reqwest), reqwest 0.12 -> 0.13 (feature rustls-tls -> rustls),
-        rust-version 1.75 -> 1.87 (process-wrap needs 1.87, reqwest 0.13 needs 1.85 — the old floor would
-        have been a false claim).
-      - >-
-        src/net.rs: http_client() is now the crate's only reqwest::Client constructor, built with
-        redirect::Policy::none() so a 3xx cannot move a request to a host the policy never checked. All
-        three providers (openrouter/openai/anthropic) construct through it.
-      - >-
-        cargo test after the bump: 136 passed, 0 failed, across all 9 binaries — the dependency change
-        needed no source change beyond the feature rename.
+- id: US-IO-HARNESS-0.8.1-T01
+  summary: Reproduce the defect as failing tests before changing any implementation. Add the I01 case
+    to tests/verify_gate.rs for RustTestPasses (a subject defining `#[macro_export] macro_rules! assert`
+    plus `pub fn hello() -> u32 { 0 }`, gated by `assert!(false, "this gate can never pass")`), the
+    same attack routed through WorkspaceTestPasses, and a second-macro case shadowing `assert_eq!`.
+    Each asserts the gate returns false. All three must FAIL against the current implementation first,
+    and that failure is recorded as evidence.
+  why_required: The release exists to close a bypass. A test written after the fix proves the fix compiles,
+    not that the bypass was ever open — and the WorkspaceTestPasses leg was never demonstrated at all,
+    only expected. Watching all three fail first is what makes F1, F2, and F3 evidence rather than assertion.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - 'F1 — the recorded bypass fails. A subject file containing `#[macro_export] macro_rules! assert
+    { ($c:expr $(, $r:tt)*) => {{ let _ = &$c; }}; }` and `pub fn hello() -> u32 { 0 }`, verified by
+    `RustTestPasses { test_src: "#[test] fn gate() { assert!(false, \"this gate can never pass\"); }"
+    }`, returns false. Asserted by a test, with no model in the loop.
 
-  - id: US-IO-HARNESS-0.8.0-T02
-    summary: >
-      The network act in the permission model. Add `Act::Net`, a `net` field on `Defaults` defaulting
-      to Deny, and `allow_net`/`deny_net`/`ask_net` builders. Targets are `host` or `host:port`,
-      matched by the existing glob matcher against both forms (so `api.openai.com` and
-      `api.openai.com:443` both match). `Policy::default()` denies network; `Policy::permissive()`
-      allows it. `Defaults` gains serde defaults so a 0.7.0-era policy JSON deserializes with network
-      Deny rather than failing.
-    why_required: >
-      Every other egress task checks against this act. Without it there is nothing to enforce, nothing
-      to contain, and nothing to attribute in the trace.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F10 — a `Policy` carrying network rules round-trips through serde unchanged, and an MCP server
-        configuration round-trips through serde unchanged.
-      - >
-        NF6 — adding a network variant to the public `Act` enum and a field to `Defaults` is a breaking
-        change under strict SemVer and is taken deliberately in a 0.x minor, which cargo already treats
-        as incompatible. It is stated in the CHANGELOG as a breaking change with the one-line migration,
-        not glossed as additive.
-    files:
-      - src/policy.rs
-      - tests/policy.rs
-    evidence:
-      - >-
-        src/policy.rs: Act::Net; Defaults.net with #[serde(default = "deny")]; allow_net/deny_net/ask_net;
-        Policy::default() denies net, Policy::permissive() allows it, is_permissive() accounts for it;
-        merge/contain tighten net like every other act; explain() has the Act::Net default arm.
-      - >-
-        Host matching: explain() tries the target as given and with a numeric :port stripped, so
-        allow_net("api.example.com") covers any port while allow_net("api.example.com:443") means that port
-        only. Wildcards work as on paths.
-      - >-
-        src/policy.rs unit tests (6 new): net_is_denied_by_default_and_allowed_only_where_a_rule_says_so,
-        a_net_rule_matches_with_or_without_the_port, net_narrows_downward_and_never_widens,
-        a_pre_0_8_policy_deserialises_with_network_denied (the owner-decided Deny for 0.7.0-era JSON),
-        net_rules_survive_a_serde_roundtrip, permissive_still_enforces_nothing_including_the_network.
+    '
+  - 'F2 — the same attack through `WorkspaceTestPasses` fails: the shadowing definition placed in any
+    one of the listed files does not make a `assert!(false, ...)` gate report a pass.
 
-  - id: US-IO-HARNESS-0.8.0-T03
-    summary: >
-      One checked entry point for outbound connections. Add a `NetGuard` that evaluates a host (or a
-      URL's host) against a policy, records the verdict to the store, and returns `Error::Refused` on
-      Deny. Add `Provider::endpoint_host()` (defaulting to `None`, like `name()`) implemented by the
-      three built-in providers, and check it in the run loop before every completion so a denied
-      provider host fails the run as a refusal before any request is built.
-    why_required: >
-      A check spread across call sites is a policy that looks enforced and is not. Funnelling every
-      outbound call through one guard is what makes "no connection is opened" testable instead of
-      assumed, and it is the single largest correctness risk named in the contract.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T01
-      - US-IO-HARNESS-0.8.0-T02
-    acceptance_criteria:
-      - >
-        F4 — under a policy whose network default is Deny, a connection to an unlisted host is refused:
-        the call returns a typed error, no connection is opened (asserted against a listener that
-        records connection attempts), and the refusal is in the trace with the deciding layer.
-    files:
-      - src/net.rs
-      - src/provider/mod.rs
-      - src/run.rs
-      - tests/net.rs
-    evidence:
-      - >-
-        src/net.rs: NetGuard { policy, trace } mirroring ExecGuard — check(url) / check_target(host:port),
-        Deny returns Error::Refused (not a verdict the caller can ignore), Allow/Ask return the Verdict.
-        target(url) normalises to host:port, filling the port from the scheme, handling userinfo and IPv6
-        literals; an unparseable URL is refused rather than waved through.
-      - >-
-        src/provider/mod.rs: Provider::endpoint() -> Option<&str>, defaulting to None ("opens no
-        connection") so every existing implementer still compiles; the three built-ins return their
-        ENDPOINT. Named endpoint() rather than the endpoint_host() of this task's summary — the guard
-        does the host normalisation, so one parser exists rather than three.
-      - >-
-        src/run.rs: authorize_provider() runs once per run in run_with / run_tree / resume_tree, records
-        the verdict at step 0, and returns the effective policy. Every verdict — allow, ask, refusal —
-        goes to policy_events, so no new DDL was needed for the network half of O1.
-      - >-
-        tests/net.rs: a_refusal_is_recorded_in_the_trace (layer and rule attributed). The no-socket proof
-        is asserted by a real TcpListener that counts accepts, against a provider that really dials TCP.
+    '
+  - 'F3 — shadowing resistance is not name-specific. A subject shadowing a second prelude macro used
+    by the criterion (for example `assert_eq!`) also fails to force a pass.
 
-  - id: US-IO-HARNESS-0.8.0-T04
-    summary: >
-      The provider-host layer. The harness merges the configured provider's host as one named policy
-      layer ("provider") beneath the caller's layers, so a run under a network-deny base reaches its
-      model and `explain` attributes the allowance to that named layer. An explicit caller Deny of
-      that host still wins (Deny is absolute) and the run fails fast as a refusal, not a hang.
-    why_required: >
-      Without it, deny-by-default network makes every existing caller's run fail against its own
-      provider, and the release ships a feature nobody can turn on. Making the allowance a visible
-      named layer rather than a hidden exemption is what keeps the trace honest.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T03
-    acceptance_criteria:
-      - >
-        F8 — a run under a base policy that denies all network still reaches its configured provider,
-        via the named provider layer, and `explain` attributes the allowance to that layer. A caller
-        rule that explicitly denies the provider host wins and the run fails as a refusal, not a hang.
-    files:
-      - src/net.rs
-      - src/run.rs
-      - tests/net.rs
-    evidence:
-      - >-
-        src/net.rs: provider_layer(target) + PROVIDER_LAYER ("provider"). Merged BEFORE the check, not
-        consulted after it: the net default denies, the layer's allow rule beats a default, and a caller's
-        explicit deny_net still beats the allow because deny is absolute across layers.
-      - >-
-        tests/net.rs: a_deny_all_base_still_reaches_its_provider_through_the_provider_layer (Success, the
-        socket really opened, and the trace attributes the allowance to layer "provider"), and
-        denying_your_own_provider_is_legal_and_fails_as_a_refusal (Error::Refused, zero connections).
-      - >-
-        Bug found and fixed while wiring this: merging the provider layer turned a permissive caller's
-        policy non-permissive, which pushed single-file runs into run_with's "policy requires workspace
-        mode" refusal. The guard now reads the caller's policy before the merge (caller_enforces).
+    '
+  files:
+  - tests/verify_gate.rs
+  evidence:
+  - 'All three reproductions FAILED against the pre-fix implementation, recorded in evidence/0.8.1/repro-before-fix.txt:
+    the I01 case, the WorkspaceTestPasses leg (never previously demonstrated, only expected), and the
+    assert_eq! case. 3 honest-behaviour tests in the same file passed, so the failures were the bypass,
+    not a broken harness.'
+  - tests/verify_gate.rs — 10 tests, all green after the fix.
+- id: US-IO-HARNESS-0.8.1-T02
+  summary: 'Fix the single-file gate structurally. The two-crate design this task originally specified
+    — subject as its own crate, criterion as a separate crate depending on it via `--extern subject=`
+    — was implemented, then REVERTED after the F7 live run: privacy is a wall between crates, so an
+    honest non-`pub` implementation became unpassable (US-IO-HARNESS-0.8.1-I02). Shipped instead: the
+    criterion is appended as a child module of the subject''s own crate, opening with an explicit
+    re-import of the core/std prelude macros and `use super::*`. The explicit import makes a macro the
+    subject defines AMBIGUOUS with the prelude name (E0659) rather than authoritative, so a shadowing
+    subject fails to compile; `use super::*` keeps the subject''s private items in scope, which is what
+    the two-crate design lost. Crate-level attributes are handled by the probe, not by this structure.'
+  why_required: This is the fix. Without it F1 and F3 fail. The two-crate split is the only identified
+    mechanism that closes the class rather than a case — `mod`-wrapping is recorded in I01 as ineffective
+    because `#[macro_export]` hoists to the crate root, and rewriting the criterion's macro calls to
+    `::core::` paths is fragile against a criterion the harness did not write.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T01
+  acceptance_criteria:
+  - 'F1 — the recorded bypass fails. A subject file containing `#[macro_export] macro_rules! assert
+    { ($c:expr $(, $r:tt)*) => {{ let _ = &$c; }}; }` and `pub fn hello() -> u32 { 0 }`, verified by
+    `RustTestPasses { test_src: "#[test] fn gate() { assert!(false, \"this gate can never pass\"); }"
+    }`, returns false. Asserted by a test, with no model in the loop.
 
-  - id: US-IO-HARNESS-0.8.0-T05
-    summary: >
-      Network `Ask` through the existing approval gate, and durably across a restart. An Ask verdict
-      on a network action builds a `Request` for `Act::Net`, consults the `Approver`, performs the
-      call exactly once on Approve, blocks on Deny, and on Defer persists the pending action so
-      `resume_with_decision` / `resume_tree_with_decision` on a fresh process performs it.
-    why_required: >
-      Ask is one of the three effects the contract promises for network, and 0.7.0's durable pause is
-      what makes it usable for an unattended run. Without this, network policy is only allow/deny and
-      the release under-delivers its stated outcome.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T03
-    acceptance_criteria:
-      - >
-        F5 — a network rule with effect Ask routes to the approval gate: a Deny decision blocks the call
-        and a run continues or fails per the existing gate semantics; an Allow decision performs it
-        exactly once.
-      - >
-        F6 — a network Ask survives a full process restart: the tree pauses, the process exits, and
-        `resume_with_decision` on a fresh process against the same store performs the approved call and
-        completes the run.
-    files:
-      - src/net.rs
-      - src/run.rs
-      - src/state.rs
-      - tests/net.rs
-    evidence:
-      - >-
-        src/run.rs: an Ask on the provider host consults the Approver at step 0. Approve proceeds, Deny
-        returns Error::Refused and finishes the run, Defer persists the pending action (act "net") and
-        returns RunOutcome::AwaitingApproval { steps: 0 }.
-      - >-
-        resume_with_decision and resume_tree_with_decision gained a pending.act == "net" branch. This was
-        a real defect the Pending path opened: the existing code maps any non-"read" pending to Act::Write,
-        so an approved network action would have been re-checked against the path policy and then written
-        to disk as a file named after the host. The net branch grants the host and starts the loop, which
-        is correct because the pause happens before the first step and has no effect to replay.
-      - >-
-        tests/net.rs: an_ask_on_the_network_is_approved_and_dials (exactly one dial),
-        an_ask_denied_at_the_gate_never_dials (zero), and a_deferred_network_decision_persists_and_resumes
-        — which pauses under one Store handle, drops it, reopens the file, reads the persisted pending, and
-        delivers the decision to a fresh provider, so it crosses a real process-shaped boundary.
+    '
+  - 'F3 — shadowing resistance is not name-specific. A subject shadowing a second prelude macro used
+    by the criterion (for example `assert_eq!`) also fails to force a pass.
 
-  - id: US-IO-HARNESS-0.8.0-T06
-    summary: >
-      Containment of network under 0.5.0. Confirm and pin that `Policy::contain` treats network rules
-      like every other act — a child inherits its parent's network rules and can only narrow them —
-      and that a child task contract attempting to widen is refused and recorded.
-    why_required: >
-      A sub-agent that could reach a host its parent cannot would make the containment boundary a
-      claim rather than a boundary, and 0.5.0's whole safety story rests on narrow-only.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T02
-    acceptance_criteria:
-      - >
-        F7 — a 0.5.0 child inherits its parent's network rules; a child task contract that tries to
-        allow a host its parent denies is refused by containment, and the refusal is recorded. A child
-        that narrows (denies more) is honoured.
-    files:
-      - src/containment.rs
-      - src/policy.rs
-      - tests/subagents.rs
-    evidence:
-      - >-
-        src/policy.rs: Policy::contain already treats every act uniformly, so net inheritance and
-        narrow-only fell out of existing code. Pinned by net_narrows_downward_and_never_widens (a child
-        allow of a host the parent denies grants nothing; a child deny binds).
-      - >-
-        src/run.rs: the spawn tool gained a deny_net argument beside deny_write, so a parent can narrow a
-        child's reachable hosts and not only its writable paths. Widening is structurally impossible: the
-        spawn tool exposes no allow of any kind, so a child cannot even express the request.
-      - >-
-        Not yet proven at run level: the only thing a child can dial is an MCP server, so the end-to-end
-        child-refused-a-host test belongs with T09 and is not claimed here.
+    '
+  - 'F4 — honest passes are unaffected. An implementation that genuinely satisfies its criterion still
+    passes both `RustTestPasses` and `WorkspaceTestPasses`, and a genuinely failing implementation still
+    fails with the same observable outcome as 0.8.0.
 
-  - id: US-IO-HARNESS-0.8.0-T07
-    summary: >
-      MCP client over stdio. Add `McpServer` config (serde: id, transport, command/args/env, timeout)
-      and a session that connects over `TokioChildProcess`, initializes, lists tools, calls a tool,
-      and shuts down. Spawning the server binary is an `Act::Exec` check; discovered tools convert to
-      `ToolSpec` under `mcp__<server>__<tool>` with their JSON Schema passed through unchanged.
-    why_required: >
-      This is the release's capability half. Without a connected server offering tools there is
-      nothing for the agent to invoke and nothing for the egress policy to be interesting about.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T01
-      - US-IO-HARNESS-0.8.0-T02
-    acceptance_criteria:
-      - >
-        F1 — with a stdio MCP server configured, a run discovers its tools, the model is offered them
-        under `mcp__<server>__<tool>` names, the agent invokes one, and the result reaches the next loop
-        step. Asserted by a test using a fixture server and by the live run.
-      - >
-        F3 — a server advertising a tool named `write_file` does not shadow the built-in: both are
-        callable, the built-in keeps its name, and the server's is reachable only under its namespaced
-        name.
-    files:
-      - src/mcp.rs
-      - src/lib.rs
-      - tests/mcp.rs
-    evidence:
-      - >-
-        src/mcp.rs: McpServer / McpTransport (serde, stdio + http, per-call timeout), McpSession::connect /
-        tool_specs / owns / call / shutdown over rmcp 2.2.0. Stdio spawn is an Act::Exec check on the
-        server binary; discovered tools become ToolSpec named mcp__<server>__<tool> with the server's JSON
-        Schema passed through unchanged. src/error.rs: Error::Mcp { server, reason }.
-      - >-
-        examples/mcp_fixture_server.rs: a real MCP server process (echo, write_file, boom, sleep, die) the
-        tests spawn over stdio. An example, not a bin, so it never ships as an installable binary; the
-        tests locate it from the test binary's own path, which is profile-agnostic.
-      - >-
-        tests/mcp.rs (10 tests, all green): a_stdio_server_is_discovered_called_and_its_result_reaches_the_
-        loop proves F1 end to end — namespaced tool offered beside grep/write_file, invoked, result into
-        the loop, and connect/discover/call/disconnect all in mcp_events with latency.
-      - >-
-        a_server_tool_named_like_a_builtin_does_not_shadow_it proves F3: the fixture advertises write_file,
-        both names are offered, the built-in appears exactly once, and the file on disk shows the built-in
-        did the writing while the server's namesake wrote nothing.
-      - >-
-        Bug found and fixed here: McpEvent::connected set detail to the transport and a chained with_detail
-        immediately overwrote it with a tool count, so the connect event lost the one fact only it records.
-        The discovered events already carry the tools; the count is gone and the transport stays.
-  - id: US-IO-HARNESS-0.8.0-T08
-    summary: >
-      MCP client over streamable HTTP. Same session API, dialling a URL with a caller-supplied
-      no-redirect `reqwest::Client`, with the URL's host checked through `NetGuard` before the
-      transport is constructed.
-    why_required: >
-      An HTTP MCP server is the case where the egress act does real work — it is the first
-      configurable arbitrary host the harness dials — and the contract includes both transports.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T03
-      - US-IO-HARNESS-0.8.0-T07
-    acceptance_criteria:
-      - >
-        F2 — with a streamable-HTTP MCP server configured, the same holds end to end against a test HTTP
-        server.
-    files:
-      - src/mcp.rs
-      - tests/mcp.rs
-    evidence:
-      - >-
-        src/mcp.rs: the Http transport builds StreamableHttpClientTransport::with_client over net::
-        http_client() (redirects off) after NetGuard checks the URL's host, so the connection is authorized
-        before the transport exists.
-      - >-
-        tests/mcp.rs: an_http_server_is_discovered_called_and_its_result_reaches_the_loop proves F2 against
-        a real HTTP server — rmcp's StreamableHttpService mounted on hyper, serving the SAME fixture handler
-        the stdio test uses (tests/mcp.rs includes examples/mcp_fixture_server.rs), so the two transports
-        cannot drift apart.
-      - >-
-        an_unlisted_mcp_host_is_refused_before_anything_is_dialled completes F4's remaining leg — the case
-        deferred at the last checkpoint. An MCP host is not the provider host, so nothing grants it
-        implicitly: under the default deny the run fails with Error::Refused, a live TcpListener records
-        zero accepts, the refusal is in the trace, and mcp_events is empty.
-      - >-
-        dev-dependencies: hyper (server, http1) + hyper-util (tokio, service, server) and rmcp's
-        transport-streamable-http-server feature. Dev-only — the shipped crate stays client-side.
+    '
+  - 'NF2 — verification stays deterministic and hermetic: no network, temp dirs removed on drop, and
+    no dependence on the caller''s toolchain layout beyond the `rustc` already required.
 
-  - id: US-IO-HARNESS-0.8.0-T09
-    summary: >
-      MCP tools in the agent loop. Offer discovered tools alongside the built-ins, dispatch
-      `mcp__*` calls through an `Act::Exec` gate on the namespaced tool name, fold the result into the
-      observation log under a documented size cap (truncation recorded), and share one session per run
-      across the whole 0.5.0 tree without serializing the fan-out.
-    why_required: >
-      Connecting to a server the agent cannot call is not a feature. This is the task that makes
-      `outcome.user_can` true.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T07
-    acceptance_criteria:
-      - >
-        F1 — with a stdio MCP server configured, a run discovers its tools, the model is offered them
-        under `mcp__<server>__<tool>` names, the agent invokes one, and the result reaches the next loop
-        step. Asserted by a test using a fixture server and by the live run.
-      - >
-        F3 — a server advertising a tool named `write_file` does not shadow the built-in: both are
-        callable, the built-in keeps its name, and the server's is reachable only under its namespaced
-        name.
-    files:
-      - src/run.rs
-      - src/mcp.rs
-      - tests/mcp.rs
-    evidence:
-      - >-
-        src/contract.rs: TaskContract.mcp + with_mcp(), empty by default so a 0.7.0-era contract is
-        unchanged. src/run.rs: sessions are connected and shut down around every workspace entry point
-        (run_with, resume, both resume_with_decision branches, run_tree, resume_tree, both
-        resume_tree_with_decision branches); Tree carries one session for the whole fan-out.
-      - >-
-        dispatch() gained an mcp.owns(name) branch: the call is gated as Act::Exec on the namespaced tool
-        name, the result is size-capped (truncation recorded), and a refusal is an observation rather than a
-        run failure. a_single_mcp_tool_can_be_denied_while_the_server_is_allowed proves the split — the
-        server starts, one of its tools is denied by a named layer, the run still succeeds, and mcp_events
-        shows the denied tool was never called.
-  - id: US-IO-HARNESS-0.8.0-T10
-    summary: >
-      MCP failure handling on the 0.2.0 recovery path. A server binary that will not start, a server
-      killed mid-run, a tool returning an error, and a call exceeding its timeout each produce a typed
-      error the loop treats as a recoverable step failure, recorded in the trace, never a panic and
-      never a silently dropped tool.
-    why_required: >
-      MCP servers are third-party processes the harness does not control; without this a dead server
-      takes down a run that 0.2.0 already knows how to recover.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T09
-    acceptance_criteria:
-      - >
-        F9 — MCP server failure paths: a server whose binary does not start, a server killed mid-run,
-        a tool returning an error, and a tool call exceeding its timeout each produce a typed error
-        handled by the 0.2.0 retry/recovery path, with the failure in the trace and no panic.
-    files:
-      - src/mcp.rs
-      - src/run.rs
-      - tests/mcp.rs
-    evidence:
-      - >-
-        tests/mcp.rs covers all four F9 legs: a_server_that_cannot_start_fails_the_run_with_a_typed_error
-        (Error::Mcp), a_tool_that_reports_an_error_does_not_end_the_run (is_error -> ok=false observation,
-        run still succeeds), a_tool_that_never_returns_times_out_and_the_run_continues (per-call timeout),
-        and a_server_that_dies_mid_run_becomes_an_observation_not_a_crash (the fixture's `die` tool exits
-        the process; the next call fails cleanly and the agent finishes with a built-in).
-      - >-
-        DEVIATION FROM F9 AS WRITTEN, for the owner to accept or reject at iterate: F9 says a server whose
-        binary does not start is "handled by the 0.2.0 retry/recovery path". It is not — connecting happens
-        before step 1, so it fails the run with a typed Error::Mcp instead. Retrying a missing binary would
-        not make it appear, and continuing without a configured capability is the worse failure. The other
-        three legs DO go through the loop as recoverable observations.
+    '
+  - 'F8 — a crate-level attribute in the subject cannot delete the criterion. A subject beginning `#![cfg(any())]`
+    must not make `RustTestPasses` or `WorkspaceTestPasses` report a pass by leaving a test binary with
+    zero tests that exits 0. Added by US-IO-HARNESS-0.8.1-I01: the vector was found while reproducing
+    F1 and is already closed by the delivered two-crate fix, but no criterion named it, and an unnamed
+    guarantee is one a later release can remove without noticing.
 
-  - id: US-IO-HARNESS-0.8.0-T11
-    summary: >
-      Trace and schema. Additive rusqlite events for MCP (server connect/disconnect with transport,
-      tools discovered, each tool call with latency and outcome) and for every network verdict (target,
-      act, effect, deciding layer) including allows, refusals, and asks, all queryable from a reopened
-      store. A 0.7.0 database migrates in place and a 0.7.0 binary still reads a migrated one.
-    why_required: >
-      An egress boundary that is not auditable cannot be trusted after the fact, and the contract's
-      operational criteria are all read-backs from the store.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T03
-      - US-IO-HARNESS-0.8.0-T07
-    acceptance_criteria:
-      - >
-        O1 — the trace records, for each run: every MCP server connect and disconnect with its
-        transport, the tool list discovered per server, each MCP tool call with latency and outcome, and
-        each network verdict with target, effect, and deciding layer. All queryable from a reopened
-        store.
-      - >
-        O2 — the rusqlite migration is additive; a database written by 0.7.0 opens and migrates in
-        place, and a 0.7.0 binary still reads a migrated database. Asserted by a migration test.
-    files:
-      - src/state.rs
-      - tests/mcp.rs
-      - tests/net.rs
-    evidence:
-      - >-
-        src/state.rs: McpEvent (connected / discovered / called / disconnected, with transport, latency, ok,
-        truncation note) and the mcp_events table — new table only. Store::record_mcp / mcp_events read it
-        back; asserted from a reopened store in tests/mcp.rs.
-      - >-
-        Network verdicts deliberately do NOT get their own table: they go to policy_events beside every
-        other permission decision, so one query answers "what was this run allowed to do". That is why the
-        egress half of O1 needed no DDL at all.
-      - >-
-        O2: a_pre_0_8_database_migrates_in_place_and_keeps_its_rows builds a 0.7.0-shaped store (steps,
-        checkpoints, policy events; mcp_events dropped), reopens it, and asserts the old rows and run status
-        are intact, the new table is empty and then usable — additive, no rewrite.
-  - id: US-IO-HARNESS-0.8.0-T12
-    summary: >
-      Back-compatibility and concurrency. A 0.7.0-era caller that configures no MCP servers compiles
-      against 0.8.0 and reaches the same verified success; the existing 0.5.0 fan-out suite runs green
-      with the network act enabled, proving the egress check introduced no global lock.
-    why_required: >
-      0.8.0 already takes one deliberate compile break (the `Act` variant); a silent behavioural break
-      or a serialized fan-out on top of it would make the upgrade unaffordable for io-cli and
-      io-studio.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T09
-    acceptance_criteria:
-      - >
-        F11 — a 0.7.0-era caller that configures no MCP servers compiles against 0.8.0 and reaches the
-        same verified success, with network governed by whatever its policy says (permissive policies
-        stay permissive).
-      - >
-        NF2 — the network check is a policy lookup on the existing matcher and introduces no new global
-        lock. The 0.5.0 fan-out suite runs green with the network act enabled, so containment of egress
-        does not serialize concurrent agents.
-    files:
-      - tests/subagents.rs
-      - tests/parity.rs
-    evidence:
-      - >-
-        F11: a_contract_without_mcp_offers_exactly_the_builtin_tools (no connection, no mcp_events, no
-        mcp__ tool offered) and tests/net.rs a_provider_with_no_endpoint_runs_under_a_network_deny_policy
-        (an endpoint-less provider is not exempt — it has nothing to govern — so every offline test in the
-        suite runs under deny-by-default egress unchanged).
-      - >-
-        NF2: the whole pre-existing suite runs green with the network act live, including the 0.5.0 fan-out
-        suite (tests/subagents.rs, 17 passed). The net check is a lookup on the existing glob matcher and
-        adds no lock; the MCP session is shared by reference through Tree rather than per agent. This is
-        indirect evidence — there is no dedicated timing benchmark asserting non-serialization, same
-        limitation 0.7.0 recorded for checkpointing.
-      - >-
-        Whole suite after the release work: 171 tests passed, 0 failed, across 11 binaries.
+    '
+  files:
+  - src/verify.rs
+  evidence:
+  - 'src/verify.rs compile_source, shipped shape: the subject plus PROBE_ITEM is compiled with --crate-type
+    lib --crate-name subject to an rlib (classifies subject-compile); PROBE_CRATE type-checks a reference
+    to the probe (catches subject-emptied); then subject + CRITERION_OPEN + test_src + CRITERION_CLOSE
+    is written as one file and built with --test, and the binary is run. Four spawns.'
+  - The criterion module's explicit `use ::core::{assert, assert_eq, ...}` / `use ::std::{...}` is what
+    stops a subject-defined macro capturing a name the criterion invokes. Against a subject defining
+    `macro_rules! assert_eq` — `#[macro_export]` or plain — rustc reports E0659 "ambiguous name" and
+    the build fails, which fails the gate. Verified directly with rustc across five cases before
+    implementing (honest private, honest pub, wrong answer, exported shadow, plain shadow).
+  - 'F1 and F3 green: a_subject_shadowing_assert_cannot_pass_an_impossible_gate, a_subject_shadowing_a_second_prelude_macro_cannot_pass_either.'
+  - 'F4 green, and this is the criterion the revert turned on: a_private_implementation_still_passes_the_gate
+    covers a non-`pub` implementation on both RustTestPasses and WorkspaceTestPasses. The two-crate build
+    failed it, and no test in the suite caught that because every one of them wrote `pub fn hello`.'
+  - 'F8 (added by US-IO-HARNESS-0.8.1-I01, previously unnamed): the crate-level-attribute vector is
+    closed by the probe step, not by crate separation — subject and criterion share a crate again.
+    Pinned by a_subject_cannot_delete_the_criterion_with_a_crate_level_cfg, which covers both the
+    single-file and workspace gates and failed against the pre-fix build. The trace phase for it is
+    now `subject-emptied` rather than `criterion-compile`, since the probe catches it before the
+    criterion is appended.'
+- id: US-IO-HARNESS-0.8.1-T03
+  summary: 'Route WorkspaceTestPasses through the same hardened path: the listed files are concatenated
+    into the subject crate, the criterion compiles as the dependent test crate. Confirms the multi-file
+    gate is not left as the surviving hole.'
+  why_required: F2 fails without it, and the iteration names WorkspaceTestPasses as sharing the weakness
+    by inspection. Leaving the multi-file gate unfixed would ship a release whose headline is a closed
+    bypass while the wider-surface variant stays open.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T02
+  acceptance_criteria:
+  - 'F2 — the same attack through `WorkspaceTestPasses` fails: the shadowing definition placed in any
+    one of the listed files does not make a `assert!(false, ...)` gate report a pass.
 
-  - id: US-IO-HARNESS-0.8.0-T13
-    summary: >
-      Documentation and packaging. README + rustdoc worked example of a run with an MCP server under a
-      deny-by-default egress policy including what a refusal looks like; the network act documented
-      alongside read/write/exec with its target format; the stdio-server limit stated; CHANGELOG entry
-      naming the `Act`/`Defaults` break and the old-policy-deserializes-to-Deny behaviour change with
-      their one-line migrations; 0.8.0 crate metadata and description.
-    why_required: >
-      The contract's operational criteria require the documented limit and the worked example, and an
-      undocumented breaking change is the difference between a deliberate 0.x break and a broken
-      upgrade.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T09
-      - US-IO-HARNESS-0.8.0-T11
-    acceptance_criteria:
-      - >
-        O3 — README and rustdoc carry a runnable example of a run with an MCP server under a
-        deny-by-default egress policy, including what a refusal looks like.
-      - >
-        O5 — the documented limit is explicit: the harness governs the connections it opens, not the
-        connections a running stdio server opens for itself.
-      - >
-        NF4 — `cargo test`, `cargo clippy --all-targets` (no warnings), and `cargo build --release` are
-        green; every new public item has rustdoc; `cargo publish --dry-run` passes with complete 0.8.0
-        metadata.
-      - >
-        NF6 — adding a network variant to the public `Act` enum and a field to `Defaults` is a breaking
-        change under strict SemVer and is taken deliberately in a 0.x minor, which cargo already treats
-        as incompatible. It is stated in the CHANGELOG as a breaking change with the one-line migration,
-        not glossed as additive.
-    files:
-      - README.md
-      - CHANGELOG.md
-      - Cargo.toml
-      - src/lib.rs
-    evidence:
-      - >-
-        CHANGELOG.md [0.8.0]: both breaking changes stated as breaking with their one-line migrations — the
-        Act variant / Defaults field (add an Act::Net arm and a net: field) and the behaviour change that a
-        pre-0.8 policy deserializes with net: Deny (add allow_net for the hosts it uses). Neither is glossed
-        as additive. Also records the reqwest 0.13 and MSRV 1.87 bumps and why.
-      - >-
-        src/lib.rs: a v0.8 section with a runnable no_run example of an MCP run under a deny-by-default
-        egress policy, what a refusal looks like, and the stdio-server limit (O5). README.md: a full
-        "MCP and network egress (v0.8)" section with the same example, the refusal text, and the limit
-        stated plainly; status line and capability list updated.
-      - >-
-        Cargo.toml: version 0.8.0, description rewritten to name MCP and egress, keywords now include mcp.
-      - >-
-        NF4 green: cargo test 171 passed / cargo clippy --all-targets no warnings / cargo build --release /
-        cargo publish --dry-run packaged 58 files and verified clean at 0.8.0. Doctests: 2 passed.
+    '
+  - 'F4 — honest passes are unaffected. An implementation that genuinely satisfies its criterion still
+    passes both `RustTestPasses` and `WorkspaceTestPasses`, and a genuinely failing implementation still
+    fails with the same observable outcome as 0.8.0.
 
-  - id: US-IO-HARNESS-0.8.0-T14
-    summary: >
-      The two live-run examples — one completing a task using a real MCP server's tool under a policy
-      whose network default is Deny, one attempting the same with that host denied and refusing
-      instead of connecting. Written and compiled during develop; executed at /ultraship:complete
-      where the API key and real spend are available.
-    why_required: >
-      They are the release's `evidence_of_value`. Without both, the release proves the capability or
-      the boundary but never that the boundary holds while the capability works.
-    status: in-progress
-    depends_on:
-      - US-IO-HARNESS-0.8.0-T09
-      - US-IO-HARNESS-0.8.0-T11
-    acceptance_criteria:
-      - >
-        O4 — the live run and the refusal run are both executed against a real MCP server and a real
-        provider, and their output is stored as release evidence.
-    files:
-      - examples/mcp_run.rs
-    evidence:
-      - >-
-        examples/mcp_run.rs written and compiling: two runs against a real model and a real MCP server —
-        one where network denies by default and the agent uses the server's tool anyway (reaching
-        OpenRouter only through the named provider layer), and one where the MCP host is unlisted and the
-        run refuses before a socket exists. The pair is the point: the first alone shows a feature, the
-        second alone shows a wall.
-      - >-
-        REMAINING: not executed. It needs OPENROUTER_API_KEY and real spend, so it runs at
-        /ultraship:complete, exactly as examples/sandbox_run did for 0.6.0 and examples/durable_run for
-        0.7.0. Until then O4 is unmet and no live evidence is claimed.
+    '
+  - 'F8 — a crate-level attribute in the subject cannot delete the criterion. A subject beginning `#![cfg(any())]`
+    must not make `RustTestPasses` or `WorkspaceTestPasses` report a pass by leaving a test binary with
+    zero tests that exits 0. Added by US-IO-HARNESS-0.8.1-I01: the vector was found while reproducing
+    F1 and is already closed by the delivered two-crate fix, but no criterion named it, and an unnamed
+    guarantee is one a later release can remove without noticing.
+
+    '
+  files:
+  - src/verify.rs
+  evidence:
+  - WorkspaceTestPasses routes through the same compile_source, so the fix lands on both gates by construction
+    rather than by a parallel code path.
+  - 'F2 green: a_workspace_subject_shadowing_assert_cannot_pass_an_impossible_gate, with the shadowing
+    definition in one of two concatenated files. F4 multi-file green: an_honest_workspace_still_passes_across_files.'
+  - 'F8 (added by US-IO-HARNESS-0.8.1-I01, previously unnamed): the crate-level-attribute vector is
+    closed by the same two-crate split — the subject''s inner attributes stay in its own crate. Pinned
+    by a_subject_cannot_delete_the_criterion_with_a_crate_level_cfg, which covers both the single-file
+    and workspace gates and failed against the pre-fix build.'
+- id: US-IO-HARNESS-0.8.1-T04
+  summary: Prove the caller-facing contract did not move. test_src keeps its 0.8.0 shape — the criterion
+    calls `hello()` unqualified, not `subject::hello()` — a legitimate macro exported by the subject
+    still reaches the criterion through the glob, and Verification's public API, variant shapes, and
+    Debug/Clone derivations are untouched. Assert no new public item and no signature change.
+  why_required: F5 is what keeps this release a patch. If the structural fix forced a path qualification
+    in test_src, that is a break in a patch and the contract's fallback_scope applies instead — this
+    task is the check that decides which of the two happened, rather than discovering it after publication.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T02
+  - US-IO-HARNESS-0.8.1-T03
+  acceptance_criteria:
+  - 'F5 — no public API break. A 0.8.0 caller''s `Verification` values compile against 0.8.1 unchanged,
+    and a `Verification` round-trips through serde with the same representation as 0.8.0. If the fallback
+    path is taken and `test_src` must change shape, this criterion is what forces that to be reported
+    as a break rather than shipped quietly.
+
+    '
+  files:
+  - tests/verify_gate.rs
+  - src/verify.rs
+  evidence:
+  - F5 green. a_macro_the_subject_legitimately_exports_still_reaches_the_criterion proves the glob still
+    carries the subject's own macros, so the fix protects the prelude names without restricting what
+    a caller may write.
+  - 'test_src shape unchanged: every criterion in the suite still calls hello() unqualified, not subject::hello().
+    The contract''s fallback_scope was therefore NOT needed and WorkspaceTestPasses stayed in scope.'
+  - 'No public API change: no new public item, no signature change, no serde surface touched. The one
+    public addition is SandboxEvent::gate_phase_failed (T09), which is additive.'
+- id: US-IO-HARNESS-0.8.1-T05
+  summary: 'Confirm the hardening runs inside the 0.6.0 sandbox under the 0.4.0 exec policy and stays
+    hermetic: every rustc invocation and the test binary still go through ExecGuard::check and ExecGuard::exec,
+    argv stays harness-constructed, the added spawn is policy-checked like the others, denying TEST_BINARY
+    still gives compile-only verification, and the temp dir is still removed on drop. Measure whether
+    the extra compiler invocation regresses verification latency and state the figure.'
+  why_required: 'NF1 and NF2 are the guardrails on the fix itself: isolating macro resolution by stepping
+    outside the sandbox would trade a verification hole for a worse isolation hole. NF5 exists because
+    the gate is on the hot path of a 0.5.0 fan-out, so a per-gate cost multiplies.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T03
+  acceptance_criteria:
+  - 'NF1 — the fix does not weaken the 0.6.0 sandbox boundary. Whatever compile or run structure the
+    hardening uses, every `rustc` invocation and every test binary still executes inside the ephemeral
+    sandbox under the 0.4.0 exec policy, with argv still harness-constructed. A fix that isolates macro
+    resolution by escaping the sandbox has traded one hole for a worse one.
+
+    '
+  - 'NF2 — verification stays deterministic and hermetic: no network, temp dirs removed on drop, and
+    no dependence on the caller''s toolchain layout beyond the `rustc` already required.
+
+    '
+  - 'NF5 — verification latency does not regress materially. If the fix means two compiler invocations
+    where there was one, that cost is measured and stated rather than discovered by a caller running
+    a 100-agent 0.5.0 fan-out.
+
+    '
+  files:
+  - src/verify.rs
+  - tests/verify_gate.rs
+  evidence:
+  - 'NF1 green: the_added_subject_compile_is_still_policy_checked — with rustc denied the gate returns
+    a typed Error::Refused rather than compiling. Both rustc spawns run through ExecGuard::check then
+    ExecGuard::exec, so they are sandboxed by the same default and argv stays harness-constructed.'
+  - The pre-existing verify.rs unit tests denying_the_test_binary_type_checks_without_running_it and
+    the deny-rustc test both still pass, so compile-only verification still works on the new flow.
+  - 'NF5 measured: 120 ms/gate single-crate vs 137 ms/gate two-crate, +17 ms (~14%). Recorded in evidence/0.8.1/latency.txt,
+    stated as a wall-clock bound on one machine, not a controlled benchmark. Re-measured after T06 to
+    cover the compile-only gates, which doubled their spawns too: 34 ms/gate to 60 ms/gate, +26 ms (~76%)
+    — cheaper than the test path in absolute terms, larger relatively, and paid per file by EachCompilesRust.'
+- id: US-IO-HARNESS-0.8.1-T06
+  summary: 'Harden CompilesRust and EachCompilesRust. The review this task originally required falsified
+    its own premise: both are defeatable without any criterion to shadow, because the subject is compiled
+    AS the crate root and can therefore delete the items the gate exists to compile — `#![cfg(any())]`
+    plus a body that does not type-check compiles clean. The `include!`-root fix this task originally
+    specified was rejected during implementation — it rejects every crate-level inner attribute, so an
+    honest `#![allow(dead_code)]` file would fail. Shipped instead: append a reserved probe item to the
+    subject, compile the subject as a crate, then type-check a probe crate that references it — a subject
+    that strips its own items strips the probe. Record the finding either way.'
+  why_required: 'F9, and O4 for the finding. Shipping a release whose headline is a closed verification
+    bypass while leaving a bypass it found — and could close with the indirection it already built —
+    would be the same overstatement this release exists to remove. The compile-only gates are not a
+    side path: EachCompilesRust is what a caller reaches for when each edited file only needs to compile
+    on its own.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T02
+  acceptance_criteria:
+  - 'F9 — the compile-only gates reject a subject that deletes itself. `CompilesRust` and `EachCompilesRust`
+    must fail a file whose body does not type-check but which compiles clean because a crate-level attribute
+    stripped it — specifically `#![cfg(any())]` followed by `pub fn hello() -> u32 { "not a u32" }`.
+    A file that genuinely compiles must still pass, and `EachCompilesRust` must still fail the whole
+    set when any one file fails.
+
+    '
+  - 'O4 — the conclusion about `CompilesRust` and `EachCompilesRust` is recorded in the release record
+    whether or not they needed a change.
+
+    '
+  files:
+  - src/verify.rs
+  evidence:
+  - 'FINDING (recorded, O4): CompilesRust passes code that does not type-check. Subject `#![cfg(any())]`
+    + `pub fn hello() -> u32 { "not a u32" }` compiles clean, rustc exit 0, because the crate-level
+    cfg strips the item before it is type-checked. EachCompilesRust routes each file through the same
+    compile_source(src, None, guard) path and shares it.'
+  - 'REMEDY VERIFIED before scheduling, THEN REJECTED in implementation: a root of `include!("subject.rs")`
+    makes rustc reject the construct outright — "error: an inner attribute is not permitted in this
+    context" — but it rejects EVERY crate-level inner attribute, including the honest ones. A subject
+    opening `#![allow(dead_code)]` failed to compile under it, which violates the half of F9 requiring
+    a file that genuinely compiles to still pass.'
+  - 'SHIPPED REMEDY: append a reserved `__io_harness_probe` item to the subject, compile the subject as
+    its own crate, then type-check a second crate referencing that probe. A crate-level attribute that
+    strips the subject''s items strips the probe with them and the reference fails to resolve; a subject
+    with a legitimate crate-level attribute keeps its items and passes. Reuses the two-crate structure
+    T02 already built rather than adding a third mechanism.'
+  - 'F9 green: three tests in tests/verify_gate.rs. a_compile_gate_rejects_a_subject_that_deletes_its_own_items
+    — the cfg-stripped subject fails both CompilesRust and EachCompilesRust. an_honest_file_still_passes_the_compile_gates
+    — a plain file passes, an `#![allow(dead_code)]` file passes (the case that falsified the include!
+    remedy), and one broken file still fails the whole EachCompilesRust set. the_trace_names_a_subject_that_deleted_its_own_items
+    — the failure records `subject-emptied`, distinct from `subject-compile` for a file that merely
+    does not compile, and an honest file records no phase failure.'
+  - Scope taken into 0.8.1 by US-IO-HARNESS-0.8.1-I01, owner-approved. Develop stopped rather than widening
+    scope on its own.
+- id: US-IO-HARNESS-0.8.1-T07
+  summary: 'State the bound in the crate''s own documentation: rustdoc on Verification, RustTestPasses,
+    and WorkspaceTestPasses saying what a passing gate proves and what it does not, and naming the shadowing
+    class this release closes; the same statement in prose in README; and a CHANGELOG entry describing
+    the defect, the fix, and the intended behaviour change that a dishonest 0.8.0 pass now fails.'
+  why_required: O1 and O2. The release tightens the gate, which is exactly when a reader is most likely
+    to over-read it as proof of correctness — the documentation has to move in the opposite direction
+    in the same version, or the next consumer inherits the overstatement product.yaml already corrected.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T06
+  acceptance_criteria:
+  - 'O1 — rustdoc on `Verification`, `RustTestPasses`, and `WorkspaceTestPasses` states what a passing
+    gate proves and what it does not, and names the shadowing class of attack this release closes. README
+    carries the same statement in prose.
+
+    '
+  - 'O2 — the CHANGELOG entry describes the defect, the fix, and the intended behaviour change (dishonest
+    0.8.0 passes now fail), with a migration line if one is needed.
+
+    '
+  files:
+  - src/verify.rs
+  - README.md
+  - CHANGELOG.md
+  evidence:
+  - Verification gained a type-level 'What a passing gate proves' section stating the bound, plus per-variant
+    notes on RustTestPasses and WorkspaceTestPasses; verify.rs and lib.rs module docs carry the 0.8.1
+    narrative.
+  - README 'Execution-based verification' gained the same statement in prose, both attack shapes, and
+    the gate_phase_failed pointer for a run that stopped passing on upgrade.
+  - 'CHANGELOG 0.8.1 section: the defect, both vectors, the fix, and the intended behaviour change stated
+    plainly (''a gate that passed dishonestly on 0.8.0 fails on 0.8.1'').'
+- id: US-IO-HARNESS-0.8.1-T08
+  summary: 'Green the whole suite and the packaging path: cargo test across every binary, cargo clippy
+    --all-targets -- -D warnings, cargo build --release, cargo publish --dry-run with complete 0.8.1
+    metadata, and confirm MSRV stays 1.87 with no dependency added or bumped. Bump the crate version
+    to 0.8.1.'
+  why_required: F6 and NF3 and NF4. The gate is load-bearing for tests written since 0.2.0, so a changed
+    compile path touches far more tests than it changes lines — and a correctness patch that raised
+    the MSRV or added a dependency would strand the callers who need it most.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T04
+  - US-IO-HARNESS-0.8.1-T05
+  - US-IO-HARNESS-0.8.1-T07
+  acceptance_criteria:
+  - 'F6 — the full pre-existing suite is green. Every gate test written since 0.2.0 and every 0.8.0
+    suite (mcp, net, policy, subagents, checkpoint, sandbox, multi_file, edit_file, parity, doc) passes
+    unchanged.
+
+    '
+  - 'NF3 — `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release` green;
+    `cargo publish --dry-run` passes with complete 0.8.1 metadata.
+
+    '
+  - 'NF4 — MSRV stays 1.87 and no dependency is added or bumped. A correctness patch that raises the
+    floor would strand exactly the callers who need it.
+
+    '
+  files:
+  - Cargo.toml
+  - Cargo.lock
+  evidence:
+  - 'cargo test — 182 passed, 0 failed across 12 binaries (172 pre-existing + 10 new). Full output in
+    evidence/0.8.1/tests.txt. F6 green: no pre-existing test needed changing.'
+  - cargo clippy --all-targets -- -D warnings — exit 0. cargo build --release — exit 0. cargo publish
+    --dry-run --allow-dirty — exit 0, packaged 59 files, 640.2KiB (168.9KiB compressed). evidence/0.8.1/builds.txt.
+  - 'NF4 green: rust-version stays 1.87 and the Cargo.lock diff is one line — the io-harness version
+    string. No dependency added, removed, or bumped. Cargo.toml bumped to 0.8.1.'
+  - Re-run required after T06's fix lands — the figures above predate it.
+- id: US-IO-HARNESS-0.8.1-T09
+  summary: Make a gate failure caused by the hardening distinguishable in the trace from an ordinary
+    failed criterion, without adding a public error variant (which would be an API change in a patch).
+    An operator whose run stopped passing after upgrading can tell which of the two happened from the
+    store alone.
+  why_required: The contract's observability entry. A silent behaviour change is the one thing that
+    turns an honest correctness fix into a support problem — this release deliberately makes some previously-passing
+    runs fail, so the trace has to say why.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T03
+  acceptance_criteria:
+  - 'O3 — the reproduction and the live run are stored as release evidence, so the claim "the bypass
+    fails" is a recorded observation rather than an assertion.
+
+    '
+  files:
+  - src/verify.rs
+  evidence:
+  - SandboxEvent::gate_phase_failed records subject-compile / criterion-compile / test-run. A new `kind`
+    VALUE on the existing sandbox_events table — not a new table or column — so the contract's 'no schema
+    change' holds and a 0.8.0 store needs no migration.
+  - 'O3 green: the_trace_distinguishes_a_closed_bypass_from_an_ordinary_failure asserts all three phases
+    land in a reopened Store.'
+  - 'HONEST BOUND, recorded in the test''s doc comment: a NEUTRALISED macro shadow reports test-run,
+    not criterion-compile — once ::core::assert! wins, assert!(false, ...) is simply a false assertion
+    and the run has become an ordinary failure rather than merely resembling one. The phase marker separates
+    the three places a gate can die; it does not reconstruct which 0.8.0 bypass a run used to rely on.
+    The contract''s observability line is met in substance, narrower than a literal reading.'
+- id: US-IO-HARNESS-0.8.1-T10
+  summary: 'Live evidence: an agent completes a RustTestPasses task against a real provider under the
+    hardened gate with a genuine implementation, and the reproduction plus the live run are stored under
+    .ultraship/products/io-harness/evidence/0.8.1/. Requires OPENROUTER_API_KEY and real spend, so it
+    runs at /ultraship:complete, not here.'
+  why_required: F7 and O3. Offline tests prove the boundary tightened; only a live run proves it did
+    not make an ordinary task unpassable, which is the failure mode a purely defensive fix invites.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.8.1-T08
+  acceptance_criteria:
+  - 'F7 — a live run against a real provider completes a `RustTestPasses` task with a genuine implementation
+    under the hardened gate, confirming the tightened boundary did not make an ordinary task unpassable.
+
+    '
+  - 'O3 — the reproduction and the live run are stored as release evidence, so the claim "the bypass
+    fails" is a recorded observation rather than an assertion.
+
+    '
+  files:
+  - .ultraship/products/io-harness/evidence/0.8.1/tests.txt
+  - .ultraship/products/io-harness/evidence/0.8.1/live_run.txt
+  evidence:
+  - 'RUN, and it FAILED the release as built. openai/gpt-5.6-luna via OpenRouter, `cargo run --example
+    edit_file`, contract "Create a Rust function `hello` that returns the u32 value 42" under
+    RustTestPasses. Outcome StepCapReached { steps: 4 } with a CORRECT implementation on disk:
+    `fn hello() -> u32 { 42 }`. The gate was rejecting honest code because the two-crate structure made
+    private items invisible to the criterion. Confirmed model-free immediately after: the same gate
+    returns Ok(false) for `fn hello` and Ok(true) for `pub fn hello`.'
+  - 'Structure reverted under US-IO-HARNESS-0.8.1-I02. Re-run, same model and contract:
+    Success { steps: 1 } on the same private implementation. F7 met.'
+  - 'This is what the criterion was for. 186 offline tests passed against the build that failed this
+    run, because every test in the suite wrote `pub fn hello` and inherited the structure''s own
+    assumption. Pinned going forward by a_private_implementation_still_passes_the_gate.'
+  - 'Both runs stored verbatim in evidence/0.8.1/live_run.txt. Offline evidence:
+    evidence/0.8.1/{repro-before-fix,tests,builds,latency}.txt.'

@@ -93,6 +93,19 @@
 //! [`Act::Exec`] check on its binary) and which of its tools may be called (an
 //! [`Act::Exec`] check on the namespaced name) — not what it does afterwards.
 //!
+//! v0.8.1 stops the execution gate being defeated by the file it verifies. Until
+//! then the subject and the caller's criterion were compiled as one crate, so the
+//! subject could shadow a macro the criterion invoked — a file defining
+//! `#[macro_export] macro_rules! assert` passed `assert!(false, ...)` — or delete
+//! the criterion outright with `#![cfg(any())]` and pass on an empty test binary.
+//! Shadowing is now stopped by re-importing the prelude macros explicitly around
+//! the criterion, which makes a subject's `assert` ambiguous rather than
+//! authoritative; deletion is caught by a probe item compiled with the subject,
+//! which a subject that strips its own contents strips too. `test_src` is
+//! unchanged, and so is what counts as a passing implementation — including a
+//! private one. See [`Verification`] for what a passing gate proves, which is
+//! narrower than it has been read to mean.
+//!
 //! ```no_run
 //! use io_harness::{run_with, ApproveAll, McpServer, OpenRouter, Policy, Store,
 //!                  TaskContract, Verification};
