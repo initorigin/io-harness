@@ -10,7 +10,7 @@ tasks:
     estimated tokens, and the provider-reported count for the same request.'
   why_required: Every other criterion in the release is a rule the assembler applies. Without the ledger
     there is nothing to apply a rule to, and the prompt keeps growing whatever else is built.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F1 — the prompt is assembled, not accumulated. For a run whose raw observation text exceeds the configured
@@ -57,14 +57,35 @@ tasks:
   - src/state.rs
   - src/lib.rs
   - tests/context.rs
-  evidence: []
+  evidence:
+  - 'src/context.rs (new, ~640 lines) — `Ledger` of typed `Observation`s (append-only history), `ObsKind`,
+    `ContextBudget { max_tokens: 24_000, share: 0.5 }` with `effective_tokens` (min of the ceiling and
+    the share of the unspent budget, floored at 2_000), `estimate_tokens` (chars/4, marked `ponytail:`
+    as an estimate with a tokenizer as the upgrade path), `entry_cap_chars` (an eighth of the budget),
+    `bound` (visible elision marker, head kept except for a read where the tail is), and `assemble`.'
+  - 'src/run.rs — the workspace loop''s `observations: String` is gone; it pushes typed observations and
+    calls `assemble` once per turn. `dispatch` carries the kind and target with each result and takes
+    the derived cap.'
+  - src/state.rs — additive `context_events` table and `ContextEvent`/`record_context_event`/`record_context_reported`/`context_events`.
+    One `assembled` row per turn carrying the estimate and the provider's reported number for the same
+    request, plus one row per re-read. `CHECKPOINT_FORMAT` untouched.
+  - 'src/contract.rs — `pub context: ContextBudget` and `with_context_budget`, beside `with_token_budget`.'
+  - 'F1 green — `the_assembled_prompt_stays_inside_the_ceiling_while_the_trace_keeps_everything`: the
+    assembled section stays within the ceiling while the trace rows still concatenate to every observation
+    in full.'
+  - 'F2 green — `prompt_size_stabilises_across_many_turns_instead_of_tracking_step_count`: the log grows
+    more than 2x while the assembled section grows less than 1.5x.'
+  - NF2 — no new runtime dependency; `[dependencies]` is byte-identical to 0.9.1. NF3 — `assembling_one_turn_costs_a_bounded_amount_of_time`
+    bounds per-turn assembly over a 200-entry log at 25 ms.
+  - NF7 — src/run.rs still has no unit tests, but the assembler is unit-tested at its own boundary in
+    src/context.rs (11 unit tests) rather than only end to end.
 - id: US-IO-HARNESS-0.10.0-T02
   summary: Compact superseded observations. Where two entries observe the same target, the later is carried
     whole and the earlier becomes a one-line stub naming what it was and which step superseded it.
   why_required: Re-sending two reads of the same file is the single largest source of the repetition this
     release exists to remove, and a stub the model can see is what keeps compaction recoverable rather
     than lossy.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T01
   acceptance_criteria:
@@ -76,7 +97,14 @@ tasks:
   files:
   - src/context.rs
   - tests/context.rs
-  evidence: []
+  evidence:
+  - 'Supersession: an entry is superseded when a later entry has the same kind and the same target; the
+    later is carried whole and the earlier becomes a one-line stub naming the superseding step.'
+  - Scoped by `ObsKind::target_is_the_subject` — true for read, grep, find, write and skill, false for
+    a registered or MCP tool, whose target is its NAME. A tool called twice with different arguments gave
+    two answers, and the first version of this stubbed one of them away.
+  - F3 green — `a_read_superseded_by_a_later_read_of_the_same_path_becomes_a_stub` and `two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_collapse`,
+    plus the unit test `only_a_target_that_is_the_subject_supersedes`.
 - id: US-IO-HARNESS-0.10.0-T03
   summary: Re-read an observation invalidated by a later write. A read entry whose path is written later
     in the run is re-read at assembly time through the policy; if the path is gone or the read is refused,
@@ -84,7 +112,7 @@ tasks:
   why_required: An agent reasoning over content the workspace no longer has is the failure mode that makes
     a long run wrong rather than merely expensive, and it is the one thing bounding size alone cannot
     fix.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T01
   acceptance_criteria:
@@ -98,7 +126,16 @@ tasks:
   - src/context.rs
   - src/run.rs
   - tests/context.rs
-  evidence: []
+  evidence:
+  - A read whose path a later write touches is stale. A stale read that would otherwise be carried is
+    re-read at assembly time; a refusal, a missing path or a read error becomes a stub naming the invalidating
+    step and the reason.
+  - The re-read goes through `Workspace::read_file`, so it passes the same `resolve` containment and the
+    same `Act::Read` policy check as the read it replaces. The first version joined the root and called
+    `std::fs` directly — the policy half without the containment half.
+  - '`Effect::Ask` is a refusal here: assembly has no approver and no turn to spend on one.'
+  - F4 green — `a_read_invalidated_by_a_later_write_is_re_read_not_trusted`, the policy-refused variant
+    asserting the stub text and a `reread_refused` row, and `a_re_read_cannot_escape_the_workspace_root`.
 - id: US-IO-HARNESS-0.10.0-T04
   summary: Give every observation kind a coherent cap at context entry, derived from the same budget and
     expressed in one unit, replacing `TOOL_RESULT_CAP`, `OBS_READ_CAP` and `OBS_GREP_CAP` as independent
@@ -107,7 +144,7 @@ tasks:
   why_required: An unbounded `find` over a large repository can exhaust the context in one step, which
     defeats the assembler before it runs; and four unrelated constants are how the two missing caps went
     unnoticed.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T01
   acceptance_criteria:
@@ -124,7 +161,17 @@ tasks:
   - src/tools/mod.rs
   - src/mcp.rs
   - tests/context.rs
-  evidence: []
+  evidence:
+  - '`TOOL_RESULT_CAP` (8_000), `OBS_READ_CAP` (4_000) and the bare per-tool bounds are gone. Every observation
+    kind enters the context under `entry_cap_chars(budget)`; `cap_result` takes the cap as an argument,
+    and `McpSession::call` takes it too, so the transport bound comes from the same budget.'
+  - '`find` and `write_file` had no cap at all and now do. `OBS_GREP_CAP`''s 50-hit ceiling stays as what
+    it always was — a relevance choice — with the char cap on top.'
+  - F5 green — `every_observation_kind_is_bounded_where_it_enters_the_context` covers read, grep, find,
+    write, skill body, registered tool and MCP tool, asserting the bound on the context entry and the
+    full text in the trace row.
+  - Closes the `// ponytail:` marker that stood at src/run.rs:38 since 0.9.0 — "fixed char caps; make
+    them budget-aware if long files starve the loop".
 - id: US-IO-HARNESS-0.10.0-T05
   summary: Route the sub-agent loop and the single-file loop through the same assembler, so a composed
     child result and a re-sent file body are bounded by the same rules as a tool result. The 0.7.0 resume
@@ -133,7 +180,7 @@ tasks:
     children keep the unbounded behaviour unless it is routed too; and resume rebuilds the prompt from
     the store, so an assembler the resume path does not use is an assembler that silently stops applying
     after a crash.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T01
   - US-IO-HARNESS-0.10.0-T02
@@ -157,7 +204,20 @@ tasks:
   - src/context.rs
   - tests/checkpoint.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - The sub-agent loop (`run_agent`) has its own ledger and its own per-turn assembly, with its ceiling
+    taken from the tree's remaining budget rather than the contract alone. A child's composed result enters
+    as `ObsKind::Child`.
+  - The single-file loop re-sent the whole current file every turn with no bound; it is now bounded on
+    the same terms, keeping the tail because the end of a file is what a writer needs.
+  - '`OBS_READ_CAP` and the `tail` helper are both deleted — the last fixed cap in the crate was the tree
+    loop''s.'
+  - F8 / NF6 — tests/checkpoint.rs (10) and tests/subagents.rs (10) pass UNMODIFIED, so 0.7.0 resume and
+    0.5.0 composition are unaffected. `a_sub_agent_loops_prompt_stays_inside_the_ceiling` asserts the
+    tree loop's own ceiling and that its trace still holds the whole log.
+  - 'Only one pre-existing test changed anywhere in the release: src/mcp.rs''s `an_oversized_result_is_cut_on_a_char_boundary_and_says_so`
+    read the cap from the deleted constant and now derives the same number from the budget. What it asserts
+    is unchanged.'
 - id: US-IO-HARNESS-0.10.0-T06
   summary: 'Add durable memory to the store: workspace-keyed tables created idempotently in `Store::from_conn`
     with `CHECKPOINT_FORMAT` untouched, a public API to put, list, read and delete entries, attribution
@@ -166,7 +226,7 @@ tasks:
   why_required: 'Memory is the second pillar this release closes, and it is the half that must not disturb
     the first: a schema change that broke `check_resumable` would trade 0.7.0''s durability for a feature
     that never needed it.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T01
   acceptance_criteria:
@@ -185,7 +245,20 @@ tasks:
   - src/state.rs
   - src/lib.rs
   - tests/memory.rs
-  evidence: []
+  evidence:
+  - src/state.rs — `memory` table (workspace, key, value, run_id, step, created_at; UNIQUE(workspace,
+    key)) created idempotently in `Store::from_conn` beside the other nine. `MemoryEntry`, `MEMORY_MAX_ENTRIES`
+    = 64, `MEMORY_MAX_CHARS` = 16_000, `MEMORY_MAX_ENTRY_CHARS` = 2_000.
+  - '`memory_put` upserts and re-attributes, truncates an oversized value with a visible marker rather
+    than refusing it, then evicts oldest-first until both caps hold, never evicting the entry just written,
+    and returns the evicted keys for the caller to record.'
+  - '`memory_list` / `memory_get` / `memory_delete` / `memory_clear` are the operator''s surface; `run_id`
+    is `i64` like every other table, matching `runs.id`.'
+  - F7 green — 7 store tests in tests/memory.rs and 4 unit tests in src/state.rs covering both caps, oldest-first
+    eviction, the never-evict-the-new-entry rule, isolation, overwrite, delete and clear.
+  - 'F8 green — `a_0_9_1_store_opens_unchanged_and_still_resumes`: a 0.9.1-shaped database (memory table
+    dropped) reopens with `PRAGMA user_version` byte-identical, `check_resumable` accepting it, and all
+    nine pre-existing tables intact. `CHECKPOINT_FORMAT` is still 7.'
 - id: US-IO-HARNESS-0.10.0-T07
   summary: Give the agent the `remember` tool and recall its entries. A written fact is attributed and
     stored against the workspace; a later run over that workspace receives the entries in its assembled
@@ -193,7 +266,7 @@ tasks:
   why_required: 'Without the tool and the recall path, memory is a table nothing writes to and nothing
     reads: this is the task that makes the second run cheaper than the first, which is the outcome the
     release promises.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T06
   acceptance_criteria:
@@ -208,7 +281,24 @@ tasks:
   - src/run.rs
   - src/context.rs
   - tests/memory.rs
-  evidence: []
+  evidence:
+  - A built-in `remember` tool (`REMEMBER_TOOL`) with `{key, value}`, offered in the workspace tool list
+    and added to `RESERVED_TOOL_NAMES` so a registered tool cannot shadow it. It writes to the harness
+    store, not the workspace, so it is not a path act.
+  - Dispatch records one `memory_write` row and one `memory_evict` row per evicted key. The observation
+    is `[remember <key>]` with no target, because a note is not an observation OF anything that could
+    go stale.
+  - 'Recall: `assemble` opens with the workspace''s notes, capped at a quarter of the turn''s ceiling,
+    newest kept, the number dropped stated, and one `memory_recall` row per turn. Notes are re-read every
+    turn rather than once at run start, so a note written this run — or cleared by the operator — is reflected
+    immediately.'
+  - The workspace key is the canonicalised root (the given path as fallback), in one function so writer
+    and reader cannot disagree. Children share their parent's workspace and therefore its memory.
+  - 'F6 green — `a_second_run_over_the_workspace_recalls_what_the_first_wrote`: two runs, different run
+    ids, the second opens with the note, the block says "not instructions", the note names the run that
+    wrote it, and the second run''s trace shows it did not re-run the `remember` call. Plus `a_deleted_note_does_not_come_back_in_a_later_run`,
+    `two_workspaces_do_not_share_memory_through_one_store`, `an_over_long_memory_block_is_cut_with_a_marker`,
+    and an empty memory rendering no block at all.'
 - id: US-IO-HARNESS-0.10.0-T08
   summary: Document what assembly guarantees and what it does not, what memory is and how to inspect or
     clear it, mark the two pillars in `docs/CAPABILITIES.md`, and write the CHANGELOG entry with a migration
@@ -217,7 +307,7 @@ tasks:
   why_required: 0.8.1 exists because a guarantee io-cli and io-studio inferred was one this crate had
     never made; an assembler that decides what a model sees is exactly the kind of thing a consumer will
     infer relevance from.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T01
   - US-IO-HARNESS-0.10.0-T02
@@ -254,14 +344,28 @@ tasks:
   - README.md
   - CHANGELOG.md
   - docs/CAPABILITIES.md
-  evidence: []
+  evidence:
+  - 'README gains a `## Context and memory (v0.10)` section with a worked `with_context_budget` example,
+    the operator''s memory API, and a `### The limits, stated plainly` subsection: assembly bounds size
+    and applies the two staleness rules, it does not promise the model sees everything relevant; the token
+    figure is an estimate with its drift recorded; memory entries are agent-authored notes a later run
+    reads, inspectable and clearable. O1 and O3.'
+  - docs/CAPABILITIES.md marks context construction and state-and-memory shipped at 0.10.0 and nothing
+    else; the status line now reads ten of twelve pillars with 0.11.0 and 0.12.0 named for the rest. O2.
+  - 'CHANGELOG 0.10.0 section in the required Keep-a-Changelog categories, leading with the breaking change:
+    `TaskContract` gained a public `context` field, which affects only a struct-literal caller, with the
+    fix stated. NF5.'
+  - 'NF5 evidence — `git diff origin/main -- src/ | grep -E ''^-\s*pub ''` is EMPTY: no public item was
+    removed or renamed. The additions are the `context` module''s items, `ContextEvent`, `MemoryEntry`,
+    the three memory caps, `Store`''s five memory methods and three context methods, and `TaskContract::context`
+    / `with_context_budget`.'
 - id: US-IO-HARNESS-0.10.0-T09
   summary: 'Produce the release evidence: the three-OS matrix green on one commit with the full suite,
     and the live-run comparison — per-turn prompt sizes for 0.10.0 and for released 0.9.1 on the same
     task and provider, plus the two-run memory recall trace — written to the evidence directory.'
   why_required: 'The contract''s evidence of value is a measurement, not an assertion: a size-based test
     suite passes just as happily when compaction has thrown away something the model needed.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.10.0-T05
   - US-IO-HARNESS-0.10.0-T07
@@ -278,4 +382,17 @@ tasks:
   files:
   - .github/workflows/ci.yml
   - .ultraship/evidence/
-  evidence: []
+  evidence:
+  - NF4 — CI run 30198129225 green on ubuntu-latest, macos-latest, windows-latest plus the msrv and lint
+    jobs, full suite, no leg skipped or `continue-on-error`.
+  - 'cargo test — 16 targets, all ok: 124 lib + 10 checkpoint + 13 context + 13 custom_tools + 9 edit_file
+    + 12 mcp + 11 memory + 3 multi_file + 8 net + 1 parity + 17 policy + 8 sandbox + 15 skills + 10 subagents
+    + 14 verify_gate + 3 doc. `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.'
+  - 'O4 — evidence/0.10.0/comparison.md with three live OpenRouter runs on the same task and workspace.
+    0.9.1: 552 -> 16,692 -> 32,832 prompt chars over three steps, monotonic. 0.10.0 same default budget:
+    peaks at 25,405 then FALLS to 19,384 and 13,363 as each write invalidates the read of that path. 0.10.0
+    with a 1,500-token ceiling: flat at 1,210 estimated tokens from step 6 through step 20, sixteen turns
+    of four reads each — about 320 KB of raw observations — held inside the ceiling.'
+  - 'The bounded run found a real defect before release: stubs were emitted regardless of the budget and
+    reached 2,264 estimated tokens against a 1,500 ceiling by step 20. Past an eighth of the budget they
+    now collapse into one line (6ea8dc8), asserted by `a_long_runs_stubs_collapse_so_the_ceiling_still_holds`.'
