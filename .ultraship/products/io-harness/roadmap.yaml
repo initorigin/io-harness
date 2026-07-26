@@ -126,7 +126,7 @@ versions:
       declared unsupported-for-containment in the roadmap rather than left as an unfulfilled
       promise. The matrix stays green on all three platforms afterwards, which is what makes 0.6.0's
       "the same harness isolates code the same way on mac, linux, and windows" a true sentence.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.10.0
     outcome: >

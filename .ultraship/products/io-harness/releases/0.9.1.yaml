@@ -1,0 +1,254 @@
+product: io-harness
+version: 0.9.1
+status: planned
+release_type: patch
+outcome:
+  user_can: >
+    A developer running io-harness on Linux or Windows gets the isolation and the verification the
+    crate has claimed since 0.3.0 and 0.6.0 — or reads, in the crate itself, exactly which platform
+    does not provide them. Today neither is true: on Linux the execution-based verification gate
+    fails outright and the sandbox CPU and memory caps never fire, and on Windows the suite does not
+    terminate at all because no cap can kill anything. Both platforms are advertised, both are
+    published, and until 0.9.0 added CI neither had ever been built.
+
+    After this release the three-OS matrix is green. A `RustTestPasses` or `WorkspaceTestPasses` gate
+    compiles and runs on Linux the way it does on macOS. A sandboxed process that exceeds its CPU or
+    memory cap is killed on Linux and the outcome names which cap it hit, so `cap_hit` is a fact on
+    every platform rather than on one. On Windows the suite completes, and containment there is
+    either genuinely enforced through the Win32 job-object API or declared unsupported in the crate's
+    own documentation and in the roadmap — a decision made explicitly rather than left as an
+    unfulfilled promise from 0.6.0.
+
+    Nothing a caller wrote against 0.9.0 changes. This is a defect release: no public item is added,
+    renamed, or removed, and a 0.9.0 contract compiles and behaves identically.
+  business_value: >
+    The crate is published and two products depend on it. io-cli and io-studio will run on their
+    users' machines, not on the maintainer's, so "works on macOS" is a third of the promise. The
+    specific defects are the worst kind to ship silently: a verification gate that fails on Linux
+    turns every honest pass into a false negative, and a sandbox whose caps never fire turns the
+    0.6.0 containment guarantee into decoration on the two platforms most likely to run untrusted
+    generated code in CI.
+
+    0.9.0 corrected the false `Backend::WindowsJobObject` label so no trace claims containment that
+    did not happen, which stopped the crate from lying. It did not stop it from being broken. This
+    release is the difference between an honest limitation and a fixed one, and it is deliberately a
+    patch: no new capability, so consumers can take it without reading a migration note.
+
+    It also has to come before 0.10.0. Context construction is about to change what every run sends
+    to the model; landing that on top of a platform whose verification gate does not work would mean
+    debugging two unrelated failures at once, on a platform nobody can reproduce locally.
+  evidence_of_value: >
+    The GitHub Actions matrix green on ubuntu-latest, macos-latest and windows-latest for the same
+    commit, with the full suite running — not skipped, not `continue-on-error`, not narrowed. Each
+    of the three defects has a regression test that is watched failing on Linux or Windows CI before
+    the fix lands, so the fix is proven to have been necessary rather than coincidental with a green
+    run.
+
+    Where a defect is closed by documenting a limit rather than by code — the Windows job object, if
+    that is the decision — the evidence is the roadmap entry and the crate documentation stating it,
+    plus a test asserting that the reported `Backend` matches what is actually enforced, so the
+    honest label cannot silently drift back.
+scope:
+  included:
+    - >
+      Root-cause and fix the 7 `verify::tests` failures on Linux, where `passes_guarded(...)` returns
+      false for verifications that pass on macOS and Windows. The fix must address the cause, not the
+      symptom: every caller of the spawn path is fixed at once rather than the individual tests being
+      adjusted to agree with the broken behaviour.
+    - >
+      Root-cause and fix the sandbox CPU and memory caps not firing on Linux, where
+      `cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap` observes `cap_hit: None` against an expected
+      `Some(Cpu)`. A cap that does not kill is the 0.6.0 pillar's central claim, so this is
+      correctness, not polish.
+    - >
+      Make the Windows suite terminate. The job currently runs to the 20-minute cap with no output
+      after the memory-cap test fails, which is the behaviour expected when nothing kills a capped
+      process.
+    - >
+      Decide and implement the Windows containment answer: either the Win32 job object behind
+      `WindowsSandbox` — accepting the runtime dependency that requires, which is a deliberate
+      reversal of 0.9.0's NF1 and must be recorded as such — or a formal declaration that Windows
+      gets the portable floor only, written into `src/sandbox.rs`, `src/sandbox/windows.rs`, the
+      README, and the 0.6.0 roadmap entry whose promise it corrects.
+    - >
+      A regression test per defect, each watched failing on the platform in question before its fix,
+      so a silent reintroduction fails CI rather than passing quietly.
+    - >
+      Whatever CI changes the above requires — but the matrix must end this release running the full
+      suite on all three platforms with no leg excluded, skipped, or marked `continue-on-error`.
+  excluded:
+    - >
+      Any new capability. This is a patch: no new public item, no new builder method, no behaviour a
+      0.9.0 caller could come to depend on.
+    - >
+      Linux seccomp hardening beyond what already exists. `LinuxSandbox` composes namespaces and
+      seccomp today; deepening that boundary is a security release with its own contract, not a
+      defect fix.
+    - >
+      The `Policy::check` glob recompilation recorded as a known limitation of 0.9.0's NF3. It is a
+      performance characteristic, not a defect, and it belongs where the policy is being worked on.
+    - >
+      Backfilling the false MSRV into the published 0.8.0 and 0.8.1 manifests. A published version
+      cannot be edited; 0.9.0 corrected it forward and that stands.
+    - >
+      Any change to the tool layer or skills shipped in 0.9.0. They are green on every platform the
+      suite runs on and are not implicated in any of these failures.
+  fallback_scope:
+    - >
+      The two Linux defects fixed and the Linux leg green, with Windows made to terminate and
+      formally declared floor-only in the documentation and the roadmap rather than implemented. This
+      is still a coherent release: Linux is the platform CI and containers actually run on, the
+      Windows claim stops being false either way, and the job object becomes a scoped future release
+      rather than a half-finished one wedged into a patch.
+acceptance:
+  functional:
+    - >
+      F1 — the verification gate works on Linux. The 7 previously failing `verify::tests` pass on
+      ubuntu-latest with the full suite running, and the failure was reproduced and understood first:
+      the root cause is stated in the release record, not merely the symptom's disappearance.
+    - >
+      F2 — a CPU cap kills on Linux and names itself.
+      `cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap` passes on ubuntu-latest with
+      `cap_hit: Some(Cpu)`, and the memory-cap test passes with `Some(Memory)`.
+    - >
+      F3 — the Windows suite terminates. `cargo test` on windows-latest completes and reports a
+      result within the job's time cap, rather than producing no output until it is cancelled.
+    - >
+      F4 — what a Windows run reports matches what it enforces. A test asserts the `Backend` recorded
+      for a Windows run against the containment actually applied, so the label corrected in 0.9.0
+      cannot drift back to claiming enforcement that is not there — whether the answer ends up being
+      the implemented job object or the declared floor.
+    - >
+      F5 — each defect has a regression test that was watched failing on the platform in question
+      before its fix, with the failing output recorded in the evidence directory. A test that passed
+      before the fix did not test the defect.
+  non_functional:
+    - >
+      NF1 — no public API change. No item is added, renamed, removed, or has its signature changed
+      against 0.9.0; a 0.9.0 contract compiles and behaves identically. Asserted the way 0.9.0
+      asserted it, by diffing the public surface against the released tag.
+    - >
+      NF2 — a new runtime dependency is permitted ONLY if the Windows job object is implemented, and
+      only the binding it requires (`windows-sys` or equivalent), scoped behind
+      `[target.'cfg(windows)'.dependencies]` so no macOS or Linux consumer takes on a dependency for
+      a platform they are not on. If the floor-only declaration is chosen instead, the dependency
+      section stays byte-identical to 0.9.0. Either way the outcome is recorded explicitly rather
+      than arrived at by accident.
+    - >
+      NF3 — MSRV stays at 1.88 and `cargo clippy --all-targets -- -D warnings` and
+      `cargo fmt --check` stay clean on every platform in the matrix, not only on the one where they
+      were developed. 0.9.0 learned this the hard way: clippy is not platform-neutral.
+    - >
+      NF4 — the three-OS matrix is green on one commit, running the full suite, with no leg excluded,
+      skipped, or marked `continue-on-error`. This is the criterion 0.9.0 could not meet and the
+      reason this release exists.
+  operational:
+    - >
+      O1 — the crate's documentation matches its behaviour on every platform. Whatever containment
+      Windows and Linux actually provide is what `src/sandbox.rs`, the backend modules, and the
+      README say they provide, and the 0.6.0 roadmap entry's "the same harness isolates code the same
+      way on mac, linux, and windows" is either true or amended.
+    - >
+      O2 — the three issues filed against 0.9.0 (#25, #26, #27) are each closed by a specific commit
+      that names them, so the trail from "CI found it" to "this fixed it" is readable without the
+      session that produced it.
+delivery:
+  target_mode: published
+  environment: crates.io, plus the GitHub Actions matrix (macOS, Linux, Windows) added in 0.9.0.
+  deployment_method: >
+    The initorigin release flow, with the 2026-07-26 owner override in effect: all work including
+    the sealed completion record on `feat/0.9.1`, PR to `develop`, release PR `develop` to `main`,
+    a GitHub Release titled `io-harness 0.9.1` with notes from the CHANGELOG, then `cargo publish`
+    last. The order is unchanged; the owner has authorized the merges to be performed without
+    waiting for manual review.
+  migrations:
+    - >
+      None. No stored-state schema change and no public API change. A 0.9.0 store opens and resumes
+      under 0.9.1 unchanged, and a caller upgrades by changing the version and nothing else.
+  observability:
+    - >
+      The existing rusqlite trace and `tracing` spans, plus CI itself — which is now the only place
+      Linux and Windows behaviour is observable at all, and the reason these defects surfaced.
+  rollback: >
+    `cargo yank --vers 0.9.1`, leaving 0.9.0 as what `cargo install` and a fresh `cargo add`
+    resolve to. Because the release is a defect fix with no API change, a consumer rolling back to
+    0.9.0 changes only the version number — and lands back on the platform behaviour documented in
+    0.9.0's known limitations, which is the state they are on today.
+dependencies:
+  products:
+    - >
+      io-cli and io-studio both consume the crate and both benefit; neither is blocked by this
+      release and neither needs to change to adopt it.
+  services:
+    - >
+      GitHub Actions is a hard dependency for the evidence: neither Linux nor Windows can be
+      reproduced locally, so CI is the only place any of this is verifiable. The repository is public
+      as of 2026-07-26, so standard-runner minutes are free and the matrix can be iterated on.
+  human_approvals:
+    - >
+      The Windows containment decision — implement the job object and accept a platform-scoped
+      runtime dependency, or declare Windows floor-only — is the owner's, because it changes what the
+      product promises rather than how it is built.
+resource_profile:
+  complexity: medium
+  uncertainty: high
+  likely_cost_drivers:
+    - >
+      Neither failing platform can be reproduced locally. Every hypothesis costs a CI round trip,
+      which makes cheap local guessing expensive and careful reading cheap. Diagnostics that answer
+      several questions in one run are worth more than a fast first attempt.
+    - >
+      The Linux verify failure and the Linux cap failure may or may not share a cause. Both run
+      through the same `run_capped` rlimit path, so one fix may close both — or the shared path may
+      be a coincidence that costs a wasted round trip to rule out.
+    - >
+      Implementing the Win32 job object, if chosen, is unfamiliar territory with no local machine to
+      test on, and it is the one part of this release that could grow past a patch. The fallback
+      scope exists precisely for that.
+  preferred_tools:
+    - The GitHub Actions matrix added in 0.9.0; `gh run view` and the job logs as the primary
+      instrument.
+    - rustc/cargo, clippy, rustfmt, and the existing test suite.
+  constraints:
+    - >
+      Patch semantics: no public API change, so no fix may be delivered by widening the API. If a fix
+      genuinely requires an API change, that is evidence the release should be a minor, and it goes
+      through `/ultraship:iterate` rather than being smuggled into a patch.
+risks:
+  - >
+    The Linux root cause is misdiagnosed and the fix passes CI for an unrelated reason — the exact
+    failure mode 0.8.1 exists to prevent, one level up. Mitigation: F5 requires every regression test
+    to be watched failing on the real platform before its fix, so a test that never failed is not
+    accepted as proof.
+  - >
+    Fixing the caps on Linux relaxes something that was accidentally providing containment, and the
+    fix trades a broken cap for a weaker boundary. Mitigation: the sandbox tests assert what is
+    enforced, not merely that nothing errored, and any change to the rlimit path is reviewed against
+    the floor's documented guarantees rather than against the tests alone.
+  - >
+    The Windows job object turns out to be a multi-day piece of work with an unfamiliar API and no
+    local machine, and it drags a patch release out indefinitely. Mitigation: the fallback scope
+    already declares the floor-only outcome a complete release, so the decision point is planned
+    rather than reached under pressure.
+  - >
+    Chasing green tempts the cheap fix — excluding a leg, marking one `continue-on-error`, or
+    skipping the offending tests on the platform that fails. That would reproduce exactly the
+    condition this release exists to end: a claim with nothing checking it. Mitigation: NF4 makes an
+    unskipped, unexcluded, full-suite green matrix the criterion, so the cheap fix cannot satisfy it.
+open_questions:
+  - >
+    Do the two Linux defects share one root cause? Both the verify spawn path and the floor's cap
+    enforcement go through `run_capped`'s `pre_exec` rlimits, and `set_rlimit` sets `rlim_max` as
+    well as `rlim_cur` while ignoring the syscall's return value — which on Linux would be visible to
+    a threaded `rustc` in a way it is not on macOS, and is invisible on Windows where rlimits do not
+    exist at all. That asymmetry matches the observed pass/fail split exactly, but it is a hypothesis
+    and the release must confirm it against a real CI run before relying on it.
+  - >
+    Is the Windows job object in or out? It is the one decision in this release that changes what the
+    product promises rather than how it is kept, so it is the owner's call and the fallback scope is
+    written to make either answer a complete release.
+  - >
+    Should the portable floor's `max_open_files` default of 512 be raised, or should it stop setting
+    `rlim_max` at all? If the fd cap is the Linux cause, the narrow fix and the correct fix may
+    differ, and the correct one is likely to leave the soft limit as the knob and the hard limit
+    alone.
