@@ -99,7 +99,7 @@ where
 }
 
 /// A tool the model may call, described in a vendor-neutral shape.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolSpec {
     /// Tool name the model calls.
     pub name: String,
@@ -110,7 +110,7 @@ pub struct ToolSpec {
 }
 
 /// A request for one model completion.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionRequest {
     /// System instructions.
     pub system: String,
@@ -121,7 +121,7 @@ pub struct CompletionRequest {
 }
 
 /// A tool call the model decided to make.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     /// Tool name.
     pub name: String,
@@ -131,7 +131,7 @@ pub struct ToolCall {
 
 /// Token usage for one completion, in a vendor-neutral shape. Used to enforce
 /// the cost budget and to record spend in the trace.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     /// Tokens in the prompt.
     pub prompt_tokens: u64,
@@ -145,7 +145,7 @@ pub struct Usage {
 ///
 /// Construct with `..Default::default()` for forward compatibility — fields are
 /// added in minor releases (e.g. `usage` in 0.2.0).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionResponse {
     /// Any free text the model returned.
     pub text: Option<String>,

@@ -218,6 +218,7 @@ mod contract;
 mod error;
 pub mod mcp;
 mod net;
+pub mod observe;
 pub mod policy;
 pub mod provider;
 pub mod resilience;
@@ -239,6 +240,7 @@ pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // `with_timeout` should be able to name the value they are overriding without
 // reaching into a provider's namespace to find it.
 pub use net::REQUEST_TIMEOUT;
+pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
 pub use policy::{Act, Effect, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
