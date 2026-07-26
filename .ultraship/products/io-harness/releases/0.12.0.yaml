@@ -1,0 +1,686 @@
+product: io-harness
+version: 0.12.0
+status: planned
+release_type: minor
+outcome:
+  user_can: >
+    A developer embedding the harness can watch a run as it happens, and a developer measuring the
+    harness can prove a change made it better. Neither is possible today, and the audit for this
+    release found the gaps are wider than the roadmap assumed.
+
+    Watching is not supported at all. `src/lib.rs:214-258` exports no observer, no callback, no
+    channel and no subscription of any kind; the full grep for `broadcast|mpsc|watch|Sender|
+    Receiver|subscribe|on_event|dyn Fn` across `src/` returns three hits, all of them predicates or
+    a test-only fixture. The only way to see a run in flight is to open the SQLite file with a
+    second connection and poll it. That works only by accident of `Store::checkpoint_step`
+    (`src/state.rs:1175`) committing each step in its own short transaction, and it is not a
+    contract: `Store::open` (`src/state.rs:644`) is a bare `Connection::open` that sets neither
+    `journal_mode=WAL` nor `busy_timeout`, so a second reader either blocks the writer or aborts on
+    contention unless it opens the file first and sets both pragmas itself, and it must guess at the
+    schema — which is precisely the coupling this release exists to remove.
+
+    Measuring has no surface either. Nothing in the crate records a provider response, so a case
+    cannot be re-run against what the model said last time. `CompletionRequest`,
+    `CompletionResponse`, `ToolCall`, `ToolSpec` and `Usage` (`src/provider/mod.rs:102-156`) carry no
+    serde derives at all, so there is no format to record into. What the trace does keep is lossy in
+    three ways: `CompletionResponse.text` is discarded entirely whenever `tool_calls` is non-empty
+    (`src/run.rs:892-905`), `Usage.prompt_tokens` and `completion_tokens` are dropped in favour of
+    `total_tokens` alone (`src/run.rs:714`), and tool calls are flattened to
+    `format!("{name}:{args}")` joined with `" | "` (`src/run.rs:909`, `:1359`), which a `|` inside an
+    argument corrupts.
+
+    And a run is not deterministic even given the same responses. `src/context.rs:545-549` renders
+    every memory note as `"- {key}: {value}  (run {run_id}, step {step})"`, and `run_id` is a SQLite
+    `AUTOINCREMENT`, so the same case run twice in one store sends the model **different prompt
+    bytes** — and that string is persisted into `steps.prompt`. Sub-agent results are collected by
+    `buffer_unordered` (`src/run.rs:1401-1408`) in completion order rather than spawn order, so
+    `steps.decision`, `steps.result` and the ordering of `runs.id`, `spawns.child_run_id` and
+    `agent_events` all vary between identical runs. Cross-run `memory` means a second run reads what
+    the first wrote. And `Store::elapsed_secs` (`src/state.rs:1249`) measures real wall-clock from
+    the database, so whether a run ends `Success` or `TimeBudgetExceeded` can differ on a slow
+    machine.
+
+    The per-run record does not exist. `runs` holds `goal, file, outcome, provider, parent_run_id,
+    depth, status, started_at` (`src/state.rs:655-661` plus its ALTERs) — no end timestamp anywhere
+    in the schema, so a finished run's latency is not recorded and not derivable; `elapsed_secs` is
+    live and keeps growing after `finish_run`. Success is an unvalidated free-text string, of which
+    eleven are written against nine `RunOutcome` variants. Steps are only reachable as `MAX(step)`,
+    which is not a step count because retry rows reuse the step number (`src/run.rs:2359`, `:2377`,
+    `:2390`). Spend is tokens; cost telemetry does not exist, and `Containment.max_total_cost` and
+    `max_total_duration` (`src/containment.rs:37,40`) are declared, defaulted, serde-roundtripped in
+    a test, and **never read** — a caller can set a tree-wide duration ceiling on a 24-hour run and
+    it does nothing.
+
+    After this release: a caller registers an observer and is called as the run happens, for every
+    kind of thing the trace already records, with each event serialisable so a host process can
+    forward it to a user interface written in another language without hand-writing a mapping.
+    Cancelling a run is something the caller asks for rather than something it achieves by dropping
+    a future. A recorded provider replays a case so that two runs over the same recording produce
+    the same trace, with the sources of variance either removed or documented as excluded from the
+    comparison. And a finished run yields one record carrying whether it succeeded, how many steps
+    it took, what it spent, and how long it took — from the crate's own API, without a consumer
+    writing SQL against a schema the crate never promised.
+  business_value: >
+    This is the twelfth and last of the twelve pillars. After it the harness is what it was defined
+    to be, and the remaining roadmap is breadth — documents, media, git, documentation — rather than
+    engine.
+
+    It is also the release that decides whether anything can be built on this crate. Every capability
+    from 0.1.0 to 0.11.0 is real and none of it is visible from outside while a run is happening. An
+    application embedding the harness has exactly two options today: poll a SQLite file whose schema
+    the crate has never promised, or show the user nothing until the run returns. Both are wrong, and
+    the second is unusable for a run designed to last 24 hours. A harness whose only progress signal
+    is a file nobody promised is a library with a private API and a public one that does not cover
+    the main use case.
+
+    The measurement half is what turns judgement into evidence. Eleven releases of engine work have
+    been justified by reasoning, live runs and tests — good, but not measurement. Nothing in the
+    portfolio can currently answer "did 0.11.0's stall detection make runs better or just make them
+    end sooner", because there is no way to run the same case twice and compare. Deterministic replay
+    plus a per-run outcome record is the minimum that makes that question answerable, and every
+    release after this one gets to be argued from numbers.
+
+    The determinism defects matter more than the missing features. A replay that returns recorded
+    responses but still sends different prompt bytes on the second run, or still composes child
+    results in a different order, would look like it worked and would silently invalidate every
+    comparison built on top of it. Fixing `run_id` out of the prompt and pinning child ordering are
+    small changes; discovering them after an evaluation suite has been scored against them is not.
+
+    And the observer surface has to be designed on the harness's own terms, now, before the
+    applications are written against it. That is the correction this release makes to
+    iterations/US-IO-HARNESS-0.9.0-I01, which recorded the dependency as running the other way. The
+    harness states what a run emits; a consumer subscribes to that. Designing the surface backwards
+    from whatever an application currently does would bake one application's shape into a public
+    trait that every future consumer inherits.
+  evidence_of_value: >
+    For the observer: a test observer registered on a run that exercises every event kind, asserting
+    that the sequence it receives matches the trace the same run wrote — the same facts, from two
+    surfaces, agreeing. That is the assertion that matters, because an event stream that disagrees
+    with the durable trace is worse than no event stream. Plus a run with no observer registered
+    asserting byte-identical trace output and an unchanged provider call count against 0.11.0, so the
+    surface is proven to cost nothing when unused.
+
+    For serialisation: every event round-trips through `serde_json` and back to an equal value, with
+    one test that pins the wire shape of each variant so a consumer in another language is reading a
+    format that a future release cannot change silently.
+
+    For cancellation: a run cancelled from inside the observer stops within one step, records a
+    terminal outcome, and is resumable — as opposed to today's only mechanism, dropping the future,
+    which leaves the run row `running` forever.
+
+    For replay: one case, recorded once, run twice, with the canonicalised trace of both runs
+    compared byte for byte and asserted equal. Then the negative controls, which are the tests that
+    actually prove something: the same comparison must FAIL if `run_id` is reintroduced into the
+    rendered memory note, and must FAIL if child results are composed in completion order rather
+    than spawn order. A determinism test that cannot fail is decoration.
+
+    For replay's resume-safety: a recorded case, killed mid-run and resumed, producing the same
+    trace as the uninterrupted replay. This is the one the existing fixtures would get wrong —
+    all ten scripted mocks in `tests/` are keyed on an `AtomicUsize`, and `tests/checkpoint.rs:63-66`
+    already documents why that breaks under resume.
+
+    For the outcome record: a run of each outcome kind, asserting the record's success flag, step
+    count, token spend and duration against independently computed values, with the duration asserted
+    as a bound rather than an equality. Plus one test proving the record is written for a run that
+    ended by escalation, which returns `Err` and therefore never reaches a `RunResult` at all.
+
+    For the containment holes: a tree given a duration ceiling that halts on it, which today it does
+    not.
+
+    For the README: `cargo package` inspection plus a diff, showing every factual claim corrected —
+    no `git` tool, no unmarked Office/OCR/media capabilities, the current version in the dependency
+    line, `Act::Net` in the defaults table, `remember` in the reserved list, all nine outcome
+    variants, and no instruction to override something a caller cannot reach.
+scope:
+  included:
+  - >
+    An `Observer` trait and a serialisable `RunEvent`. `pub trait Observer: Send + Sync` with a
+    `&self` method taking `&RunEvent`, passed to a run as `&dyn Observer` — exactly the shape of the
+    crate's one existing inversion-of-control precedent, `Approver` (`src/approve.rs:95-98`,
+    threaded as `&dyn Approver` at `src/run.rs:143`). `&self` rather than `&mut self` is what makes
+    it work under `buffer_unordered`'s concurrent children without an aliasing problem; interior
+    mutability is the implementer's business. `RunEvent` derives `Serialize` and `Deserialize` so a
+    host process can forward events to a user interface in another language without hand-writing a
+    mapping — the design constraint that makes this a serialisable enum rather than a callback with
+    loose arguments.
+  - >
+    An event per kind of thing the run already records, so the two surfaces agree: a committed step,
+    a tool call, a policy refusal, an approval request and its decision, a spend draw, a retry, a
+    provider fallback, a stall, a replan, a sub-agent spawn, a memory write, a sandbox lifecycle
+    event, an MCP call, and the run's terminal outcome. The audit enumerated every emission site;
+    this release adds no new trace facts, it exposes the ones already written.
+  - >
+    A registration path on every entry point that does not break the existing seven. `run`,
+    `run_with`, `run_tree`, `resume`, `resume_with_decision`, `resume_tree` and
+    `resume_tree_with_decision` all return `Result<RunResult>` today (`src/run.rs:116-1174`); the
+    observer is opt-in and a run without one behaves exactly as 0.11.0 did.
+  - >
+    One shared step-boundary emission instead of three. The commit point is duplicated at
+    `src/run.rs:743`, `:962` and `:1455`, each with its own inline `StepRecord` construction and its
+    own differently-named `info!` ("loop step" / "workspace step" / "agent step"). The event must be
+    emitted from one place or the three loops will drift, and the sub-agent loop's deliberately
+    uncommitted step (`src/run.rs:1442-1456`, a step paused by a child so that resume replays it) has
+    to be handled explicitly rather than silently dropped.
+  - >
+    Cancellation the caller can ask for. The observer's return value can stop the run, which ends as
+    a terminal outcome, records it, and stays resumable. Today the only way to stop a run in flight
+    is to drop its future, which leaves `runs.status` as `running` forever — `Store::set_status`
+    exists (`src/state.rs:1227`) and is never called from `src/run.rs`, so `RunStatus::Failed` is a
+    variant nothing writes.
+  - >
+    `Store::open` sets `journal_mode=WAL` and a `busy_timeout`. A store the crate hands out should be
+    safe for a second reader without that reader reaching around the API to configure the file. This
+    is a harness defect on its own merits, independent of who the reader is.
+  - >
+    Provider types gain serde. `CompletionRequest`, `CompletionResponse`, `ToolCall`, `ToolSpec` and
+    `Usage` derive `Serialize`/`Deserialize`. This is the prerequisite for recording anything, and it
+    is additive.
+  - >
+    A recording provider and a replaying provider, as combinators. Both are themselves `Provider`, so
+    every existing generic entry point takes them with no signature change — the pattern `Fallback`
+    established in 0.11.0 (`src/provider/fallback.rs:87`), including its `+ Sync` bounds and its use
+    of an atomic rather than a `Mutex` because a `MutexGuard` is not `Send`. The recorder wraps a real
+    provider and persists each request with its response; the replayer serves recorded responses and
+    never dials the network.
+  - >
+    Replay keyed on the request, not on a counter. Every scripted mock in `tests/` advances an
+    `AtomicUsize`, which breaks under resume because a replayed step calls `complete` again and would
+    consume the next recording; `tests/checkpoint.rs:63-66` already documents the fix. Keying on the
+    request content makes replay and 0.7.0's resume compose instead of fighting.
+  - >
+    Fix the determinism leaks that would invalidate a replay. `run_id` comes out of the rendered
+    memory note (`src/context.rs:545-549`), so the same case sends the same prompt bytes twice.
+    Sub-agent results are composed in spawn order rather than `buffer_unordered` completion order,
+    so `steps.decision`, `steps.result` and the child id sequence stop varying. Both are small
+    changes whose absence would make a working-looking replay silently wrong.
+  - >
+    A stated, tested definition of "identical twice". `steps` has no `UNIQUE(run_id, step)` and no
+    indexes, and retry rows insert unconditionally, so equality cannot be row identity. The release
+    defines a canonicalised projection of the trace — which tables, which columns, and which fields
+    are excluded as inherently variable (wall-clock stamps, `mcp_events.millis`, sandbox tempdir
+    paths in `sandbox_events.detail`, `Debug`-formatted retry waits) — and the excluded set is
+    documented rather than discovered.
+  - >
+    A per-run outcome record, in an additive table written by `finish_run`. Carries whether the run
+    succeeded, its step count, its token spend, and its duration. All four are computable at that
+    point from helpers that already exist — `last_step` (`src/state.rs:1485`), `spent_tokens`
+    (`:1261`) and the run's `started_at` — plus an end stamp, which is the one genuinely new write:
+    no end timestamp exists anywhere in the schema, and `elapsed_secs` is live so it cannot
+    reconstruct a finished run's latency.
+  - >
+    The record reaches the caller as well as the store. `RunResult` (`src/run.rs:84`) carries
+    `outcome`, `run_id` and `remembered` and nothing about spend or latency; it grows to carry the
+    summary. Its constructors are private, so this breaks only an exhaustive struct pattern, and it
+    is documented as the release's public break.
+  - >
+    `"refused"` becomes a real outcome. `finish_run(run_id, "refused")` is written at
+    `src/run.rs:1801` for a network denial, and it has no `RunOutcome` variant and no
+    `terminal_outcome` mapping (`src/run.rs:630-651`) — so resuming a refused run falls back into the
+    loop. This is the same class of defect 0.11.0 fixed for `"escalated"`, found by the same kind of
+    audit, and it is fixed here where outcomes are being worked on.
+  - >
+    `AgentEvent` and `SpawnRow` become nameable. Both are `pub struct` inside the private `mod state`
+    (`src/lib.rs:227`) and are not re-exported, so `Store::agent_events` (`src/state.rs:992`) returns
+    a `Vec` of a type an external caller cannot name — which makes `agent_events`, the only audit of
+    per-step budget draws, unreadable through the public API. An observability release cannot ship
+    with an unreadable audit table.
+  - >
+    Close the two dead containment fields. `Containment.max_total_duration` becomes enforced — a
+    24-hour tree with a duration ceiling that is silently ignored is a containment hole, and the
+    ledger already has everywhere it needs to check. `max_total_cost` cannot be enforced because no
+    price telemetry exists, so it is documented as reserved with what it would require, rather than
+    left looking functional.
+  - >
+    The small trace-honesty fixes the audit turned up, all in the release's own subject area: the
+    single-file loop back-fills `reported_tokens` like the other two loops do (`src/run.rs:881`,
+    `:1332` — the single-file loop has no such call, so its `assembled` rows keep a NULL);
+    `context_events` stops conflating a replan and a terminal stall under one `stalled` kind
+    distinguishable only by prose in `detail`; and the documented-but-never-emitted
+    `sandbox_events` `net_deny` kind (`src/state.rs:332`) is either emitted or removed from the
+    documentation.
+  - >
+    Make the request deadline overridable, as 0.11.0's O4 said it was. `REQUEST_TIMEOUT` and
+    `http_client_with_timeout` are `pub(crate)` (`src/net.rs:40,62`) and every timeout-taking
+    provider constructor is `pub(crate) fn at` (`openrouter.rs:35`, `anthropic.rs:46`,
+    `openai.rs:36`), so no caller can change it. `src/net.rs:50` documents the case for "a caller
+    whose model is slower than `REQUEST_TIMEOUT` allows" and that caller has no way in. The 0.11.0
+    record is immutable, so this is recorded as a 0.11.0 miss corrected here.
+  - >
+    Correct the README's factual errors — not its structure, which is 0.15.0's subject. It claims a
+    `git` tool the crate does not have (built-ins are `write_file`, `grep`, `find`, `read_file`,
+    `remember`, `read_skill`, `spawn_agent`); lists Office/PDF/OCR/media as capabilities with no
+    status marker beside siblings carrying shipped markers; pins `io-harness = "0.3"` in the one
+    dependency snippet a reader copies; omits `Act::Net` from the policy defaults table although it
+    defaults to Deny (`src/policy.rs:167-175`); omits `remember` from the reserved tool names; lists
+    four of nine `RunOutcome` variants; asserts "everything else in Capabilities is roadmap" when ten
+    of the listed items have shipped; and tells the reader to override a deadline they cannot reach.
+    Plus the leaked rustdoc hidden lines (`# async fn demo()`, `# Ok(())`, `# }`) that render as
+    stray text, and the top-of-file pseudo-field block that collapses into one run-on line.
+  - >
+    Tests per event kind, per determinism property and per record field, with the negative controls
+    that make the determinism tests capable of failing, plus the three-OS matrix staying green and a
+    live run exercising the observer and the recorder end to end.
+  excluded:
+  - >
+    Designing any surface in this release backwards from what io-cli or io-studio currently do. Their
+    development follows the harness. The observer's shape, the event set and the record's fields are
+    decided from what a run actually does, and an application is built against the result. This is
+    the correction to iterations/US-IO-HARNESS-0.9.0-I01, which recorded the dependency the other
+    way round.
+  - >
+    A channel, a stream adapter, or any second subscription mechanism. The trait is the primitive; a
+    caller who wants a channel writes four lines to push into one. Shipping both means maintaining a
+    public adapter with no consumer, and `tokio`'s `sync` feature is not currently enabled for the
+    library (`Cargo.toml:22` — it is dev-only at `:56`).
+  - >
+    A network or IPC transport for events. The observer is in-process. Getting events to another
+    process is the host application's job and its choice of mechanism; the crate's obligation is that
+    the event serialises cleanly, which it does.
+  - >
+    Replacing the rusqlite trace, or promising its schema as a public contract. The durable trace
+    stays what it is; this release adds a supported way to observe a run and a supported way to read
+    a finished one, so that no consumer needs the schema. Freezing the schema would be a much larger
+    promise and would end additive migration.
+  - >
+    A results schema, scoring, suites, case definitions, pass/fail policy or regression comparison.
+    Those belong to io-eval, which intends its own results store. This release provides replay and a
+    per-run record; deciding what a score means is a different product.
+  - >
+    Cost in currency. No price telemetry exists anywhere in the crate, and inventing a price table
+    would make the number wrong in a new way. Spend is tokens, stated as tokens.
+  - >
+    Bit-exact reproduction of wall-clock-dependent facts. Timestamps, `mcp_events.millis`, sandbox
+    tempdir paths and measured retry waits are excluded from the equality definition by design and
+    by documentation. A determinism claim that pretends to cover them would be false.
+  - >
+    Making a replayed run independent of durable cross-run memory by rewriting how memory works.
+    Memory is keyed to the workspace (`src/run.rs:2322-2327`); a replayed case gets a determinism
+    guarantee only under the isolation the release documents, and changing memory's semantics is
+    0.10.0's subject, not this one.
+  - >
+    The structural README rewrite and the docs/ guide pages. Moved to 0.15.0 by the owner's decision
+    this session: the documentation should describe a finished twelve-pillar harness once, rather than
+    being redrafted after each pillar. 0.12.0 corrects only what is factually false.
+  - >
+    Making `Provider` object-safe, provider routing, cross-run health tracking, or a plan artifact.
+    All still excluded, unchanged from 0.11.0.
+  - >
+    The Windows Job Object. Windows containment stays the portable floor with a wall-clock cap, as
+    documented and asserted since 0.9.1. It needs a `windows-sys` binding scoped to `cfg(windows)`
+    and its own release.
+  - >
+    Any change to the policy, the approver, verification, the sandbox, or 0.10.0's assembly rules
+    beyond removing `run_id` from one rendered line and adding the events that report what they
+    already do.
+  fallback_scope:
+  - >
+    The observability half plus the record: the `Observer` trait, the serialisable `RunEvent` covering
+    every kind the trace already holds, one shared step boundary, caller-requested cancellation, the
+    `Store::open` pragmas, the per-run outcome record with its additive table and its end stamp, the
+    `"refused"` outcome fix, `AgentEvent`/`SpawnRow` becoming nameable, the enforced
+    `max_total_duration`, the overridable request deadline, and the README's factual corrections —
+    with deterministic replay and the recording provider deferred to their own release. This is a
+    coherent outcome a developer reaches: an embedding application is called as the run happens
+    instead of polling a file, and a finished run reports whether it worked, how long it took and
+    what it cost, from the crate's own API. It is also the half whose absence blocks anything being
+    built on the crate, whereas replay's only consumer does not exist yet. If this fallback is taken,
+    the twelfth pillar stays partial and the deferred release is named.
+acceptance:
+  functional:
+  - >
+    F1 — a registered observer is called for every kind of thing the run records. One run exercising
+    steps, tool calls, refusals, an approval decision, a spend draw, a retry, a fallback, a stall, a
+    replan, a spawn, a memory write, a sandbox event, an MCP call and a terminal outcome delivers one
+    event per occurrence. Asserted against the trace the same run wrote: the two surfaces report the
+    same facts in the same order. An event stream that disagrees with the durable trace is worse than
+    none.
+  - >
+    F2 — the observer costs nothing when absent. A run with no observer produces a byte-identical
+    canonicalised trace and the same provider call count as 0.11.0, asserted by a call counter on the
+    existing mock providers. No new allocation per step on the unobserved path.
+  - >
+    F3 — every event serialises and round-trips. Each `RunEvent` variant survives
+    `serde_json` to value and back to an equal value, and one test pins the rendered shape of each
+    variant so a consumer reading the JSON is reading something a future release cannot change
+    silently.
+  - >
+    F4 — the step boundary is emitted once, from one place, for all three loops. Asserted by driving
+    the single-file, workspace and sub-agent loops and observing the same event shape from each; and
+    the sub-agent loop's step that is deliberately left uncommitted when a child defers
+    (`src/run.rs:1442-1456`) is asserted to behave as the release specifies rather than to silently
+    emit nothing.
+  - >
+    F5 — a run can be cancelled by its observer. The run stops within one step of the request,
+    records a terminal outcome, leaves `runs.status` not `running`, and is resumable. Contrasted with
+    a dropped future, which is asserted to be the thing that leaves a run wedged today.
+  - >
+    F6 — a store the crate opens is safe for a second reader. `Store::open` sets WAL and a busy
+    timeout; asserted by a concurrent reader on the same file that neither blocks the writer nor
+    aborts, using no pragmas of its own.
+  - >
+    F7 — a recording provider captures a call losslessly. Request and response round-trip through the
+    recording, including `CompletionResponse.text` when tool calls are also present (discarded today
+    at `src/run.rs:892-905`), both `Usage.prompt_tokens` and `completion_tokens` (dropped today at
+    `src/run.rs:714`), and tool-call arguments containing a `|` character, which the current
+    `" | "`-joined trace format corrupts.
+  - >
+    F8 — a case replays identically. One case recorded once and run twice produces the same
+    canonicalised trace, compared byte for byte. The replaying provider makes no network call,
+    asserted rather than assumed.
+  - >
+    F9 — the determinism tests can fail. The F8 comparison FAILS when `run_id` is reintroduced into
+    the rendered memory note, and FAILS when child results are composed in `buffer_unordered`
+    completion order rather than spawn order. Both are asserted as explicit negative controls,
+    because a determinism test that cannot fail proves nothing and this release's whole measurement
+    claim rests on it.
+  - >
+    F10 — replay survives resume. A recorded case killed mid-run and resumed produces the same
+    canonicalised trace as the uninterrupted replay. This is the criterion the existing fixtures
+    would fail: all ten scripted mocks in `tests/` key on an `AtomicUsize`, and a resumed step
+    re-calls `complete` and would consume the next recording.
+  - >
+    F11 — a finished run has a record, and its numbers are right. For each outcome kind, the record's
+    success flag, step count, token spend and duration are asserted against independently computed
+    values — duration as a bound, never an equality. `steps` is asserted to mean what the release
+    documents it to mean, given that retry rows share a step number so `COUNT(*)` over the table is
+    not a step count.
+  - >
+    F12 — the record exists for a run that never returns a `RunResult`. An escalated run returns
+    `Err`, so its record must be written by `finish_run` rather than assembled by the caller.
+    Asserted by reading the record back for a run that escalated.
+  - >
+    F13 — the record reaches the caller. `RunResult` carries the summary, so spend and latency are
+    available without a follow-up store query. The added fields are asserted against the stored
+    record so the two cannot drift.
+  - >
+    F14 — a refused run is terminal on resume. `"refused"` (`src/run.rs:1801`) maps through
+    `terminal_outcome` to its own outcome, so resuming reports what happened instead of re-entering
+    the loop. A regression test that fails against 0.11.0, in the shape of 0.11.0's own F10.
+  - >
+    F15 — `agent_events` is readable through the public API. `AgentEvent` and `SpawnRow` are
+    nameable, so an external consumer can read the per-step budget-draw audit without opening the
+    SQLite file. Asserted from an integration test, which is where the public surface is visible.
+  - >
+    F16 — a tree halts on its duration ceiling. `Containment.max_total_duration` is enforced;
+    asserted by a tree that crosses it and stops. It is silently ignored today.
+  - >
+    F17 — the request deadline is overridable by a caller. Asserted from an integration test, which
+    is the only place that proves the item is actually public — the 0.11.0 criterion that claimed
+    this was satisfied by a `pub(crate)` path reachable only from inside the crate.
+  non_functional:
+  - >
+    NF1 — no new runtime dependency. `serde` is already a dependency and is already derived on
+    `Containment`, `Policy` and the sandbox types; the observer needs no channel and therefore no
+    `tokio` `sync` feature. `[dependencies]` is unchanged against 0.11.0 except for serde derive
+    coverage.
+  - >
+    NF2 — the observer does not change the run's concurrency model. `Store` stays `Send + !Sync`, the
+    tree stays `buffer_unordered` on one task, and `run_agent`'s future stays non-`Send`. An
+    `Observer: Send + Sync` with `&self` methods is compatible with all three; a `&mut self` observer
+    would not be, under concurrent children.
+  - >
+    NF3 — a trace failure does not become a run failure through a new path, and neither does an
+    observer. A panicking or erroring observer must not corrupt the trace or leave a run wedged, and
+    the chosen behaviour is documented rather than incidental.
+  - >
+    NF4 — MSRV stays 1.88; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` stay
+    clean on all three platforms; the ubuntu/macos/windows matrix plus the msrv and lint jobs are
+    green on one commit with no leg skipped, excluded or marked `continue-on-error`.
+  - >
+    NF5 — the public break is deliberate and documented. Adding fields to `RunResult` breaks an
+    exhaustive struct pattern; that is the only intended break. The CHANGELOG carries the migration
+    note, the public-surface diff against the 0.11.0 tag is recorded in the evidence, and no other
+    public item is renamed or removed.
+  - >
+    NF6 — no regression. All 341 tests shipped at 0.11.0 pass unless one asserted a behaviour this
+    release deliberately changes, and each such test is named in the record with why its old
+    assertion was wrong. The likely casualties are tests asserting the memory note's rendered text,
+    which currently contains `run_id`, and any test asserting child-result order.
+  - >
+    NF7 — replay is not a second engine. The replaying provider is a `Provider` and nothing else; no
+    entry point, no loop and no store method branches on whether a run is a replay. If the loops have
+    to know, the design is wrong and is reconsidered rather than special-cased.
+  - >
+    NF8 — additive migration only. Any new table is `CREATE TABLE IF NOT EXISTS` in
+    `Store::from_conn`, `CHECKPOINT_FORMAT` stays 7, and no existing table is renamed or reshaped. A
+    0.11.0 store opens and a 0.11.0 checkpoint resumes, matching the precedent set twice in 0.10.0
+    (`src/state.rs:807-809`, `:826-828`).
+  operational:
+  - >
+    O1 — the observer's contract is documented: what order events arrive in, that they are emitted
+    in-process and synchronously with the run, that an event is not a transaction and a caller must
+    not assume one event equals one committed row, and that the durable trace remains the record of
+    what happened. A consumer needs to know which surface is authoritative.
+  - >
+    O2 — the determinism guarantee is documented precisely: what is compared, what is excluded and
+    why, and under what conditions two runs are expected to match — same recording, same workspace
+    isolation, memory state stated. An over-broad determinism claim is worse than a narrow one,
+    because it will be relied on.
+  - >
+    O3 — the outcome record's fields are documented with what each means and where it comes from,
+    including that spend is tokens and not currency, that duration is wall-clock including time the
+    process was down, and exactly what "steps" counts given that retry rows share a step number.
+  - >
+    O4 — `docs/CAPABILITIES.md` marks observability and evaluation shipped at 0.12.0 and marks
+    nothing else, and states that all twelve pillars now hold. If the fallback scope is taken, both
+    stay partial with the deferred release named. The file's existing "completed 0.12.0" wording for
+    observability is made accurate rather than aspirational.
+  - >
+    O5 — the README's corrected claims are accurate against the source, verified by re-running the
+    audit that found them rather than by inspection. Every claim about a tool, a capability, a
+    default or a public item is checked against the code it describes.
+  - >
+    O6 — the 0.11.0 O4 miss is recorded honestly: the request deadline was documented as overridable
+    and was not, the record for 0.11.0 is immutable and stays as sealed, and the correction is
+    attributed in this release's CHANGELOG entry rather than quietly fixed.
+  - >
+    O7 — the live-run evidence exists in the evidence directory: a run observed through the observer
+    with its event sequence captured, and a recorded case replayed twice with the comparison output.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io, plus the three-OS GitHub Actions matrix (ubuntu-latest, macos-latest, windows-latest)
+    with the msrv and lint jobs.
+  deployment_method: >
+    The initorigin release flow with the owner's 2026-07-26 override in effect: all work including
+    the sealed completion record on `feat/0.12.0`, PR to `develop`, release PR `develop` to `main`, a
+    GitHub Release titled `io-harness 0.12.0` with notes taken verbatim from the CHANGELOG, then
+    `cargo publish` last. The order is unchanged; the merges are performed without waiting for
+    manual review.
+  migrations:
+  - >
+    Additive only, in the shape the store already uses: the per-run outcome record's table and
+    whatever the recording needs, created idempotently in `Store::from_conn` with
+    `CHECKPOINT_FORMAT` left at 7, so a 0.11.0 store opens and a 0.11.0 checkpoint resumes. No
+    existing table is renamed or reshaped.
+  - >
+    `finish_run` gains a write. Rows already written by 0.11.0 keep their values and gain no record
+    retroactively; a run finished by an older binary simply has no outcome record, which the read
+    path must report as absent rather than as zeroes.
+  - >
+    `Store::open` begins setting `journal_mode=WAL`, which is a persistent property of the database
+    file. A store converted to WAL is not readable by a SQLite older than 3.7.0, and the conversion
+    is one-way in practice. Documented as a migration rather than as an implementation detail.
+  - >
+    `terminal_outcome` learns `"refused"`. An existing refused run becomes correctly terminal rather
+    than being rewritten; the change is in how the row is read.
+  - >
+    A caller upgrades by changing the version and, if they pattern-match `RunResult` exhaustively,
+    adding the new field, per the CHANGELOG migration note.
+  observability:
+  - >
+    This release is the observability work. The existing rusqlite trace and `tracing` events stay as
+    they are and remain the durable record; the observer is a second, live surface reporting the same
+    facts, and F1 asserts they agree.
+  - >
+    The three inconsistently-named step logs ("loop step", "workspace step", "agent step") converge
+    with the shared step boundary, so one step means one thing across all three loops.
+  - >
+    A per-run outcome record readable from the crate's own API, plus the previously unreadable
+    `agent_events` budget-draw audit becoming reachable, so a finished run can be inspected without
+    opening the SQLite file.
+  rollback: >
+    `cargo yank --vers 0.12.0`, leaving 0.11.0 as what `cargo install` and a fresh `cargo add`
+    resolve to. A consumer rolling back restores their old `RunResult` pattern and loses the
+    observer, replay and the outcome record; their store keeps the unused additive tables, which
+    0.11.0 ignores. The one asymmetry is WAL: a database converted by 0.12.0's `Store::open` stays
+    in WAL mode after the rollback, which 0.11.0 reads without complaint but does not itself set. As
+    with previous releases, roll back between runs rather than during one.
+dependencies:
+  products:
+  - >
+    io-cli and io-studio are both being rebuilt, and their development follows this release rather
+    than constraining it. The harness defines the observer surface, the event set and the outcome
+    record on its own contract; the applications are then built against them. Nothing in this
+    release is designed backwards from what either currently does, and neither is a blocker.
+  - >
+    io-eval does not exist yet — no `Cargo.toml`, no source, lifecycle `BRAINSTORMED`. So there is no
+    consumer to satisfy or break, and this release chooses the evaluation surface rather than
+    matching one. That is also why the additive-only schema discipline is kept: it costs nothing now
+    and keeps the choice open.
+  services:
+  - >
+    A provider API key for the live evidence only. The observer tests, the replay tests and the
+    record tests all run against fixtures and recordings; only the live-run confirmation needs a real
+    provider.
+  - >
+    GitHub Actions for the three-OS matrix. The determinism comparison is the leg most likely to
+    differ across platforms, since path rendering and line endings both reach the trace.
+  human_approvals:
+  - >
+    None. The owner's 2026-07-26 override authorizes the PRs, both merges, the GitHub Release and
+    `cargo publish` without a review stop, and engineering decisions inside the release are made and
+    recorded rather than referred.
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    The event set is the design risk, and it is wide. Fourteen kinds of thing get recorded from
+    roughly forty emission sites across `src/run.rs`, `src/verify.rs`, `src/net.rs`, `src/mcp.rs` and
+    `src/context.rs`. Settle the enum against the audited list of emission sites BEFORE threading an
+    observer anywhere, the way 0.11.0 settled the error kind and 0.9.0 settled the `Tool` trait.
+  - >
+    Unifying three duplicated step boundaries into one touches the hottest code in the crate and has
+    a genuinely awkward case in the sub-agent loop's deliberately uncommitted step. This is the
+    change most likely to break existing tests in ways that are correct.
+  - >
+    The determinism work is open-ended if allowed to be. The audit named the leaks that reach the
+    store; the discipline is to fix those, define the comparison, document the exclusions, and stop —
+    not to pursue bit-exactness through the sandbox and the clock.
+  - >
+    Defining "identical twice" is a judgement call like 0.10.0's compaction rules and 0.11.0's stall
+    signal. Too strict and it fails on a timestamp; too loose and it passes on a real divergence. The
+    negative controls in F9 are what keep it honest, which is why they are acceptance criteria rather
+    than nice-to-haves.
+  - >
+    Twelve small defects alongside three features is a long tail of unrelated diffs. Each is
+    individually cheap; together they are the kind of list that makes a release feel unfinished if
+    they are left to the end. They should land early and separately, since none depends on the
+    features.
+  preferred_tools:
+  - The `Fallback` combinator (`src/provider/fallback.rs`) as the template for both new providers,
+    and `Approver` (`src/approve.rs:95`) as the template for the observer trait.
+  - The scripted-mock pattern across `tests/`, and `tests/context.rs:34-72`, which already records
+    every request and is most of the recorder's shape.
+  - rustc/cargo, clippy, rustfmt, and the three-OS matrix via `gh run view`.
+  - >
+    The four audits taken for this contract, which enumerate every trace emission site, every
+    nondeterminism source and every schema column. They are the map; re-deriving them during
+    development is waste.
+  constraints:
+  - >
+    Additive schema only: `CREATE TABLE IF NOT EXISTS` in `Store::from_conn`, `CHECKPOINT_FORMAT`
+    stays 7, no existing table renamed or reshaped.
+  - >
+    Reuse the `context_events` pattern — a table, a `*Event` struct, a `record_*` writer, a
+    `*_events(run_id)` reader — rather than inventing new machinery.
+  - No new runtime dependency, and no `tokio` `sync` feature for the library.
+  - >
+    A run without an observer and without a recording must behave exactly as it does under 0.11.0.
+    This release adds visibility, and adding visibility must not change what a run does.
+  - >
+    The harness's surfaces are designed from what a run does, not from what any current application
+    does. Application development follows this release.
+  - >
+    Minor semantics on a 0.x crate: the `RunResult` break is permitted but must be documented with a
+    migration note, and it is the only public break this release takes. The crate stays pre-1.0 and
+    no 1.0.0 is planned or implied.
+  - >
+    Scope discipline against 0.15.0: correcting a false statement in the README is this release;
+    restructuring the README and writing guide pages is not.
+risks:
+- >
+  The event enum is shaped by what was easy to emit rather than by what a consumer needs to
+  branch on, and becomes a public enum that is wrong in a way only a real consumer discovers.
+  Mitigation: settle the enum and write its documentation (O1) FIRST against the audited list of
+  emission sites, and pin each variant's serialised shape in a test (F3) so the cost of getting it
+  wrong is visible immediately rather than after an application is built on it.
+- >
+  Replay looks like it works while being silently wrong, because the recorded responses match but
+  the prompt bytes or the child ordering differ. This is the release's worst failure mode: it would
+  invalidate every measurement built on top of it, quietly. Mitigation: F9's negative controls are
+  acceptance criteria — the comparison must be proven capable of failing on exactly these two
+  causes.
+- >
+  Unifying the three step boundaries breaks the sub-agent loop's deliberately uncommitted step and
+  reintroduces the double-execution bug 0.7.0 fixed. Mitigation: F4 asserts that case explicitly,
+  and the existing checkpoint and subagent test suites are run before and after the unification
+  rather than only at the end.
+- >
+  The determinism definition gets loosened whenever a test fails, until it excludes everything that
+  ever differed and asserts nothing. Mitigation: the exclusion set is documented (O2) with a reason
+  per exclusion, and any addition to it during development is recorded in the release record rather
+  than made silently.
+- >
+  Twelve small defects and three features in one release produces a diff nobody can review, and the
+  features get the attention while the defects ship half-done. Mitigation: the defects land first,
+  in their own commits, each with its own test; several are one-line changes with a regression test
+  and there is no reason to hold them behind the features.
+- >
+  `Store::open` setting WAL is a persistent, effectively one-way change to a user's database file
+  that a rollback does not undo. Mitigation: it is documented as a migration rather than an
+  implementation detail, and the rollback note states the asymmetry plainly.
+- >
+  Scope creep from "an observer" toward a metrics system, a tracing subscriber, an exporter or a
+  dashboard. Mitigation: the excluded list names the channel, the transport and the results schema,
+  and the trait is one method.
+- >
+  The README correction slides into the rewrite, because the file is genuinely badly structured and
+  the temptation to fix it while inside it is strong. Mitigation: the constraint names the boundary,
+  and the rewrite has a release number.
+open_questions:
+- >
+  What is the observer's exact signature — one method taking an event enum, or a method per event
+  kind with default implementations? One method is smaller and versions better as kinds are added; a
+  method per kind lets a consumer ignore what it does not care about without matching. Decided in
+  development against the settled event set, with the reasoning recorded.
+- >
+  What does an observer returning an error or panicking do to the run? Abort it, log and continue, or
+  be forbidden from failing at all by taking no `Result`. The last is the laziest and arguably the
+  most honest — an observer is a spectator — but it forces an implementer's own errors somewhere
+  else. Decided in development and documented either way (NF3).
+- >
+  Do recordings live in the store's own additive table, or in a portable file? The table reuses the
+  established pattern and needs no new format; a file is portable between machines and is what a
+  fixture usually is. The store is the current default on laziness grounds, and serde on the provider
+  types makes an export trivial later if a real need appears.
+- >
+  What exactly is the request key for replay? A hash of system, user and tools is the obvious
+  candidate, but the assembled prompt contains the workspace's own content, so a recording is
+  implicitly tied to a workspace state. Whether that is a feature or a trap is decided in
+  development.
+- >
+  Does the outcome record replace or supplement the eleven free-text outcome strings? A validated
+  enum written alongside the string is additive and safe; replacing the string is a reshape the
+  constraints forbid. Supplementing is the expected answer, and the redundancy is documented rather
+  than left to be discovered.
+- >
+  Is `max_total_cost` documented-as-reserved or removed? Removing a public field is a break this
+  release did not otherwise need; leaving it looking functional is what the audit objected to.
+  Documented-as-reserved is the current default, decided in development.
+- >
+  How much of the determinism guarantee can hold for a sub-agent tree, given that spawn-order
+  composition fixes the ordering of results but concurrent execution still interleaves writes to a
+  shared workspace? The honest answer may be that the guarantee is stated for single-agent runs and
+  stated more narrowly for trees. Decided in development, and stated narrowly rather than broadly.
