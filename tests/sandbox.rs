@@ -21,15 +21,55 @@ fn good() -> &'static str {
 
 #[tokio::test]
 async fn selection_picks_native_on_this_host_and_floor_when_forced() {
-    // On the macOS build host the default selection is the native backend...
+    // The default selection is the strongest backend this host can actually
+    // deliver — which is not the same as "the native one for this target". A
+    // backend whose primitive is unavailable must degrade *and say so*.
     let native = select(&SandboxConfig::new());
+
+    // macOS: `sandbox-exec` is part of the OS, so the native backend is always
+    // available and the floor is always wrong here.
     #[cfg(target_os = "macos")]
     assert_eq!(native.backend(), Backend::MacosSandboxExec);
-    assert_ne!(
-        native.backend(),
-        Backend::PortableFloor,
-        "default must be native, not the floor"
-    );
+
+    // Linux: namespaces when the kernel permits unprivileged user namespaces,
+    // the floor when it does not (Ubuntu 24.04 restricts them by default). Pin
+    // it against the same question the backend asks, so a wrong answer in
+    // either direction fails: promising namespaces it cannot create, or falling
+    // back on a host where the wrapper works fine.
+    #[cfg(target_os = "linux")]
+    {
+        let wrapper_works = std::process::Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--net",
+                "--",
+                "true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert_eq!(
+            native.backend(),
+            if wrapper_works {
+                Backend::LinuxNamespaces
+            } else {
+                Backend::PortableFloor
+            },
+            "must report the strongest backend the kernel actually allows"
+        );
+    }
+
+    // Windows: the Job Object is unimplemented, so the floor *is* the strongest
+    // available backend and naming `WindowsJobObject` would be a lie.
+    #[cfg(target_os = "windows")]
+    assert_eq!(native.backend(), Backend::PortableFloor);
 
     // ...and forcing the floor selects the portable backend, recorded so the
     // selection ladder is observable.
@@ -157,9 +197,16 @@ async fn sandbox_lifecycle_is_recorded_and_reconstructable() {
     assert!(kinds.contains(&"create"), "missing create: {kinds:?}");
     assert!(kinds.contains(&"exec"), "missing exec: {kinds:?}");
     assert!(kinds.contains(&"destroy"), "missing destroy: {kinds:?}");
-    // The exec event names the backend and the argv (command line only).
+    // The exec event names the backend and the argv (command line only). The
+    // backend recorded must be the one `select` reported — so a backend that
+    // quietly degrades is caught here as a trace mismatch rather than as a
+    // mystery in someone's CI log.
     let exec = events.iter().find(|e| e.kind == "exec").unwrap();
-    assert!(exec.backend.is_some());
+    assert_eq!(
+        exec.backend.as_deref(),
+        Some(select(&SandboxConfig::new()).backend().as_str()),
+        "the trace must name the backend that actually ran"
+    );
     assert!(exec.detail.as_deref().unwrap().contains("rustc"));
 }
 
