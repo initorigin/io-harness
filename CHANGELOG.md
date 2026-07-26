@@ -24,6 +24,34 @@ notes are produced from it.
 
 ### Fixed
 
+- **The Linux sandbox no longer fails every verification on a kernel that
+  restricts unprivileged user namespaces.** The `unshare` wrapper was never
+  probed and was selected unconditionally on Linux, so on hosts such as Ubuntu
+  24.04 (`kernel.apparmor_restrict_unprivileged_userns=1`) every sandboxed
+  `rustc` spawn failed and the caller was told its code had failed to compile.
+  The wrapper is now probed once per process; when it does not work the run
+  degrades to the portable floor and *reports* `Backend::PortableFloor`, which
+  the trace records, so a degraded run is auditable rather than silent.
+- **A sandbox wrapper failure is no longer reported as a failed verification.**
+  When the `unshare` wrapper itself fails, the command never ran, and that is now
+  `Error::Sandbox` instead of an indistinguishable "verification failed". A
+  failing command's own stderr is also no longer discarded — both the sandboxed
+  and the direct-host exec paths log it, so a diagnosis reads the compiler's
+  error instead of inferring it.
+- **The CPU cap now names itself on Linux.** Caps were applied with the soft and
+  hard `rlimit` equal; Linux tests the hard limit first and `SIGKILL`s there, so
+  `SIGXCPU` was never sent and a CPU-exhausted run was reported with no
+  `cap_hit`. The hard limit is now kept one above the soft one, clamped to what
+  `getrlimit` reports so it is never raised. A cap that cannot be applied now
+  fails the spawn instead of silently running the payload uncapped.
+- **The memory cap now measures the process tree, not just the process it
+  spawned.** A payload that forks — which is what Linux `/bin/sh` does — grew in
+  a child the monitor never watched, so the cap never fired and the run finished
+  cleanly. The monitor now sums RSS across the process and its descendants and
+  kills descendants first. It also no longer treats an unreadable process table
+  as "the process is gone", which previously switched the cap off for the rest of
+  the run after a single hiccup.
+
 ### Security
 
 ## [0.9.0] - 2026-07-26
