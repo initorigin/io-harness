@@ -597,6 +597,31 @@ impl ContextEvent {
             reported_tokens: None,
         }
     }
+
+    /// The agent recorded a durable note for later runs over this workspace.
+    pub fn memory_write(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_write", step, detail)
+    }
+
+    /// A note was dropped to hold the workspace's memory caps.
+    pub fn memory_evict(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_evict", step, detail)
+    }
+
+    /// Notes from earlier runs were carried into this turn's context.
+    pub fn memory_recall(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_recall", step, detail)
+    }
+
+    fn of(kind: &str, step: u32, detail: impl Into<String>) -> Self {
+        Self {
+            step,
+            kind: kind.into(),
+            detail: Some(detail.into()),
+            est_tokens: None,
+            reported_tokens: None,
+        }
+    }
 }
 
 impl Store {

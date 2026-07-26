@@ -229,6 +229,7 @@ mod verify;
 
 pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
+pub use context::ContextBudget;
 pub use contract::TaskContract;
 pub use error::{Error, Result};
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
@@ -247,8 +248,9 @@ pub use sandbox::{
 };
 pub use skills::{Skill, Skills};
 pub use state::{
-    CheckpointEvent, McpEvent, Pending, PolicyEvent, RunStatus, SandboxEvent, StepRecord, Store,
-    CHECKPOINT_FORMAT,
+    CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent, RunStatus,
+    SandboxEvent, StepRecord, Store, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
+    MEMORY_MAX_ENTRY_CHARS,
 };
 pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

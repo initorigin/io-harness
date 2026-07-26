@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use io_harness::context::{
-    assemble, entry_cap_chars, estimate_tokens, ContextBudget, Ledger, ObsKind, Observation,
+    assemble, entry_cap_chars, estimate_tokens, Assembly, ContextBudget, Ledger, ObsKind,
+    Observation,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
@@ -407,9 +408,20 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         .deny_read("notes.txt");
 
     let ws = Workspace::with_policy(dir.path(), policy.clone());
-    let out = assemble(&ledger, 24_000, Some(&ws), &policy, &store, 1, 3)
-        .await
-        .unwrap();
+    let out = assemble(
+        &ledger,
+        24_000,
+        &[],
+        Assembly {
+            ws: Some(&ws),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 3,
+        },
+    )
+    .await
+    .unwrap();
 
     assert!(
         out.text.contains("invalidated by the write at step 2"),
@@ -641,9 +653,20 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
     const TURNS: u32 = 50;
     let started = Instant::now();
     for step in 0..TURNS {
-        let out = assemble(&ledger, 24_000, Some(&workspace), &policy, &store, 1, step)
-            .await
-            .unwrap();
+        let out = assemble(
+            &ledger,
+            24_000,
+            &[],
+            Assembly {
+                ws: Some(&workspace),
+                policy: &policy,
+                store: &store,
+                run_id: 1,
+                step,
+            },
+        )
+        .await
+        .unwrap();
         assert!(out.carried > 0);
     }
     let per_turn = started.elapsed() / TURNS;
@@ -710,9 +733,20 @@ async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_colla
         "\n[read a.txt]\nSECOND\n",
     ));
 
-    let out = assemble(&ledger, 24_000, Some(&workspace), &policy, &store, 1, 5)
-        .await
-        .unwrap();
+    let out = assemble(
+        &ledger,
+        24_000,
+        &[],
+        Assembly {
+            ws: Some(&workspace),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 5,
+        },
+    )
+    .await
+    .unwrap();
 
     assert!(
         out.text.contains("LONDON-RAIN") && out.text.contains("CAIRO-SUN"),
@@ -763,9 +797,20 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
         "\n[wrote ../secret.txt] (3 chars)\n",
     ));
 
-    let out = assemble(&ledger, 24_000, Some(&workspace), &policy, &store, 1, 3)
-        .await
-        .unwrap();
+    let out = assemble(
+        &ledger,
+        24_000,
+        &[],
+        Assembly {
+            ws: Some(&workspace),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 3,
+        },
+    )
+    .await
+    .unwrap();
 
     assert!(
         !out.text.contains("TOP-SECRET"),

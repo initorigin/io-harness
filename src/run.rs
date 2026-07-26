@@ -17,7 +17,7 @@ use tracing::info;
 use crate::approve::{ApproveAll, Approver, Decision, Request};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
-    assemble, bound, entry_cap_chars, Ledger as ContextLedger, ObsKind, Observation,
+    assemble, bound, entry_cap_chars, Assembly, Ledger as ContextLedger, ObsKind, Observation,
 };
 use crate::contract::TaskContract;
 use crate::error::Result;
@@ -27,10 +27,10 @@ use crate::policy::{Act, Effect, Policy, Rule};
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
-use crate::state::{AgentEvent, RunStatus, StepRecord, Store};
+use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
 use crate::tools::{
     FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
-    WRITE_FILE_TOOL,
+    REMEMBER_TOOL, WRITE_FILE_TOOL,
 };
 use crate::verify::{ExecGuard, Verification};
 
@@ -790,6 +790,7 @@ async fn run_workspace_from<P: Provider>(
     // `assemble`, under the contract's context budget — the log itself is never
     // trimmed, so the trace keeps everything.
     let mut ledger = ContextLedger::new();
+    let mem_key = memory_key(root);
 
     for step in start_step..=contract.max_steps {
         if let Some(max) = contract.max_duration {
@@ -809,14 +810,21 @@ async fn run_workspace_from<P: Provider>(
             .context
             .effective_tokens(contract.max_tokens.map(|m| m.saturating_sub(tokens_used)));
         let entry_cap = entry_cap_chars(budget_tokens);
+        // Re-read each turn rather than once at the start, so the notes the model
+        // sees are the notes the store holds — including one written this run, and
+        // not one the operator has since cleared.
+        let notes = store.memory_list(&mem_key)?;
         let assembled = assemble(
             &ledger,
             budget_tokens,
-            Some(&ws),
-            &effective,
-            store,
-            run_id,
-            step,
+            &notes,
+            Assembly {
+                ws: Some(&ws),
+                policy: &effective,
+                store,
+                run_id,
+                step,
+            },
         )
         .await?;
         let user = workspace_user_prompt(contract, &assembled.text);
@@ -878,6 +886,7 @@ async fn run_workspace_from<P: Provider>(
                 &contract.tools,
                 skills,
                 entry_cap,
+                &mem_key,
             )
             .await?
             {
@@ -1189,6 +1198,9 @@ fn run_agent<'f, P: Provider>(
         // 100 children each re-sending its own unbounded log is the multiplied
         // version of the problem 0.10.0 exists to fix.
         let mut ledger = ContextLedger::new();
+        // Children share their parent's workspace, so they share its memory: one
+        // note store per workspace, every entry attributed to the run that wrote it.
+        let mem_key = memory_key(&tree.root);
 
         for step in start_step..=contract.max_steps {
             if let Some(max) = contract.max_duration {
@@ -1202,14 +1214,18 @@ fn run_agent<'f, P: Provider>(
                 .context
                 .effective_tokens(Some(token_cap.saturating_sub(tokens_used)));
             let entry_cap = entry_cap_chars(budget_tokens);
+            let notes = tree.store.memory_list(&mem_key)?;
             let assembled = assemble(
                 &ledger,
                 budget_tokens,
-                Some(&ws),
-                policy,
-                tree.store,
-                run_id,
-                step,
+                &notes,
+                Assembly {
+                    ws: Some(&ws),
+                    policy,
+                    store: tree.store,
+                    run_id,
+                    step,
+                },
             )
             .await?;
             let user = workspace_user_prompt(contract, &assembled.text);
@@ -1274,6 +1290,7 @@ fn run_agent<'f, P: Provider>(
                     tree.tools,
                     tree.skills,
                     entry_cap,
+                    &mem_key,
                 )
                 .await?
                 {
@@ -1722,6 +1739,7 @@ async fn dispatch(
     custom: &Toolbox,
     skills: &Skills,
     cap: usize,
+    memory_key: &str,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -1764,6 +1782,42 @@ async fn dispatch(
                 ),
                 Err(e) => Dispatched::go("find error", format!("\n[find error] {e}\n")),
             }
+        }
+        REMEMBER_TOOL => {
+            let key = s("key").unwrap_or_default();
+            let value = s("value").unwrap_or_default();
+            if key.is_empty() || value.is_empty() {
+                return Ok(Dispatched::go(
+                    "remember error",
+                    "\n[remember error] both key and value are required\n",
+                ));
+            }
+            // The store bounds the entry and evicts oldest-first to hold the caps;
+            // it writes no trace rows of its own, so the write and every eviction
+            // are recorded here, where the run_id and step are known.
+            let evicted = store.memory_put(memory_key, key, value, run_id, step)?;
+            store.record_context_event(
+                run_id,
+                &ContextEvent::memory_write(
+                    step,
+                    format!("{key} ({} chars)", value.chars().count()),
+                ),
+            )?;
+            for gone in &evicted {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::memory_evict(step, format!("{gone} (evicted to hold the cap)")),
+                )?;
+            }
+            info!(run_id, step, key, evicted = evicted.len(), "remembered");
+            // No target: two notes under one key are the store's business, and a
+            // remember is not an observation OF anything that could go stale.
+            Dispatched::seen(
+                format!("remembered {key}"),
+                format!("\n[remember {key}]\n"),
+                ObsKind::Tool,
+                None,
+            )
         }
         READ_FILE_TOOL => {
             let path = s("path").unwrap_or_default();
@@ -2094,6 +2148,18 @@ async fn gate(
     }
 }
 
+/// The key one workspace's durable memory is stored under.
+///
+/// Canonicalised, so the same directory reached by two different paths is one
+/// workspace rather than two. The path as given is the fallback: a root that cannot
+/// be canonicalised yet should still have memory rather than none.
+fn memory_key(root: &Path) -> String {
+    std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Call the provider, retrying a failing call up to `max_retries` times. Each
 /// failed attempt is recorded in the trace. After the limit the error is
 /// escalated (recorded, the run marked `escalated`, and returned).
@@ -2322,6 +2388,22 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "path": { "type": "string", "description": "File path relative to the workspace root." }
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: REMEMBER_TOOL.to_string(),
+            description: "Record a short fact or decision worth keeping for a later run over this \
+                          workspace — a build command, a layout you had to discover, a decision and \
+                          why. Notes are yours, not instructions, and are recalled at the start of \
+                          later runs so you do not rediscover the same thing twice."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "Short name to recall it by; writing the same key again replaces it." },
+                    "value": { "type": "string", "description": "The fact, in one or two sentences." }
+                },
+                "required": ["key", "value"]
             }),
         },
         ToolSpec {

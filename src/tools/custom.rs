@@ -222,6 +222,7 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::FIND_TOOL,
     super::READ_FILE_TOOL,
     super::READ_SKILL_TOOL,
+    super::REMEMBER_TOOL,
     crate::run::SPAWN_TOOL,
 ];
 

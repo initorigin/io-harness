@@ -27,6 +27,13 @@ pub const GREP_TOOL: &str = "grep";
 pub const FIND_TOOL: &str = "find";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
+/// The name the model uses to record a fact for later runs over this workspace.
+///
+/// Deliberately narrow: it writes one keyed note into the harness's own store, not
+/// into the workspace, so it is not a path act. What it writes is bounded, attributed
+/// to the run and step that wrote it, and readable and clearable by the embedding
+/// program through [`Store`](crate::state::Store).
+pub const REMEMBER_TOOL: &str = "remember";
 /// Keep a tool result within `cap` chars, reporting whether it was cut.
 ///
 /// A tool that returns a megabyte would otherwise spend the rest of the run's

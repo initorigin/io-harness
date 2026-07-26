@@ -153,3 +153,244 @@ fn an_oversized_value_is_remembered_truncated_rather_than_refused() {
         .chars()
         .all(|c| c == '日'));
 }
+
+// ------------------------------------------------ end to end, through a real run
+
+mod live {
+    use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
+    use io_harness::{
+        run_with, ApproveAll, ContextBudget, Policy, Provider, Store, TaskContract, Verification,
+    };
+    use serde_json::json;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Plays a script of tool calls and keeps every request it was sent.
+    struct Script {
+        steps: Vec<Vec<ToolCall>>,
+        at: AtomicUsize,
+        seen: Arc<Mutex<Vec<CompletionRequest>>>,
+    }
+
+    impl Script {
+        fn new(steps: Vec<Vec<ToolCall>>) -> Self {
+            Self {
+                steps,
+                at: AtomicUsize::new(0),
+                seen: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn prompts(&self) -> Vec<String> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.user.clone())
+                .collect()
+        }
+    }
+
+    impl Provider for Script {
+        async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push(req);
+            Ok(CompletionResponse {
+                tool_calls: self.steps.get(i).cloned().unwrap_or_default(),
+                ..Default::default()
+            })
+        }
+    }
+
+    fn never_passes(root: &Path, steps: u32) -> TaskContract {
+        TaskContract::workspace(
+            "exercise durable memory",
+            root,
+            Verification::WorkspaceFileContains {
+                file: "unreachable.txt".into(),
+                needle: "never".into(),
+            },
+        )
+        .with_max_steps(steps)
+        .with_context_budget(ContextBudget::default())
+    }
+
+    fn remember(key: &str, value: &str) -> Vec<ToolCall> {
+        vec![ToolCall {
+            name: "remember".into(),
+            arguments: json!({ "key": key, "value": value }),
+        }]
+    }
+
+    /// F6 — the point of the pillar: a second run over one workspace starts
+    /// knowing what the first established, without re-running the work.
+    #[tokio::test]
+    async fn a_second_run_over_the_workspace_recalls_what_the_first_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("runs.db")).unwrap();
+        let policy = Policy::default()
+            .layer("t")
+            .allow_read("*")
+            .allow_write("*");
+
+        let first = Script::new(vec![remember(
+            "build-command",
+            "cargo test --workspace, not cargo build",
+        )]);
+        let contract = never_passes(dir.path(), 1);
+        let a = run_with(&contract, &first, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+
+        // The first run's own prompts never carried the note: it had none to carry.
+        assert!(
+            !first.prompts()[0].contains("[memory]"),
+            "an empty memory must render no block at all"
+        );
+
+        let second = Script::new(vec![vec![], vec![]]);
+        let b = run_with(&contract, &second, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+        assert_ne!(a.run_id, b.run_id, "these must be two different runs");
+
+        let first_prompt = &second.prompts()[0];
+        assert!(
+            first_prompt.contains("[memory]") && first_prompt.contains("cargo test --workspace"),
+            "the second run must open already knowing it, got:\n{first_prompt}"
+        );
+        assert!(
+            first_prompt.contains("not instructions"),
+            "the block must say what it is, got:\n{first_prompt}"
+        );
+        assert!(
+            first_prompt.contains(&format!("run {}", a.run_id)),
+            "a note must name the run that wrote it, got:\n{first_prompt}"
+        );
+
+        // And the second run did not re-execute the call that established it.
+        let calls: Vec<String> = store
+            .steps(b.run_id)
+            .unwrap()
+            .iter()
+            .map(|s| s.tool_call.clone())
+            .collect();
+        assert!(
+            calls.iter().all(|c| !c.contains("remember")),
+            "the second run re-did the work it should have recalled: {calls:?}"
+        );
+
+        // The write and the recall are both in the trace.
+        let kinds: Vec<String> = store
+            .context_events(a.run_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(kinds.contains(&"memory_write".to_string()), "got {kinds:?}");
+        let kinds: Vec<String> = store
+            .context_events(b.run_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.kind)
+            .collect();
+        assert!(
+            kinds.contains(&"memory_recall".to_string()),
+            "got {kinds:?}"
+        );
+    }
+
+    /// F7 — what the operator deletes stays deleted, including for later runs.
+    #[tokio::test]
+    async fn a_deleted_note_does_not_come_back_in_a_later_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("runs.db")).unwrap();
+        let policy = Policy::default().layer("t").allow_read("*");
+        let contract = never_passes(dir.path(), 1);
+
+        let first = Script::new(vec![remember("stale", "SHOULD-NOT-SURVIVE")]);
+        run_with(&contract, &first, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+
+        let key = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(store.memory_delete(&key, "stale").unwrap());
+
+        let second = Script::new(vec![vec![]]);
+        run_with(&contract, &second, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+        assert!(
+            !second.prompts()[0].contains("SHOULD-NOT-SURVIVE"),
+            "a deleted note must not be recalled, got:\n{}",
+            second.prompts()[0]
+        );
+    }
+
+    /// Two workspaces share a store and must not share memory.
+    #[tokio::test]
+    async fn two_workspaces_do_not_share_memory_through_one_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("runs.db")).unwrap();
+        let policy = Policy::default().layer("t").allow_read("*");
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+
+        let first = Script::new(vec![remember("secret", "ONLY-IN-A")]);
+        run_with(&never_passes(&a, 1), &first, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+
+        let second = Script::new(vec![vec![]]);
+        run_with(&never_passes(&b, 1), &second, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+        assert!(
+            !second.prompts()[0].contains("ONLY-IN-A"),
+            "workspace b must not see a's notes, got:\n{}",
+            second.prompts()[0]
+        );
+    }
+
+    /// The block is capped like everything else, and says how much it dropped.
+    #[tokio::test]
+    async fn an_over_long_memory_block_is_cut_with_a_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("runs.db")).unwrap();
+        let policy = Policy::default().layer("t").allow_read("*");
+        let key = std::fs::canonicalize(dir.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for i in 0..40 {
+            store
+                .memory_put(&key, &format!("k{i}"), &"n".repeat(300), 1, 1)
+                .unwrap();
+        }
+
+        // A small ceiling, so a quarter of it cannot hold forty notes.
+        let contract = never_passes(dir.path(), 1).with_context_budget(ContextBudget {
+            max_tokens: 1_000,
+            share: 0.5,
+        });
+        let script = Script::new(vec![vec![]]);
+        run_with(&contract, &script, &store, &policy, &ApproveAll)
+            .await
+            .unwrap();
+
+        let prompt = &script.prompts()[0];
+        assert!(
+            prompt.contains("older note(s) elided to fit"),
+            "the cut must be visible, got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("k39"),
+            "the newest notes are the ones kept, got:\n{prompt}"
+        );
+    }
+}
