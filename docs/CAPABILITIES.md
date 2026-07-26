@@ -28,7 +28,7 @@ not when a release merely touched it.
 | **Stop conditions and budgets** — cap steps, time, tokens, retries | shipped | 0.2.0, tree-wide 0.5.0 |
 | **Permissions and guardrails** — what the agent may read, write, exec, dial | shipped | 0.4.0, network 0.8.0 |
 | **Human approval layer** — review before sensitive or irreversible actions | shipped | 0.4.0, durable 0.7.0 |
-| **Tool layer** — narrow, typed actions the agent invokes | partial — built-ins + MCP; in-process typed tools and skills pending | 0.3.0, 0.8.0, completed 0.9.0 |
+| **Tool layer** — narrow, typed actions the agent invokes | shipped | 0.3.0, 0.8.0, completed 0.9.0 |
 | **Context construction** — feed the model only relevant, current, trusted info | pending — observations accumulate unbounded and are re-sent whole | 0.10.0 |
 | **State and memory** — progress and decisions within a run; durable recall across runs | partial — the rusqlite trace is durable; cross-run memory pending | 0.2.0, completed 0.10.0 |
 | **Recovery and retry** — retries, fallbacks, replanning, escalation | partial — provider retry and escalation only | 0.2.0, completed 0.11.0 |
@@ -41,13 +41,13 @@ not when a release merely touched it.
 - **Agent composition** — spawn and nest many agents with shared context and one budget · 0.5.0
 - **Ephemeral code-exec sandboxes** — OS-native per platform over a portable floor · 0.6.0
 - **Long-running autonomous tasks** — 24h+ unattended, crash-resumable · 0.7.0
-- **Extensibility** — MCP client, stdio and streamable HTTP · 0.8.0
+- **Extensibility** — MCP client, stdio and streamable HTTP · 0.8.0; in-process `Tool` implementations and markdown skills · 0.9.0
 - **Built-in tools** — filesystem, grep, find over a policy-scoped workspace · 0.1.0, 0.3.0
 - **Office and document tools** — Word/Excel/PowerPoint/PDF create and edit, PDF watermark, PDF form fill, OCR, barcode/QR · planned 0.13.0
 - **Media and git** — image and video passthrough where the model accepts it; real repository work · planned 0.14.0
 
 ## Status
 
-Released through 0.8.1, live on crates.io. Seven of the twelve pillars are shipped;
-0.9.0 through 0.12.0 close the remaining five. Ordering rationale is recorded in
+Released through 0.9.0, live on crates.io. Eight of the twelve pillars are shipped;
+0.10.0 through 0.12.0 close the remaining four. Ordering rationale is recorded in
 `.ultraship/iterations/US-IO-HARNESS-0.9.0-I01.yaml`; the roadmap is canonical.
