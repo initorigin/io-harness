@@ -22,10 +22,12 @@ use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
+use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{AgentEvent, RunStatus, StepRecord, Store};
 use crate::tools::{
-    FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL,
+    FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
+    WRITE_FILE_TOOL,
 };
 use crate::verify::{ExecGuard, Verification};
 
@@ -133,7 +135,7 @@ pub async fn run_with<P: Provider>(
     // Same reason, same point: a skills directory that cannot be read is a
     // configuration mistake, and the caller hears the path before a run row
     // exists rather than getting a silently empty catalogue mid-run.
-    contract.discover_skills()?;
+    let skills = contract.discover_skills()?;
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
     store.set_provider(run_id, provider.name())?;
@@ -158,7 +160,7 @@ pub async fn run_with<P: Provider>(
         Some(root) => {
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, 1, policy, approver, &mcp,
+                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &skills,
             )
             .await;
             mcp.shutdown(store, run_id).await;
@@ -188,7 +190,7 @@ pub async fn resume<P: Provider>(
     run_id: i64,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
-    contract.discover_skills()?;
+    let skills = contract.discover_skills()?;
     // Refuse a store from a newer checkpoint format or a missing run with a
     // typed error, rather than misreading it or panicking.
     store.check_resumable(run_id)?;
@@ -219,6 +221,7 @@ pub async fn resume<P: Provider>(
                 &policy,
                 &ApproveAll,
                 &mcp,
+                &skills,
             )
             .await;
             mcp.shutdown(store, run_id).await;
@@ -248,7 +251,7 @@ pub async fn resume_with_decision<P: Provider>(
     approver: &dyn Approver,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
-    contract.discover_skills()?;
+    let skills = contract.discover_skills()?;
     let pending = store
         .pending(request_id)?
         .ok_or_else(|| crate::error::Error::Config(format!("no pending request {request_id}")))?;
@@ -322,6 +325,7 @@ pub async fn resume_with_decision<P: Provider>(
                 &effective,
                 approver,
                 &mcp,
+                &skills,
             )
             .await;
             mcp.shutdown(store, run_id).await;
@@ -392,6 +396,7 @@ pub async fn resume_with_decision<P: Provider>(
                 &effective,
                 approver,
                 &mcp,
+                &skills,
             )
             .await;
             mcp.shutdown(store, run_id).await;
@@ -424,7 +429,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
 ) -> Result<RunResult> {
     store.check_resumable(run_id)?;
     contract.tools.validate()?;
-    contract.discover_skills()?;
+    let skills = contract.discover_skills()?;
     let pending = store
         .pending(request_id)?
         .ok_or_else(|| crate::error::Error::Config(format!("no pending request {request_id}")))?;
@@ -493,6 +498,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
             let tree = Tree {
                 mcp: &mcp,
                 tools: &contract.tools,
+                skills: &skills,
                 provider,
                 store,
                 approver,
@@ -566,6 +572,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
             let tree = Tree {
                 mcp: &mcp,
                 tools: &contract.tools,
+                skills: &skills,
                 provider,
                 store,
                 approver,
@@ -744,6 +751,7 @@ async fn run_workspace_from<P: Provider>(
     policy: &Policy,
     approver: &dyn Approver,
     mcp: &McpSession,
+    skills: &Skills,
 ) -> Result<RunResult> {
     // The effective policy grows as approvers remember rules; it is rebuilt as a
     // merge so a remembered allow can still never defeat a deny beneath it.
@@ -757,7 +765,8 @@ async fn run_workspace_from<P: Provider>(
     // between grep and find.
     let mut extra = contract.tools.specs();
     extra.extend(mcp.tool_specs());
-    let system = with_extra_tools(workspace_system_prompt(), &extra);
+    extra.extend(skill_tool(skills));
+    let system = with_skill_catalog(with_extra_tools(workspace_system_prompt(), &extra), skills);
     let mut tools = workspace_tools();
     tools.extend(extra);
     // Durable budget: restored from the store so a resume continues the same
@@ -819,6 +828,7 @@ async fn run_workspace_from<P: Provider>(
                 step,
                 mcp,
                 &contract.tools,
+                skills,
             )
             .await?
             {
@@ -924,6 +934,10 @@ struct Tree<'a, P: Provider> {
     /// than read from each agent's contract so a spawned child — whose contract
     /// the *model* writes — cannot register a tool its parent never had.
     tools: &'a Toolbox,
+    /// The catalogue discovered from the ROOT contract, shared by the whole tree
+    /// for the same reason `tools` is: a child contract the *model* wrote must
+    /// not be able to conjure skills its parent was never offered.
+    skills: &'a Skills,
     provider: &'a P,
     store: &'a Store,
     approver: &'a dyn Approver,
@@ -951,7 +965,7 @@ pub async fn run_tree<P: Provider>(
     containment: &Containment,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
-    contract.discover_skills()?;
+    let skills = contract.discover_skills()?;
     let root = contract.root.clone().ok_or_else(|| {
         crate::error::Error::Config(
             "run_tree needs a workspace contract — build it with TaskContract::workspace".into(),
@@ -979,6 +993,7 @@ pub async fn run_tree<P: Provider>(
     let tree = Tree {
         mcp: &mcp,
         tools: &contract.tools,
+        skills: &skills,
         provider,
         store,
         approver,
@@ -1012,7 +1027,7 @@ pub async fn resume_tree<P: Provider>(
     containment: &Containment,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
-    contract.discover_skills()?;
+    let skills = contract.discover_skills()?;
     store.check_resumable(run_id)?;
 
     // A finished tree is returned as-is — resume is idempotent for the whole tree.
@@ -1056,6 +1071,7 @@ pub async fn resume_tree<P: Provider>(
     let tree = Tree {
         mcp: &mcp,
         tools: &contract.tools,
+        skills: &skills,
         provider,
         store,
         approver,
@@ -1093,7 +1109,9 @@ fn run_agent<'f, P: Provider>(
         // call something the run had already paid to set up.
         let mut extra = tree.tools.specs();
         extra.extend(tree.mcp.tool_specs());
-        let system = with_extra_tools(tree_system_prompt(), &extra);
+        extra.extend(skill_tool(tree.skills));
+        let system =
+            with_skill_catalog(with_extra_tools(tree_system_prompt(), &extra), tree.skills);
         let mut tools = tree_tools();
         tools.extend(extra);
         // The budget this agent runs under is the smaller of what its contract
@@ -1158,6 +1176,7 @@ fn run_agent<'f, P: Provider>(
                     step,
                     tree.mcp,
                     tree.tools,
+                    tree.skills,
                 )
                 .await?
                 {
@@ -1574,6 +1593,7 @@ async fn dispatch(
     step: u32,
     mcp: &McpSession,
     custom: &Toolbox,
+    skills: &Skills,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -1660,6 +1680,52 @@ async fn dispatch(
                         Err(e) => Dispatched::go("write error", format!("\n[write error] {e}\n")),
                     }
                 }
+            }
+        }
+        // Loading one skill's body. Offered only when skills are configured, so
+        // the name is not special otherwise: a run without skills falls through
+        // to the unknown-tool arm like any other name.
+        //
+        // The body is read through the policy at the moment it is asked for,
+        // against the skill file's ABSOLUTE path — a skills directory usually
+        // sits outside the workspace root, so this is a policy check, not a
+        // workspace-relative one (see `gate`).
+        READ_SKILL_TOOL if !skills.is_empty() => {
+            let name = s("name").unwrap_or_default();
+            let Some(skill) = skills.get(name) else {
+                // Not an error and not a failed run: the model asked for
+                // something that does not exist, so it is told what does.
+                return Ok(Dispatched::go(
+                    format!("unknown skill {name}"),
+                    format!(
+                        "\n[read_skill] there is no skill named {name:?}. Available: {}\n",
+                        skills.names().join(", ")
+                    ),
+                ));
+            };
+            let path = skill.path.display().to_string();
+            match gate(ws, approver, store, run_id, step, Act::Read, &path, None).await? {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => match std::fs::read_to_string(&target) {
+                    Ok(body) => {
+                        // Capped where it enters the context, like every other
+                        // tool result: the observation log is re-sent whole.
+                        let (body, truncated) = crate::tools::cap_result(body);
+                        info!(run_id, step, skill = name, truncated, "skill read");
+                        Dispatched::Continue {
+                            decision: format!("read skill {name}"),
+                            obs: format!("\n[skill {name}]\n{body}\n"),
+                            remember,
+                        }
+                    }
+                    Err(e) => Dispatched::go(
+                        format!("skill {name} read error"),
+                        format!("\n[skill {name} error] {e}\n"),
+                    ),
+                },
             }
         }
         // A tool the embedding program registered. Registration made it
@@ -1771,8 +1837,18 @@ async fn gate(
     // binary, an MCP tool, a registered tool, a host — and must not be resolved
     // against the root, or a file that happens to share a tool's name would
     // change what the policy said about calling it.
+    //
+    // An ABSOLUTE read/write target is not a workspace path at all — a skill
+    // file normally lives outside the root — so it is decided by the policy
+    // directly. `check_path` would resolve it against the root and deny it
+    // unconditionally, which would make `read_skill` refusable only by accident.
+    // This relaxes what the *gate* says, not what the workspace does:
+    // `Workspace::resolve` rejects absolute paths outright and both `read_file`
+    // and `write_file` go through it, so an absolute path still cannot leave the
+    // root (asserted in tests/skills.rs).
     let check = |act: Act, target: &str| match act {
         Act::Exec | Act::Net => ws.policy().check(act, target),
+        Act::Read | Act::Write if Path::new(target).is_absolute() => ws.policy().check(act, target),
         Act::Read | Act::Write => ws.check_path(act, target),
     };
     let verdict = check(act, target);
@@ -1966,6 +2042,45 @@ fn with_extra_tools(base: String, extra: &[ToolSpec]) -> String {
          Each tool's result appears in the observations below; once a tool has \
          returned what you asked for, move on rather than calling it again.",
         names.join(", ")
+    )
+}
+
+/// [`READ_SKILL_TOOL`], offered only when the contract configures skills — a
+/// tool that could do nothing but fail would cost a slot in every request of
+/// every other run. Same rule MCP tools get: they appear when servers do.
+fn skill_tool(skills: &Skills) -> Option<ToolSpec> {
+    if skills.is_empty() {
+        return None;
+    }
+    Some(ToolSpec {
+        name: READ_SKILL_TOOL.to_string(),
+        description: "Load one skill's full instructions into your observations, by the name it \
+                      is listed under. Read a skill when its description says it covers what you \
+                      are about to do."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "The skill's name, as listed in the system prompt." }
+            },
+            "required": ["name"]
+        }),
+    })
+}
+
+/// Name the available skills in the system prompt: one line each, name and
+/// description. A body is never here — that is what [`READ_SKILL_TOOL`] loads,
+/// once, on demand, so a caller with twenty skills does not pay for twenty
+/// bodies on every turn.
+fn with_skill_catalog(base: String, skills: &Skills) -> String {
+    if skills.is_empty() {
+        return base;
+    }
+    format!(
+        "{base}\n\nSkills available to you — instructions written for this repository. Only each \
+         skill's name and description is shown; call `{READ_SKILL_TOOL}` with a name to read that \
+         skill's full text when its description matches what you are doing.\n{}",
+        skills.catalog()
     )
 }
 
