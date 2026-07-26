@@ -149,7 +149,7 @@ versions:
       and the escalation path distinguishes a retryable transport failure from a terminal one so a
       caller learns which happened. Every fallback, stall, and replan is in the trace.
     detail: specified
-    status: planned
+    status: released
   - version: 0.12.0
     outcome: >
       A developer watching a run sees it as it happens, and a developer measuring the harness can.
