@@ -24,6 +24,22 @@ notes are produced from it.
 
 ### Fixed
 
+- **A path deny rule no longer fails open on Windows.** `Act::Read` and
+  `Act::Write` patterns were matched against targets literally, so a rule and a
+  target that named the same file with different separators did not match — and
+  a rule built from a `Path`, as `std::fs::canonicalize` returns one
+  (`\\?\C:\...`, backslashes), never matched the target it was written to cover.
+  The deny simply did not fire and the access was **allowed**. Any consumer
+  writing `deny_read("C:/secrets/*")`, or deriving a pattern from a path, had no
+  protection there. Latent since 0.4.0 and unseen because the suite had never
+  run on Windows. Both the pattern and the target now go through one
+  normalisation — verbatim `\\?\` and `\\?\UNC\` prefixes stripped, `\` folded
+  to `/` — so the two sides agree on what "the same path" is. Scoped to path
+  acts: `Act::Exec` targets a binary name and `Act::Net` a host, where `\` is
+  not a separator, and both keep matching literally. Scoped to Windows: on unix
+  `\` is a legal filename character, and folding it would merge two distinct
+  paths — the same fail-open bug reversed — so unix matching is now literal
+  there too, where the target (but not the pattern) had previously been folded.
 - **The Linux sandbox no longer fails every verification on a kernel that
   restricts unprivileged user namespaces.** The `unshare` wrapper was never
   probed and was selected unconditionally on Linux, so on hosts such as Ubuntu
