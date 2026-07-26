@@ -17,8 +17,8 @@ use io_harness::approve::{Approver, Decision, DecisionFuture, Request};
 use io_harness::policy::{Act, Effect, Policy};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    resume_with_decision, run_with, ApproveAll, DenyAll, Error, Provider, RunOutcome, Store,
-    TaskContract, Verification,
+    resume, resume_with_decision, run_with, ApproveAll, DenyAll, Error, Provider, RunOutcome,
+    Store, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -298,6 +298,87 @@ async fn an_ask_denied_at_the_gate_never_dials() {
 
     assert!(matches!(&err, Error::Refused { act, .. } if act == "net"));
     assert_eq!(sink.connections(), 0);
+}
+
+/// An approver that answers `Deny` and counts how many times it was asked.
+///
+/// Counting the asks is the whole assertion below: "the human is not asked again"
+/// cannot be observed from the outcome alone.
+#[derive(Default)]
+struct CountingDeny {
+    asked: Arc<AtomicUsize>,
+}
+
+impl Approver for CountingDeny {
+    fn decide<'a>(&'a self, _request: &'a Request) -> DecisionFuture<'a> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Decision::deny("no egress from this machine") })
+    }
+}
+
+/// F14 — a refused run is terminal on resume, and the human is not asked twice.
+///
+/// A regression that fails against 0.11.0. `authorize_provider` writes
+/// `finish_run(run_id, "refused")` and returns the `Err` itself, so the caller
+/// never sees a `RunResult` — the outcome is only reachable by resuming. But
+/// `"refused"` had no `RunOutcome` variant and no `terminal_outcome` mapping, so
+/// the resume fell straight back into the loop and put the same question to the
+/// human a second time. A human's no is as final as a policy's.
+///
+/// This is the same defect 0.11.0 fixed for `"escalated"`, found by the same kind
+/// of audit against the shipped source.
+#[tokio::test]
+async fn resuming_a_refused_run_reports_the_refusal_instead_of_asking_again() {
+    let sink = Sink::start();
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = Dialer::new(sink.url());
+    let policy = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*")
+        .ask_net("127.0.0.1");
+    let approver = CountingDeny::default();
+    let asked = approver.asked.clone();
+
+    let err = run_with(&contract(dir.path()), &provider, &store, &policy, &approver)
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Refused { act, .. } if act == "net"));
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "asked once on the first run"
+    );
+
+    let run_id = store
+        .last_run()
+        .unwrap()
+        .expect("the refused run was recorded");
+    assert_eq!(
+        store.outcome(run_id).unwrap().as_deref(),
+        Some("refused"),
+        "the store has recorded a refusal since 0.8.0 — only reading it is new"
+    );
+
+    let resumed = resume(&contract(dir.path()), &provider, &store, run_id)
+        .await
+        .expect("resuming a refused run must report, not re-drive");
+
+    assert!(
+        matches!(resumed.outcome, RunOutcome::Refused { .. }),
+        "{resumed:?}"
+    );
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the human was asked once, not once per resume"
+    );
+    assert_eq!(
+        sink.connections(),
+        0,
+        "and no socket was opened on either attempt"
+    );
 }
 
 /// F6 — a deferred network decision is persisted and delivered later, against a

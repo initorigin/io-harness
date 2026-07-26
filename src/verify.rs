@@ -30,9 +30,11 @@ use std::process::Stdio;
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
+use crate::observe::{EventKind, RunEvent};
 use crate::policy::{Act, Effect, Policy};
+use crate::run::{refused, Watch};
 use crate::sandbox::{self, RunSpec, Sandbox, SandboxConfig};
-use crate::state::{PolicyEvent, Store};
+use crate::state::{PolicyEvent, SandboxEvent, Store};
 
 /// How the harness decides a task is done.
 ///
@@ -142,6 +144,11 @@ pub enum Verification {
 pub struct ExecGuard<'a> {
     policy: &'a Policy,
     trace: Option<(&'a Store, i64, u32)>,
+    /// Where to announce what the trace records, and the depth to announce it
+    /// at. Separate from `trace` because a caller may attach a store without an
+    /// observer; every event below is written inside the `trace` block anyway,
+    /// so an event never reports something no row does.
+    watch: Option<(&'a Watch<'a>, u32)>,
     /// How to sandbox the spawn. `Some` (the default) runs the compile inside an
     /// ephemeral sandbox — the 0.6.0 default; `None` opts back to direct host
     /// execution, the exact 0.5.0 behaviour.
@@ -154,6 +161,7 @@ impl<'a> ExecGuard<'a> {
         Self {
             policy,
             trace: None,
+            watch: None,
             sandbox: Some(SandboxConfig::default()),
         }
     }
@@ -162,6 +170,14 @@ impl<'a> ExecGuard<'a> {
     /// argument-level enforcement can be added later against a real baseline.
     pub fn tracing(mut self, store: &'a Store, run_id: i64, step: u32) -> Self {
         self.trace = Some((store, run_id, step));
+        self
+    }
+
+    /// Also announce what it records to `watch`, at `depth` in the agent tree.
+    /// Crate-internal: an observer reaches the gate through the run, not through
+    /// a guard an embedder built by hand.
+    pub(crate) fn watching(mut self, watch: &'a Watch<'a>, depth: u32) -> Self {
+        self.watch = Some((watch, depth));
         self
     }
 
@@ -186,6 +202,7 @@ impl<'a> ExecGuard<'a> {
         ExecGuard {
             policy: PERMISSIVE.get_or_init(Policy::permissive),
             trace: None,
+            watch: None,
             sandbox: Some(SandboxConfig::default()),
         }
     }
@@ -203,6 +220,11 @@ impl<'a> ExecGuard<'a> {
             ev.rule = verdict.rule.clone();
             ev.layer = verdict.layer.clone();
             let _ = store.record_event(run_id, &ev);
+            if verdict.effect != Effect::Allow {
+                if let Some((watch, depth)) = self.watch {
+                    refused(watch, run_id, depth, &ev);
+                }
+            }
         }
         if verdict.effect == Effect::Allow {
             Ok(())
@@ -222,8 +244,27 @@ impl<'a> ExecGuard<'a> {
     /// (the shape a pre-0.8.1 bypass takes) from a test that ran and failed.
     fn record_gate_failure(&self, phase: &str) {
         if let Some((store, run_id, step)) = self.trace {
-            let _ = store.record_sandbox_event(&crate::state::SandboxEvent::gate_phase_failed(
-                run_id, step, phase,
+            self.sandboxed_event(store, &SandboxEvent::gate_phase_failed(run_id, step, phase));
+        }
+    }
+
+    /// Write one sandbox row and announce it, from the same value, so the event
+    /// cannot name a kind or a backend the `sandbox_events` row does not.
+    ///
+    /// The write stays `let _ =`: a trace failure must not fail the gate, and
+    /// telling an observer about a row that failed to land is better than a run
+    /// that dies because its audit trail did.
+    fn sandboxed_event(&self, store: &Store, e: &SandboxEvent) {
+        let _ = store.record_sandbox_event(e);
+        if let Some((watch, depth)) = self.watch {
+            watch.emit(RunEvent::at_depth(
+                e.run_id,
+                e.step,
+                depth,
+                EventKind::Sandbox {
+                    kind: e.kind.clone(),
+                    backend: e.backend.clone(),
+                },
             ));
         }
     }
@@ -239,17 +280,14 @@ impl<'a> ExecGuard<'a> {
                 let backend = sb.backend();
                 // Record the sandbox lifecycle so an audit shows where code ran.
                 if let Some((store, run_id, step)) = self.trace {
-                    let _ = store.record_sandbox_event(&crate::state::SandboxEvent::create(
-                        run_id,
-                        step,
-                        backend.as_str(),
-                    ));
-                    let _ = store.record_sandbox_event(&crate::state::SandboxEvent::exec(
-                        run_id,
-                        step,
-                        backend.as_str(),
-                        &argv.join(" "),
-                    ));
+                    self.sandboxed_event(
+                        store,
+                        &SandboxEvent::create(run_id, step, backend.as_str()),
+                    );
+                    self.sandboxed_event(
+                        store,
+                        &SandboxEvent::exec(run_id, step, backend.as_str(), &argv.join(" ")),
+                    );
                 }
                 let outcome = sb
                     .run(RunSpec {
@@ -261,16 +299,14 @@ impl<'a> ExecGuard<'a> {
                     .await?;
                 if let Some((store, run_id, step)) = self.trace {
                     if let Some(cap) = outcome.cap_hit {
-                        let _ = store.record_sandbox_event(&crate::state::SandboxEvent::cap_hit(
-                            run_id,
-                            step,
-                            cap.as_str(),
-                        ));
+                        self.sandboxed_event(
+                            store,
+                            &SandboxEvent::cap_hit(run_id, step, cap.as_str()),
+                        );
                     }
                     // The workdir is torn down when this call returns (tempdir
                     // drop in the caller); record the destroy now.
-                    let _ = store
-                        .record_sandbox_event(&crate::state::SandboxEvent::destroy(run_id, step));
+                    self.sandboxed_event(store, &SandboxEvent::destroy(run_id, step));
                 }
                 // A cap hit is a real failure of the gate, not a pass.
                 if !outcome.success() {

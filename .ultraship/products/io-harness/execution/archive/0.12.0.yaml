@@ -1,0 +1,64 @@
+product: io-harness
+version: 0.12.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: >
+    One working session, continuous. The owner asked for 0.12.0 to be planned, built and shipped in
+    this session, as 0.10.0 and 0.11.0 both were before it. Stated this session as "commit
+    constantly, be token-efficient".
+  budget: null
+  capacity: >
+    The owner directed that parallel work on disjoint files go to subagents and that the main thread
+    stay token-efficient, which is a capacity constraint on the main context rather than on the
+    work. 0.12.0 is also the last of four consecutive pillar releases taken in one stretch (0.9.0
+    tools, 0.10.0 context and memory, 0.11.0 resilience, 0.12.0 observability and evaluation), so
+    there is no later release to absorb sprawl from this one — anything that grows scope is deferred
+    rather than accommodated.
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      Recorded constraint: one continuous session, with subagents for disjoint files and a
+      token-efficient main thread. That fits this release's shape unusually well. Twelve of the
+      twenty-one scope items are independent single-site defects on files that do not overlap — the
+      pragmas in `src/state.rs`, the deadline in `src/net.rs` and the three providers, the ceiling
+      in `src/containment.rs`, the memory note in `src/context.rs` — so they parallelise cleanly and
+      land before any feature work begins.
+    - >
+      Two of the three features are combinators over an established pattern rather than new
+      architecture. `Fallback` (`src/provider/fallback.rs:87`) already proved how a wrapping
+      provider satisfies an RPITIT trait, including the `+ Sync` bounds and the atomic-not-Mutex
+      constraint, and the recorder's request-capturing half already exists as a test fixture at
+      `tests/context.rs:34-72`. The observer's shape is likewise settled by `Approver`
+      (`src/approve.rs:95`), the crate's existing inversion-of-control precedent.
+    - >
+      The outcome record is almost entirely composition of helpers that already exist. `last_step`,
+      `spent_tokens` and `started_at` are all in place; the one genuinely new write is an end stamp.
+    - >
+      Four audits against the shipped source were completed before this assessment, enumerating
+      every trace emission site, every nondeterminism source and every schema column. The design
+      work is choosing shapes, not discovering the codebase — which is what made 0.10.0 and 0.11.0
+      land in a session.
+    - >
+      Not `high`, for two reasons. Unifying the three duplicated step boundaries (`src/run.rs:743`,
+      `:962`, `:1455`) touches the hottest code in the crate and has a genuinely awkward case in the
+      sub-agent loop's deliberately uncommitted step. And "identical twice" is a judgement call of
+      the same kind as 0.10.0's compaction rules and 0.11.0's stall signal, where the risk is a
+      definition that passes because it asserts nothing.
+  major_cost_drivers:
+    - >
+      First-time design of a public event enum covering fourteen kinds of thing across roughly forty
+      emission sites. Wide, and wrong is expensive because it is public.
+    - >
+      Unifying three duplicated step boundaries into one, including the sub-agent loop's step that
+      is deliberately left uncommitted when a child defers.
+    - >
+      Defining and proving determinism, where the negative controls matter more than the positive
+      test.
+    - >
+      A long tail of twelve unrelated small defects alongside three features, which is the shape
+      that makes a release feel unfinished if the defects are left to the end.
+  recommended_scope_change: null

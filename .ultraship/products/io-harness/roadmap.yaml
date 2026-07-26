@@ -153,14 +153,18 @@ versions:
   - version: 0.12.0
     outcome: >
       A developer watching a run sees it as it happens, and a developer measuring the harness can.
-      The embedding application subscribes to a live event stream — steps, tool calls, approvals,
-      spend, outcomes — instead of polling the store, so io-cli and io-studio render progress off a
-      supported surface. The same release gives io-eval what it needs to score the harness: a
-      deterministic replay from recorded provider responses, so a case runs identically twice, and a
-      per-run outcome record carrying success, steps, spend, and latency. Closes the observability
-      and evaluation gaps; see iterations/US-IO-HARNESS-0.9.0-I01.
-    detail: outline
-    status: planned
+      An embedding application registers an observer and is called as the run happens — steps, tool
+      calls, approvals, refusals, spend draws, retries, fallbacks, stalls, outcomes — instead of
+      polling the store, and every event serialises, so a host process can forward it to a UI in
+      another language without hand-writing a mapping. The same release makes a run measurable: a
+      recorded provider replays a case so it runs identically twice, and a per-run outcome record
+      carries success, steps, spend, and latency, none of which the store holds today. Closes the
+      observability and evaluation gaps and completes the twelve pillars; see
+      iterations/US-IO-HARNESS-0.9.0-I01, whose stated dependency direction is corrected here — the
+      harness defines these surfaces on its own contract, and the applications are built against
+      them, not the reverse.
+    detail: specified
+    status: released
   - version: 0.13.0
     outcome: >
       A developer runs a task over real documents: the agent creates and edits Word, Excel,
@@ -179,11 +183,34 @@ versions:
     status: planned
   - version: 0.15.0
     outcome: >
-      A developer depends on io-harness under a public contract that is documented rather than
-      frozen: every public item carries a worked example, each breaking change between 0.x minors is
-      called out in the changelog with a migration note, and renamed or removed items go through a
-      deprecation cycle instead of vanishing. The crate stays pre-1.0, so a minor may still break —
-      what an external Rust developer can rely on is that the break is documented and survivable,
-      not that it will not happen.
+      A developer arriving at the crate cold can tell what it does and start using it, and a
+      developer depending on it knows what may change. The README becomes a landing page rather than
+      a release history — one description, a quickstart above the fold, badges, the MSRV, and what
+      the harness does today instead of what each version added — with the per-capability depth
+      moved into guide pages under docs/ so nothing is lost. Every public item carries a worked
+      example, each breaking change between 0.x minors is called out in the changelog with a
+      migration note, and renamed or removed items go through a deprecation cycle instead of
+      vanishing. The crate stays pre-1.0, so a minor may still break — what an external Rust
+      developer can rely on is that the break is documented and survivable, not that it will not
+      happen. The documentation rewrite lands here rather than earlier because it should describe a
+      finished twelve-pillar harness once, not be redrafted after each pillar; 0.12.0 corrects only
+      the README's factual errors, which are a different problem from its structure.
     detail: hypothesis
+    status: planned
+  - version: 0.16.0
+    outcome: >
+      A developer who resumes an interrupted run gets the run they had, not a similar one. Today
+      0.7.0's resume restores the durable half of a run — the step it reached, what it spent, how
+      long it has been alive — and silently drops the assembled half: the observation ledger the
+      0.10.0 context assembler builds is in memory only (src/run.rs:1183, :1758), so a resumed
+      workspace or sub-agent run re-derives its context from the workspace and asks the model a
+      different question than the process before it would have. The agent usually recovers, which is
+      why this went unnoticed through five releases; what it costs is that a resumed run is not
+      comparable to an uninterrupted one. After this release the ledger is durable and restored, so
+      a 24-hour run that crashes at hour twenty continues with the context it had rather than a
+      reconstruction, and a recorded case replays identically across an interruption in every loop
+      rather than only the single-file one. Found by 0.12.0's replay work and recorded in
+      iterations/US-IO-HARNESS-0.12.0-I01; 0.12.0 ships the honest boundary instead, where a replay
+      that cannot reproduce a request refuses loudly rather than answering from the wrong recording.
+    detail: outline
     status: planned

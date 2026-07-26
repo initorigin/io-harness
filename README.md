@@ -1,13 +1,25 @@
 # IO Harness
 
+[![crates.io](https://img.shields.io/crates/v/io-harness.svg)](https://crates.io/crates/io-harness)
+[![docs.rs](https://img.shields.io/docsrs/io-harness)](https://docs.rs/io-harness)
+[![CI](https://github.com/initorigin/io-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/initorigin/io-harness/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/crates/l/io-harness.svg)](LICENSE)
+[![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
+
 > A Rust agent harness that runs AI agents from a typed task contract to a checked result.
 
 The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 
-**Type:** Rust library crate
-**Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
-**License:** Apache-2.0
-**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise. v0.6 adds the execution sandbox: every command the verification gate runs — the `rustc` compile and the test binary it has run since v0.2 — executes inside an ephemeral, per-run sandbox (isolated workdir, resource caps that kill, network denied by default, guaranteed teardown), so model-produced code no longer runs on the host directly. The sandbox is OS-native and OS-neutral — one trait, a native backend per platform (macOS `sandbox-exec`, Linux namespaces, Windows Job Objects) over a portable floor that runs everywhere. v0.7 makes a run durable and unattended: every step is checkpointed transactionally, and a crash or full restart resumes the whole agent tree from its own last committed step without re-running work, double-charging the budget, or re-applying an edit. v0.8 makes the harness extensible and its network reach governed: it is an MCP client (stdio and streamable HTTP) whose servers' tools reach the agent beside the built-ins under namespaced names, and outbound connections become a fourth permission act — deny-by-default, layered, contained downward, and traced. v0.9 closes the tool layer with the in-process half of extensibility: implement the public `Tool` trait for an action your own binary already performs, register it on the task contract, and the model is offered it beside the built-ins — governed by the same policy, refused as an observation rather than a failed run, size-capped, traced, and inherited by a v0.5 child; plus skills, a directory of markdown instruction files whose names and descriptions reach the system prompt and whose bodies the agent loads on demand through a built-in `read_skill` tool.
+- **Type:** Rust library crate
+- **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
+- **API docs:** [docs.rs/io-harness](https://docs.rs/io-harness)
+- **License:** Apache-2.0
+- **MSRV:** Rust **1.88**. The floor comes from `rmcp`, which publishes no
+  `rust-version` of its own, so cargo cannot catch it at resolve time — on 1.87
+  the build fails inside that dependency rather than here.
+- **Status:** Pre-release (0.x), published on crates.io. Released through
+  0.12.0, which closes the twelfth of the twelve pillars — all twelve now hold.
+  Per-release detail is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Capabilities
 
@@ -20,15 +32,16 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Permissions and guardrails — what the agent may access, change, send, spend ✅ **v0.8** completes *send*: `Act::Net`, deny-by-default egress
 - Recovery and retry — retries, fallbacks, replanning, escalation ✅ **v0.11**: classified provider failures, kind-aware retry with backoff, `Fallback`, stall detection
 - Stop conditions and budgets — cap steps, time, cost, retries, risky actions
-- Observability and tracing — record prompts, decisions, tool calls, cost
+- Observability and tracing — record prompts, decisions, tool calls, cost ✅ **v0.12** completes it
+- Evaluation layer — success, reliability, safety, latency, cost across cases ✅ **v0.12**
 - Human approval layer — review before sensitive or irreversible actions
 - Providers — OpenRouter first, then Anthropic and OpenAI (own HTTP+SSE client)
 - Agent composition — spawn and nest many agents (100+) with shared context
 - Long-running autonomous tasks — 24h+ with no user input
-- Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, portable floor everywhere — Windows is the floor only, its Job Object is not implemented yet)
-- Built-in tools — filesystem, git, grep, find
-- Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete, PDF watermark, PDF form fill, OCR, barcode/QR read and generate
-- Media — image and video passthrough when the model supports it
+- Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, portable floor everywhere — on Windows the floor only, where the Job Object is designed but not implemented and just the wall clock is enforced)
+- Built-in tools — `write_file`, `read_file`, `grep`, `find` ✅ **v0.1**, **v0.3**; `read_skill` ✅ **v0.9**; `remember` ✅ **v0.10**; `spawn_agent` (in `run_tree` only) ✅ **v0.5**
+- Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete, PDF watermark, PDF form fill, OCR, barcode/QR read and generate — 🚧 **planned v0.13**
+- Media and git — image and video passthrough when the model supports it; real repository work — 🚧 **planned v0.14**
 - Extensibility — MCP (rmcp) ✅ **v0.8** (client; stdio + streamable HTTP), in-process `Tool` implementations and skills ✅ **v0.9**
 
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
@@ -40,13 +53,16 @@ Hand the harness a task contract; it runs the loop, verifies the result, records
 every step to rusqlite, and stops on success or a budget. A single-file task uses
 the filesystem tool; a workspace task lets the agent `grep`/`find` across a
 repository and edit several files. Pick any of three providers at construction.
-Everything else in **Capabilities** is roadmap.
+Everything shipped since — the permission boundary, sub-agents, the sandbox,
+durable resume, MCP and egress, custom tools and skills, context assembly and
+memory, resilience — has its own section further down. Only the items marked
+🚧 **planned** in **Capabilities** are still roadmap.
 
 ### 1. Add the crate
 
 ```toml
 [dependencies]
-io-harness = "0.3"
+io-harness = "0.12"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -114,7 +130,9 @@ async fn main() -> io_harness::Result<()> {
     let store = Store::open("runs.db")?;
 
     let result = run(&contract, &provider, &store).await?;
-    // Success | StepCapReached | TimeBudgetExceeded | CostBudgetExceeded
+    // Success | StepCapReached | TimeBudgetExceeded | CostBudgetExceeded |
+    // Denied | AwaitingApproval | Stalled | Escalated | BudgetCeilingReached |
+    // Refused — the full `RunOutcome`.
     println!("{:?}", result.outcome);
     Ok(())
 }
@@ -223,7 +241,7 @@ it denied.
 ```rust
 use io_harness::{run_with, ApproveAll, Policy, Store, TaskContract, Verification};
 
-let policy = Policy::default()          // reads open, writes ask, secrets denied
+let policy = Policy::default() // reads open, writes/execs ask, egress denied, secrets denied
     .layer("project")
     .allow_read("*")
     .deny_read("secrets/*")
@@ -249,6 +267,7 @@ is a deliberate trade-off for backward compatibility, not an oversight.
 | Read | allow | `.env`, `*.pem`, `id_rsa`, `id_ed25519`, `*.key` denied outright |
 | Write | **ask** | including overwriting a file the path rules already allow |
 | Exec | ask | `rustc` and `<test-binary>` allowed, so verification works |
+| Net (since v0.8) | **deny** | an outbound host is not something a human can meaningfully approve on sight mid-run; name your hosts with `allow_net` — your configured provider is allowed for you |
 
 A **denied** action never reaches the approver — it is refused and reported to
 the model as a tool result it can adapt to, and the refusal consumes a step, so
@@ -327,13 +346,12 @@ each running the same observe/reason/act/verify/stop loop over the **same
 workspace and the same trace**. A child's result composes back so the parent
 continues from what it produced, and children may nest.
 
-Sub-agents are **opt-in**: only [`run_tree`] offers the `spawn_agent` tool. Pass a
+Sub-agents are **opt-in**: only `run_tree` offers the `spawn_agent` tool. Pass a
 `Containment` and the tree runs under it.
 
 ```rust
 use io_harness::{run_tree, ApproveAll, Containment, Policy, Store, TaskContract, Verification};
 
-# async fn demo() -> io_harness::Result<()> {
 let provider = io_harness::OpenRouter::from_env()?;
 let store = Store::memory()?;
 
@@ -352,8 +370,6 @@ let containment = Containment::new(
 );
 
 let result = run_tree(&contract, &provider, &store, &Policy::permissive(), &ApproveAll, &containment).await?;
-# Ok(())
-# }
 ```
 
 ### Containment is inherit-and-narrow
@@ -412,8 +428,17 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | --- | --- |
 | **macOS `sandbox-exec`** | profile confines writes to the workdir and **denies network**; rlimits cap CPU/fds; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
 | **Linux namespaces** | user/mount/pid/**net** namespaces — a *hard* network boundary and a private root — plus rlimits *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
-| **Windows** | **no native backend yet** — the Job Object is designed but unimplemented (no Win32 call is made), so a Windows run gets the portable floor and reports it as such. On Windows that floor enforces the **wall clock only**: no CPU cap, no memory cap, no process cap (all three are unix `rlimit`/`ps` mechanisms) and no kernel network boundary. The wall-clock kill does reach the whole process tree. Caps that are not applied are never reported — a Windows run never claims a CPU or memory cap hit. Tracked for a dedicated release |
+| **Windows** | **no native backend yet** — the portable floor, wall clock only (see the note under this table) |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
+
+**Windows, stated plainly.** The Job Object is designed but **unimplemented** — no
+Win32 call is made — so a Windows run gets the portable floor and reports it as
+such. On Windows that floor
+enforces the **wall clock only**: no CPU cap, no memory cap, no process cap (all
+three are unix `rlimit`/`ps` mechanisms) and no kernel network boundary. The
+wall-clock kill does reach the whole process tree. Caps that are not applied are
+never reported — a Windows run never claims a CPU or memory cap hit. Tracked for a
+dedicated release.
 
 `select` picks the strongest backend available on the running OS and records which
 ran. Sandboxing is the **new default** for the verification gate and is transparent
@@ -603,8 +628,8 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
   rule and layer in the trace. An `ask_exec` routes to the `Approver` and
   survives a restart like any other v0.4 approval.
 - **Nothing may shadow anything** — a registered tool cannot take the name of a
-  built-in (`write_file`, `grep`, `find`, `read_file`, `spawn_agent`,
-  `read_skill`), cannot use the `mcp__` prefix reserved for server tools, and two
+  built-in (`write_file`, `grep`, `find`, `read_file`, `read_skill`,
+  `remember`, `spawn_agent`), cannot use the `mcp__` prefix reserved for server tools, and two
   registered tools cannot share a name. Each is an `Error::Config` raised
   **before the provider is called once**, not a silent shadowing found at
   dispatch.
@@ -649,7 +674,7 @@ Optional YAML frontmatter names and describes a skill; without it the name comes
 from the file stem (or the containing directory, for a `SKILL.md`) and the
 description from the first prose line:
 
-```text
+```yaml
 ---
 name: migrations
 description: How to write a reversible database migration in this repo.
@@ -840,8 +865,23 @@ size. The provider that answered is recorded per step so you can tell.
 
 **The request deadline defaults to 600 seconds** — long enough that no realistic
 single completion reaches it, since a full 8192-token stream at a sluggish 15
-tokens/second is about nine minutes. Override it if your models are slower; a hung
-socket is caught by any finite deadline, so the default is deliberately generous.
+tokens/second is about nine minutes. A hung socket is caught by any finite
+deadline, so the default is deliberately generous. Since 0.12.0 you can name it
+and replace it — `with_timeout` on any of the three providers, and the default is
+public as `REQUEST_TIMEOUT`:
+
+```rust
+use std::time::Duration;
+use io_harness::{OpenRouter, REQUEST_TIMEOUT};
+
+// Slower model: raise it. Impatient caller: lower it. Rebuilds the HTTP client,
+// so call it before handing the provider to a run.
+let provider = OpenRouter::from_env()?.with_timeout(Duration::from_secs(1_800));
+assert_eq!(REQUEST_TIMEOUT, Duration::from_secs(600));   // the default it replaces
+```
+
+`Anthropic::with_timeout` and `OpenAi::with_timeout` are the same call, and each
+provider module re-exports `REQUEST_TIMEOUT` beside its own type.
 
 **Stall detection is a heuristic on a signal, not a proof.** It reads whether a
 write changed the file's bytes and whether a tool call repeated. An agent that

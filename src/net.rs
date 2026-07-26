@@ -37,7 +37,14 @@ use crate::state::{PolicyEvent, Store};
 /// was none at all, so such a socket hung the run forever — no step recorded, so
 /// no checkpoint, no ledger draw, and the time budget (checked at the top of a
 /// step) never reached.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+///
+/// A caller who needs a different deadline overrides it per provider with
+/// `with_timeout` ([`crate::OpenRouter::with_timeout`],
+/// [`crate::Anthropic::with_timeout`], [`crate::OpenAi::with_timeout`]). This
+/// module is private, so the value reaches callers re-exported from each of those
+/// provider modules — a default you are told to reason about has to be one you
+/// can read.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The one `reqwest::Client` constructor in the crate.
 ///
@@ -49,6 +56,12 @@ pub(crate) fn http_client() -> reqwest::Client {
 /// As [`http_client`], with an explicit deadline — for a caller whose model is
 /// slower than [`REQUEST_TIMEOUT`] allows, and for tests that need a deadline
 /// they can reach in a second rather than ten minutes.
+///
+/// This function is crate-private; the caller reaches it through the
+/// `with_timeout` builder method on each provider, which is what makes the
+/// override an actual public affordance rather than a documented one. Until
+/// 0.12.0 it was only reachable from inside the crate, so the slow-model case
+/// named above had no way in.
 ///
 /// Redirects are **off**. A 3xx is a host change, and a host change after the
 /// policy has already decided is a hole in the boundary: the check would have
@@ -197,6 +210,11 @@ pub(crate) fn target(url: &str) -> Option<String> {
 pub(crate) struct NetGuard<'a> {
     policy: &'a Policy,
     trace: Option<(&'a Store, i64, u32)>,
+    /// Where to announce a refusal, and at what tree depth.
+    ///
+    /// Separate from `trace` because a caller may record without observing, and
+    /// because the depth is the agent's rather than the store's.
+    watch: Option<(&'a crate::run::Watch<'a>, u32)>,
 }
 
 impl<'a> NetGuard<'a> {
@@ -205,6 +223,7 @@ impl<'a> NetGuard<'a> {
         Self {
             policy,
             trace: None,
+            watch: None,
         }
     }
 
@@ -213,6 +232,17 @@ impl<'a> NetGuard<'a> {
     /// from the store afterwards.
     pub(crate) fn tracing(mut self, store: &'a Store, run_id: i64, step: u32) -> Self {
         self.trace = Some((store, run_id, step));
+        self
+    }
+
+    /// Also announce a network refusal to `watch`.
+    ///
+    /// Without this a policy-denied host writes a `policy_events` refusal row that
+    /// has no `Refused` event beside it — the one place the two surfaces would
+    /// have disagreed, which is precisely what the observer's headline test exists
+    /// to catch.
+    pub(crate) fn watching(mut self, watch: &'a crate::run::Watch<'a>, depth: u32) -> Self {
+        self.watch = Some((watch, depth));
         self
     }
 
@@ -249,6 +279,13 @@ impl<'a> NetGuard<'a> {
             };
             ev.rule = verdict.rule.clone();
             ev.layer = verdict.layer.clone();
+            // Announced from the row itself, so the event cannot carry a rule or
+            // layer the row lacks.
+            if verdict.effect == Effect::Deny {
+                if let Some((watch, depth)) = self.watch {
+                    crate::run::refused(watch, run_id, depth, &ev);
+                }
+            }
             let _ = store.record_event(run_id, &ev);
         }
         if verdict.effect == Effect::Deny {

@@ -6,6 +6,7 @@
 //! and [`resume`], which continues an interrupted run under its original id
 //! instead of restarting.
 
+use std::cell::Cell;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -23,6 +24,7 @@ use crate::contract::TaskContract;
 use crate::error::{Error, Result};
 use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
+use crate::observe::{EventKind, Ignore, Observer, RunEvent};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
 use crate::resilience::{Progress, Progressing};
@@ -77,6 +79,27 @@ pub enum RunOutcome {
     /// whole tree halts — not this one agent hitting its own budget. `steps` is
     /// how many steps this agent completed before the tree-wide halt.
     BudgetCeilingReached { steps: u32 },
+    /// The run never started, because reaching the provider needed network access
+    /// the policy asked about and a human denied. The authorization happens before
+    /// the run's first step, so `steps` is normally 0.
+    ///
+    /// Reached through [`resume`] after the fact: the run that was refused
+    /// returned the `Err` itself, exactly as an escalation does. Added in 0.12.0 —
+    /// `"refused"` was written to the store from 0.8.0 onward with no variant and
+    /// no mapping, so resuming a refused run fell back into the loop and asked
+    /// the human again.
+    Refused { steps: u32 },
+    /// An [`Observer`] asked the run to stop, and it stopped — at the next step
+    /// boundary rather than where the request landed, so no step was abandoned
+    /// half-done. `steps` is how many steps completed before it stopped.
+    ///
+    /// Added in 0.12.0 with [`Flow::Cancel`](crate::Flow::Cancel), which is the
+    /// first supported way to stop a run in flight: dropping the run's future
+    /// abandons it mid-step and leaves `runs.status` as `running` forever, which
+    /// nothing can tell apart from a process that crashed. A cancelled run is
+    /// finished rather than abandoned, and stays resumable — a resume reports this
+    /// outcome instead of re-driving the loop.
+    Cancelled { steps: u32 },
 }
 
 /// The result of a run, including the persisted run id for audit.
@@ -90,6 +113,27 @@ pub struct RunResult {
     /// them for the rest of the run and hands them back here; persisting them
     /// across runs is the caller's decision, since config files are app-owned.
     pub remembered: Vec<Rule>,
+}
+
+impl RunResult {
+    /// What this run cost and whether it worked, read back from the store.
+    ///
+    /// Added in 0.12.0. Before it, a caller holding a `RunResult` had an outcome
+    /// discriminant and a `run_id`: spend needed a follow-up query, and latency
+    /// was not recorded anywhere at all.
+    ///
+    /// `None` when the run has not finished — a run paused awaiting a human has
+    /// no ending to summarise yet.
+    ///
+    /// A method rather than a field, deliberately. A field would have to be
+    /// filled at every one of the entry points' return sites, including the ones
+    /// that return `Err` and never build a `RunResult`, so the two could drift.
+    /// Reading it from the store means the caller and an auditor are looking at
+    /// the same row by construction. It also keeps this struct's existing
+    /// exhaustive-pattern compatibility intact: no new field, no break.
+    pub fn summary(&self, store: &Store) -> Result<Option<crate::RunSummary>> {
+        store.run_summary(self.run_id)
+    }
 }
 
 impl RunResult {
@@ -118,12 +162,30 @@ pub async fn run<P: Provider>(
     provider: &P,
     store: &Store,
 ) -> Result<RunResult> {
-    run_with(
+    run_observed(contract, provider, store, &Ignore).await
+}
+
+/// [`run`], reporting to `observer` as it happens.
+///
+/// The observed twin of every entry point takes the [`Observer`] last and does
+/// exactly what its unobserved original does — the originals *are* these
+/// functions, called with [`Ignore`]. Adding a parameter to the seven existing
+/// signatures would have broken every caller of a 0.11.0 API to add something
+/// opt-in; a builder would have added a second way to start a run for the same
+/// reason.
+pub async fn run_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    run_with_observed(
         contract,
         provider,
         store,
         &Policy::permissive(),
         &ApproveAll,
+        observer,
     )
     .await
 }
@@ -142,6 +204,18 @@ pub async fn run_with<P: Provider>(
     policy: &Policy,
     approver: &dyn Approver,
 ) -> Result<RunResult> {
+    run_with_observed(contract, provider, store, policy, approver, &Ignore).await
+}
+
+/// [`run_with`], reporting to `observer` as it happens. See [`run_observed`].
+pub async fn run_with_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    policy: &Policy,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
     // Arbitration before anything else: a toolbox that cannot be dispatched
     // unambiguously is a configuration mistake, and the caller should hear about
     // it before a run row exists and before the provider is billed for a turn.
@@ -153,12 +227,25 @@ pub async fn run_with<P: Provider>(
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
     store.set_provider(run_id, provider.name())?;
+    // The run row exists and the provider is set, which is what `Started` reports:
+    // emitted before the network authorization below, so an observer watching a run
+    // that is refused before its first step still saw it begin.
+    let watch = &Watch::new(observer);
+    watch.emit(RunEvent::new(
+        run_id,
+        0,
+        EventKind::Started {
+            goal: contract.goal.clone(),
+            provider: provider.name().to_string(),
+        },
+    ));
     // Decided against the *caller's* policy, before the provider layer is merged
     // in: the harness adding a network layer of its own must not turn a
     // permissive caller into a policy-bearing one and push it off the
     // single-file path.
     let caller_enforces = !policy.is_permissive();
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver).await? {
+    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
             return Ok(RunResult::new(
@@ -172,12 +259,12 @@ pub async fn run_with<P: Provider>(
     };
     match contract.root.clone() {
         Some(root) => {
-            let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &skills,
+                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &skills, watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result
         }
         // Single-file mode has no policy-aware tool layer in 0.4.0. Silently
@@ -190,7 +277,7 @@ pub async fn run_with<P: Provider>(
              contracts are not policy-enforced in 0.4.0."
                 .into(),
         )),
-        None => run_from(contract, provider, store, run_id, 1).await,
+        None => run_from(contract, provider, store, run_id, 1, watch).await,
     }
 }
 
@@ -202,6 +289,20 @@ pub async fn resume<P: Provider>(
     provider: &P,
     store: &Store,
     run_id: i64,
+) -> Result<RunResult> {
+    resume_observed(contract, provider, store, run_id, &Ignore).await
+}
+
+/// [`resume`], reporting to `observer` as it happens. See [`run_observed`].
+///
+/// A resume of an already-finished run is a no-op and reports no events: it drives
+/// nothing, so there is nothing to watch.
+pub async fn resume_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    observer: &dyn Observer,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
@@ -221,10 +322,19 @@ pub async fn resume<P: Provider>(
 
     let start_step = record_resume_markers(store, run_id)?;
     store.set_provider(run_id, provider.name())?;
+    let watch = &Watch::new(observer);
+    watch.emit(RunEvent::new(
+        run_id,
+        start_step.saturating_sub(1),
+        EventKind::Started {
+            goal: contract.goal.clone(),
+            provider: provider.name().to_string(),
+        },
+    ));
     match contract.root.clone() {
         Some(root) => {
             let policy = Policy::permissive();
-            let mcp = McpSession::connect(&contract.mcp, &policy, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &policy, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -236,12 +346,13 @@ pub async fn resume<P: Provider>(
                 &ApproveAll,
                 &mcp,
                 &skills,
+                watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result
         }
-        None => run_from(contract, provider, store, run_id, start_step).await,
+        None => run_from(contract, provider, store, run_id, start_step, watch).await,
     }
 }
 
@@ -264,6 +375,26 @@ pub async fn resume_with_decision<P: Provider>(
     policy: &Policy,
     approver: &dyn Approver,
 ) -> Result<RunResult> {
+    resume_with_decision_observed(
+        contract, provider, store, run_id, request_id, decision, policy, approver, &Ignore,
+    )
+    .await
+}
+
+/// [`resume_with_decision`], reporting to `observer` as it happens. See
+/// [`run_observed`].
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_decision_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    request_id: i64,
+    decision: Decision,
+    policy: &Policy,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     let pending = store
@@ -280,6 +411,18 @@ pub async fn resume_with_decision<P: Provider>(
         crate::error::Error::Config("resume_with_decision needs a workspace".into())
     })?;
     let step = pending.step;
+    // The run row and its provider have existed since the run that paused, so
+    // `Started` here says "this process is now driving it" — one per entry point,
+    // never zero, so a `Finished` below is never the first thing an observer hears.
+    let watch = &Watch::new(observer);
+    watch.emit(RunEvent::new(
+        run_id,
+        step,
+        EventKind::Started {
+            goal: contract.goal.clone(),
+            provider: provider.name().to_string(),
+        },
+    ));
 
     match decision {
         // Deferring again leaves it pending and the run paused.
@@ -303,7 +446,7 @@ pub async fn resume_with_decision<P: Provider>(
                 ),
             )?;
             info!(run_id, request_id, %reason, "deferred action denied");
-            store.finish_run(run_id, "denied")?;
+            finish(store, watch, run_id, 0, step, "denied")?;
             Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id))
         }
         // A deferred *network* action has no filesystem effect to replay: the
@@ -328,7 +471,7 @@ pub async fn resume_with_decision<P: Provider>(
                 ),
             )?;
             let remember = remember.clone();
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -340,9 +483,10 @@ pub async fn resume_with_decision<P: Provider>(
                 approver,
                 &mcp,
                 &skills,
+                watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result.map(|r| r.with_remembered(remember))
         }
         Decision::Approve { modified, remember } => {
@@ -377,8 +521,9 @@ pub async fn resume_with_decision<P: Provider>(
                 ev.rule = recheck.rule.clone();
                 ev.layer = recheck.layer.clone();
                 store.record_event(run_id, &ev)?;
+                refused(watch, run_id, 0, &ev);
                 store.resolve_pending(request_id, "deny")?;
-                store.finish_run(run_id, "denied")?;
+                finish(store, watch, run_id, 0, step, "denied")?;
                 return Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id));
             }
 
@@ -399,7 +544,7 @@ pub async fn resume_with_decision<P: Provider>(
             store.record_event(run_id, &ev)?;
 
             // Continue the run under its original id, from the next step.
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -411,9 +556,10 @@ pub async fn resume_with_decision<P: Provider>(
                 approver,
                 &mcp,
                 &skills,
+                watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result.map(|r| r.with_remembered(remember))
         }
     }
@@ -441,6 +587,40 @@ pub async fn resume_tree_with_decision<P: Provider>(
     approver: &dyn Approver,
     containment: &Containment,
 ) -> Result<RunResult> {
+    resume_tree_with_decision_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        request_id,
+        decision,
+        policy,
+        approver,
+        containment,
+        &Ignore,
+    )
+    .await
+}
+
+/// [`resume_tree_with_decision`], reporting to `observer` as it happens. See
+/// [`run_observed`].
+///
+/// One observer watches the whole tree: every agent's events carry that agent's
+/// own `run_id` and `depth`, so a consumer routes on those rather than being
+/// handed one observer per child.
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_with_decision_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    request_id: i64,
+    decision: Decision,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
     store.check_resumable(run_id)?;
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
@@ -458,6 +638,15 @@ pub async fn resume_tree_with_decision<P: Provider>(
         crate::error::Error::Config("resume_tree_with_decision needs a workspace".into())
     })?;
     let step = pending.step;
+    let watch = &Watch::new(observer);
+    watch.emit(RunEvent::new(
+        run_id,
+        step,
+        EventKind::Started {
+            goal: contract.goal.clone(),
+            provider: provider.name().to_string(),
+        },
+    ));
 
     match decision {
         Decision::Defer => Ok(RunResult::new(
@@ -480,7 +669,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
                 ),
             )?;
             info!(run_id, request_id, %reason, "deferred tree action denied; tree stops");
-            store.finish_run(run_id, "denied")?;
+            finish(store, watch, run_id, 0, step, "denied")?;
             Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id))
         }
         // As in `resume_with_decision`: an approved network action grants the
@@ -508,7 +697,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
             ));
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
                 tools: &contract.tools,
@@ -516,12 +705,14 @@ pub async fn resume_tree_with_decision<P: Provider>(
                 provider,
                 store,
                 approver,
+                watch,
                 ledger,
                 containment,
                 root,
+                root_run_id: run_id,
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
         }
         Decision::Approve { modified, remember } => {
@@ -547,7 +738,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
             };
             if ws.check_path(act, &target).effect == Effect::Deny {
                 store.resolve_pending(request_id, "deny")?;
-                store.finish_run(run_id, "denied")?;
+                finish(store, watch, run_id, 0, step, "denied")?;
                 return Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id));
             }
             if act == Act::Write {
@@ -582,7 +773,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
             ));
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
                 tools: &contract.tools,
@@ -590,12 +781,14 @@ pub async fn resume_tree_with_decision<P: Provider>(
                 provider,
                 store,
                 approver,
+                watch,
                 ledger,
                 containment,
                 root,
+                root_run_id: run_id,
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
         }
     }
@@ -646,8 +839,207 @@ fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
             steps: last,
             retryable: false,
         }),
+        // 0.12.0: the same defect, found by the same kind of audit. `"refused"` is
+        // written when a human denies the network access the provider needs
+        // (`authorize_provider`), and it was unmapped — so resuming a refused run
+        // re-entered the loop and asked the human the same question again. A human's
+        // no is as final as a policy's, which is why `denied` above is final too.
+        "refused" => Some(RunOutcome::Refused { steps: last }),
+        // Also 0.12.0: a run its observer stopped. Final for the same reason a
+        // human's `denied` is — the caller asked for it — so a resume reports it
+        // rather than quietly starting the run up again.
+        "cancelled" => Some(RunOutcome::Cancelled { steps: last }),
         _ => None,
     }))
+}
+
+/// The [`Observer`] a run reports to, plus the one bit of state it can set.
+///
+/// A wrapper rather than a bare `&dyn Observer` because a cancellation has to
+/// outlive the `event()` call that asked for it: [`Flow::Cancel`](crate::Flow::Cancel)
+/// is honoured at the next step boundary, not where it was returned, so the
+/// request is remembered here — and one `Watch` shared by a whole tree means a
+/// child's observer can stop the tree, not only itself.
+///
+/// A [`Cell`] is enough: [`Store`] is `!Sync` and `run_agent` returns a
+/// non-`Send` future, so a run and every agent in its tree are driven on one
+/// task. Nothing here needs a lock, and adding one would be the only `Sync`
+/// requirement in the loop.
+pub(crate) struct Watch<'a> {
+    observer: &'a dyn Observer,
+    cancelled: Cell<bool>,
+}
+
+impl<'a> Watch<'a> {
+    fn new(observer: &'a dyn Observer) -> Self {
+        Self {
+            observer,
+            cancelled: Cell::new(false),
+        }
+    }
+
+    /// Report one event, remembering a cancellation for the next step boundary.
+    pub(crate) fn emit(&self, event: RunEvent) {
+        if self.observer.event(&event).is_cancel() {
+            self.cancelled.set(true);
+        }
+    }
+
+    /// Whether stopping has been asked for. Read at a step boundary only.
+    fn cancelled(&self) -> bool {
+        self.cancelled.get()
+    }
+}
+
+/// Announce a refusal, reading the event straight off the row that records it.
+///
+/// Every `Refused` in the crate goes through here, and takes the `PolicyEvent`
+/// rather than the four fields, so an event cannot carry a rule or a layer the
+/// `policy_events` row does not. The two surfaces agree by construction instead
+/// of by four call sites remembering to keep in step.
+pub(crate) fn refused(watch: &Watch<'_>, run_id: i64, depth: u32, ev: &PolicyEvent) {
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        ev.step,
+        depth,
+        EventKind::Refused {
+            act: ev.act.clone(),
+            target: ev.target.clone(),
+            rule: ev.rule.clone(),
+            layer: ev.layer.clone(),
+        },
+    ));
+}
+
+/// Announce a human's answer, from the row that records it. As [`refused`]: the
+/// event's `decision` is the row's, never a second literal beside it.
+fn decided(watch: &Watch<'_>, run_id: i64, depth: u32, ev: &PolicyEvent) {
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        ev.step,
+        depth,
+        EventKind::ApprovalDecided {
+            act: ev.act.clone(),
+            target: ev.target.clone(),
+            decision: ev.decision.clone().unwrap_or_default(),
+        },
+    ));
+}
+
+/// The one step boundary: commit the step, log it, and tell the observer.
+///
+/// Before 0.12.0 the single-file loop, the workspace loop and the sub-agent loop
+/// each had their own copy of this — their own inline [`StepRecord`], their own
+/// `checkpoint_step`, and their own differently-named `info!` ("loop step" /
+/// "workspace step" / "agent step"). One boundary is what stops the three
+/// drifting, and what makes [`EventKind::Step`] one fact about a committed step
+/// rather than three approximations of one.
+///
+/// `commit` is `false` for exactly one case: the sub-agent loop's step that
+/// paused because one of its CHILDREN deferred. That step is deliberately left
+/// uncommitted so a resume replays it and re-adopts the paused child — only the
+/// parent re-entering `spawn_child` can wait on that child again — and committing
+/// it would skip the replay, which is the double-execution defect 0.7.0's
+/// checkpointing exists to prevent. Nothing is committed and no
+/// [`EventKind::Step`] is emitted, because there is no committed step to report:
+/// what the caller hears about is the pause, through
+/// [`RunOutcome::AwaitingApproval`].
+fn commit_step(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    depth: u32,
+    record: StepRecord,
+    changed: bool,
+    commit: bool,
+) -> Result<()> {
+    if !commit {
+        info!(
+            run_id,
+            depth,
+            step = record.step,
+            "tree paused for a child's approval (step left uncommitted for replay)"
+        );
+        return Ok(());
+    }
+    store.checkpoint_step(run_id, &record)?;
+    info!(
+        run_id,
+        depth,
+        step = record.step,
+        decision = %record.decision,
+        tokens = record.tokens,
+        changed,
+        "step"
+    );
+    // The record's own fields, moved rather than cloned: an event must report
+    // exactly what was committed, and the unobserved path must not pay an
+    // allocation per step for the privilege of being ignored.
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        record.step,
+        depth,
+        EventKind::Step {
+            decision: record.decision,
+            tool_call: record.tool_call,
+            tokens: record.tokens,
+            changed,
+        },
+    ));
+    Ok(())
+}
+
+/// Stop the run if the observer asked it to, recording `"cancelled"` as the
+/// outcome. `None` means carry on.
+///
+/// Call this at a step boundary and nowhere else — that is the contract
+/// [`Flow::Cancel`](crate::Flow::Cancel) states, and the whole reason the request
+/// is remembered in [`Watch`] rather than acted on where it was returned. The run
+/// is *finished*, not abandoned: `runs.status` stops being `running`, a summary is
+/// written, and `terminal_outcome` maps the string back so a resume reports the
+/// cancellation instead of re-driving the loop.
+fn cancelled(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    depth: u32,
+    steps: u32,
+) -> Result<Option<RunOutcome>> {
+    if !watch.cancelled() {
+        return Ok(None);
+    }
+    finish(store, watch, run_id, depth, steps, "cancelled")?;
+    info!(run_id, depth, steps, "run cancelled by its observer");
+    Ok(Some(RunOutcome::Cancelled { steps }))
+}
+
+/// End a run: write the outcome and tell the observer, so no terminal path can do
+/// one without the other. Every `finish_run` in this file goes through here.
+///
+/// `steps` is what the outcome reports, which is not always the step the loop was
+/// on — a time-budget stop reports the last step that completed.
+fn finish(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    depth: u32,
+    steps: u32,
+    outcome: &str,
+) -> Result<()> {
+    store.finish_run(run_id, outcome)?;
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        steps,
+        depth,
+        EventKind::Finished {
+            outcome: outcome.to_string(),
+            steps,
+            // Read back from the store rather than carried in a local: the store
+            // is what an audit will read, and the two must agree.
+            tokens: store.spent_tokens(run_id)?,
+        },
+    ));
+    Ok(())
 }
 
 async fn run_from<P: Provider>(
@@ -656,6 +1048,7 @@ async fn run_from<P: Provider>(
     store: &Store,
     run_id: i64,
     start_step: u32,
+    watch: &Watch<'_>,
 ) -> Result<RunResult> {
     let fs = FsTool::new(&contract.file);
     let system = system_prompt();
@@ -669,11 +1062,19 @@ async fn run_from<P: Provider>(
     let permissive = Policy::permissive();
 
     for step in start_step..=contract.max_steps {
+        // A cancellation is acted on here, at the boundary between two steps, and
+        // nowhere else: the points inside a step are not safe to stop at — a tool
+        // call is in flight, a file may be half-written — and stopping there is
+        // what dropping the future already does badly. Checked before the budgets
+        // because the caller asking to stop outranks a budget saying so.
+        if let Some(o) = cancelled(store, watch, run_id, 0, step - 1)? {
+            return Ok(RunResult::new(o, run_id));
+        }
         // Time budget: checked before doing the step's work, against real
         // wall-clock elapsed since the run started (durable across a restart).
         if let Some(max) = contract.max_duration {
             if store.elapsed_secs(run_id)? > max.as_secs_f64() {
-                store.finish_run(run_id, "time_budget_exceeded")?;
+                finish(store, watch, run_id, 0, step - 1, "time_budget_exceeded")?;
                 return Ok(RunResult::new(
                     RunOutcome::TimeBudgetExceeded { steps: step - 1 },
                     run_id,
@@ -703,13 +1104,19 @@ async fn run_from<P: Provider>(
         };
 
         let response =
-            complete_with_retry(provider, &request, contract, store, run_id, step).await?;
+            complete_with_retry(provider, &request, contract, store, run_id, step, watch, 0)
+                .await?;
 
         // Which provider answered, when that is not a foregone conclusion. A
         // `Fallback` that fell over served this step from its secondary, and a trace
         // reader has no other way to know.
         if let Some(served) = provider.last_served() {
-            store.record_context_event(run_id, &ContextEvent::served(step, served))?;
+            store.record_context_event(run_id, &ContextEvent::served(step, served.clone()))?;
+            watch.emit(RunEvent::new(
+                run_id,
+                step,
+                EventKind::FellBackTo { provider: served },
+            ));
         }
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
@@ -732,20 +1139,28 @@ async fn run_from<P: Provider>(
         // a crash between the write and the commit replays this step, and the
         // model re-observes the already-written file, so the edit lands exactly
         // once. The committed checkpoint is the step's completion marker.
-        store.checkpoint_step(
+        //
+        // Single-file mode has no workspace-change signal of its own, so `changed`
+        // is whether this step wrote the file at all — the nearest true statement
+        // the mode can make.
+        commit_step(
+            store,
+            watch,
             run_id,
-            &StepRecord::new(step, decision, result_text).with_trace(
+            0,
+            StepRecord::new(step, decision, result_text).with_trace(
                 user,
                 tool_call_json,
                 step_tokens,
             ),
+            write.is_some(),
+            true,
         )?;
-        info!(step, decision, tokens = step_tokens, "loop step");
 
         // Cost budget: checked after this step's tokens are counted.
         if let Some(max) = contract.max_tokens {
             if tokens_used > max {
-                store.finish_run(run_id, "cost_budget_exceeded")?;
+                finish(store, watch, run_id, 0, step, "cost_budget_exceeded")?;
                 return Ok(RunResult::new(
                     RunOutcome::CostBudgetExceeded { steps: step },
                     run_id,
@@ -754,18 +1169,27 @@ async fn run_from<P: Provider>(
         }
 
         let contents = fs.read().await?;
-        let guard = ExecGuard::new(&permissive).tracing(store, run_id, step);
+        let guard = ExecGuard::new(&permissive)
+            .tracing(store, run_id, step)
+            .watching(watch, 0);
         if contract
             .verify
             .passes_guarded(&contract.file, &contents, &guard)
             .await?
         {
-            store.finish_run(run_id, "success")?;
+            finish(store, watch, run_id, 0, step, "success")?;
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id));
         }
     }
 
-    store.finish_run(run_id, "step_cap_reached")?;
+    finish(
+        store,
+        watch,
+        run_id,
+        0,
+        contract.max_steps,
+        "step_cap_reached",
+    )?;
     Ok(RunResult::new(
         RunOutcome::StepCapReached {
             steps: contract.max_steps,
@@ -791,6 +1215,7 @@ async fn run_workspace_from<P: Provider>(
     approver: &dyn Approver,
     mcp: &McpSession,
     skills: &Skills,
+    watch: &Watch<'_>,
 ) -> Result<RunResult> {
     // The effective policy grows as approvers remember rules; it is rebuilt as a
     // merge so a remembered allow can still never defeat a deny beneath it.
@@ -822,9 +1247,13 @@ async fn run_workspace_from<P: Provider>(
     let mem_key = memory_key(root);
 
     for step in start_step..=contract.max_steps {
+        // The step boundary, where a cancellation is honoured (see `cancelled`).
+        if let Some(o) = cancelled(store, watch, run_id, 0, step - 1)? {
+            return Ok(RunResult::new(o, run_id).with_remembered(remembered));
+        }
         if let Some(max) = contract.max_duration {
             if store.elapsed_secs(run_id)? > max.as_secs_f64() {
-                store.finish_run(run_id, "time_budget_exceeded")?;
+                finish(store, watch, run_id, 0, step - 1, "time_budget_exceeded")?;
                 return Ok(RunResult::new(
                     RunOutcome::TimeBudgetExceeded { steps: step - 1 },
                     run_id,
@@ -864,13 +1293,19 @@ async fn run_workspace_from<P: Provider>(
         };
 
         let response =
-            complete_with_retry(provider, &request, contract, store, run_id, step).await?;
+            complete_with_retry(provider, &request, contract, store, run_id, step, watch, 0)
+                .await?;
 
         // Which provider answered, when that is not a foregone conclusion. A
         // `Fallback` that fell over served this step from its secondary, and a trace
         // reader has no other way to know.
         if let Some(served) = provider.last_served() {
-            store.record_context_event(run_id, &ContextEvent::served(step, served))?;
+            store.record_context_event(run_id, &ContextEvent::served(step, served.clone()))?;
+            watch.emit(RunEvent::new(
+                run_id,
+                step,
+                EventKind::FellBackTo { provider: served },
+            ));
         }
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
@@ -919,6 +1354,8 @@ async fn run_workspace_from<P: Provider>(
                 skills,
                 entry_cap,
                 &mem_key,
+                watch,
+                0,
             )
             .await?
             {
@@ -951,23 +1388,24 @@ async fn run_workspace_from<P: Provider>(
         // ponytail: each row repeats the whole log, so the column grows with the
         // square of the step count. Bounded in practice by the step budget times
         // the entry cap; write per-step deltas if a long run's store size matters.
-        store.checkpoint_step(
+        //
+        // The assembly stats this line used to log (`carried`, `stubbed`,
+        // `est_tokens`) are not lost with the loop's own `info!`: `assemble`
+        // records them as the step's `"assembled"` context event, which is where a
+        // reader could already find them.
+        commit_step(
+            store,
+            watch,
             run_id,
-            &StepRecord::new(step, decisions.join("; "), ledger.text_for_step(step)).with_trace(
+            0,
+            StepRecord::new(step, decisions.join("; "), ledger.text_for_step(step)).with_trace(
                 user,
                 calls_json.join(" | "),
                 step_tokens,
             ),
+            step_changed,
+            true,
         )?;
-        info!(
-            step,
-            decisions = %decisions.join("; "),
-            tokens = step_tokens,
-            carried = assembled.carried,
-            stubbed = assembled.stubbed,
-            est_tokens = assembled.est_tokens,
-            "workspace step"
-        );
 
         // Did that step get anywhere? A stall needs both halves — nothing changed
         // in the workspace AND a tool call this window already saw — because a
@@ -979,7 +1417,7 @@ async fn run_workspace_from<P: Provider>(
             Progressing::Replan => {
                 store.record_context_event(
                     run_id,
-                    &ContextEvent::stalled(
+                    &ContextEvent::replan(
                         step,
                         format!(
                             "{} steps without progress; replanning",
@@ -1001,14 +1439,22 @@ async fn run_workspace_from<P: Provider>(
                     ),
                 ));
                 info!(run_id, step, "agent told to change approach");
+                watch.emit(RunEvent::new(
+                    run_id,
+                    step,
+                    EventKind::Replan {
+                        window: contract.stall.window,
+                    },
+                ));
             }
             Progressing::Stalled => {
                 store.record_context_event(
                     run_id,
                     &ContextEvent::stalled(step, "still no progress after replanning"),
                 )?;
-                store.finish_run(run_id, "stalled")?;
                 info!(run_id, step, "run stopped: stalled");
+                watch.emit(RunEvent::new(run_id, step, EventKind::Stalled));
+                finish(store, watch, run_id, 0, step, "stalled")?;
                 return Ok(RunResult::new(RunOutcome::Stalled { steps: step }, run_id)
                     .with_remembered(remembered));
             }
@@ -1017,7 +1463,7 @@ async fn run_workspace_from<P: Provider>(
         // An approver deferred: persist nothing further, stop, and let the
         // caller resume once a human has decided.
         if let Some(request_id) = paused {
-            store.finish_run(run_id, "awaiting_approval")?;
+            finish(store, watch, run_id, 0, step, "awaiting_approval")?;
             return Ok(RunResult::new(
                 RunOutcome::AwaitingApproval {
                     request_id,
@@ -1043,7 +1489,7 @@ async fn run_workspace_from<P: Provider>(
 
         if let Some(max) = contract.max_tokens {
             if tokens_used > max {
-                store.finish_run(run_id, "cost_budget_exceeded")?;
+                finish(store, watch, run_id, 0, step, "cost_budget_exceeded")?;
                 return Ok(
                     RunResult::new(RunOutcome::CostBudgetExceeded { steps: step }, run_id)
                         .with_remembered(remembered),
@@ -1055,17 +1501,26 @@ async fn run_workspace_from<P: Provider>(
             .verify
             .passes_in_guarded(
                 root,
-                &ExecGuard::new(&effective).tracing(store, run_id, step),
+                &ExecGuard::new(&effective)
+                    .tracing(store, run_id, step)
+                    .watching(watch, 0),
             )
             .await?
         {
-            store.finish_run(run_id, "success")?;
+            finish(store, watch, run_id, 0, step, "success")?;
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id)
                 .with_remembered(remembered));
         }
     }
 
-    store.finish_run(run_id, "step_cap_reached")?;
+    finish(
+        store,
+        watch,
+        run_id,
+        0,
+        contract.max_steps,
+        "step_cap_reached",
+    )?;
     Ok(RunResult::new(
         RunOutcome::StepCapReached {
             steps: contract.max_steps,
@@ -1095,9 +1550,21 @@ struct Tree<'a, P: Provider> {
     provider: &'a P,
     store: &'a Store,
     approver: &'a dyn Approver,
+    /// One observer for the whole tree, exactly as there is one approver: every
+    /// event carries the agent's own `run_id` and `depth`, so a consumer routes on
+    /// those rather than being handed an observer per child. It also carries the
+    /// tree's single cancellation flag, so a `Flow::Cancel` from any agent's event
+    /// stops the tree at the next boundary rather than only that agent.
+    watch: &'a Watch<'a>,
     ledger: Arc<Ledger>,
     containment: &'a Containment,
     root: PathBuf,
+    /// The tree root's run id, so `Containment::max_total_duration` can be
+    /// measured against when the TREE started rather than when this agent did.
+    /// A child spawned twenty hours into a run has its own young `started_at`;
+    /// the ceiling is about the whole tree, so the root's stamp is the only
+    /// correct clock. Held here because [`Ledger`] has no store access.
+    root_run_id: i64,
 }
 
 /// Run a workspace contract as the root of an agent tree under `containment`.
@@ -1118,6 +1585,32 @@ pub async fn run_tree<P: Provider>(
     approver: &dyn Approver,
     containment: &Containment,
 ) -> Result<RunResult> {
+    run_tree_observed(
+        contract,
+        provider,
+        store,
+        policy,
+        approver,
+        containment,
+        &Ignore,
+    )
+    .await
+}
+
+/// [`run_tree`], reporting to `observer` as it happens. See [`run_observed`].
+///
+/// One observer watches the whole tree: a child's events carry that child's own
+/// `run_id` and its non-zero `depth`.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_tree_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     let root = contract.root.clone().ok_or_else(|| {
@@ -1128,10 +1621,20 @@ pub async fn run_tree<P: Provider>(
     let ledger = Arc::new(Ledger::new(containment));
     let run_id = store.start_run(&contract.goal, &root.display().to_string())?;
     store.set_provider(run_id, provider.name())?;
+    let watch = &Watch::new(observer);
+    watch.emit(RunEvent::new(
+        run_id,
+        0,
+        EventKind::Started {
+            goal: contract.goal.clone(),
+            provider: provider.name().to_string(),
+        },
+    ));
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver).await? {
+    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
             return Ok(RunResult::new(
@@ -1143,7 +1646,7 @@ pub async fn run_tree<P: Provider>(
             ))
         }
     };
-    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let tree = Tree {
         mcp: &mcp,
         tools: &contract.tools,
@@ -1151,12 +1654,14 @@ pub async fn run_tree<P: Provider>(
         provider,
         store,
         approver,
+        watch,
         ledger,
         containment,
         root,
+        root_run_id: run_id,
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await;
-    mcp.shutdown(store, run_id).await;
+    mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -1179,6 +1684,31 @@ pub async fn resume_tree<P: Provider>(
     policy: &Policy,
     approver: &dyn Approver,
     containment: &Containment,
+) -> Result<RunResult> {
+    resume_tree_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        policy,
+        approver,
+        containment,
+        &Ignore,
+    )
+    .await
+}
+
+/// [`resume_tree`], reporting to `observer` as it happens. See [`run_observed`].
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+    observer: &dyn Observer,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
@@ -1206,10 +1736,20 @@ pub async fn resume_tree<P: Provider>(
     ));
     let start_step = record_resume_markers(store, run_id)?;
     store.set_provider(run_id, provider.name())?;
+    let watch = &Watch::new(observer);
+    watch.emit(RunEvent::new(
+        run_id,
+        start_step.saturating_sub(1),
+        EventKind::Started {
+            goal: contract.goal.clone(),
+            provider: provider.name().to_string(),
+        },
+    ));
     // Re-authorized on resume rather than trusted from the crashed run: the
     // policy handed to the resume is the one that governs it, and a host allowed
     // before a crash may not be allowed after.
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver).await? {
+    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
             return Ok(RunResult::new(
@@ -1221,7 +1761,7 @@ pub async fn resume_tree<P: Provider>(
             ))
         }
     };
-    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let tree = Tree {
         mcp: &mcp,
         tools: &contract.tools,
@@ -1229,12 +1769,14 @@ pub async fn resume_tree<P: Provider>(
         provider,
         store,
         approver,
+        watch,
         ledger,
         containment,
         root,
+        root_run_id: run_id,
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await;
-    mcp.shutdown(store, run_id).await;
+    mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -1283,9 +1825,22 @@ fn run_agent<'f, P: Provider>(
         let mem_key = memory_key(&tree.root);
 
         for step in start_step..=contract.max_steps {
+            // The step boundary, where a cancellation is honoured (see `cancelled`).
+            // One flag for the whole tree, so a cancel asked for while a sibling was
+            // mid-flight stops this agent too.
+            if let Some(o) = cancelled(tree.store, tree.watch, run_id, depth, step - 1)? {
+                return Ok(o);
+            }
             if let Some(max) = contract.max_duration {
                 if tree.store.elapsed_secs(run_id)? > max.as_secs_f64() {
-                    tree.store.finish_run(run_id, "time_budget_exceeded")?;
+                    finish(
+                        tree.store,
+                        tree.watch,
+                        run_id,
+                        depth,
+                        step - 1,
+                        "time_budget_exceeded",
+                    )?;
                     return Ok(RunOutcome::TimeBudgetExceeded { steps: step - 1 });
                 }
             }
@@ -1314,16 +1869,30 @@ fn run_agent<'f, P: Provider>(
                 user: user.clone(),
                 tools: tools.clone(),
             };
-            let response =
-                complete_with_retry(tree.provider, &request, contract, tree.store, run_id, step)
-                    .await?;
+            let response = complete_with_retry(
+                tree.provider,
+                &request,
+                contract,
+                tree.store,
+                run_id,
+                step,
+                tree.watch,
+                depth,
+            )
+            .await?;
 
             // Which provider answered, when that is not a foregone conclusion. A
             // `Fallback` that fell over served this step from its secondary, and a
             // trace reader has no other way to know.
             if let Some(served) = tree.provider.last_served() {
                 tree.store
-                    .record_context_event(run_id, &ContextEvent::served(step, served))?;
+                    .record_context_event(run_id, &ContextEvent::served(step, served.clone()))?;
+                tree.watch.emit(RunEvent::at_depth(
+                    run_id,
+                    step,
+                    depth,
+                    EventKind::FellBackTo { provider: served },
+                ));
             }
             let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
             tokens_used += step_tokens;
@@ -1373,6 +1942,8 @@ fn run_agent<'f, P: Provider>(
                     tree.skills,
                     entry_cap,
                     &mem_key,
+                    tree.watch,
+                    depth,
                 )
                 .await?
                 {
@@ -1398,12 +1969,27 @@ fn run_agent<'f, P: Provider>(
             if paused.is_none() && !spawn_calls.is_empty() {
                 use futures_util::stream::{self, StreamExt};
                 let max_c = tree.containment.max_concurrent.max(1) as usize;
+                // `buffered`, not `buffer_unordered`: up to `max_c` children still
+                // run at once, but their results are collected in the order the
+                // model asked for them rather than the order they happen to finish.
+                //
+                // Until 0.12.0 this was `buffer_unordered`, which made a tree run
+                // non-reproducible: the composed child observations and the
+                // `decisions` list — both of which become the `steps.result` and
+                // `steps.decision` columns — came back in completion order, so the
+                // same task over the same workspace produced a different trace and
+                // a different next prompt depending on which child won a race.
+                // Deterministic replay cannot be built on that.
+                //
+                // The cost is that a child which finishes early has its result held
+                // until the children before it are done. That is bounded by `max_c`
+                // and changes when a result is *read*, never when the work runs.
                 let results: Vec<Result<SpawnResult>> = stream::iter(
                     spawn_calls
                         .into_iter()
                         .map(|c| spawn_child(tree, c, run_id, depth, policy, step)),
                 )
-                .buffer_unordered(max_c)
+                .buffered(max_c)
                 .collect()
                 .await;
                 for r in results {
@@ -1439,21 +2025,27 @@ fn run_agent<'f, P: Provider>(
             // paused child (only the parent re-entering `spawn_child` can wait on
             // the child again). An agent paused by its OWN gate commits normally —
             // it resumes from the step after, past the now-approved action.
-            if paused.is_some() && paused_by_child {
-                info!(
-                    run_id,
-                    depth,
-                    step,
-                    "tree paused for a child's approval (step left uncommitted for replay)"
-                );
-            } else {
-                tree.store.checkpoint_step(
-                    run_id,
-                    &StepRecord::new(step, decisions.join("; "), ledger.text_for_step(step))
-                        .with_trace(user, calls_json.join(" | "), step_tokens),
-                )?;
-                info!(run_id, depth, step, decisions = %decisions.join("; "), tokens = step_tokens, "agent step");
-            }
+            //
+            // The condition is passed to the one boundary rather than branching
+            // around it, so the uncommitted case is a stated argument at the single
+            // commit point instead of a second, quieter commit path that a later
+            // change could forget about. `commit_step` emits no `EventKind::Step`
+            // for it either: there is no committed step to report, and a resume is
+            // going to run this step again.
+            let committed = !(paused.is_some() && paused_by_child);
+            commit_step(
+                tree.store,
+                tree.watch,
+                run_id,
+                depth,
+                StepRecord::new(step, decisions.join("; "), ledger.text_for_step(step)).with_trace(
+                    user,
+                    calls_json.join(" | "),
+                    step_tokens,
+                ),
+                step_changed,
+                committed,
+            )?;
 
             // 0.5.0 spawns up to a hundred of these, so an agent burning its whole
             // step budget going nowhere is the multiplied version of the problem.
@@ -1463,7 +2055,7 @@ fn run_agent<'f, P: Provider>(
                 Progressing::Replan => {
                     tree.store.record_context_event(
                         run_id,
-                        &ContextEvent::stalled(
+                        &ContextEvent::replan(
                             step,
                             format!(
                                 "{} steps without progress; replanning",
@@ -1482,20 +2074,37 @@ fn run_agent<'f, P: Provider>(
                         ),
                     ));
                     info!(run_id, depth, step, "agent told to change approach");
+                    tree.watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::Replan {
+                            window: contract.stall.window,
+                        },
+                    ));
                 }
                 Progressing::Stalled => {
                     tree.store.record_context_event(
                         run_id,
                         &ContextEvent::stalled(step, "still no progress after replanning"),
                     )?;
-                    tree.store.finish_run(run_id, "stalled")?;
                     info!(run_id, depth, step, "agent stopped: stalled");
+                    tree.watch
+                        .emit(RunEvent::at_depth(run_id, step, depth, EventKind::Stalled));
+                    finish(tree.store, tree.watch, run_id, depth, step, "stalled")?;
                     return Ok(RunOutcome::Stalled { steps: step });
                 }
             }
 
             if let Some(request_id) = paused {
-                tree.store.finish_run(run_id, "awaiting_approval")?;
+                finish(
+                    tree.store,
+                    tree.watch,
+                    run_id,
+                    depth,
+                    step,
+                    "awaiting_approval",
+                )?;
                 return Ok(RunOutcome::AwaitingApproval {
                     request_id,
                     steps: step,
@@ -1506,19 +2115,70 @@ fn run_agent<'f, P: Provider>(
             // when it crosses the ceiling — the tokens were already spent — and a
             // crossing halts the whole tree, not just this agent.
             let draw = tree.ledger.draw_tokens(step_tokens);
+            let remaining = tree.ledger.remaining_tokens();
             tree.store.record_agent_event(&AgentEvent::budget_draw(
                 run_id,
                 step,
                 step_tokens,
-                tree.ledger.remaining_tokens(),
+                remaining,
             ))?;
+            tree.watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::SpendDraw {
+                    tokens: step_tokens,
+                    // A tree always has a ceiling, so there is always a number here;
+                    // the field is optional for a future draw against no ceiling.
+                    remaining: Some(remaining),
+                },
+            ));
             if draw == Draw::Halted {
-                tree.store.finish_run(run_id, "budget_ceiling_reached")?;
+                finish(
+                    tree.store,
+                    tree.watch,
+                    run_id,
+                    depth,
+                    step,
+                    "budget_ceiling_reached",
+                )?;
                 return Ok(RunOutcome::BudgetCeilingReached { steps: step });
+            }
+            // The tree's wall-clock ceiling, measured from the ROOT's `started_at`
+            // rather than this agent's: a child spawned twenty hours in has a young
+            // stamp of its own, and the ceiling is about the whole tree. Checked
+            // beside the token draw because both are the same kind of limit — one a
+            // contract cannot raise, crossing which halts the tree rather than the
+            // agent that noticed.
+            //
+            // `max_total_duration` has existed on `Containment` since 0.5.0 and was
+            // never read, so a caller could set a ceiling on a 24-hour tree and have
+            // it silently ignored. Enforced in 0.12.0. Its sibling `max_total_cost`
+            // still cannot be: there is no price telemetry to compare against.
+            if let Some(max) = tree.containment.max_total_duration {
+                if tree.store.elapsed_secs(tree.root_run_id)? > max.as_secs_f64() {
+                    finish(
+                        tree.store,
+                        tree.watch,
+                        run_id,
+                        depth,
+                        step,
+                        "budget_ceiling_reached",
+                    )?;
+                    info!(run_id, depth, step, "tree stopped: duration ceiling");
+                    return Ok(RunOutcome::BudgetCeilingReached { steps: step });
+                }
             }
             // This agent's own contract budget (never looser than the tree's).
             if tokens_used > token_cap {
-                tree.store.finish_run(run_id, "cost_budget_exceeded")?;
+                finish(
+                    tree.store,
+                    tree.watch,
+                    run_id,
+                    depth,
+                    step,
+                    "cost_budget_exceeded",
+                )?;
                 return Ok(RunOutcome::CostBudgetExceeded { steps: step });
             }
 
@@ -1526,16 +2186,25 @@ fn run_agent<'f, P: Provider>(
                 .verify
                 .passes_in_guarded(
                     &tree.root,
-                    &ExecGuard::new(policy).tracing(tree.store, run_id, step),
+                    &ExecGuard::new(policy)
+                        .tracing(tree.store, run_id, step)
+                        .watching(tree.watch, depth),
                 )
                 .await?
             {
-                tree.store.finish_run(run_id, "success")?;
+                finish(tree.store, tree.watch, run_id, depth, step, "success")?;
                 return Ok(RunOutcome::Success { steps: step });
             }
         }
 
-        tree.store.finish_run(run_id, "step_cap_reached")?;
+        finish(
+            tree.store,
+            tree.watch,
+            run_id,
+            depth,
+            contract.max_steps,
+            "step_cap_reached",
+        )?;
         Ok(RunOutcome::StepCapReached {
             steps: contract.max_steps,
         })
@@ -1637,6 +2306,16 @@ async fn spawn_child<P: Provider>(
                     step,
                     refusal.cap(),
                 ))?;
+                // The parent's event, at the parent's depth: no child exists to
+                // attribute it to, which is the point of the refusal.
+                tree.watch.emit(RunEvent::at_depth(
+                    parent_run_id,
+                    step,
+                    depth,
+                    EventKind::SpawnRefused {
+                        cap: refusal.cap().to_string(),
+                    },
+                ));
                 return Ok(SpawnResult::Composed {
                     decision: format!("spawn refused ({})", refusal.cap()),
                     obs: format!(
@@ -1656,6 +2335,18 @@ async fn spawn_child<P: Provider>(
                 child_run,
                 goal,
             ))?;
+            // Attributed to the PARENT's run and depth: the parent is what spawned
+            // it, and the child's own events (which carry `child_depth`) start
+            // arriving next.
+            tree.watch.emit(RunEvent::at_depth(
+                parent_run_id,
+                step,
+                depth,
+                EventKind::Spawned {
+                    child_run_id: child_run,
+                    goal: goal.to_string(),
+                },
+            ));
             let deny_json = a
                 .get("deny_write")
                 .map(|v| v.to_string())
@@ -1745,6 +2436,7 @@ async fn authorize_provider<P: Provider>(
     store: &Store,
     run_id: i64,
     approver: &dyn Approver,
+    watch: &Watch<'_>,
 ) -> Result<ProviderAccess> {
     // A provider that opens no connection (the mock providers tests drive the
     // loop with) has no endpoint to authorize.
@@ -1773,6 +2465,7 @@ async fn authorize_provider<P: Provider>(
         // Step 0: the authorization happens before the run's first step.
         let verdict = NetGuard::new(&effective)
             .tracing(store, run_id, 0)
+            .watching(watch, 0)
             .check_target(&target)?;
         if verdict.effect == Effect::Ask {
             // One human decision covers the run; the first host that needs asking
@@ -1785,20 +2478,29 @@ async fn authorize_provider<P: Provider>(
         return Ok(ProviderAccess::Granted(effective));
     };
 
+    // The run is now waiting on a human, before its first step. Step 0 for the
+    // same reason the rows below are: the authorization precedes step 1.
+    watch.emit(RunEvent::new(
+        run_id,
+        0,
+        EventKind::ApprovalRequested {
+            act: "net".into(),
+            target: target.clone(),
+        },
+    ));
     match approver.decide(&Request::new(Act::Net, &target)).await {
         Decision::Approve { .. } => {
-            store.record_event(
-                run_id,
-                &PolicyEvent::decision(0, "net", &target, "approve", "approver"),
-            )?;
+            let ev = PolicyEvent::decision(0, "net", &target, "approve", "approver");
+            store.record_event(run_id, &ev)?;
+            decided(watch, run_id, 0, &ev);
             Ok(ProviderAccess::Granted(effective))
         }
         Decision::Deny { reason } => {
-            store.record_event(
-                run_id,
-                &PolicyEvent::decision(0, "net", &target, "deny", "approver"),
-            )?;
-            store.finish_run(run_id, "refused")?;
+            let ev = PolicyEvent::decision(0, "net", &target, "deny", "approver");
+            store.record_event(run_id, &ev)?;
+            decided(watch, run_id, 0, &ev);
+            // Step 0: the run never started, so it finished having taken no steps.
+            finish(store, watch, run_id, 0, 0, "refused")?;
             Err(crate::error::Error::Refused {
                 act: "net".into(),
                 target: format!("{target} — {reason}"),
@@ -1809,12 +2511,11 @@ async fn authorize_provider<P: Provider>(
             })
         }
         Decision::Defer => {
-            store.record_event(
-                run_id,
-                &PolicyEvent::decision(0, "net", &target, "defer", "approver"),
-            )?;
+            let ev = PolicyEvent::decision(0, "net", &target, "defer", "approver");
+            store.record_event(run_id, &ev)?;
+            decided(watch, run_id, 0, &ev);
             let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
-            store.finish_run(run_id, "awaiting_approval")?;
+            finish(store, watch, run_id, 0, 0, "awaiting_approval")?;
             Ok(ProviderAccess::Pending(request_id))
         }
     }
@@ -1888,9 +2589,28 @@ async fn dispatch(
     skills: &Skills,
     cap: usize,
     memory_key: &str,
+    watch: &Watch<'_>,
+    depth: u32,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
+    // Announced before the call is made, so a watcher sees what the run is about
+    // to do rather than only what it did. The subject is whichever of the
+    // conventional argument names this tool uses; a tool that names none of them
+    // is its own subject, which is what an MCP or registered tool call is.
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::ToolCall {
+            name: call.name.clone(),
+            target: ["path", "pattern", "name_glob", "glob", "key", "name"]
+                .into_iter()
+                .find_map(s)
+                .unwrap_or(&call.name)
+                .to_string(),
+        },
+    ));
     Ok(match call.name.as_str() {
         GREP_TOOL => {
             let pattern = s("pattern").unwrap_or_default();
@@ -1951,6 +2671,16 @@ async fn dispatch(
                     format!("{key} ({} chars)", value.chars().count()),
                 ),
             )?;
+            // The key only: the row's detail carries a character count too, but
+            // that is prose about the write, not the note's identity.
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::MemoryWrote {
+                    key: key.to_string(),
+                },
+            ));
             for gone in &evicted {
                 store.record_context_event(
                     run_id,
@@ -1969,7 +2699,20 @@ async fn dispatch(
         }
         READ_FILE_TOOL => {
             let path = s("path").unwrap_or_default();
-            match gate(ws, approver, store, run_id, step, Act::Read, path, None).await? {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
                 Gated::Go {
@@ -2005,6 +2748,8 @@ async fn dispatch(
                 Act::Write,
                 path,
                 Some(content),
+                watch,
+                depth,
             )
             .await?
             {
@@ -2069,7 +2814,20 @@ async fn dispatch(
                 ));
             };
             let path = skill.path.display().to_string();
-            match gate(ws, approver, store, run_id, step, Act::Read, &path, None).await? {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                &path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
                 Gated::Go {
@@ -2107,7 +2865,20 @@ async fn dispatch(
         // sets are disjoint, so the order is documentation rather than a
         // tie-break.
         name if custom.owns(name) => {
-            match gate(ws, approver, store, run_id, step, Act::Exec, name, None).await? {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Exec,
+                name,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
                 Gated::Go { remember, .. } => {
@@ -2153,6 +2924,7 @@ async fn dispatch(
                 ev.rule = verdict.rule.clone();
                 ev.layer = verdict.layer.clone();
                 store.record_event(run_id, &ev)?;
+                refused(watch, run_id, depth, &ev);
                 let why = verdict
                     .rule
                     .as_deref()
@@ -2164,7 +2936,16 @@ async fn dispatch(
                 ));
             }
             let out = mcp
-                .call(name, &call.arguments, store, run_id, step, cap)
+                .call(
+                    name,
+                    &call.arguments,
+                    store,
+                    run_id,
+                    step,
+                    cap,
+                    watch,
+                    depth,
+                )
                 .await?;
             Dispatched::seen(
                 format!("called {name}"),
@@ -2211,6 +2992,8 @@ async fn gate(
     act: Act,
     target: &str,
     content: Option<&str>,
+    watch: &Watch<'_>,
+    depth: u32,
 ) -> Result<Gated> {
     let kind = format!("{act:?}").to_lowercase();
     // Read and write targets are workspace paths, and are resolved so a symlink
@@ -2242,6 +3025,7 @@ async fn gate(
                 ev.layer = layer;
             }
             store.record_event(run_id, &ev)?;
+            refused(watch, run_id, depth, &ev);
             let why = verdict
                 .rule
                 .as_deref()
@@ -2262,6 +3046,15 @@ async fn gate(
             if let Some(c) = content {
                 request = request.with_content(c);
             }
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::ApprovalRequested {
+                    act: kind.clone(),
+                    target: target.to_string(),
+                },
+            ));
             match approver.decide(&request).await {
                 Decision::Approve { modified, remember } => {
                     let performed = modified.unwrap_or_else(|| request.clone());
@@ -2272,6 +3065,9 @@ async fn gate(
                         ev.rule = recheck.rule.clone();
                         ev.layer = recheck.layer.clone();
                         store.record_event(run_id, &ev)?;
+                        // A refusal, not a decision: the row is a refusal too, and
+                        // the approval it overrode never took effect.
+                        refused(watch, run_id, depth, &ev);
                         return Ok(Gated::Refused {
                             decision: format!("{kind} refused after approval"),
                             obs: format!(
@@ -2285,6 +3081,7 @@ async fn gate(
                         ev = ev.with_performed(&performed.target);
                     }
                     store.record_event(run_id, &ev)?;
+                    decided(watch, run_id, depth, &ev);
                     Ok(Gated::Go {
                         target: performed.target,
                         content: performed.content,
@@ -2292,20 +3089,18 @@ async fn gate(
                     })
                 }
                 Decision::Deny { reason } => {
-                    store.record_event(
-                        run_id,
-                        &PolicyEvent::decision(step, &kind, target, "deny", "approver"),
-                    )?;
+                    let ev = PolicyEvent::decision(step, &kind, target, "deny", "approver");
+                    store.record_event(run_id, &ev)?;
+                    decided(watch, run_id, depth, &ev);
                     Ok(Gated::Refused {
                         decision: format!("{kind} denied"),
                         obs: format!("\n[{kind} denied] {target} — {reason}\n"),
                     })
                 }
                 Decision::Defer => {
-                    store.record_event(
-                        run_id,
-                        &PolicyEvent::decision(step, &kind, target, "defer", "approver"),
-                    )?;
+                    let ev = PolicyEvent::decision(step, &kind, target, "defer", "approver");
+                    store.record_event(run_id, &ev)?;
+                    decided(watch, run_id, depth, &ev);
                     let request_id = store.put_pending(run_id, step, &kind, target, content)?;
                     Ok(Gated::Paused { request_id })
                 }
@@ -2329,6 +3124,7 @@ fn memory_key(root: &Path) -> String {
 /// Call the provider, retrying a failing call up to `max_retries` times. Each
 /// failed attempt is recorded in the trace. After the limit the error is
 /// escalated (recorded, the run marked `escalated`, and returned).
+#[allow(clippy::too_many_arguments)]
 async fn complete_with_retry<P: Provider>(
     provider: &P,
     request: &CompletionRequest,
@@ -2336,6 +3132,8 @@ async fn complete_with_retry<P: Provider>(
     store: &Store,
     run_id: i64,
     step: u32,
+    watch: &Watch<'_>,
+    depth: u32,
 ) -> Result<CompletionResponse> {
     let max_retries = contract.max_retries;
     let retry = contract.retry;
@@ -2370,7 +3168,11 @@ async fn complete_with_retry<P: Provider>(
                                 e.to_string(),
                             ),
                         )?;
-                        store.finish_run(run_id, escalation_outcome(&e))?;
+                        // The step that failed never completed, so the count comes from the
+                        // trace itself — which is also what `terminal_outcome` reports
+                        // when this run is later resumed, so the two cannot disagree.
+                        let steps = store.last_step(run_id)?;
+                        finish(store, watch, run_id, depth, steps, escalation_outcome(&e))?;
                         return Err(e);
                     }
                 }
@@ -2382,6 +3184,18 @@ async fn complete_with_retry<P: Provider>(
                         e.to_string(),
                     ),
                 )?;
+                // The same `kind_of` string the row above records, so the event and
+                // the trace name the failure identically rather than nearly so.
+                watch.emit(RunEvent::at_depth(
+                    run_id,
+                    step,
+                    depth,
+                    EventKind::Retry {
+                        kind: kind_of(&e),
+                        attempt,
+                        delay_ms: wait.as_millis() as u64,
+                    },
+                ));
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
@@ -2395,7 +3209,11 @@ async fn complete_with_retry<P: Provider>(
                         e.to_string(),
                     ),
                 )?;
-                store.finish_run(run_id, escalation_outcome(&e))?;
+                // The step that failed never completed, so the count comes from the
+                // trace itself — which is also what `terminal_outcome` reports
+                // when this run is later resumed, so the two cannot disagree.
+                let steps = store.last_step(run_id)?;
+                finish(store, watch, run_id, depth, steps, escalation_outcome(&e))?;
                 return Err(e);
             }
         }

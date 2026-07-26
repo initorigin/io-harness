@@ -8,11 +8,16 @@
 //! block index here — no vendor SDK.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use serde_json::json;
 
 use super::{read_sse, CompletionRequest, CompletionResponse, Provider, ToolCall, Usage};
 use crate::error::{Error, Result};
+
+/// The request deadline this provider uses unless [`Anthropic::with_timeout`]
+/// replaces it.
+pub use crate::net::REQUEST_TIMEOUT;
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
@@ -37,6 +42,17 @@ impl Anthropic {
             model: model.into(),
             endpoint: ENDPOINT.to_string(),
         }
+    }
+
+    /// Set the deadline for one request, replacing the [`REQUEST_TIMEOUT`] default.
+    ///
+    /// For the case [`REQUEST_TIMEOUT`] names and could not serve until now: a
+    /// model slower than ten minutes per completion, or a caller who would rather
+    /// abandon a hung socket sooner than the default does. Rebuilds the client, so
+    /// call it before handing the provider to a run.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = crate::net::http_client_with_timeout(timeout);
+        self
     }
 
     /// The same provider pointed at `endpoint` with `timeout` as its deadline, so

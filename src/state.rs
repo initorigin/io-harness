@@ -15,6 +15,13 @@ use crate::error::{Error, Result};
 /// higher than this is from a newer binary and is refused on resume.
 pub const CHECKPOINT_FORMAT: i64 = 7;
 
+/// The one outcome string that means the run did what it was asked.
+///
+/// Named rather than inlined so that [`RunSummary::success`] and any future
+/// reader agree by construction. Eleven outcome strings exist; exactly one of
+/// them is the task being done.
+pub const SUCCESS_OUTCOME: &str = "success";
+
 /// The durable lifecycle status of a run, so a caller can tell a crashed run
 /// (still `Running`) from one paused for a human (`Paused`) or finished
 /// (`Completed`). OS- and rusqlite-free, so it is safe in the public API.
@@ -58,6 +65,57 @@ pub struct SpawnRow {
     pub max_steps: Option<u32>,
     /// JSON array of `deny_write` globs the parent narrowed the child with.
     pub deny_write: String,
+}
+
+/// What one finished run cost and whether it worked.
+///
+/// Written once by [`Store::finish_run`] and read back with
+/// [`Store::run_summary`]. Before 0.12.0 a consumer had to assemble this itself
+/// from three different queries plus knowledge of which of eleven outcome
+/// strings count as success — and could not get `duration_ms` at all, because
+/// nothing recorded when a run ended.
+///
+/// Serialisable, so a scoring tool can store or ship it without restating the
+/// shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunSummary {
+    /// The run this describes.
+    pub run_id: i64,
+    /// The raw outcome string, as written to `runs.outcome`.
+    ///
+    /// Kept alongside [`Self::success`] rather than replaced by it: the string
+    /// says *which* ending, the flag says whether it was the good one, and
+    /// collapsing them would throw away the distinction between a step cap, a
+    /// stall and a human's refusal.
+    pub outcome: String,
+    /// Whether the run achieved what it was asked to do.
+    ///
+    /// True for exactly one outcome — `success`. Every other ending, including
+    /// the ones that are nobody's fault like a rate-limited provider, is not the
+    /// task being done.
+    pub success: bool,
+    /// Steps completed, as `MAX(step)`.
+    ///
+    /// Not `COUNT(*)` over `steps`: a retry writes its own row under the same
+    /// step number, so counting rows counts trace entries rather than agent
+    /// steps. For a tree this is the ROOT agent's step count, not the tree's
+    /// total — each agent has its own summary.
+    pub steps: u32,
+    /// Tokens spent by this run, summed from its committed steps.
+    ///
+    /// Tokens, not money. A provider reports usage and never a price, so the
+    /// crate has nothing to convert with; see
+    /// [`Containment::max_total_cost`](crate::Containment::max_total_cost).
+    pub tokens: u64,
+    /// Wall-clock milliseconds from the run's start to its end.
+    ///
+    /// `None` for a run started before 0.7.0, which has no `started_at` to
+    /// measure from. Includes time the process was not running — a run that
+    /// crashed at midnight and resumed at nine counts the nine hours, because
+    /// that is how long the run took even though it was not working.
+    pub duration_ms: Option<u64>,
+    /// When the run ended, from the database clock.
+    pub finished_at: String,
 }
 
 /// A persisted run store. Use [`Store::open`] for a file, or [`Store::memory`]
@@ -329,8 +387,15 @@ pub struct SandboxEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"create"`, `"exec"`, `"cap_hit"`, `"net_deny"`, `"destroy"`, or
-    /// `"gate_phase_failed"` (whose `detail` names the phase).
+    /// `"create"`, `"exec"`, `"cap_hit"`, `"destroy"`, or `"gate_phase_failed"`
+    /// (whose `detail` names the phase).
+    ///
+    /// A `"net_deny"` kind was documented here from 0.6.0 to 0.11.0 and never
+    /// existed: nothing constructed it and nothing emitted it. It was removed in
+    /// 0.12.0 rather than implemented, because a sandbox denies egress
+    /// *structurally* — the backend gives the child no route out, so there is no
+    /// attempt to observe and nothing to count. Network decisions the harness
+    /// actually makes are in `policy_events` with `act = "net"`.
     pub kind: String,
     /// The backend that isolated the run (e.g. `"macos-sandbox-exec"`).
     pub backend: Option<String>,
@@ -622,8 +687,22 @@ impl ContextEvent {
         Self::of("served", step, provider)
     }
 
-    /// The agent made no progress: either it was told to change approach, or it had
-    /// already been told and the run is ending.
+    /// The agent made no progress and was told once to change approach. The run
+    /// continues.
+    ///
+    /// Split from [`Self::stalled`] in 0.12.0. Both were recorded under the one
+    /// `"stalled"` kind, distinguishable only by prose in `detail` — so anything
+    /// scoring a run could not tell "was nudged and carried on" from "gave up"
+    /// without string-matching an English sentence the crate never promised.
+    pub fn replan(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("replan", step, detail)
+    }
+
+    /// The agent made no progress, had already been told once, and the run is
+    /// ending here. Terminal.
+    ///
+    /// A nudge that did not work is [`Self::replan`]; see there for why the two
+    /// are separate kinds since 0.12.0.
     pub fn stalled(step: u32, detail: impl Into<String>) -> Self {
         Self::of("stalled", step, detail)
     }
@@ -639,10 +718,35 @@ impl ContextEvent {
     }
 }
 
+/// How long a contended statement waits for the writer before giving up, set on
+/// every store opened from a file. Without it rusqlite's default is to fail
+/// immediately with `SQLITE_BUSY`, which turns a moment of contention into an
+/// error rather than a short wait.
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
+    ///
+    /// Sets `journal_mode = WAL` and a [`BUSY_TIMEOUT`], so a second process may
+    /// read the trace while a run is still writing it without either side
+    /// blocking or aborting the other. Before 0.12.0 this was a bare
+    /// `Connection::open`, which left every reader to configure the file itself
+    /// — reaching around this API to do it, and having to do it before the
+    /// harness opened the file at all.
+    ///
+    /// WAL is a persistent property of the database file, not of this
+    /// connection: a store opened once by 0.12.0 stays in WAL mode afterwards.
+    /// That is why it is documented as a migration.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_conn(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // `query_row` rather than `execute`: this pragma returns the resulting
+        // mode as a row, and rusqlite's `execute` rejects a statement that
+        // yields rows. The returned mode is not asserted — a database on a
+        // filesystem that cannot support WAL stays in its previous journal mode
+        // and still works, just without concurrent readers.
+        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        Self::from_conn(conn)
     }
 
     /// An in-memory store, for tests and throwaway runs.
@@ -835,6 +939,41 @@ impl Store {
                  detail          TEXT,
                  est_tokens      INTEGER,
                  reported_tokens INTEGER
+             );",
+        )?;
+
+        // 0.12.0: one row per finished run, so "did it work, how long did it take,
+        // what did it cost" is one read rather than a reconstruction.
+        //
+        // Every field but the end stamp was already derivable, and derivable was
+        // not good enough: a consumer had to know that success is one of eleven
+        // free-text strings, that steps means MAX(step) and not COUNT(*) because
+        // retry rows share a step number, and that spend is SUM(steps.tokens). That
+        // is schema knowledge the crate never promised, so io-eval would have been
+        // coupled to internals from its first line.
+        //
+        // `finished_at` is the genuinely new fact. Nothing in the schema recorded
+        // when a run ENDED — only `runs.started_at` — and `Store::elapsed_secs`
+        // measures against `julianday('now')`, so it keeps growing after the run is
+        // over and cannot reconstruct a finished run's latency. Stamped from
+        // SQLite's clock for the same reason `started_at` is: the pair must come
+        // from one clock or the difference is meaningless.
+        //
+        // A separate table rather than columns on `runs`: additive, and `runs` is
+        // read by resume on the hot path. New table only, so a 0.11.0 database gains
+        // it and a 0.11.0 binary, which never queries it, still opens and resumes a
+        // migrated database. Deliberately NOT a `CHECKPOINT_FORMAT` bump — no
+        // checkpoint layout changed, and bumping it would make
+        // [`Store::check_resumable`] refuse every 0.11.0 store for an additive table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_outcomes (
+                 run_id      INTEGER PRIMARY KEY,
+                 outcome     TEXT NOT NULL,
+                 success     INTEGER NOT NULL,
+                 steps       INTEGER NOT NULL,
+                 tokens      INTEGER NOT NULL,
+                 duration_ms INTEGER,
+                 finished_at TEXT NOT NULL
              );",
         )?;
 
@@ -1438,7 +1577,78 @@ impl Store {
             "UPDATE runs SET outcome = ?1, status = ?2 WHERE id = ?3",
             (outcome, status, run_id),
         )?;
+        // A paused run has not finished — it is waiting for a human and will be
+        // resumed — so it gets no summary yet. It gets one when it really ends.
+        if status == "completed" {
+            self.write_summary(run_id, outcome)?;
+        }
         Ok(())
+    }
+
+    /// Record the run's outcome summary. Called by [`Self::finish_run`].
+    ///
+    /// Written here rather than assembled by the caller because a run that
+    /// escalates or is refused returns `Err` and never reaches a
+    /// [`RunResult`](crate::RunResult) at all — so a summary built at the call
+    /// site would be missing for exactly the endings a scoring tool most wants to
+    /// count.
+    fn write_summary(&self, run_id: i64, outcome: &str) -> Result<()> {
+        // Both stamps from the database clock, like `started_at`. Mixing SQLite's
+        // clock with the process's would make the difference meaningless.
+        let (finished_at, duration_ms): (String, Option<f64>) = self.conn.query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    (julianday('now') - julianday(started_at)) * 86400000.0
+             FROM runs WHERE id = ?1",
+            [run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let duration_ms = duration_ms.map(|ms| ms.max(0.0) as u64);
+        // `INSERT OR REPLACE`, because `finish_run` is reachable more than once for
+        // one run: a paused run resumes and finishes, and a resume of an already
+        // finished run is documented as idempotent. The last ending is the true one.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO run_outcomes
+                 (run_id, outcome, success, steps, tokens, duration_ms, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                run_id,
+                outcome,
+                i64::from(outcome == SUCCESS_OUTCOME),
+                self.last_step(run_id)?,
+                self.spent_tokens(run_id)?,
+                duration_ms,
+                &finished_at,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// What a finished run cost and whether it worked.
+    ///
+    /// `None` if the run has not finished, is paused awaiting a human, or was
+    /// finished by a pre-0.12.0 binary — a missing summary is reported as absent
+    /// rather than as a row of zeroes, which would be indistinguishable from a run
+    /// that did nothing.
+    pub fn run_summary(&self, run_id: i64) -> Result<Option<RunSummary>> {
+        let mut q = self.conn.prepare(
+            "SELECT run_id, outcome, success, steps, tokens, duration_ms, finished_at
+             FROM run_outcomes WHERE run_id = ?1",
+        )?;
+        let mut rows = q.query_map([run_id], |r| {
+            Ok(RunSummary {
+                run_id: r.get(0)?,
+                outcome: r.get(1)?,
+                success: r.get::<_, i64>(2)? != 0,
+                steps: r.get(3)?,
+                tokens: r.get(4)?,
+                duration_ms: r.get(5)?,
+                finished_at: r.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     /// Every run in this store, newest first.
@@ -1492,6 +1702,73 @@ impl Store {
     }
 
     /// Read every step of a run back, in order, as the full trace.
+    /// The run's trace reduced to the part that two identical runs must match,
+    /// as diffable text.
+    ///
+    /// This is the crate's definition of "the same run twice", and it exists
+    /// because equality could not be row identity: `steps` has no
+    /// `UNIQUE(run_id, step)` and a retry inserts its own row under the step
+    /// number the eventual commit will reuse, so counting or comparing rows
+    /// compares trace entries rather than agent behaviour.
+    ///
+    /// # What is compared
+    ///
+    /// Every `steps` row — step number, decision, result, prompt, tool call and
+    /// tokens — and every `context_events` row's step, kind and detail. Between
+    /// them these are what the agent was shown, what it decided, what it did, and
+    /// what that cost.
+    ///
+    /// # What is excluded, and why
+    ///
+    /// Everything whose value is a fact about *this* execution rather than about
+    /// the run:
+    ///
+    /// - **Wall-clock stamps** — `runs.started_at`, `memory.created_at`,
+    ///   `run_outcomes.finished_at` and `duration_ms`. Two runs of the same case
+    ///   take different amounts of time; that is not a divergence.
+    /// - **`mcp_events.millis`** — a measured duration, for the same reason.
+    /// - **`sandbox_events.detail`** — it carries the argv, and the argv carries
+    ///   an ephemeral tempdir path that is different every run by design.
+    /// - **Run and child ids** — `AUTOINCREMENT` values, meaningful only within
+    ///   one store.
+    ///
+    /// Excluding a field is a decision that this crate cannot promise it, not a
+    /// convenience. Anything added to this list should be added to this doc with
+    /// its reason, because a comparison that quietly excludes what it cannot
+    /// match is a comparison that asserts nothing.
+    ///
+    /// # What it assumes
+    ///
+    /// That each run being compared has its **own fresh store**. Run ids are
+    /// excluded from the text, but a child agent's run id is embedded in the
+    /// parent's composed observation (`[child 5 "goal" -> …]`), which is real
+    /// content the model was shown. In a fresh store those ids start at 1 and are
+    /// allocated in spawn order, so they match; in a shared store the second run's
+    /// ids are higher and the traces differ for a reason that has nothing to do
+    /// with the agent.
+    ///
+    /// Deterministic replay also requires the provider to answer identically —
+    /// see [`Replay`](crate::provider::Replay) — and the same workspace state to
+    /// start from.
+    pub fn canonical_trace(&self, run_id: i64) -> Result<String> {
+        let mut out = String::new();
+        for s in self.steps(run_id)? {
+            out.push_str(&format!(
+                "step {} | tokens {} | decision {} | tool_call {} | prompt {} | result {}\n",
+                s.step, s.tokens, s.decision, s.tool_call, s.prompt, s.result
+            ));
+        }
+        for e in self.context_events(run_id)? {
+            out.push_str(&format!(
+                "context {} | {} | {}\n",
+                e.step,
+                e.kind,
+                e.detail.as_deref().unwrap_or("")
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn steps(&self, run_id: i64) -> Result<Vec<StepRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT step, decision, result, prompt, tool_call, tokens

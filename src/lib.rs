@@ -218,6 +218,7 @@ mod contract;
 mod error;
 pub mod mcp;
 mod net;
+pub mod observe;
 pub mod policy;
 pub mod provider;
 pub mod resilience;
@@ -234,25 +235,44 @@ pub use context::ContextBudget;
 pub use contract::TaskContract;
 pub use error::{Error, ProviderErrorKind, Result};
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
+// The `net` module itself stays private, so the default request deadline is
+// surfaced here as well as from each provider module. A caller overriding it with
+// `with_timeout` should be able to name the value they are overriding without
+// reaching into a provider's namespace to find it.
+pub use net::REQUEST_TIMEOUT;
+pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
 pub use policy::{Act, Effect, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
     ToolSpec, Usage,
 };
 pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
+// Each entry point has an observed twin: a separate function rather than an extra
+// parameter on the existing seven, so 0.11.0 code compiles unchanged against
+// 0.12.0. The observer is this release's headline, not a reason to break every
+// caller that does not want one.
 pub use run::{
-    resume, resume_tree, resume_tree_with_decision, resume_with_decision, run, run_tree, run_with,
-    RunOutcome, RunResult, SPAWN_TOOL,
+    resume, resume_observed, resume_tree, resume_tree_observed, resume_tree_with_decision,
+    resume_tree_with_decision_observed, resume_with_decision, resume_with_decision_observed, run,
+    run_observed, run_tree, run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult,
+    SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
     Selected,
 };
 pub use skills::{Skill, Skills};
+// `AgentEvent` and `SpawnRow` were `pub` inside this private module but were not
+// re-exported, so `Store::agent_events` and `Store::find_spawn` returned values an
+// external caller could hold and could not name — which made `agent_events`, the
+// only audit of per-step budget draws against the shared tree ledger, unreadable
+// through the public API. Exported in 0.12.0: an observability release cannot ship
+// leaving its own audit table reachable only by opening the SQLite file.
 pub use state::{
-    CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent, RunStatus,
-    SandboxEvent, StepRecord, Store, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
-    MEMORY_MAX_ENTRY_CHARS,
+    AgentEvent, CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent,
+    RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, BUSY_TIMEOUT,
+    CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    SUCCESS_OUTCOME,
 };
 pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};
