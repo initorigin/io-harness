@@ -140,7 +140,7 @@ tasks:
   why_required: A child that cannot reach an inherited tool makes the extension point useless for the
     decomposed tasks 0.5.0 exists for, and a resume that drops the toolbox is a correctness bug that surfaces
     only after a crash — exactly the class 0.7.0 was released to eliminate.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T02
   acceptance_criteria:
@@ -158,9 +158,18 @@ tasks:
     resume-with-decision paths and the one in `resume_tree`. The field is documented as read from the
     *root* contract rather than each agent''s, so a spawned child (whose contract the model writes) cannot
     register a tool its parent never had.'
-  - 'NOT done: F6 has no test yet. A child''s inheritance is structurally true but unasserted, and the
-    contract''s own cost-driver note says the resume paths must be covered rather than the happy path
-    alone. This is the next task to pick up.'
+  - 'F6 green — `a_spawned_child_inherits_the_toolbox_and_the_call_is_its_own`: the child''s `CompletionRequest.tools`
+    carries `lookup_order` and its system prompt names it, the child runs the *parent''s* single registered
+    instance (asserted on the `Arc` the parent holds, not a copy), the result reaches the child''s next
+    turn, and the call is in the child''s `store.steps(child_run)` and absent from the parent''s.'
+  - 'The resume path is covered too, as the contract''s cost-driver note required — `a_toolbox_survives_a_tree_resume_and_still_reaches_a_child`:
+    leg 1 stops at a step cap, leg 2 re-registers the same tool through `Toolbox::with_arc` as a restarted
+    caller would and calls `resume_tree`, and the resumed root''s child still reaches the tool with the
+    call traced under its own run.'
+  - 'Both tests were watched failing before being relied on: in a scratch copy of the crate with `run_agent`''s
+    `tree.tools` use broken, each fails with the built-in-only tool list and the other 10 tests in the
+    file stay green — proving they were not already covered. `cargo test --test custom_tools`: 12 passed,
+    0 failed.'
 - id: US-IO-HARNESS-0.9.0-T04
   summary: 'Discover skills from a directory: `<dir>/<name>.md` and `<dir>/<name>/SKILL.md`, an in-crate
     frontmatter reader for optional `name`/`description` with fallback to the file stem and first prose
@@ -170,7 +179,7 @@ tasks:
     description, and a non-ASCII body.'
   why_required: Skills are half the release, and a discovery step that silently truncates or silently
     accepts a malformed file would give a caller a set they believe is complete and is not.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T01
   acceptance_criteria:
@@ -209,9 +218,24 @@ tasks:
     the description, absent frontmatter, unterminated frontmatter (treated as no frontmatter, whole file
     is body), heading-derived fallback description, a non-ASCII body, and clamping a long description
     at a char boundary.'
-  - 'NOT done: `TaskContract::with_skills(dir)` is not added, so nothing reaches a run yet, and F7/F9
-    have no integration tests. `READ_SKILL_TOOL` is already reserved and its arbitration is covered by
-    T01''s F3.'
+  - '`TaskContract::with_skills(dir)` added, storing `skills: Option<PathBuf>` — the path, not the discovered
+    set. `with_tools` can store a whole `Toolbox` because `validate()` is a separate fallible call; a
+    builder method cannot return `Result`, and for skills the fallible step *is* discovery, so `pub(crate)
+    fn discover_skills()` is the exact analogue of `Toolbox::validate()`: same call site, same error type,
+    same before-a-run-row-exists guarantee.'
+  - '`contract.discover_skills()?` is called immediately after `contract.tools.validate()?` at all six
+    entry points (`run_with`, `resume`, `resume_with_decision`, `resume_tree_with_decision`, `run_tree`,
+    `resume_tree`).'
+  - 'F7 green (discovery half) — 3 tests in tests/skills.rs: `alpha.md` + `beta/SKILL.md` yield exactly
+    two skills (a `notes.txt` and a `SKILL.md`-less subdirectory ignored), derived name/description fall
+    back to the stem/dirname and first prose line, frontmatter `name:`/`description:` override both, and
+    `catalog()` carries the two lines and never a body. The prompt half is T05''s.'
+  - 'F9 green — 4 tests driving `run_with` with a counting mock provider: a missing path, a path that
+    is not a directory, and a directory of `MAX_SKILLS + 1` files each return `Error::Config` naming the
+    path with the provider''s call count at 0, plus a positive control proving a usable directory lets
+    the run start (calls == 1) — a gate, not a wall.'
+  - NF1 held — no runtime dependency added; tests reuse the existing `tempfile` and `tokio`. Full suite
+    216 passed / 0 failed, clippy `-D warnings` clean, `cargo fmt --check` exit 0.
 - id: US-IO-HARNESS-0.9.0-T05
   summary: Put skill names and descriptions — and not bodies — into the system prompt, and offer a built-in
     `read_skill` tool that loads exactly one body into the observations on demand, as a policy-checked
