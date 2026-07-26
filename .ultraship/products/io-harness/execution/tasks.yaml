@@ -300,7 +300,7 @@ tasks:
     discovery over a 32-skill directory, confirmed to run once per run rather than once per step.'
   why_required: NF3 is a stated acceptance criterion with numbers in it. Unmeasured, it is an assertion,
     and the release would be claiming a bound nobody checked.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T03
   - US-IO-HARNESS-0.9.0-T05
@@ -314,7 +314,32 @@ tasks:
   files:
   - tests/custom_tools.rs
   - .ultraship/products/io-harness/evidence/0.9.0/latency.txt
-  evidence: []
+  evidence:
+  - 'NF3 measured, not asserted. Three tests, no new dependency (`std::time::Instant` + `black_box`):
+    `dispatching_a_registered_tool_costs_under_a_millisecond_over_a_direct_call`, `discovery_over_a_32_skill_directory_is_under_50ms`,
+    and `discovery_happens_once_per_run_not_once_per_step`. Bounds asserted are the criterion''s own
+    (1 ms, 50 ms), not tuned to the machine.'
+  - 'Measured on Apple M1 / macOS 26.5.2 / rustc 1.95.0, three runs each: dispatch overhead 0.442-0.453
+    ms per call debug and 0.059-0.072 ms release; 32-skill discovery 2.28-3.19 ms debug, 1.87-2.58 ms
+    release. NF3 holds on both profiles.'
+  - 'The honest finding, recorded rather than rounded away: the dispatch figure is dominated by `Policy::check(Act::Exec,
+    name)` recompiling its globs to a regex on every call (the standing `ponytail:` note at src/policy.rs:384)
+    — ~440 us/call debug against a three-rule policy. The tool layer''s own share (name scan, `dyn` dispatch,
+    boxed future, Arc) is ~9 us debug and ~3-6 us release. So the debug margin is 2.2x rather than orders
+    of magnitude, and it scales with the number of exec rules; if it ever needs to grow, the fix is caching
+    compiled globs in the policy, not in the tool layer.'
+  - 'What the number measures is stated in the test and the evidence: `Toolbox::owns` -> `Policy::check`
+    -> `Toolbox::get` -> `Tool::invoke().await`, in the order `dispatch` uses them, with `echo` registered
+    last so both O(n) scans are timed in their worst position. It is deliberately NOT a full run-loop
+    turn, which would let prompt building, the provider and the SQLite commit flatter the claim.'
+  - '"Once per run, not once per step" is proved behaviourally, not only structurally: a real run writes
+    `skills/gamma.md` into its own skills directory at step 1 via the ordinary `write_file` tool, and at
+    step 2 no system prompt mentions gamma and `read_skill` answers "there is no skill named". Corroborated
+    by call-site structure — `discover_skills()` appears at all six entry points and never inside the step
+    loop.'
+  - Recorded in .ultraship/products/io-harness/evidence/0.9.0/latency.txt (machine, OS, rustc, debug vs
+    release, and the reproduce commands). The evidence directory is gitignored, as it has been for every
+    prior release.
 - id: US-IO-HARNESS-0.9.0-T07
   summary: 'Run the release gates: the full test suite, `cargo clippy --all-targets -- -D warnings`, `cargo
     fmt --check`, a build at the declared MSRV, and the three-OS matrix. Include a test that builds and
@@ -349,7 +374,7 @@ tasks:
   why_required: The contract's third risk is a developer reading registration as a grant, or believing
     the policy sandboxes what their tool does. That misreading is prevented by documentation or not at
     all.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T05
   acceptance_criteria:
@@ -364,7 +389,19 @@ tasks:
   - README.md
   - CHANGELOG.md
   - docs/CAPABILITIES.md
-  evidence: []
+  evidence:
+  - 'O2 green. src/lib.rs gained three paragraphs after the v0.8 refusal note, matching the existing per-version
+    shape: the in-process tool layer, skills, and the boundary. The boundary paragraph opens with the same
+    "What it does **not** govern:" framing v0.8 uses and states that a registered tool runs in the harness''s
+    own process with the embedding program''s privileges, that the policy governs whether it is *called*
+    and not what it does once running (no sandbox, no path scoping, no egress control), that this is exactly
+    the bound v0.8 states for a stdio MCP server, and that a skill is instructions with no execution of
+    its own.'
+  - CHANGELOG.md carries the 0.9.0 section (Added / Changed / Fixed / Security) with the privilege bound
+    under Security; README.md gained the v0.9 section with a sample per extension point and the same boundary
+    wording; docs/CAPABILITIES.md moves the tool-layer row to shipped.
+  - '`cargo test --doc` stays at 3 passing doc-tests; `cargo doc --no-deps` adds no new warning (the two
+    it reports are pre-existing private-link warnings in the provider modules).'
 - id: US-IO-HARNESS-0.9.0-T09
   summary: 'Ship both extension points as runnable examples in the style of the existing ones: `examples/custom_tool.rs`
     registering a tool whose answer exists nowhere on disk, and `examples/skills_run.rs` pointing at a
@@ -406,7 +443,7 @@ tasks:
   why_required: F11 is the only acceptance criterion produced by a model rather than by the suite. The
     0.8.1 release shipped 186 passing offline tests against a build a real run rejected in four steps;
     the live run is what catches that class of defect.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T07
   - US-IO-HARNESS-0.9.0-T09
@@ -422,4 +459,32 @@ tasks:
   - examples/custom_tool.rs
   - examples/skills_run.rs
   - .ultraship/products/io-harness/evidence/0.9.0/live_run.txt
-  evidence: []
+  evidence:
+  - 'F11 green on the first attempt, both halves, two live API calls total. `examples/live_f11.rs` runs
+    either half from argv, matching the repo''s convention that live evidence comes from an example.'
+  - 'The design isolates the two extension points: the datum (quay `Kattegat`, draft `11.6`, window `0430`)
+    exists only inside `BerthTable::invoke()` — not on disk, not in the goal, not in the criterion — and
+    the required shape (three labelled fields in a fixed order) exists only inside the `berth-record` skill
+    body, whose catalogue description deliberately withholds the format. A second skill is a distractor;
+    its body was never read.'
+  - 'The contract''s own risk register called the criterion the fiddly part, and it was: `Verification::describe()`
+    is fed to the model verbatim, so any literal needle in it is a needle the CONTROL could copy, which
+    would make the control pass and the evidence worthless. The criterion is therefore an FNV-1a digest
+    of `record()` over alphanumerics only — one-way, so the constant discloses neither datum nor shape,
+    and case/punctuation-insensitive, so it pins the values, labels and order without becoming a whitespace
+    quiz. Verified offline with `rustc --test` before any money was spent.'
+  - 'Positive run: `Success { steps: 3 }`. Step 1 carries both extension points — `read_skill:{"name":"berth-record"}`
+    and `lookup_berth:{"id":"BRT-2291"}` — and step 3 wrote `quay=Kattegat; draft=11.6; window=0430`,
+    the skill''s shape filled with the tool''s values character for character, not merely inside the digest''s
+    tolerance. No refusals.'
+  - 'Negative control: `StepCapReached { steps: 6 }`, and the trace says why it failed. It searched for
+    exactly the two things removed and found neither — `grep "skill"` 0 hits, `find "*skill*"` 0 paths
+    (`read_skill` is not offered when no skills are configured), and `grep` for `lookup_berth`, `BRT-2291`,
+    `BRT` and `berth` all 0 hits. Told to invent neither, it never wrote the file. Ruled out: no crash
+    (six committed steps, ordinary cap), no refusal (empty refusal set in both runs), not an unsatisfiable
+    criterion (the same criterion and model passed minutes earlier), not a malformed prompt (goal byte-identical).
+    The single difference is `with_tools`/`with_skills`.'
+  - 'Both runs recorded in .ultraship/products/io-harness/evidence/0.9.0/live_run.txt with provider, model,
+    date, the full contract, both traces and both produced files. No harness defect found; one example-hygiene
+    note (the examples open `runs.db` inside the workspace the agent may read, which cost the control two
+    steps of noise) is recorded there.'
