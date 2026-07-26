@@ -138,6 +138,50 @@
 //! denied host or an unstartable server fails the run with [`Error::Refused`] or
 //! [`Error::Mcp`] before anything happens.
 //!
+//! v0.9 closes the tool layer by adding the **in-process** half. Implement the
+//! object-safe [`Tool`] trait for something the embedding program already knows
+//! how to do — [`spec`](Tool::spec) returns the same vendor-neutral [`ToolSpec`]
+//! the built-ins and MCP tools are described by, [`invoke`](Tool::invoke) takes
+//! the arguments the model sent and returns a boxed [`ToolFuture`] — collect them
+//! in a [`Toolbox`], and register it with [`TaskContract::with_tools`], which
+//! mirrors [`with_mcp`](TaskContract::with_mcp). They are offered to the model
+//! beside `grep`, `find`, `read_file`, and `write_file`, with no second process,
+//! transport, or serialization hop for a function that is one `await` away. A
+//! registered tool may not take a built-in's name, may not use the `mcp__` prefix
+//! reserved for server tools, may not be nameless, and two may not share a name:
+//! each is an [`Error::Config`] raised before the provider is called once, not a
+//! silent shadowing found at dispatch. Registration makes a tool *available*; it
+//! does not authorize it — every call is an [`Act::Exec`] check on the tool's
+//! name under the same deny-first v0.4 stack that decides paths, binaries, and
+//! hosts, so an operator can hand an agent a toolbox and still refuse one tool in
+//! it. A v0.5 child inherits the toolbox and calls it under its own narrowed
+//! policy.
+//!
+//! Alongside it, **skills**: [`TaskContract::with_skills`] points the run at a
+//! directory of markdown instruction files that shape *how* the agent approaches
+//! a class of task, without touching Rust. Both conventions in common use are
+//! discovered — `<dir>/<name>.md` and `<dir>/<name>/SKILL.md` — with optional
+//! YAML frontmatter supplying `name` and `description`, falling back to the file
+//! stem (or the containing directory, for a `SKILL.md`) and the first prose line.
+//! Names and descriptions go into the system prompt, never bodies; the agent
+//! loads the one it judges relevant through the built-in
+//! [`read_skill`](tools::READ_SKILL_TOOL) tool, which is offered only when a
+//! contract configures skills and reads that file as an ordinary policy-checked
+//! [`Act::Read`]. A missing path, a path that is not a directory, more than
+//! [`MAX_SKILLS`](skills::MAX_SKILLS), or two skills with the same name is an
+//! [`Error::Config`] at run start — a rejected set, not a silently truncated one.
+//!
+//! What it does **not** govern: a registered tool runs in the harness's own
+//! process, with the embedding program's privileges. The policy governs whether
+//! it is *called*; it does not govern what it does once running — no sandbox, no
+//! path scoping, and no egress control applies inside it. This is exactly the
+//! bound v0.8 states for a stdio MCP server, and for the same reason: the harness
+//! decides what starts, not what a started thing then does. A skill is
+//! instructions with no execution of its own — a skill saying "run `rm -rf /`" is
+//! a sentence the model reads, and any action it then takes passes the same
+//! policy every other action does. Anything that should actually *do* something
+//! is a [`Tool`], where the permission layer can see it.
+//!
 //! v0.3 adds repository work: [`TaskContract::workspace`] runs a multi-tool loop
 //! where the agent greps, finds, reads, and writes several files under one root,
 //! verified together ([`Verification::WorkspaceTestPasses`]). It also adds the
@@ -177,29 +221,33 @@ pub mod policy;
 pub mod provider;
 mod run;
 pub mod sandbox;
+pub mod skills;
 mod state;
 pub mod tools;
 mod verify;
 
+pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
+pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use contract::TaskContract;
 pub use error::{Error, Result};
+pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
+pub use policy::{Act, Effect, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
     ToolSpec, Usage,
 };
-pub use policy::{Act, Effect, Policy, Rule, Verdict};
-pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
-pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
 pub use run::{
     resume, resume_tree, resume_tree_with_decision, resume_with_decision, run, run_tree, run_with,
     RunOutcome, RunResult, SPAWN_TOOL,
 };
+pub use sandbox::{
+    copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
+    Selected,
+};
+pub use skills::{Skill, Skills};
 pub use state::{
     CheckpointEvent, McpEvent, Pending, PolicyEvent, RunStatus, SandboxEvent, StepRecord, Store,
     CHECKPOINT_FORMAT,
 };
-pub use sandbox::{
-    copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome, Selected,
-};
-pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
+pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

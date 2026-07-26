@@ -6,8 +6,13 @@
 //! cfg-gated to `target_os = "linux"`; compiled and unit-tested on the macOS
 //! build host under its cfg but **not live-run here** (see the 0.6.0 contract's
 //! excluded scope). Seccomp tightening is layered by the kernel default under
-//! the unprivileged user namespace; a hardened kernel without unprivileged user
-//! namespaces degrades to the portable floor at [`super::select`] time.
+//! the unprivileged user namespace.
+//!
+//! Note what this backend does **not** do: it never probes for `unshare`, and
+//! [`super::select`] returns it unconditionally on Linux rather than falling back
+//! to the floor. On a kernel with unprivileged user namespaces disabled — or a
+//! host without `unshare(1)` — the wrapper fails at spawn time instead of
+//! degrading; there is no runtime capability check yet.
 
 use super::{run_capped, Backend, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::Result;
@@ -60,13 +65,21 @@ mod tests {
     #[test]
     fn denies_network_with_a_new_net_namespace() {
         let argv = unshare_argv(&["echo".into(), "hi".into()], false);
-        assert!(argv.contains(&"--net".into()), "net namespace must isolate network by default");
-        assert!(argv.windows(2).any(|w| w == ["--".to_string(), "echo".to_string()]));
+        assert!(
+            argv.contains(&"--net".into()),
+            "net namespace must isolate network by default"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--".to_string(), "echo".to_string()]));
     }
 
     #[test]
     fn allows_network_when_asked() {
         let argv = unshare_argv(&["echo".into()], true);
-        assert!(!argv.contains(&"--net".into()), "no net namespace when network is allowed");
+        assert!(
+            !argv.contains(&"--net".into()),
+            "no net namespace when network is allowed"
+        );
     }
 }

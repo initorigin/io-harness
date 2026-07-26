@@ -84,8 +84,14 @@ impl Provider for Dialer {
         Some(&self.url)
     }
 
-    async fn complete(&self, _request: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        let authority = self.url.trim_start_matches("http://").trim_end_matches("/v1");
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> io_harness::Result<CompletionResponse> {
+        let authority = self
+            .url
+            .trim_start_matches("http://")
+            .trim_end_matches("/v1");
         let _stream = tokio::net::TcpStream::connect(authority)
             .await
             .map_err(|e| Error::Provider(e.to_string()))?;
@@ -153,7 +159,14 @@ async fn a_refusal_is_recorded_in_the_trace() {
         .allow_write("*")
         .deny_net("127.0.0.1");
 
-    let _ = run_with(&contract(dir.path()), &provider, &store, &policy, &ApproveAll).await;
+    let _ = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+    )
+    .await;
 
     // The run id is 1 — the only run in a fresh in-memory store.
     let events = store.events(1).unwrap();
@@ -174,14 +187,26 @@ async fn a_deny_all_base_still_reaches_its_provider_through_the_provider_layer()
     let store = Store::memory().unwrap();
     let provider = Dialer::new(sink.url());
     // No allow_net anywhere: the caller never names its provider's host.
-    let policy = Policy::default().layer("app").allow_read("*").allow_write("*");
+    let policy = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*");
     assert_eq!(policy.defaults.net, Effect::Deny);
 
-    let result = run_with(&contract(dir.path()), &provider, &store, &policy, &ApproveAll)
-        .await
-        .unwrap();
+    let result = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
 
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
     assert!(sink.connections() >= 1, "the provider should have dialled");
 
     let allowed = store
@@ -206,9 +231,15 @@ async fn denying_your_own_provider_is_legal_and_fails_as_a_refusal() {
         .allow_write("*")
         .deny_net("127.0.0.1");
 
-    let err = run_with(&contract(dir.path()), &provider, &store, &policy, &ApproveAll)
-        .await
-        .unwrap_err();
+    let err = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+    )
+    .await
+    .unwrap_err();
 
     assert!(matches!(&err, Error::Refused { act, .. } if act == "net"));
     assert_eq!(sink.connections(), 0);
@@ -227,11 +258,20 @@ async fn an_ask_on_the_network_is_approved_and_dials() {
         .allow_write("*")
         .ask_net("127.0.0.1");
 
-    let result = run_with(&contract(dir.path()), &provider, &store, &policy, &ApproveAll)
-        .await
-        .unwrap();
+    let result = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
 
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
     assert_eq!(
         sink.connections(),
         1,
@@ -314,7 +354,10 @@ async fn a_deferred_network_decision_persists_and_resumes() {
     .await
     .unwrap();
 
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
     assert!(sink.connections() >= 1, "the resumed run dialled");
 }
 
@@ -325,10 +368,7 @@ async fn a_deferred_network_decision_persists_and_resumes() {
 async fn a_provider_with_no_endpoint_runs_under_a_network_deny_policy() {
     struct Offline(AtomicUsize);
     impl Provider for Offline {
-        async fn complete(
-            &self,
-            _r: CompletionRequest,
-        ) -> io_harness::Result<CompletionResponse> {
+        async fn complete(&self, _r: CompletionRequest) -> io_harness::Result<CompletionResponse> {
             let first = self.0.fetch_add(1, Ordering::SeqCst) == 0;
             Ok(CompletionResponse {
                 tool_calls: if first {
@@ -346,7 +386,10 @@ async fn a_provider_with_no_endpoint_runs_under_a_network_deny_policy() {
 
     let dir = workspace();
     let store = Store::memory().unwrap();
-    let policy = Policy::default().layer("app").allow_read("*").allow_write("*");
+    let policy = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*");
     let result = run_with(
         &contract(dir.path()),
         &Offline(AtomicUsize::new(0)),
@@ -356,7 +399,10 @@ async fn a_provider_with_no_endpoint_runs_under_a_network_deny_policy() {
     )
     .await
     .unwrap();
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
     assert!(
         !store.events(1).unwrap().iter().any(|e| e.act == "net"),
         "no connection, no network verdict"
@@ -370,6 +416,9 @@ fn a_net_rule_does_not_govern_paths_and_a_path_rule_does_not_govern_hosts() {
         .layer("l")
         .allow_net("api.example.com")
         .deny_write("api.example.com");
-    assert_eq!(p.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
+    assert_eq!(
+        p.check(Act::Net, "api.example.com:443").effect,
+        Effect::Allow
+    );
     assert_eq!(p.check(Act::Write, "api.example.com").effect, Effect::Deny);
 }

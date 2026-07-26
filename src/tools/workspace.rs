@@ -81,7 +81,10 @@ impl Workspace {
         // The canonical form, when it differs and still lands inside the root.
         if let Ok(abs) = self.resolve(rel) {
             if let Ok(canon) = abs.canonicalize() {
-                let root_canon = self.root.canonicalize().unwrap_or_else(|_| self.root.clone());
+                let root_canon = self
+                    .root
+                    .canonicalize()
+                    .unwrap_or_else(|_| self.root.clone());
                 if let Ok(rel_canon) = canon.strip_prefix(&root_canon) {
                     let rel_canon = rel_canon.to_string_lossy().replace('\\', "/");
                     let v = self.policy.check(act, &rel_canon);
@@ -293,7 +296,11 @@ mod tests {
         std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::create_dir_all(root.join("target")).unwrap();
         std::fs::write(root.join("src/a.rs"), "pub fn alpha() -> u32 { 1 }\n").unwrap();
-        std::fs::write(root.join("src/b.rs"), "pub fn beta() -> u32 { 2 }\n// alpha ref\n").unwrap();
+        std::fs::write(
+            root.join("src/b.rs"),
+            "pub fn beta() -> u32 { 2 }\n// alpha ref\n",
+        )
+        .unwrap();
         std::fs::write(root.join("README.md"), "# alpha and beta\n").unwrap();
         std::fs::write(root.join("target/junk.rs"), "fn alpha() {}\n").unwrap();
         dir
@@ -381,7 +388,9 @@ mod tests {
             "original"
         );
         // An in-policy write still succeeds.
-        assert!(ws.write_file("src/a.rs", "pub fn alpha() -> u32 { 9 }\n").is_ok());
+        assert!(ws
+            .write_file("src/a.rs", "pub fn alpha() -> u32 { 9 }\n")
+            .is_ok());
     }
 
     #[test]
@@ -474,7 +483,11 @@ mod tests {
         // No policy means no enforcement — the boundary is opt-in.
         assert!(ws.write_file("secrets/key.txt", "y").is_ok());
         assert!(ws.read_file("secrets/key.txt").is_ok());
-        assert!(ws.find("*.txt").unwrap().iter().any(|p| p.starts_with("secrets/")));
+        assert!(ws
+            .find("*.txt")
+            .unwrap()
+            .iter()
+            .any(|p| p.starts_with("secrets/")));
     }
 
     #[test]

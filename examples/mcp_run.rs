@@ -45,7 +45,10 @@ fn fixture_server() -> PathBuf {
     if !dir.ends_with("examples") {
         dir.push("examples");
     }
-    dir.join(format!("mcp_fixture_server{}", std::env::consts::EXE_SUFFIX))
+    dir.join(format!(
+        "mcp_fixture_server{}",
+        std::env::consts::EXE_SUFFIX
+    ))
 }
 
 #[tokio::main]
@@ -107,7 +110,11 @@ async fn main() -> io_harness::Result<()> {
             e.millis.map(|m| format!(" ({m}ms)")).unwrap_or_default()
         );
     }
-    for e in store.events(result.run_id)?.iter().filter(|e| e.kind == "refusal") {
+    for e in store
+        .events(result.run_id)?
+        .iter()
+        .filter(|e| e.kind == "refusal")
+    {
         println!(
             "  refused: {} {} (rule {})",
             e.act,
@@ -115,7 +122,11 @@ async fn main() -> io_harness::Result<()> {
             e.rule.clone().unwrap_or_else(|| "-".into())
         );
     }
-    for e in store.events(result.run_id)?.iter().filter(|e| e.act == "net") {
+    for e in store
+        .events(result.run_id)?
+        .iter()
+        .filter(|e| e.act == "net")
+    {
         println!(
             "  net: {} {} (layer {})",
             e.kind,
@@ -142,7 +153,9 @@ async fn main() -> io_harness::Result<()> {
 
     let store2 = Store::open(dir.path().join("runs2.db"))?;
     match run_with(&denied, &provider, &store2, &policy, &ApproveAll).await {
-        Err(Error::Refused { act, target, layer, .. }) => {
+        Err(Error::Refused {
+            act, target, layer, ..
+        }) => {
             println!(
                 "  refused before dialling: {act} {target} (layer {})",
                 layer.unwrap_or_else(|| "default".into())

@@ -90,7 +90,10 @@ async fn main() -> io_harness::Result<()> {
     // still succeed at the part it is allowed to do.
     if matches!(result.outcome, RunOutcome::Success { .. }) {
         println!("\nverified, and the secret was never read:");
-        println!("  {}", std::fs::read_to_string(dir.path().join("secrets/key.txt"))?);
+        println!(
+            "  {}",
+            std::fs::read_to_string(dir.path().join("secrets/key.txt"))?
+        );
     }
     Ok(())
 }

@@ -49,14 +49,29 @@ async fn main() -> io_harness::Result<()> {
 
     // 2) A resource cap kills a runaway instead of hanging.
     let cfg = SandboxConfig {
-        limits: SandboxLimits { max_cpu_secs: Some(1), max_wall_secs: Some(20), ..Default::default() },
+        limits: SandboxLimits {
+            max_cpu_secs: Some(1),
+            max_wall_secs: Some(20),
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let busy: Vec<String> = ["sh", "-c", "while :; do :; done"].iter().map(|s| s.to_string()).collect();
+    let busy: Vec<String> = ["sh", "-c", "while :; do :; done"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let capped = select(&cfg)
-        .run(RunSpec { argv: &busy, workdir: dir.path(), limits: &cfg.limits, allow_network: false })
+        .run(RunSpec {
+            argv: &busy,
+            workdir: dir.path(),
+            limits: &cfg.limits,
+            allow_network: false,
+        })
         .await?;
-    println!("\ncap demo: cap_hit = {:?} (a runaway was killed, not left hanging)", capped.cap_hit);
+    println!(
+        "\ncap demo: cap_hit = {:?} (a runaway was killed, not left hanging)",
+        capped.cap_hit
+    );
 
     // 3) Network is denied by default — enforced by the sandbox, not the prompt.
     let curl: Vec<String> = ["curl", "-s", "-m", "5", "https://example.com"]
@@ -71,10 +86,15 @@ async fn main() -> io_harness::Result<()> {
             allow_network: false,
         })
         .await?;
-    println!("network demo: outbound allowed = {} (default-deny)", net.success());
+    println!(
+        "network demo: outbound allowed = {} (default-deny)",
+        net.success()
+    );
 
     if matches!(result.outcome, RunOutcome::Success { .. }) {
-        println!("\nverified — the model's code compiled inside the sandbox, and every workdir is gone.");
+        println!(
+            "\nverified — the model's code compiled inside the sandbox, and every workdir is gone."
+        );
     }
     Ok(())
 }

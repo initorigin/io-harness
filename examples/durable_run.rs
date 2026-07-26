@@ -51,6 +51,9 @@ async fn main() -> io_harness::Result<()> {
     println!(
         "[process 2] {checkpoints} step(s) checkpointed, {skipped} skipped as already-done on resume",
     );
-    println!("[process 2] final status = {:?}", store.run_status(run_id)?.unwrap());
+    println!(
+        "[process 2] final status = {:?}",
+        store.run_status(run_id)?.unwrap()
+    );
     Ok(())
 }

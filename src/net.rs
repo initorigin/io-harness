@@ -187,9 +187,15 @@ mod tests {
     #[test]
     fn a_url_becomes_host_and_port() {
         for (url, want) in [
-            ("https://api.openai.com/v1/chat/completions", "api.openai.com:443"),
+            (
+                "https://api.openai.com/v1/chat/completions",
+                "api.openai.com:443",
+            ),
             ("http://127.0.0.1:8931/mcp", "127.0.0.1:8931"),
-            ("https://openrouter.ai/api/v1/chat/completions", "openrouter.ai:443"),
+            (
+                "https://openrouter.ai/api/v1/chat/completions",
+                "openrouter.ai:443",
+            ),
             ("http://example.com", "example.com:80"),
             ("https://example.com:8443/x?y=1#z", "example.com:8443"),
             ("https://user:pw@example.com/x", "example.com:443"),
@@ -202,7 +208,13 @@ mod tests {
 
     #[test]
     fn an_uncheckable_url_is_refused_not_waved_through() {
-        for url in ["", "not a url", "file:///etc/passwd", "https://", "https://host:/x"] {
+        for url in [
+            "",
+            "not a url",
+            "file:///etc/passwd",
+            "https://",
+            "https://host:/x",
+        ] {
             assert_eq!(target(url), None, "{url}");
             let p = Policy::permissive();
             // Even a policy that allows everything cannot allow what it cannot see.
@@ -236,6 +248,9 @@ mod tests {
         assert_eq!(v.layer.as_deref(), Some(PROVIDER_LAYER));
 
         let locked = with_provider.layer("caller").deny_net("api.example.com");
-        assert_eq!(locked.check(Act::Net, "api.example.com:443").effect, Effect::Deny);
+        assert_eq!(
+            locked.check(Act::Net, "api.example.com:443").effect,
+            Effect::Deny
+        );
     }
 }
