@@ -247,9 +247,15 @@ pub use provider::{
     ToolSpec, Usage,
 };
 pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
+// Each entry point has an observed twin: a separate function rather than an extra
+// parameter on the existing seven, so 0.11.0 code compiles unchanged against
+// 0.12.0. The observer is this release's headline, not a reason to break every
+// caller that does not want one.
 pub use run::{
-    resume, resume_tree, resume_tree_with_decision, resume_with_decision, run, run_tree, run_with,
-    RunOutcome, RunResult, SPAWN_TOOL,
+    resume, resume_observed, resume_tree, resume_tree_observed, resume_tree_with_decision,
+    resume_tree_with_decision_observed, resume_with_decision, resume_with_decision_observed, run,
+    run_observed, run_tree, run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult,
+    SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,

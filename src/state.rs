@@ -1702,6 +1702,73 @@ impl Store {
     }
 
     /// Read every step of a run back, in order, as the full trace.
+    /// The run's trace reduced to the part that two identical runs must match,
+    /// as diffable text.
+    ///
+    /// This is the crate's definition of "the same run twice", and it exists
+    /// because equality could not be row identity: `steps` has no
+    /// `UNIQUE(run_id, step)` and a retry inserts its own row under the step
+    /// number the eventual commit will reuse, so counting or comparing rows
+    /// compares trace entries rather than agent behaviour.
+    ///
+    /// # What is compared
+    ///
+    /// Every `steps` row — step number, decision, result, prompt, tool call and
+    /// tokens — and every `context_events` row's step, kind and detail. Between
+    /// them these are what the agent was shown, what it decided, what it did, and
+    /// what that cost.
+    ///
+    /// # What is excluded, and why
+    ///
+    /// Everything whose value is a fact about *this* execution rather than about
+    /// the run:
+    ///
+    /// - **Wall-clock stamps** — `runs.started_at`, `memory.created_at`,
+    ///   `run_outcomes.finished_at` and `duration_ms`. Two runs of the same case
+    ///   take different amounts of time; that is not a divergence.
+    /// - **`mcp_events.millis`** — a measured duration, for the same reason.
+    /// - **`sandbox_events.detail`** — it carries the argv, and the argv carries
+    ///   an ephemeral tempdir path that is different every run by design.
+    /// - **Run and child ids** — `AUTOINCREMENT` values, meaningful only within
+    ///   one store.
+    ///
+    /// Excluding a field is a decision that this crate cannot promise it, not a
+    /// convenience. Anything added to this list should be added to this doc with
+    /// its reason, because a comparison that quietly excludes what it cannot
+    /// match is a comparison that asserts nothing.
+    ///
+    /// # What it assumes
+    ///
+    /// That each run being compared has its **own fresh store**. Run ids are
+    /// excluded from the text, but a child agent's run id is embedded in the
+    /// parent's composed observation (`[child 5 "goal" -> …]`), which is real
+    /// content the model was shown. In a fresh store those ids start at 1 and are
+    /// allocated in spawn order, so they match; in a shared store the second run's
+    /// ids are higher and the traces differ for a reason that has nothing to do
+    /// with the agent.
+    ///
+    /// Deterministic replay also requires the provider to answer identically —
+    /// see [`Replay`](crate::provider::Replay) — and the same workspace state to
+    /// start from.
+    pub fn canonical_trace(&self, run_id: i64) -> Result<String> {
+        let mut out = String::new();
+        for s in self.steps(run_id)? {
+            out.push_str(&format!(
+                "step {} | tokens {} | decision {} | tool_call {} | prompt {} | result {}\n",
+                s.step, s.tokens, s.decision, s.tool_call, s.prompt, s.result
+            ));
+        }
+        for e in self.context_events(run_id)? {
+            out.push_str(&format!(
+                "context {} | {} | {}\n",
+                e.step,
+                e.kind,
+                e.detail.as_deref().unwrap_or("")
+            ));
+        }
+        Ok(out)
+    }
+
     pub fn steps(&self, run_id: i64) -> Result<Vec<StepRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT step, decision, result, prompt, tool_call, tokens
