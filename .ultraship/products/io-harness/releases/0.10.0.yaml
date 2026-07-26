@@ -1,425 +1,668 @@
 product: io-harness
 version: 0.10.0
-status: planned
+status: released
 release_type: minor
 outcome:
-  user_can: >
-    A developer runs a long task and the agent's context stays relevant instead of merely growing.
-    Today it only grows: `src/run.rs:775` (workspace) and `src/run.rs:1122` (sub-agent) each declare
-    `let mut observations = String::new()`, every tool result, bare model message and composed child
-    result is appended to it (`src/run.rs:838`, `1204`), and the whole accumulated string is re-sent
-    verbatim inside the user prompt on every subsequent turn (`workspace_user_prompt`,
-    `src/run.rs:2087`). Individual results are capped where they enter that log —
-    `TOOL_RESULT_CAP` at `src/tools/mod.rs:37`, `OBS_READ_CAP`/`OBS_GREP_CAP` at `src/run.rs:38` —
-    but the log itself has no bound at all, `find` and `write_file` observations have no cap of their
-    own, and the only place the aggregate is trimmed is `tail(&observations, OBS_READ_CAP)` at
-    `src/run.rs:857` and `1240`, which writes the trace column, not the request. Nothing compacts a
-    superseded entry, and nothing notices that a file read at step 3 was rewritten at step 7. A
-    twenty-step run therefore spends most of every request re-sending stale text until the token
-    budget stops it: the budget is enforced, it is just being spent on repetition.
+  user_can: 'A developer runs a long task and the agent''s context stays relevant instead of merely growing.
+    Today it only grows: `src/run.rs:775` (workspace) and `src/run.rs:1122` (sub-agent) each declare `let
+    mut observations = String::new()`, every tool result, bare model message and composed child result
+    is appended to it (`src/run.rs:838`, `1204`), and the whole accumulated string is re-sent verbatim
+    inside the user prompt on every subsequent turn (`workspace_user_prompt`, `src/run.rs:2087`). Individual
+    results are capped where they enter that log — `TOOL_RESULT_CAP` at `src/tools/mod.rs:37`, `OBS_READ_CAP`/`OBS_GREP_CAP`
+    at `src/run.rs:38` — but the log itself has no bound at all, `find` and `write_file` observations
+    have no cap of their own, and the only place the aggregate is trimmed is `tail(&observations, OBS_READ_CAP)`
+    at `src/run.rs:857` and `1240`, which writes the trace column, not the request. Nothing compacts a
+    superseded entry, and nothing notices that a file read at step 3 was rewritten at step 7. A twenty-step
+    run therefore spends most of every request re-sending stale text until the token budget stops it:
+    the budget is enforced, it is just being spent on repetition.
 
-    After this release what the model sees each turn is assembled to fit a stated share of the token
-    budget. A superseded observation is compacted to a one-line stub instead of carried whole. An
-    observation invalidated by a later write to the same path is re-read rather than trusted, so the
-    agent never reasons over content the workspace no longer has. Every tool result is bounded where
-    it enters the context, with the elision visible to the model so it can ask for the rest, while
-    the trace keeps the full result unchanged.
+    After this release what the model sees each turn is assembled to fit a stated share of the token budget.
+    A superseded observation is compacted to a one-line stub instead of carried whole. An observation
+    invalidated by a later write to the same path is re-read rather than trusted, so the agent never reasons
+    over content the workspace no longer has. Every tool result is bounded where it enters the context,
+    with the elision visible to the model so it can ask for the rest, while the trace keeps the full result
+    unchanged.
 
-    The same release gives the agent durable memory: facts and decisions it writes deliberately
-    during a run, keyed to the workspace rather than the run, and recalled on a later run over that
-    same workspace. A second run does not rediscover what the first established. The embedding
-    application can list, inspect and clear those entries, so memory is a surface the operator
-    controls rather than an invisible accretion.
-  business_value: >
-    Context construction was audited as the weakest of the twelve pillars and was not on the roadmap
-    at all until iteration US-IO-HARNESS-0.9.0-I01 put it here. It is the pillar that decides whether
-    every other one pays off: budgets (0.2.0), sub-agents (0.5.0) and 24-hour unattended runs (0.7.0)
-    all assume the per-turn request is proportional to the work, and none of them are true while the
-    prompt grows monotonically. A 0.7.0 run that survives a crash still degrades over its horizon,
-    because the thing that ends it is not a fault, it is repetition. 0.5.0's hundred concurrent
-    children multiply that cost by a hundred.
+    The same release gives the agent durable memory: facts and decisions it writes deliberately during
+    a run, keyed to the workspace rather than the run, and recalled on a later run over that same workspace.
+    A second run does not rediscover what the first established. The embedding application can list, inspect
+    and clear those entries, so memory is a surface the operator controls rather than an invisible accretion.
 
-    Durable memory is the difference between a tool and an agent that improves. io-cli and io-studio
-    both run repeatedly over the same repository; without cross-run recall each session pays full
-    price to rediscover the same layout, the same build command, the same failure. This is also the
-    release that makes the harness cheaper to run, which is the only kind of engine work a downstream
-    product feels immediately.
+    '
+  business_value: 'Context construction was audited as the weakest of the twelve pillars and was not on
+    the roadmap at all until iteration US-IO-HARNESS-0.9.0-I01 put it here. It is the pillar that decides
+    whether every other one pays off: budgets (0.2.0), sub-agents (0.5.0) and 24-hour unattended runs
+    (0.7.0) all assume the per-turn request is proportional to the work, and none of them are true while
+    the prompt grows monotonically. A 0.7.0 run that survives a crash still degrades over its horizon,
+    because the thing that ends it is not a fault, it is repetition. 0.5.0''s hundred concurrent children
+    multiply that cost by a hundred.
 
-    Ordering matters here too: 0.11.0's stall detection and 0.12.0's evaluation both measure runs, and
+    Durable memory is the difference between a tool and an agent that improves. io-cli and io-studio both
+    run repeatedly over the same repository; without cross-run recall each session pays full price to
+    rediscover the same layout, the same build command, the same failure. This is also the release that
+    makes the harness cheaper to run, which is the only kind of engine work a downstream product feels
+    immediately.
+
+    Ordering matters here too: 0.11.0''s stall detection and 0.12.0''s evaluation both measure runs, and
     measuring a run whose prompt grows without bound measures the growth rather than the agent.
-  evidence_of_value: >
-    A live run on a real multi-step, multi-file task with a small token budget, recorded in the
-    evidence directory, showing per-turn prompt size across every step — flat or sublinear where
-    0.9.1 grows linearly — and the same task completing under a budget that 0.9.1 exhausts. The
-    comparison is run against the released 0.9.1 on the same task and the same provider, so the
-    improvement is measured rather than asserted.
 
-    For memory: two consecutive runs over one workspace, different `run_id`s, where the second run's
-    assembled prompt contains a fact the first run wrote, and its trace shows it did not re-execute
-    the tool calls that established that fact.
+    '
+  evidence_of_value: 'A live run on a real multi-step, multi-file task with a small token budget, recorded
+    in the evidence directory, showing per-turn prompt size across every step — flat or sublinear where
+    0.9.1 grows linearly — and the same task completing under a budget that 0.9.1 exhausts. The comparison
+    is run against the released 0.9.1 on the same task and the same provider, so the improvement is measured
+    rather than asserted.
 
-    For honesty: the trace records the estimated token count the assembler enforced against and the
-    provider-reported count for the same request, so the estimator's drift is a number in the
-    evidence rather than a claim in the record.
+    For memory: two consecutive runs over one workspace, different `run_id`s, where the second run''s
+    assembled prompt contains a fact the first run wrote, and its trace shows it did not re-execute the
+    tool calls that established that fact.
+
+    For honesty: the trace records the estimated token count the assembler enforced against and the provider-reported
+    count for the same request, so the estimator''s drift is a number in the evidence rather than a claim
+    in the record.
+
+    '
 scope:
   included:
-    - >
-      Replace the accumulating `observations: String` (`src/run.rs:775` and `1122`, appended at `838`
-      and `1204`, re-sent through `workspace_user_prompt` at `src/run.rs:2087`) with a structured
-      context ledger: one entry per observation carrying its step, kind (tool result, bare model
-      message, composed child result), the target path where the tool names one, its full text, and
-      its size. Assembly reads the ledger and decides what the model sees; the trace keeps recording
-      what happened.
-    - >
-      Budget-aware assembly. The assembled prompt fits a stated share of the token budget, expressed
-      as a caller-visible setting with a documented default, and enforced against a token estimate on
-      every turn. When the ledger exceeds the share, the assembler compacts rather than truncating
-      blindly: newest and task-relevant entries survive whole, older ones become stubs.
-    - >
-      Compaction of superseded observations. Where two entries observe the same target, the later one
-      is carried whole and the earlier is replaced by a one-line stub naming what it was and which
-      step superseded it. The model can always tell that something was elided and can re-read it.
-    - >
-      Invalidation by write. A read observation whose path is written later in the run is not carried
-      as current: it is re-read at assembly time through the 0.4.0 policy, or — if the path is gone or
-      the re-read is refused — replaced by a stub naming the invalidating step and the reason. A
-      refused re-read is a trace row, not a silent drop.
-    - >
-      Coherent per-result caps at the point of construction, replacing today's four unrelated bounds:
-      `TOOL_RESULT_CAP` = 8_000 chars (`src/tools/mod.rs:37`) for MCP, registered tools and skill
-      bodies; `OBS_READ_CAP` = 4_000 chars as a tail for `read_file` (`src/run.rs:1638`);
-      `OBS_GREP_CAP` = 50 hits for grep (`src/run.rs:1607`); and nothing at all for `find` and
-      `write_file`. Every observation is bounded where it enters the context, with the elision visible
-      to the model so it can ask for the rest, the caps expressed in the same unit and derived from
-      the same budget rather than as four independent constants, and the full result still written to
-      the trace unbounded. This closes the standing `// ponytail:` marker at `src/run.rs:38` —
-      "fixed char caps; make them budget-aware if long files starve the loop."
-    - >
-      Durable memory. A new store surface, keyed to the workspace rather than the `run_id`, that an
-      agent writes facts and decisions into through a tool and that a later run over the same
-      workspace recalls into its assembled context. Entries are attributed to the run and step that
-      wrote them, bounded in count and total size with a documented eviction rule, and every write,
-      recall and eviction is a trace row.
-    - >
-      A public API for the embedding application to list, read and delete memory entries for a
-      workspace, so io-cli and io-studio can show and clear what the agent believes rather than
-      inheriting an opaque store.
-    - >
-      The rusqlite schema change memory requires, in the shape the store already uses: additive
-      `CREATE TABLE IF NOT EXISTS` inside `Store::from_conn` (`src/state.rs:511-673`), no existing
-      table renamed or reshaped, and `CHECKPOINT_FORMAT` (`src/state.rs:13`) left alone — bumping it
-      would make `Store::check_resumable` (`src/state.rs:1158`) reject every 0.9.1 checkpoint, which
-      would break the 0.7.0 durability promise to add a feature that does not need it.
-    - >
-      Trace rows for what the assembler did each turn — entries carried whole, stubbed, re-read,
-      elided, and the estimated versus provider-reported token counts — because a context decision
-      that is invisible is one nobody can debug or evaluate.
-    - >
-      Documentation of what the assembler guarantees and what it does not: it bounds size and applies
-      the stated staleness rules; it does not promise the model sees everything relevant. 0.8.1's
-      lesson applies — a guarantee io-cli and io-studio infer is one this crate will be held to.
-    - >
-      Tests for each rule above, plus the three-OS matrix staying green, plus a live run as described
-      in `evidence_of_value`.
+  - 'Replace the accumulating `observations: String` (`src/run.rs:775` and `1122`, appended at `838` and
+    `1204`, re-sent through `workspace_user_prompt` at `src/run.rs:2087`) with a structured context ledger:
+    one entry per observation carrying its step, kind (tool result, bare model message, composed child
+    result), the target path where the tool names one, its full text, and its size. Assembly reads the
+    ledger and decides what the model sees; the trace keeps recording what happened.
+
+    '
+  - 'Budget-aware assembly. The assembled prompt fits a stated share of the token budget, expressed as
+    a caller-visible setting with a documented default, and enforced against a token estimate on every
+    turn. When the ledger exceeds the share, the assembler compacts rather than truncating blindly: newest
+    and task-relevant entries survive whole, older ones become stubs.
+
+    '
+  - 'Compaction of superseded observations. Where two entries observe the same target, the later one is
+    carried whole and the earlier is replaced by a one-line stub naming what it was and which step superseded
+    it. The model can always tell that something was elided and can re-read it.
+
+    '
+  - 'Invalidation by write. A read observation whose path is written later in the run is not carried as
+    current: it is re-read at assembly time through the 0.4.0 policy, or — if the path is gone or the
+    re-read is refused — replaced by a stub naming the invalidating step and the reason. A refused re-read
+    is a trace row, not a silent drop.
+
+    '
+  - 'Coherent per-result caps at the point of construction, replacing today''s four unrelated bounds:
+    `TOOL_RESULT_CAP` = 8_000 chars (`src/tools/mod.rs:37`) for MCP, registered tools and skill bodies;
+    `OBS_READ_CAP` = 4_000 chars as a tail for `read_file` (`src/run.rs:1638`); `OBS_GREP_CAP` = 50 hits
+    for grep (`src/run.rs:1607`); and nothing at all for `find` and `write_file`. Every observation is
+    bounded where it enters the context, with the elision visible to the model so it can ask for the rest,
+    the caps expressed in the same unit and derived from the same budget rather than as four independent
+    constants, and the full result still written to the trace unbounded. This closes the standing `//
+    ponytail:` marker at `src/run.rs:38` — "fixed char caps; make them budget-aware if long files starve
+    the loop."
+
+    '
+  - 'Durable memory. A new store surface, keyed to the workspace rather than the `run_id`, that an agent
+    writes facts and decisions into through a tool and that a later run over the same workspace recalls
+    into its assembled context. Entries are attributed to the run and step that wrote them, bounded in
+    count and total size with a documented eviction rule, and every write, recall and eviction is a trace
+    row.
+
+    '
+  - 'A public API for the embedding application to list, read and delete memory entries for a workspace,
+    so io-cli and io-studio can show and clear what the agent believes rather than inheriting an opaque
+    store.
+
+    '
+  - 'The rusqlite schema change memory requires, in the shape the store already uses: additive `CREATE
+    TABLE IF NOT EXISTS` inside `Store::from_conn` (`src/state.rs:511-673`), no existing table renamed
+    or reshaped, and `CHECKPOINT_FORMAT` (`src/state.rs:13`) left alone — bumping it would make `Store::check_resumable`
+    (`src/state.rs:1158`) reject every 0.9.1 checkpoint, which would break the 0.7.0 durability promise
+    to add a feature that does not need it.
+
+    '
+  - 'Trace rows for what the assembler did each turn — entries carried whole, stubbed, re-read, elided,
+    and the estimated versus provider-reported token counts — because a context decision that is invisible
+    is one nobody can debug or evaluate.
+
+    '
+  - 'Documentation of what the assembler guarantees and what it does not: it bounds size and applies the
+    stated staleness rules; it does not promise the model sees everything relevant. 0.8.1''s lesson applies
+    — a guarantee io-cli and io-studio infer is one this crate will be held to.
+
+    '
+  - 'Tests for each rule above, plus the three-OS matrix staying green, plus a live run as described in
+    `evidence_of_value`.
+
+    '
   excluded:
-    - >
-      Model-assisted summarization of observations. Compaction is mechanical in this release: rules
-      over the ledger, no extra provider call. A summarizing pass spends the budget this release
-      exists to protect and adds a failure mode inside context construction itself.
-    - >
-      Any tokenizer dependency. The estimate is computed in-crate from the text and documented as an
-      estimate, with its drift against provider-reported usage recorded in the trace. A per-provider
-      tokenizer is a dependency and a maintenance surface for accuracy this release does not need.
-    - >
-      Retrieval, embeddings or vector search — over memory or over the workspace. Memory is a small
-      attributed keyed set the agent writes deliberately; it is not a RAG index. Semantic recall is a
-      separate product decision with its own release.
-    - >
-      Stall detection, replan, provider fallback and the retryable-versus-terminal escalation split.
-      All 0.11.0. It is tempting to treat a repeating tool call as a context problem; it is a
-      resilience problem and it has a release.
-    - >
-      The live event stream, deterministic replay and the per-run outcome record. All 0.12.0.
-    - >
-      Reshaping `CompletionRequest` into a role/message list. It is `{ system, user, tools }` today
-      (`src/provider/mod.rs:64`) and every turn is a stateless rebuild of two wire messages
-      (`src/provider/openai_wire.rs:38`, `src/provider/anthropic.rs:67`). Assembly produces the `user`
-      string; converting the harness to a conversation-history model is a provider-layer change across
-      three providers, and this release does not need it to bound or compact what is sent. If it turns
-      out to be required, it is an iteration, not a silent widening.
-    - >
-      A new policy act for memory. Memory lives in the harness store, not in the workspace, so it is
-      not a path, exec or net act. A 0.5.0 child shares its parent's workspace and therefore its
-      memory; that is stated in the documentation rather than modelled as a new permission.
-    - >
-      The Windows Job Object. Windows containment remains the portable floor with the wall clock
-      only, as documented and asserted in 0.9.1. It needs a `windows-sys` binding and its own
-      release; it is not smuggled into a context-construction minor.
-    - >
-      Any change to verification (`src/verify.rs`), the sandbox, or policy semantics. This release
-      reads the policy to re-check a re-read; it does not alter it.
+  - 'Model-assisted summarization of observations. Compaction is mechanical in this release: rules over
+    the ledger, no extra provider call. A summarizing pass spends the budget this release exists to protect
+    and adds a failure mode inside context construction itself.
+
+    '
+  - 'Any tokenizer dependency. The estimate is computed in-crate from the text and documented as an estimate,
+    with its drift against provider-reported usage recorded in the trace. A per-provider tokenizer is
+    a dependency and a maintenance surface for accuracy this release does not need.
+
+    '
+  - 'Retrieval, embeddings or vector search — over memory or over the workspace. Memory is a small attributed
+    keyed set the agent writes deliberately; it is not a RAG index. Semantic recall is a separate product
+    decision with its own release.
+
+    '
+  - 'Stall detection, replan, provider fallback and the retryable-versus-terminal escalation split. All
+    0.11.0. It is tempting to treat a repeating tool call as a context problem; it is a resilience problem
+    and it has a release.
+
+    '
+  - 'The live event stream, deterministic replay and the per-run outcome record. All 0.12.0.
+
+    '
+  - 'Reshaping `CompletionRequest` into a role/message list. It is `{ system, user, tools }` today (`src/provider/mod.rs:64`)
+    and every turn is a stateless rebuild of two wire messages (`src/provider/openai_wire.rs:38`, `src/provider/anthropic.rs:67`).
+    Assembly produces the `user` string; converting the harness to a conversation-history model is a provider-layer
+    change across three providers, and this release does not need it to bound or compact what is sent.
+    If it turns out to be required, it is an iteration, not a silent widening.
+
+    '
+  - 'A new policy act for memory. Memory lives in the harness store, not in the workspace, so it is not
+    a path, exec or net act. A 0.5.0 child shares its parent''s workspace and therefore its memory; that
+    is stated in the documentation rather than modelled as a new permission.
+
+    '
+  - 'The Windows Job Object. Windows containment remains the portable floor with the wall clock only,
+    as documented and asserted in 0.9.1. It needs a `windows-sys` binding and its own release; it is not
+    smuggled into a context-construction minor.
+
+    '
+  - 'Any change to verification (`src/verify.rs`), the sandbox, or policy semantics. This release reads
+    the policy to re-check a re-read; it does not alter it.
+
+    '
   fallback_scope:
-    - >
-      Context construction alone: the structured ledger, budget-aware assembly, compaction of
-      superseded observations, re-read on invalidation, and per-result caps at construction — with
-      durable memory deferred to its own release. This is still a coherent outcome a developer
-      reaches: a long run's context stays relevant and bounded, which is the pillar the audit named
-      weakest and the one every other pillar depends on. Memory is additive and store-shaped, so
-      deferring it costs nothing already built and leaves no half-finished schema behind.
+  - 'Context construction alone: the structured ledger, budget-aware assembly, compaction of superseded
+    observations, re-read on invalidation, and per-result caps at construction — with durable memory deferred
+    to its own release. This is still a coherent outcome a developer reaches: a long run''s context stays
+    relevant and bounded, which is the pillar the audit named weakest and the one every other pillar depends
+    on. Memory is additive and store-shaped, so deferring it costs nothing already built and leaves no
+    half-finished schema behind.
+
+    '
 acceptance:
   functional:
-    - >
-      F1 — the prompt is assembled, not accumulated. For a run whose raw observation text exceeds the
-      configured share, a test asserts the assembled prompt is within the share on every turn while
-      the trace still holds every observation in full. The `observations: String` at `src/run.rs:950`
-      no longer exists as an append-only buffer that is re-sent whole.
-    - >
-      F2 — per-turn prompt size does not grow linearly with steps. A test drives a run over many turns
-      whose tool results are individually small but cumulatively over the share, and asserts the
-      assembled size stabilises rather than tracking step count.
-    - >
-      F3 — a superseded observation is compacted, not duplicated. Two observations of the same target
-      in one run yield an assembled prompt containing the later text once and a stub for the earlier
-      that names it and the superseding step. Asserted on the assembled prompt, not on an internal
-      counter.
-    - >
-      F4 — an observation invalidated by a later write is never presented as current. Read path X
-      (content A), write X (content B); the next assembled prompt contains B and does not contain A
-      as a current read. If the re-read is refused by policy or the path is gone, the prompt carries a
-      stub naming the invalidating step and the reason, and the refusal is a trace row.
-    - >
-      F5 — every observation is bounded where it enters the context, including the two that are not
-      bounded today. A `find` result with thousands of matches and a large `write_file` observation
-      each produce a bounded, explicitly-elided context entry and a full, unelided trace row. A test
-      asserts both sides for each observation kind — read, grep, find, write, skill body, registered
-      tool, MCP tool, child result — so no kind is unbounded by omission again.
-    - >
-      F6 — durable memory survives a run. An agent writes a fact in run 1; run 2 over the same
-      workspace with a different `run_id` receives it in its assembled context. Asserted end to end
-      across two real runs against a fixture provider, and the second run's trace shows the tool calls
-      that established the fact were not re-executed.
-    - >
-      F7 — memory is attributed, bounded and operator-controlled. Every entry names the run and step
-      that wrote it; the count and total size caps evict by the documented rule when exceeded; and the
-      public API lists, reads and deletes entries for a workspace. A test asserts eviction happens and
-      that a deleted entry does not reappear in a later run's context.
-    - >
-      F8 — the migration is invisible to a 0.9.1 consumer. A store written by 0.9.1 opens under
-      0.10.0, and a 0.9.1 checkpoint resumes to completion under 0.10.0 with no step re-run and no
-      budget double-charge — the 0.7.0 crash-resume test suite passes unmodified against the new
-      schema.
+  - 'F1 — the prompt is assembled, not accumulated. For a run whose raw observation text exceeds the configured
+    share, a test asserts the assembled prompt is within the share on every turn while the trace still
+    holds every observation in full. The `observations: String` at `src/run.rs:950` no longer exists as
+    an append-only buffer that is re-sent whole.
+
+    '
+  - 'F2 — per-turn prompt size does not grow linearly with steps. A test drives a run over many turns
+    whose tool results are individually small but cumulatively over the share, and asserts the assembled
+    size stabilises rather than tracking step count.
+
+    '
+  - 'F3 — a superseded observation is compacted, not duplicated. Two observations of the same target in
+    one run yield an assembled prompt containing the later text once and a stub for the earlier that names
+    it and the superseding step. Asserted on the assembled prompt, not on an internal counter.
+
+    '
+  - 'F4 — an observation invalidated by a later write is never presented as current. Read path X (content
+    A), write X (content B); the next assembled prompt contains B and does not contain A as a current
+    read. If the re-read is refused by policy or the path is gone, the prompt carries a stub naming the
+    invalidating step and the reason, and the refusal is a trace row.
+
+    '
+  - 'F5 — every observation is bounded where it enters the context, including the two that are not bounded
+    today. A `find` result with thousands of matches and a large `write_file` observation each produce
+    a bounded, explicitly-elided context entry and a full, unelided trace row. A test asserts both sides
+    for each observation kind — read, grep, find, write, skill body, registered tool, MCP tool, child
+    result — so no kind is unbounded by omission again.
+
+    '
+  - 'F6 — durable memory survives a run. An agent writes a fact in run 1; run 2 over the same workspace
+    with a different `run_id` receives it in its assembled context. Asserted end to end across two real
+    runs against a fixture provider, and the second run''s trace shows the tool calls that established
+    the fact were not re-executed.
+
+    '
+  - 'F7 — memory is attributed, bounded and operator-controlled. Every entry names the run and step that
+    wrote it; the count and total size caps evict by the documented rule when exceeded; and the public
+    API lists, reads and deletes entries for a workspace. A test asserts eviction happens and that a deleted
+    entry does not reappear in a later run''s context.
+
+    '
+  - 'F8 — the migration is invisible to a 0.9.1 consumer. A store written by 0.9.1 opens under 0.10.0,
+    and a 0.9.1 checkpoint resumes to completion under 0.10.0 with no step re-run and no budget double-charge
+    — the 0.7.0 crash-resume test suite passes unmodified against the new schema.
+
+    '
   non_functional:
-    - >
-      NF1 — the token estimate is honest and measurable. There is no estimator in the crate today:
-      every token number is post-hoc provider-reported usage, and a provider that reports none is
-      counted as zero (`src/run.rs:674`, `806`, `1148`), so assembly cannot be built on reported usage
-      at all. The new estimate's method is documented in the crate as an estimate rather than a count,
-      is computed before the request from the text being sent, and every turn's trace row carries both
-      it and the provider-reported usage when the provider supplies any, so drift is a recorded number
-      and a silent provider does not make the assembler blind.
-      The default share is set below 1.0 of the budget by enough margin that estimator drift cannot
-      push a real request past a provider's context limit; a provider context-length rejection is
-      surfaced as a named error, not laundered into a generic retry.
-    - >
-      NF2 — no new runtime dependency. Assembly, estimation, compaction and memory are built on the
-      existing dependency set; `[dependencies]` gains nothing. A dev-dependency for a fixture is
-      acceptable; a tokenizer is not.
-    - >
-      NF3 — assembly is not a new hot spot. The per-turn assembly cost is measured and bounded by a
-      test, in the manner 0.9.1 bounded policy dispatch, so the fix for a token cost is not paid for
-      in wall-clock on every step.
-    - >
-      NF4 — MSRV stays 1.88; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` stay
-      clean on all three platforms; the ubuntu/macos/windows matrix plus the msrv and lint jobs are
-      green on one commit with no leg skipped, excluded or marked `continue-on-error`.
-    - >
-      NF5 — a public API change is permitted (0.x minor) but must be deliberate and documented: every
-      added, renamed or removed public item is listed in the CHANGELOG with a migration note, and the
-      diff of the public surface against the 0.9.1 tag is recorded in the evidence. The crate stays
-      pre-1.0; no 1.0.0 is planned or implied.
-    - >
-      NF6 — no regression in the existing suite. All ~258 tests shipped at 0.9.1 (~138 integration
-      across `tests/`, ~120 unit) pass unmodified unless a test asserted the old accumulate-and-resend
-      behaviour, and each such test that is changed is named in the record with why the old assertion
-      was wrong. `tests/checkpoint.rs` and `tests/subagents.rs` in particular pass untouched, since
-      they cover the two features that read the observation buffer indirectly.
-    - >
-      NF7 — the loop gains direct test coverage. `src/run.rs` is 2,193 lines with zero unit tests
-      today; the assembler introduced here is unit-tested at its own boundary rather than only through
-      an integration mock provider, because a context rule that can only be observed end to end is one
-      nobody will tune.
+  - 'NF1 — the token estimate is honest and measurable. There is no estimator in the crate today: every
+    token number is post-hoc provider-reported usage, and a provider that reports none is counted as zero
+    (`src/run.rs:674`, `806`, `1148`), so assembly cannot be built on reported usage at all. The new estimate''s
+    method is documented in the crate as an estimate rather than a count, is computed before the request
+    from the text being sent, and every turn''s trace row carries both it and the provider-reported usage
+    when the provider supplies any, so drift is a recorded number and a silent provider does not make
+    the assembler blind. The default share is set below 1.0 of the budget by enough margin that estimator
+    drift cannot push a real request past a provider''s context limit; a provider context-length rejection
+    is surfaced as a named error, not laundered into a generic retry.
+
+    '
+  - 'NF2 — no new runtime dependency. Assembly, estimation, compaction and memory are built on the existing
+    dependency set; `[dependencies]` gains nothing. A dev-dependency for a fixture is acceptable; a tokenizer
+    is not.
+
+    '
+  - 'NF3 — assembly is not a new hot spot. The per-turn assembly cost is measured and bounded by a test,
+    in the manner 0.9.1 bounded policy dispatch, so the fix for a token cost is not paid for in wall-clock
+    on every step.
+
+    '
+  - 'NF4 — MSRV stays 1.88; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` stay clean
+    on all three platforms; the ubuntu/macos/windows matrix plus the msrv and lint jobs are green on one
+    commit with no leg skipped, excluded or marked `continue-on-error`.
+
+    '
+  - 'NF5 — a public API change is permitted (0.x minor) but must be deliberate and documented: every added,
+    renamed or removed public item is listed in the CHANGELOG with a migration note, and the diff of the
+    public surface against the 0.9.1 tag is recorded in the evidence. The crate stays pre-1.0; no 1.0.0
+    is planned or implied.
+
+    '
+  - 'NF6 — no regression in the existing suite. All ~258 tests shipped at 0.9.1 (~138 integration across
+    `tests/`, ~120 unit) pass unmodified unless a test asserted the old accumulate-and-resend behaviour,
+    and each such test that is changed is named in the record with why the old assertion was wrong. `tests/checkpoint.rs`
+    and `tests/subagents.rs` in particular pass untouched, since they cover the two features that read
+    the observation buffer indirectly.
+
+    '
+  - 'NF7 — the loop gains direct test coverage. `src/run.rs` is 2,193 lines with zero unit tests today;
+    the assembler introduced here is unit-tested at its own boundary rather than only through an integration
+    mock provider, because a context rule that can only be observed end to end is one nobody will tune.
+
+    '
   operational:
-    - >
-      O1 — the crate documents what context assembly does and does not guarantee, including the
-      staleness rules it applies and the relevance it does not promise, so io-cli and io-studio do not
-      inherit an unmade guarantee.
-    - >
-      O2 — `docs/CAPABILITIES.md` marks context construction and state-and-memory shipped at 0.10.0,
-      and marks nothing this release did not accept. If the fallback scope is taken, state and memory
-      stays partial with the deferred release named.
-    - >
-      O3 — memory is documented as agent-authored, attributed content that a later run reads. The
-      documentation states plainly that an entry written by one run influences a later one, how to
-      inspect and clear entries, and that entries are rendered to the model as notes rather than as
-      instructions.
-    - >
-      O4 — the live run evidence exists in the evidence directory: per-turn prompt sizes for 0.10.0
-      and for 0.9.1 on the same task and provider, and the two-run memory recall trace.
+  - 'O1 — the crate documents what context assembly does and does not guarantee, including the staleness
+    rules it applies and the relevance it does not promise, so io-cli and io-studio do not inherit an
+    unmade guarantee.
+
+    '
+  - 'O2 — `docs/CAPABILITIES.md` marks context construction and state-and-memory shipped at 0.10.0, and
+    marks nothing this release did not accept. If the fallback scope is taken, state and memory stays
+    partial with the deferred release named.
+
+    '
+  - 'O3 — memory is documented as agent-authored, attributed content that a later run reads. The documentation
+    states plainly that an entry written by one run influences a later one, how to inspect and clear entries,
+    and that entries are rendered to the model as notes rather than as instructions.
+
+    '
+  - 'O4 — the live run evidence exists in the evidence directory: per-turn prompt sizes for 0.10.0 and
+    for 0.9.1 on the same task and provider, and the two-run memory recall trace.
+
+    '
 delivery:
   target_mode: published
-  environment: >
-    crates.io, plus the three-OS GitHub Actions matrix (ubuntu-latest, macos-latest, windows-latest)
+  environment: 'crates.io, plus the three-OS GitHub Actions matrix (ubuntu-latest, macos-latest, windows-latest)
     with the msrv and lint jobs, first fully green at 0.9.1.
-  deployment_method: >
-    The initorigin release flow with the 2026-07-26 owner override in effect: all work including the
-    sealed completion record on `feat/0.10.0`, PR to `develop`, release PR `develop` to `main`, a
-    GitHub Release titled `io-harness 0.10.0` with notes taken verbatim from the CHANGELOG, then
-    `cargo publish` last. The order is unchanged; the merges are performed without waiting for manual
+
+    '
+  deployment_method: 'The initorigin release flow with the 2026-07-26 owner override in effect: all work
+    including the sealed completion record on `feat/0.10.0`, PR to `develop`, release PR `develop` to
+    `main`, a GitHub Release titled `io-harness 0.10.0` with notes taken verbatim from the CHANGELOG,
+    then `cargo publish` last. The order is unchanged; the merges are performed without waiting for manual
     review.
+
+    '
   migrations:
-    - >
-      One additive rusqlite schema change for durable memory: new table(s) keyed by workspace, created
-      idempotently in `Store::from_conn` the way every existing table is, leaving all nine current
-      tables untouched and `CHECKPOINT_FORMAT`/`PRAGMA user_version` unchanged. A 0.9.1 store opens and
-      resumes under 0.10.0 unchanged (F8). No down-migration is provided and none is needed: a 0.10.0
-      store opened by 0.9.1 simply does not see the new table, which is the rollback path.
-    - >
-      No workspace or filesystem migration. A caller upgrades by changing the version and adopting
-      any renamed public item listed in the CHANGELOG migration note.
+  - 'One additive rusqlite schema change for durable memory: new table(s) keyed by workspace, created
+    idempotently in `Store::from_conn` the way every existing table is, leaving all nine current tables
+    untouched and `CHECKPOINT_FORMAT`/`PRAGMA user_version` unchanged. A 0.9.1 store opens and resumes
+    under 0.10.0 unchanged (F8). No down-migration is provided and none is needed: a 0.10.0 store opened
+    by 0.9.1 simply does not see the new table, which is the rollback path.
+
+    '
+  - 'No workspace or filesystem migration. A caller upgrades by changing the version and adopting any
+    renamed public item listed in the CHANGELOG migration note.
+
+    '
   observability:
-    - >
-      The existing rusqlite trace and `tracing` spans, extended with the per-turn assembly rows: what
-      was carried, stubbed, re-read, elided, and the estimated versus reported token counts. Memory
-      writes, recalls and evictions are trace rows too.
-  rollback: >
-    `cargo yank --vers 0.10.0`, leaving 0.9.1 as what `cargo install` and a fresh `cargo add` resolve
-    to. A consumer rolling back changes the version and reverts any public-item rename from the
-    migration note; their store keeps the unused memory table, which 0.9.1 ignores. In-flight 0.10.0
-    checkpoints are not resumable by 0.9.1 if they carry memory state — stated in the record so an
-    operator rolls back between runs, not during one.
+  - 'The existing rusqlite trace and `tracing` spans, extended with the per-turn assembly rows: what was
+    carried, stubbed, re-read, elided, and the estimated versus reported token counts. Memory writes,
+    recalls and evictions are trace rows too.
+
+    '
+  rollback: '`cargo yank --vers 0.10.0`, leaving 0.9.1 as what `cargo install` and a fresh `cargo add`
+    resolve to. A consumer rolling back changes the version and reverts any public-item rename from the
+    migration note; their store keeps the unused memory table, which 0.9.1 ignores. In-flight 0.10.0 checkpoints
+    are not resumable by 0.9.1 if they carry memory state — stated in the record so an operator rolls
+    back between runs, not during one.
+
+    '
 dependencies:
   products:
-    - >
-      io-cli and io-studio consume the crate; both gain the memory inspection API and both benefit
-      from bounded prompts immediately. Neither is blocked by this release and neither must change to
-      adopt it beyond any migration note.
-    - >
-      io-eval is unaffected until 0.12.0 delivers the evaluation surface. It currently reads the trace
-      schema directly, so the additive memory tables must not rename or reshape an existing table.
+  - 'io-cli and io-studio consume the crate; both gain the memory inspection API and both benefit from
+    bounded prompts immediately. Neither is blocked by this release and neither must change to adopt it
+    beyond any migration note.
+
+    '
+  - 'io-eval is unaffected until 0.12.0 delivers the evaluation surface. It currently reads the trace
+    schema directly, so the additive memory tables must not rename or reshape an existing table.
+
+    '
   services:
-    - >
-      A provider API key (OpenRouter, Anthropic or OpenAI) for the live-run evidence in
-      `evidence_of_value` — the before/after comparison cannot be produced against a fixture.
-    - >
-      GitHub Actions for the three-OS matrix; the repository is public so standard-runner minutes are
-      free.
+  - 'A provider API key (OpenRouter, Anthropic or OpenAI) for the live-run evidence in `evidence_of_value`
+    — the before/after comparison cannot be produced against a fixture.
+
+    '
+  - 'GitHub Actions for the three-OS matrix; the repository is public so standard-runner minutes are free.
+
+    '
   human_approvals:
-    - >
-      None. The owner's 2026-07-26 override — restated the same day as "override all human
-      interventions which I had told earlier" — authorizes the PRs, both merges, the GitHub Release and
-      `cargo publish` to be performed without any review stop. The release ORDER is unchanged; only the
-      approval gate is gone.
-    - >
-      Engineering decisions inside this release are not converted into questions. Where this contract
-      leaves an open question, the answer is chosen in development, stated with its reasoning, and
-      recorded. The narrow exceptions that still get raised are the ones outside a release flow
-      entirely: yanking a published version, changing repository visibility, rewriting git history, or
-      deleting data.
+  - 'None. The owner''s 2026-07-26 override — restated the same day as "override all human interventions
+    which I had told earlier" — authorizes the PRs, both merges, the GitHub Release and `cargo publish`
+    to be performed without any review stop. The release ORDER is unchanged; only the approval gate is
+    gone.
+
+    '
+  - 'Engineering decisions inside this release are not converted into questions. Where this contract leaves
+    an open question, the answer is chosen in development, stated with its reasoning, and recorded. The
+    narrow exceptions that still get raised are the ones outside a release flow entirely: yanking a published
+    version, changing repository visibility, rewriting git history, or deleting data.
+
+    '
 resource_profile:
   complexity: large
   uncertainty: medium
   likely_cost_drivers:
-    - >
-      `src/run.rs` is the orchestration loop and nearly every integration test runs through it. The
-      observation buffer is threaded through the turn path, the child-composition path and the
-      checkpoint path, so replacing it touches 0.5.0 composition and 0.7.0 resume at once. The cost is
-      in not breaking those, not in writing the ledger.
-    - >
-      Compaction rules are judgment, not arithmetic. Which entries survive whole is a quality decision
-      that only a real run reveals; the mechanical rules are cheap to write and expensive to tune, and
-      the live-run comparison is the only instrument that answers it.
-    - >
-      Token estimation without a tokenizer is approximate by construction. Making the approximation
-      safe rather than accurate — margin plus recorded drift plus a named error on rejection — is the
-      work; chasing accuracy is the trap.
-    - >
-      The store schema change must be additive and must not disturb the 0.7.0 resume path or io-eval's
-      direct reads. Migration work is small and verification of it is not.
-    - >
-      Live-run evidence costs real inference twice, once on 0.9.1 and once on 0.10.0, on the same task.
+  - '`src/run.rs` is the orchestration loop and nearly every integration test runs through it. The observation
+    buffer is threaded through the turn path, the child-composition path and the checkpoint path, so replacing
+    it touches 0.5.0 composition and 0.7.0 resume at once. The cost is in not breaking those, not in writing
+    the ledger.
+
+    '
+  - 'Compaction rules are judgment, not arithmetic. Which entries survive whole is a quality decision
+    that only a real run reveals; the mechanical rules are cheap to write and expensive to tune, and the
+    live-run comparison is the only instrument that answers it.
+
+    '
+  - 'Token estimation without a tokenizer is approximate by construction. Making the approximation safe
+    rather than accurate — margin plus recorded drift plus a named error on rejection — is the work; chasing
+    accuracy is the trap.
+
+    '
+  - 'The store schema change must be additive and must not disturb the 0.7.0 resume path or io-eval''s
+    direct reads. Migration work is small and verification of it is not.
+
+    '
+  - 'Live-run evidence costs real inference twice, once on 0.9.1 and once on 0.10.0, on the same task.
+
+    '
   preferred_tools:
-    - The existing test suite, `cargo test`, and the three-OS matrix via `gh run view`.
-    - rustc/cargo, clippy, rustfmt.
-    - >
-      The rusqlite trace itself as the primary instrument — per-turn assembly rows are how a context
-      decision is debugged, which is why they are in scope rather than an afterthought.
-    - A fixture provider for the deterministic multi-turn assembly and memory tests; a live provider
-      only for the before/after evidence.
+  - The existing test suite, `cargo test`, and the three-OS matrix via `gh run view`.
+  - rustc/cargo, clippy, rustfmt.
+  - 'The rusqlite trace itself as the primary instrument — per-turn assembly rows are how a context decision
+    is debugged, which is why they are in scope rather than an afterthought.
+
+    '
+  - A fixture provider for the deterministic multi-turn assembly and memory tests; a live provider only
+    for the before/after evidence.
   constraints:
-    - >
-      Minor semantics on a 0.x crate: a public break is permitted but must be documented with a
-      migration note, and no 1.0.0 is planned or implied.
-    - >
-      The trace stays complete. Nothing this release does may reduce what is recorded — bounding what
-      the model sees must not bound what an operator can audit. The two caps exist precisely so these
-      cannot be conflated.
-    - >
-      No new runtime dependency.
-    - >
-      Scope discipline against 0.11.0 and 0.12.0: a repeating ineffective tool call is a resilience
-      problem, and a live view of assembly decisions is an observability problem. Both stay out.
+  - 'Minor semantics on a 0.x crate: a public break is permitted but must be documented with a migration
+    note, and no 1.0.0 is planned or implied.
+
+    '
+  - 'The trace stays complete. Nothing this release does may reduce what is recorded — bounding what the
+    model sees must not bound what an operator can audit. The two caps exist precisely so these cannot
+    be conflated.
+
+    '
+  - 'No new runtime dependency.
+
+    '
+  - 'Scope discipline against 0.11.0 and 0.12.0: a repeating ineffective tool call is a resilience problem,
+    and a live view of assembly decisions is an observability problem. Both stay out.
+
+    '
 risks:
-  - >
-    Replacing the observation buffer breaks 0.7.0 crash-resume or 0.5.0 child composition — the two
-    features that read it indirectly. Mitigation: the existing resume and composition suites run
-    unmodified as the gate (F8, NF6), and any test that must change is named in the record with why
-    its old assertion was wrong.
-  - >
-    Compaction elides something the model needed and task success drops while token cost improves —
-    a regression that every size-based test would call a pass. Mitigation: the live before/after on a
-    real task is required evidence, not optional, and every elision carries a marker the model can act
-    on so a wrong compaction is recoverable rather than silent.
-  - >
-    Estimator drift lets a real request exceed a provider's context window despite the share being
-    respected, turning a fixed problem into a new failure. Mitigation: NF1's margin, both token counts
-    in the trace, and a context-length rejection surfaced as a named error instead of being retried
-    identically until the budget dies.
-  - >
-    Durable memory becomes a persistence path for bad or adversarial content: a fact a run was talked
-    into writing is read by every later run over that workspace. Mitigation: entries are attributed to
-    their run and step, bounded, rendered as agent-authored notes rather than instructions, inspectable
-    and deletable through the public API, and documented as such in O3. An operator can always see and
-    clear what the agent believes.
-  - >
-    The memory schema is designed for one release's needs and reshaped in 0.12.0 when evaluation needs
-    a stable exported trace. Mitigation: additive tables only, no change to existing ones, so io-eval's
-    direct reads and any future export are unaffected either way.
-  - >
-    Scope creep. Every problem in a long run looks like a context problem from inside this release —
-    stalls, retries, live views. Mitigation: the excluded list names them with their release numbers,
-    and the fallback scope is already a complete release if the included list proves too large.
+- 'Replacing the observation buffer breaks 0.7.0 crash-resume or 0.5.0 child composition — the two features
+  that read it indirectly. Mitigation: the existing resume and composition suites run unmodified as the
+  gate (F8, NF6), and any test that must change is named in the record with why its old assertion was
+  wrong.
+
+  '
+- 'Compaction elides something the model needed and task success drops while token cost improves — a regression
+  that every size-based test would call a pass. Mitigation: the live before/after on a real task is required
+  evidence, not optional, and every elision carries a marker the model can act on so a wrong compaction
+  is recoverable rather than silent.
+
+  '
+- 'Estimator drift lets a real request exceed a provider''s context window despite the share being respected,
+  turning a fixed problem into a new failure. Mitigation: NF1''s margin, both token counts in the trace,
+  and a context-length rejection surfaced as a named error instead of being retried identically until
+  the budget dies.
+
+  '
+- 'Durable memory becomes a persistence path for bad or adversarial content: a fact a run was talked into
+  writing is read by every later run over that workspace. Mitigation: entries are attributed to their
+  run and step, bounded, rendered as agent-authored notes rather than instructions, inspectable and deletable
+  through the public API, and documented as such in O3. An operator can always see and clear what the
+  agent believes.
+
+  '
+- 'The memory schema is designed for one release''s needs and reshaped in 0.12.0 when evaluation needs
+  a stable exported trace. Mitigation: additive tables only, no change to existing ones, so io-eval''s
+  direct reads and any future export are unaffected either way.
+
+  '
+- 'Scope creep. Every problem in a long run looks like a context problem from inside this release — stalls,
+  retries, live views. Mitigation: the excluded list names them with their release numbers, and the fallback
+  scope is already a complete release if the included list proves too large.
+
+  '
 open_questions:
-  - >
-    Is the context share a fraction of the token budget, an absolute token ceiling, or both? A fraction
-    composes with 0.2.0's budgets and with 0.5.0's shared ledger; an absolute ceiling is what a
-    provider's context window actually imposes. The likely answer is both with the lower one binding,
-    but the default values are a real decision and belong in the first development slice.
-  - >
-    Which entries survive compaction whole? Newest-first is the obvious rule and probably wrong on its
-    own: the task contract's own criteria and the observation that last changed the workspace matter
-    more than recency. The mechanical rule set is the first thing the live-run comparison should be
-    used to tune.
-  - >
-    Is memory keyed by canonical workspace path or by a caller-supplied workspace id? A path is
-    automatic and breaks when the workspace moves or is a temp dir; a caller-supplied id is explicit and
-    is one more thing for an embedder to get wrong. Leaning to the canonical path with an optional
-    override, decided in development.
-  - >
-    May a 0.5.0 child write to memory, or only read? A hundred concurrent children writing to one
-    workspace's memory could thrash it, while read-only children cannot record what they learned.
-    Attribution makes writes traceable either way; the cap makes them bounded. Decided in development
-    and recorded.
-  - >
-    Should the re-read on invalidation happen at assembly time or at write time? Assembly-time is lazy
-    and always current but does filesystem work inside prompt construction; write-time is eager and
-    could re-read a file the agent never looks at again. Assembly-time is the default assumption here.
+- 'Is the context share a fraction of the token budget, an absolute token ceiling, or both? A fraction
+  composes with 0.2.0''s budgets and with 0.5.0''s shared ledger; an absolute ceiling is what a provider''s
+  context window actually imposes. The likely answer is both with the lower one binding, but the default
+  values are a real decision and belong in the first development slice.
+
+  '
+- 'Which entries survive compaction whole? Newest-first is the obvious rule and probably wrong on its
+  own: the task contract''s own criteria and the observation that last changed the workspace matter more
+  than recency. The mechanical rule set is the first thing the live-run comparison should be used to tune.
+
+  '
+- 'Is memory keyed by canonical workspace path or by a caller-supplied workspace id? A path is automatic
+  and breaks when the workspace moves or is a temp dir; a caller-supplied id is explicit and is one more
+  thing for an embedder to get wrong. Leaning to the canonical path with an optional override, decided
+  in development.
+
+  '
+- 'May a 0.5.0 child write to memory, or only read? A hundred concurrent children writing to one workspace''s
+  memory could thrash it, while read-only children cannot record what they learned. Attribution makes
+  writes traceable either way; the cap makes them bounded. Decided in development and recorded.
+
+  '
+- 'Should the re-read on invalidation happen at assembly time or at write time? Assembly-time is lazy
+  and always current but does filesystem work inside prompt construction; write-time is eager and could
+  re-read a file the agent never looks at again. Assembly-time is the default assumption here.
+
+  '
+released_at: '2026-07-26T10:45:00Z'
+mode: published
+delivered: 'The prompt stops growing. Through 0.9.1 the workspace loop kept one `String`, appended every
+  tool result to it, and re-sent the whole thing verbatim every turn; a live run on 0.9.1 went from 552
+  to 16,692 to 32,832 prompt characters in three steps, and nothing in the crate could bring that number
+  down. 0.10.0 assembles the request instead of accumulating it: on the same task, the same workspace
+  and the same provider, the prompt peaks at 25,405 characters and then FALLS to 19,384 and 13,363 as
+  each write invalidates the read of that path. With an explicit 1,500-token ceiling it goes flat — 1,210
+  estimated tokens from step 6 through step 20, sixteen turns of four reads each, roughly 320 KB of raw
+  observations held inside the line.
+
+  A developer also gets an agent that remembers. The built-in `remember` tool writes a keyed note against
+  the workspace; a later run over that workspace opens with it, attributed to the run and step that wrote
+  it and rendered as the agent''s own notes rather than as instructions. The operator can list, read,
+  delete and clear them through `Store`.
+
+  Two of the twelve pillars close here — context construction and state and memory — leaving recovery
+  and retry (0.11.0) and observability and evaluation (0.12.0).
+
+  The one public break is additive: `TaskContract` gained a `context: ContextBudget` field, which only
+  a struct-literal caller notices. No public item was renamed or removed, and `CHECKPOINT_FORMAT` is unchanged,
+  so a 0.9.1 store opens and a 0.9.1 checkpoint resumes.
+
+  '
+evidence:
+  tests:
+  - 'cargo test — 271 passed, 0 failed across 16 targets (233 at 0.9.1; 38 new). 124 lib unit tests, 13
+    tests/context.rs, 11 tests/memory.rs, and the 14 pre-existing integration binaries. Only ONE pre-existing
+    test changed in the whole release: src/mcp.rs''s `an_oversized_result_is_cut_on_a_char_boundary_and_says_so`,
+    which read the cap from the deleted `TOOL_RESULT_CAP` and now derives the same number from the budget;
+    what it asserts is unchanged.
+
+    '
+  - 'F1/F2 green — `the_assembled_prompt_stays_inside_the_ceiling_while_the_trace_keeps_everything` and
+    `prompt_size_stabilises_across_many_turns_instead_of_tracking_step_count`: the log grows more than
+    2x while the assembled section grows less than 1.5x, and the trace rows still concatenate to every
+    observation in full.
+
+    '
+  - 'F3 green — `two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_collapse`. Supersession
+    is scoped by `ObsKind::target_is_the_subject`: true for read, grep, find, write and skill, false for
+    a registered or MCP tool whose target is its NAME. The first implementation stubbed a tool''s earlier
+    answer as "superseded" when it had been called twice with different arguments, throwing a distinct
+    answer away.
+
+    '
+  - 'F4 green — `a_read_invalidated_by_a_later_write_is_re_read_not_trusted`, the policy-refused variant
+    asserting both the stub text and a `reread_refused` trace row, and `a_re_read_cannot_escape_the_workspace_root`.
+    The re-read goes through `Workspace::read_file`, so it passes the same `resolve` containment and the
+    same `Act::Read` check as the read it replaces; the first implementation joined the root and called
+    `std::fs` directly, copying the policy half without the containment half.
+
+    '
+  - 'F5 green — `every_observation_kind_is_bounded_where_it_enters_the_context` covers read, grep, find,
+    write, skill body, registered tool and MCP tool, asserting the bound on the context entry and the
+    full text in the trace row. `find` and `write_file` had no cap at all before this release.
+
+    '
+  - 'F6 green — `a_second_run_over_the_workspace_recalls_what_the_first_wrote`: two runs, different run
+    ids, one workspace; the second opens with the note, the block says "not instructions", the note names
+    the run that wrote it, and the second run''s trace shows it did not re-run the `remember` call. Plus
+    `a_deleted_note_does_not_come_back_in_a_later_run`, `two_workspaces_do_not_share_memory_through_one_store`,
+    `an_over_long_memory_block_is_cut_with_a_marker`, and an empty memory rendering no block at all.
+
+    '
+  - 'F7 green — 7 store tests plus 4 unit tests covering both caps, oldest-first eviction, the never-evict-the-entry-just-written
+    rule, workspace isolation, overwrite with re-attribution, delete and clear.
+
+    '
+  - 'F8 green — `a_0_9_1_store_opens_unchanged_and_still_resumes`: a 0.9.1-shaped database reopens with
+    `PRAGMA user_version` byte-identical, `check_resumable` accepting it, and all nine pre-existing tables
+    intact. tests/checkpoint.rs (10) and tests/subagents.rs (10) pass UNMODIFIED, so 0.7.0 resume and
+    0.5.0 composition are unaffected.
+
+    '
+  - 'NF3 green — `assembling_one_turn_costs_a_bounded_amount_of_time` bounds per-turn assembly over a
+    200-entry log at 25 ms, the way 0.9.1 bounded policy dispatch.
+
+    '
+  - 'The release''s own defect, found by its own evidence rather than by a test: the first bounded live
+    run reached 2,264 estimated tokens against a 1,500-token ceiling by step 20. Every observation was
+    bounded; the one-line stubs standing in for them were not, and they grow with a run''s LENGTH rather
+    than with what it observed. Past an eighth of the budget the stub block now collapses into a single
+    line naming how many it stands for. Fixed in 6ea8dc8 and asserted by `a_long_runs_stubs_collapse_so_the_ceiling_still_holds`,
+    which reproduces the failure at 400 observations.
+
+    '
+  builds:
+  - 'CI run 30198469465 — lint, msrv, and test on ubuntu-latest, macos-latest and windows-latest all green
+    on the final code commit, full suite, no leg skipped, excluded or marked `continue-on-error`.
+
+    '
+  - cargo clippy --all-targets -- -D warnings — exit 0. cargo fmt --check — exit 0. MSRV 1.88 holds.
+  - 'cargo package — 71 files, 970.0 KiB (257.3 KiB compressed), verify build clean. Inspected: no `.env`,
+    no secret-shaped path, no diagnostic scaffolding; `.env.example` is the only env-named file and is
+    intentional.
+
+    '
+  - 'NF2 — no new runtime dependency. The only lines changed in Cargo.toml''s manifest are `version` and
+    `description`; `[dependencies]` is byte-identical to 0.9.1.
+
+    '
+  - 'NF5 — `git diff origin/main -- src/ | grep -E ''^-\s*pub ''` is EMPTY: no public item was removed
+    or renamed. The additions are the `context` module, `ContextEvent`, `MemoryEntry`, the three memory
+    caps, five `Store` memory methods, three `Store` context methods, and `TaskContract::context` / `with_context_budget`.
+    Recorded in evidence/0.10.0/public_surface_diff.txt.
+
+    '
+  - 'Scope discipline verified rather than assumed: `src/policy.rs`, `src/verify.rs`, `src/sandbox.rs`,
+    `src/approve.rs` and `src/containment.rs` are untouched against main (`Act` still has exactly four
+    variants, so memory added no policy act), and the source contains no stall detection, replan, provider
+    fallback, event stream, subscription, tokenizer or embedding code. Everything `scope.excluded` names
+    is still absent.
+
+    '
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- 'The record is sealed before the crates.io upload, which follows the two merges and the GitHub Release.
+  `mode: published` states the authorized target.
+
+  '
+- 'The token figure the assembler enforces against is an ESTIMATE — four chars per token, computed in-crate,
+  no tokenizer dependency. The trace records it beside the provider''s reported usage for the same request,
+  and the live runs show the estimate running roughly 55-75% of what the provider charged for the whole
+  request (which also carries the system prompt and tool schemas the estimate does not). The ceiling is
+  therefore a bound on the observation section, not on the whole request.
+
+  '
+- 'Assembly bounds size and applies exactly two staleness rules. It does not promise the model sees everything
+  relevant: an observation older than the current window is a stub, and a stub the model does not act
+  on is information it does not have. The README says so.
+
+  '
+- 'A stale read is re-read on every subsequent turn, since history is immutable — so one `reread` trace
+  row and one disk read per turn per stale path. Correct, and worth knowing before reading row counts.
+
+  '
+- 'Memory is a small keyed set the agent writes deliberately: 64 entries, 16,000 chars total, 2,000 chars
+  per entry, oldest-first eviction. There is no retrieval, no ranking and no semantic recall, so a workspace
+  with more to remember than that loses its oldest notes rather than its least useful ones.
+
+  '
+- 'A note one run writes is read by every later run over that workspace. Entries are attributed, bounded,
+  rendered as the agent''s own notes rather than as directives, and listable and deletable through `Store`
+  — but a wrong or planted note persists until someone removes it. This is the release''s main new trust
+  surface and the README states it plainly.
+
+  '
+- 'Recency ordering for memory is millisecond-resolution, so two notes written in the same millisecond
+  tie and fall back to insertion order. Deterministic and correct for the caps; a monotonic sequence column
+  would be the fix if it ever matters.
+
+  '
+- 'Both 20-step live runs ended in `StepCapReached` with the model re-reading the same four files without
+  writing. The observations were correct and current every turn, so this is a stalled agent rather than
+  a context defect — precisely what 0.11.0''s stall detection and bounded replan are scoped to catch.
+  Observed here rather than predicted.
+
+  '
+- 'Windows containment is still the portable floor with a wall-clock cap only; the Job Object needs a
+  `windows-sys` binding and its own release. Unchanged from 0.9.1, and the manifest description — which
+  still claimed "Windows Job Objects" as a shipped backend — was corrected in this release to say what
+  Windows actually enforces.
+
+  '
+- 'The `Backend::WindowsJobObject` enum variant remains in the public API from 0.9.0 while nothing constructs
+  it on the enforcement path. 0.9.1 made sure no trace claims it; removing the variant is a public break
+  and belongs with the release that implements it.
+
+  '
+- 'The context section''s ceiling bounds observations and recalled notes. The task contract''s own goal,
+  constraints and success criterion are always sent in full, by design — they are the task, not history
+  — so a pathologically long goal string is not bounded by this release.
+
+  '
+supersedes: 0.9.1
+next_recommended_version: 0.11.0
+immutable: true

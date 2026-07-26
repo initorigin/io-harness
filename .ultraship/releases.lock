@@ -10,3 +10,4 @@ releases:
   io-harness/0.8.1: sha256:07651f2344512838ef2087fe07c9f03ac292fc1945fafda85871405581845afa
   io-harness/0.9.0: sha256:1b2edfa38e50ed449fd34bdb9f0a31e7af19fc9797f4837d8ed32b37e1a1f43a
   io-harness/0.9.1: sha256:51cd9bb4d24ad899ffa74e2ea9fb197bd467eef597c07e581c3c112a41cbabc4
+  io-harness/0.10.0: sha256:ecf08e159edba7118841697aceedf6bbfdb76135ff5d73dbb20bab96ed386576
