@@ -51,6 +51,24 @@ notes are produced from it.
   kills descendants first. It also no longer treats an unreadable process table
   as "the process is gone", which previously switched the cap off for the rest of
   the run after a single hiccup.
+- **The wall-clock cap now actually kills on Windows, and its kill reaches the
+  whole process tree everywhere.** The timeout *owned* the child, so expiry
+  dropped it and the only kill left was `kill_on_drop`, which terminates the one
+  process the harness spawned and not the descendants a shell puts the real work
+  in. On unix those reparented; on Windows they also kept the pipes open, which
+  stranded the blocking reads tokio uses there and hung the caller's runtime long
+  after the cap had "fired" — a run that could never be stopped. The wait is now
+  its own task, so the child is still alive when the clock expires and is killed
+  by pid: `SIGKILL` descendants-first on unix, `taskkill /T` on Windows (a system
+  utility, not a new dependency).
+- **The sandbox no longer implies caps it cannot apply on Windows.** The CPU cap
+  (`RLIMIT_CPU`) and the memory cap (an RSS monitor over `ps`) are unix
+  mechanisms; on Windows neither is applied, so the floor there enforces the
+  **wall clock only** — no CPU, memory, or process cap, and no kernel network
+  boundary. A `Cap::Cpu` or `Cap::Memory` hit is never reported on a platform
+  that applied no such cap, a run configured with one warns once that it is not
+  in force, and the docs and README now say so, the same honesty 0.9.0 applied to
+  the backend label.
 
 ### Security
 
