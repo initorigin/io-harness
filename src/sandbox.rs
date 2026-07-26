@@ -346,8 +346,15 @@ async fn run_capped(
         // session, not the sandbox. The native backends scope it per-sandbox.
         unsafe {
             cmd.pre_exec(move || {
-                set_rlimit(libc::RLIMIT_CPU as u32, cpu);
-                set_rlimit(libc::RLIMIT_NOFILE as u32, nofile);
+                // The cast is load-bearing on macOS, where the RLIMIT_* constants
+                // are c_int, and a no-op on Linux, where they are already u32 —
+                // so clippy's unnecessary_cast fires on Linux only. Keep the cast
+                // and silence it rather than cfg-splitting two lines.
+                #[allow(clippy::unnecessary_cast)]
+                {
+                    set_rlimit(libc::RLIMIT_CPU as u32, cpu);
+                    set_rlimit(libc::RLIMIT_NOFILE as u32, nofile);
+                }
                 Ok(())
             });
         }

@@ -31,6 +31,10 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A cap that never fires means a process that is never killed, so a hung
+    # test must not burn a six-hour default. 20 minutes is well above a cold
+    # Windows build plus the suite.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -52,6 +56,10 @@ jobs:
   msrv:
     name: msrv
     runs-on: ubuntu-latest
+    # A cap that never fires means a process that is never killed, so a hung
+    # test must not burn a six-hour default. 20 minutes is well above a cold
+    # Windows build plus the suite.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - id: rv
@@ -66,6 +74,10 @@ jobs:
   lint:
     name: lint
     runs-on: ubuntu-latest
+    # A cap that never fires means a process that is never killed, so a hung
+    # test must not burn a six-hour default. 20 minutes is well above a cold
+    # Windows build plus the suite.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@v1
