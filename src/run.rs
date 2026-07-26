@@ -77,6 +77,16 @@ pub enum RunOutcome {
     /// whole tree halts — not this one agent hitting its own budget. `steps` is
     /// how many steps this agent completed before the tree-wide halt.
     BudgetCeilingReached { steps: u32 },
+    /// The run never started, because reaching the provider needed network access
+    /// the policy asked about and a human denied. The authorization happens before
+    /// the run's first step, so `steps` is normally 0.
+    ///
+    /// Reached through [`resume`] after the fact: the run that was refused
+    /// returned the `Err` itself, exactly as an escalation does. Added in 0.12.0 —
+    /// `"refused"` was written to the store from 0.8.0 onward with no variant and
+    /// no mapping, so resuming a refused run fell back into the loop and asked
+    /// the human again.
+    Refused { steps: u32 },
 }
 
 /// The result of a run, including the persisted run id for audit.
@@ -646,6 +656,12 @@ fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
             steps: last,
             retryable: false,
         }),
+        // 0.12.0: the same defect, found by the same kind of audit. `"refused"` is
+        // written when a human denies the network access the provider needs
+        // (`authorize_provider`), and it was unmapped — so resuming a refused run
+        // re-entered the loop and asked the human the same question again. A human's
+        // no is as final as a policy's, which is why `denied` above is final too.
+        "refused" => Some(RunOutcome::Refused { steps: last }),
         _ => None,
     }))
 }

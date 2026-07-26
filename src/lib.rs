@@ -249,10 +249,16 @@ pub use sandbox::{
     Selected,
 };
 pub use skills::{Skill, Skills};
+// `AgentEvent` and `SpawnRow` were `pub` inside this private module but were not
+// re-exported, so `Store::agent_events` and `Store::find_spawn` returned values an
+// external caller could hold and could not name — which made `agent_events`, the
+// only audit of per-step budget draws against the shared tree ledger, unreadable
+// through the public API. Exported in 0.12.0: an observability release cannot ship
+// leaving its own audit table reachable only by opening the SQLite file.
 pub use state::{
-    CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent, RunStatus,
-    SandboxEvent, StepRecord, Store, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS,
-    MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    AgentEvent, CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent,
+    RunStatus, SandboxEvent, SpawnRow, StepRecord, Store, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
+    MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
 };
 pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

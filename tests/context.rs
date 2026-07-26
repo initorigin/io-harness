@@ -23,7 +23,8 @@ use io_harness::context::{
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
 use io_harness::{
-    run_with, ApproveAll, McpServer, Policy, Provider, Store, TaskContract, ToolSpec, Verification,
+    run_with, ApproveAll, McpServer, MemoryEntry, Policy, Provider, Store, TaskContract, ToolSpec,
+    Verification,
 };
 use serde_json::json;
 
@@ -826,6 +827,91 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
     assert!(
         rows.iter().any(|r| r.kind == "reread_refused"),
         "the refused re-read must be in the trace, got {rows:?}"
+    );
+}
+
+// ------------------------------------------- the memory block is replay-stable
+
+/// The prompt a case produces must not depend on how many runs the store has
+/// held. `MemoryEntry::run_id` is the store's `AUTOINCREMENT` row id, so the
+/// second run of one case over one workspace carries notes attributed to run 2
+/// where the first carried run 1 — and the rendered block goes into the request
+/// *and* into `steps.prompt`. Rendering it made byte-identical replay impossible,
+/// so the block must be a function of the notes' content alone.
+#[tokio::test]
+async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_carry() {
+    let store = Store::memory().unwrap();
+    let policy = open_policy();
+
+    let notes = |run_id: i64| {
+        vec![
+            MemoryEntry {
+                key: "build-command".into(),
+                value: "cargo test --workspace".into(),
+                run_id,
+                step: 3,
+                created_at: "2026-01-01T00:00:00Z".into(),
+            },
+            MemoryEntry {
+                key: "api-base".into(),
+                value: "http://localhost:1".into(),
+                run_id: run_id + 40,
+                step: 7,
+                created_at: "2026-01-02T00:00:00Z".into(),
+            },
+        ]
+    };
+
+    // An empty ledger, so the assembled text is the memory block and nothing else.
+    let render = |run_id: i64| {
+        let notes = notes(run_id);
+        let store = &store;
+        let policy = &policy;
+        async move {
+            assemble(
+                &Ledger::new(),
+                24_000,
+                &notes,
+                Assembly {
+                    ws: None,
+                    policy,
+                    store,
+                    run_id: 1,
+                    step: 9,
+                },
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let first = render(1).await;
+    let second = render(2).await;
+    let far = render(9_999).await;
+
+    assert_eq!(
+        first.text, second.text,
+        "run 2 of the same case must send the same bytes as run 1"
+    );
+    assert_eq!(first.text, far.text, "and so must run 10,000");
+    assert_eq!(first.est_tokens, far.est_tokens);
+    assert_eq!((first.recalled, far.recalled), (2, 2));
+
+    // Pin the format, so "byte-identical" cannot be satisfied by rendering less.
+    assert!(
+        first
+            .text
+            .contains("- build-command: cargo test --workspace  (step 3)\n")
+            && first
+                .text
+                .contains("- api-base: http://localhost:1  (step 7)\n"),
+        "got:\n{}",
+        first.text
+    );
+    assert!(
+        !first.text.contains("run "),
+        "no note may name a run, got:\n{}",
+        first.text
     );
 }
 

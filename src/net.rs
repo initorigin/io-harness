@@ -37,7 +37,14 @@ use crate::state::{PolicyEvent, Store};
 /// was none at all, so such a socket hung the run forever — no step recorded, so
 /// no checkpoint, no ledger draw, and the time budget (checked at the top of a
 /// step) never reached.
-pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+///
+/// A caller who needs a different deadline overrides it per provider with
+/// `with_timeout` ([`crate::OpenRouter::with_timeout`],
+/// [`crate::Anthropic::with_timeout`], [`crate::OpenAi::with_timeout`]). This
+/// module is private, so the value reaches callers re-exported from each of those
+/// provider modules — a default you are told to reason about has to be one you
+/// can read.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The one `reqwest::Client` constructor in the crate.
 ///
@@ -49,6 +56,12 @@ pub(crate) fn http_client() -> reqwest::Client {
 /// As [`http_client`], with an explicit deadline — for a caller whose model is
 /// slower than [`REQUEST_TIMEOUT`] allows, and for tests that need a deadline
 /// they can reach in a second rather than ten minutes.
+///
+/// This function is crate-private; the caller reaches it through the
+/// `with_timeout` builder method on each provider, which is what makes the
+/// override an actual public affordance rather than a documented one. Until
+/// 0.12.0 it was only reachable from inside the crate, so the slow-model case
+/// named above had no way in.
 ///
 /// Redirects are **off**. A 3xx is a host change, and a host change after the
 /// policy has already decided is a hole in the boundary: the check would have
