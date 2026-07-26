@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::context::ContextBudget;
+use crate::resilience::{RetryPolicy, StallPolicy};
 use crate::verify::Verification;
 
 /// A single unit of work handed to the harness.
@@ -52,6 +53,16 @@ pub struct TaskContract {
     /// process, unlike [`TaskContract::mcp`]: see [`crate::tools::Tool`] for what
     /// registration does and does not authorize.
     pub tools: crate::tools::Toolbox,
+    /// How long to wait between provider attempts, and how long a wait may grow.
+    ///
+    /// Applies only to a failure that
+    /// [`is_retryable`](crate::error::ProviderErrorKind::is_retryable); an
+    /// authentication failure escalates on its first occurrence however patient
+    /// this is.
+    pub retry: RetryPolicy,
+    /// When to decide the agent has stopped making progress, and how many times to
+    /// tell it. `StallPolicy { window: 0, .. }` switches detection off.
+    pub stall: StallPolicy,
     /// How much of each request the observation log may occupy.
     ///
     /// Defaults to [`ContextBudget::default`]. Separate from
@@ -88,6 +99,8 @@ impl TaskContract {
             mcp: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
+            retry: RetryPolicy::default(),
+            stall: StallPolicy::default(),
             skills: None,
         }
     }
@@ -116,6 +129,8 @@ impl TaskContract {
             mcp: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
+            retry: RetryPolicy::default(),
+            stall: StallPolicy::default(),
             skills: None,
         }
     }
@@ -202,6 +217,25 @@ impl TaskContract {
     /// any one request carries of what it has already observed.
     pub fn with_context_budget(mut self, context: ContextBudget) -> Self {
         self.context = context;
+        self
+    }
+
+    /// Set how long to wait between provider attempts.
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
+    }
+
+    /// Set when a run decides its agent has stalled, and how often to tell it.
+    ///
+    /// `StallPolicy { window: 0, .. }` disables detection, restoring 0.10.0
+    /// behaviour exactly.
+    ///
+    /// Applies to workspace and sub-agent runs. A single-file run
+    /// ([`TaskContract::new`]) ignores it: it has one tool and one file, so
+    /// "repeated a call without changing anything" describes its only move.
+    pub fn with_stall_policy(mut self, stall: StallPolicy) -> Self {
+        self.stall = stall;
         self
     }
 

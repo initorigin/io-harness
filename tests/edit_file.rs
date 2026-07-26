@@ -93,7 +93,7 @@ struct MockFlaky {
 impl Provider for MockFlaky {
     async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
         if self.fails_remaining.fetch_sub(1, Ordering::SeqCst) > 0 {
-            return Err(io_harness::Error::Provider("transient".into()));
+            return Err(io_harness::Error::provider_transport("transient"));
         }
         Ok(CompletionResponse {
             tool_calls: vec![ToolCall {
@@ -110,7 +110,7 @@ struct MockAlwaysErr;
 
 impl Provider for MockAlwaysErr {
     async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        Err(io_harness::Error::Provider("down".into()))
+        Err(io_harness::Error::provider_status(503, None, "down"))
     }
 }
 
@@ -246,11 +246,21 @@ async fn retries_then_succeeds_recording_each_attempt() {
     let result = run(&contract, &provider, &store).await.unwrap();
     assert_eq!(result.outcome, RunOutcome::Success { steps: 1 });
 
-    // Two retry attempts plus the successful write are all in the trace.
+    // Two retry attempts plus the successful write are all in the trace. Since
+    // 0.11.0 a retry row names the kind it retried and the delay it waited, so a
+    // reader can tell a wait from a hammer — the old rows said only "after error".
     let steps = store.steps(result.run_id).unwrap();
     assert_eq!(steps.len(), 3);
-    assert_eq!(steps[0].decision, "retry 1 after error");
-    assert_eq!(steps[1].decision, "retry 2 after error");
+    assert!(
+        steps[0].decision.starts_with("retry 1 after Transport in "),
+        "got {:?}",
+        steps[0].decision
+    );
+    assert!(
+        steps[1].decision.starts_with("retry 2 after Transport in "),
+        "got {:?}",
+        steps[1].decision
+    );
     assert_eq!(steps[2].decision, "wrote file");
 }
 

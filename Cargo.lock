@@ -653,7 +653,7 @@ dependencies = [
 
 [[package]]
 name = "io-harness"
-version = "0.10.0"
+version = "0.11.0"
 dependencies = [
  "futures-util",
  "hyper",

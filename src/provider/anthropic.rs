@@ -25,6 +25,7 @@ pub struct Anthropic {
     client: reqwest::Client,
     api_key: String,
     model: String,
+    endpoint: String,
 }
 
 impl Anthropic {
@@ -34,6 +35,20 @@ impl Anthropic {
             client: crate::net::http_client(),
             api_key: api_key.into(),
             model: model.into(),
+            endpoint: ENDPOINT.to_string(),
+        }
+    }
+
+    /// The same provider pointed at `endpoint` with `timeout` as its deadline, so
+    /// the failure tests can drive the real HTTP and SSE path against a local
+    /// socket. Test-only: the endpoint is not configurable in the public API.
+    #[cfg(test)]
+    pub(crate) fn at(endpoint: impl Into<String>, timeout: std::time::Duration) -> Self {
+        Self {
+            client: crate::net::http_client_with_timeout(timeout),
+            api_key: "test-key".into(),
+            model: "test-model".into(),
+            endpoint: endpoint.into(),
         }
     }
 
@@ -80,25 +95,19 @@ impl Provider for Anthropic {
     }
 
     fn endpoint(&self) -> Option<&str> {
-        Some(ENDPOINT)
+        Some(&self.endpoint)
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let resp = self
             .client
-            .post(ENDPOINT)
+            .post(&self.endpoint)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", API_VERSION)
             .json(&self.body(&request))
             .send()
-            .await
-            .map_err(|e| Error::Provider(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let detail = resp.text().await.unwrap_or_default();
-            return Err(Error::Provider(format!("HTTP {status}: {detail}")));
-        }
+            .await?;
+        let resp = super::ensure_success(resp).await?;
 
         let mut acc = Accumulator::default();
         read_sse(resp, |data| {
@@ -111,7 +120,8 @@ impl Provider for Anthropic {
             false
         })
         .await?;
-        Ok(acc.finish())
+        // A stream where nothing at all parsed is a failure, not a quiet model.
+        super::ensure_parsed(acc.finish())
     }
 }
 

@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::error::Result;
+use crate::tools::workspace::Wrote;
 
 /// A filesystem tool scoped to a single file.
 #[derive(Debug, Clone)]
@@ -34,15 +35,20 @@ impl FsTool {
         }
     }
 
-    /// Write the agent's edit back to disk, creating parent directories.
-    pub async fn write(&self, contents: &str) -> Result<()> {
+    /// Write the agent's edit back to disk, creating parent directories,
+    /// reporting whether it changed anything.
+    ///
+    /// The write happens in every case, [`Wrote::Unchanged`] included: this
+    /// reports, it does not skip work.
+    pub async fn write(&self, contents: &str) -> Result<Wrote> {
+        let did = Wrote::classify(tokio::fs::read(&self.path).await, contents);
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await?;
             }
         }
         tokio::fs::write(&self.path, contents).await?;
-        Ok(())
+        Ok(did)
     }
 }
 
@@ -58,5 +64,29 @@ mod tests {
         assert_eq!(tool.read().await.unwrap(), "");
         tool.write("hello").await.unwrap();
         assert_eq!(tool.read().await.unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn a_write_reports_what_it_did_to_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = FsTool::new(dir.path().join("nested/out.txt"));
+
+        // Missing file: created.
+        assert_eq!(tool.write("one").await.unwrap(), Wrote::Created);
+        // Different content: changed, and the new content is on disk.
+        assert_eq!(tool.write("two!").await.unwrap(), Wrote::Changed);
+        assert_eq!(tool.read().await.unwrap(), "two!");
+        // Byte-identical: unchanged.
+        assert_eq!(tool.write("two!").await.unwrap(), Wrote::Unchanged);
+        // Same length, different bytes: changed, not a length check.
+        assert_eq!(tool.write("owt!").await.unwrap(), Wrote::Changed);
+        assert_eq!(tool.read().await.unwrap(), "owt!");
+        // Multibyte round-trips and compares by bytes, not chars.
+        assert_eq!(tool.write("héllo — 日本語").await.unwrap(), Wrote::Changed);
+        assert_eq!(tool.read().await.unwrap(), "héllo — 日本語");
+        assert_eq!(
+            tool.write("héllo — 日本語").await.unwrap(),
+            Wrote::Unchanged
+        );
     }
 }

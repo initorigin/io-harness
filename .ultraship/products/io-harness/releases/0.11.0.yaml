@@ -1,0 +1,741 @@
+product: io-harness
+version: 0.11.0
+status: released
+release_type: minor
+outcome:
+  user_can: 'A developer''s long unattended run survives the failures that end runs today, and learns
+    which one happened. Four of those failures are currently unsurvivable, and the audit for this release
+    found that three of them are worse than the roadmap assumed.
+
+    A provider that is down takes the run with it. `complete_with_retry` (`src/run.rs:2166`) re-calls
+    the same provider `max_retries` times — two by default — with no backoff and no inspection of the
+    error, then calls `finish_run(run_id, "escalated")` and returns `Err`. Three providers are implemented
+    and only one is ever reachable in a run: every entry point is generic over a single `P: Provider`,
+    and `Provider::complete` returns `impl Future`, so there is no `dyn Provider` to put a list behind.
+
+    A provider that is rate-limited is indistinguishable from one whose key is wrong. Every failure in
+    all three providers becomes `Error::Provider(String)` — a 429, a 503, a 401 and a DNS failure are
+    the same variant carrying different prose (`src/provider/openrouter.rs:57-66`, and byte-identical
+    in `openai.rs` and `anthropic.rs`). `Retry-After` is discarded with the rest of the headers, and a
+    401 is retried exactly as eagerly as a 503.
+
+    A provider that hangs hangs the run forever. `net::http_client()` (`src/net.rs:38-43`) sets no request
+    timeout at all — only an OS-level connect timeout applies, so a server that accepts the connection
+    and then stops writing stalls a 24-hour run indefinitely with no step, no trace row and no budget
+    draw.
+
+    A provider returning garbage is not treated as failing at all. Both stream parsers skip un-parseable
+    `data:` lines (`src/provider/openai_wire.rs:50-55`, `src/provider/anthropic.rs:106-115`), so a completely
+    malformed stream yields `Ok(CompletionResponse::default())` — which the loops read as "the model chose
+    not to call a tool". The run spends a step, a retry is never attempted, and the failure is invisible.
+
+    And an agent that stops making progress burns to its step cap. The 0.10.0 live evidence recorded this
+    twice: the model re-read the same four files for sixteen consecutive turns and ended in `StepCapReached`.
+    Nothing in the crate compares workspace state between steps — `Workspace::write_file` (`src/tools/workspace.rs:212`)
+    never reads the old content, so a byte-identical rewrite is recorded as `wrote {target}` and is indistinguishable
+    from a real edit.
+
+    After this release: a run configured with more than one provider falls over to the next when the first
+    fails in a way that another provider could survive, and the trace says which provider served each
+    step. A failure carries its kind, so a rate limit waits (honouring `Retry-After` when the server sends
+    one) and an authentication failure escalates immediately instead of being retried. Requests have a
+    deadline. A malformed stream is an error rather than a shrug. An agent making no change to the workspace
+    for a bounded number of steps is told so and given one chance to change approach; if it does not,
+    the run stops as `Stalled` rather than spending the rest of its budget. Every fallback, retry, stall
+    and replan is a trace row, and the outcome a caller receives says whether what ended the run was retryable
+    or terminal.
+
+    '
+  business_value: '0.7.0 made a run survive a crash. It did not make one survive a bad afternoon at a
+    provider, which is the failure an unattended 24-hour run will actually meet: a rate limit, a rolling
+    deploy, a 503, a hung socket. Every one of those currently ends the run inside three provider calls
+    with no backoff, and the caller is handed a `String` it cannot branch on.
+
+    The missing HTTP timeout is the sharpest of these because it defeats every other guarantee at once.
+    A hung request produces no step, so 0.7.0''s checkpointing never fires, the 0.2.0 time budget is checked
+    only at the top of a step and so is never reached, and 0.5.0''s aggregate ledger sees no draw. The
+    run is simply gone, and the only remedy today is killing the process — which is the exact scenario
+    0.7.0 exists to make unnecessary.
+
+    Three providers are implemented and paid for. Not being able to reach the second one when the first
+    is down is a capability the crate already has and cannot use.
+
+    For the downstream products this is the difference between an agent an operator watches and one they
+    can leave. io-cli and io-studio both surface a run''s outcome to a person; "escalated, here is a string"
+    is not something either can act on, while "the provider rate-limited us and we exhausted our waits"
+    and "your API key is wrong" lead to different buttons.
+
+    It also has to come before 0.12.0. Evaluation scores runs, and a scoring harness cannot tell a model
+    that failed the task from a provider that was briefly unavailable unless the outcome record distinguishes
+    them. Building the evaluation surface on top of an undifferentiated `escalated` would bake that ambiguity
+    into io-eval''s data.
+
+    '
+  evidence_of_value: 'A fixture provider that fails in each classified way — connection refused, 429 with
+    and without `Retry-After`, 503, 401, a malformed stream, and a socket that accepts and then never
+    writes — with a test per case asserting the kind, whether it was retried, how long it waited, and
+    what the caller finally received. The hang case is the one that must be proven rather than reasoned
+    about: a real local server that accepts and stalls, and a run that ends on the deadline instead of
+    never.
+
+    For fallback: a run configured with a failing primary and a working secondary that completes the task,
+    with the trace naming both — the primary''s failure and its kind, and the secondary as the provider
+    that served the step. Plus the inverse, an unrecoverable primary failure that must NOT fall over,
+    because falling over on a 401 just fails twice.
+
+    For the stall: the 0.10.0 live run replayed. That run is on record ending in `StepCapReached` after
+    sixteen turns of re-reading four files; the same fixture under 0.11.0 must be detected, told once,
+    and end as `Stalled` in materially fewer steps. A live run is worth doing here too, since the stall
+    was found live rather than in a test.
+
+    For honesty about what is retryable: the trace''s own rows. Every retry names the kind it retried
+    and the delay it waited, so a reader can tell a wait from a hammer.
+
+    '
+scope:
+  included:
+  - 'Classify provider failures. `Error::Provider(String)` becomes a structured variant carrying a kind
+    — transport, timeout, rate-limited (with `Retry-After` when the server sends one), server error, authentication/authorization,
+    malformed response — with the HTTP status preserved rather than formatted into prose. The kind answers
+    one question: is retrying this the same call likely to behave differently. This is a public break
+    on a widely-matched enum and is documented as one.
+
+    '
+  - 'Retry only what is retryable, and wait. `complete_with_retry` inspects the kind: a transport error,
+    a 5xx, a timeout and a rate limit are retried with a backoff that grows per attempt and honours `Retry-After`
+    when present; an authentication failure and a malformed request escalate on the first occurrence instead
+    of being re-sent twice. Today every error, including `Error::Config("OPENAI_API_KEY not set")`, is
+    retried identically and instantly.
+
+    '
+  - 'Give requests a deadline. `net::http_client()` sets a request timeout with a documented default,
+    overridable by the caller, so a server that accepts a connection and stops writing produces a timeout
+    error rather than hanging a 24-hour run forever. A timeout is a retryable kind.
+
+    '
+  - 'Make a malformed stream an error. A response whose stream yields no parseable event at all is `Error::Provider`
+    with the malformed kind, not `Ok(CompletionResponse::default())`. A response that parses and legitimately
+    contains no tool call keeps its current meaning exactly — the distinction is "nothing could be read"
+    versus "the model said something and called nothing", and the tests must pin both sides.
+
+    '
+  - 'Provider fallback without breaking the trait. A `Fallback` combinator that is itself a `Provider`
+    and wraps two of them, so `Fallback::new(primary, secondary)` composes and nests for three, and every
+    existing generic entry point takes it unchanged. `Provider::complete` returns `impl Future` and so
+    is not object-safe; making it object-safe would be a far larger public break for a feature a combinator
+    delivers, and that trade is recorded rather than discovered.
+
+    '
+  - 'Fall over only when falling over could help. The combinator consults the failure''s kind: a provider-side
+    failure another provider might not have (transport, timeout, 5xx, rate limit, and a malformed stream)
+    falls through to the secondary; a failure that is about the request or the caller''s own configuration
+    does not, because trying the same bad request twice is two failures instead of one.
+
+    '
+  - 'Record which provider served each step. `runs.provider` is one label for a whole run (`src/state.rs`,
+    set once at `src/run.rs:139`), which is no longer true once a run can use two. A per-step or per-event
+    record of the provider that actually answered, so a trace reader can see the switch happen.
+
+    '
+  - 'A durable notion of workspace change. `Workspace::write_file` reports whether the bytes it wrote
+    differ from what was there, so a byte-identical rewrite is recorded as the no-op it is. This is the
+    signal stall detection rests on and the crate has nothing like it today.
+
+    '
+  - 'Stall detection. A bounded number of consecutive steps that change nothing in the workspace AND whose
+    tool calls repeat what an earlier step in that window already did is a stall. Both halves are required:
+    a legitimate exploration phase changes nothing either, and what distinguishes the 0.10.0 live failure
+    is that it was doing the same thing over and over. The threshold is configurable and can be switched
+    off.
+
+    '
+  - 'One bounded replan. On the first stall the agent is told plainly, in the context 0.10.0 assembles,
+    that it has made no change for N steps, what it has already tried, and that it should change approach.
+    Once per run. If it stalls again the run ends as a stall rather than spending the rest of its budget
+    proving it.
+
+    '
+  - 'An outcome a caller can branch on. A stall ends the run with its own `RunOutcome` variant rather
+    than as `StepCapReached`, and an escalation carries whether the failure was retryable. The `"escalated"`
+    outcome string is also currently absent from `terminal_outcome` (`src/run.rs:617-625`) and `finish_run`
+    maps it to `Completed`, so a resumed escalated run falls through into the loop and re-runs; that is
+    fixed here, where escalation is being worked on.
+
+    '
+  - 'Trace rows for all of it: every retry with its kind and the delay it waited, every fallback with
+    the provider that failed and the one that answered, every stall, and every replan. A resilience decision
+    that is invisible is one nobody can debug or evaluate.
+
+    '
+  - 'All three loops. The single-file loop, the workspace loop and the sub-agent loop each call `complete_with_retry`
+    (`src/run.rs:679`, `:837`, `:1237`); the classification and backoff apply to all three. Stall detection
+    applies where there is a workspace to change, which is the workspace and sub-agent loops.
+
+    '
+  - 'Tests per classified failure and per behaviour, plus the three-OS matrix staying green, plus a live
+    run confirming the stall path on the fixture that produced it.
+
+    '
+  excluded:
+  - 'Making `Provider` object-safe. The combinator delivers fallback without it; boxing the future in
+    a public trait every caller implements is a larger break than this release needs, and it would be
+    a permanent tax on the common single-provider path.
+
+    '
+  - 'Provider routing, load balancing, or model selection by cost, latency or capability. Fallback is
+    "the first one failed"; choosing a provider on purpose is a product decision with its own release.
+
+    '
+  - 'Health tracking or circuit breaking across runs. A provider that failed the last run starts the next
+    one trusted. Remembering that would need a store surface and an expiry policy, and it is a different
+    feature from surviving the failure in front of you.
+
+    '
+  - 'A plan artifact the agent maintains and revises. The replan is one bounded directive in the context,
+    not a durable plan object with its own tool and table. A real planner changes what the product is
+    and belongs in its own release.
+
+    '
+  - 'More than one replan per run. An agent that stalls twice is not going to be talked out of it by a
+    third message, and an unbounded replan loop is a way to spend a whole budget politely.
+
+    '
+  - 'Retrying tool calls, verification, or sandbox execution. This release is about the provider and about
+    progress; a flaky test or a failing compile is a result, not a transport failure.
+
+    '
+  - 'Quota or spend management against a provider''s rate limits. Honouring `Retry-After` is not the same
+    as modelling a token bucket.
+
+    '
+  - 'The live event stream, deterministic replay and the per-run outcome record. All 0.12.0. The outcome
+    variant this release adds is a return value, not the evaluation surface.
+
+    '
+  - 'The Windows Job Object. Windows containment stays the portable floor with a wall-clock cap, as documented
+    and asserted since 0.9.1. It needs a `windows-sys` binding and its own release.
+
+    '
+  - 'Any change to the 0.10.0 assembler''s rules, the policy, verification or the sandbox. The replan
+    directive is a new thing put into the context; it does not alter how the context is built.
+
+    '
+  fallback_scope:
+  - 'The provider half only: failure classification, retry of what is retryable with backoff and `Retry-After`,
+    a request deadline, a malformed stream becoming an error, the `Fallback` combinator with kind-aware
+    fall-through, the per-step provider record, and the `escalated` resume fix — with stall detection
+    and the replan deferred to their own release. This is a coherent outcome a developer reaches: a long
+    unattended run survives a provider that is down, rate-limited, hung or returning garbage, and is told
+    which. It is also the half where the audit found real defects rather than missing features, and the
+    half 0.12.0''s evaluation surface depends on.
+
+    '
+acceptance:
+  functional:
+  - 'F1 — a provider failure carries its kind. A fixture provider returning connection-refused, 429, 503,
+    401, and a malformed stream produces five distinguishable kinds, with the HTTP status preserved and
+    `Retry-After` captured when the server sent one. Asserted on the error value, not on its rendered
+    string.
+
+    '
+  - 'F2 — only retryable failures are retried, and they wait. A 401 reaches the caller after exactly one
+    provider call; a 503 is retried up to the contract''s limit with a delay that grows per attempt; a
+    429 carrying `Retry-After` waits at least that long. Asserted by counting provider calls and measuring
+    elapsed time against the fixture, and each retry''s trace row names the kind and the delay.
+
+    '
+  - 'F3 — a request has a deadline. A local server that accepts the connection and then never writes ends
+    the call as a timeout error within the configured deadline, and the deadline is overridable by the
+    caller. Proven against a real stalling socket, not a mocked error: this is the failure mode that produces
+    no step, no trace row and no budget draw today, so a fixture that merely returns an error would not
+    test it.
+
+    '
+  - 'F4 — a malformed stream is an error, and a quiet model is not. A stream with no parseable event yields
+    `Error::Provider` with the malformed kind; a stream that parses and contains text but no tool call
+    still yields `Ok` and is still read as "no tool call". Both sides asserted, because collapsing them
+    in either direction is a regression.
+
+    '
+  - 'F5 — fallback works and composes. `Fallback::new(down, working)` completes a task that the primary
+    alone cannot, three providers nest, and every existing entry point accepts it with no signature change.
+    The trace names the provider that failed, its kind, and the provider that served the step.
+
+    '
+  - 'F6 — fallback does not fire when it cannot help. A primary failing with an authentication or request-shaped
+    error does NOT reach the secondary; the caller gets the primary''s error. Asserted by a secondary
+    that panics if called.
+
+    '
+  - 'F7 — the workspace knows when it did not change. Writing byte-identical content is recorded as a
+    no-op distinct from a real edit, and a real edit is still recorded as one. This is the signal F8 rests
+    on, asserted on its own so a stall test failing cannot hide a broken signal.
+
+    '
+  - 'F8 — a stalled agent is detected and told once. The 0.10.0 live failure replayed as a fixture — repeated
+    identical reads with no write — is detected within the configured window, produces a replan directive
+    in the next turn''s context naming what was already tried, and the detection and the replan are trace
+    rows. An agent that changes the workspace, and an agent legitimately exploring with varied calls,
+    are NOT flagged.
+
+    '
+  - 'F9 — a persistent stall ends the run as a stall. After the one replan, a still-stalled agent ends
+    with the stall outcome in materially fewer steps than its cap, rather than as `StepCapReached`. Asserted
+    against the step count.
+
+    '
+  - 'F10 — an escalated run is terminal on resume. `"escalated"` maps through `terminal_outcome` and `finish_run`
+    no longer reports it as a plain completion, so resuming an escalated run reports what happened instead
+    of silently re-entering the loop. A regression test that fails against 0.10.0.
+
+    '
+  - 'F11 — the outcome says which. The result a caller receives distinguishes a retryable failure from
+    a terminal one without parsing a string, and the distinction survives into the store so a resume and
+    a trace reader agree with the caller.
+
+    '
+  non_functional:
+  - 'NF1 — no new runtime dependency. Backoff is `tokio::time::sleep`, which is already a dependency;
+    the request deadline is a `reqwest` builder option already available. No retry crate, no backoff crate,
+    and no randomness crate — the backoff is deterministic and documented as such rather than jittered.
+
+    '
+  - 'NF2 — the single-provider path pays nothing. A run with one provider makes the same number of provider
+    calls as it does under 0.10.0, and the classification adds no request. Asserted by a call counter
+    on the existing mock providers.
+
+    '
+  - 'NF3 — stall detection is off-by-default-safe. Its work per step is bounded and independent of the
+    run''s length, it can be disabled by configuration, and with it disabled the loops behave exactly
+    as 0.10.0 did. A resilience feature that changes a working run''s behaviour is a regression however
+    well it works.
+
+    '
+  - 'NF4 — MSRV stays 1.88; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` stay clean
+    on all three platforms; the ubuntu/macos/windows matrix plus the msrv and lint jobs are green on one
+    commit with no leg skipped, excluded or marked `continue-on-error`.
+
+    '
+  - 'NF5 — the public break is deliberate and documented. `Error::Provider`''s shape changes, which breaks
+    every `match` on it. The CHANGELOG carries the migration note, the public-surface diff against the
+    0.10.0 tag is recorded in the evidence, and no other public item is renamed or removed. The crate
+    stays pre-1.0; no 1.0.0 is planned or implied.
+
+    '
+  - 'NF6 — no regression. All 271 tests shipped at 0.10.0 pass unless one asserted a behaviour this release
+    deliberately changes, and each such test is named in the record with why its old assertion was wrong.
+    `tests/edit_file.rs`''s two retry tests are the expected casualties: they assert `"retry 1 after error"`
+    against a provider error that this release classifies, and the retry trace row is gaining the kind
+    and the delay.
+
+    '
+  - 'NF7 — a retry wait is cancellable and budgeted. A backoff sleep does not outlive the run''s time
+    budget, and a run whose deadline passes while waiting ends on the budget rather than after it. Waiting
+    is not a way to escape a limit.
+
+    '
+  operational:
+  - 'O1 — the crate documents what fallback does and does not promise: it tries another provider when
+    the failure suggests another provider might succeed, it does not verify that the second provider is
+    equivalent to the first, and a model swap mid-run can change behaviour in ways the harness cannot
+    see. An operator configuring two providers should know they may get two different models.
+
+    '
+  - 'O2 — the documented failure taxonomy matches the code. Every kind the enum carries is described with
+    what produces it and whether it is retried, in the crate docs and the README, so a consumer branching
+    on a kind is branching on something specified rather than observed.
+
+    '
+  - 'O3 — `docs/CAPABILITIES.md` marks recovery and retry shipped at 0.11.0 and marks nothing else. If
+    the fallback scope is taken, it stays partial with the deferred release named.
+
+    '
+  - 'O4 — the request deadline''s default is stated wherever a timeout would surprise someone: a long
+    single completion on a slow model must not be killed by a default meant to catch a hung socket. The
+    default is documented with that trade named, and it is overridable.
+
+    '
+  - 'O5 — the live-run evidence exists in the evidence directory: the stall fixture ending as a stall,
+    and a fallback run whose trace shows both providers.
+
+    '
+delivery:
+  target_mode: published
+  environment: 'crates.io, plus the three-OS GitHub Actions matrix (ubuntu-latest, macos-latest, windows-latest)
+    with the msrv and lint jobs.
+
+    '
+  deployment_method: 'The initorigin release flow with the owner''s 2026-07-26 override in effect: all
+    work including the sealed completion record on `feat/0.11.0`, PR to `develop`, release PR `develop`
+    to `main`, a GitHub Release titled `io-harness 0.11.0` with notes taken verbatim from the CHANGELOG,
+    then `cargo publish` last. The order is unchanged; the merges are performed without waiting for manual
+    review.
+
+    '
+  migrations:
+  - 'Additive only, in the shape the store already uses: whatever table or columns the per-step provider
+    record and the resilience trace rows need, created idempotently in `Store::from_conn` with `CHECKPOINT_FORMAT`
+    left alone, so a 0.10.0 store opens and a 0.10.0 checkpoint resumes.
+
+    '
+  - '`finish_run`''s handling of `"escalated"` changes, and `terminal_outcome` learns two new outcome
+    strings. Rows already written by 0.10.0 keep their values; the change is in how they are read, so
+    an existing escalated run becomes correctly terminal rather than being rewritten.
+
+    '
+  - 'A caller upgrades by changing the version and updating any `match` on `Error::Provider`, per the
+    CHANGELOG migration note.
+
+    '
+  observability:
+  - 'The existing rusqlite trace and `tracing` spans, extended with a row per retry (kind and delay),
+    a row per fallback (which provider failed, with what kind, and which answered), a row per stall, and
+    a row per replan.
+
+    '
+  rollback: '`cargo yank --vers 0.11.0`, leaving 0.10.0 as what `cargo install` and a fresh `cargo add`
+    resolve to. A consumer rolling back restores their old `Error::Provider` match arms and loses fallback,
+    classification and stall detection; their store keeps the unused additive tables, which 0.10.0 ignores.
+    As with 0.10.0, roll back between runs rather than during one.
+
+    '
+dependencies:
+  products:
+  - 'io-cli and io-studio both surface a run''s outcome to a person and both gain something to show instead
+    of an undifferentiated escalation. Neither is blocked by this release, and neither must change to
+    adopt it beyond the `Error::Provider` migration note.
+
+    '
+  - 'io-eval depends on the retryable/terminal distinction landing before 0.12.0''s evaluation surface
+    is built on it, or the ambiguity gets baked into its data.
+
+    '
+  services:
+  - 'A provider API key for the live evidence. The classification, fallback and stall tests all run against
+    fixtures — including a real local stalling socket for the deadline — so only the live-run confirmation
+    needs a real provider.
+
+    '
+  - 'GitHub Actions for the three-OS matrix. The timeout and backoff tests are timing-sensitive and must
+    hold on the slowest runner, not only on the development machine.
+
+    '
+  human_approvals:
+  - 'None. The owner''s 2026-07-26 override authorizes the PRs, both merges, the GitHub Release and `cargo
+    publish` without a review stop, and engineering decisions inside the release are made and recorded
+    rather than referred.
+
+    '
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - 'Reshaping `Error::Provider` touches every construction site in three providers and every match in
+    the crate and the tests. It is mechanical but wide, and it is the change most likely to produce a
+    long tail of compile errors in test files.
+
+    '
+  - 'Timing-sensitive tests are the expensive kind. A backoff assertion and a deadline assertion both
+    measure wall-clock, and both have to hold on a loaded Windows runner as well as locally. Generous
+    bounds and few of them.
+
+    '
+  - 'The stall signal is a judgment call, like 0.10.0''s compaction rules. Too eager and it interrupts
+    a legitimate exploration phase; too lax and it never fires. The 0.10.0 live transcript is the fixture
+    that tells us, which is why replaying it is an acceptance criterion rather than a nicety.
+
+    '
+  - 'The `Fallback` combinator has to satisfy a trait whose method returns `impl Future`, from a type
+    generic over two other implementations. The signature is the risk; settle it against a real pair of
+    providers before threading it anywhere, the way 0.9.0 settled the `Tool` trait.
+
+    '
+  - 'A real stalling-socket fixture is a small piece of async plumbing the repo has a precedent for (`tests/net.rs`
+    and `examples/mcp_fixture_server.rs` both stand up real servers), but it is new code in the test harness
+    rather than a mock.
+
+    '
+  preferred_tools:
+  - The existing mock-provider pattern in `tests/edit_file.rs` and `tests/parity.rs`, and the real-server
+    pattern in `tests/net.rs`.
+  - rustc/cargo, clippy, rustfmt, and the three-OS matrix via `gh run view`.
+  - 'The 0.10.0 live-run evidence in `evidence/0.10.0/comparison.md` as the stall fixture''s source of
+    truth: it is a recorded real failure, which is worth more than an invented one.
+
+    '
+  constraints:
+  - 'Minor semantics on a 0.x crate: the `Error::Provider` break is permitted but must be documented with
+    a migration note, and it is the only public break this release takes.
+
+    '
+  - 'No new runtime dependency.
+
+    '
+  - 'A run with one provider and stall detection disabled must behave exactly as it does under 0.10.0.
+    This release adds survival, and adding survival must not change what a healthy run does.
+
+    '
+  - 'Scope discipline against 0.12.0: an outcome variant is a return value, not an evaluation surface,
+    and a trace row is not an event stream.
+
+    '
+risks:
+- 'The `Error::Provider` reshape is wide enough that the compiler leads and the design follows — ending
+  with a variant shaped by what made the tests compile rather than by what a consumer needs to branch
+  on. Mitigation: settle the kind enum and write the taxonomy documentation (O2) FIRST, against the five
+  real failure modes F1 names, before touching a call site.
+
+  '
+- 'Stall detection fires on a legitimate exploration phase and interrupts a run that was working. This
+  is the release''s worst failure mode, because it degrades healthy runs to add resilience. Mitigation:
+  both halves of the signal are required (no workspace change AND repeated tool calls), the threshold
+  is configurable, it can be disabled, and F8 asserts explicitly that a varied-call exploration is not
+  flagged.
+
+  '
+- 'The request deadline kills a legitimately slow completion. A large model on a long prompt can take
+  minutes, and a default chosen to catch a hung socket could cut it off. Mitigation: O4 requires the default
+  to be documented with the trade named and overridable, and the default is chosen generous rather than
+  tight — a hung socket is caught by any finite deadline, so there is no reason to pick a small one.
+
+  '
+- 'Falling over to a second provider silently changes the model mid-run, and the caller reads a result
+  produced by something other than what they configured. Mitigation: the trace records which provider
+  served each step, and O1 documents plainly that fallback does not promise equivalence.
+
+  '
+- 'Timing-based tests are flaky on CI and get quietly loosened until they assert nothing. Mitigation:
+  assert lower bounds on waits and upper bounds on deadlines with wide margins, keep the count of timing-sensitive
+  tests small, and never assert an exact duration.
+
+  '
+- 'Making a malformed stream an error turns a previously-silent success into a failure, and some real
+  provider that emits an unparseable keep-alive line starts erroring. Mitigation: the malformed kind fires
+  only when NOTHING in the stream parsed, and F4 pins the quiet-but-valid case on the other side.
+
+  '
+- 'Scope creep toward a planner. "Replan" is a word that invites building one. Mitigation: the excluded
+  list names the plan artifact and the second replan, and the replan here is one directive in the context
+  with a per-run bound.
+
+  '
+open_questions:
+- 'What is the request deadline''s default? It must be long enough that no realistic single completion
+  hits it and short enough that a hung socket does not cost a whole unattended run. Something in the minutes
+  rather than the seconds, decided in development with the reasoning recorded.
+
+  '
+- 'Does the backoff cap, and where? An exponential wait on a rate limit can exceed the run''s remaining
+  time budget, which NF7 says must not happen; the cap and the interaction with the time budget are one
+  decision, made in development.
+
+  '
+- 'Is the stall window a step count, or a fraction of `max_steps`? A fixed count is predictable; a fraction
+  scales with the contract''s own ambition. The 0.10.0 transcript stalled for sixteen steps out of twenty,
+  so either would have caught it.
+
+  '
+- 'Does the per-step provider record go on the `steps` row or into its own event table? A column is cheaper
+  to read and changes an existing table''s shape; an event table is additive and costs a join. Additive
+  is the safer default given io-eval reads the schema directly.
+
+  '
+- 'Should `Fallback` expose which provider answered, beyond the trace? A caller might want to branch on
+  it; a caller might equally not care. Decided in development, and left out unless there is a use for
+  it — an accessor nobody calls is a public item to maintain forever.
+
+  '
+released_at: '2026-07-26T12:45:00Z'
+mode: published
+delivered: 'A long unattended run now survives the failures that used to end it, and the caller learns
+  which one happened. The audit for this release found three failures worse than the roadmap assumed and
+  all three are closed: `net::http_client()` had no request timeout at all, so a server that accepted
+  a connection and then stopped writing hung a run forever — producing no step, so 0.7.0''s checkpointing
+  never fired, the time budget (checked only at the top of a step) was never reached, and the 0.5.0 ledger
+  saw no draw; both stream parsers skipped un-parseable lines, so a wholly malformed response returned
+  `Ok(CompletionResponse::default())` and the loops read it as "the model chose not to call a tool"; and
+  `"escalated"` was absent from `terminal_outcome` while `finish_run` filed it as a plain completion,
+  so a run that escalated at 3am was silently re-run by whatever resumed it.
+
+  The two the roadmap named are closed too. `Error::Provider(String)` becomes a structured variant carrying
+  a `ProviderErrorKind`, the HTTP status and the server''s `Retry-After`, so a 429 and a 401 are no longer
+  the same value retried with equal eagerness; retries now wait, doubling to a ceiling, honouring `Retry-After`
+  above it, and refusing to sleep past the run''s own time budget. `Fallback` is itself a `Provider`,
+  so it needs no new entry point and nests for three, and it falls through only on a failure another provider
+  might not have.
+
+  An agent that stops getting anywhere is stopped for it. A stall needs both halves — nothing changed
+  in the workspace, and a tool call this window already saw — resting on a new `Wrote` signal, since `write_file`
+  never read the old content and a byte-identical rewrite was indistinguishable from an edit. A live run
+  proved it: 20-step cap, told once at step 4, stopped at step 11.
+
+  Recovery and retry is the eleventh of the twelve pillars. Only observability and evaluation remains.
+
+  '
+evidence:
+  tests:
+  - 'cargo test — 341 passed, 0 failed across 19 targets, from a cold build cache (271 at 0.10.0; +70).
+    New: tests/stall.rs (7), tests/fallback.rs (6), tests/provider_failures.rs (13), plus 9 resilience
+    unit tests and the crate-internal real-socket `provider::failures` module.
+
+    '
+  - 'F1 green — one test per kind against real local sockets: refused connection, 429 bare, 429 delta-seconds,
+    429 HTTP-date, 503, 401, 400. `all_three_providers_map_a_status_to_the_same_kind` drives OpenRouter,
+    OpenAI and Anthropic against one fixture, and `tests/provider_failures.rs` holds an exhaustive match
+    that fails to compile if a kind is added without a retry decision.
+
+    '
+  - 'F2 green — `a_wrong_key_reaches_the_caller_after_exactly_one_provider_call` (1 call, under 2s against
+    a 5s base), `a_server_failure_is_retried_to_the_limit_with_a_wait_that_doubles` (4 calls; rows pinned
+    exactly at 40ms/80ms/160ms so growth is asserted on the trace rather than the clock), `a_rate_limit_waits_at_least_as_long_as_the_server_asked`.
+    Timing assertions are lower bounds with margin, never exact durations.
+
+    '
+  - 'F3 green — proven against a REAL socket, not a mocked error: `a_server_that_accepts_and_never_answers_ends_as_a_timeout`,
+    a listener that accepts and never writes, ending as `Timeout` well inside a 300ms override. A fixture
+    returning an error would not have tested the failure this criterion is about, which produces no step
+    and no trace row at all.
+
+    '
+  - 'F4 green — `a_stream_that_parses_to_nothing_is_malformed_not_an_empty_answer`, `a_stream_with_text_and_no_tool_call_stays_a_quiet_success`,
+    `a_stream_carrying_only_usage_is_not_malformed`. Both directions pinned: collapsing them either way
+    is a regression.
+
+    '
+  - 'F5/F6 green — `a_down_primary_is_answered_by_the_secondary_and_the_run_still_succeeds`, `three_nested_providers_reach_the_one_that_is_up`,
+    and two tests where the secondary''s `complete` panics if reached, proving an `Auth` or `Request`
+    failure does not fall over. `falling_over_costs_the_primary_one_attempt_per_step_not_a_retry_budget`
+    pins that retry and fallback budgets do not multiply.
+
+    '
+  - 'F7 green — 7 `Wrote` tests including `a_write_of_the_same_length_but_different_bytes_reports_changed`
+    (27-byte fixture one digit apart, so a size or mtime shortcut fails it). Asserted on its own so a
+    stall test failing cannot hide a broken change signal.
+
+    '
+  - 'F8 green, and its healthy half matters more: `the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the_window`
+    replays the recorded 0.10.0 failure and `a_write_that_changed_nothing_is_not_progress_and_is_flagged`
+    proves the `Unchanged` signal end to end — while `an_agent_that_changes_the_workspace_is_never_flagged`
+    and `varied_calls_that_write_nothing_are_exploration_and_are_never_flagged` both run to their cap
+    with no row and no directive. Flagging a legitimate exploration phase would degrade healthy runs in
+    order to add resilience.
+
+    '
+  - 'F9/NF3 green — `a_still_stalled_run_stops_far_short_of_its_step_budget` ends `Stalled { steps: 6
+    }` on a 20-step script with the provider called exactly 6 times, and `a_window_of_zero_restores_the_old_step_cap_behaviour_exactly`
+    runs the same script to `StepCapReached { steps: 20 }` with nothing recorded. `a_stalled_root_agent_ends_the_tree_as_stalled`
+    covers the sub-agent loop.
+
+    '
+  - 'F10 green — the regression that fails against 0.10.0: `resuming_an_escalated_run_reports_the_escalation_instead_of_calling_the_provider_again`
+    asserts the provider''s call count does not move across the resume, and the terminal variant gives
+    one total call across run and resume.
+
+    '
+  - 'NF7 green — `a_retry_that_would_outlast_the_time_budget_escalates_instead_of_sleeping`: a 1s budget
+    against a 30s base escalates after one call. Waiting is not a way to escape a limit.
+
+    '
+  builds:
+  - 'CI run 30202128038 — lint, msrv, ubuntu-latest, macos-latest and windows-latest all green on one
+    commit, full suite, no leg skipped, excluded or marked `continue-on-error`.
+
+    '
+  - 'CI earned its keep: run 30201946447''s Windows leg failed `a_refused_connection_is_transport` with
+    `left: Timeout, right: Transport`. Not flakiness — on unix the stack refuses a connect to a closed
+    local port immediately, while Windows retransmits the SYN so the client''s own deadline fires first.
+    Both mean the request never reached a model and both are retryable, which is the property worth asserting;
+    fixed in 8c97950 by asserting the pair rather than one of them.
+
+    '
+  - cargo clippy --all-targets -- -D warnings — exit 0. cargo fmt --check — exit 0. MSRV 1.88 holds.
+  - 'cargo package — 78 files, verify build clean, no `.env` or secret-shaped path; `.env.example` is
+    the only env-named file and is intentional.
+
+    '
+  - 'NF1 — no new runtime dependency. Backoff is `tokio::time::sleep` and the deadline a `reqwest` builder
+    option, both already present. `[dependencies]` unchanged against 0.10.0.
+
+    '
+  - 'NF5 — the public-surface diff is recorded in evidence/0.11.0/public_surface_diff.txt. Exactly three
+    removals, all deliberate and all documented: the `pub use error::{...}` line (replaced, additive)
+    and the two signature changes on `Workspace::write_file` and `FsTool::write`.
+
+    '
+  - 'Scope discipline verified rather than assumed: src/policy.rs, src/verify.rs, src/sandbox.rs, src/approve.rs,
+    src/containment.rs and src/context.rs are all untouched against main, and the source contains no circuit
+    breaker, load balancer, cross-run health tracking, tokenizer, event stream or subscription. Everything
+    `scope.excluded` names is still absent.
+
+    '
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- 'The record is sealed before the crates.io upload, which follows the two merges and the GitHub Release.
+  `mode: published` states the authorized target.
+
+  '
+- 'Stall detection is a heuristic over two signals, not a proof. It reads whether a write changed the
+  file''s bytes and whether a tool call repeated. An agent making real progress the harness cannot see
+  — reasoning, or work inside a registered tool whose effects are outside the workspace — could in principle
+  be flagged, which is why the window is configurable and can be set to 0.
+
+  '
+- 'The stall signature is the joined tool-call text, so two calls that differ only in an irrelevant argument
+  read as different work and reset nothing. An agent that varies a padding argument while achieving nothing
+  would not be caught.
+
+  '
+- '`with_stall_policy` is inert for a single-file run, which has one tool and one file. Documented on
+  the builder rather than silently accepted.
+
+  '
+- 'The request deadline is 600s by default. Long enough that no realistic single completion reaches it
+  — a full 8192-token stream at a sluggish 15 tokens/second is about nine minutes — but a caller running
+  a slower model or a much longer output should raise it. A hung socket is caught by any finite deadline,
+  so the default is deliberately generous rather than tight.
+
+  '
+- 'Backoff is deterministic, with no jitter. Many clients retrying in lockstep after a shared outage would
+  synchronise; jitter needs a randomness dependency this release does not take, and would make the wait
+  assertions untestable without loosening them until they assert nothing.
+
+  '
+- 'Falling over swaps the model mid-run and the harness cannot see whether the replacement is as capable,
+  as well tuned, or even the same size. The provider that answered is recorded per step so an operator
+  can tell, but nothing verifies equivalence, and a run that fell over may behave differently from one
+  that did not.
+
+  '
+- 'Nothing tracks a provider''s health across runs. A provider that failed every call last run starts
+  the next one trusted; a circuit breaker needs a store surface and an expiry policy and is a different
+  feature from surviving the failure in front of you.
+
+  '
+- 'Honouring `Retry-After` is not rate-limit management. There is no token bucket and no quota model,
+  so a run that is being throttled will keep asking and keep waiting.
+
+  '
+- '`Retry-After` handles delta-seconds and IMF-fixdate only. RFC 850 and asctime dates degrade to "no
+  hint" rather than to a wrong wait, marked `ponytail:` with the upgrade path named.
+
+  '
+- 'The malformed kind fires only when NOTHING in a stream parsed. A provider that emits a valid but truncated
+  response — half the tool call, then a clean end — is still `Ok`, and looks to the loop like a model
+  that changed its mind.
+
+  '
+- 'Windows containment is still the portable floor with a wall-clock cap only, and `Backend::WindowsJobObject`
+  remains a public variant nothing constructs on the enforcement path. Unchanged since 0.9.1; it needs
+  a `windows-sys` binding and its own release.
+
+  '
+- 'Every Windows claim in this record rests on CI run 30202128038. Nobody on this project has a Windows
+  machine, and this release is the second time in three releases that CI found a real Windows-specific
+  behaviour nothing local could see.
+
+  '
+supersedes: 0.10.0
+next_recommended_version: 0.12.0
+immutable: true
