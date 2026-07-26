@@ -2465,6 +2465,7 @@ async fn authorize_provider<P: Provider>(
         // Step 0: the authorization happens before the run's first step.
         let verdict = NetGuard::new(&effective)
             .tracing(store, run_id, 0)
+            .watching(watch, 0)
             .check_target(&target)?;
         if verdict.effect == Effect::Ask {
             // One human decision covers the run; the first host that needs asking

@@ -197,7 +197,10 @@ impl McpSession {
                     })?
                 }
                 McpTransport::Http { url, headers } => {
-                    NetGuard::new(policy).tracing(store, run_id, 0).check(url)?;
+                    NetGuard::new(policy)
+                        .tracing(store, run_id, 0)
+                        .watching(watch, 0)
+                        .check(url)?;
                     let mut config = StreamableHttpClientTransportConfig::with_uri(url.clone());
                     // Built as one map and set once: `custom_headers` replaces
                     // the whole map, so setting it per header would keep only

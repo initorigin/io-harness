@@ -1294,3 +1294,86 @@ async fn every_mcp_row_is_announced_with_the_same_server_tool_outcome_and_latenc
         "an Mcp event must report the server, tool, outcome and latency its row does"
     );
 }
+
+/// A policy-denied network host is announced, not only recorded.
+///
+/// This was the last place the two surfaces disagreed: `NetGuard` wrote a
+/// `policy_events` refusal row for a denied host and emitted nothing, so an
+/// application watching a run would have seen the connection simply not happen.
+/// Egress is the one refusal an operator most needs to see live.
+///
+/// Asserted against the row rather than a literal, like every other agreement
+/// test here.
+#[tokio::test]
+async fn a_denied_network_host_is_announced_with_what_the_row_records() {
+    struct Dialer;
+    impl Provider for Dialer {
+        fn name(&self) -> &str {
+            "dialer"
+        }
+        fn endpoint(&self) -> Option<&str> {
+            Some("http://127.0.0.1:9/v1")
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> io_harness::Result<CompletionResponse> {
+            Ok(CompletionResponse::default())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+    let policy = Policy::default()
+        .layer("lockdown")
+        .allow_read("*")
+        .allow_write("*")
+        .deny_net("127.0.0.1");
+
+    let contract = TaskContract::workspace(
+        "reach a denied host",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "never.txt".into(),
+            needle: "never".into(),
+        },
+    )
+    .with_max_steps(1);
+
+    let err =
+        io_harness::run_with_observed(&contract, &Dialer, &store, &policy, &ApproveAll, &watcher)
+            .await
+            .expect_err("a denied host must refuse the run");
+    assert!(matches!(&err, io_harness::Error::Refused { act, .. } if act == "net"));
+
+    // Every net refusal the store recorded...
+    let rows: Vec<(String, Option<String>, Option<String>)> = store
+        .events(1)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.act == "net" && e.kind == "refusal")
+        .map(|e| (e.target, e.rule, e.layer))
+        .collect();
+    assert!(!rows.is_empty(), "the policy must have refused something");
+
+    // ...has an event carrying exactly the same target, rule and layer.
+    let announced: Vec<(String, Option<String>, Option<String>)> = watcher
+        .events()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            EventKind::Refused {
+                act,
+                target,
+                rule,
+                layer,
+            } if act == "net" => Some((target, rule, layer)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        announced, rows,
+        "a denied host must be announced with exactly what the trace row records"
+    );
+}

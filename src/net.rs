@@ -210,6 +210,11 @@ pub(crate) fn target(url: &str) -> Option<String> {
 pub(crate) struct NetGuard<'a> {
     policy: &'a Policy,
     trace: Option<(&'a Store, i64, u32)>,
+    /// Where to announce a refusal, and at what tree depth.
+    ///
+    /// Separate from `trace` because a caller may record without observing, and
+    /// because the depth is the agent's rather than the store's.
+    watch: Option<(&'a crate::run::Watch<'a>, u32)>,
 }
 
 impl<'a> NetGuard<'a> {
@@ -218,6 +223,7 @@ impl<'a> NetGuard<'a> {
         Self {
             policy,
             trace: None,
+            watch: None,
         }
     }
 
@@ -226,6 +232,17 @@ impl<'a> NetGuard<'a> {
     /// from the store afterwards.
     pub(crate) fn tracing(mut self, store: &'a Store, run_id: i64, step: u32) -> Self {
         self.trace = Some((store, run_id, step));
+        self
+    }
+
+    /// Also announce a network refusal to `watch`.
+    ///
+    /// Without this a policy-denied host writes a `policy_events` refusal row that
+    /// has no `Refused` event beside it — the one place the two surfaces would
+    /// have disagreed, which is precisely what the observer's headline test exists
+    /// to catch.
+    pub(crate) fn watching(mut self, watch: &'a crate::run::Watch<'a>, depth: u32) -> Self {
+        self.watch = Some((watch, depth));
         self
     }
 
@@ -262,6 +279,13 @@ impl<'a> NetGuard<'a> {
             };
             ev.rule = verdict.rule.clone();
             ev.layer = verdict.layer.clone();
+            // Announced from the row itself, so the event cannot carry a rule or
+            // layer the row lacks.
+            if verdict.effect == Effect::Deny {
+                if let Some((watch, depth)) = self.watch {
+                    crate::run::refused(watch, run_id, depth, &ev);
+                }
+            }
             let _ = store.record_event(run_id, &ev);
         }
         if verdict.effect == Effect::Deny {
