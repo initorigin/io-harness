@@ -138,8 +138,8 @@ versions:
       deliberately and recalls on a later run over the same workspace — so a second run does not
       rediscover what the first established. Closes the context-construction and state-and-memory
       gaps; see iterations/US-IO-HARNESS-0.9.0-I01.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.11.0
     outcome: >
       A developer's long unattended run survives the failures that end runs today, not just the

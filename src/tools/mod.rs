@@ -27,31 +27,38 @@ pub const GREP_TOOL: &str = "grep";
 pub const FIND_TOOL: &str = "find";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
-/// How much of one tool result may enter the model's context.
+/// The name the model uses to record a fact for later runs over this workspace.
+///
+/// Deliberately narrow: it writes one keyed note into the harness's own store, not
+/// into the workspace, so it is not a path act. What it writes is bounded, attributed
+/// to the run and step that wrote it, and readable and clearable by the embedding
+/// program through [`Store`](crate::state::Store).
+pub const REMEMBER_TOOL: &str = "remember";
+/// Keep a tool result within `cap` chars, reporting whether it was cut.
 ///
 /// A tool that returns a megabyte would otherwise spend the rest of the run's
-/// token budget on a single observation, every turn, since the observation log
-/// is re-sent whole. The bound is the same for every non-built-in tool — an MCP
-/// server's and a caller's registered [`Tool`] alike — because the model cannot
-/// tell them apart and neither should the ceiling.
-pub(crate) const TOOL_RESULT_CAP: usize = 8_000;
-
-/// Keep a tool result within [`TOOL_RESULT_CAP`], reporting whether it was cut.
+/// token budget on a single observation, every turn. The bound is the same for
+/// every non-built-in tool — an MCP server's and a caller's registered [`Tool`]
+/// alike — because the model cannot tell them apart and neither should the
+/// ceiling.
+///
+/// 0.10.0 takes the cap as an argument instead of holding its own constant: it is
+/// derived per turn from the run's [`ContextBudget`](crate::context::ContextBudget)
+/// by [`entry_cap_chars`](crate::context::entry_cap_chars), so the per-result
+/// ceiling and the whole prompt's ceiling are one unit from one source and cannot
+/// drift apart.
 ///
 /// Truncation is visible in the returned text rather than silent: a model that
 /// cannot see it was cut off will treat a partial answer as the whole one.
-pub(crate) fn cap_result(s: String) -> (String, bool) {
-    if s.len() <= TOOL_RESULT_CAP {
+pub(crate) fn cap_result(s: String, cap: usize) -> (String, bool) {
+    if s.len() <= cap {
         return (s, false);
     }
-    let mut end = TOOL_RESULT_CAP;
+    let mut end = cap;
     while end > 0 && !s.is_char_boundary(end) {
         end -= 1;
     }
-    (
-        format!("{}\n[truncated at {TOOL_RESULT_CAP} chars]", &s[..end]),
-        true,
-    )
+    (format!("{}\n[truncated at {cap} chars]", &s[..end]), true)
 }
 
 /// The name the model uses to load one skill's body into its observations.

@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::context::ContextBudget;
 use crate::verify::Verification;
 
 /// A single unit of work handed to the harness.
@@ -51,6 +52,14 @@ pub struct TaskContract {
     /// process, unlike [`TaskContract::mcp`]: see [`crate::tools::Tool`] for what
     /// registration does and does not authorize.
     pub tools: crate::tools::Toolbox,
+    /// How much of each request the observation log may occupy.
+    ///
+    /// Defaults to [`ContextBudget::default`]. Separate from
+    /// [`TaskContract::max_tokens`] because they bound different things: that is
+    /// what the whole run may *spend*, this is what one request may *carry* —
+    /// though the two are related, since the share is taken of what the spend
+    /// budget has left.
+    pub context: ContextBudget,
     /// Directory of skill files to offer the agent, or `None` (the default) for
     /// no skills.
     ///
@@ -78,6 +87,7 @@ impl TaskContract {
             max_retries: 2,
             mcp: Vec::new(),
             tools: crate::tools::Toolbox::new(),
+            context: ContextBudget::default(),
             skills: None,
         }
     }
@@ -105,6 +115,7 @@ impl TaskContract {
             max_retries: 2,
             mcp: Vec::new(),
             tools: crate::tools::Toolbox::new(),
+            context: ContextBudget::default(),
             skills: None,
         }
     }
@@ -181,6 +192,16 @@ impl TaskContract {
     /// Set the cost budget, in total tokens across all completions.
     pub fn with_token_budget(mut self, max_tokens: u64) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Set how much of each request the observation log may occupy.
+    ///
+    /// Sits beside [`TaskContract::with_token_budget`] because they are the two
+    /// halves of one thing: that bounds what the run may spend, this bounds what
+    /// any one request carries of what it has already observed.
+    pub fn with_context_budget(mut self, context: ContextBudget) -> Self {
+        self.context = context;
         self
     }
 

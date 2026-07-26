@@ -1,540 +1,398 @@
 product: io-harness
-version: 0.9.0
+version: 0.10.0
 tasks:
-- id: US-IO-HARNESS-0.9.0-T01
-  summary: 'Introduce the in-process extension point: an object-safe `Tool` trait (spec + boxed-future
-    invoke), a `Toolbox` holding registered tools, `TaskContract::with_tools(...)` beside `with_mcp(...)`,
-    and the name arbitration that rejects a tool shadowing a built-in, using the reserved `mcp__` prefix,
-    or duplicating another registered name. Arbitration runs at run start, before the provider is called.
-    Settle the trait signature against three reference implementations first — a synchronous closure,
-    a stateful async tool, and one that returns an error — as the contract''s first risk requires.'
-  why_required: Nothing else in the release can be built against a trait shape that is not object-safe
-    or that a real implementer cannot satisfy, and a registered tool that silently shadows `write_file`
-    would hand a caller a way to replace the harness's own file writer without the policy ever seeing
-    it.
+- id: US-IO-HARNESS-0.10.0-T01
+  summary: 'Replace the append-only `observations: String` with a structured context ledger and a budget-aware
+    assembler. Adds a `context` module holding `Observation`/`Ledger`, an in-crate token estimate, and
+    a `ContextBudget` on `TaskContract` (absolute ceiling plus a share of the remaining token budget,
+    the lower binding). The workspace loop pushes typed entries instead of `push_str` and calls the assembler
+    to build the user prompt. Records what assembly did as trace rows: entries carried, entries stubbed,
+    estimated tokens, and the provider-reported count for the same request.'
+  why_required: Every other criterion in the release is a rule the assembler applies. Without the ledger
+    there is nothing to apply a rule to, and the prompt keeps growing whatever else is built.
   status: done
   depends_on: []
   acceptance_criteria:
-  - 'F3 — a registered tool may not shadow anything. Registering `write_file`, `grep`, `find`, `read_file`,
-    or `spawn_agent`, or a name starting `mcp__`, or two tools sharing one name, returns `Error::Config`
-    naming the offending tool, and it does so before the provider is called even once (asserted by a completion
-    counter that stays at zero).
+  - 'F1 — the prompt is assembled, not accumulated. For a run whose raw observation text exceeds the configured
+    share, a test asserts the assembled prompt is within the share on every turn while the trace still
+    holds every observation in full. The `observations: String` at `src/run.rs:950` no longer exists as
+    an append-only buffer that is re-sent whole.
 
     '
-  - 'NF1 — no new runtime dependency. `cargo tree --edges normal` for the crate is unchanged against 0.8.1:
-    the frontmatter reader is written in-crate against the standard library, and the `dyn`-safe trait
-    uses `std::pin::Pin<Box<dyn Future>>` as `run_agent` already does. A new dev-dependency is permitted;
-    a new runtime one is not.
+  - 'F2 — per-turn prompt size does not grow linearly with steps. A test drives a run over many turns
+    whose tool results are individually small but cumulatively over the share, and asserts the assembled
+    size stabilises rather than tracking step count.
 
     '
-  - 'NF2 — additive public API. The 0.8.1 doc example and every existing example compile against 0.9.0
-    with no edit beyond the version. No public item is renamed, removed, or has its signature changed;
-    `with_tools` and `with_skills` are new builder methods and `Tool`, `Toolbox`, and `Skill` are new
-    exports. Asserted by a test that builds a 0.8.1-shaped contract and runs it.
+  - 'NF1 — the token estimate is honest and measurable. There is no estimator in the crate today: every
+    token number is post-hoc provider-reported usage, and a provider that reports none is counted as zero
+    (`src/run.rs:674`, `806`, `1148`), so assembly cannot be built on reported usage at all. The new estimate''s
+    method is documented in the crate as an estimate rather than a count, is computed before the request
+    from the text being sent, and every turn''s trace row carries both it and the provider-reported usage
+    when the provider supplies any, so drift is a recorded number and a silent provider does not make
+    the assembler blind. The default share is set below 1.0 of the budget by enough margin that estimator
+    drift cannot push a real request past a provider''s context limit; a provider context-length rejection
+    is surfaced as a named error, not laundered into a generic retry.
+
+    '
+  - 'NF2 — no new runtime dependency. Assembly, estimation, compaction and memory are built on the existing
+    dependency set; `[dependencies]` gains nothing. A dev-dependency for a fixture is acceptable; a tokenizer
+    is not.
+
+    '
+  - 'NF3 — assembly is not a new hot spot. The per-turn assembly cost is measured and bounded by a test,
+    in the manner 0.9.1 bounded policy dispatch, so the fix for a token cost is not paid for in wall-clock
+    on every step.
+
+    '
+  - 'NF7 — the loop gains direct test coverage. `src/run.rs` is 2,193 lines with zero unit tests today;
+    the assembler introduced here is unit-tested at its own boundary rather than only through an integration
+    mock provider, because a context rule that can only be observed end to end is one nobody will tune.
 
     '
   files:
-  - src/tools/custom.rs
+  - src/context.rs
+  - src/run.rs
+  - src/contract.rs
+  - src/state.rs
+  - src/lib.rs
+  - tests/context.rs
+  evidence:
+  - 'src/context.rs (new, ~640 lines) — `Ledger` of typed `Observation`s (append-only history), `ObsKind`,
+    `ContextBudget { max_tokens: 24_000, share: 0.5 }` with `effective_tokens` (min of the ceiling and
+    the share of the unspent budget, floored at 2_000), `estimate_tokens` (chars/4, marked `ponytail:`
+    as an estimate with a tokenizer as the upgrade path), `entry_cap_chars` (an eighth of the budget),
+    `bound` (visible elision marker, head kept except for a read where the tail is), and `assemble`.'
+  - 'src/run.rs — the workspace loop''s `observations: String` is gone; it pushes typed observations and
+    calls `assemble` once per turn. `dispatch` carries the kind and target with each result and takes
+    the derived cap.'
+  - src/state.rs — additive `context_events` table and `ContextEvent`/`record_context_event`/`record_context_reported`/`context_events`.
+    One `assembled` row per turn carrying the estimate and the provider's reported number for the same
+    request, plus one row per re-read. `CHECKPOINT_FORMAT` untouched.
+  - 'src/contract.rs — `pub context: ContextBudget` and `with_context_budget`, beside `with_token_budget`.'
+  - 'F1 green — `the_assembled_prompt_stays_inside_the_ceiling_while_the_trace_keeps_everything`: the
+    assembled section stays within the ceiling while the trace rows still concatenate to every observation
+    in full.'
+  - 'F2 green — `prompt_size_stabilises_across_many_turns_instead_of_tracking_step_count`: the log grows
+    more than 2x while the assembled section grows less than 1.5x.'
+  - NF2 — no new runtime dependency; `[dependencies]` is byte-identical to 0.9.1. NF3 — `assembling_one_turn_costs_a_bounded_amount_of_time`
+    bounds per-turn assembly over a 200-entry log at 25 ms.
+  - NF7 — src/run.rs still has no unit tests, but the assembler is unit-tested at its own boundary in
+    src/context.rs (11 unit tests) rather than only end to end.
+- id: US-IO-HARNESS-0.10.0-T02
+  summary: Compact superseded observations. Where two entries observe the same target, the later is carried
+    whole and the earlier becomes a one-line stub naming what it was and which step superseded it.
+  why_required: Re-sending two reads of the same file is the single largest source of the repetition this
+    release exists to remove, and a stub the model can see is what keeps compaction recoverable rather
+    than lossy.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.10.0-T01
+  acceptance_criteria:
+  - 'F3 — a superseded observation is compacted, not duplicated. Two observations of the same target in
+    one run yield an assembled prompt containing the later text once and a stub for the earlier that names
+    it and the superseding step. Asserted on the assembled prompt, not on an internal counter.
+
+    '
+  files:
+  - src/context.rs
+  - tests/context.rs
+  evidence:
+  - 'Supersession: an entry is superseded when a later entry has the same kind and the same target; the
+    later is carried whole and the earlier becomes a one-line stub naming the superseding step.'
+  - Scoped by `ObsKind::target_is_the_subject` — true for read, grep, find, write and skill, false for
+    a registered or MCP tool, whose target is its NAME. A tool called twice with different arguments gave
+    two answers, and the first version of this stubbed one of them away.
+  - F3 green — `a_read_superseded_by_a_later_read_of_the_same_path_becomes_a_stub` and `two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_collapse`,
+    plus the unit test `only_a_target_that_is_the_subject_supersedes`.
+- id: US-IO-HARNESS-0.10.0-T03
+  summary: Re-read an observation invalidated by a later write. A read entry whose path is written later
+    in the run is re-read at assembly time through the policy; if the path is gone or the read is refused,
+    the entry becomes a stub naming the invalidating step and the reason, and the refusal is a trace row.
+  why_required: An agent reasoning over content the workspace no longer has is the failure mode that makes
+    a long run wrong rather than merely expensive, and it is the one thing bounding size alone cannot
+    fix.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.10.0-T01
+  acceptance_criteria:
+  - 'F4 — an observation invalidated by a later write is never presented as current. Read path X (content
+    A), write X (content B); the next assembled prompt contains B and does not contain A as a current
+    read. If the re-read is refused by policy or the path is gone, the prompt carries a stub naming the
+    invalidating step and the reason, and the refusal is a trace row.
+
+    '
+  files:
+  - src/context.rs
+  - src/run.rs
+  - tests/context.rs
+  evidence:
+  - A read whose path a later write touches is stale. A stale read that would otherwise be carried is
+    re-read at assembly time; a refusal, a missing path or a read error becomes a stub naming the invalidating
+    step and the reason.
+  - The re-read goes through `Workspace::read_file`, so it passes the same `resolve` containment and the
+    same `Act::Read` policy check as the read it replaces. The first version joined the root and called
+    `std::fs` directly — the policy half without the containment half.
+  - '`Effect::Ask` is a refusal here: assembly has no approver and no turn to spend on one.'
+  - F4 green — `a_read_invalidated_by_a_later_write_is_re_read_not_trusted`, the policy-refused variant
+    asserting the stub text and a `reread_refused` row, and `a_re_read_cannot_escape_the_workspace_root`.
+- id: US-IO-HARNESS-0.10.0-T04
+  summary: Give every observation kind a coherent cap at context entry, derived from the same budget and
+    expressed in one unit, replacing `TOOL_RESULT_CAP`, `OBS_READ_CAP` and `OBS_GREP_CAP` as independent
+    constants and closing the two kinds that have no cap at all (`find`, `write_file`). Elision stays
+    visible to the model; the trace row stays unbounded.
+  why_required: An unbounded `find` over a large repository can exhaust the context in one step, which
+    defeats the assembler before it runs; and four unrelated constants are how the two missing caps went
+    unnoticed.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.10.0-T01
+  acceptance_criteria:
+  - 'F5 — every observation is bounded where it enters the context, including the two that are not bounded
+    today. A `find` result with thousands of matches and a large `write_file` observation each produce
+    a bounded, explicitly-elided context entry and a full, unelided trace row. A test asserts both sides
+    for each observation kind — read, grep, find, write, skill body, registered tool, MCP tool, child
+    result — so no kind is unbounded by omission again.
+
+    '
+  files:
+  - src/context.rs
+  - src/run.rs
   - src/tools/mod.rs
-  - src/contract.rs
+  - src/mcp.rs
+  - tests/context.rs
+  evidence:
+  - '`TOOL_RESULT_CAP` (8_000), `OBS_READ_CAP` (4_000) and the bare per-tool bounds are gone. Every observation
+    kind enters the context under `entry_cap_chars(budget)`; `cap_result` takes the cap as an argument,
+    and `McpSession::call` takes it too, so the transport bound comes from the same budget.'
+  - '`find` and `write_file` had no cap at all and now do. `OBS_GREP_CAP`''s 50-hit ceiling stays as what
+    it always was — a relevance choice — with the char cap on top.'
+  - F5 green — `every_observation_kind_is_bounded_where_it_enters_the_context` covers read, grep, find,
+    write, skill body, registered tool and MCP tool, asserting the bound on the context entry and the
+    full text in the trace row.
+  - Closes the `// ponytail:` marker that stood at src/run.rs:38 since 0.9.0 — "fixed char caps; make
+    them budget-aware if long files starve the loop".
+- id: US-IO-HARNESS-0.10.0-T05
+  summary: Route the sub-agent loop and the single-file loop through the same assembler, so a composed
+    child result and a re-sent file body are bounded by the same rules as a tool result. The 0.7.0 resume
+    and 0.5.0 composition suites run unmodified.
+  why_required: The sub-agent loop has its own copy of the accumulator, so 0.5.0's hundred concurrent
+    children keep the unbounded behaviour unless it is routed too; and resume rebuilds the prompt from
+    the store, so an assembler the resume path does not use is an assembler that silently stops applying
+    after a crash.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.10.0-T01
+  - US-IO-HARNESS-0.10.0-T02
+  - US-IO-HARNESS-0.10.0-T03
+  - US-IO-HARNESS-0.10.0-T04
+  acceptance_criteria:
+  - 'F8 — the migration is invisible to a 0.9.1 consumer. A store written by 0.9.1 opens under 0.10.0,
+    and a 0.9.1 checkpoint resumes to completion under 0.10.0 with no step re-run and no budget double-charge
+    — the 0.7.0 crash-resume test suite passes unmodified against the new schema.
+
+    '
+  - 'NF6 — no regression in the existing suite. All ~258 tests shipped at 0.9.1 (~138 integration across
+    `tests/`, ~120 unit) pass unmodified unless a test asserted the old accumulate-and-resend behaviour,
+    and each such test that is changed is named in the record with why the old assertion was wrong. `tests/checkpoint.rs`
+    and `tests/subagents.rs` in particular pass untouched, since they cover the two features that read
+    the observation buffer indirectly.
+
+    '
+  files:
+  - src/run.rs
+  - src/context.rs
+  - tests/checkpoint.rs
+  - tests/subagents.rs
+  evidence:
+  - The sub-agent loop (`run_agent`) has its own ledger and its own per-turn assembly, with its ceiling
+    taken from the tree's remaining budget rather than the contract alone. A child's composed result enters
+    as `ObsKind::Child`.
+  - The single-file loop re-sent the whole current file every turn with no bound; it is now bounded on
+    the same terms, keeping the tail because the end of a file is what a writer needs.
+  - '`OBS_READ_CAP` and the `tail` helper are both deleted — the last fixed cap in the crate was the tree
+    loop''s.'
+  - F8 / NF6 — tests/checkpoint.rs (10) and tests/subagents.rs (10) pass UNMODIFIED, so 0.7.0 resume and
+    0.5.0 composition are unaffected. `a_sub_agent_loops_prompt_stays_inside_the_ceiling` asserts the
+    tree loop's own ceiling and that its trace still holds the whole log.
+  - 'Only one pre-existing test changed anywhere in the release: src/mcp.rs''s `an_oversized_result_is_cut_on_a_char_boundary_and_says_so`
+    read the cap from the deleted constant and now derives the same number from the budget. What it asserts
+    is unchanged.'
+- id: US-IO-HARNESS-0.10.0-T06
+  summary: 'Add durable memory to the store: workspace-keyed tables created idempotently in `Store::from_conn`
+    with `CHECKPOINT_FORMAT` untouched, a public API to put, list, read and delete entries, attribution
+    to the writing run and step, and count and total-size caps with oldest-first eviction recorded in
+    the trace.'
+  why_required: 'Memory is the second pillar this release closes, and it is the half that must not disturb
+    the first: a schema change that broke `check_resumable` would trade 0.7.0''s durability for a feature
+    that never needed it.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.10.0-T01
+  acceptance_criteria:
+  - 'F7 — memory is attributed, bounded and operator-controlled. Every entry names the run and step that
+    wrote it; the count and total size caps evict by the documented rule when exceeded; and the public
+    API lists, reads and deletes entries for a workspace. A test asserts eviction happens and that a deleted
+    entry does not reappear in a later run''s context.
+
+    '
+  - 'F8 — the migration is invisible to a 0.9.1 consumer. A store written by 0.9.1 opens under 0.10.0,
+    and a 0.9.1 checkpoint resumes to completion under 0.10.0 with no step re-run and no budget double-charge
+    — the 0.7.0 crash-resume test suite passes unmodified against the new schema.
+
+    '
+  files:
+  - src/state.rs
   - src/lib.rs
-  - tests/custom_tools.rs
+  - tests/memory.rs
   evidence:
-  - 'src/tools/custom.rs — the `Tool` trait (object-safe: `spec()` plus `invoke()` returning a boxed `ToolFuture`),
-    `Toolbox` with `with`/`with_arc`/`specs`/`owns`/`get`/`validate`, a manual `Debug` listing registered
-    names (a `Tool` is caller code with no `Debug` bound and `TaskContract` derives it), and `RESERVED_TOOL_NAMES`.'
-  - 'The signature was settled against three reference implementations in tests/custom_tools.rs before
-    being threaded anywhere, as the contract''s first risk required: `Echo` (synchronous work behind the
-    async signature), `Ledger` (holds state, awaits inside `invoke`, records that it ran), and `Broken`
-    (returns `Err`). All three satisfy the trait unchanged.'
-  - '`TaskContract::with_tools` added beside `with_mcp`; `tools: Toolbox` on the struct. No public signature
-    changed anywhere — F3''s arbitration is reached from the existing entry points.'
-  - '`Toolbox::validate()` is called at the top of all six entry points (`run_with`, `run_tree`, `resume`,
-    `resume_tree`, `resume_with_decision`, `resume_tree_with_decision`) before a run row exists and before
-    the provider is reached.'
-  - 'F3 — 4 tests green: shadowing each of the six built-ins (`write_file`, `grep`, `find`, `read_file`,
-    `spawn_agent`, `read_skill`), the `mcp__` prefix, a duplicate name, and an empty name each return
-    `Error::Config` naming the offender, with the mock provider''s completion counter asserted at 0.'
-  - NF2 — `a_contract_with_no_registered_tools_behaves_as_before` builds a 0.8.1-shaped contract and runs
-    it to `Success`. All 207 tests in the suite pass, including the 197 that predate this release.
-  - NF1 — no runtime dependency added. The trait uses `std::pin::Pin<Box<dyn Future>>`; Cargo.toml's [dependencies]
-    section is untouched.
-- id: US-IO-HARNESS-0.9.0-T02
-  summary: 'Dispatch a registered tool through the orchestration loop on the same terms as an MCP tool:
-    offered in the request''s tool list and named in the system prompt, gated by an `Act::Exec` policy
-    check on its name with refusals recorded as `PolicyEvent`s and surfaced as observations, an `Effect::Ask`
-    verdict routed through the `Approver`, a failing `invoke()` turned into an observation rather than
-    a run failure, the result truncated at the context boundary, and the whole call recorded in the trace.'
-  why_required: This is the release's central behaviour. Without it a registered tool is a type the model
-    never sees, and every claim that extension is governed by the same policy and visible in the same
-    trace is unproven.
+  - src/state.rs — `memory` table (workspace, key, value, run_id, step, created_at; UNIQUE(workspace,
+    key)) created idempotently in `Store::from_conn` beside the other nine. `MemoryEntry`, `MEMORY_MAX_ENTRIES`
+    = 64, `MEMORY_MAX_CHARS` = 16_000, `MEMORY_MAX_ENTRY_CHARS` = 2_000.
+  - '`memory_put` upserts and re-attributes, truncates an oversized value with a visible marker rather
+    than refusing it, then evicts oldest-first until both caps hold, never evicting the entry just written,
+    and returns the evicted keys for the caller to record.'
+  - '`memory_list` / `memory_get` / `memory_delete` / `memory_clear` are the operator''s surface; `run_id`
+    is `i64` like every other table, matching `runs.id`.'
+  - F7 green — 7 store tests in tests/memory.rs and 4 unit tests in src/state.rs covering both caps, oldest-first
+    eviction, the never-evict-the-new-entry rule, isolation, overwrite, delete and clear.
+  - 'F8 green — `a_0_9_1_store_opens_unchanged_and_still_resumes`: a 0.9.1-shaped database (memory table
+    dropped) reopens with `PRAGMA user_version` byte-identical, `check_resumable` accepting it, and all
+    nine pre-existing tables intact. `CHECKPOINT_FORMAT` is still 7.'
+- id: US-IO-HARNESS-0.10.0-T07
+  summary: Give the agent the `remember` tool and recall its entries. A written fact is attributed and
+    stored against the workspace; a later run over that workspace receives the entries in its assembled
+    context, rendered as agent-authored notes rather than instructions.
+  why_required: 'Without the tool and the recall path, memory is a table nothing writes to and nothing
+    reads: this is the task that makes the second run cheaper than the first, which is the outcome the
+    release promises.'
   status: done
   depends_on:
-  - US-IO-HARNESS-0.9.0-T01
+  - US-IO-HARNESS-0.10.0-T06
   acceptance_criteria:
-  - 'F1 — a caller-registered tool reaches the model and runs. A contract registering a tool whose `spec()`
-    names it `lookup_order` offers it in the request''s tool list, and a scripted provider calling `lookup_order`
-    causes `invoke()` to run with the parsed arguments and its returned string to appear in the next turn''s
-    observations. Asserted offline with the mock provider.
-
-    '
-  - 'F2 — a registered tool is governed by the policy, not trusted by registration. Under a policy denying
-    `Act::Exec` on `lookup_order`, the call is refused, `invoke()` is never entered (asserted by a flag
-    the fake tool sets), a `PolicyEvent` naming the rule and layer is in the trace, the model receives
-    a refusal observation, and the run continues rather than failing.
-
-    '
-  - 'F4 — a failing tool is an observation, not a failed run. A tool whose `invoke()` returns an error
-    produces an error observation the agent can act on, the step is committed, and the run continues to
-    its next turn — the same treatment `grep` gives a bad regex.
-
-    '
-  - 'F5 — a registered tool cannot flood the context. A tool returning far more than the result cap has
-    its output truncated with a visible marker before it enters the observations, and the truncated form
-    is what the trace records.
-
-    '
-  - 'O1 — a run is reconstructable from the trace alone. For every registered-tool call the trace holds
-    the tool name, the arguments, the decision, and the observation; for every skill load it holds which
-    skill was read. An auditor reading the trace can say which skills shaped the run and which caller-supplied
-    tools it depended on, without the caller''s source.
+  - 'F6 — durable memory survives a run. An agent writes a fact in run 1; run 2 over the same workspace
+    with a different `run_id` receives it in its assembled context. Asserted end to end across two real
+    runs against a fixture provider, and the second run''s trace shows the tool calls that established
+    the fact were not re-executed.
 
     '
   files:
+  - src/tools/mod.rs
   - src/run.rs
-  - src/tools/custom.rs
-  - tests/custom_tools.rs
+  - src/context.rs
+  - tests/memory.rs
   evidence:
-  - src/run.rs — a `name if custom.owns(name)` arm in `dispatch`, placed after the built-ins and before
-    the MCP arm. It gates on `Act::Exec` through the existing `gate()` (so `Effect::Ask` routes to the
-    `Approver` and a `Decision::Defer` still returns `Dispatched::Pause`), then awaits `tool.invoke()`.
-  - '`dispatch` gained a `custom: &Toolbox` parameter; both call sites pass it (`run_workspace_from` from
-    `contract.tools`, `run_agent` from `tree.tools`). Registered specs are added to the request''s tool
-    list and named in the system prompt through the existing `with_extra_tools`, so a model that trusts
-    the prose over the schema still learns the tool exists.'
-  - 'F1 green — `a_registered_tool_is_offered_called_and_its_result_observed`: the spec is in the request''s
-    tool list, the name is in the system prompt, `invoke` ran with the model''s arguments (`A-17`), and
-    `A-17=shipped` appears in the next turn''s user prompt.'
-  - 'F2 green — `a_registered_tool_is_refused_by_the_policy_without_being_entered`: under `deny_exec("lookup_order")`
-    the tool''s own call log stays empty, the trace holds a refusal with act=exec, rule=lookup_order,
-    layer=base, the model sees a refusal observation, and the run ends `StepCapReached` rather than erroring.'
-  - 'F4 green — `a_failing_tool_becomes_an_observation_not_a_failed_run`: the tool''s own error text reaches
-    the model, the step is still committed (2 step rows), and the run continues.'
-  - 'F5 green — `an_oversized_tool_result_is_truncated_before_it_enters_the_context`: a 200,000-char result
-    reaches the model truncated, with the word ''truncated'' visible, and the trace records the truncated
-    form.'
-  - 'The cap is now defined once for the whole tool layer: `tools::TOOL_RESULT_CAP` and `tools::cap_result`,
-    which `mcp.rs` now calls instead of carrying its own copy. Placing it in the tool layer rather than
-    in `mcp` resolves the contract''s third open question and keeps 0.10.0''s consolidation to one move.'
-  - 'O1 green (partial — the skill half is T05''s): the trace records the tool name, the arguments, and
-    the decision for a registered-tool call, asserted in F1.'
-  - 'Incidental correctness fix in `gate()`: exec and net targets are now checked with `ws.policy().check(...)`
-    rather than `ws.check_path(...)`. An exec target is a *name*, and resolving it against the workspace
-    root meant a file sharing a tool''s name could change what the policy said about calling it. No existing
-    caller was affected — `gate()` was only ever reached with Read and Write.'
-- id: US-IO-HARNESS-0.9.0-T03
-  summary: Thread the toolbox through every `Tree` construction site so a 0.5.0 child inherits its parent's
-    registered tools and calls them under its own narrowed policy — `run_with`, `run_tree`, `resume`,
-    `resume_tree`, and both `*_with_decision` variants — and cover the resume paths, not only the happy
-    path, so a toolbox silently lost across a restart fails a test.
-  why_required: A child that cannot reach an inherited tool makes the extension point useless for the
-    decomposed tasks 0.5.0 exists for, and a resume that drops the toolbox is a correctness bug that surfaces
-    only after a crash — exactly the class 0.7.0 was released to eliminate.
+  - A built-in `remember` tool (`REMEMBER_TOOL`) with `{key, value}`, offered in the workspace tool list
+    and added to `RESERVED_TOOL_NAMES` so a registered tool cannot shadow it. It writes to the harness
+    store, not the workspace, so it is not a path act.
+  - Dispatch records one `memory_write` row and one `memory_evict` row per evicted key. The observation
+    is `[remember <key>]` with no target, because a note is not an observation OF anything that could
+    go stale.
+  - 'Recall: `assemble` opens with the workspace''s notes, capped at a quarter of the turn''s ceiling,
+    newest kept, the number dropped stated, and one `memory_recall` row per turn. Notes are re-read every
+    turn rather than once at run start, so a note written this run — or cleared by the operator — is reflected
+    immediately.'
+  - The workspace key is the canonicalised root (the given path as fallback), in one function so writer
+    and reader cannot disagree. Children share their parent's workspace and therefore its memory.
+  - 'F6 green — `a_second_run_over_the_workspace_recalls_what_the_first_wrote`: two runs, different run
+    ids, the second opens with the note, the block says "not instructions", the note names the run that
+    wrote it, and the second run''s trace shows it did not re-run the `remember` call. Plus `a_deleted_note_does_not_come_back_in_a_later_run`,
+    `two_workspaces_do_not_share_memory_through_one_store`, `an_over_long_memory_block_is_cut_with_a_marker`,
+    and an empty memory rendering no block at all.'
+- id: US-IO-HARNESS-0.10.0-T08
+  summary: Document what assembly guarantees and what it does not, what memory is and how to inspect or
+    clear it, mark the two pillars in `docs/CAPABILITIES.md`, and write the CHANGELOG entry with a migration
+    note for every added, renamed or removed public item plus the recorded public-surface diff against
+    the 0.9.1 tag.
+  why_required: 0.8.1 exists because a guarantee io-cli and io-studio inferred was one this crate had
+    never made; an assembler that decides what a model sees is exactly the kind of thing a consumer will
+    infer relevance from.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.9.0-T02
+  - US-IO-HARNESS-0.10.0-T01
+  - US-IO-HARNESS-0.10.0-T02
+  - US-IO-HARNESS-0.10.0-T03
+  - US-IO-HARNESS-0.10.0-T04
+  - US-IO-HARNESS-0.10.0-T05
+  - US-IO-HARNESS-0.10.0-T06
+  - US-IO-HARNESS-0.10.0-T07
   acceptance_criteria:
-  - 'F6 — a 0.5.0 child inherits the toolbox. In a `run_tree` where the parent spawns a child, the child''s
-    request carries `lookup_order` and a child calling it runs the same implementation, with the call
-    attributed to the child''s `run_id` in the trace.
+  - 'NF5 — a public API change is permitted (0.x minor) but must be deliberate and documented: every added,
+    renamed or removed public item is listed in the CHANGELOG with a migration note, and the diff of the
+    public surface against the 0.9.1 tag is recorded in the evidence. The crate stays pre-1.0; no 1.0.0
+    is planned or implied.
+
+    '
+  - 'O1 — the crate documents what context assembly does and does not guarantee, including the staleness
+    rules it applies and the relevance it does not promise, so io-cli and io-studio do not inherit an
+    unmade guarantee.
+
+    '
+  - 'O2 — `docs/CAPABILITIES.md` marks context construction and state-and-memory shipped at 0.10.0, and
+    marks nothing this release did not accept. If the fallback scope is taken, state and memory stays
+    partial with the deferred release named.
+
+    '
+  - 'O3 — memory is documented as agent-authored, attributed content that a later run reads. The documentation
+    states plainly that an entry written by one run influences a later one, how to inspect and clear entries,
+    and that entries are rendered to the model as notes rather than as instructions.
 
     '
   files:
-  - src/run.rs
-  - tests/custom_tools.rs
-  evidence:
-  - 'The threading itself is done, because T02 could not compile without it: `Tree` carries `tools: &''a
-    Toolbox`, and all four `Tree` construction sites pass `&contract.tools` — including the two on the
-    resume-with-decision paths and the one in `resume_tree`. The field is documented as read from the
-    *root* contract rather than each agent''s, so a spawned child (whose contract the model writes) cannot
-    register a tool its parent never had.'
-  - 'F6 green — `a_spawned_child_inherits_the_toolbox_and_the_call_is_its_own`: the child''s `CompletionRequest.tools`
-    carries `lookup_order` and its system prompt names it, the child runs the *parent''s* single registered
-    instance (asserted on the `Arc` the parent holds, not a copy), the result reaches the child''s next
-    turn, and the call is in the child''s `store.steps(child_run)` and absent from the parent''s.'
-  - 'The resume path is covered too, as the contract''s cost-driver note required — `a_toolbox_survives_a_tree_resume_and_still_reaches_a_child`:
-    leg 1 stops at a step cap, leg 2 re-registers the same tool through `Toolbox::with_arc` as a restarted
-    caller would and calls `resume_tree`, and the resumed root''s child still reaches the tool with the
-    call traced under its own run.'
-  - 'Both tests were watched failing before being relied on: in a scratch copy of the crate with `run_agent`''s
-    `tree.tools` use broken, each fails with the built-in-only tool list and the other 10 tests in the
-    file stay green — proving they were not already covered. `cargo test --test custom_tools`: 12 passed,
-    0 failed.'
-- id: US-IO-HARNESS-0.9.0-T04
-  summary: 'Discover skills from a directory: `<dir>/<name>.md` and `<dir>/<name>/SKILL.md`, an in-crate
-    frontmatter reader for optional `name`/`description` with fallback to the file stem and first prose
-    line, `TaskContract::with_skills(dir)`, and the hard caps — a missing or non-directory path and an
-    over-cap directory are both `Error::Config` at run start rather than a silently partial set. Cover
-    the reader''s edge cases: absent frontmatter, unterminated frontmatter, CRLF line endings, a multi-line
-    description, and a non-ASCII body.'
-  why_required: Skills are half the release, and a discovery step that silently truncates or silently
-    accepts a malformed file would give a caller a set they believe is complete and is not.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.9.0-T01
-  acceptance_criteria:
-  - 'F7 — skills are discovered from both layouts. A directory containing `alpha.md` and `beta/SKILL.md`
-    yields exactly two skills named `alpha` and `beta`; frontmatter `name:` and `description:` override
-    the derived values when present; a file with no frontmatter takes the file stem as name and its first
-    non-empty prose line as description. Both names and both descriptions appear in the system prompt
-    and neither body does.
-
-    '
-  - 'F9 — a bad skills directory fails honestly. A `with_skills` path that does not exist, or is not a
-    directory, is an `Error::Config` at run start naming the path. A directory holding more than the discovery
-    cap is an `Error::Config` too, rather than a silently truncated set the caller believes is complete.
-
-    '
-  - 'NF1 — no new runtime dependency. `cargo tree --edges normal` for the crate is unchanged against 0.8.1:
-    the frontmatter reader is written in-crate against the standard library, and the `dyn`-safe trait
-    uses `std::pin::Pin<Box<dyn Future>>` as `run_agent` already does. A new dev-dependency is permitted;
-    a new runtime one is not.
-
-    '
-  files:
-  - src/skills.rs
-  - src/contract.rs
-  - src/lib.rs
-  - tests/skills.rs
-  evidence:
-  - 'src/skills.rs written and compiled into the crate (`pub mod skills`, exporting `Skill` and `Skills`):
-    `Skills::discover` accepts both `<dir>/<name>.md` and `<dir>/<name>/SKILL.md`, sorts by name so the
-    prompt is byte-identical across runs on one directory, canonicalises each path, and returns `Error::Config`
-    for a missing path, a non-directory path, more than `MAX_SKILLS` (64), or two skills sharing a name.
-    `catalog()` renders the name/description lines for the prompt; no body is held.'
-  - 'The frontmatter reader is in-crate against the standard library — no YAML dependency, holding NF1.
-    10 unit tests green covering every edge case the contract named: plain frontmatter, CRLF line endings,
-    a `>`-folded multi-line description, a plain continuation line, a later key (`metadata:`) not absorbing
-    the description, absent frontmatter, unterminated frontmatter (treated as no frontmatter, whole file
-    is body), heading-derived fallback description, a non-ASCII body, and clamping a long description
-    at a char boundary.'
-  - '`TaskContract::with_skills(dir)` added, storing `skills: Option<PathBuf>` — the path, not the discovered
-    set. `with_tools` can store a whole `Toolbox` because `validate()` is a separate fallible call; a
-    builder method cannot return `Result`, and for skills the fallible step *is* discovery, so `pub(crate)
-    fn discover_skills()` is the exact analogue of `Toolbox::validate()`: same call site, same error type,
-    same before-a-run-row-exists guarantee.'
-  - '`contract.discover_skills()?` is called immediately after `contract.tools.validate()?` at all six
-    entry points (`run_with`, `resume`, `resume_with_decision`, `resume_tree_with_decision`, `run_tree`,
-    `resume_tree`).'
-  - 'F7 green (discovery half) — 3 tests in tests/skills.rs: `alpha.md` + `beta/SKILL.md` yield exactly
-    two skills (a `notes.txt` and a `SKILL.md`-less subdirectory ignored), derived name/description fall
-    back to the stem/dirname and first prose line, frontmatter `name:`/`description:` override both, and
-    `catalog()` carries the two lines and never a body. The prompt half is T05''s.'
-  - 'F9 green — 4 tests driving `run_with` with a counting mock provider: a missing path, a path that
-    is not a directory, and a directory of `MAX_SKILLS + 1` files each return `Error::Config` naming the
-    path with the provider''s call count at 0, plus a positive control proving a usable directory lets
-    the run start (calls == 1) — a gate, not a wall.'
-  - NF1 held — no runtime dependency added; tests reuse the existing `tempfile` and `tokio`. Full suite
-    216 passed / 0 failed, clippy `-D warnings` clean, `cargo fmt --check` exit 0.
-- id: US-IO-HARNESS-0.9.0-T05
-  summary: Put skill names and descriptions — and not bodies — into the system prompt, and offer a built-in
-    `read_skill` tool that loads exactly one body into the observations on demand, as a policy-checked
-    read of that file's path, recorded in the trace. Offer the tool only when skills are configured.
-  why_required: A skill nobody can read is inert, and a body injected without being asked for is the unbounded-prompt
-    failure this release's own risk register names and 0.10.0 exists to fix.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.9.0-T04
-  acceptance_criteria:
-  - 'F8 — a skill body loads on demand. A scripted provider calling `read_skill` with `{"name": "beta"}`
-    puts beta''s body — and only beta''s — into the observations; a call naming an unknown skill yields
-    an observation listing what does exist, not an error.
-
-    '
-  - 'F10 — reading a skill is a policy-governed read. Under a policy denying `Act::Read` on the skills
-    directory, `read_skill` is refused with a `PolicyEvent` in the trace and the body never enters the
-    observations, while the skill''s name and description remain in the system prompt.
-
-    '
-  - 'O1 — a run is reconstructable from the trace alone. For every registered-tool call the trace holds
-    the tool name, the arguments, the decision, and the observation; for every skill load it holds which
-    skill was read. An auditor reading the trace can say which skills shaped the run and which caller-supplied
-    tools it depended on, without the caller''s source.
-
-    '
-  files:
-  - src/run.rs
-  - src/skills.rs
-  - tests/skills.rs
-  evidence:
-  - 'src/run.rs — the discovered `Skills` is now plumbed from all six entry points into `run_workspace_from`
-    (new `skills: &Skills` parameter) and onto `Tree` (new `skills` field), read from the ROOT contract
-    exactly as `tools` is, so a model-written child contract cannot conjure a skill its parent never
-    configured.'
-  - '`skill_tool(&Skills)` pushes `read_skill` into the request''s tool list and the prompt prose only
-    when the catalogue is non-empty — settling the contract''s second open question the way MCP tools
-    already answer it. `with_skill_catalog` appends `Skills::catalog()` (names and descriptions) to the
-    workspace and tree system prompts; no body is ever placed there.'
-  - 'The `READ_SKILL_TOOL` dispatch arm mirrors the registered-tool arm: an unknown name returns an observation
-    listing `skills.names()`, a known name gates on `Act::Read` against the skill file''s path, the body
-    is capped through `tools::cap_result`, and the decision `read skill <name>` plus the skill name reach
-    the trace — O1''s skill half.'
-  - 'The release''s one open hypothesis is resolved and proven, not assumed. `gate()` now decides an absolute
-    Read/Write target with `ws.policy().check(...)` instead of `ws.check_path(...)`, because a skills
-    directory normally sits outside the workspace root and the old path would have refused every `read_skill`
-    — making F10 pass for the wrong reason. `an_absolute_path_still_cannot_escape_the_workspace_root`
-    pins the invariant the relaxation depends on: under `Policy::permissive()` an absolute `read_file`
-    outside the root still yields `[read error] path escapes workspace` and an absolute `write_file` leaves
-    no file, because `Workspace::resolve` rejects absolute paths before any policy question is asked.
-    The test passes before and after the gate change, which is the point.'
-  - 'F7 green (prompt half) — `the_catalog_reaches_the_system_prompt_and_no_body_does`. F8 green — `read_skill_loads_exactly_the_named_body_into_the_observations`
-    and `an_unknown_skill_name_is_an_observation_listing_what_exists`. F10 green — `a_denied_skills_directory_refuses_the_read_but_keeps_the_catalog`.
-    Plus `read_skill_is_not_offered_when_no_skills_are_configured`.'
-  - 'All four behavioural tests were watched failing first (`9 passed; 4 failed`, with the prompt missing
-    `alpha`, `[unknown tool read_skill]` in the observations, and no refusal in the trace) before the
-    implementation was written. Full suite after: 222 passed / 0 failed across 14 targets, clippy `-D
-    warnings` clean, `cargo fmt --check` exit 0.'
-- id: US-IO-HARNESS-0.9.0-T06
-  summary: 'Measure and record the two performance claims: per-call dispatch overhead for a registered
-    tool that returns immediately, across 1000 calls, against calling the same closure directly; and skill
-    discovery over a 32-skill directory, confirmed to run once per run rather than once per step.'
-  why_required: NF3 is a stated acceptance criterion with numbers in it. Unmeasured, it is an assertion,
-    and the release would be claiming a bound nobody checked.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.9.0-T03
-  - US-IO-HARNESS-0.9.0-T05
-  acceptance_criteria:
-  - 'NF3 — the harness is not the cost. Dispatching a registered tool that returns immediately adds under
-    1 ms per call over calling the same closure directly, measured across 1000 calls and recorded in evidence/0.9.0/latency.txt.
-    Skill discovery over a 32-skill directory completes in under 50 ms and happens once per run, not once
-    per step.
-
-    '
-  files:
-  - tests/custom_tools.rs
-  - .ultraship/products/io-harness/evidence/0.9.0/latency.txt
-  evidence:
-  - 'NF3 measured, not asserted. Three tests, no new dependency (`std::time::Instant` + `black_box`):
-    `dispatching_a_registered_tool_costs_under_a_millisecond_over_a_direct_call`, `discovery_over_a_32_skill_directory_is_under_50ms`,
-    and `discovery_happens_once_per_run_not_once_per_step`. Bounds asserted are the criterion''s own
-    (1 ms, 50 ms), not tuned to the machine.'
-  - 'Measured on Apple M1 / macOS 26.5.2 / rustc 1.95.0, three runs each: dispatch overhead 0.442-0.453
-    ms per call debug and 0.059-0.072 ms release; 32-skill discovery 2.28-3.19 ms debug, 1.87-2.58 ms
-    release. NF3 holds on both profiles.'
-  - 'The honest finding, recorded rather than rounded away: the dispatch figure is dominated by `Policy::check(Act::Exec,
-    name)` recompiling its globs to a regex on every call (the standing `ponytail:` note at src/policy.rs:384)
-    — ~440 us/call debug against a three-rule policy. The tool layer''s own share (name scan, `dyn` dispatch,
-    boxed future, Arc) is ~9 us debug and ~3-6 us release. So the debug margin is 2.2x rather than orders
-    of magnitude, and it scales with the number of exec rules; if it ever needs to grow, the fix is caching
-    compiled globs in the policy, not in the tool layer.'
-  - 'What the number measures is stated in the test and the evidence: `Toolbox::owns` -> `Policy::check`
-    -> `Toolbox::get` -> `Tool::invoke().await`, in the order `dispatch` uses them, with `echo` registered
-    last so both O(n) scans are timed in their worst position. It is deliberately NOT a full run-loop
-    turn, which would let prompt building, the provider and the SQLite commit flatter the claim.'
-  - '"Once per run, not once per step" is proved behaviourally, not only structurally: a real run writes
-    `skills/gamma.md` into its own skills directory at step 1 via the ordinary `write_file` tool, and at
-    step 2 no system prompt mentions gamma and `read_skill` answers "there is no skill named". Corroborated
-    by call-site structure — `discover_skills()` appears at all six entry points and never inside the step
-    loop.'
-  - Recorded in .ultraship/products/io-harness/evidence/0.9.0/latency.txt (machine, OS, rustc, debug vs
-    release, and the reproduce commands). The evidence directory is gitignored, as it has been for every
-    prior release.
-- id: US-IO-HARNESS-0.9.0-T07
-  summary: 'Run the release gates: the full test suite, `cargo clippy --all-targets -- -D warnings`, `cargo
-    fmt --check`, a build at the declared MSRV, and the three-OS matrix. Include a test that builds and
-    runs a 0.8.1-shaped contract untouched, so the additive-API claim is asserted rather than asserted
-    about.'
-  why_required: The crate is published and consumed by two products; a release that breaks a platform,
-    the MSRV, or an existing caller is worse than one that ships a week later.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.9.0-T05
-  acceptance_criteria:
-  - 'NF2 — additive public API. The 0.8.1 doc example and every existing example compile against 0.9.0
-    with no edit beyond the version. No public item is renamed, removed, or has its signature changed;
-    `with_tools` and `with_skills` are new builder methods and `Tool`, `Toolbox`, and `Skill` are new
-    exports. Asserted by a test that builds a 0.8.1-shaped contract and runs it.
-
-    '
-  - "NF4 (amended by iterations/US-IO-HARNESS-0.9.0-I02) \u2014 the crate declares an MSRV it actually holds,\
-      \ and the three-OS matrix that verifies it exists. `rust-version` is 1.88, the floor rmcp 2.2.0's let-chains\
-      \ impose; 1.87 was wrong from 0.8.0 onward and cargo could not catch it because rmcp declares no `rust-version`\
-      \ of its own. A GitHub Actions workflow \u2014 added by this release, having never existed before \u2014\
-      \ builds and tests on macOS, Linux, and Windows, with a lint job and an MSRV job that reads `rust-version`\
-      \ out of Cargo.toml so the declared and proven floors cannot drift apart again. `cargo clippy --all-targets\
-      \ -- -D warnings` and `cargo fmt --check` are clean on macOS and Linux. macOS passes the full suite.\
-      \ Linux and Windows are built and run, and their failures are recorded in `known_limitations` rather\
-      \ than implied away: they are defects in the 0.3.0 verify and 0.6.0 sandbox pillars, present since those\
-      \ releases and undetectable without CI, and they are fixed in 0.9.1 rather than here.\n"
-  files:
-  - .ultraship/products/io-harness/evidence/0.9.0/tests.txt
-  - .ultraship/products/io-harness/evidence/0.9.0/builds.txt
-  evidence:
-  - 'NF2 green. `a_contract_with_no_registered_tools_behaves_as_before` builds and runs a 0.8.1-shaped
-    contract untouched. The public API was additionally diffed item by item against shipped 0.8.1 (commit
-    381163f — note there is no v0.8.1 tag; tags stop at v0.8.0): 42 items added, 0 removed, 0 signature-changed.
-    Two apparent diffs were run down and are not changes — `state.rs::find_spawn` is a rustfmt line-wrap
-    from 7b3ec4a, byte-identical in signature, and five `pub use` lines were alphabetised with every name
-    still exported.'
-  - 'Recorded rather than papered over: `TaskContract` has public fields, derives only Debug/Clone and
-    is not `#[non_exhaustive]`, so the new `tools`/`skills` fields do break struct-literal construction.
-    This is the crate''s established pattern (0.8.0 added `mcp` the same way) and the type documents the
-    builder as the supported path, so the additive verdict stands — but it is a real edge and it is written
-    down.'
-  - 'Cargo.toml bumped to 0.9.0, matching exactly the file set 0.8.0 and 0.8.1 bumps touched (Cargo.toml
-    + Cargo.lock; nothing else in the repo pins the crate version).'
-  - 'NF4 as amended by iterations/US-IO-HARNESS-0.9.0-I02. The repository had NO CI and had never had
-    an Actions run; `.github/workflows/ci.yml` is added by this release — a three-OS test matrix (fail-fast
-    off, 20-minute job cap), a lint job, and an MSRV job that reads `rust-version` out of Cargo.toml so
-    the declared and proven floors cannot drift apart again. Least-privilege `permissions: contents: read`,
-    no secret in any job, `pull_request` rather than `pull_request_target`, so a fork PR has nothing to
-    exfiltrate.'
-  - 'MSRV corrected to 1.88 and verified: `cargo +1.87 build --all-targets` failed inside rmcp 2.2.0 (let-chains,
-    stabilised 1.88; rmcp declares no rust-version of its own so cargo could not catch it), `cargo +1.88
-    build --all-targets` succeeds, and with the declaration fixed 1.87 now fails at resolve time with
-    a clear "requires rustc 1.88" instead of a compile error inside a dependency. rmcp has been pinned
-    at 2.2.0 since 0.8.0, so 0.8.0 and 0.8.1 are published declaring a floor they do not hold; corrected
-    forward here and noted in the CHANGELOG.'
-  - 'CI results (run 30190204224, then 30190878769 after fixes): macOS green — full 225-test suite, clippy
-    and fmt. MSRV job green. lint green after fixing a `-D warnings` failure that only occurs on Linux
-    (the `libc::RLIMIT_*` casts are load-bearing on macOS where the constants are `c_int` and redundant
-    on Linux where they are already u32; kept and silenced with a comment rather than cfg-split).'
-  - 'NF4 is NOT fully met, and the release records that rather than claiming it. Linux: 9 lib-test failures
-    — 7 in `verify::tests` where `passes_guarded` returns false, 2 in `sandbox::tests` where the CPU and
-    memory caps never fire (`cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap` observes `backend: PortableFloor,
-    exit_code: None, cap_hit: None` against an expected `Some(Cpu)`). Windows: builds clean, then the
-    suite does not terminate — consistent with a cap that never fires, since `src/sandbox/windows.rs`
-    creates no job object at all. These are defects in the released 0.3.0 verify and 0.6.0 sandbox pillars,
-    invisible until CI existed. Filed as issues #25, #26 and #27 and scheduled into 0.9.1.'
-  - 'The one part fixed here rather than deferred, on the owner''s decision: the Windows path reported
-    `Backend::WindowsJobObject` into the trace for a run that creates no job object, and its docs claimed
-    kill-on-close plus memory/process/CPU limits and a restricted token. That is a security claim, not
-    a feature, so it is corrected now — the Windows path reports `PortableFloor`, the variant stays documented
-    as reserved and never reported, and the same false claim was removed from the sandbox module docs,
-    linux.rs, and the README.'
-  - Evidence in .ultraship/products/io-harness/evidence/0.9.0/tests.txt and builds.txt (gitignored, as
-    for every prior release), which state plainly what was measured locally and what came from CI.
-- id: US-IO-HARNESS-0.9.0-T08
-  summary: 'Document the release and the boundary it draws: the v0.9 paragraph in lib.rs stating plainly
-    that a registered tool runs in the harness''s own process with the embedding program''s privileges
-    and that the policy governs whether it is called rather than what it does once running, the same bound
-    0.8.0 already states for a stdio MCP server; that a skill is instructions with no execution of its
-    own; plus the README section, the CHANGELOG entry, and the CAPABILITIES tool-layer row moved to shipped.'
-  why_required: The contract's third risk is a developer reading registration as a grant, or believing
-    the policy sandboxes what their tool does. That misreading is prevented by documentation or not at
-    all.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.9.0-T05
-  acceptance_criteria:
-  - 'O2 — the crate documents the boundary it is drawing. lib.rs states plainly that a registered tool
-    runs in the harness''s own process with the embedding program''s privileges, that the policy governs
-    whether it is *called* and not what it does once running — the same bound 0.8.0 already states for
-    a stdio MCP server — and that a skill is instructions with no execution of its own.
-
-    '
-  files:
+  - src/context.rs
   - src/lib.rs
   - README.md
   - CHANGELOG.md
   - docs/CAPABILITIES.md
   evidence:
-  - 'O2 green. src/lib.rs gained three paragraphs after the v0.8 refusal note, matching the existing per-version
-    shape: the in-process tool layer, skills, and the boundary. The boundary paragraph opens with the same
-    "What it does **not** govern:" framing v0.8 uses and states that a registered tool runs in the harness''s
-    own process with the embedding program''s privileges, that the policy governs whether it is *called*
-    and not what it does once running (no sandbox, no path scoping, no egress control), that this is exactly
-    the bound v0.8 states for a stdio MCP server, and that a skill is instructions with no execution of
-    its own.'
-  - CHANGELOG.md carries the 0.9.0 section (Added / Changed / Fixed / Security) with the privilege bound
-    under Security; README.md gained the v0.9 section with a sample per extension point and the same boundary
-    wording; docs/CAPABILITIES.md moves the tool-layer row to shipped.
-  - '`cargo test --doc` stays at 3 passing doc-tests; `cargo doc --no-deps` adds no new warning (the two
-    it reports are pre-existing private-link warnings in the provider modules).'
-- id: US-IO-HARNESS-0.9.0-T09
-  summary: 'Ship both extension points as runnable examples in the style of the existing ones: `examples/custom_tool.rs`
-    registering a tool whose answer exists nowhere on disk, and `examples/skills_run.rs` pointing at a
-    small skills directory, each driven by a real provider from an API key in the environment.'
-  why_required: Every prior release of this crate ships an example per capability, and the examples are
-    what the two downstream products will copy from. A feature with no runnable example is a feature adopted
-    by reading the source.
+  - 'README gains a `## Context and memory (v0.10)` section with a worked `with_context_budget` example,
+    the operator''s memory API, and a `### The limits, stated plainly` subsection: assembly bounds size
+    and applies the two staleness rules, it does not promise the model sees everything relevant; the token
+    figure is an estimate with its drift recorded; memory entries are agent-authored notes a later run
+    reads, inspectable and clearable. O1 and O3.'
+  - docs/CAPABILITIES.md marks context construction and state-and-memory shipped at 0.10.0 and nothing
+    else; the status line now reads ten of twelve pillars with 0.11.0 and 0.12.0 named for the rest. O2.
+  - 'CHANGELOG 0.10.0 section in the required Keep-a-Changelog categories, leading with the breaking change:
+    `TaskContract` gained a public `context` field, which affects only a struct-literal caller, with the
+    fix stated. NF5.'
+  - 'NF5 evidence — `git diff origin/main -- src/ | grep -E ''^-\s*pub ''` is EMPTY: no public item was
+    removed or renamed. The additions are the `context` module''s items, `ContextEvent`, `MemoryEntry`,
+    the three memory caps, `Store`''s five memory methods and three context methods, and `TaskContract::context`
+    / `with_context_budget`.'
+- id: US-IO-HARNESS-0.10.0-T09
+  summary: 'Produce the release evidence: the three-OS matrix green on one commit with the full suite,
+    and the live-run comparison — per-turn prompt sizes for 0.10.0 and for released 0.9.1 on the same
+    task and provider, plus the two-run memory recall trace — written to the evidence directory.'
+  why_required: 'The contract''s evidence of value is a measurement, not an assertion: a size-based test
+    suite passes just as happily when compaction has thrown away something the model needed.'
   status: done
   depends_on:
-  - US-IO-HARNESS-0.9.0-T05
+  - US-IO-HARNESS-0.10.0-T05
+  - US-IO-HARNESS-0.10.0-T07
   acceptance_criteria:
-  - 'O3 — both extension points ship with a runnable example. `examples/custom_tool.rs` and `examples/skills_run.rs`
-    run against a real provider from an API key in the environment, in the style of the existing examples.
+  - 'NF4 — MSRV stays 1.88; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` stay clean
+    on all three platforms; the ubuntu/macos/windows matrix plus the msrv and lint jobs are green on one
+    commit with no leg skipped, excluded or marked `continue-on-error`.
+
+    '
+  - 'O4 — the live run evidence exists in the evidence directory: per-turn prompt sizes for 0.10.0 and
+    for 0.9.1 on the same task and provider, and the two-run memory recall trace.
 
     '
   files:
-  - examples/custom_tool.rs
-  - examples/skills_run.rs
+  - .github/workflows/ci.yml
+  - .ultraship/evidence/
   evidence:
-  - 'O3 green — `examples/custom_tool.rs` registers a `Shipments` tool through `Toolbox::new().with(...)`
-    and `TaskContract::with_tools`. The workspace on disk holds only a list of ids; the status line the
-    task needs exists solely inside the tool and appears in neither the goal nor the verification criterion,
-    so the post-run check (the produced file contains a datum only the tool knows) is real evidence rather
-    than a needle already in the prompt. The policy allows exec on the tool name with a comment noting
-    that dropping that line leaves the tool offered but refused on every call.'
-  - '`examples/skills_run.rs` points `with_skills` at a directory written at run time (the pattern `policy_run.rs`
-    already uses), shipping both layouts: `release-notes.md` with `name:`/`description:` frontmatter and
-    `commit-style/SKILL.md` with none. The required output shape is stated only inside the release-notes
-    body and the goal merely says the style is a skill, so the shape check proves the body was read; `commit-style`
-    is a deliberate irrelevant second entry, since selection is the model''s judgement and not the harness''s.'
-  - Both run against a real provider from an API key in the environment via `OpenRouter::from_env()`,
-    in the style of the existing examples. Compile-verified with `cargo build --examples` (clean); running
-    them live is T10's job.
-- id: US-IO-HARNESS-0.9.0-T10
-  summary: 'Run the headline evidence against a real model: a workspace task whose required output shape
-    is stated only in a skill and whose required datum is available only from a registered tool, plus
-    the negative control with `with_tools` and `with_skills` removed. Confirm the negative control fails
-    for the intended reason and not an unrelated one before recording either run.'
-  why_required: F11 is the only acceptance criterion produced by a model rather than by the suite. The
-    0.8.1 release shipped 186 passing offline tests against a build a real run rejected in four steps;
-    the live run is what catches that class of defect.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.9.0-T07
-  - US-IO-HARNESS-0.9.0-T09
-  acceptance_criteria:
-  - 'F11 — live run, real model. Contract: a workspace task whose required output shape is stated only
-    in a skill, and whose required datum is available only from a registered tool. The run succeeds, the
-    trace shows the `read_skill` call and the tool call, and the produced file carries both the shape
-    and the datum. The same contract with `with_tools` and `with_skills` removed reaches its step cap.
-    Both runs recorded in evidence/0.9.0/live_run.txt.
-
-    '
-  files:
-  - examples/custom_tool.rs
-  - examples/skills_run.rs
-  - .ultraship/products/io-harness/evidence/0.9.0/live_run.txt
-  evidence:
-  - 'F11 green on the first attempt, both halves, two live API calls total. `examples/live_f11.rs` runs
-    either half from argv, matching the repo''s convention that live evidence comes from an example.'
-  - 'The design isolates the two extension points: the datum (quay `Kattegat`, draft `11.6`, window `0430`)
-    exists only inside `BerthTable::invoke()` — not on disk, not in the goal, not in the criterion — and
-    the required shape (three labelled fields in a fixed order) exists only inside the `berth-record` skill
-    body, whose catalogue description deliberately withholds the format. A second skill is a distractor;
-    its body was never read.'
-  - 'The contract''s own risk register called the criterion the fiddly part, and it was: `Verification::describe()`
-    is fed to the model verbatim, so any literal needle in it is a needle the CONTROL could copy, which
-    would make the control pass and the evidence worthless. The criterion is therefore an FNV-1a digest
-    of `record()` over alphanumerics only — one-way, so the constant discloses neither datum nor shape,
-    and case/punctuation-insensitive, so it pins the values, labels and order without becoming a whitespace
-    quiz. Verified offline with `rustc --test` before any money was spent.'
-  - 'Positive run: `Success { steps: 3 }`. Step 1 carries both extension points — `read_skill:{"name":"berth-record"}`
-    and `lookup_berth:{"id":"BRT-2291"}` — and step 3 wrote `quay=Kattegat; draft=11.6; window=0430`,
-    the skill''s shape filled with the tool''s values character for character, not merely inside the digest''s
-    tolerance. No refusals.'
-  - 'Negative control: `StepCapReached { steps: 6 }`, and the trace says why it failed. It searched for
-    exactly the two things removed and found neither — `grep "skill"` 0 hits, `find "*skill*"` 0 paths
-    (`read_skill` is not offered when no skills are configured), and `grep` for `lookup_berth`, `BRT-2291`,
-    `BRT` and `berth` all 0 hits. Told to invent neither, it never wrote the file. Ruled out: no crash
-    (six committed steps, ordinary cap), no refusal (empty refusal set in both runs), not an unsatisfiable
-    criterion (the same criterion and model passed minutes earlier), not a malformed prompt (goal byte-identical).
-    The single difference is `with_tools`/`with_skills`.'
-  - 'Both runs recorded in .ultraship/products/io-harness/evidence/0.9.0/live_run.txt with provider, model,
-    date, the full contract, both traces and both produced files. No harness defect found; one example-hygiene
-    note (the examples open `runs.db` inside the workspace the agent may read, which cost the control two
-    steps of noise) is recorded there.'
+  - NF4 — CI run 30198129225 green on ubuntu-latest, macos-latest, windows-latest plus the msrv and lint
+    jobs, full suite, no leg skipped or `continue-on-error`.
+  - 'cargo test — 16 targets, all ok: 124 lib + 10 checkpoint + 13 context + 13 custom_tools + 9 edit_file
+    + 12 mcp + 11 memory + 3 multi_file + 8 net + 1 parity + 17 policy + 8 sandbox + 15 skills + 10 subagents
+    + 14 verify_gate + 3 doc. `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean.'
+  - 'O4 — evidence/0.10.0/comparison.md with three live OpenRouter runs on the same task and workspace.
+    0.9.1: 552 -> 16,692 -> 32,832 prompt chars over three steps, monotonic. 0.10.0 same default budget:
+    peaks at 25,405 then FALLS to 19,384 and 13,363 as each write invalidates the read of that path. 0.10.0
+    with a 1,500-token ceiling: flat at 1,210 estimated tokens from step 6 through step 20, sixteen turns
+    of four reads each — about 320 KB of raw observations — held inside the ceiling.'
+  - 'The bounded run found a real defect before release: stubs were emitted regardless of the budget and
+    reached 2,264 estimated tokens against a 1,500 ceiling by step 20. Past an eighth of the budget they
+    now collapse into one line (6ea8dc8), asserted by `a_long_runs_stubs_collapse_so_the_ceiling_still_holds`.'
