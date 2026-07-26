@@ -9,7 +9,7 @@ tasks:
     event at all becomes the malformed kind instead of `Ok(CompletionResponse::default())`.
   why_required: Every other task in the release branches on the kind. Retry, fallback and escalation are
     all one question — is this worth trying again — and today the answer is a `String`.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F1 — a provider failure carries its kind. A fixture provider returning connection-refused, 429, 503,
@@ -42,7 +42,30 @@ tasks:
   - src/provider/anthropic.rs
   - src/provider/openai_wire.rs
   - tests/provider_failures.rs
-  evidence: []
+  evidence:
+  - 'src/error.rs — `ProviderErrorKind { Transport, Timeout, RateLimited, Server, Auth, Request, Malformed
+    }` with `is_retryable()` and `from_status(u16)`, and `Error::Provider { kind, status, retry_after,
+    message }`. The taxonomy''s doc comment was written before the call sites, per the contract''s first
+    risk: the enum is shaped by what a consumer branches on, not by what made the tests compile.'
+  - 'Retryable: Transport, Timeout, RateLimited, Server, Malformed. Terminal: Auth (a key does not become
+    valid a second later) and Request (the server read this exact request and refused it). Reasoning is
+    per-arm in `is_retryable`.'
+  - '`From<reqwest::Error> for Error` is the single place `is_timeout()` is consulted, so all four call
+    sites are a plain `?` and the three providers are byte-identical by construction rather than by discipline.
+    `from_status` takes `u16`, not `reqwest::StatusCode`, keeping a vendor type out of the public API.'
+  - '`Retry-After` parsed in both spec forms — delta-seconds and IMF-fixdate — preserved on any non-success
+    status rather than only 429, and treated as absent when unparseable so a bad header degrades to no
+    hint rather than a wrong wait.'
+  - F4 green — malformed is detected on the finished response (`text.is_none() && tool_calls.is_empty()
+    && usage.is_none()`), so a stream that parses and legitimately has no tool call keeps its old meaning
+    exactly. `a_stream_that_parses_to_nothing_is_malformed_not_an_empty_answer`, `a_stream_with_text_and_no_tool_call_stays_a_quiet_success`
+    and `a_stream_carrying_only_usage_is_not_malformed` pin all three sides.
+  - 'F1 green — one test per kind against real local sockets: refused connection, 429 bare, 429 delta-seconds,
+    429 HTTP-date, 503, 401, 400. `all_three_providers_map_a_status_to_the_same_kind` drives OpenRouter,
+    OpenAI and Anthropic against one fixture. `tests/provider_failures.rs` additionally pins the public
+    contract with an exhaustive match that fails to compile if a kind is added without a retry decision.'
+  - NF1 — no new runtime dependency; backoff is `tokio::time::sleep` and the deadline a `reqwest` builder
+    option, both already present.
 - id: US-IO-HARNESS-0.11.0-T02
   summary: Give requests a deadline. `net::http_client()` sets a documented, overridable request timeout,
     so a server that accepts a connection and then never writes ends the call as a timeout rather than
@@ -50,7 +73,7 @@ tasks:
   why_required: A hung request produces no step, so 0.7.0's checkpointing never fires, the time budget
     is only checked at the top of a step and so is never reached, and the aggregate ledger sees no draw.
     The run is simply gone — the one failure mode with no remedy but killing the process.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.11.0-T01
   acceptance_criteria:
@@ -69,7 +92,17 @@ tasks:
   files:
   - src/net.rs
   - tests/provider_failures.rs
-  evidence: []
+  evidence:
+  - src/net.rs — `http_client()` now delegates to `http_client_with_timeout(REQUEST_TIMEOUT)`; before
+    this it set only `.redirect(none)` and had no request timeout at all.
+  - 'The default is 600s, chosen from the slow end of the legitimate side: a full 8192-token stream at
+    a sluggish 15 tokens/second is about nine minutes, so no realistic completion reaches it. The trade
+    is asymmetric — killing a real completion is worse than one hung socket costing ten minutes once —
+    so the default is deliberately generous and overridable. Stated in the README (O4).'
+  - 'F3 green — proven against a REAL socket, not a mocked error: a local listener that accepts the connection
+    and never writes, with a 300ms override, asserted to end as `Timeout` well inside the deadline. A
+    fixture returning an error would not have tested the failure this criterion is about, which produces
+    no step, no trace row and no budget draw.'
 - id: US-IO-HARNESS-0.11.0-T03
   summary: 'Retry only what is retryable, and wait. `complete_with_retry` consults the kind: transport,
     timeout, 5xx and rate limit are retried with a backoff that grows per attempt and honours `Retry-After`;
@@ -78,7 +111,7 @@ tasks:
   why_required: Today a 401 and `Error::Config("OPENAI_API_KEY not set")` are retried twice, instantly,
     exactly as eagerly as a 503 — so the one failure worth waiting for is the one that gets no wait, and
     the two that are hopeless cost three calls each.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.11.0-T01
   acceptance_criteria:
@@ -104,7 +137,26 @@ tasks:
   - src/run.rs
   - src/state.rs
   - tests/provider_failures.rs
-  evidence: []
+  evidence:
+  - '`complete_with_retry` retries only when `Error::Provider`''s kind is retryable. Before this it retried
+    every `Err` identically and instantly — including `Error::Config("OPENAI_API_KEY not set")` and a
+    401, three calls each to learn nothing, while a 503 got no wait at all.'
+  - '`RetryPolicy { base: 500ms, max: 30s }` doubles per attempt to the ceiling; a server''s `Retry-After`
+    wins outright, above the ceiling included, because the server knows its own limit better than a default
+    does.'
+  - F2 green — `a_wrong_key_reaches_the_caller_after_exactly_one_provider_call` (1 call, elapsed under
+    2s against a 5s base), `a_server_failure_is_retried_to_the_limit_with_a_wait_that_doubles` (4 calls;
+    rows pinned exactly at 40ms/80ms/160ms so growth is asserted on the trace rather than the clock),
+    `a_rate_limit_waits_at_least_as_long_as_the_server_asked` (429 with 250ms honoured against a 1ms policy).
+    Timing assertions are lower bounds with margin, never exact durations, so they hold on a loaded Windows
+    runner.
+  - 'NF7 green — `a_retry_that_would_outlast_the_time_budget_escalates_instead_of_sleeping`: a 1s budget
+    against a 30s base escalates after one call rather than sleeping past its deadline. Waiting is not
+    a way to escape a limit.'
+  - 'NF6 — one pre-existing test changed: `retries_then_succeeds_recording_each_attempt` asserted the
+    literal `"retry 1 after error"`. The row now names the kind and the delay, which is the point of the
+    release; the assertion is a prefix match on `"retry 1 after Transport in "` and what it proves is
+    unchanged.'
 - id: US-IO-HARNESS-0.11.0-T04
   summary: A `Fallback` combinator that is itself a `Provider` and wraps two of them, composing and nesting
     for three, accepted unchanged by every existing generic entry point. It falls through only on a failure
@@ -113,7 +165,7 @@ tasks:
   why_required: Three providers are implemented and only one is reachable in a run. `Provider::complete`
     returns `impl Future`, so there is no `dyn Provider` to hold a list — the combinator is how fallback
     happens without breaking the trait every caller implements.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.11.0-T01
   acceptance_criteria:
@@ -139,7 +191,29 @@ tasks:
   - src/state.rs
   - src/run.rs
   - tests/fallback.rs
-  evidence: []
+  evidence:
+  - src/provider/fallback.rs — `Fallback<A, B>` implements `Provider`, so `run`, `run_with`, `run_tree`
+    and the resume entry points all take it with no signature change, and it nests for three. `Provider::complete`
+    returns `impl Future`, so there is no `dyn Provider`; the combinator is what delivers fallback without
+    making the trait object-safe.
+  - '`Sync` on both halves is required and documented: the combinator holds `&self` across the primary''s
+    await, so the future''s `Send` bound needs its fields `Sync`. Every real provider already is.'
+  - F5 green — `a_down_primary_is_answered_by_the_secondary_and_the_run_still_succeeds` (Success, file
+    on disk, a `served` row naming the secondary) and `three_nested_providers_reach_the_one_that_is_up`.
+    `falling_over_costs_the_primary_one_attempt_per_step_not_a_retry_budget` pins that a fall-over happens
+    inside one `complete`, so retry and fallback budgets do not multiply.
+  - F6 green — `a_wrong_key_never_reaches_the_secondary_and_the_caller_gets_the_primarys_kind` and `an_unacceptable_request_never_reaches_the_secondary_either`,
+    both with a secondary whose `complete` panics so being wrong is unmissable.
+  - 'NF2 green — `a_single_provider_run_is_unaffected_and_records_no_served_row`: the single-provider
+    path makes the same calls it did at 0.10.0 and records nothing, because there is nothing ambiguous
+    to record.'
+  - 'Beyond the contract, and necessary: `Provider::endpoints()`, defaulted to `endpoint()`. Authorization
+    checks every host in the chain before the first step. A combinator reporting only its primary would
+    have let a fallback dial the secondary''s host without the 0.8.0 deny-by-default egress policy ever
+    seeing it — a hole the feature would otherwise have opened. Asserted by `authorization_sees_every_endpoint_in_the_chain`.'
+  - 'The per-step record names the LEAF that answered, not the branch: a nested fallback reporting `"b
+    -> c"` would reintroduce one level down the ambiguity the row exists to remove. Found by the integration
+    tests and fixed in 7354328.'
 - id: US-IO-HARNESS-0.11.0-T05
   summary: Make escalation terminal and legible. `"escalated"` maps through `terminal_outcome`, `finish_run`
     stops reporting it as a plain completion, and the result a caller receives says whether what ended
@@ -148,7 +222,7 @@ tasks:
   why_required: A resumed escalated run currently falls straight back into the loop and re-runs, because
     the outcome string is unmapped and the status is `Completed`. An unattended run that escalated at
     3am is therefore silently restarted by the next resume.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.11.0-T01
   - US-IO-HARNESS-0.11.0-T03
@@ -167,7 +241,18 @@ tasks:
   - src/run.rs
   - src/state.rs
   - tests/provider_failures.rs
-  evidence: []
+  evidence:
+  - 'F10 green — the regression that fails against 0.10.0: `resuming_an_escalated_run_reports_the_escalation_instead_of_calling_the_provider_again`
+    asserts the provider''s call count does not move across the resume, and `a_wrong_key_resumes_as_an_escalation_that_was_never_worth_retrying`
+    gives one total call across run and resume. Before this, `"escalated"` was absent from `terminal_outcome`
+    and `finish_run` filed it as a plain completion, so a run that escalated at 3am was silently re-run
+    by whatever resumed it.'
+  - F11 green — `RunOutcome::Escalated { steps, retryable }`, with `"escalated_retryable"` and `"escalated_terminal"`
+    recorded distinctly so a resume, a trace reader and the caller all reach the same conclusion. The
+    caller's own `Err` carries the kind directly.
+  - '`Store::runs()` and `Store::last_run()` added because the integration tests exposed that an escalation
+    returns a bare `Err` with no `run_id`, leaving `RunOutcome::Escalated` unreachable for a caller who
+    had not recorded the id in advance — the outcome existed but could not be got at.'
 - id: US-IO-HARNESS-0.11.0-T06
   summary: Make the workspace report whether a write changed anything. `Workspace::write_file` compares
     the bytes it is about to write with what is there, so a byte-identical rewrite is recorded as the
@@ -175,7 +260,7 @@ tasks:
   why_required: 'Stall detection rests entirely on this signal and the crate has nothing like it: `write_file`
     never reads the old content, so `wrote {target}` today means "a write was attempted", not "the workspace
     changed".'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F7 — the workspace knows when it did not change. Writing byte-identical content is recorded as a
@@ -187,7 +272,18 @@ tasks:
   - src/tools/workspace.rs
   - src/tools/fs.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - src/tools/workspace.rs — `Wrote { Created, Changed, Unchanged }` returned by `Workspace::write_file`,
+    and by `FsTool::write` through the same shared `Wrote::classify`, so the workspace and single-file
+    paths cannot drift. Content is compared, never metadata.
+  - 'The policy check and path resolution are unmoved: a denied write is still refused before anything
+    is read or written. The write always happens, `Unchanged` included — this reports, it does not skip
+    work. An unreadable existing file reports `Changed`, the conservative answer, and says so in a comment.'
+  - F7 green — 7 tests including `a_write_of_the_same_length_but_different_bytes_reports_changed` (27-byte
+    fixture, one digit apart, so a size or mtime shortcut fails it) and `multibyte_content_round_trips_and_compares_correctly`.
+    Asserted on its own so a stall test failing cannot hide a broken change signal.
+  - '`Wrote::moved_the_workspace()` is the question stall detection asks, kept next to the enum rather
+    than at the call site.'
 - id: US-IO-HARNESS-0.11.0-T07
   summary: Detect a stalled agent and give it one chance. A bounded number of consecutive steps that change
     nothing in the workspace AND whose tool calls repeat what an earlier step in the window already did
@@ -197,7 +293,7 @@ tasks:
   why_required: 'The 0.10.0 live evidence recorded this twice: sixteen consecutive turns re-reading the
     same four files, ending in `StepCapReached` with the whole step budget spent proving the agent was
     stuck.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.11.0-T06
   - US-IO-HARNESS-0.11.0-T03
@@ -226,14 +322,35 @@ tasks:
   - src/contract.rs
   - src/state.rs
   - tests/stall.rs
-  evidence: []
+  evidence:
+  - 'src/resilience.rs — `StallPolicy { window: 3, max_replans: 1 }` and `Progress`, with 9 unit tests.
+    A stall requires BOTH halves: nothing changed in the workspace AND a tool call this window already
+    saw.'
+  - 'F8 green — `the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the_window` replays
+    the recorded 0.10.0 failure: turns 1-3 carry no directive, turn 4''s prompt contains the directive
+    naming what was tried, and one `"stalled"` row sits at step 3. `a_write_that_changed_nothing_is_not_progress_and_is_flagged`
+    proves the `Wrote::Unchanged` signal end to end — the case a naive "did it call write_file" check
+    would miss.'
+  - 'F8''s healthy half green, which matters more than the detection: `an_agent_that_changes_the_workspace_is_never_flagged`
+    and `varied_calls_that_write_nothing_are_exploration_and_are_never_flagged` both run to their step
+    cap with no row and no directive. Flagging a legitimate exploration phase would degrade healthy runs
+    to add resilience, which is this release''s worst possible outcome.'
+  - 'F9 green — `a_still_stalled_run_stops_far_short_of_its_step_budget`: a 20-step repeating script ends
+    `Stalled { steps: 6 }`, with the provider called exactly 6 times, so the 14 unspent steps are turns
+    never paid for.'
+  - 'NF3 green — `a_window_of_zero_restores_the_old_step_cap_behaviour_exactly`: the same script under
+    `window: 0` runs to `StepCapReached { steps: 20 }` with no row and no directive anywhere.'
+  - 'The sub-agent loop too: `a_stalled_root_agent_ends_the_tree_as_stalled`. 0.5.0 spawns up to a hundred
+    agents, so one burning its whole budget going nowhere is the multiplied version of the problem.'
+  - The replan directive is an `ObsKind::Message` observation with no target, so it is bounded by the
+    0.10.0 context budget like anything else and can never be superseded away.
 - id: US-IO-HARNESS-0.11.0-T08
   summary: Document the taxonomy and the limits, mark the pillar, and write the CHANGELOG with the `Error::Provider`
     migration note plus the recorded public-surface diff against the 0.10.0 tag.
   why_required: '`Error::Provider`''s shape change breaks every match on it, and a consumer branching
     on a kind is entitled to a specification rather than an observation. Fallback also needs its non-promise
     stated: it does not check that the second provider is equivalent to the first.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.11.0-T01
   - US-IO-HARNESS-0.11.0-T02
@@ -269,7 +386,18 @@ tasks:
   - README.md
   - CHANGELOG.md
   - docs/CAPABILITIES.md
-  evidence: []
+  evidence:
+  - 'README gains `## Resilience (v0.11)` with a worked `match` on `ProviderErrorKind`, the `Fallback`
+    example, the `StallPolicy` knob, and a `### The limits, stated plainly` subsection: fallback does
+    not promise equivalence, the 600s deadline and why, stall detection is a heuristic on a signal rather
+    than a proof, and a retry is not a queue. O1, O2, O4.'
+  - docs/CAPABILITIES.md marks recovery and retry shipped at 0.11.0 and nothing else; the status line
+    reads eleven of twelve pillars with 0.12.0 named for the last. O3.
+  - 'CHANGELOG 0.11.0 section in the required Keep-a-Changelog categories, leading with the two breaking
+    changes and how to migrate each: `Error::Provider` becoming a struct variant, and `write_file`/`FsTool::write`
+    returning `Result<Wrote>`. NF5.'
+  - NF5 evidence — the public-surface diff against the 0.10.0 tag is recorded in the evidence directory.
+    The removals are exactly the two deliberate signature changes; everything else is additive.
 - id: US-IO-HARNESS-0.11.0-T09
   summary: 'Produce the release evidence: the three-OS matrix green on one commit with the full suite,
     and the live runs — the stall fixture ending as a stall, and a fallback run whose trace shows both
@@ -277,7 +405,7 @@ tasks:
   why_required: The timing-sensitive deadline and backoff assertions have to hold on the slowest runner
     rather than on the development machine, and the stall was found live rather than in a test, so it
     is confirmed live.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.11.0-T05
   - US-IO-HARNESS-0.11.0-T07
@@ -294,4 +422,9 @@ tasks:
   files:
   - .github/workflows/ci.yml
   - .ultraship/products/io-harness/evidence/0.11.0/
-  evidence: []
+  evidence:
+  - NF4 — the three-OS matrix green on one commit with the full suite, no leg skipped, excluded or marked
+    `continue-on-error`.
+  - cargo test — 341 passed, 0 failed across 19 targets (322 before the integration tests, 271 at 0.10.0).
+    `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` clean. MSRV 1.88 holds.
+  - O5 — the live-run evidence in evidence/0.11.0/.
