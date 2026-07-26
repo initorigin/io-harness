@@ -613,6 +613,12 @@ impl ContextEvent {
         Self::of("memory_recall", step, detail)
     }
 
+    /// The agent made no progress: either it was told to change approach, or it had
+    /// already been told and the run is ending.
+    pub fn stalled(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("stalled", step, detail)
+    }
+
     fn of(kind: &str, step: u32, detail: impl Into<String>) -> Self {
         Self {
             step,

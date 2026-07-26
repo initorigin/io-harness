@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use serde_json::json;
 
-use super::{read_sse, CompletionRequest, CompletionResponse, ToolCall, Usage};
+use super::{ensure_parsed, read_sse, CompletionRequest, CompletionResponse, ToolCall, Usage};
 use crate::error::Result;
 
 /// Build the chat/completions request body for `model` from a neutral request.
@@ -44,6 +44,10 @@ pub(crate) fn body(model: &str, request: &CompletionRequest) -> serde_json::Valu
 }
 
 /// Parse the SSE stream of an OpenAI-style response into one completion.
+///
+/// Un-parseable `data:` lines are skipped, as a robust SSE reader should — but a
+/// stream where *every* line was skipped is a failure, not an empty answer, so
+/// the result goes through [`ensure_parsed`].
 pub(crate) async fn parse_stream(resp: reqwest::Response) -> Result<CompletionResponse> {
     let mut acc = Accumulator::default();
     read_sse(resp, |data| {
@@ -56,7 +60,7 @@ pub(crate) async fn parse_stream(resp: reqwest::Response) -> Result<CompletionRe
         false
     })
     .await?;
-    Ok(acc.finish())
+    ensure_parsed(acc.finish())
 }
 
 /// Accumulates streamed deltas into one response.

@@ -1,5 +1,85 @@
 //! The one error type the crate returns.
 
+use std::time::Duration;
+
+/// Why a provider call failed, and therefore whether trying it again — or trying
+/// a different provider — is worth doing.
+///
+/// Before 0.11.0 every provider failure was one string: a 429, a 503, a 401 and
+/// a DNS failure differed only in prose, so nothing above the provider could
+/// branch on them. This enum is that branch, and [`ProviderErrorKind::is_retryable`]
+/// is the decision the rest of the crate reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    /// The request never completed: connection refused, DNS failure, TLS failure,
+    /// a mid-stream byte error.
+    Transport,
+    /// The request had a deadline and passed it.
+    Timeout,
+    /// 429. Carries the server's `Retry-After` when it sent one.
+    RateLimited,
+    /// 5xx.
+    Server,
+    /// 401 or 403 — the key is wrong, missing, or not entitled to this model.
+    Auth,
+    /// 4xx other than 401/403: the request itself is unacceptable.
+    Request,
+    /// The response arrived and nothing in it could be read.
+    Malformed,
+}
+
+impl ProviderErrorKind {
+    /// Whether re-sending the same request could plausibly succeed.
+    ///
+    /// Per arm, and the reasoning is the point — a retry that cannot work costs
+    /// the budget twice and hides the real failure behind a later one:
+    ///
+    /// - [`Transport`](Self::Transport): the request never reached the model, so
+    ///   nothing about it was rejected. Networks drop connections for reasons
+    ///   that do not repeat.
+    /// - [`Timeout`](Self::Timeout): the deadline says nothing about the request.
+    ///   A hung socket or an overloaded server is the usual cause and neither is
+    ///   permanent.
+    /// - [`RateLimited`](Self::RateLimited): the server is explicitly telling you
+    ///   to come back later. This is the one kind that carries *when*.
+    /// - [`Server`](Self::Server): a 5xx is the server's own admission that the
+    ///   fault is its side, not the request's.
+    /// - [`Malformed`](Self::Malformed): a garbled or empty stream is far more
+    ///   often a truncated transfer than a model that genuinely produced nothing,
+    ///   and re-asking is cheap — cheaper than a run that reads the emptiness as
+    ///   "the model chose not to call a tool" and quietly stops.
+    /// - [`Auth`](Self::Auth): the key will not become valid between two calls a
+    ///   second apart. Retrying burns the retry budget to reach the same 401.
+    /// - [`Request`](Self::Request): the server has already read this exact
+    ///   request and refused it. Sending it again is two failures instead of one.
+    pub fn is_retryable(self) -> bool {
+        match self {
+            Self::Transport
+            | Self::Timeout
+            | Self::RateLimited
+            | Self::Server
+            | Self::Malformed => true,
+            Self::Auth | Self::Request => false,
+        }
+    }
+
+    /// The kind an HTTP status maps to.
+    ///
+    /// The one place that mapping lives, so OpenRouter, OpenAI and Anthropic
+    /// cannot drift apart: they were byte-identical before this existed and this
+    /// is what keeps them so. A status the buckets do not cover (1xx, 3xx — the
+    /// client follows no redirects, so a 3xx is a boundary hop, not a success)
+    /// is [`Request`](Self::Request): unexpected, and not something a retry fixes.
+    pub fn from_status(status: u16) -> Self {
+        match status {
+            429 => Self::RateLimited,
+            401 | 403 => Self::Auth,
+            500..=599 => Self::Server,
+            _ => Self::Request,
+        }
+    }
+}
+
 /// Errors io-harness can return from a run.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -12,8 +92,21 @@ pub enum Error {
     State(#[from] rusqlite::Error),
 
     /// The provider request or its streamed response failed.
-    #[error("provider error: {0}")]
-    Provider(String),
+    ///
+    /// [`ProviderErrorKind`] is what a caller branches on; `status` and
+    /// `retry_after` are kept rather than folded into the message so a retry can
+    /// honour what the server actually said.
+    #[error("provider error ({kind:?}{}): {message}", .status.map(|s| format!(", HTTP {s}")).unwrap_or_default())]
+    Provider {
+        /// Why the call failed, and whether retrying is worth it.
+        kind: ProviderErrorKind,
+        /// The HTTP status, when the failure had one.
+        status: Option<u16>,
+        /// The server's `Retry-After`, when it sent one.
+        retry_after: Option<Duration>,
+        /// What the provider or the transport reported.
+        message: String,
+    },
 
     /// Configuration was missing or invalid (e.g. no API key).
     #[error("configuration error: {0}")]
@@ -76,5 +169,115 @@ pub enum Error {
     },
 }
 
+impl Error {
+    /// A provider failure of `kind` carrying no HTTP status — the request never
+    /// completed, or the response could not be read.
+    pub fn provider(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self::Provider {
+            kind,
+            status: None,
+            retry_after: None,
+            message: message.into(),
+        }
+    }
+
+    /// The request never completed: connection refused, DNS, TLS, a mid-stream
+    /// byte error.
+    pub fn provider_transport(message: impl Into<String>) -> Self {
+        Self::provider(ProviderErrorKind::Transport, message)
+    }
+
+    /// The response arrived and nothing in it could be read.
+    pub fn provider_malformed(message: impl Into<String>) -> Self {
+        Self::provider(ProviderErrorKind::Malformed, message)
+    }
+
+    /// A non-success HTTP status, with the kind derived once by
+    /// [`ProviderErrorKind::from_status`] so no provider can classify it
+    /// differently.
+    pub fn provider_status(
+        status: u16,
+        retry_after: Option<Duration>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::Provider {
+            kind: ProviderErrorKind::from_status(status),
+            status: Some(status),
+            retry_after,
+            message: message.into(),
+        }
+    }
+}
+
+/// Every `reqwest` failure the crate sees is a provider call that did not
+/// complete, so the timeout/transport split is decided here once instead of at
+/// each of the four call sites (three providers plus the shared SSE reader).
+impl From<reqwest::Error> for Error {
+    fn from(e: reqwest::Error) -> Self {
+        let kind = if e.is_timeout() {
+            ProviderErrorKind::Timeout
+        } else {
+            ProviderErrorKind::Transport
+        };
+        Self::provider(kind, e.to_string())
+    }
+}
+
 /// Crate result alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_same_status_always_maps_to_the_same_kind() {
+        use ProviderErrorKind::*;
+        for (status, kind) in [
+            (429, RateLimited),
+            (401, Auth),
+            (403, Auth),
+            (400, Request),
+            (404, Request),
+            (422, Request),
+            (500, Server),
+            (503, Server),
+            (599, Server),
+        ] {
+            assert_eq!(ProviderErrorKind::from_status(status), kind, "{status}");
+        }
+    }
+
+    #[test]
+    fn retrying_is_worth_it_for_everything_except_a_rejected_request() {
+        use ProviderErrorKind::*;
+        for kind in [Transport, Timeout, RateLimited, Server, Malformed] {
+            assert!(kind.is_retryable(), "{kind:?}");
+        }
+        for kind in [Auth, Request] {
+            assert!(!kind.is_retryable(), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn a_status_failure_keeps_its_status_and_retry_after() {
+        let e = Error::provider_status(429, Some(Duration::from_secs(7)), "slow down");
+        let Error::Provider {
+            kind,
+            status,
+            retry_after,
+            ..
+        } = &e
+        else {
+            panic!("expected a provider error");
+        };
+        assert_eq!(*kind, ProviderErrorKind::RateLimited);
+        assert_eq!(*status, Some(429));
+        assert_eq!(*retry_after, Some(Duration::from_secs(7)));
+        // The rendering names the kind and the status; the fields are what code
+        // branches on.
+        let shown = e.to_string();
+        assert!(shown.contains("RateLimited"), "{shown}");
+        assert!(shown.contains("429"), "{shown}");
+    }
+}

@@ -20,11 +20,12 @@ use crate::context::{
     assemble, bound, entry_cap_chars, Assembly, Ledger as ContextLedger, ObsKind, Observation,
 };
 use crate::contract::TaskContract;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
+use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
@@ -60,6 +61,18 @@ pub enum RunOutcome {
     /// process, so [`resume_with_decision`] can continue it once a human
     /// decides. `steps` is how many steps completed.
     AwaitingApproval { request_id: i64, steps: u32 },
+    /// The agent stopped making progress: for `StallPolicy::window` consecutive
+    /// steps it changed nothing in the workspace while repeating a tool call it had
+    /// already made, and it had already been told once. The run stops here rather
+    /// than spending the rest of its step budget proving it is stuck. `steps` is
+    /// how many steps completed.
+    Stalled { steps: u32 },
+    /// A provider failure exhausted its retries and the run was escalated to the
+    /// caller. `retryable` is whether the failure was one another attempt could have
+    /// survived — a rate limit or a 503 — as opposed to a wrong key or an
+    /// unacceptable request. Reached through [`resume`] after the fact: the run that
+    /// escalated returned the `Err` itself.
+    Escalated { steps: u32, retryable: bool },
     /// (sub-agent trees) The tree's aggregate spend ceiling was crossed, so the
     /// whole tree halts — not this one agent hitting its own budget. `steps` is
     /// how many steps this agent completed before the tree-wide halt.
@@ -620,6 +633,19 @@ fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
         "success" => Some(RunOutcome::Success { steps: last }),
         "denied" => Some(RunOutcome::Denied { steps: last }),
         "budget_ceiling_reached" => Some(RunOutcome::BudgetCeilingReached { steps: last }),
+        "stalled" => Some(RunOutcome::Stalled { steps: last }),
+        // Before 0.11.0 `"escalated"` was unmapped and `finish_run` reported it as a
+        // plain completion, so resuming an escalated run fell straight back into the
+        // loop and re-ran it. An unattended run that escalated at 3am was silently
+        // restarted by the next resume.
+        "escalated_retryable" => Some(RunOutcome::Escalated {
+            steps: last,
+            retryable: true,
+        }),
+        "escalated_terminal" | "escalated" => Some(RunOutcome::Escalated {
+            steps: last,
+            retryable: false,
+        }),
         _ => None,
     }))
 }
@@ -676,15 +702,8 @@ async fn run_from<P: Provider>(
             tools: vec![tool.clone()],
         };
 
-        let response = complete_with_retry(
-            provider,
-            &request,
-            contract.max_retries,
-            store,
-            run_id,
-            step,
-        )
-        .await?;
+        let response =
+            complete_with_retry(provider, &request, contract, store, run_id, step).await?;
 
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
@@ -790,6 +809,10 @@ async fn run_workspace_from<P: Provider>(
     // `assemble`, under the contract's context budget — the log itself is never
     // trimmed, so the trace keeps everything.
     let mut ledger = ContextLedger::new();
+    // Is the agent getting anywhere? Restored from nothing on resume by design: a
+    // resumed run has just been given a fresh chance, and condemning it for the
+    // window it stalled in before the crash would be a poor welcome.
+    let mut progress = Progress::new();
     let mem_key = memory_key(root);
 
     for step in start_step..=contract.max_steps {
@@ -834,15 +857,8 @@ async fn run_workspace_from<P: Provider>(
             tools: tools.clone(),
         };
 
-        let response = complete_with_retry(
-            provider,
-            &request,
-            contract.max_retries,
-            store,
-            run_id,
-            step,
-        )
-        .await?;
+        let response =
+            complete_with_retry(provider, &request, contract, store, run_id, step).await?;
 
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
@@ -857,6 +873,10 @@ async fn run_workspace_from<P: Provider>(
         // each result into the observation log the next turn will see.
         let mut decisions: Vec<String> = Vec::new();
         let mut calls_json: Vec<String> = Vec::new();
+        // Did this step move the workspace? Only a write that wrote something
+        // different can, and it is the half of the stall signal that says the agent
+        // is not merely repeating itself but achieving nothing.
+        let mut step_changed = false;
         if response.tool_calls.is_empty() {
             let said = response.text.clone().unwrap_or_default();
             ledger.push(Observation::new(
@@ -895,8 +915,10 @@ async fn run_workspace_from<P: Provider>(
                     obs,
                     kind,
                     target,
+                    changed,
                     remember,
                 } => {
+                    step_changed |= changed;
                     ledger.push(Observation::new(step, kind, target, obs));
                     decisions.push(decision);
                     new_rules.extend(remember);
@@ -934,6 +956,51 @@ async fn run_workspace_from<P: Provider>(
             est_tokens = assembled.est_tokens,
             "workspace step"
         );
+
+        // Did that step get anywhere? A stall needs both halves — nothing changed
+        // in the workspace AND a tool call this window already saw — because a
+        // legitimate exploration phase changes nothing either, and flagging that
+        // would degrade healthy runs to add resilience.
+        let signature = calls_json.join(" | ");
+        match progress.step(contract.stall, step_changed, &signature) {
+            Progressing::Fine => {}
+            Progressing::Replan => {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::stalled(
+                        step,
+                        format!(
+                            "{} steps without progress; replanning",
+                            contract.stall.window
+                        ),
+                    ),
+                )?;
+                // The directive is an observation like any other, so it is bounded
+                // by the same budget and, carrying no target, can never be
+                // superseded away.
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Message,
+                    None,
+                    bound(
+                        &progress.replan_directive(contract.stall.window, &decisions),
+                        entry_cap,
+                        ObsKind::Message,
+                    ),
+                ));
+                info!(run_id, step, "agent told to change approach");
+            }
+            Progressing::Stalled => {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::stalled(step, "still no progress after replanning"),
+                )?;
+                store.finish_run(run_id, "stalled")?;
+                info!(run_id, step, "run stopped: stalled");
+                return Ok(RunResult::new(RunOutcome::Stalled { steps: step }, run_id)
+                    .with_remembered(remembered));
+            }
+        }
 
         // An approver deferred: persist nothing further, stop, and let the
         // caller resume once a human has decided.
@@ -1198,6 +1265,7 @@ fn run_agent<'f, P: Provider>(
         // 100 children each re-sending its own unbounded log is the multiplied
         // version of the problem 0.10.0 exists to fix.
         let mut ledger = ContextLedger::new();
+        let mut progress = Progress::new();
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);
@@ -1234,15 +1302,9 @@ fn run_agent<'f, P: Provider>(
                 user: user.clone(),
                 tools: tools.clone(),
             };
-            let response = complete_with_retry(
-                tree.provider,
-                &request,
-                contract.max_retries,
-                tree.store,
-                run_id,
-                step,
-            )
-            .await?;
+            let response =
+                complete_with_retry(tree.provider, &request, contract, tree.store, run_id, step)
+                    .await?;
 
             let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
             tokens_used += step_tokens;
@@ -1253,6 +1315,7 @@ fn run_agent<'f, P: Provider>(
 
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
+            let mut step_changed = false;
             if response.tool_calls.is_empty() {
                 let said = response.text.clone().unwrap_or_default();
                 ledger.push(Observation::new(
@@ -1299,8 +1362,10 @@ fn run_agent<'f, P: Provider>(
                         obs,
                         kind,
                         target,
+                        changed,
                         ..
                     } => {
+                        step_changed |= changed;
                         ledger.push(Observation::new(step, kind, target, obs));
                         decisions.push(decision);
                     }
@@ -1334,6 +1399,10 @@ fn run_agent<'f, P: Provider>(
                                 bound(&obs, entry_cap, ObsKind::Child),
                             ));
                             decisions.push(decision);
+                            // A child that ran did work the parent did not have to.
+                            // Whether it changed the workspace is the child's own
+                            // stall problem, tracked in the child's own loop.
+                            step_changed = true;
                         }
                         // A child deferred; pause the tree with its request_id.
                         SpawnResult::Paused { request_id } => {
@@ -1365,6 +1434,45 @@ fn run_agent<'f, P: Provider>(
                         .with_trace(user, calls_json.join(" | "), step_tokens),
                 )?;
                 info!(run_id, depth, step, decisions = %decisions.join("; "), tokens = step_tokens, "agent step");
+            }
+
+            // 0.5.0 spawns up to a hundred of these, so an agent burning its whole
+            // step budget going nowhere is the multiplied version of the problem.
+            let signature = calls_json.join(" | ");
+            match progress.step(contract.stall, step_changed, &signature) {
+                Progressing::Fine => {}
+                Progressing::Replan => {
+                    tree.store.record_context_event(
+                        run_id,
+                        &ContextEvent::stalled(
+                            step,
+                            format!(
+                                "{} steps without progress; replanning",
+                                contract.stall.window
+                            ),
+                        ),
+                    )?;
+                    ledger.push(Observation::new(
+                        step,
+                        ObsKind::Message,
+                        None,
+                        bound(
+                            &progress.replan_directive(contract.stall.window, &decisions),
+                            entry_cap,
+                            ObsKind::Message,
+                        ),
+                    ));
+                    info!(run_id, depth, step, "agent told to change approach");
+                }
+                Progressing::Stalled => {
+                    tree.store.record_context_event(
+                        run_id,
+                        &ContextEvent::stalled(step, "still no progress after replanning"),
+                    )?;
+                    tree.store.finish_run(run_id, "stalled")?;
+                    info!(run_id, depth, step, "agent stopped: stalled");
+                    return Ok(RunOutcome::Stalled { steps: step });
+                }
             }
 
             if let Some(request_id) = paused {
@@ -1621,27 +1729,42 @@ async fn authorize_provider<P: Provider>(
 ) -> Result<ProviderAccess> {
     // A provider that opens no connection (the mock providers tests drive the
     // loop with) has no endpoint to authorize.
-    let Some(url) = provider.endpoint() else {
+    // Every host in the chain, not just the first: a `Fallback` can dial its
+    // secondary, and a host the policy never checked would be a hole in an egress
+    // model that is deny-by-default everywhere else.
+    let urls = provider.endpoints();
+    if urls.is_empty() {
+        // A provider that opens no connection (the mock providers the tests drive
+        // the loop with) has no endpoint to authorize.
         return Ok(ProviderAccess::Granted(policy.clone()));
-    };
-    let Some(target) = net::target(url) else {
-        return Err(crate::error::Error::Refused {
-            act: "net".into(),
-            target: url.to_string(),
-            rule: None,
-            layer: None,
-        });
-    };
-
-    let effective = policy.clone().merge(net::provider_layer(&target));
-    // Step 0: the authorization happens before the run's first step.
-    let verdict = NetGuard::new(&effective)
-        .tracing(store, run_id, 0)
-        .check_target(&target)?;
-
-    if verdict.effect != Effect::Ask {
-        return Ok(ProviderAccess::Granted(effective));
     }
+
+    let mut effective = policy.clone();
+    let mut ask: Option<String> = None;
+    for url in urls {
+        let Some(target) = net::target(url) else {
+            return Err(crate::error::Error::Refused {
+                act: "net".into(),
+                target: url.to_string(),
+                rule: None,
+                layer: None,
+            });
+        };
+        effective = effective.merge(net::provider_layer(&target));
+        // Step 0: the authorization happens before the run's first step.
+        let verdict = NetGuard::new(&effective)
+            .tracing(store, run_id, 0)
+            .check_target(&target)?;
+        if verdict.effect == Effect::Ask {
+            // One human decision covers the run; the first host that needs asking
+            // is the one asked about.
+            ask = Some(target.clone());
+        }
+    }
+
+    let Some(target) = ask else {
+        return Ok(ProviderAccess::Granted(effective));
+    };
 
     match approver.decide(&Request::new(Act::Net, &target)).await {
         Decision::Approve { .. } => {
@@ -1660,8 +1783,10 @@ async fn authorize_provider<P: Provider>(
             Err(crate::error::Error::Refused {
                 act: "net".into(),
                 target: format!("{target} — {reason}"),
-                rule: verdict.rule,
-                layer: verdict.layer,
+                // The approver denied it, so the refusal is the human's, not a
+                // rule's: there is no rule to name.
+                rule: None,
+                layer: None,
             })
         }
         Decision::Defer => {
@@ -1690,6 +1815,9 @@ enum Dispatched {
         obs: String,
         kind: ObsKind,
         target: Option<String>,
+        /// Whether this call moved the workspace. Only a write can, and only a
+        /// write that wrote something different — the signal stall detection reads.
+        changed: bool,
         remember: Vec<Rule>,
     },
     /// An approver deferred; the action is persisted under `request_id` and the
@@ -1710,6 +1838,7 @@ impl Dispatched {
             obs: obs.into(),
             kind,
             target,
+            changed: false,
             remember: Vec::new(),
         }
     }
@@ -1832,6 +1961,7 @@ async fn dispatch(
                         obs: format!("\n[read {target}]\n{}\n", bound(&c, cap, ObsKind::Read)),
                         kind: ObsKind::Read,
                         target: Some(target.clone()),
+                        changed: false,
                         remember,
                     },
                     Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
@@ -1868,15 +1998,29 @@ async fn dispatch(
                 } => {
                     let body = content.unwrap_or_default();
                     match ws.write_file(&target, &body) {
-                        Ok(()) => Dispatched::Continue {
+                        Ok(wrote) => Dispatched::Continue {
                             decision: format!("wrote {target}"),
+                            // A write that changed nothing says so, to the model as
+                            // well as to the trace: an agent rewriting a file with
+                            // what it already held is the shape of a stall, and it
+                            // cannot correct for what it is not told.
                             obs: bound(
-                                &format!("\n[wrote {target}] ({} chars)\n", body.chars().count()),
+                                &format!(
+                                    "\n[wrote {target}] ({} chars{})\n",
+                                    body.chars().count(),
+                                    if wrote.moved_the_workspace() {
+                                        ""
+                                    } else {
+                                        ", identical to what was already there — the \
+                                         workspace did not change"
+                                    }
+                                ),
                                 cap,
                                 ObsKind::Write,
                             ),
                             kind: ObsKind::Write,
                             target: Some(target.clone()),
+                            changed: wrote.moved_the_workspace(),
                             remember,
                         },
                         Err(e) => Dispatched::go("write error", format!("\n[write error] {e}\n")),
@@ -1922,6 +2066,7 @@ async fn dispatch(
                             obs: format!("\n[skill {name}]\n{body}\n"),
                             kind: ObsKind::Skill,
                             target: Some(name.to_string()),
+                            changed: false,
                             remember,
                         }
                     }
@@ -1958,6 +2103,7 @@ async fn dispatch(
                                 obs: format!("\n[{name}]\n{out}\n"),
                                 kind: ObsKind::Tool,
                                 target: Some(name.to_string()),
+                                changed: false,
                                 remember,
                             }
                         }
@@ -1971,6 +2117,7 @@ async fn dispatch(
                                 obs: format!("\n[{name} error] {e}\n"),
                                 kind: ObsKind::Error,
                                 target: None,
+                                changed: false,
                                 remember,
                             }
                         }
@@ -2166,28 +2313,106 @@ fn memory_key(root: &Path) -> String {
 async fn complete_with_retry<P: Provider>(
     provider: &P,
     request: &CompletionRequest,
-    max_retries: u32,
+    contract: &TaskContract,
     store: &Store,
     run_id: i64,
     step: u32,
 ) -> Result<CompletionResponse> {
+    let max_retries = contract.max_retries;
+    let retry = contract.retry;
+    let max_duration = contract.max_duration;
     let mut attempt = 0;
     loop {
         match provider.complete(request.clone()).await {
             Ok(response) => return Ok(response),
-            Err(e) if attempt < max_retries => {
+            // Only ask again if asking again could answer differently. Before
+            // 0.11.0 every error was retried identically — including a 401 and a
+            // missing API key, which cost three calls each to learn nothing, while
+            // the one failure worth waiting for got no wait at all.
+            Err(e) if attempt < max_retries && retryable(&e) => {
                 attempt += 1;
+                let wait = retry.wait(attempt, retry_after(&e));
+                // A wait is not a way to escape the time budget: if the run's
+                // deadline falls inside this sleep, stop now rather than after it.
+                if let Some(max) = max_duration {
+                    let elapsed = store.elapsed_secs(run_id)?;
+                    if elapsed + wait.as_secs_f64() > max.as_secs_f64() {
+                        store.record(
+                            run_id,
+                            &StepRecord::new(
+                                step,
+                                "escalated (retry would outlast the time budget)",
+                                e.to_string(),
+                            ),
+                        )?;
+                        store.finish_run(run_id, escalation_outcome(&e))?;
+                        return Err(e);
+                    }
+                }
                 store.record(
                     run_id,
-                    &StepRecord::new(step, format!("retry {attempt} after error"), e.to_string()),
+                    &StepRecord::new(
+                        step,
+                        format!("retry {attempt} after {} in {:?}", kind_of(&e), wait),
+                        e.to_string(),
+                    ),
                 )?;
+                if !wait.is_zero() {
+                    tokio::time::sleep(wait).await;
+                }
             }
             Err(e) => {
-                store.record(run_id, &StepRecord::new(step, "escalated", e.to_string()))?;
-                store.finish_run(run_id, "escalated")?;
+                store.record(
+                    run_id,
+                    &StepRecord::new(
+                        step,
+                        format!("escalated after {}", kind_of(&e)),
+                        e.to_string(),
+                    ),
+                )?;
+                store.finish_run(run_id, escalation_outcome(&e))?;
                 return Err(e);
             }
         }
+    }
+}
+
+/// Whether this failure is worth another attempt. A non-provider error — a bad
+/// configuration, an IO failure — is not: it will fail the same way next time.
+fn retryable(e: &Error) -> bool {
+    matches!(e, Error::Provider { kind, .. } if kind.is_retryable())
+}
+
+/// What the server asked us to wait, if it asked.
+fn retry_after(e: &Error) -> Option<std::time::Duration> {
+    match e {
+        Error::Provider { retry_after, .. } => *retry_after,
+        _ => None,
+    }
+}
+
+/// A short name for the trace row, so a reader can tell a wait from a hammer.
+fn kind_of(e: &Error) -> String {
+    match e {
+        Error::Provider { kind, status, .. } => match status {
+            Some(s) => format!("{kind:?} (HTTP {s})"),
+            None => format!("{kind:?}"),
+        },
+        other => format!("{other}"),
+    }
+}
+
+/// The outcome string an escalation records, carrying whether the failure was one
+/// another attempt could have survived.
+///
+/// Two strings rather than one because a resumed run and a trace reader have to
+/// reach the same conclusion the caller did, and the caller's `Error` does not
+/// survive into the store.
+fn escalation_outcome(e: &Error) -> &'static str {
+    if retryable(e) {
+        "escalated_retryable"
+    } else {
+        "escalated_terminal"
     }
 }
 

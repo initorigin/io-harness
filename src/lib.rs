@@ -220,6 +220,7 @@ pub mod mcp;
 mod net;
 pub mod policy;
 pub mod provider;
+pub mod resilience;
 mod run;
 pub mod sandbox;
 pub mod skills;
@@ -231,13 +232,14 @@ pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprove
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use context::ContextBudget;
 pub use contract::TaskContract;
-pub use error::{Error, Result};
+pub use error::{Error, ProviderErrorKind, Result};
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 pub use policy::{Act, Effect, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
     ToolSpec, Usage,
 };
+pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
 pub use run::{
     resume, resume_tree, resume_tree_with_decision, resume_with_decision, run, run_tree, run_with,
     RunOutcome, RunResult, SPAWN_TOOL,

@@ -30,6 +30,45 @@ pub struct Workspace {
     policy: Policy,
 }
 
+/// What a write did to the file it targeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wrote {
+    /// The file did not exist and now does.
+    Created,
+    /// The contents differ from what was there.
+    Changed,
+    /// The bytes written are identical to the bytes that were already there.
+    /// Recorded as the no-op it is: a step that only rewrites a file unchanged
+    /// has not moved the workspace.
+    Unchanged,
+}
+
+impl Wrote {
+    /// Whether this write actually moved the workspace.
+    ///
+    /// The question stall detection asks each step: an agent that only rewrites
+    /// files with what they already contained has not made progress, however many
+    /// writes it performed.
+    pub fn moved_the_workspace(self) -> bool {
+        !matches!(self, Wrote::Unchanged)
+    }
+
+    /// Classify a write from the result of reading the target beforehand.
+    ///
+    /// Content is compared, never metadata: a same-length different-content
+    /// write is [`Wrote::Changed`]. A file that exists but cannot be read
+    /// (permissions) is not a reason to fail the write — the old content is
+    /// unknown, so it reports `Changed`, the conservative answer.
+    pub(crate) fn classify(old: std::io::Result<Vec<u8>>, content: &str) -> Self {
+        match old {
+            Ok(old) if old == content.as_bytes() => Wrote::Unchanged,
+            Ok(_) => Wrote::Changed,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Wrote::Created,
+            Err(_) => Wrote::Changed,
+        }
+    }
+}
+
 /// One grep hit: file relative to the root, 1-based line number, and the line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Match {
@@ -207,16 +246,22 @@ impl Workspace {
         Ok(std::fs::read_to_string(abs).unwrap_or_default())
     }
 
-    /// Write a file under the root, creating parent directories. A path the
-    /// policy denies is refused before anything is written.
-    pub fn write_file(&self, rel: &str, content: &str) -> Result<()> {
+    /// Write a file under the root, creating parent directories, reporting
+    /// whether it changed anything. A path the policy denies is refused before
+    /// anything is read or written.
+    ///
+    /// The write happens in every case, [`Wrote::Unchanged`] included: this
+    /// reports, it does not skip work, so nothing about the file's state depends
+    /// on the comparison.
+    pub fn write_file(&self, rel: &str, content: &str) -> Result<Wrote> {
         let abs = self.resolve(rel)?;
         self.enforce(Act::Write, rel)?;
+        let did = Wrote::classify(std::fs::read(&abs), content);
         if let Some(parent) = abs.parent() {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(abs, content)?;
-        Ok(())
+        Ok(did)
     }
 
     /// All files under the root, relative and `/`-separated, sorted, skipping
@@ -524,5 +569,84 @@ mod tests {
         assert_eq!(ws.read_file("src/new.rs").unwrap(), "fn n() {}");
         // an escaping write is refused, nothing written outside root.
         assert!(ws.write_file("../evil.rs", "x").is_err());
+    }
+
+    #[test]
+    fn a_write_to_a_path_that_does_not_exist_reports_created() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+        assert_eq!(
+            ws.write_file("src/new.rs", "fn n() {}").unwrap(),
+            Wrote::Created
+        );
+    }
+
+    #[test]
+    fn a_write_of_different_content_reports_changed_and_lands_on_disk() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+        assert_eq!(
+            ws.write_file("src/a.rs", "pub fn alpha() -> u32 { 9 }\n")
+                .unwrap(),
+            Wrote::Changed
+        );
+        assert_eq!(
+            ws.read_file("src/a.rs").unwrap(),
+            "pub fn alpha() -> u32 { 9 }\n"
+        );
+    }
+
+    #[test]
+    fn a_write_of_byte_identical_content_reports_unchanged() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+        let same = "pub fn alpha() -> u32 { 1 }\n";
+        assert_eq!(ws.write_file("src/a.rs", same).unwrap(), Wrote::Unchanged);
+        // Written anyway: the file is still exactly what was asked for.
+        assert_eq!(ws.read_file("src/a.rs").unwrap(), same);
+    }
+
+    #[test]
+    fn a_write_of_the_same_length_but_different_bytes_reports_changed() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+        // Same byte length as the fixture's src/a.rs, one digit apart — a size
+        // or mtime shortcut would call this unchanged.
+        assert_eq!(
+            ws.write_file("src/a.rs", "pub fn alpha() -> u32 { 2 }\n")
+                .unwrap(),
+            Wrote::Changed
+        );
+    }
+
+    #[test]
+    fn multibyte_content_round_trips_and_compares_correctly() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+        let text = "// héllo — 日本語 🌍\n";
+        assert_eq!(ws.write_file("src/uni.rs", text).unwrap(), Wrote::Created);
+        assert_eq!(ws.read_file("src/uni.rs").unwrap(), text);
+        assert_eq!(ws.write_file("src/uni.rs", text).unwrap(), Wrote::Unchanged);
+        // Same char count, different bytes.
+        assert_eq!(
+            ws.write_file("src/uni.rs", "// héllo — 日本語 🌎\n")
+                .unwrap(),
+            Wrote::Changed
+        );
+    }
+
+    #[test]
+    fn a_denied_write_is_refused_before_the_change_signal_is_computed() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/key.txt"), "original").unwrap();
+        let ws = guarded(dir.path());
+
+        // No Wrote at all — the refusal still comes first, even for content
+        // identical to what is already there.
+        assert!(matches!(
+            ws.write_file("secrets/key.txt", "original"),
+            Err(Error::Refused { .. })
+        ));
     }
 }
