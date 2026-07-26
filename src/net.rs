@@ -20,11 +20,35 @@
 //! running it dials whatever it likes. That limit is real and documented rather
 //! than implied away.
 
+use std::time::{Duration, SystemTime};
+
 use crate::error::{Error, Result};
 use crate::policy::{Act, Effect, Policy, Verdict};
 use crate::state::{PolicyEvent, Store};
 
+/// How long one provider request may take before it is abandoned.
+///
+/// The trade, named: too short kills a legitimate completion, too long lets one
+/// hung socket eat an unattended run. Ten minutes is chosen from the slow end of
+/// the *legitimate* side — a full 8192-token stream at a sluggish 15 tokens per
+/// second is about nine minutes — so no realistic single completion reaches this
+/// deadline. There is no reason to shave it closer: a socket that accepts and
+/// then stops writing is caught by *any* finite deadline, and before 0.11.0 there
+/// was none at all, so such a socket hung the run forever — no step recorded, so
+/// no checkpoint, no ledger draw, and the time budget (checked at the top of a
+/// step) never reached.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The one `reqwest::Client` constructor in the crate.
+///
+/// Uses [`REQUEST_TIMEOUT`]; see [`http_client_with_timeout`] for the rest.
+pub(crate) fn http_client() -> reqwest::Client {
+    http_client_with_timeout(REQUEST_TIMEOUT)
+}
+
+/// As [`http_client`], with an explicit deadline — for a caller whose model is
+/// slower than [`REQUEST_TIMEOUT`] allows, and for tests that need a deadline
+/// they can reach in a second rather than ten minutes.
 ///
 /// Redirects are **off**. A 3xx is a host change, and a host change after the
 /// policy has already decided is a hole in the boundary: the check would have
@@ -35,11 +59,88 @@ use crate::state::{PolicyEvent, Store};
 /// Falls back to `Client::new()` if the builder fails, which it does not do for
 /// a configuration this small — the fallback exists so a client is infallible to
 /// construct, not because failure is expected.
-pub(crate) fn http_client() -> reqwest::Client {
+pub(crate) fn http_client_with_timeout(timeout: Duration) -> reqwest::Client {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+/// The wait a response asks for in its `Retry-After` header, if it asks for one.
+pub(crate) fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    parse_retry_after(headers.get("retry-after")?.to_str().ok()?)
+}
+
+/// Parse a `Retry-After` value in either form the spec allows: delta-seconds, or
+/// an HTTP-date.
+///
+/// An unparseable value is *absent*, not an error: the header is advice, and
+/// failing a call because a server sent a malformed hint about how to retry it
+/// would be the header making things worse. A date already in the past means
+/// "now", which is what a clock skewed the wrong way looks like.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = parse_http_date(value)?;
+    Some(
+        at.duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+/// Parse an IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) into a `SystemTime`.
+///
+/// ponytail: IMF-fixdate only. RFC 850 and asctime are legal in a `Retry-After`
+/// but no HTTP/1.1 server has emitted them in decades, and an unrecognised value
+/// degrades to "no hint" rather than to a wrong wait. Add them if a real server
+/// ever turns up sending one.
+fn parse_http_date(value: &str) -> Option<SystemTime> {
+    let mut parts = value.split_whitespace();
+    let (_weekday, day, month, year, time, zone) = (
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+        parts.next()?,
+    );
+    if !zone.eq_ignore_ascii_case("GMT") || parts.next().is_some() {
+        return None;
+    }
+
+    let day: i64 = day.parse().ok()?;
+    let year: i64 = year.parse().ok()?;
+    let month = 1 + [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|m| *m == month)? as i64;
+
+    let mut hms = time.split(':');
+    let (h, m, s): (i64, i64, i64) = (
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+    );
+    if hms.next().is_some() || !(1..=31).contains(&day) || h > 23 || m > 59 || s > 60 {
+        return None;
+    }
+
+    // days_from_civil: shift the year to start in March so the leap day lands at
+    // the end of the cycle, then count era/day-of-era. Hinnant's algorithm.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let secs = days * 86_400 + h * 3_600 + m * 60 + s;
+    (secs >= 0).then(|| SystemTime::UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
 /// The policy target for `url`: its host and port as `host:port`.
@@ -180,9 +281,114 @@ pub(crate) fn provider_layer(target: &str) -> Policy {
     Policy::permissive().layer(PROVIDER_LAYER).allow_net(target)
 }
 
+/// An IMF-fixdate for a Unix timestamp — the inverse of [`parse_http_date`], so
+/// the tests can say "thirty seconds from now" without a date library.
+#[cfg(test)]
+pub(crate) fn http_date(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let tod = unix_secs % 86_400;
+    // civil_from_days, Hinnant again.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ][(m - 1) as usize];
+    // The weekday is not parsed, so any name is accepted on the way back in.
+    format!(
+        "Mon, {d:02} {month} {year} {:02}:{:02}:{:02} GMT",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// Seconds since the epoch, for building a `Retry-After` date relative to now.
+#[cfg(test)]
+pub(crate) fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_after_reads_delta_seconds() {
+        assert_eq!(parse_retry_after("7"), Some(Duration::from_secs(7)));
+        assert_eq!(parse_retry_after("  0 "), Some(Duration::ZERO));
+        assert_eq!(parse_retry_after("120"), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn retry_after_reads_an_http_date_as_the_wait_until_then() {
+        // A fixed date, checked as an absolute instant so no clock is involved.
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777))
+        );
+        // Leap-year and century-boundary arithmetic, where a hand-rolled civil
+        // calendar goes wrong if it goes wrong at all.
+        assert_eq!(
+            parse_http_date("Thu, 01 Jan 1970 00:00:00 GMT"),
+            Some(SystemTime::UNIX_EPOCH)
+        );
+        assert_eq!(
+            parse_http_date("Tue, 29 Feb 2000 12:00:00 GMT"),
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(951_825_600))
+        );
+
+        // Relative to now: a date thirty seconds out is a wait of about thirty.
+        let waited = parse_retry_after(&http_date(unix_now() + 30)).unwrap();
+        assert!(
+            waited <= Duration::from_secs(31) && waited >= Duration::from_secs(28),
+            "{waited:?}"
+        );
+    }
+
+    #[test]
+    fn a_retry_after_in_the_past_is_a_wait_of_zero() {
+        let past = http_date(unix_now() - 600);
+        assert_eq!(parse_retry_after(&past), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn an_unparseable_retry_after_is_treated_as_absent() {
+        for value in [
+            "",
+            "soon",
+            "-5",
+            "7.5",
+            "Sun, 06 Nov 1994 08:49:37 PST", // not GMT
+            "Sun, 06 Nov 1994 08:49 GMT",    // no seconds
+            "Sun, 06 Nov 1994 08:49:37",     // no zone
+            "Sun, 06 Nov 1994 08:49:37 GMT extra",
+            "Sun, 32 Nov 1994 08:49:37 GMT", // no such day
+            "Sun, 06 Nov 1994 24:49:37 GMT", // no such hour
+            "Sun, 06 Foo 1994 08:49:37 GMT", // no such month
+            "Thu, 01 Jan 1969 00:00:00 GMT", // before the epoch
+        ] {
+            assert_eq!(parse_retry_after(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn a_retry_after_header_is_read_off_the_response_headers() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+        headers.insert("retry-after", "42".parse().unwrap());
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(42)));
+    }
 
     #[test]
     fn a_url_becomes_host_and_port() {

@@ -613,6 +613,21 @@ impl ContextEvent {
         Self::of("memory_recall", step, detail)
     }
 
+    /// Which provider actually answered this step.
+    ///
+    /// Recorded only when the answer is not obvious from configuration — a
+    /// [`Fallback`](crate::provider::Fallback) that fell over. `runs.provider` is one
+    /// label for a whole run and stops being true the moment a run can use two.
+    pub fn served(step: u32, provider: impl Into<String>) -> Self {
+        Self::of("served", step, provider)
+    }
+
+    /// The agent made no progress: either it was told to change approach, or it had
+    /// already been told and the run is ending.
+    pub fn stalled(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("stalled", step, detail)
+    }
+
     fn of(kind: &str, step: u32, detail: impl Into<String>) -> Self {
         Self {
             step,
@@ -1424,6 +1439,29 @@ impl Store {
             (outcome, status, run_id),
         )?;
         Ok(())
+    }
+
+    /// Every run in this store, newest first.
+    ///
+    /// Exists because an escalation returns `Err` rather than a
+    /// [`RunResult`](crate::RunResult), so a caller whose run escalated has no
+    /// `run_id` to resume with and therefore no way to reach
+    /// [`RunOutcome::Escalated`](crate::RunOutcome::Escalated) — the outcome added
+    /// for exactly that case. A caller who did not record the id before starting
+    /// can find it here.
+    pub fn runs(&self) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM runs ORDER BY id DESC")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// The most recently started run, if this store holds one.
+    ///
+    /// A convenience over [`Store::runs`] for the common single-run case. With
+    /// concurrent runs in one store, "most recent" is by insertion order and a
+    /// caller that cares should track its own ids.
+    pub fn last_run(&self) -> Result<Option<i64>> {
+        Ok(self.runs()?.into_iter().next())
     }
 
     /// The recorded final outcome string of a run, if it has finished.

@@ -18,7 +18,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - State and memory — progress, intermediate results, decisions (rusqlite) ✅ **v0.10** adds durable cross-run memory, keyed to the workspace
 - Verification layer — tests, schemas, read-backs confirm the task is done
 - Permissions and guardrails — what the agent may access, change, send, spend ✅ **v0.8** completes *send*: `Act::Net`, deny-by-default egress
-- Recovery and retry — retries, fallbacks, replanning, escalation
+- Recovery and retry — retries, fallbacks, replanning, escalation ✅ **v0.11**: classified provider failures, kind-aware retry with backoff, `Fallback`, stall detection
 - Stop conditions and budgets — cap steps, time, cost, retries, risky actions
 - Observability and tracing — record prompts, decisions, tool calls, cost
 - Human approval layer — review before sensitive or irreversible actions
@@ -768,6 +768,90 @@ persists until someone removes it — which is why entries carry their origin, a
 rendered to the model as its own notes rather than as directives, and are
 listable and deletable through `Store`. An operator can always see and clear what
 the agent believes.
+
+## Resilience (v0.11)
+
+Through v0.10 a run survived a crash and nothing else. Every provider failure was
+one `String` — a 429 and a wrong API key were the same value, retried equally
+eagerly, with no backoff. Three providers were implemented and only one was
+reachable in a run. And three failures had no handling at all: a server that
+accepted a connection and then stopped writing hung the run forever, a malformed
+response was read as "the model chose not to call a tool", and an escalated run
+was silently re-run by the next `resume`.
+
+### Failures you can branch on
+
+```rust
+use io_harness::{Error, ProviderErrorKind};
+
+match harness_result {
+    Err(Error::Provider { kind: ProviderErrorKind::Auth, .. }) => // your key
+    Err(Error::Provider { kind: ProviderErrorKind::RateLimited, retry_after, .. }) => // wait
+    Err(Error::Provider { kind, .. }) if kind.is_retryable() => // transient
+    _ => {}
+}
+```
+
+`Transport`, `Timeout`, `RateLimited`, `Server` and `Malformed` are retryable;
+`Auth` and `Request` are not, because re-sending a request the server read and
+refused is two failures instead of one. Retries wait, doubling to a ceiling and
+honouring the server's `Retry-After` above that ceiling — and never sleeping past
+the run's own time budget.
+
+### A second provider behind the first
+
+```rust
+use io_harness::provider::Fallback;
+use io_harness::{Anthropic, OpenRouter};
+
+let provider = Fallback::new(OpenRouter::from_env()?, Anthropic::from_env()?);
+let result = io_harness::run(&contract, &provider, &store).await?;
+```
+
+`Fallback` is itself a `Provider`, so no entry point changes, and it nests for
+three. It falls through only on a failure another provider might not have. Both
+hosts are authorized against the v0.8 egress policy before the first step — a
+fallback is not a way around it.
+
+### An agent that stops getting anywhere
+
+```rust
+use io_harness::StallPolicy;
+
+let contract = contract.with_stall_policy(StallPolicy { window: 3, max_replans: 1 });
+```
+
+A stall needs both halves: `window` consecutive steps that changed nothing in the
+workspace **and** repeated a tool call the window already saw. One alone is not
+enough — a run reading four different files is working, not stuck. On the first
+stall the agent is told what it already tried and given one chance to change
+approach; if it stalls again the run ends as `RunOutcome::Stalled` instead of
+spending the rest of its step budget. `window: 0` switches it off.
+
+This is a failure that was measured, not imagined: the v0.10 evidence records a
+live run re-reading the same four files for sixteen consecutive turns before
+hitting its step cap.
+
+### The limits, stated plainly
+
+**Fallback does not promise equivalence.** Falling over swaps the model mid-run,
+and the harness cannot see whether the replacement is as capable or even the same
+size. The provider that answered is recorded per step so you can tell.
+
+**The request deadline defaults to 600 seconds** — long enough that no realistic
+single completion reaches it, since a full 8192-token stream at a sluggish 15
+tokens/second is about nine minutes. Override it if your models are slower; a hung
+socket is caught by any finite deadline, so the default is deliberately generous.
+
+**Stall detection is a heuristic on a signal, not a proof.** It reads whether a
+write changed the file's bytes and whether a tool call repeated. An agent that
+makes real progress the harness cannot see — thinking, or work in a tool whose
+effects are outside the workspace — could in principle be flagged, which is why
+the window is configurable and can be disabled.
+
+**A retry is not a queue.** Honouring `Retry-After` is not the same as modelling a
+provider's rate limit, and nothing here tracks a provider's health across runs: a
+provider that failed the last run starts the next one trusted.
 
 ## Part of initorigin
 

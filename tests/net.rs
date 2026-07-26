@@ -94,7 +94,7 @@ impl Provider for Dialer {
             .trim_end_matches("/v1");
         let _stream = tokio::net::TcpStream::connect(authority)
             .await
-            .map_err(|e| Error::Provider(e.to_string()))?;
+            .map_err(|e| Error::provider_transport(e.to_string()))?;
         let first = self.turns.fetch_add(1, Ordering::SeqCst) == 0;
         Ok(CompletionResponse {
             tool_calls: if first {
