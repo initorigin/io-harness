@@ -37,15 +37,6 @@ use crate::verify::{ExecGuard, Verification};
 /// The tool a parent agent calls to spawn a contained sub-agent.
 pub const SPAWN_TOOL: &str = "spawn_agent";
 
-/// The tree loop's trace-side tail bound on its observation log.
-///
-/// 0.10.0 made the workspace loop's caps budget-derived
-/// ([`entry_cap_chars`](crate::context::entry_cap_chars)), so this constant is
-/// down to one use: the sub-agent loop, whose context wiring lands separately.
-// ponytail: one fixed cap left, on one path. It goes when the tree loop gets its
-// own ledger.
-const OBS_READ_CAP: usize = 4_000;
-
 /// How many grep hits are folded into one observation. A relevance ceiling, not a
 /// size one — the size ceiling is the budget-derived per-entry cap on top of it.
 const OBS_GREP_CAP: usize = 50;
@@ -665,7 +656,20 @@ async fn run_from<P: Provider>(
         }
 
         let current = fs.read().await?;
-        let user = user_prompt(contract, &current);
+        // The whole file goes back every turn, so it is bounded on the same terms
+        // as any observation: one large file must not exhaust the request. The tail
+        // is kept, because the end of a file is what a writer needs.
+        let user =
+            user_prompt(
+                contract,
+                &bound(
+                    &current,
+                    entry_cap_chars(contract.context.effective_tokens(
+                        contract.max_tokens.map(|m| m.saturating_sub(tokens_used)),
+                    )),
+                    ObsKind::Read,
+                ),
+            );
         let request = CompletionRequest {
             system: system.clone(),
             user: user.clone(),
@@ -1181,7 +1185,10 @@ fn run_agent<'f, P: Provider>(
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
         // Durable per-agent budget, restored across a restart.
         let mut tokens_used: u64 = tree.store.spent_tokens(run_id)?;
-        let mut observations = String::new();
+        // Same ledger and same per-turn assembly as the workspace loop: a tree of
+        // 100 children each re-sending its own unbounded log is the multiplied
+        // version of the problem 0.10.0 exists to fix.
+        let mut ledger = ContextLedger::new();
 
         for step in start_step..=contract.max_steps {
             if let Some(max) = contract.max_duration {
@@ -1191,7 +1198,21 @@ fn run_agent<'f, P: Provider>(
                 }
             }
 
-            let user = workspace_user_prompt(contract, &observations);
+            let budget_tokens = contract
+                .context
+                .effective_tokens(Some(token_cap.saturating_sub(tokens_used)));
+            let entry_cap = entry_cap_chars(budget_tokens);
+            let assembled = assemble(
+                &ledger,
+                budget_tokens,
+                Some(&ws),
+                policy,
+                tree.store,
+                run_id,
+                step,
+            )
+            .await?;
+            let user = workspace_user_prompt(contract, &assembled.text);
             let request = CompletionRequest {
                 system: system.clone(),
                 user: user.clone(),
@@ -1209,12 +1230,25 @@ fn run_agent<'f, P: Provider>(
 
             let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
             tokens_used += step_tokens;
+            if step_tokens > 0 {
+                tree.store
+                    .record_context_reported(run_id, step, step_tokens)?;
+            }
 
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
             if response.tool_calls.is_empty() {
                 let said = response.text.clone().unwrap_or_default();
-                observations.push_str(&format!("\n[step {step}] (no tool call) {said}\n"));
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Message,
+                    None,
+                    bound(
+                        &format!("\n[step {step}] (no tool call) {said}\n"),
+                        entry_cap,
+                        ObsKind::Message,
+                    ),
+                ));
                 decisions.push("no tool call".into());
             }
             // Non-spawn tools mutate the workspace and the observation log, so
@@ -1239,15 +1273,18 @@ fn run_agent<'f, P: Provider>(
                     tree.mcp,
                     tree.tools,
                     tree.skills,
-                    // The tree loop still accumulates a plain string (its own
-                    // ledger wiring lands separately), so it takes the cap the
-                    // default budget derives rather than a per-turn one.
-                    entry_cap_chars(contract.context.effective_tokens(None)),
+                    entry_cap,
                 )
                 .await?
                 {
-                    Dispatched::Continue { decision, obs, .. } => {
-                        observations.push_str(&obs);
+                    Dispatched::Continue {
+                        decision,
+                        obs,
+                        kind,
+                        target,
+                        ..
+                    } => {
+                        ledger.push(Observation::new(step, kind, target, obs));
                         decisions.push(decision);
                     }
                     Dispatched::Pause { request_id } => {
@@ -1271,7 +1308,14 @@ fn run_agent<'f, P: Provider>(
                 for r in results {
                     match r? {
                         SpawnResult::Composed { decision, obs } => {
-                            observations.push_str(&obs);
+                            // A child's composed result is an observation like any
+                            // other, and is bounded like any other.
+                            ledger.push(Observation::new(
+                                step,
+                                ObsKind::Child,
+                                None,
+                                bound(&obs, entry_cap, ObsKind::Child),
+                            ));
                             decisions.push(decision);
                         }
                         // A child deferred; pause the tree with its request_id.
@@ -1300,12 +1344,8 @@ fn run_agent<'f, P: Provider>(
             } else {
                 tree.store.checkpoint_step(
                     run_id,
-                    &StepRecord::new(
-                        step,
-                        decisions.join("; "),
-                        tail(&observations, OBS_READ_CAP),
-                    )
-                    .with_trace(user, calls_json.join(" | "), step_tokens),
+                    &StepRecord::new(step, decisions.join("; "), ledger.text_for_step(step))
+                        .with_trace(user, calls_json.join(" | "), step_tokens),
                 )?;
                 info!(run_id, depth, step, decisions = %decisions.join("; "), tokens = step_tokens, "agent step");
             }
@@ -2051,20 +2091,6 @@ async fn gate(
                 }
             }
         }
-    }
-}
-
-/// Keep only the last `cap` chars, so a big file/log doesn't blow up the prompt.
-fn tail(s: &str, cap: usize) -> String {
-    if s.len() <= cap {
-        s.to_string()
-    } else {
-        let start = s.len() - cap;
-        // Snap to a char boundary so we never slice mid-UTF-8.
-        let start = (start..s.len())
-            .find(|&i| s.is_char_boundary(i))
-            .unwrap_or(s.len());
-        format!("...(truncated)...{}", &s[start..])
     }
 }
 

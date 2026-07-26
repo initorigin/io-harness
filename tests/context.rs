@@ -783,3 +783,78 @@ async fn a_re_read_cannot_escape_the_workspace_root() {
         "the refused re-read must be in the trace, got {rows:?}"
     );
 }
+
+// -------------------------------------------------- the tree loop is bounded too
+
+/// T05 — a sub-agent runs the same assembler as the workspace loop. 0.5.0 spawns
+/// up to a hundred children, each of which kept its own unbounded log, so an
+/// unbounded tree loop is the multiplied version of the problem this release
+/// exists to fix.
+#[tokio::test]
+async fn a_sub_agent_loops_prompt_stays_inside_the_ceiling() {
+    use io_harness::{run_tree, Containment};
+
+    let dir = ws();
+    for i in 0..6 {
+        std::fs::write(
+            dir.path().join(format!("f{i}.txt")),
+            "z".repeat(6_000) + "\nneedle\n",
+        )
+        .unwrap();
+    }
+
+    // Every turn reads a different large file, so the log outgrows the ceiling.
+    let script = MockScript::new(
+        (0..8)
+            .map(|i| {
+                vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: json!({ "path": format!("f{}.txt", i % 6) }),
+                }]
+            })
+            .collect(),
+    );
+    let contract = never_passes(dir.path(), 8).with_context_budget(ContextBudget {
+        max_tokens: 1_000,
+        share: 0.5,
+    });
+
+    let store = Store::memory().unwrap();
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &Containment::new(4, 2, 2, 1_000_000),
+    )
+    .await
+    .unwrap();
+
+    let last = section(&{
+        let seen = script.seen.lock().unwrap();
+        seen.last().unwrap().user.clone()
+    });
+    assert!(
+        script.turns() >= 4,
+        "the tree loop must have run several turns, got {}",
+        script.turns()
+    );
+    assert!(
+        estimate_tokens(&last) <= 1_400,
+        "a sub-agent's assembled section must stay inside its ceiling, got {} est. tokens",
+        estimate_tokens(&last)
+    );
+    // And the trace still holds every read in full, one row per step.
+    let raw: String = store
+        .steps(result.run_id)
+        .unwrap()
+        .iter()
+        .map(|s| s.result.as_str())
+        .collect();
+    assert!(
+        raw.chars().count() > 9_000,
+        "the tree loop's trace must keep the whole log (got {} chars)",
+        raw.chars().count()
+    );
+}
