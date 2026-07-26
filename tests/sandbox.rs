@@ -130,8 +130,8 @@ async fn sandbox_on_runs_the_produced_test_binary_transparently() {
 
 #[tokio::test]
 async fn the_selected_backend_denies_outbound_network_by_default() {
-    // The default backend (native on macOS) must deny network. curl to a real
-    // host should fail because the sandbox blocks it, not because of the prompt.
+    // curl to a real host must fail because the sandbox blocks it, not because
+    // of the prompt — for every backend that claims a kernel boundary.
     let dir = tempfile::tempdir().unwrap();
     let sb = select(&SandboxConfig::new()); // allow_network: false
     let argv: Vec<String> = ["curl", "-s", "-m", "5", "https://example.com"]
@@ -147,10 +147,28 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         })
         .await
         .unwrap();
-    assert!(
-        !out.success(),
-        "network must be denied by default, got {out:?}"
-    );
+
+    if matches!(
+        sb.backend(),
+        Backend::MacosSandboxExec | Backend::LinuxNamespaces
+    ) {
+        assert!(
+            !out.success(),
+            "a backend that claims a network boundary must deny network, got {out:?}"
+        );
+    } else {
+        // The portable floor's network deny is best-effort (proxy env stripped),
+        // *not* a kernel boundary — documented in the module, and the reason it
+        // must never claim to be one. So the invariant asserted on this host is
+        // the contrapositive, which is what keeps the claim honest: a run that
+        // could reach the network is a run that reported the floor. A kernel
+        // whose unprivileged user namespaces are restricted lands here.
+        assert_eq!(
+            out.backend,
+            Backend::PortableFloor,
+            "only the floor may run without a network boundary"
+        );
+    }
 }
 
 // --- teardown leaves nothing behind -----------------------------------------
