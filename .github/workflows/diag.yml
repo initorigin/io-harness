@@ -1,0 +1,44 @@
+name: diag
+
+# Throwaway diagnostic for 0.9.1. Linux and Windows behaviour cannot be
+# reproduced locally, so this settles three questions in one run rather than
+# paying a CI round trip per hypothesis.
+on:
+  push:
+    branches: ["diag/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Q1 - does unshare work on this runner?
+        run: |
+          echo "--- apparmor sysctl ---"
+          sysctl kernel.apparmor_restrict_unprivileged_userns || echo "(sysctl absent)"
+          echo "--- unshare exactly as linux.rs builds it ---"
+          unshare --user --map-root-user --mount --pid --fork --net -- rustc --version
+          echo "unshare rc=$?"
+        continue-on-error: true
+      - name: Q2 - hard vs soft RLIMIT_CPU
+        run: |
+          echo "--- hard+soft (what set_rlimit does today) ---"
+          ( ulimit -t 1; sh -c 'while :; do :; done' ) ; echo "rc=$? (137=SIGKILL, 152=SIGXCPU)"
+          echo "--- soft only (the proposed fix) ---"
+          ( ulimit -S -t 1; sh -c 'while :; do :; done' ) ; echo "rc=$? (137=SIGKILL, 152=SIGXCPU)"
+        continue-on-error: true
+      - name: Q3 - does the memory hog stay in the monitored pid?
+        run: |
+          sh -c 'perl -e "my \$x = q(x) x (400*1024*1024); sleep 5;"' &
+          p=$!
+          sleep 2
+          echo "--- monitored pid $p ---"
+          ps -o pid=,ppid=,rss=,comm= -p $p || echo "(pid gone)"
+          echo "--- children of $p ---"
+          ps --ppid $p -o pid=,rss=,comm= || echo "(no children)"
+          wait $p; echo "rc=$?"
+        continue-on-error: true
