@@ -114,6 +114,23 @@ versions:
       for. Skills carry instructions, not code.
     detail: specified
     status: planned
+  - version: 0.9.1
+    outcome: >
+      A developer on Linux or Windows gets the isolation and verification the crate has claimed since
+      0.3.0 and 0.6.0, or is told plainly that they do not. 0.9.0 added the repository's first CI
+      matrix and it immediately disproved three standing claims: on Linux the execution-based
+      verification gate does not work at all (7 `verify::tests` failures, `passes_guarded` returning
+      false) and the sandbox CPU and memory caps never fire (`cap_hit: None` where `Some(Cpu)` is
+      expected); on Windows no Job Object is ever created, so containment is the portable floor and
+      the suite hangs rather than being killed by a cap. 0.9.0 corrected the false
+      `Backend::WindowsJobObject` label and documented the gap; this release closes it — the Linux
+      verify and cap failures are root-caused and fixed, the Windows suite terminates, and the
+      Windows native backend is either implemented against the Win32 job-object API or formally
+      declared unsupported-for-containment in the roadmap rather than left as an unfulfilled promise.
+      The matrix stays green on all three platforms afterwards, which is what makes 0.6.0's
+      "the same harness isolates code the same way on mac, linux, and windows" a true sentence.
+    detail: outline
+    status: planned
   - version: 0.10.0
     outcome: >
       A developer runs a long task and the agent's context stays relevant instead of merely

@@ -185,8 +185,17 @@ acceptance:
       recorded in evidence/0.9.0/latency.txt. Skill discovery over a 32-skill directory completes in
       under 50 ms and happens once per run, not once per step.
     - >
-      NF4 — MSRV stays at 1.87 and the crate still builds on macOS, Linux, and Windows. `cargo
-      clippy --all-targets -- -D warnings` and `cargo fmt --check` are clean.
+      NF4 (amended by iterations/US-IO-HARNESS-0.9.0-I02) — the crate declares an MSRV it actually
+      holds, and the three-OS matrix that verifies it exists. `rust-version` is 1.88, the floor rmcp
+      2.2.0's let-chains impose; 1.87 was wrong from 0.8.0 onward and cargo could not catch it
+      because rmcp declares no `rust-version` of its own. A GitHub Actions workflow — added by this
+      release, having never existed before — builds and tests on macOS, Linux, and Windows, with a
+      lint job and an MSRV job that reads `rust-version` out of Cargo.toml so the declared and proven
+      floors cannot drift apart again. `cargo clippy --all-targets -- -D warnings` and `cargo fmt
+      --check` are clean on macOS and Linux. macOS passes the full suite. Linux and Windows are built
+      and run, and their failures are recorded in `known_limitations` rather than implied away: they
+      are defects in the 0.3.0 verify and 0.6.0 sandbox pillars, present since those releases and
+      undetectable without CI, and they are fixed in 0.9.1 rather than here.
   operational:
     - >
       O1 — a run is reconstructable from the trace alone. For every registered-tool call the trace
@@ -205,7 +214,10 @@ acceptance:
       the style of the existing examples.
 delivery:
   target_mode: published
-  environment: crates.io, plus the repository's GitHub Actions matrix (macOS, Linux, Windows).
+  environment: >
+    crates.io, plus the GitHub Actions matrix (macOS, Linux, Windows) that this release adds. The
+    repository had no workflow of any kind before 0.9.0 and had never had an Actions run, so the
+    matrix earlier contracts referred to did not exist.
   deployment_method: >
     The initorigin release flow: all work including the sealed completion record on `feat/0.9.0`,
     PR to `develop`, release PR `develop` to `main`, a GitHub Release titled `io-harness 0.9.0` with

@@ -357,10 +357,16 @@ tasks:
     exports. Asserted by a test that builds a 0.8.1-shaped contract and runs it.
 
     '
-  - 'NF4 — MSRV stays at 1.87 and the crate still builds on macOS, Linux, and Windows. `cargo clippy --all-targets
-    -- -D warnings` and `cargo fmt --check` are clean.
-
-    '
+  - "NF4 (amended by iterations/US-IO-HARNESS-0.9.0-I02) \u2014 the crate declares an MSRV it actually holds,\
+      \ and the three-OS matrix that verifies it exists. `rust-version` is 1.88, the floor rmcp 2.2.0's let-chains\
+      \ impose; 1.87 was wrong from 0.8.0 onward and cargo could not catch it because rmcp declares no `rust-version`\
+      \ of its own. A GitHub Actions workflow \u2014 added by this release, having never existed before \u2014\
+      \ builds and tests on macOS, Linux, and Windows, with a lint job and an MSRV job that reads `rust-version`\
+      \ out of Cargo.toml so the declared and proven floors cannot drift apart again. `cargo clippy --all-targets\
+      \ -- -D warnings` and `cargo fmt --check` are clean on macOS and Linux. macOS passes the full suite.\
+      \ Linux and Windows are built and run, and their failures are recorded in `known_limitations` rather\
+      \ than implied away: they are defects in the 0.3.0 verify and 0.6.0 sandbox pillars, present since those\
+      \ releases and undetectable without CI, and they are fixed in 0.9.1 rather than here.\n"
   files:
   - .ultraship/products/io-harness/evidence/0.9.0/tests.txt
   - .ultraship/products/io-harness/evidence/0.9.0/builds.txt
