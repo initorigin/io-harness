@@ -242,7 +242,7 @@ tasks:
     read of that file's path, recorded in the trace. Offer the tool only when skills are configured.
   why_required: A skill nobody can read is inert, and a body injected without being asked for is the unbounded-prompt
     failure this release's own risk register names and 0.10.0 exists to fix.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T04
   acceptance_criteria:
@@ -266,7 +266,34 @@ tasks:
   - src/run.rs
   - src/skills.rs
   - tests/skills.rs
-  evidence: []
+  evidence:
+  - 'src/run.rs — the discovered `Skills` is now plumbed from all six entry points into `run_workspace_from`
+    (new `skills: &Skills` parameter) and onto `Tree` (new `skills` field), read from the ROOT contract
+    exactly as `tools` is, so a model-written child contract cannot conjure a skill its parent never
+    configured.'
+  - '`skill_tool(&Skills)` pushes `read_skill` into the request''s tool list and the prompt prose only
+    when the catalogue is non-empty — settling the contract''s second open question the way MCP tools
+    already answer it. `with_skill_catalog` appends `Skills::catalog()` (names and descriptions) to the
+    workspace and tree system prompts; no body is ever placed there.'
+  - 'The `READ_SKILL_TOOL` dispatch arm mirrors the registered-tool arm: an unknown name returns an observation
+    listing `skills.names()`, a known name gates on `Act::Read` against the skill file''s path, the body
+    is capped through `tools::cap_result`, and the decision `read skill <name>` plus the skill name reach
+    the trace — O1''s skill half.'
+  - 'The release''s one open hypothesis is resolved and proven, not assumed. `gate()` now decides an absolute
+    Read/Write target with `ws.policy().check(...)` instead of `ws.check_path(...)`, because a skills
+    directory normally sits outside the workspace root and the old path would have refused every `read_skill`
+    — making F10 pass for the wrong reason. `an_absolute_path_still_cannot_escape_the_workspace_root`
+    pins the invariant the relaxation depends on: under `Policy::permissive()` an absolute `read_file`
+    outside the root still yields `[read error] path escapes workspace` and an absolute `write_file` leaves
+    no file, because `Workspace::resolve` rejects absolute paths before any policy question is asked.
+    The test passes before and after the gate change, which is the point.'
+  - 'F7 green (prompt half) — `the_catalog_reaches_the_system_prompt_and_no_body_does`. F8 green — `read_skill_loads_exactly_the_named_body_into_the_observations`
+    and `an_unknown_skill_name_is_an_observation_listing_what_exists`. F10 green — `a_denied_skills_directory_refuses_the_read_but_keeps_the_catalog`.
+    Plus `read_skill_is_not_offered_when_no_skills_are_configured`.'
+  - 'All four behavioural tests were watched failing first (`9 passed; 4 failed`, with the prompt missing
+    `alpha`, `[unknown tool read_skill]` in the observations, and no refusal in the trace) before the
+    implementation was written. Full suite after: 222 passed / 0 failed across 14 targets, clippy `-D
+    warnings` clean, `cargo fmt --check` exit 0.'
 - id: US-IO-HARNESS-0.9.0-T06
   summary: 'Measure and record the two performance claims: per-call dispatch overhead for a registered
     tool that returns immediately, across 1000 calls, against calling the same closure directly; and skill
@@ -345,7 +372,7 @@ tasks:
   why_required: Every prior release of this crate ships an example per capability, and the examples are
     what the two downstream products will copy from. A feature with no runnable example is a feature adopted
     by reading the source.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T05
   acceptance_criteria:
@@ -356,7 +383,21 @@ tasks:
   files:
   - examples/custom_tool.rs
   - examples/skills_run.rs
-  evidence: []
+  evidence:
+  - 'O3 green — `examples/custom_tool.rs` registers a `Shipments` tool through `Toolbox::new().with(...)`
+    and `TaskContract::with_tools`. The workspace on disk holds only a list of ids; the status line the
+    task needs exists solely inside the tool and appears in neither the goal nor the verification criterion,
+    so the post-run check (the produced file contains a datum only the tool knows) is real evidence rather
+    than a needle already in the prompt. The policy allows exec on the tool name with a comment noting
+    that dropping that line leaves the tool offered but refused on every call.'
+  - '`examples/skills_run.rs` points `with_skills` at a directory written at run time (the pattern `policy_run.rs`
+    already uses), shipping both layouts: `release-notes.md` with `name:`/`description:` frontmatter and
+    `commit-style/SKILL.md` with none. The required output shape is stated only inside the release-notes
+    body and the goal merely says the style is a skill, so the shape check proves the body was read; `commit-style`
+    is a deliberate irrelevant second entry, since selection is the model''s judgement and not the harness''s.'
+  - Both run against a real provider from an API key in the environment via `OpenRouter::from_env()`,
+    in the style of the existing examples. Compile-verified with `cargo build --examples` (clean); running
+    them live is T10's job.
 - id: US-IO-HARNESS-0.9.0-T10
   summary: 'Run the headline evidence against a real model: a workspace task whose required output shape
     is stated only in a skill and whose required datum is available only from a registered tool, plus
