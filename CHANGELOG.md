@@ -16,15 +16,116 @@ notes are produced from it.
 
 ### Added
 
+- **Watch a run while it happens.** `Observer` is called as the run proceeds —
+  steps, tool calls, refusals, approvals, spend draws, retries, fallbacks,
+  stalls, spawns, memory writes, sandbox events, MCP calls and the outcome.
+  Until now the crate exported no observer, callback or channel of any kind, so
+  an application showing progress had to open the SQLite file with a second
+  connection and poll a schema the crate never promised. Every `RunEvent`
+  serialises to a flat, tagged JSON object, so a host process can forward events
+  to a user interface written in another language without hand-writing a mapping.
+  The events report the same facts the durable trace records, and that agreement
+  is asserted rather than assumed — if the two ever disagree, the trace is right.
+- **Stop a run from outside it.** `Flow::Cancel` returned from an observer ends
+  the run at its next step boundary, records the outcome, and leaves it
+  resumable. Previously the only way to stop a run in flight was to drop its
+  future, which abandoned it mid-step and left `runs.status` as `running`
+  forever — indistinguishable from a crashed process.
+- **A per-run outcome record.** `Store::run_summary` returns whether the run
+  succeeded, its step count, its token spend and its duration, from one read.
+  Three of those were derivable only by knowing which of eleven free-text
+  outcome strings means success, that steps is `MAX(step)` rather than
+  `COUNT(*)` because retry rows share a step number, and that spend is
+  `SUM(steps.tokens)`. The fourth was not available at all: nothing recorded
+  when a run *ended*, and `elapsed_secs` measures against `now`, so it keeps
+  growing after the run is over. Written by `finish_run`, so a run that escalates
+  or is refused — and therefore returns `Err` without ever producing a
+  `RunResult` — still gets one.
+- **A public request deadline.** `OpenRouter`, `Anthropic` and `OpenAi` each take
+  `with_timeout(Duration)`, and `REQUEST_TIMEOUT` is public. This is the
+  correction to 0.11.0's claim that the deadline was overridable; see the
+  annotation on that entry.
+- `AgentEvent` and `SpawnRow` are exported. Both were `pub` inside a private
+  module and never re-exported, so `Store::agent_events` returned a `Vec` of a
+  type no external caller could name — leaving `agent_events`, the only audit of
+  per-step budget draws, unreadable through the public API.
+- Provider types (`CompletionRequest`, `CompletionResponse`, `ToolCall`,
+  `ToolSpec`, `Usage`) derive `Serialize`, `Deserialize` and `PartialEq`.
+- `BUSY_TIMEOUT` and `SUCCESS_OUTCOME` are public constants.
+
 ### Changed
+
+- `Store::open` sets `journal_mode = WAL` and a busy timeout. A store the crate
+  hands out is now safe for a second reader without that reader configuring the
+  file behind the API's back. **WAL is a persistent property of the database
+  file**, not of the connection that set it: a store opened once by 0.12.0 stays
+  in WAL afterwards, and rolling back to 0.11.0 does not undo it (0.11.0 reads
+  WAL happily; it simply never set it).
+- A tree composes its children in **spawn order** rather than completion order.
+  The fan-out used `buffer_unordered`, so the composed observations and the
+  decisions list — which become `steps.result` and `steps.decision` — came back
+  in whatever order children happened to finish, making the same task over the
+  same workspace produce a different trace run to run. Concurrency is unchanged
+  and still bounded by `Containment::max_concurrent`; only when a finished
+  child's result is *read* changed.
+- Durable memory notes no longer render the writing run's id into the prompt.
+  `run_id` is an `AUTOINCREMENT`, so the same case run twice sent the model
+  different prompt bytes — and that string was persisted into `steps.prompt`.
+  The note's `step` is kept: it is a stored column and stable across replays.
+- `context_events` records a **`replan`** kind distinctly from **`stalled`**.
+  Both were the one `"stalled"` kind, told apart only by an English sentence in
+  `detail`, so nothing scoring a run could distinguish "was nudged and carried
+  on" from "gave up" without matching prose the crate never promised.
+- `Containment::max_total_duration` is **enforced**. Declared in 0.5.0 and never
+  read, so a caller could bound a 24-hour tree's wall-clock and have it silently
+  ignored. Measured from the root run's `started_at`, so it counts the whole
+  tree's life including time the process was down.
+- The step boundary is emitted from one place for all three loops, which
+  previously each had their own copy of the commit and their own differently
+  named log line.
 
 ### Deprecated
 
 ### Removed
 
+- The `"net_deny"` `sandbox_events` kind, which was documented from 0.6.0 and
+  never constructed or emitted. Removed rather than implemented: a sandbox denies
+  egress *structurally* — the backend gives the child no route out — so there is
+  no attempt to observe. Network decisions the harness does make are in
+  `policy_events` with `act = "net"`.
+
 ### Fixed
 
+- **A refused run is terminal.** `RunOutcome::Refused` is added and mapped, so
+  resuming a run a human denied network access for reports the refusal. It had no
+  variant and no `terminal_outcome` arm since 0.8.0 — the same defect 0.11.0
+  fixed for `"escalated"`. The consequence was worse than a repeated question:
+  because `resume` substitutes `Policy::permissive()` and `ApproveAll`, the
+  resumed run dialled the socket, wrote the file and reported `Success`.
+- `Containment::max_total_cost` is documented as reserved and not enforced,
+  rather than left looking functional. It cannot be enforced: a provider reports
+  tokens and never a price, so any figure compared against would be invented.
+  Bound spend with `max_total_tokens`.
+
 ### Security
+
+- Resuming a network-refused run no longer performs the refused access. See the
+  `RunOutcome::Refused` entry above.
+
+  The **broader issue is not fixed in this release, and you should know about
+  it**: `resume` substitutes `Policy::permissive()` and `ApproveAll` for *any*
+  resumed workspace run, so a caller who ran under a restrictive policy via
+  `run_with` and then resumed via `resume` silently loses that boundary. The
+  crate states the opposite principle elsewhere — it refuses a policy it cannot
+  enforce rather than ignoring one — so this is a defect, not a design.
+
+  There is currently **no policy-preserving general resume**.
+  `resume_with_decision` does take a policy, but it exists only to deliver a
+  pending approval: it requires a `request_id` and a `Decision`, so it cannot
+  resume a run that merely crashed. Until this is fixed, a policy-governed run
+  that dies mid-flight should be re-run rather than resumed if the boundary
+  matters. Fixing it changes a public signature and is tracked for its own
+  release.
 
 ## [0.11.0] - 2026-07-26
 
@@ -48,7 +149,13 @@ observability and evaluation (0.12.0) remains.
   because the server knows its own limit better than a default does, and refuses
   to sleep past the run's time budget — waiting is not a way to escape a limit.
   An `Auth` failure now escalates on its first occurrence.
-- **A request deadline.** `net::http_client()` sets a request timeout, and
+- **A request deadline.** _(Correction, 0.12.0: this entry named
+  `net::http_client()` and `http_client_with_timeout` as though a caller could
+  reach them. They are `pub(crate)` in a private module, so the deadline shipped
+  as documentation of a capability nobody had. 0.12.0 adds the public
+  `with_timeout` that makes the sentence below true. The entry is annotated
+  rather than rewritten — it is what 0.11.0 claimed.)_
+  `net::http_client()` sets a request timeout, and
   `http_client_with_timeout` overrides it. The default is 600s: chosen from the
   slow end of the legitimate side, since a full 8192-token stream at a sluggish
   15 tokens/second is about nine minutes, and killing a real completion is worse
