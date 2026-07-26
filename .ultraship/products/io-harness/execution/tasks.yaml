@@ -13,7 +13,7 @@ tasks:
     that is silently ignored, which is a containment hole on a 24-hour run; and a store the crate opens
     cannot safely be read by anything else, which is the coupling the observer exists to remove. None
     depends on any feature in this release, so they land first.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F6 — a store the crate opens is safe for a second reader. `Store::open` sets WAL and a busy timeout;
@@ -38,7 +38,16 @@ tasks:
   - src/provider/openai.rs
   - src/containment.rs
   - tests/net.rs
-  evidence: []
+  evidence:
+  - Store::open sets WAL + public BUSY_TIMEOUT (5s); tests/store_open.rs 4 passed. WAL asserted from a
+    plain second connection with no pragmas of its own.
+  - with_timeout(Duration) added public on OpenRouter/Anthropic/OpenAi; REQUEST_TIMEOUT public at the
+    crate root and per provider module. tests/deadline.rs 2 passed, as an INTEGRATION test because that
+    is the only thing that proves the item is reachable from outside the crate -- the exact mistake 0.11.0's
+    O4 made.
+  - Containment::max_total_duration enforced against the ROOT run's started_at; max_total_cost documented
+    as inert with the reason (no price telemetry). tests/subagents.rs 12 passed, including a tree with
+    no ceiling still reaching its step cap unchanged.
 - id: US-IO-HARNESS-0.12.0-T02
   summary: Make an outcome terminal and an audit table readable. `finish_run(run_id, "refused")` (`src/run.rs:1801`)
     gains a `RunOutcome` variant and a `terminal_outcome` mapping (`src/run.rs:630-651`), so resuming
@@ -49,7 +58,7 @@ tasks:
     no variant and no mapping, so a resumed run silently re-runs. And `agent_events` is the only audit
     of per-step budget draws; an observability release cannot ship leaving it unreadable through the public
     API.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F14 — a refused run is terminal on resume. `"refused"` (`src/run.rs:1801`) maps through `terminal_outcome`
@@ -67,7 +76,13 @@ tasks:
   - src/lib.rs
   - src/state.rs
   - tests/checkpoint.rs
-  evidence: []
+  evidence:
+  - 'RunOutcome::Refused added and mapped in terminal_outcome. Regression proven by deleting the arm:
+    the resumed run reported Success { steps: 1 } because resume() substitutes Policy::permissive() +
+    ApproveAll, so a human-refused run was resumed under a permissive policy and completed. tests/net.rs
+    10 passed; the test counts approver calls, since ''not asked twice'' is not observable from the outcome.'
+  - AgentEvent and SpawnRow re-exported from src/lib.rs, so the agent_events budget-draw audit is readable
+    through the public API.
 - id: US-IO-HARNESS-0.12.0-T03
   summary: Remove the determinism leaks and the trace dishonesty the audit found. `run_id` comes out of
     the rendered memory note (`src/context.rs:545-549`), which today sends different prompt bytes for
@@ -80,7 +95,7 @@ tasks:
     child ordering would look like it worked and would silently invalidate every measurement built on
     it. These fixes must precede the replay work, not follow it, or the replay tests will be written against
     a moving target.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T02
   acceptance_criteria:
@@ -97,7 +112,20 @@ tasks:
   - tests/context.rs
   - tests/memory.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - 'Children composed in spawn order: buffer_unordered -> buffered. Negative control in tests/subagents.rs
+    shows the old code returning child 5,4,3,2 for a spawn order of 0,1,2,3.'
+  - run_id removed from the rendered memory note (src/context.rs), so the same case sends the same prompt
+    bytes twice. step kept -- it is a stored column, stable across replays. New test asserts the rendered
+    block is byte-identical across run_ids 1, 2 and 9999.
+  - context_events splits replan from stalled; four stall assertions replaced with the stronger cross-kind
+    sequence assertion.
+  - 'sandbox_events ''net_deny'' removed from the docs: documented since 0.6.0, never constructed, never
+    emitted. A sandbox denies egress structurally, so there is no attempt to observe.'
+  - 'NOT A DEFECT after all: the contract''s claim that the single-file loop leaves assembled rows with
+    a NULL reported_tokens was wrong. assemble() is called only from the workspace loop (src/run.rs:864)
+    and the sub-agent loop (:1324); the single-file loop uses bound() and records no assembled row at
+    all, so there is nothing to back-fill. Reported rather than silently dropped.'
 - id: US-IO-HARNESS-0.12.0-T04
   summary: 'Settle the event surface before threading it anywhere: a serde-serialisable `RunEvent` covering
     every kind of thing the run records, and an `Observer` trait shaped on the crate''s existing inversion-of-control
@@ -347,7 +375,7 @@ tasks:
   why_required: The crate is published. A README claiming a tool that does not exist and pinning a version
     eight minors stale is not a formatting preference — it is the page every prospective user reads first,
     and it is currently wrong about what the crate can do.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T01
   - US-IO-HARNESS-0.12.0-T02
@@ -366,7 +394,19 @@ tasks:
   files:
   - README.md
   - docs/CAPABILITIES.md
-  evidence: []
+  evidence:
+  - 'README factual errors corrected: no git tool, Office/OCR/media marked planned 0.13/0.14, dep line
+    0.12, Act::Net row added to the defaults table, remember added to the reserved names, all ten RunOutcome
+    variants, the false ''everything else is roadmap'' sentence removed, and the deadline override now
+    shown with a working example because it is finally possible.'
+  - 'Rendering: leaked rustdoc hidden lines removed, intra-doc link syntax fixed, the 2834-char metadata
+    line replaced with a real list, the 546-char table cell reflowed with every fact preserved, yaml fence
+    tagged, comment padding normalised. Badges, docs.rs link and MSRV 1.88 added at the top.'
+  - Structure deliberately untouched -- git diff confirms the heading tree is byte-identical apart from
+    the three deleted rustdoc lines. The restructure is 0.15.0.
+  - 'OPEN: docs/CAPABILITIES.md and README now claim observability and evaluation shipped in 0.12.0. Those
+    are release-forward claims and are not yet true in the tree; they must be made true by T04-T10 or
+    walked back before the release is sealed.'
 - id: US-IO-HARNESS-0.12.0-T12
   summary: Document the three contracts this release creates, and record the correction it makes. What
     order events arrive in, that they are in-process and synchronous, that an event is not a transaction,
