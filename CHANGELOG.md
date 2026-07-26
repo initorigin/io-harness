@@ -128,6 +128,22 @@ behaves exactly as it did, the release adds no runtime dependency, MSRV stays
   caller's source — and does not have to distinguish extension from core to do
   it. No new table and no new channel.
 
+### Fixed
+
+- **The declared MSRV was wrong from 0.8.0 onward; 0.9.0 corrects the
+  declaration, not the dependency.** `rust-version` said 1.87, derived from
+  process-wrap — the highest floor that had been counted. It missed rmcp. rmcp
+  2.2.0 uses let-chains, stabilised in 1.88, and publishes no `rust-version` of
+  its own, so cargo had nothing to check when resolving and the mistake could
+  only surface as a compile error inside the dependency, well after the point
+  where a clear "requires rustc 1.88" would have been useful. 0.8.0 and 0.8.1
+  are published declaring 1.87 while depending on an rmcp that needs 1.88: on a
+  1.87 toolchain both resolve happily and then fail to build, inside a crate the
+  user did not write. `rust-version` is now 1.88, which is what the crate has
+  actually required since 0.8.0. The dependency is unchanged and the code is
+  unchanged — only the claim about the floor is, so a toolchain that built 0.8.x
+  still builds 0.9.0, and one that could not now says so before compiling.
+
 ### Security
 
 - **Registration is availability, not authority.** A developer who registers a

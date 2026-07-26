@@ -1,0 +1,77 @@
+name: CI
+
+# NF4: the crate builds on macOS, Linux and Windows, holds its declared MSRV,
+# and stays clean under `cargo fmt --check` and `cargo clippy -D warnings`.
+
+on:
+  push:
+    branches: [main, develop, "feat/**"]
+  pull_request:
+    branches: [develop, main]
+  workflow_dispatch:
+
+# Least privilege: every job here only reads the checkout. Nothing publishes,
+# comments, or writes back, and no job takes a secret — so a fork PR running
+# under this workflow has nothing to exfiltrate and nothing to escalate to.
+permissions:
+  contents: read
+
+# A superseded run stops immediately rather than muddying the status checks.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # The three-OS matrix. fail-fast is off on purpose: Linux and Windows have
+  # never been built, so one platform failing must not hide the other two.
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+      # rmcp and a bundled rusqlite are the expensive part of a cold build.
+      - uses: Swatinem/rust-cache@v2.9.1
+      # --all-targets also builds examples/: the mcp and checkpoint tests spawn
+      # examples/mcp_fixture_server and examples/crash_fixture as child processes.
+      - run: cargo build --all-targets
+      - run: cargo test
+
+  # The MSRV is read from Cargo.toml rather than hardcoded, so the declared
+  # rust-version and the version actually proven to build cannot drift apart.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: rv
+        run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: ${{ steps.rv.outputs.version }}
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo build --all-targets
+
+  # Lints are platform-independent, so they run once instead of per-OS.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2.9.1
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
