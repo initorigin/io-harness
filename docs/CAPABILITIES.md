@@ -32,8 +32,8 @@ not when a release merely touched it.
 | **Context construction** — feed the model only relevant, current, trusted info | shipped | 0.10.0 |
 | **State and memory** — progress and decisions within a run; durable recall across runs | shipped | 0.2.0, completed 0.10.0 |
 | **Recovery and retry** — retries, fallbacks, replanning, escalation | shipped | 0.2.0, completed 0.11.0 |
-| **Observability and tracing** — prompts, decisions, tool calls, cost, outcomes | partial — durable trace, no live stream | 0.2.0, completed 0.12.0 |
-| **Evaluation layer** — success, reliability, safety, latency, cost across cases | pending — no replay, no outcome record | 0.12.0 |
+| **Observability and tracing** — prompts, decisions, tool calls, cost, outcomes | shipped | 0.2.0, completed 0.12.0 |
+| **Evaluation layer** — success, reliability, safety, latency, cost across cases | shipped | 0.12.0 |
 
 ## Beyond the pillars
 
@@ -48,6 +48,6 @@ not when a release merely touched it.
 
 ## Status
 
-Released through 0.11.0, live on crates.io. Eleven of the twelve pillars are
-shipped; 0.12.0 (observability and evaluation) closes the last one. Ordering rationale is recorded in
+Released through 0.12.0, live on crates.io. **All twelve pillars now hold** —
+0.12.0 closed the last two, observability and evaluation. Ordering rationale is recorded in
 `.ultraship/iterations/US-IO-HARNESS-0.9.0-I01.yaml`; the roadmap is canonical.

@@ -329,8 +329,15 @@ pub struct SandboxEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"create"`, `"exec"`, `"cap_hit"`, `"net_deny"`, `"destroy"`, or
-    /// `"gate_phase_failed"` (whose `detail` names the phase).
+    /// `"create"`, `"exec"`, `"cap_hit"`, `"destroy"`, or `"gate_phase_failed"`
+    /// (whose `detail` names the phase).
+    ///
+    /// A `"net_deny"` kind was documented here from 0.6.0 to 0.11.0 and never
+    /// existed: nothing constructed it and nothing emitted it. It was removed in
+    /// 0.12.0 rather than implemented, because a sandbox denies egress
+    /// *structurally* — the backend gives the child no route out, so there is no
+    /// attempt to observe and nothing to count. Network decisions the harness
+    /// actually makes are in `policy_events` with `act = "net"`.
     pub kind: String,
     /// The backend that isolated the run (e.g. `"macos-sandbox-exec"`).
     pub backend: Option<String>,
@@ -622,8 +629,22 @@ impl ContextEvent {
         Self::of("served", step, provider)
     }
 
-    /// The agent made no progress: either it was told to change approach, or it had
-    /// already been told and the run is ending.
+    /// The agent made no progress and was told once to change approach. The run
+    /// continues.
+    ///
+    /// Split from [`Self::stalled`] in 0.12.0. Both were recorded under the one
+    /// `"stalled"` kind, distinguishable only by prose in `detail` — so anything
+    /// scoring a run could not tell "was nudged and carried on" from "gave up"
+    /// without string-matching an English sentence the crate never promised.
+    pub fn replan(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("replan", step, detail)
+    }
+
+    /// The agent made no progress, had already been told once, and the run is
+    /// ending here. Terminal.
+    ///
+    /// A nudge that did not work is [`Self::replan`]; see there for why the two
+    /// are separate kinds since 0.12.0.
     pub fn stalled(step: u32, detail: impl Into<String>) -> Self {
         Self::of("stalled", step, detail)
     }

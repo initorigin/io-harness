@@ -997,7 +997,7 @@ async fn run_workspace_from<P: Provider>(
             Progressing::Replan => {
                 store.record_context_event(
                     run_id,
-                    &ContextEvent::stalled(
+                    &ContextEvent::replan(
                         step,
                         format!(
                             "{} steps without progress; replanning",
@@ -1424,12 +1424,27 @@ fn run_agent<'f, P: Provider>(
             if paused.is_none() && !spawn_calls.is_empty() {
                 use futures_util::stream::{self, StreamExt};
                 let max_c = tree.containment.max_concurrent.max(1) as usize;
+                // `buffered`, not `buffer_unordered`: up to `max_c` children still
+                // run at once, but their results are collected in the order the
+                // model asked for them rather than the order they happen to finish.
+                //
+                // Until 0.12.0 this was `buffer_unordered`, which made a tree run
+                // non-reproducible: the composed child observations and the
+                // `decisions` list — both of which become the `steps.result` and
+                // `steps.decision` columns — came back in completion order, so the
+                // same task over the same workspace produced a different trace and
+                // a different next prompt depending on which child won a race.
+                // Deterministic replay cannot be built on that.
+                //
+                // The cost is that a child which finishes early has its result held
+                // until the children before it are done. That is bounded by `max_c`
+                // and changes when a result is *read*, never when the work runs.
                 let results: Vec<Result<SpawnResult>> = stream::iter(
                     spawn_calls
                         .into_iter()
                         .map(|c| spawn_child(tree, c, run_id, depth, policy, step)),
                 )
-                .buffer_unordered(max_c)
+                .buffered(max_c)
                 .collect()
                 .await;
                 for r in results {
@@ -1489,7 +1504,7 @@ fn run_agent<'f, P: Provider>(
                 Progressing::Replan => {
                     tree.store.record_context_event(
                         run_id,
-                        &ContextEvent::stalled(
+                        &ContextEvent::replan(
                             step,
                             format!(
                                 "{} steps without progress; replanning",

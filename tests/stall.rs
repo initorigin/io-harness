@@ -125,15 +125,29 @@ fn open_policy() -> Policy {
         .allow_exec("*")
 }
 
-/// Every `"stalled"` row a run recorded, as `(step, detail)`.
-fn stalls(store: &Store, run_id: i64) -> Vec<(u32, String)> {
+fn rows_of_kind(store: &Store, run_id: i64, kind: &str) -> Vec<(u32, String)> {
     store
         .context_events(run_id)
         .unwrap()
         .into_iter()
-        .filter(|r| r.kind == "stalled")
+        .filter(|r| r.kind == kind)
         .map(|r| (r.step, r.detail.unwrap_or_default()))
         .collect()
+}
+
+/// Every `"replan"` row — the agent was nudged and the run carried on.
+///
+/// Until 0.12.0 this and [`stalls`] were one `"stalled"` kind, told apart only by
+/// English prose in `detail`. These two helpers being separate is the point: a
+/// reader distinguishing "was nudged" from "gave up" now branches on the kind
+/// instead of string-matching a sentence the crate never promised.
+fn replans(store: &Store, run_id: i64) -> Vec<(u32, String)> {
+    rows_of_kind(store, run_id, "replan")
+}
+
+/// Every `"stalled"` row — terminal, the run ended here.
+fn stalls(store: &Store, run_id: i64) -> Vec<(u32, String)> {
+    rows_of_kind(store, run_id, "stalled")
 }
 
 async fn go(
@@ -198,12 +212,8 @@ async fn the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the
 
     // And the trace says so, at the step it happened, so an operator reading the
     // run back can see why the prompt changed.
-    let rows = stalls(&store, result.run_id);
-    assert_eq!(
-        rows.len(),
-        1,
-        "exactly one stall row for one replan, got {rows:?}"
-    );
+    let rows = replans(&store, result.run_id);
+    assert_eq!(rows.len(), 1, "exactly one replan row, got {rows:?}");
     assert_eq!(
         rows[0].0, 3,
         "the row belongs to the step that closed the window"
@@ -211,6 +221,13 @@ async fn the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the
     assert!(
         rows[0].1.contains("3 steps without progress"),
         "the row must name the window it measured, got {rows:?}"
+    );
+    // The run was nudged and carried on, so it did NOT record a terminal stall.
+    // Before 0.12.0 both were the same kind and this distinction was unassertable.
+    assert!(
+        stalls(&store, result.run_id).is_empty(),
+        "a nudge is not a terminal stall, got {:?}",
+        stalls(&store, result.run_id)
     );
 
     // Four steps was the whole budget, so this run ends at the cap — the warning
@@ -330,11 +347,20 @@ async fn a_write_that_changed_nothing_is_not_progress_and_is_flagged() {
 
     // Told once, still repeating, so the second window ends the run.
     assert_eq!(result.outcome, RunOutcome::Stalled { steps: 6 });
-    let rows = stalls(&store, result.run_id);
-    assert_eq!(rows.len(), 2, "one replan then one stop, got {rows:?}");
+    // One nudge, then one stop -- and since 0.12.0 those are two DIFFERENT kinds,
+    // so "was told once and then gave up" is a shape a reader can branch on rather
+    // than two rows of prose under one label.
+    let nudges = replans(&store, result.run_id);
+    let stops = stalls(&store, result.run_id);
+    assert_eq!(nudges.len(), 1, "exactly one replan, got {nudges:?}");
+    assert_eq!(stops.len(), 1, "exactly one terminal stall, got {stops:?}");
     assert!(
-        rows[1].1.contains("still no progress after replanning"),
-        "the closing row must say the warning was already given, got {rows:?}"
+        nudges[0].0 < stops[0].0,
+        "the nudge must precede the stop, got {nudges:?} then {stops:?}"
+    );
+    assert!(
+        stops[0].1.contains("still no progress after replanning"),
+        "the closing row must say the warning was already given, got {stops:?}"
     );
 
     // The file is untouched throughout — no test artefact hid the no-op.
@@ -381,12 +407,20 @@ async fn a_still_stalled_run_stops_far_short_of_its_step_budget() {
         "one completion per step, and none after the stop"
     );
 
-    // Warned once, then stopped — two rows, in that order.
-    let rows = stalls(&store, result.run_id);
-    assert_eq!(rows.len(), 2, "one replan then one stop, got {rows:?}");
-    assert!(rows[0].1.contains("replanning"), "got {rows:?}");
-    assert!(rows[1].1.contains("still no progress"), "got {rows:?}");
-    assert_eq!(rows[1].0, steps, "the stop belongs to the last step");
+    // Warned once, then stopped — one row of each kind, in that order. Since
+    // 0.12.0 the nudge and the stop are separate kinds, so the sequence is
+    // readable without matching prose.
+    let nudges = replans(&store, result.run_id);
+    let stops = stalls(&store, result.run_id);
+    assert_eq!(nudges.len(), 1, "exactly one replan, got {nudges:?}");
+    assert_eq!(stops.len(), 1, "exactly one terminal stall, got {stops:?}");
+    assert!(nudges[0].1.contains("replanning"), "got {nudges:?}");
+    assert!(stops[0].1.contains("still no progress"), "got {stops:?}");
+    assert!(
+        nudges[0].0 < stops[0].0,
+        "the nudge must precede the stop, got {nudges:?} then {stops:?}"
+    );
+    assert_eq!(stops[0].0, steps, "the stop belongs to the last step");
     // The run is finished, and finished as stalled rather than as a plain cap.
     assert_eq!(
         store.outcome(result.run_id).unwrap().as_deref(),
@@ -477,8 +511,16 @@ async fn a_stalled_root_agent_ends_the_tree_as_stalled() {
         provider.any_prompt_carries_the_directive(),
         "the root agent must have been warned before it was stopped"
     );
-    let rows = stalls(&store, result.run_id);
-    assert_eq!(rows.len(), 2, "one replan then one stop, got {rows:?}");
+    assert_eq!(
+        replans(&store, result.run_id).len(),
+        1,
+        "the root was nudged exactly once"
+    );
+    assert_eq!(
+        stalls(&store, result.run_id).len(),
+        1,
+        "and stopped exactly once"
+    );
     assert_eq!(
         store.outcome(result.run_id).unwrap().as_deref(),
         Some("stalled")
