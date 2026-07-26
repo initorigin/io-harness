@@ -25,7 +25,7 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Providers — OpenRouter first, then Anthropic and OpenAI (own HTTP+SSE client)
 - Agent composition — spawn and nest many agents (100+) with shared context
 - Long-running autonomous tasks — 24h+ with no user input
-- Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, Windows Job Objects, portable floor)
+- Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, portable floor everywhere — Windows is the floor only, its Job Object is not implemented yet)
 - Built-in tools — filesystem, git, grep, find
 - Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete, PDF watermark, PDF form fill, OCR, barcode/QR read and generate
 - Media — image and video passthrough when the model supports it
@@ -409,7 +409,7 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | --- | --- |
 | **macOS `sandbox-exec`** | profile confines writes to the workdir and **denies network**; rlimits cap CPU/fds; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
 | **Linux namespaces** | user/mount/pid/**net** namespaces — a *hard* network boundary and a private root — plus rlimits *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
-| **Windows Job Object** | kill-on-close + memory / active-process / CPU limits and a restricted token *(cfg-gated; compiled + unit-tested, not live-run here)* |
+| **Windows** | **no native backend yet** — the Job Object is designed but unimplemented (no Win32 call is made), so a Windows run gets the portable floor and reports it as such. Tracked for a dedicated release |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
 
 `select` picks the strongest backend available on the running OS and records which

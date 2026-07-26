@@ -144,6 +144,41 @@ behaves exactly as it did, the release adds no runtime dependency, MSRV stays
   unchanged — only the claim about the floor is, so a toolchain that built 0.8.x
   still builds 0.9.0, and one that could not now says so before compiling.
 
+- **The Windows sandbox backend no longer claims a Job Object it never
+  creates.** `WindowsSandbox` documented "a Job Object with kill-on-close plus
+  memory / active-process / CPU limits, and a restricted token", and reported
+  `Backend::WindowsJobObject` into the trace. It calls no Win32 API: no job
+  object is created, there is no restricted token, and none of those caps are
+  enforced. What a Windows run actually gets is the portable floor, so that is
+  what it now reports — a run that creates no job object must not name one in an
+  audit trail. `Backend::WindowsJobObject` is kept as a public variant, reserved
+  and never reported, and `JobLimits` is kept as the tested mapping the real
+  implementation will use. Nothing is removed, and nothing on macOS or Linux
+  changes. The same correction is applied to the Linux backend's documentation,
+  which claimed a degrade-to-floor fallback at `select` time that `select` has
+  never performed — it picks the backend for the target at compile time and does
+  not probe the host.
+
+- **First CI across three platforms, and what it found.** Until this release the
+  crate had no continuous integration: every green suite ever reported was one
+  developer's macOS machine. CI now runs on macOS, Linux, and Windows. macOS
+  passes — 225 tests, clippy and rustfmt clean. The other two do not, and the
+  failures are pre-existing defects from 0.6.0, not regressions in 0.9.0:
+
+  - **Linux** — 9 failing lib tests. Seven in `verify::tests`, where
+    `passes_guarded` returns false. Two in `sandbox::tests`, where the CPU and
+    memory caps do not fire: `cpu_cap_kills_a_busy_loop` observes `backend:
+    PortableFloor, exit_code: None, cap_hit: None` where it requires
+    `Cap::Cpu`.
+  - **Windows** — the suite hangs in `cargo test` until cancelled, consistent
+    with a cap that never fires; the build itself is clean.
+
+  These went unnoticed for three releases because no test could catch them —
+  there was nowhere they ran. They are being fixed in a dedicated release rather
+  than folded into this one, so 0.9.0's tool layer ships on the platform it was
+  verified on and the cross-platform work gets its own contract and its own
+  evidence.
+
 ### Security
 
 - **Registration is availability, not authority.** A developer who registers a
@@ -162,6 +197,17 @@ behaves exactly as it did, the release adds no runtime dependency, MSRV stays
   passes the same policy every other action does. Executable skills are excluded
   by design; anything that should actually *do* something is a `Tool`, where the
   permission layer can see it.
+- **Containment on Windows is the portable floor, and only that.** No Job Object
+  is created, so there is no process-tree kill-on-close, no active-process limit,
+  and no restricted token; the CPU and memory caps are unix-only mechanisms
+  (`RLIMIT_CPU` and an RSS monitor) and do not apply either. A Windows run gets a
+  fresh subprocess in an ephemeral workdir, the wall-clock timeout, and the
+  best-effort proxy-env strip — filesystem-scoped, not a jail. On Linux the CPU
+  and memory caps do not fire under CI, which means a runaway process there is
+  bounded by the wall clock alone. Both are 0.6.0 defects, both are now stated
+  wherever the backend is documented rather than left implied by a backend name,
+  and both are scheduled for a dedicated release. Treat sandboxed execution of
+  untrusted code as verified on macOS only until then.
 
 ## [0.8.1] - 2026-07-25
 

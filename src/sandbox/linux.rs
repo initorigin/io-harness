@@ -6,8 +6,13 @@
 //! cfg-gated to `target_os = "linux"`; compiled and unit-tested on the macOS
 //! build host under its cfg but **not live-run here** (see the 0.6.0 contract's
 //! excluded scope). Seccomp tightening is layered by the kernel default under
-//! the unprivileged user namespace; a hardened kernel without unprivileged user
-//! namespaces degrades to the portable floor at [`super::select`] time.
+//! the unprivileged user namespace.
+//!
+//! Note what this backend does **not** do: it never probes for `unshare`, and
+//! [`super::select`] returns it unconditionally on Linux rather than falling back
+//! to the floor. On a kernel with unprivileged user namespaces disabled — or a
+//! host without `unshare(1)` — the wrapper fails at spawn time instead of
+//! degrading; there is no runtime capability check yet.
 
 use super::{run_capped, Backend, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::Result;

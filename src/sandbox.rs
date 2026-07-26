@@ -8,12 +8,13 @@
 //! teardown so nothing the run wrote or spawned outlives it.
 //!
 //! The sandbox is both **OS-native** and **OS-neutral**. One trait,
-//! [`Sandbox`], has a real native backend per platform — macOS `sandbox-exec`,
-//! Linux namespaces + seccomp, Windows Job Objects — over a [portable
-//! floor](FloorSandbox) (fresh subprocess, ephemeral tempdir, resource caps,
-//! network env stripped) that compiles and runs on all three, so isolation is
-//! never *absent* on any OS the crate builds for. [`select`] picks the strongest
-//! backend available at run time and records which one ran.
+//! [`Sandbox`], has a native backend per platform — macOS `sandbox-exec` and
+//! Linux namespaces + seccomp; Windows is still the floor (its Job Object is
+//! unimplemented) — over a [portable floor](FloorSandbox) (fresh subprocess,
+//! ephemeral tempdir, resource caps, network env stripped) that compiles and runs
+//! on all three, so isolation is never *absent* on any OS the crate builds for.
+//! [`select`] picks the backend for this OS — at compile time, not by probing —
+//! and the one that ran is recorded.
 //!
 //! ## Backend isolation strength (documented, not hidden)
 //!
@@ -23,8 +24,9 @@
 //! - **Linux namespaces** — user + mount + pid + net namespaces give a hard
 //!   network boundary and a private tmpfs; seccomp + rlimits on top. *(cfg-gated,
 //!   not live-run on the macOS build host.)*
-//! - **Windows Job Object** — kill-on-close plus memory / active-process / CPU
-//!   limits and a restricted token. *(cfg-gated, not live-run here.)*
+//! - **Windows** — *no native backend yet.* The Job Object was designed but
+//!   never implemented (no Win32 call is made), so a Windows run gets the
+//!   portable floor and reports it as such. See [`windows`].
 //! - **Portable floor** — the weakest backend: filesystem-scoped (a fresh
 //!   ephemeral workdir) and resource-capped, **not a full syscall jail**. Network
 //!   deny is best-effort (proxy env stripped), *not* a kernel boundary. It exists
@@ -47,7 +49,9 @@ pub enum Backend {
     MacosSandboxExec,
     /// Linux user/mount/pid/net namespaces + seccomp + rlimits.
     LinuxNamespaces,
-    /// Windows Job Object + restricted token.
+    /// Windows Job Object + restricted token. **Reserved, never reported** —
+    /// the Job Object is not implemented, so Windows runs report
+    /// [`Backend::PortableFloor`]. Kept so the variant is here when it is.
     WindowsJobObject,
     /// The portable floor: subprocess + ephemeral workdir + caps + env strip.
     PortableFloor,
@@ -261,9 +265,11 @@ impl Sandbox for Selected {
     }
 }
 
-/// Pick the strongest backend available on this OS for `config`. The ladder is
-/// native-for-this-OS, then the portable floor. `force_floor` skips the native
-/// rung so the floor can be exercised everywhere and the ladder proven.
+/// Pick the backend for this OS. The choice is made at **compile time** by cfg,
+/// not by probing the host: the native rung for this target, or the portable
+/// floor when `force_floor` skips it (so the floor can be exercised everywhere).
+/// There is no runtime capability check and so no runtime degradation — a native
+/// backend whose primitive is unavailable fails at spawn rather than falling back.
 pub fn select(config: &SandboxConfig) -> Selected {
     if !config.force_floor {
         #[cfg(target_os = "macos")]
