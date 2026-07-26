@@ -347,7 +347,7 @@ tasks:
     about.'
   why_required: The crate is published and consumed by two products; a release that breaks a platform,
     the MSRV, or an existing caller is worse than one that ships a week later.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.9.0-T05
   acceptance_criteria:
@@ -370,7 +370,51 @@ tasks:
   files:
   - .ultraship/products/io-harness/evidence/0.9.0/tests.txt
   - .ultraship/products/io-harness/evidence/0.9.0/builds.txt
-  evidence: []
+  evidence:
+  - 'NF2 green. `a_contract_with_no_registered_tools_behaves_as_before` builds and runs a 0.8.1-shaped
+    contract untouched. The public API was additionally diffed item by item against shipped 0.8.1 (commit
+    381163f — note there is no v0.8.1 tag; tags stop at v0.8.0): 42 items added, 0 removed, 0 signature-changed.
+    Two apparent diffs were run down and are not changes — `state.rs::find_spawn` is a rustfmt line-wrap
+    from 7b3ec4a, byte-identical in signature, and five `pub use` lines were alphabetised with every name
+    still exported.'
+  - 'Recorded rather than papered over: `TaskContract` has public fields, derives only Debug/Clone and
+    is not `#[non_exhaustive]`, so the new `tools`/`skills` fields do break struct-literal construction.
+    This is the crate''s established pattern (0.8.0 added `mcp` the same way) and the type documents the
+    builder as the supported path, so the additive verdict stands — but it is a real edge and it is written
+    down.'
+  - 'Cargo.toml bumped to 0.9.0, matching exactly the file set 0.8.0 and 0.8.1 bumps touched (Cargo.toml
+    + Cargo.lock; nothing else in the repo pins the crate version).'
+  - 'NF4 as amended by iterations/US-IO-HARNESS-0.9.0-I02. The repository had NO CI and had never had
+    an Actions run; `.github/workflows/ci.yml` is added by this release — a three-OS test matrix (fail-fast
+    off, 20-minute job cap), a lint job, and an MSRV job that reads `rust-version` out of Cargo.toml so
+    the declared and proven floors cannot drift apart again. Least-privilege `permissions: contents: read`,
+    no secret in any job, `pull_request` rather than `pull_request_target`, so a fork PR has nothing to
+    exfiltrate.'
+  - 'MSRV corrected to 1.88 and verified: `cargo +1.87 build --all-targets` failed inside rmcp 2.2.0 (let-chains,
+    stabilised 1.88; rmcp declares no rust-version of its own so cargo could not catch it), `cargo +1.88
+    build --all-targets` succeeds, and with the declaration fixed 1.87 now fails at resolve time with
+    a clear "requires rustc 1.88" instead of a compile error inside a dependency. rmcp has been pinned
+    at 2.2.0 since 0.8.0, so 0.8.0 and 0.8.1 are published declaring a floor they do not hold; corrected
+    forward here and noted in the CHANGELOG.'
+  - 'CI results (run 30190204224, then 30190878769 after fixes): macOS green — full 225-test suite, clippy
+    and fmt. MSRV job green. lint green after fixing a `-D warnings` failure that only occurs on Linux
+    (the `libc::RLIMIT_*` casts are load-bearing on macOS where the constants are `c_int` and redundant
+    on Linux where they are already u32; kept and silenced with a comment rather than cfg-split).'
+  - 'NF4 is NOT fully met, and the release records that rather than claiming it. Linux: 9 lib-test failures
+    — 7 in `verify::tests` where `passes_guarded` returns false, 2 in `sandbox::tests` where the CPU and
+    memory caps never fire (`cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap` observes `backend: PortableFloor,
+    exit_code: None, cap_hit: None` against an expected `Some(Cpu)`). Windows: builds clean, then the
+    suite does not terminate — consistent with a cap that never fires, since `src/sandbox/windows.rs`
+    creates no job object at all. These are defects in the released 0.3.0 verify and 0.6.0 sandbox pillars,
+    invisible until CI existed. Filed as issues #25, #26 and #27 and scheduled into 0.9.1.'
+  - 'The one part fixed here rather than deferred, on the owner''s decision: the Windows path reported
+    `Backend::WindowsJobObject` into the trace for a run that creates no job object, and its docs claimed
+    kill-on-close plus memory/process/CPU limits and a restricted token. That is a security claim, not
+    a feature, so it is corrected now — the Windows path reports `PortableFloor`, the variant stays documented
+    as reserved and never reported, and the same false claim was removed from the sandbox module docs,
+    linux.rs, and the README.'
+  - Evidence in .ultraship/products/io-harness/evidence/0.9.0/tests.txt and builds.txt (gitignored, as
+    for every prior release), which state plainly what was measured locally and what came from CI.
 - id: US-IO-HARNESS-0.9.0-T08
   summary: 'Document the release and the boundary it draws: the v0.9 paragraph in lib.rs stating plainly
     that a registered tool runs in the harness''s own process with the embedding program''s privileges
