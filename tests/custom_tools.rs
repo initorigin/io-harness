@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox};
 use io_harness::{
-    run_with, ApproveAll, Policy, Provider, Store, TaskContract, ToolSpec, Verification,
+    resume_tree, run_tree, run_with, ApproveAll, Containment, Policy, Provider, Store,
+    TaskContract, ToolSpec, Verification,
 };
 use serde_json::json;
 
@@ -212,6 +213,34 @@ fn open_policy() -> Policy {
         .allow_read("*")
         .allow_write("*")
         .allow_exec("*")
+}
+
+fn containment() -> Containment {
+    Containment::new(10, 4, 3, 1_000_000)
+}
+
+fn spawn(goal: &str, file: &str, needle: &str) -> ToolCall {
+    call(
+        "spawn_agent",
+        json!({ "goal": goal, "verify_file": file, "verify_contains": needle }),
+    )
+}
+
+/// The child's goal. Every agent's prompt opens with its own goal, so this is
+/// what picks the child's turns out of the one shared provider script.
+const CHILD_GOAL: &str = "look the order up";
+
+/// The child's turns, in order, identified by the goal its prompt opens with.
+/// Copied out rather than borrowed so the lock is released before the caller
+/// touches the store or the tool's own ledger.
+fn turns_of(seen: &Mutex<Vec<CompletionRequest>>, goal: &str) -> Vec<CompletionRequest> {
+    let prefix = format!("Goal: {goal}");
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|r| r.user.starts_with(&prefix))
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------- F3: arbitration
@@ -552,6 +581,194 @@ async fn an_oversized_tool_result_is_truncated_before_it_enters_the_context() {
     assert!(
         step.result.len() < huge.len(),
         "the trace must record the truncated form, not the original"
+    );
+}
+
+// ---------------------------------------------------------------- F6: a child inherits it
+
+/// F6 — a 0.5.0 child inherits the toolbox. The child's request carries
+/// `lookup_order`, calling it runs the very implementation the *parent* registered
+/// (one instance, one ledger), and the call is attributed to the child's own
+/// `run_id` in the trace rather than the parent's.
+#[tokio::test]
+async fn a_spawned_child_inherits_the_toolbox_and_the_call_is_its_own() {
+    let dir = ws();
+    let tool = Ledger::new("lookup_order", "shipped");
+    let calls = tool.calls.clone();
+    let contract = never_passes(dir.path(), 2).with_tools(Toolbox::new().with(tool));
+
+    // parent#1 spawns; child#1 calls the inherited tool; child#2 meets its own
+    // criterion and returns; parent#2 does nothing and reaches the step cap.
+    let provider = MockScript::new(vec![
+        vec![spawn(CHILD_GOAL, "child_done.txt", "OK")],
+        vec![call("lookup_order", json!({ "id": "A-17" }))],
+        vec![call(
+            "write_file",
+            json!({ "path": "child_done.txt", "content": "OK" }),
+        )],
+    ]);
+    let seen = provider.seen.clone();
+    let store = Store::memory().unwrap();
+    let result = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    let child_turns = turns_of(&seen, CHILD_GOAL);
+    assert!(
+        child_turns.len() >= 2,
+        "the child must have taken its own turns, got {}",
+        child_turns.len()
+    );
+
+    // Offered: the inherited tool is in the *child's* request and system prompt.
+    let names: Vec<String> = child_turns[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "lookup_order"),
+        "the child's request must carry the inherited tool, got {names:?}"
+    );
+    assert!(
+        child_turns[0].system.contains("lookup_order"),
+        "the child's system prompt must name it, got: {}",
+        child_turns[0].system
+    );
+
+    // Same implementation: the parent registered exactly one `Ledger`, and this
+    // is the call the child made into it.
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["A-17"],
+        "the child must run the parent's implementation, not a copy of it"
+    );
+    assert!(
+        child_turns[1].user.contains("A-17=shipped"),
+        "the child observes its own tool's result, got: {}",
+        child_turns[1].user
+    );
+
+    // Attributed: the call is on the child's run, and only there.
+    let child_run = store.children(result.run_id).unwrap()[0];
+    assert!(
+        store
+            .steps(child_run)
+            .unwrap()
+            .iter()
+            .any(|s| s.tool_call.contains("lookup_order") && s.tool_call.contains("A-17")),
+        "the child's trace must record the call under the child's run_id"
+    );
+    assert!(
+        !store
+            .steps(result.run_id)
+            .unwrap()
+            .iter()
+            .any(|s| s.tool_call.contains("lookup_order")),
+        "the call belongs to the child's run, not the parent's"
+    );
+    assert!(
+        matches!(
+            result.outcome,
+            io_harness::RunOutcome::StepCapReached { .. }
+        ),
+        "got {:?}",
+        result.outcome
+    );
+}
+
+/// F6 across a restart — the cost-driver case. A tree that stopped at its step
+/// cap is resumed with the same toolbox re-registered; the resumed leg spawns a
+/// child, and the child still has the tool. A toolbox dropped on the resume path
+/// fails here rather than silently at a customer's.
+#[tokio::test]
+async fn a_toolbox_survives_a_tree_resume_and_still_reaches_a_child() {
+    let dir = ws();
+    let tool = Arc::new(Ledger::new("lookup_order", "shipped"));
+    let calls = tool.calls.clone();
+    // One instance registered by both legs, as a caller re-registering its own
+    // tools after a restart would.
+    let toolbox = || Toolbox::new().with_arc(tool.clone() as Arc<dyn Tool>);
+
+    let store = Store::memory().unwrap();
+    let crashed = run_tree(
+        &never_passes(dir.path(), 1).with_tools(toolbox()),
+        &MockScript::new(vec![vec![]]),
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(
+            crashed.outcome,
+            io_harness::RunOutcome::StepCapReached { .. }
+        ),
+        "the first leg must stop mid-task, got {:?}",
+        crashed.outcome
+    );
+    assert!(calls.lock().unwrap().is_empty(), "nothing called yet");
+
+    // Resumed from step 2: spawn, the child calls the inherited tool, the child
+    // finishes; step 3 does nothing and the tree stops again at its cap.
+    let provider = MockScript::new(vec![
+        vec![spawn(CHILD_GOAL, "child_done.txt", "OK")],
+        vec![call("lookup_order", json!({ "id": "A-99" }))],
+        vec![call(
+            "write_file",
+            json!({ "path": "child_done.txt", "content": "OK" }),
+        )],
+    ]);
+    let seen = provider.seen.clone();
+    let resumed = resume_tree(
+        &never_passes(dir.path(), 3).with_tools(toolbox()),
+        &provider,
+        &store,
+        crashed.run_id,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    let child_turns = turns_of(&seen, CHILD_GOAL);
+    assert!(
+        !child_turns.is_empty(),
+        "the resumed tree must have spawned a child"
+    );
+    let names: Vec<String> = child_turns[0]
+        .tools
+        .iter()
+        .map(|t| t.name.clone())
+        .collect();
+    assert!(
+        names.iter().any(|n| n == "lookup_order"),
+        "the toolbox must survive the resume and reach the child, got {names:?}"
+    );
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["A-99"],
+        "the resumed child must reach the same implementation"
+    );
+
+    let child_run = store.children(resumed.run_id).unwrap()[0];
+    assert!(
+        store
+            .steps(child_run)
+            .unwrap()
+            .iter()
+            .any(|s| s.tool_call.contains("lookup_order")),
+        "the resumed child's call is in its own trace"
     );
 }
 
