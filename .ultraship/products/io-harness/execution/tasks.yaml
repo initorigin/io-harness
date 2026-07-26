@@ -1,403 +1,360 @@
 product: io-harness
-version: 0.8.1
+version: 0.9.0
 tasks:
-- id: US-IO-HARNESS-0.8.1-T01
-  summary: Reproduce the defect as failing tests before changing any implementation. Add the I01 case
-    to tests/verify_gate.rs for RustTestPasses (a subject defining `#[macro_export] macro_rules! assert`
-    plus `pub fn hello() -> u32 { 0 }`, gated by `assert!(false, "this gate can never pass")`), the
-    same attack routed through WorkspaceTestPasses, and a second-macro case shadowing `assert_eq!`.
-    Each asserts the gate returns false. All three must FAIL against the current implementation first,
-    and that failure is recorded as evidence.
-  why_required: The release exists to close a bypass. A test written after the fix proves the fix compiles,
-    not that the bypass was ever open — and the WorkspaceTestPasses leg was never demonstrated at all,
-    only expected. Watching all three fail first is what makes F1, F2, and F3 evidence rather than assertion.
+- id: US-IO-HARNESS-0.9.0-T01
+  summary: 'Introduce the in-process extension point: an object-safe `Tool` trait (spec + boxed-future
+    invoke), a `Toolbox` holding registered tools, `TaskContract::with_tools(...)` beside `with_mcp(...)`,
+    and the name arbitration that rejects a tool shadowing a built-in, using the reserved `mcp__` prefix,
+    or duplicating another registered name. Arbitration runs at run start, before the provider is called.
+    Settle the trait signature against three reference implementations first — a synchronous closure,
+    a stateful async tool, and one that returns an error — as the contract''s first risk requires.'
+  why_required: Nothing else in the release can be built against a trait shape that is not object-safe
+    or that a real implementer cannot satisfy, and a registered tool that silently shadows `write_file`
+    would hand a caller a way to replace the harness's own file writer without the policy ever seeing
+    it.
   status: done
   depends_on: []
   acceptance_criteria:
-  - 'F1 — the recorded bypass fails. A subject file containing `#[macro_export] macro_rules! assert
-    { ($c:expr $(, $r:tt)*) => {{ let _ = &$c; }}; }` and `pub fn hello() -> u32 { 0 }`, verified by
-    `RustTestPasses { test_src: "#[test] fn gate() { assert!(false, \"this gate can never pass\"); }"
-    }`, returns false. Asserted by a test, with no model in the loop.
+  - 'F3 — a registered tool may not shadow anything. Registering `write_file`, `grep`, `find`, `read_file`,
+    or `spawn_agent`, or a name starting `mcp__`, or two tools sharing one name, returns `Error::Config`
+    naming the offending tool, and it does so before the provider is called even once (asserted by a completion
+    counter that stays at zero).
 
     '
-  - 'F2 — the same attack through `WorkspaceTestPasses` fails: the shadowing definition placed in any
-    one of the listed files does not make a `assert!(false, ...)` gate report a pass.
+  - 'NF1 — no new runtime dependency. `cargo tree --edges normal` for the crate is unchanged against 0.8.1:
+    the frontmatter reader is written in-crate against the standard library, and the `dyn`-safe trait
+    uses `std::pin::Pin<Box<dyn Future>>` as `run_agent` already does. A new dev-dependency is permitted;
+    a new runtime one is not.
 
     '
-  - 'F3 — shadowing resistance is not name-specific. A subject shadowing a second prelude macro used
-    by the criterion (for example `assert_eq!`) also fails to force a pass.
+  - 'NF2 — additive public API. The 0.8.1 doc example and every existing example compile against 0.9.0
+    with no edit beyond the version. No public item is renamed, removed, or has its signature changed;
+    `with_tools` and `with_skills` are new builder methods and `Tool`, `Toolbox`, and `Skill` are new
+    exports. Asserted by a test that builds a 0.8.1-shaped contract and runs it.
 
     '
   files:
-  - tests/verify_gate.rs
+  - src/tools/custom.rs
+  - src/tools/mod.rs
+  - src/contract.rs
+  - src/lib.rs
+  - tests/custom_tools.rs
   evidence:
-  - 'All three reproductions FAILED against the pre-fix implementation, recorded in evidence/0.8.1/repro-before-fix.txt:
-    the I01 case, the WorkspaceTestPasses leg (never previously demonstrated, only expected), and the
-    assert_eq! case. 3 honest-behaviour tests in the same file passed, so the failures were the bypass,
-    not a broken harness.'
-  - tests/verify_gate.rs — 10 tests, all green after the fix.
-- id: US-IO-HARNESS-0.8.1-T02
-  summary: 'Fix the single-file gate structurally. The two-crate design this task originally specified
-    — subject as its own crate, criterion as a separate crate depending on it via `--extern subject=`
-    — was implemented, then REVERTED after the F7 live run: privacy is a wall between crates, so an
-    honest non-`pub` implementation became unpassable (US-IO-HARNESS-0.8.1-I02). Shipped instead: the
-    criterion is appended as a child module of the subject''s own crate, opening with an explicit
-    re-import of the core/std prelude macros and `use super::*`. The explicit import makes a macro the
-    subject defines AMBIGUOUS with the prelude name (E0659) rather than authoritative, so a shadowing
-    subject fails to compile; `use super::*` keeps the subject''s private items in scope, which is what
-    the two-crate design lost. Crate-level attributes are handled by the probe, not by this structure.'
-  why_required: This is the fix. Without it F1 and F3 fail. The two-crate split is the only identified
-    mechanism that closes the class rather than a case — `mod`-wrapping is recorded in I01 as ineffective
-    because `#[macro_export]` hoists to the crate root, and rewriting the criterion's macro calls to
-    `::core::` paths is fragile against a criterion the harness did not write.
+  - 'src/tools/custom.rs — the `Tool` trait (object-safe: `spec()` plus `invoke()` returning a boxed `ToolFuture`),
+    `Toolbox` with `with`/`with_arc`/`specs`/`owns`/`get`/`validate`, a manual `Debug` listing registered
+    names (a `Tool` is caller code with no `Debug` bound and `TaskContract` derives it), and `RESERVED_TOOL_NAMES`.'
+  - 'The signature was settled against three reference implementations in tests/custom_tools.rs before
+    being threaded anywhere, as the contract''s first risk required: `Echo` (synchronous work behind the
+    async signature), `Ledger` (holds state, awaits inside `invoke`, records that it ran), and `Broken`
+    (returns `Err`). All three satisfy the trait unchanged.'
+  - '`TaskContract::with_tools` added beside `with_mcp`; `tools: Toolbox` on the struct. No public signature
+    changed anywhere — F3''s arbitration is reached from the existing entry points.'
+  - '`Toolbox::validate()` is called at the top of all six entry points (`run_with`, `run_tree`, `resume`,
+    `resume_tree`, `resume_with_decision`, `resume_tree_with_decision`) before a run row exists and before
+    the provider is reached.'
+  - 'F3 — 4 tests green: shadowing each of the six built-ins (`write_file`, `grep`, `find`, `read_file`,
+    `spawn_agent`, `read_skill`), the `mcp__` prefix, a duplicate name, and an empty name each return
+    `Error::Config` naming the offender, with the mock provider''s completion counter asserted at 0.'
+  - NF2 — `a_contract_with_no_registered_tools_behaves_as_before` builds a 0.8.1-shaped contract and runs
+    it to `Success`. All 207 tests in the suite pass, including the 197 that predate this release.
+  - NF1 — no runtime dependency added. The trait uses `std::pin::Pin<Box<dyn Future>>`; Cargo.toml's [dependencies]
+    section is untouched.
+- id: US-IO-HARNESS-0.9.0-T02
+  summary: 'Dispatch a registered tool through the orchestration loop on the same terms as an MCP tool:
+    offered in the request''s tool list and named in the system prompt, gated by an `Act::Exec` policy
+    check on its name with refusals recorded as `PolicyEvent`s and surfaced as observations, an `Effect::Ask`
+    verdict routed through the `Approver`, a failing `invoke()` turned into an observation rather than
+    a run failure, the result truncated at the context boundary, and the whole call recorded in the trace.'
+  why_required: This is the release's central behaviour. Without it a registered tool is a type the model
+    never sees, and every claim that extension is governed by the same policy and visible in the same
+    trace is unproven.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.8.1-T01
+  - US-IO-HARNESS-0.9.0-T01
   acceptance_criteria:
-  - 'F1 — the recorded bypass fails. A subject file containing `#[macro_export] macro_rules! assert
-    { ($c:expr $(, $r:tt)*) => {{ let _ = &$c; }}; }` and `pub fn hello() -> u32 { 0 }`, verified by
-    `RustTestPasses { test_src: "#[test] fn gate() { assert!(false, \"this gate can never pass\"); }"
-    }`, returns false. Asserted by a test, with no model in the loop.
+  - 'F1 — a caller-registered tool reaches the model and runs. A contract registering a tool whose `spec()`
+    names it `lookup_order` offers it in the request''s tool list, and a scripted provider calling `lookup_order`
+    causes `invoke()` to run with the parsed arguments and its returned string to appear in the next turn''s
+    observations. Asserted offline with the mock provider.
 
     '
-  - 'F3 — shadowing resistance is not name-specific. A subject shadowing a second prelude macro used
-    by the criterion (for example `assert_eq!`) also fails to force a pass.
+  - 'F2 — a registered tool is governed by the policy, not trusted by registration. Under a policy denying
+    `Act::Exec` on `lookup_order`, the call is refused, `invoke()` is never entered (asserted by a flag
+    the fake tool sets), a `PolicyEvent` naming the rule and layer is in the trace, the model receives
+    a refusal observation, and the run continues rather than failing.
 
     '
-  - 'F4 — honest passes are unaffected. An implementation that genuinely satisfies its criterion still
-    passes both `RustTestPasses` and `WorkspaceTestPasses`, and a genuinely failing implementation still
-    fails with the same observable outcome as 0.8.0.
+  - 'F4 — a failing tool is an observation, not a failed run. A tool whose `invoke()` returns an error
+    produces an error observation the agent can act on, the step is committed, and the run continues to
+    its next turn — the same treatment `grep` gives a bad regex.
 
     '
-  - 'NF2 — verification stays deterministic and hermetic: no network, temp dirs removed on drop, and
-    no dependence on the caller''s toolchain layout beyond the `rustc` already required.
+  - 'F5 — a registered tool cannot flood the context. A tool returning far more than the result cap has
+    its output truncated with a visible marker before it enters the observations, and the truncated form
+    is what the trace records.
 
     '
-  - 'F8 — a crate-level attribute in the subject cannot delete the criterion. A subject beginning `#![cfg(any())]`
-    must not make `RustTestPasses` or `WorkspaceTestPasses` report a pass by leaving a test binary with
-    zero tests that exits 0. Added by US-IO-HARNESS-0.8.1-I01: the vector was found while reproducing
-    F1 and is already closed by the delivered two-crate fix, but no criterion named it, and an unnamed
-    guarantee is one a later release can remove without noticing.
+  - 'O1 — a run is reconstructable from the trace alone. For every registered-tool call the trace holds
+    the tool name, the arguments, the decision, and the observation; for every skill load it holds which
+    skill was read. An auditor reading the trace can say which skills shaped the run and which caller-supplied
+    tools it depended on, without the caller''s source.
 
     '
   files:
-  - src/verify.rs
+  - src/run.rs
+  - src/tools/custom.rs
+  - tests/custom_tools.rs
   evidence:
-  - 'src/verify.rs compile_source, shipped shape: the subject plus PROBE_ITEM is compiled with --crate-type
-    lib --crate-name subject to an rlib (classifies subject-compile); PROBE_CRATE type-checks a reference
-    to the probe (catches subject-emptied); then subject + CRITERION_OPEN + test_src + CRITERION_CLOSE
-    is written as one file and built with --test, and the binary is run. Four spawns.'
-  - The criterion module's explicit `use ::core::{assert, assert_eq, ...}` / `use ::std::{...}` is what
-    stops a subject-defined macro capturing a name the criterion invokes. Against a subject defining
-    `macro_rules! assert_eq` — `#[macro_export]` or plain — rustc reports E0659 "ambiguous name" and
-    the build fails, which fails the gate. Verified directly with rustc across five cases before
-    implementing (honest private, honest pub, wrong answer, exported shadow, plain shadow).
-  - 'F1 and F3 green: a_subject_shadowing_assert_cannot_pass_an_impossible_gate, a_subject_shadowing_a_second_prelude_macro_cannot_pass_either.'
-  - 'F4 green, and this is the criterion the revert turned on: a_private_implementation_still_passes_the_gate
-    covers a non-`pub` implementation on both RustTestPasses and WorkspaceTestPasses. The two-crate build
-    failed it, and no test in the suite caught that because every one of them wrote `pub fn hello`.'
-  - 'F8 (added by US-IO-HARNESS-0.8.1-I01, previously unnamed): the crate-level-attribute vector is
-    closed by the probe step, not by crate separation — subject and criterion share a crate again.
-    Pinned by a_subject_cannot_delete_the_criterion_with_a_crate_level_cfg, which covers both the
-    single-file and workspace gates and failed against the pre-fix build. The trace phase for it is
-    now `subject-emptied` rather than `criterion-compile`, since the probe catches it before the
-    criterion is appended.'
-- id: US-IO-HARNESS-0.8.1-T03
-  summary: 'Route WorkspaceTestPasses through the same hardened path: the listed files are concatenated
-    into the subject crate, the criterion compiles as the dependent test crate. Confirms the multi-file
-    gate is not left as the surviving hole.'
-  why_required: F2 fails without it, and the iteration names WorkspaceTestPasses as sharing the weakness
-    by inspection. Leaving the multi-file gate unfixed would ship a release whose headline is a closed
-    bypass while the wider-surface variant stays open.
-  status: done
+  - src/run.rs — a `name if custom.owns(name)` arm in `dispatch`, placed after the built-ins and before
+    the MCP arm. It gates on `Act::Exec` through the existing `gate()` (so `Effect::Ask` routes to the
+    `Approver` and a `Decision::Defer` still returns `Dispatched::Pause`), then awaits `tool.invoke()`.
+  - '`dispatch` gained a `custom: &Toolbox` parameter; both call sites pass it (`run_workspace_from` from
+    `contract.tools`, `run_agent` from `tree.tools`). Registered specs are added to the request''s tool
+    list and named in the system prompt through the existing `with_extra_tools`, so a model that trusts
+    the prose over the schema still learns the tool exists.'
+  - 'F1 green — `a_registered_tool_is_offered_called_and_its_result_observed`: the spec is in the request''s
+    tool list, the name is in the system prompt, `invoke` ran with the model''s arguments (`A-17`), and
+    `A-17=shipped` appears in the next turn''s user prompt.'
+  - 'F2 green — `a_registered_tool_is_refused_by_the_policy_without_being_entered`: under `deny_exec("lookup_order")`
+    the tool''s own call log stays empty, the trace holds a refusal with act=exec, rule=lookup_order,
+    layer=base, the model sees a refusal observation, and the run ends `StepCapReached` rather than erroring.'
+  - 'F4 green — `a_failing_tool_becomes_an_observation_not_a_failed_run`: the tool''s own error text reaches
+    the model, the step is still committed (2 step rows), and the run continues.'
+  - 'F5 green — `an_oversized_tool_result_is_truncated_before_it_enters_the_context`: a 200,000-char result
+    reaches the model truncated, with the word ''truncated'' visible, and the trace records the truncated
+    form.'
+  - 'The cap is now defined once for the whole tool layer: `tools::TOOL_RESULT_CAP` and `tools::cap_result`,
+    which `mcp.rs` now calls instead of carrying its own copy. Placing it in the tool layer rather than
+    in `mcp` resolves the contract''s third open question and keeps 0.10.0''s consolidation to one move.'
+  - 'O1 green (partial — the skill half is T05''s): the trace records the tool name, the arguments, and
+    the decision for a registered-tool call, asserted in F1.'
+  - 'Incidental correctness fix in `gate()`: exec and net targets are now checked with `ws.policy().check(...)`
+    rather than `ws.check_path(...)`. An exec target is a *name*, and resolving it against the workspace
+    root meant a file sharing a tool''s name could change what the policy said about calling it. No existing
+    caller was affected — `gate()` was only ever reached with Read and Write.'
+- id: US-IO-HARNESS-0.9.0-T03
+  summary: Thread the toolbox through every `Tree` construction site so a 0.5.0 child inherits its parent's
+    registered tools and calls them under its own narrowed policy — `run_with`, `run_tree`, `resume`,
+    `resume_tree`, and both `*_with_decision` variants — and cover the resume paths, not only the happy
+    path, so a toolbox silently lost across a restart fails a test.
+  why_required: A child that cannot reach an inherited tool makes the extension point useless for the
+    decomposed tasks 0.5.0 exists for, and a resume that drops the toolbox is a correctness bug that surfaces
+    only after a crash — exactly the class 0.7.0 was released to eliminate.
+  status: in-progress
   depends_on:
-  - US-IO-HARNESS-0.8.1-T02
+  - US-IO-HARNESS-0.9.0-T02
   acceptance_criteria:
-  - 'F2 — the same attack through `WorkspaceTestPasses` fails: the shadowing definition placed in any
-    one of the listed files does not make a `assert!(false, ...)` gate report a pass.
-
-    '
-  - 'F4 — honest passes are unaffected. An implementation that genuinely satisfies its criterion still
-    passes both `RustTestPasses` and `WorkspaceTestPasses`, and a genuinely failing implementation still
-    fails with the same observable outcome as 0.8.0.
-
-    '
-  - 'F8 — a crate-level attribute in the subject cannot delete the criterion. A subject beginning `#![cfg(any())]`
-    must not make `RustTestPasses` or `WorkspaceTestPasses` report a pass by leaving a test binary with
-    zero tests that exits 0. Added by US-IO-HARNESS-0.8.1-I01: the vector was found while reproducing
-    F1 and is already closed by the delivered two-crate fix, but no criterion named it, and an unnamed
-    guarantee is one a later release can remove without noticing.
+  - 'F6 — a 0.5.0 child inherits the toolbox. In a `run_tree` where the parent spawns a child, the child''s
+    request carries `lookup_order` and a child calling it runs the same implementation, with the call
+    attributed to the child''s `run_id` in the trace.
 
     '
   files:
-  - src/verify.rs
+  - src/run.rs
+  - tests/custom_tools.rs
   evidence:
-  - WorkspaceTestPasses routes through the same compile_source, so the fix lands on both gates by construction
-    rather than by a parallel code path.
-  - 'F2 green: a_workspace_subject_shadowing_assert_cannot_pass_an_impossible_gate, with the shadowing
-    definition in one of two concatenated files. F4 multi-file green: an_honest_workspace_still_passes_across_files.'
-  - 'F8 (added by US-IO-HARNESS-0.8.1-I01, previously unnamed): the crate-level-attribute vector is
-    closed by the same two-crate split — the subject''s inner attributes stay in its own crate. Pinned
-    by a_subject_cannot_delete_the_criterion_with_a_crate_level_cfg, which covers both the single-file
-    and workspace gates and failed against the pre-fix build.'
-- id: US-IO-HARNESS-0.8.1-T04
-  summary: Prove the caller-facing contract did not move. test_src keeps its 0.8.0 shape — the criterion
-    calls `hello()` unqualified, not `subject::hello()` — a legitimate macro exported by the subject
-    still reaches the criterion through the glob, and Verification's public API, variant shapes, and
-    Debug/Clone derivations are untouched. Assert no new public item and no signature change.
-  why_required: F5 is what keeps this release a patch. If the structural fix forced a path qualification
-    in test_src, that is a break in a patch and the contract's fallback_scope applies instead — this
-    task is the check that decides which of the two happened, rather than discovering it after publication.
-  status: done
+  - 'The threading itself is done, because T02 could not compile without it: `Tree` carries `tools: &''a
+    Toolbox`, and all four `Tree` construction sites pass `&contract.tools` — including the two on the
+    resume-with-decision paths and the one in `resume_tree`. The field is documented as read from the
+    *root* contract rather than each agent''s, so a spawned child (whose contract the model writes) cannot
+    register a tool its parent never had.'
+  - 'NOT done: F6 has no test yet. A child''s inheritance is structurally true but unasserted, and the
+    contract''s own cost-driver note says the resume paths must be covered rather than the happy path
+    alone. This is the next task to pick up.'
+- id: US-IO-HARNESS-0.9.0-T04
+  summary: 'Discover skills from a directory: `<dir>/<name>.md` and `<dir>/<name>/SKILL.md`, an in-crate
+    frontmatter reader for optional `name`/`description` with fallback to the file stem and first prose
+    line, `TaskContract::with_skills(dir)`, and the hard caps — a missing or non-directory path and an
+    over-cap directory are both `Error::Config` at run start rather than a silently partial set. Cover
+    the reader''s edge cases: absent frontmatter, unterminated frontmatter, CRLF line endings, a multi-line
+    description, and a non-ASCII body.'
+  why_required: Skills are half the release, and a discovery step that silently truncates or silently
+    accepts a malformed file would give a caller a set they believe is complete and is not.
+  status: in-progress
   depends_on:
-  - US-IO-HARNESS-0.8.1-T02
-  - US-IO-HARNESS-0.8.1-T03
+  - US-IO-HARNESS-0.9.0-T01
   acceptance_criteria:
-  - 'F5 — no public API break. A 0.8.0 caller''s `Verification` values compile against 0.8.1 unchanged,
-    and a `Verification` round-trips through serde with the same representation as 0.8.0. If the fallback
-    path is taken and `test_src` must change shape, this criterion is what forces that to be reported
-    as a break rather than shipped quietly.
+  - 'F7 — skills are discovered from both layouts. A directory containing `alpha.md` and `beta/SKILL.md`
+    yields exactly two skills named `alpha` and `beta`; frontmatter `name:` and `description:` override
+    the derived values when present; a file with no frontmatter takes the file stem as name and its first
+    non-empty prose line as description. Both names and both descriptions appear in the system prompt
+    and neither body does.
+
+    '
+  - 'F9 — a bad skills directory fails honestly. A `with_skills` path that does not exist, or is not a
+    directory, is an `Error::Config` at run start naming the path. A directory holding more than the discovery
+    cap is an `Error::Config` too, rather than a silently truncated set the caller believes is complete.
+
+    '
+  - 'NF1 — no new runtime dependency. `cargo tree --edges normal` for the crate is unchanged against 0.8.1:
+    the frontmatter reader is written in-crate against the standard library, and the `dyn`-safe trait
+    uses `std::pin::Pin<Box<dyn Future>>` as `run_agent` already does. A new dev-dependency is permitted;
+    a new runtime one is not.
 
     '
   files:
-  - tests/verify_gate.rs
-  - src/verify.rs
+  - src/skills.rs
+  - src/contract.rs
+  - src/lib.rs
+  - tests/skills.rs
   evidence:
-  - F5 green. a_macro_the_subject_legitimately_exports_still_reaches_the_criterion proves the glob still
-    carries the subject's own macros, so the fix protects the prelude names without restricting what
-    a caller may write.
-  - 'test_src shape unchanged: every criterion in the suite still calls hello() unqualified, not subject::hello().
-    The contract''s fallback_scope was therefore NOT needed and WorkspaceTestPasses stayed in scope.'
-  - 'No public API change: no new public item, no signature change, no serde surface touched. The one
-    public addition is SandboxEvent::gate_phase_failed (T09), which is additive.'
-- id: US-IO-HARNESS-0.8.1-T05
-  summary: 'Confirm the hardening runs inside the 0.6.0 sandbox under the 0.4.0 exec policy and stays
-    hermetic: every rustc invocation and the test binary still go through ExecGuard::check and ExecGuard::exec,
-    argv stays harness-constructed, the added spawn is policy-checked like the others, denying TEST_BINARY
-    still gives compile-only verification, and the temp dir is still removed on drop. Measure whether
-    the extra compiler invocation regresses verification latency and state the figure.'
-  why_required: 'NF1 and NF2 are the guardrails on the fix itself: isolating macro resolution by stepping
-    outside the sandbox would trade a verification hole for a worse isolation hole. NF5 exists because
-    the gate is on the hot path of a 0.5.0 fan-out, so a per-gate cost multiplies.'
-  status: done
+  - 'src/skills.rs written and compiled into the crate (`pub mod skills`, exporting `Skill` and `Skills`):
+    `Skills::discover` accepts both `<dir>/<name>.md` and `<dir>/<name>/SKILL.md`, sorts by name so the
+    prompt is byte-identical across runs on one directory, canonicalises each path, and returns `Error::Config`
+    for a missing path, a non-directory path, more than `MAX_SKILLS` (64), or two skills sharing a name.
+    `catalog()` renders the name/description lines for the prompt; no body is held.'
+  - 'The frontmatter reader is in-crate against the standard library — no YAML dependency, holding NF1.
+    10 unit tests green covering every edge case the contract named: plain frontmatter, CRLF line endings,
+    a `>`-folded multi-line description, a plain continuation line, a later key (`metadata:`) not absorbing
+    the description, absent frontmatter, unterminated frontmatter (treated as no frontmatter, whole file
+    is body), heading-derived fallback description, a non-ASCII body, and clamping a long description
+    at a char boundary.'
+  - 'NOT done: `TaskContract::with_skills(dir)` is not added, so nothing reaches a run yet, and F7/F9
+    have no integration tests. `READ_SKILL_TOOL` is already reserved and its arbitration is covered by
+    T01''s F3.'
+- id: US-IO-HARNESS-0.9.0-T05
+  summary: Put skill names and descriptions — and not bodies — into the system prompt, and offer a built-in
+    `read_skill` tool that loads exactly one body into the observations on demand, as a policy-checked
+    read of that file's path, recorded in the trace. Offer the tool only when skills are configured.
+  why_required: A skill nobody can read is inert, and a body injected without being asked for is the unbounded-prompt
+    failure this release's own risk register names and 0.10.0 exists to fix.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.8.1-T03
+  - US-IO-HARNESS-0.9.0-T04
   acceptance_criteria:
-  - 'NF1 — the fix does not weaken the 0.6.0 sandbox boundary. Whatever compile or run structure the
-    hardening uses, every `rustc` invocation and every test binary still executes inside the ephemeral
-    sandbox under the 0.4.0 exec policy, with argv still harness-constructed. A fix that isolates macro
-    resolution by escaping the sandbox has traded one hole for a worse one.
+  - 'F8 — a skill body loads on demand. A scripted provider calling `read_skill` with `{"name": "beta"}`
+    puts beta''s body — and only beta''s — into the observations; a call naming an unknown skill yields
+    an observation listing what does exist, not an error.
 
     '
-  - 'NF2 — verification stays deterministic and hermetic: no network, temp dirs removed on drop, and
-    no dependence on the caller''s toolchain layout beyond the `rustc` already required.
+  - 'F10 — reading a skill is a policy-governed read. Under a policy denying `Act::Read` on the skills
+    directory, `read_skill` is refused with a `PolicyEvent` in the trace and the body never enters the
+    observations, while the skill''s name and description remain in the system prompt.
 
     '
-  - 'NF5 — verification latency does not regress materially. If the fix means two compiler invocations
-    where there was one, that cost is measured and stated rather than discovered by a caller running
-    a 100-agent 0.5.0 fan-out.
+  - 'O1 — a run is reconstructable from the trace alone. For every registered-tool call the trace holds
+    the tool name, the arguments, the decision, and the observation; for every skill load it holds which
+    skill was read. An auditor reading the trace can say which skills shaped the run and which caller-supplied
+    tools it depended on, without the caller''s source.
 
     '
   files:
-  - src/verify.rs
-  - tests/verify_gate.rs
-  evidence:
-  - 'NF1 green: the_added_subject_compile_is_still_policy_checked — with rustc denied the gate returns
-    a typed Error::Refused rather than compiling. Both rustc spawns run through ExecGuard::check then
-    ExecGuard::exec, so they are sandboxed by the same default and argv stays harness-constructed.'
-  - The pre-existing verify.rs unit tests denying_the_test_binary_type_checks_without_running_it and
-    the deny-rustc test both still pass, so compile-only verification still works on the new flow.
-  - 'NF5 measured: 120 ms/gate single-crate vs 137 ms/gate two-crate, +17 ms (~14%). Recorded in evidence/0.8.1/latency.txt,
-    stated as a wall-clock bound on one machine, not a controlled benchmark. Re-measured after T06 to
-    cover the compile-only gates, which doubled their spawns too: 34 ms/gate to 60 ms/gate, +26 ms (~76%)
-    — cheaper than the test path in absolute terms, larger relatively, and paid per file by EachCompilesRust.'
-- id: US-IO-HARNESS-0.8.1-T06
-  summary: 'Harden CompilesRust and EachCompilesRust. The review this task originally required falsified
-    its own premise: both are defeatable without any criterion to shadow, because the subject is compiled
-    AS the crate root and can therefore delete the items the gate exists to compile — `#![cfg(any())]`
-    plus a body that does not type-check compiles clean. The `include!`-root fix this task originally
-    specified was rejected during implementation — it rejects every crate-level inner attribute, so an
-    honest `#![allow(dead_code)]` file would fail. Shipped instead: append a reserved probe item to the
-    subject, compile the subject as a crate, then type-check a probe crate that references it — a subject
-    that strips its own items strips the probe. Record the finding either way.'
-  why_required: 'F9, and O4 for the finding. Shipping a release whose headline is a closed verification
-    bypass while leaving a bypass it found — and could close with the indirection it already built —
-    would be the same overstatement this release exists to remove. The compile-only gates are not a
-    side path: EachCompilesRust is what a caller reaches for when each edited file only needs to compile
-    on its own.'
-  status: done
+  - src/run.rs
+  - src/skills.rs
+  - tests/skills.rs
+  evidence: []
+- id: US-IO-HARNESS-0.9.0-T06
+  summary: 'Measure and record the two performance claims: per-call dispatch overhead for a registered
+    tool that returns immediately, across 1000 calls, against calling the same closure directly; and skill
+    discovery over a 32-skill directory, confirmed to run once per run rather than once per step.'
+  why_required: NF3 is a stated acceptance criterion with numbers in it. Unmeasured, it is an assertion,
+    and the release would be claiming a bound nobody checked.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.8.1-T02
+  - US-IO-HARNESS-0.9.0-T03
+  - US-IO-HARNESS-0.9.0-T05
   acceptance_criteria:
-  - 'F9 — the compile-only gates reject a subject that deletes itself. `CompilesRust` and `EachCompilesRust`
-    must fail a file whose body does not type-check but which compiles clean because a crate-level attribute
-    stripped it — specifically `#![cfg(any())]` followed by `pub fn hello() -> u32 { "not a u32" }`.
-    A file that genuinely compiles must still pass, and `EachCompilesRust` must still fail the whole
-    set when any one file fails.
-
-    '
-  - 'O4 — the conclusion about `CompilesRust` and `EachCompilesRust` is recorded in the release record
-    whether or not they needed a change.
+  - 'NF3 — the harness is not the cost. Dispatching a registered tool that returns immediately adds under
+    1 ms per call over calling the same closure directly, measured across 1000 calls and recorded in evidence/0.9.0/latency.txt.
+    Skill discovery over a 32-skill directory completes in under 50 ms and happens once per run, not once
+    per step.
 
     '
   files:
-  - src/verify.rs
-  evidence:
-  - 'FINDING (recorded, O4): CompilesRust passes code that does not type-check. Subject `#![cfg(any())]`
-    + `pub fn hello() -> u32 { "not a u32" }` compiles clean, rustc exit 0, because the crate-level
-    cfg strips the item before it is type-checked. EachCompilesRust routes each file through the same
-    compile_source(src, None, guard) path and shares it.'
-  - 'REMEDY VERIFIED before scheduling, THEN REJECTED in implementation: a root of `include!("subject.rs")`
-    makes rustc reject the construct outright — "error: an inner attribute is not permitted in this
-    context" — but it rejects EVERY crate-level inner attribute, including the honest ones. A subject
-    opening `#![allow(dead_code)]` failed to compile under it, which violates the half of F9 requiring
-    a file that genuinely compiles to still pass.'
-  - 'SHIPPED REMEDY: append a reserved `__io_harness_probe` item to the subject, compile the subject as
-    its own crate, then type-check a second crate referencing that probe. A crate-level attribute that
-    strips the subject''s items strips the probe with them and the reference fails to resolve; a subject
-    with a legitimate crate-level attribute keeps its items and passes. Reuses the two-crate structure
-    T02 already built rather than adding a third mechanism.'
-  - 'F9 green: three tests in tests/verify_gate.rs. a_compile_gate_rejects_a_subject_that_deletes_its_own_items
-    — the cfg-stripped subject fails both CompilesRust and EachCompilesRust. an_honest_file_still_passes_the_compile_gates
-    — a plain file passes, an `#![allow(dead_code)]` file passes (the case that falsified the include!
-    remedy), and one broken file still fails the whole EachCompilesRust set. the_trace_names_a_subject_that_deleted_its_own_items
-    — the failure records `subject-emptied`, distinct from `subject-compile` for a file that merely
-    does not compile, and an honest file records no phase failure.'
-  - Scope taken into 0.8.1 by US-IO-HARNESS-0.8.1-I01, owner-approved. Develop stopped rather than widening
-    scope on its own.
-- id: US-IO-HARNESS-0.8.1-T07
-  summary: 'State the bound in the crate''s own documentation: rustdoc on Verification, RustTestPasses,
-    and WorkspaceTestPasses saying what a passing gate proves and what it does not, and naming the shadowing
-    class this release closes; the same statement in prose in README; and a CHANGELOG entry describing
-    the defect, the fix, and the intended behaviour change that a dishonest 0.8.0 pass now fails.'
-  why_required: O1 and O2. The release tightens the gate, which is exactly when a reader is most likely
-    to over-read it as proof of correctness — the documentation has to move in the opposite direction
-    in the same version, or the next consumer inherits the overstatement product.yaml already corrected.
-  status: done
+  - tests/custom_tools.rs
+  - .ultraship/products/io-harness/evidence/0.9.0/latency.txt
+  evidence: []
+- id: US-IO-HARNESS-0.9.0-T07
+  summary: 'Run the release gates: the full test suite, `cargo clippy --all-targets -- -D warnings`, `cargo
+    fmt --check`, a build at the declared MSRV, and the three-OS matrix. Include a test that builds and
+    runs a 0.8.1-shaped contract untouched, so the additive-API claim is asserted rather than asserted
+    about.'
+  why_required: The crate is published and consumed by two products; a release that breaks a platform,
+    the MSRV, or an existing caller is worse than one that ships a week later.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.8.1-T06
+  - US-IO-HARNESS-0.9.0-T05
   acceptance_criteria:
-  - 'O1 — rustdoc on `Verification`, `RustTestPasses`, and `WorkspaceTestPasses` states what a passing
-    gate proves and what it does not, and names the shadowing class of attack this release closes. README
-    carries the same statement in prose.
+  - 'NF2 — additive public API. The 0.8.1 doc example and every existing example compile against 0.9.0
+    with no edit beyond the version. No public item is renamed, removed, or has its signature changed;
+    `with_tools` and `with_skills` are new builder methods and `Tool`, `Toolbox`, and `Skill` are new
+    exports. Asserted by a test that builds a 0.8.1-shaped contract and runs it.
 
     '
-  - 'O2 — the CHANGELOG entry describes the defect, the fix, and the intended behaviour change (dishonest
-    0.8.0 passes now fail), with a migration line if one is needed.
+  - 'NF4 — MSRV stays at 1.87 and the crate still builds on macOS, Linux, and Windows. `cargo clippy --all-targets
+    -- -D warnings` and `cargo fmt --check` are clean.
 
     '
   files:
-  - src/verify.rs
+  - .ultraship/products/io-harness/evidence/0.9.0/tests.txt
+  - .ultraship/products/io-harness/evidence/0.9.0/builds.txt
+  evidence: []
+- id: US-IO-HARNESS-0.9.0-T08
+  summary: 'Document the release and the boundary it draws: the v0.9 paragraph in lib.rs stating plainly
+    that a registered tool runs in the harness''s own process with the embedding program''s privileges
+    and that the policy governs whether it is called rather than what it does once running, the same bound
+    0.8.0 already states for a stdio MCP server; that a skill is instructions with no execution of its
+    own; plus the README section, the CHANGELOG entry, and the CAPABILITIES tool-layer row moved to shipped.'
+  why_required: The contract's third risk is a developer reading registration as a grant, or believing
+    the policy sandboxes what their tool does. That misreading is prevented by documentation or not at
+    all.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.9.0-T05
+  acceptance_criteria:
+  - 'O2 — the crate documents the boundary it is drawing. lib.rs states plainly that a registered tool
+    runs in the harness''s own process with the embedding program''s privileges, that the policy governs
+    whether it is *called* and not what it does once running — the same bound 0.8.0 already states for
+    a stdio MCP server — and that a skill is instructions with no execution of its own.
+
+    '
+  files:
+  - src/lib.rs
   - README.md
   - CHANGELOG.md
-  evidence:
-  - Verification gained a type-level 'What a passing gate proves' section stating the bound, plus per-variant
-    notes on RustTestPasses and WorkspaceTestPasses; verify.rs and lib.rs module docs carry the 0.8.1
-    narrative.
-  - README 'Execution-based verification' gained the same statement in prose, both attack shapes, and
-    the gate_phase_failed pointer for a run that stopped passing on upgrade.
-  - 'CHANGELOG 0.8.1 section: the defect, both vectors, the fix, and the intended behaviour change stated
-    plainly (''a gate that passed dishonestly on 0.8.0 fails on 0.8.1'').'
-- id: US-IO-HARNESS-0.8.1-T08
-  summary: 'Green the whole suite and the packaging path: cargo test across every binary, cargo clippy
-    --all-targets -- -D warnings, cargo build --release, cargo publish --dry-run with complete 0.8.1
-    metadata, and confirm MSRV stays 1.87 with no dependency added or bumped. Bump the crate version
-    to 0.8.1.'
-  why_required: F6 and NF3 and NF4. The gate is load-bearing for tests written since 0.2.0, so a changed
-    compile path touches far more tests than it changes lines — and a correctness patch that raised
-    the MSRV or added a dependency would strand the callers who need it most.
-  status: done
+  - docs/CAPABILITIES.md
+  evidence: []
+- id: US-IO-HARNESS-0.9.0-T09
+  summary: 'Ship both extension points as runnable examples in the style of the existing ones: `examples/custom_tool.rs`
+    registering a tool whose answer exists nowhere on disk, and `examples/skills_run.rs` pointing at a
+    small skills directory, each driven by a real provider from an API key in the environment.'
+  why_required: Every prior release of this crate ships an example per capability, and the examples are
+    what the two downstream products will copy from. A feature with no runnable example is a feature adopted
+    by reading the source.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.8.1-T04
-  - US-IO-HARNESS-0.8.1-T05
-  - US-IO-HARNESS-0.8.1-T07
+  - US-IO-HARNESS-0.9.0-T05
   acceptance_criteria:
-  - 'F6 — the full pre-existing suite is green. Every gate test written since 0.2.0 and every 0.8.0
-    suite (mcp, net, policy, subagents, checkpoint, sandbox, multi_file, edit_file, parity, doc) passes
-    unchanged.
-
-    '
-  - 'NF3 — `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release` green;
-    `cargo publish --dry-run` passes with complete 0.8.1 metadata.
-
-    '
-  - 'NF4 — MSRV stays 1.87 and no dependency is added or bumped. A correctness patch that raises the
-    floor would strand exactly the callers who need it.
+  - 'O3 — both extension points ship with a runnable example. `examples/custom_tool.rs` and `examples/skills_run.rs`
+    run against a real provider from an API key in the environment, in the style of the existing examples.
 
     '
   files:
-  - Cargo.toml
-  - Cargo.lock
-  evidence:
-  - 'cargo test — 182 passed, 0 failed across 12 binaries (172 pre-existing + 10 new). Full output in
-    evidence/0.8.1/tests.txt. F6 green: no pre-existing test needed changing.'
-  - cargo clippy --all-targets -- -D warnings — exit 0. cargo build --release — exit 0. cargo publish
-    --dry-run --allow-dirty — exit 0, packaged 59 files, 640.2KiB (168.9KiB compressed). evidence/0.8.1/builds.txt.
-  - 'NF4 green: rust-version stays 1.87 and the Cargo.lock diff is one line — the io-harness version
-    string. No dependency added, removed, or bumped. Cargo.toml bumped to 0.8.1.'
-  - Re-run required after T06's fix lands — the figures above predate it.
-- id: US-IO-HARNESS-0.8.1-T09
-  summary: Make a gate failure caused by the hardening distinguishable in the trace from an ordinary
-    failed criterion, without adding a public error variant (which would be an API change in a patch).
-    An operator whose run stopped passing after upgrading can tell which of the two happened from the
-    store alone.
-  why_required: The contract's observability entry. A silent behaviour change is the one thing that
-    turns an honest correctness fix into a support problem — this release deliberately makes some previously-passing
-    runs fail, so the trace has to say why.
-  status: done
+  - examples/custom_tool.rs
+  - examples/skills_run.rs
+  evidence: []
+- id: US-IO-HARNESS-0.9.0-T10
+  summary: 'Run the headline evidence against a real model: a workspace task whose required output shape
+    is stated only in a skill and whose required datum is available only from a registered tool, plus
+    the negative control with `with_tools` and `with_skills` removed. Confirm the negative control fails
+    for the intended reason and not an unrelated one before recording either run.'
+  why_required: F11 is the only acceptance criterion produced by a model rather than by the suite. The
+    0.8.1 release shipped 186 passing offline tests against a build a real run rejected in four steps;
+    the live run is what catches that class of defect.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.8.1-T03
+  - US-IO-HARNESS-0.9.0-T07
+  - US-IO-HARNESS-0.9.0-T09
   acceptance_criteria:
-  - 'O3 — the reproduction and the live run are stored as release evidence, so the claim "the bypass
-    fails" is a recorded observation rather than an assertion.
+  - 'F11 — live run, real model. Contract: a workspace task whose required output shape is stated only
+    in a skill, and whose required datum is available only from a registered tool. The run succeeds, the
+    trace shows the `read_skill` call and the tool call, and the produced file carries both the shape
+    and the datum. The same contract with `with_tools` and `with_skills` removed reaches its step cap.
+    Both runs recorded in evidence/0.9.0/live_run.txt.
 
     '
   files:
-  - src/verify.rs
-  evidence:
-  - SandboxEvent::gate_phase_failed records subject-compile / criterion-compile / test-run. A new `kind`
-    VALUE on the existing sandbox_events table — not a new table or column — so the contract's 'no schema
-    change' holds and a 0.8.0 store needs no migration.
-  - 'O3 green: the_trace_distinguishes_a_closed_bypass_from_an_ordinary_failure asserts all three phases
-    land in a reopened Store.'
-  - 'HONEST BOUND, recorded in the test''s doc comment: a NEUTRALISED macro shadow reports test-run,
-    not criterion-compile — once ::core::assert! wins, assert!(false, ...) is simply a false assertion
-    and the run has become an ordinary failure rather than merely resembling one. The phase marker separates
-    the three places a gate can die; it does not reconstruct which 0.8.0 bypass a run used to rely on.
-    The contract''s observability line is met in substance, narrower than a literal reading.'
-- id: US-IO-HARNESS-0.8.1-T10
-  summary: 'Live evidence: an agent completes a RustTestPasses task against a real provider under the
-    hardened gate with a genuine implementation, and the reproduction plus the live run are stored under
-    .ultraship/products/io-harness/evidence/0.8.1/. Requires OPENROUTER_API_KEY and real spend, so it
-    runs at /ultraship:complete, not here.'
-  why_required: F7 and O3. Offline tests prove the boundary tightened; only a live run proves it did
-    not make an ordinary task unpassable, which is the failure mode a purely defensive fix invites.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.8.1-T08
-  acceptance_criteria:
-  - 'F7 — a live run against a real provider completes a `RustTestPasses` task with a genuine implementation
-    under the hardened gate, confirming the tightened boundary did not make an ordinary task unpassable.
-
-    '
-  - 'O3 — the reproduction and the live run are stored as release evidence, so the claim "the bypass
-    fails" is a recorded observation rather than an assertion.
-
-    '
-  files:
-  - .ultraship/products/io-harness/evidence/0.8.1/tests.txt
-  - .ultraship/products/io-harness/evidence/0.8.1/live_run.txt
-  evidence:
-  - 'RUN, and it FAILED the release as built. openai/gpt-5.6-luna via OpenRouter, `cargo run --example
-    edit_file`, contract "Create a Rust function `hello` that returns the u32 value 42" under
-    RustTestPasses. Outcome StepCapReached { steps: 4 } with a CORRECT implementation on disk:
-    `fn hello() -> u32 { 42 }`. The gate was rejecting honest code because the two-crate structure made
-    private items invisible to the criterion. Confirmed model-free immediately after: the same gate
-    returns Ok(false) for `fn hello` and Ok(true) for `pub fn hello`.'
-  - 'Structure reverted under US-IO-HARNESS-0.8.1-I02. Re-run, same model and contract:
-    Success { steps: 1 } on the same private implementation. F7 met.'
-  - 'This is what the criterion was for. 186 offline tests passed against the build that failed this
-    run, because every test in the suite wrote `pub fn hello` and inherited the structure''s own
-    assumption. Pinned going forward by a_private_implementation_still_passes_the_gate.'
-  - 'Both runs stored verbatim in evidence/0.8.1/live_run.txt. Offline evidence:
-    evidence/0.8.1/{repro-before-fix,tests,builds,latency}.txt.'
+  - examples/custom_tool.rs
+  - examples/skills_run.rs
+  - .ultraship/products/io-harness/evidence/0.9.0/live_run.txt
+  evidence: []

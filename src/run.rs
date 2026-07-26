@@ -14,20 +14,20 @@ use std::sync::Arc;
 use serde_json::json;
 use tracing::info;
 
+use crate::approve::{ApproveAll, Approver, Decision, Request};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::contract::TaskContract;
 use crate::error::Result;
 use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
-use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
-use crate::state::{AgentEvent, RunStatus, StepRecord, Store};
-use crate::approve::{ApproveAll, Approver, Decision, Request};
 use crate::policy::{Act, Effect, Policy, Rule};
+use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
 use crate::state::PolicyEvent;
-use crate::verify::{ExecGuard, Verification};
+use crate::state::{AgentEvent, RunStatus, StepRecord, Store};
 use crate::tools::{
-    FsTool, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL,
+    FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, WRITE_FILE_TOOL,
 };
+use crate::verify::{ExecGuard, Verification};
 
 /// The tool a parent agent calls to spawn a contained sub-agent.
 pub const SPAWN_TOOL: &str = "spawn_agent";
@@ -78,7 +78,11 @@ pub struct RunResult {
 
 impl RunResult {
     fn new(outcome: RunOutcome, run_id: i64) -> Self {
-        Self { outcome, run_id, remembered: Vec::new() }
+        Self {
+            outcome,
+            run_id,
+            remembered: Vec::new(),
+        }
     }
 
     fn with_remembered(mut self, remembered: Vec<Rule>) -> Self {
@@ -98,7 +102,14 @@ pub async fn run<P: Provider>(
     provider: &P,
     store: &Store,
 ) -> Result<RunResult> {
-    run_with(contract, provider, store, &Policy::permissive(), &ApproveAll).await
+    run_with(
+        contract,
+        provider,
+        store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
 }
 
 /// Run a task contract under a permission `policy`, routing anything the policy
@@ -115,6 +126,10 @@ pub async fn run_with<P: Provider>(
     policy: &Policy,
     approver: &dyn Approver,
 ) -> Result<RunResult> {
+    // Arbitration before anything else: a toolbox that cannot be dispatched
+    // unambiguously is a configuration mistake, and the caller should hear about
+    // it before a run row exists and before the provider is billed for a turn.
+    contract.tools.validate()?;
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
     store.set_provider(run_id, provider.name())?;
@@ -138,9 +153,10 @@ pub async fn run_with<P: Provider>(
     match contract.root.clone() {
         Some(root) => {
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
-            let result =
-                run_workspace_from(contract, provider, store, run_id, &root, 1, policy, approver, &mcp)
-                    .await;
+            let result = run_workspace_from(
+                contract, provider, store, run_id, &root, 1, policy, approver, &mcp,
+            )
+            .await;
             mcp.shutdown(store, run_id).await;
             result
         }
@@ -167,6 +183,7 @@ pub async fn resume<P: Provider>(
     store: &Store,
     run_id: i64,
 ) -> Result<RunResult> {
+    contract.tools.validate()?;
     // Refuse a store from a newer checkpoint format or a missing run with a
     // typed error, rather than misreading it or panicking.
     store.check_resumable(run_id)?;
@@ -188,7 +205,15 @@ pub async fn resume<P: Provider>(
             let policy = Policy::permissive();
             let mcp = McpSession::connect(&contract.mcp, &policy, store, run_id).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, start_step, &policy, &ApproveAll, &mcp,
+                contract,
+                provider,
+                store,
+                run_id,
+                &root,
+                start_step,
+                &policy,
+                &ApproveAll,
+                &mcp,
             )
             .await;
             mcp.shutdown(store, run_id).await;
@@ -217,6 +242,7 @@ pub async fn resume_with_decision<P: Provider>(
     policy: &Policy,
     approver: &dyn Approver,
 ) -> Result<RunResult> {
+    contract.tools.validate()?;
     let pending = store
         .pending(request_id)?
         .ok_or_else(|| crate::error::Error::Config(format!("no pending request {request_id}")))?;
@@ -227,20 +253,20 @@ pub async fn resume_with_decision<P: Provider>(
         )));
     }
 
-    let root = contract
-        .root
-        .clone()
-        .ok_or_else(|| crate::error::Error::Config("resume_with_decision needs a workspace".into()))?;
+    let root = contract.root.clone().ok_or_else(|| {
+        crate::error::Error::Config("resume_with_decision needs a workspace".into())
+    })?;
     let step = pending.step;
 
     match decision {
         // Deferring again leaves it pending and the run paused.
-        Decision::Defer => {
-            Ok(RunResult::new(
-                RunOutcome::AwaitingApproval { request_id, steps: step },
-                run_id,
-            ))
-        }
+        Decision::Defer => Ok(RunResult::new(
+            RunOutcome::AwaitingApproval {
+                request_id,
+                steps: step,
+            },
+            run_id,
+        )),
         Decision::Deny { reason } => {
             store.resolve_pending(request_id, "deny")?;
             store.record_event(
@@ -281,7 +307,15 @@ pub async fn resume_with_decision<P: Provider>(
             let remember = remember.clone();
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, step + 1, &effective, approver, &mcp,
+                contract,
+                provider,
+                store,
+                run_id,
+                &root,
+                step + 1,
+                &effective,
+                approver,
+                &mcp,
             )
             .await;
             mcp.shutdown(store, run_id).await;
@@ -308,7 +342,11 @@ pub async fn resume_with_decision<P: Provider>(
             let ws = Workspace::with_policy(&root, effective.clone());
 
             // The pause does not grant immunity: the policy still decides.
-            let act = if pending.act == "read" { Act::Read } else { Act::Write };
+            let act = if pending.act == "read" {
+                Act::Read
+            } else {
+                Act::Write
+            };
             let recheck = ws.check_path(act, &target);
             if recheck.effect == Effect::Deny {
                 let mut ev = PolicyEvent::refusal(step, &pending.act, &target);
@@ -339,7 +377,15 @@ pub async fn resume_with_decision<P: Provider>(
             // Continue the run under its original id, from the next step.
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, step + 1, &effective, approver, &mcp,
+                contract,
+                provider,
+                store,
+                run_id,
+                &root,
+                step + 1,
+                &effective,
+                approver,
+                &mcp,
             )
             .await;
             mcp.shutdown(store, run_id).await;
@@ -371,6 +417,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
     containment: &Containment,
 ) -> Result<RunResult> {
     store.check_resumable(run_id)?;
+    contract.tools.validate()?;
     let pending = store
         .pending(request_id)?
         .ok_or_else(|| crate::error::Error::Config(format!("no pending request {request_id}")))?;
@@ -388,7 +435,10 @@ pub async fn resume_tree_with_decision<P: Provider>(
 
     match decision {
         Decision::Defer => Ok(RunResult::new(
-            RunOutcome::AwaitingApproval { request_id, steps: step },
+            RunOutcome::AwaitingApproval {
+                request_id,
+                steps: step,
+            },
             run_id,
         )),
         Decision::Deny { reason } => {
@@ -433,7 +483,16 @@ pub async fn resume_tree_with_decision<P: Provider>(
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
-            let tree = Tree { mcp: &mcp, provider, store, approver, ledger, containment, root };
+            let tree = Tree {
+                mcp: &mcp,
+                tools: &contract.tools,
+                provider,
+                store,
+                approver,
+                ledger,
+                containment,
+                root,
+            };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
             mcp.shutdown(store, run_id).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
@@ -454,7 +513,11 @@ pub async fn resume_tree_with_decision<P: Provider>(
             // this one performed action. Tighten if child-specific deny of an
             // approved action becomes a requirement.
             let ws = Workspace::with_policy(&root, policy.clone());
-            let act = if pending.act == "read" { Act::Read } else { Act::Write };
+            let act = if pending.act == "read" {
+                Act::Read
+            } else {
+                Act::Write
+            };
             if ws.check_path(act, &target).effect == Effect::Deny {
                 store.resolve_pending(request_id, "deny")?;
                 store.finish_run(run_id, "denied")?;
@@ -493,7 +556,16 @@ pub async fn resume_tree_with_decision<P: Provider>(
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
-            let tree = Tree { mcp: &mcp, provider, store, approver, ledger, containment, root };
+            let tree = Tree {
+                mcp: &mcp,
+                tools: &contract.tools,
+                provider,
+                store,
+                approver,
+                ledger,
+                containment,
+                root,
+            };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
             mcp.shutdown(store, run_id).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
@@ -561,7 +633,10 @@ async fn run_from<P: Provider>(
         if let Some(max) = contract.max_duration {
             if store.elapsed_secs(run_id)? > max.as_secs_f64() {
                 store.finish_run(run_id, "time_budget_exceeded")?;
-                return Ok(RunResult::new(RunOutcome::TimeBudgetExceeded { steps: step - 1 }, run_id));
+                return Ok(RunResult::new(
+                    RunOutcome::TimeBudgetExceeded { steps: step - 1 },
+                    run_id,
+                ));
             }
         }
 
@@ -573,9 +648,15 @@ async fn run_from<P: Provider>(
             tools: vec![tool.clone()],
         };
 
-        let response =
-            complete_with_retry(provider, &request, contract.max_retries, store, run_id, step)
-                .await?;
+        let response = complete_with_retry(
+            provider,
+            &request,
+            contract.max_retries,
+            store,
+            run_id,
+            step,
+        )
+        .await?;
 
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
@@ -612,7 +693,10 @@ async fn run_from<P: Provider>(
         if let Some(max) = contract.max_tokens {
             if tokens_used > max {
                 store.finish_run(run_id, "cost_budget_exceeded")?;
-                return Ok(RunResult::new(RunOutcome::CostBudgetExceeded { steps: step }, run_id));
+                return Ok(RunResult::new(
+                    RunOutcome::CostBudgetExceeded { steps: step },
+                    run_id,
+                ));
             }
         }
 
@@ -629,9 +713,12 @@ async fn run_from<P: Provider>(
     }
 
     store.finish_run(run_id, "step_cap_reached")?;
-    Ok(RunResult::new(RunOutcome::StepCapReached {
+    Ok(RunResult::new(
+        RunOutcome::StepCapReached {
             steps: contract.max_steps,
-        }, run_id))
+        },
+        run_id,
+    ))
 }
 
 /// The workspace loop (0.3 multi-file mode): the agent greps, finds, reads, and
@@ -658,10 +745,14 @@ async fn run_workspace_from<P: Provider>(
     let mut ws = Workspace::with_policy(root, effective.clone());
     // MCP tools sit beside the built-ins under their namespaced names, so the
     // model chooses between them the same way it chooses between grep and find.
-    let mcp_tools = mcp.tool_specs();
-    let system = with_extra_tools(workspace_system_prompt(), &mcp_tools);
+    // Registered in-process tools and MCP tools sit beside the built-ins under
+    // their own names, so the model chooses between them the same way it chooses
+    // between grep and find.
+    let mut extra = contract.tools.specs();
+    extra.extend(mcp.tool_specs());
+    let system = with_extra_tools(workspace_system_prompt(), &extra);
     let mut tools = workspace_tools();
-    tools.extend(mcp_tools);
+    tools.extend(extra);
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -671,7 +762,11 @@ async fn run_workspace_from<P: Provider>(
         if let Some(max) = contract.max_duration {
             if store.elapsed_secs(run_id)? > max.as_secs_f64() {
                 store.finish_run(run_id, "time_budget_exceeded")?;
-                return Ok(RunResult::new(RunOutcome::TimeBudgetExceeded { steps: step - 1 }, run_id).with_remembered(remembered));
+                return Ok(RunResult::new(
+                    RunOutcome::TimeBudgetExceeded { steps: step - 1 },
+                    run_id,
+                )
+                .with_remembered(remembered));
             }
         }
 
@@ -682,9 +777,15 @@ async fn run_workspace_from<P: Provider>(
             tools: tools.clone(),
         };
 
-        let response =
-            complete_with_retry(provider, &request, contract.max_retries, store, run_id, step)
-                .await?;
+        let response = complete_with_retry(
+            provider,
+            &request,
+            contract.max_retries,
+            store,
+            run_id,
+            step,
+        )
+        .await?;
 
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
@@ -702,7 +803,18 @@ async fn run_workspace_from<P: Provider>(
         let mut new_rules: Vec<Rule> = Vec::new();
         for call in &response.tool_calls {
             calls_json.push(format!("{}:{}", call.name, call.arguments));
-            match dispatch(&ws, call, approver, store, run_id, step, mcp).await? {
+            match dispatch(
+                &ws,
+                call,
+                approver,
+                store,
+                run_id,
+                step,
+                mcp,
+                &contract.tools,
+            )
+            .await?
+            {
                 Dispatched::Continue {
                     decision,
                     obs,
@@ -722,8 +834,12 @@ async fn run_workspace_from<P: Provider>(
 
         store.checkpoint_step(
             run_id,
-            &StepRecord::new(step, decisions.join("; "), tail(&observations, OBS_READ_CAP))
-                .with_trace(user, calls_json.join(" | "), step_tokens),
+            &StepRecord::new(
+                step,
+                decisions.join("; "),
+                tail(&observations, OBS_READ_CAP),
+            )
+            .with_trace(user, calls_json.join(" | "), step_tokens),
         )?;
         info!(step, decisions = %decisions.join("; "), tokens = step_tokens, "workspace step");
 
@@ -757,24 +873,34 @@ async fn run_workspace_from<P: Provider>(
         if let Some(max) = contract.max_tokens {
             if tokens_used > max {
                 store.finish_run(run_id, "cost_budget_exceeded")?;
-                return Ok(RunResult::new(RunOutcome::CostBudgetExceeded { steps: step }, run_id).with_remembered(remembered));
+                return Ok(
+                    RunResult::new(RunOutcome::CostBudgetExceeded { steps: step }, run_id)
+                        .with_remembered(remembered),
+                );
             }
         }
 
         if contract
             .verify
-            .passes_in_guarded(root, &ExecGuard::new(&effective).tracing(store, run_id, step))
+            .passes_in_guarded(
+                root,
+                &ExecGuard::new(&effective).tracing(store, run_id, step),
+            )
             .await?
         {
             store.finish_run(run_id, "success")?;
-            return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id).with_remembered(remembered));
+            return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id)
+                .with_remembered(remembered));
         }
     }
 
     store.finish_run(run_id, "step_cap_reached")?;
-    Ok(RunResult::new(RunOutcome::StepCapReached {
+    Ok(RunResult::new(
+        RunOutcome::StepCapReached {
             steps: contract.max_steps,
-        }, run_id))
+        },
+        run_id,
+    ))
 }
 
 /// Shared context for one agent tree: everything every agent in the tree
@@ -785,6 +911,12 @@ struct Tree<'a, P: Provider> {
     /// 100 concurrent agents get 100 views of one connection, not 100 of their
     /// own — the same reason the ledger and the store are shared here.
     mcp: &'a McpSession,
+    /// The caller's registered tools, shared by the whole tree. A child is
+    /// offered exactly what its parent was: inheritance grants the tool, and the
+    /// child's own narrowed policy still decides each call. Carried here rather
+    /// than read from each agent's contract so a spawned child — whose contract
+    /// the *model* writes — cannot register a tool its parent never had.
+    tools: &'a Toolbox,
     provider: &'a P,
     store: &'a Store,
     approver: &'a dyn Approver,
@@ -811,6 +943,7 @@ pub async fn run_tree<P: Provider>(
     approver: &dyn Approver,
     containment: &Containment,
 ) -> Result<RunResult> {
+    contract.tools.validate()?;
     let root = contract.root.clone().ok_or_else(|| {
         crate::error::Error::Config(
             "run_tree needs a workspace contract — build it with TaskContract::workspace".into(),
@@ -837,6 +970,7 @@ pub async fn run_tree<P: Provider>(
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
     let tree = Tree {
         mcp: &mcp,
+        tools: &contract.tools,
         provider,
         store,
         approver,
@@ -869,6 +1003,7 @@ pub async fn resume_tree<P: Provider>(
     approver: &dyn Approver,
     containment: &Containment,
 ) -> Result<RunResult> {
+    contract.tools.validate()?;
     store.check_resumable(run_id)?;
 
     // A finished tree is returned as-is — resume is idempotent for the whole tree.
@@ -909,7 +1044,16 @@ pub async fn resume_tree<P: Provider>(
         }
     };
     let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
-    let tree = Tree { mcp: &mcp, provider, store, approver, ledger, containment, root };
+    let tree = Tree {
+        mcp: &mcp,
+        tools: &contract.tools,
+        provider,
+        store,
+        approver,
+        ledger,
+        containment,
+        root,
+    };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await;
     mcp.shutdown(store, run_id).await;
     Ok(RunResult::new(outcome?, run_id))
@@ -938,10 +1082,11 @@ fn run_agent<'f, P: Provider>(
         // is offered the same server tools beside its built-ins. Connecting a
         // session and then not offering its tools would leave the model unable to
         // call something the run had already paid to set up.
-        let mcp_tools = tree.mcp.tool_specs();
-        let system = with_extra_tools(tree_system_prompt(), &mcp_tools);
+        let mut extra = tree.tools.specs();
+        extra.extend(tree.mcp.tool_specs());
+        let system = with_extra_tools(tree_system_prompt(), &extra);
         let mut tools = tree_tools();
-        tools.extend(mcp_tools);
+        tools.extend(extra);
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
@@ -995,7 +1140,18 @@ fn run_agent<'f, P: Provider>(
                     spawn_calls.push(call);
                     continue;
                 }
-                match dispatch(&ws, call, tree.approver, tree.store, run_id, step, tree.mcp).await? {
+                match dispatch(
+                    &ws,
+                    call,
+                    tree.approver,
+                    tree.store,
+                    run_id,
+                    step,
+                    tree.mcp,
+                    tree.tools,
+                )
+                .await?
+                {
                     Dispatched::Continue { decision, obs, .. } => {
                         observations.push_str(&obs);
                         decisions.push(decision);
@@ -1026,7 +1182,8 @@ fn run_agent<'f, P: Provider>(
                         }
                         // A child deferred; pause the tree with its request_id.
                         SpawnResult::Paused { request_id } => {
-                            decisions.push(format!("child awaiting approval (request {request_id})"));
+                            decisions
+                                .push(format!("child awaiting approval (request {request_id})"));
                             paused = Some(request_id);
                             paused_by_child = true;
                         }
@@ -1040,19 +1197,31 @@ fn run_agent<'f, P: Provider>(
             // the child again). An agent paused by its OWN gate commits normally —
             // it resumes from the step after, past the now-approved action.
             if paused.is_some() && paused_by_child {
-                info!(run_id, depth, step, "tree paused for a child's approval (step left uncommitted for replay)");
+                info!(
+                    run_id,
+                    depth,
+                    step,
+                    "tree paused for a child's approval (step left uncommitted for replay)"
+                );
             } else {
                 tree.store.checkpoint_step(
                     run_id,
-                    &StepRecord::new(step, decisions.join("; "), tail(&observations, OBS_READ_CAP))
-                        .with_trace(user, calls_json.join(" | "), step_tokens),
+                    &StepRecord::new(
+                        step,
+                        decisions.join("; "),
+                        tail(&observations, OBS_READ_CAP),
+                    )
+                    .with_trace(user, calls_json.join(" | "), step_tokens),
                 )?;
                 info!(run_id, depth, step, decisions = %decisions.join("; "), tokens = step_tokens, "agent step");
             }
 
             if let Some(request_id) = paused {
                 tree.store.finish_run(run_id, "awaiting_approval")?;
-                return Ok(RunOutcome::AwaitingApproval { request_id, steps: step });
+                return Ok(RunOutcome::AwaitingApproval {
+                    request_id,
+                    steps: step,
+                });
             }
 
             // Draw this step's tokens against the tree. The draw is recorded even
@@ -1077,7 +1246,10 @@ fn run_agent<'f, P: Provider>(
 
             if contract
                 .verify
-                .passes_in_guarded(&tree.root, &ExecGuard::new(policy).tracing(tree.store, run_id, step))
+                .passes_in_guarded(
+                    &tree.root,
+                    &ExecGuard::new(policy).tracing(tree.store, run_id, step),
+                )
                 .await?
             {
                 tree.store.finish_run(run_id, "success")?;
@@ -1086,7 +1258,9 @@ fn run_agent<'f, P: Provider>(
         }
 
         tree.store.finish_run(run_id, "step_cap_reached")?;
-        Ok(RunOutcome::StepCapReached { steps: contract.max_steps })
+        Ok(RunOutcome::StepCapReached {
+            steps: contract.max_steps,
+        })
     })
 }
 
@@ -1115,8 +1289,14 @@ async fn spawn_child<P: Provider>(
 ) -> Result<SpawnResult> {
     let a = &call.arguments;
     let goal = a.get("goal").and_then(|v| v.as_str()).unwrap_or_default();
-    let file = a.get("verify_file").and_then(|v| v.as_str()).unwrap_or_default();
-    let needle = a.get("verify_contains").and_then(|v| v.as_str()).unwrap_or_default();
+    let file = a
+        .get("verify_file")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let needle = a
+        .get("verify_contains")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if goal.is_empty() || file.is_empty() {
         return Ok(SpawnResult::Composed {
             decision: "spawn missing fields".into(),
@@ -1165,7 +1345,10 @@ async fn spawn_child<P: Provider>(
             if let Some(o) = terminal_outcome(tree.store, row.child_run_id)? {
                 return Ok(compose_child(row.child_run_id, goal, o));
             }
-            (row.child_run_id, tree.store.last_step(row.child_run_id)? + 1)
+            (
+                row.child_run_id,
+                tree.store.last_step(row.child_run_id)? + 1,
+            )
         }
         None => {
             // Fresh: the containment boundary decides whether it may exist, and
@@ -1178,7 +1361,9 @@ async fn spawn_child<P: Provider>(
                 ))?;
                 return Ok(SpawnResult::Composed {
                     decision: format!("spawn refused ({})", refusal.cap()),
-                    obs: format!("\n[spawn refused] {refusal} — adapt or finish with what you have\n"),
+                    obs: format!(
+                        "\n[spawn refused] {refusal} — adapt or finish with what you have\n"
+                    ),
                 });
             }
             let child_run = tree.store.start_child_run(
@@ -1187,9 +1372,16 @@ async fn spawn_child<P: Provider>(
                 parent_run_id,
                 child_depth,
             )?;
-            tree.store
-                .record_agent_event(&AgentEvent::spawn(parent_run_id, step, child_run, goal))?;
-            let deny_json = a.get("deny_write").map(|v| v.to_string()).unwrap_or_else(|| "[]".into());
+            tree.store.record_agent_event(&AgentEvent::spawn(
+                parent_run_id,
+                step,
+                child_run,
+                goal,
+            ))?;
+            let deny_json = a
+                .get("deny_write")
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "[]".into());
             tree.store.record_spawn(
                 parent_run_id,
                 step,
@@ -1197,15 +1389,24 @@ async fn spawn_child<P: Provider>(
                 goal,
                 file,
                 needle,
-                a.get("max_steps").and_then(|v| v.as_u64()).map(|n| n as u32),
+                a.get("max_steps")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32),
                 &deny_json,
             )?;
             (child_run, 1)
         }
     };
 
-    let outcome =
-        run_agent(tree, &child_contract, child_run, child_depth, &child_policy, child_start).await?;
+    let outcome = run_agent(
+        tree,
+        &child_contract,
+        child_run,
+        child_depth,
+        &child_policy,
+        child_start,
+    )
+    .await?;
 
     // A child that deferred pauses the whole tree, surfacing its request_id so
     // the caller can resume that child once a human decides.
@@ -1363,6 +1564,7 @@ async fn dispatch(
     run_id: i64,
     step: u32,
     mcp: &McpSession,
+    custom: &Toolbox,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -1399,7 +1601,9 @@ async fn dispatch(
             match gate(ws, approver, store, run_id, step, Act::Read, path, None).await? {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
-                Gated::Go { target, remember, .. } => match ws.read_file(&target) {
+                Gated::Go {
+                    target, remember, ..
+                } => match ws.read_file(&target) {
                     Ok(c) => Dispatched::Continue {
                         decision: format!("read {target}"),
                         obs: format!("\n[read {target}]\n{}\n", tail(&c, OBS_READ_CAP)),
@@ -1418,10 +1622,25 @@ async fn dispatch(
                     "\n[write error] write_file needs a \"path\" in workspace mode\n",
                 ));
             }
-            match gate(ws, approver, store, run_id, step, Act::Write, path, Some(content)).await? {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Write,
+                path,
+                Some(content),
+            )
+            .await?
+            {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
-                Gated::Go { target, content, remember } => {
+                Gated::Go {
+                    target,
+                    content,
+                    remember,
+                } => {
                     let body = content.unwrap_or_default();
                     match ws.write_file(&target, &body) {
                         Ok(()) => Dispatched::Continue {
@@ -1430,6 +1649,48 @@ async fn dispatch(
                             remember,
                         },
                         Err(e) => Dispatched::go("write error", format!("\n[write error] {e}\n")),
+                    }
+                }
+            }
+        }
+        // A tool the embedding program registered. Registration made it
+        // available; this check is what authorizes the call, on exactly the terms
+        // an MCP tool gets — an exec check on the name the model used. Deciding
+        // it here rather than at registration is what lets one policy layer hand
+        // over a toolbox and another refuse a single tool in it.
+        //
+        // Registered tools are matched before the MCP arm and after the
+        // built-ins, and `Toolbox::validate` has already guaranteed the three
+        // sets are disjoint, so the order is documentation rather than a
+        // tie-break.
+        name if custom.owns(name) => {
+            match gate(ws, approver, store, run_id, step, Act::Exec, name, None).await? {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go { remember, .. } => {
+                    // `validate` ran at run start, so the lookup cannot miss.
+                    let tool = custom.get(name).expect("owns() and get() agree");
+                    match tool.invoke(&call.arguments).await {
+                        Ok(out) => {
+                            let (out, truncated) = crate::tools::cap_result(out);
+                            info!(run_id, step, tool = name, truncated, "registered tool call");
+                            Dispatched::Continue {
+                                decision: format!("called {name}"),
+                                obs: format!("\n[{name}]\n{out}\n"),
+                                remember,
+                            }
+                        }
+                        // A tool's own failure is the model's problem to route
+                        // around, not the run's to die on — the same treatment a
+                        // bad regex gets from grep.
+                        Err(e) => {
+                            info!(run_id, step, tool = name, error = %e, "registered tool failed");
+                            Dispatched::Continue {
+                                decision: format!("{name} failed"),
+                                obs: format!("\n[{name} error] {e}\n"),
+                                remember,
+                            }
+                        }
                     }
                 }
             }
@@ -1496,7 +1757,16 @@ async fn gate(
     content: Option<&str>,
 ) -> Result<Gated> {
     let kind = format!("{act:?}").to_lowercase();
-    let verdict = ws.check_path(act, target);
+    // Read and write targets are workspace paths, and are resolved so a symlink
+    // cannot smuggle one outside the root. Exec and net targets are *names* — a
+    // binary, an MCP tool, a registered tool, a host — and must not be resolved
+    // against the root, or a file that happens to share a tool's name would
+    // change what the policy said about calling it.
+    let check = |act: Act, target: &str| match act {
+        Act::Exec | Act::Net => ws.policy().check(act, target),
+        Act::Read | Act::Write => ws.check_path(act, target),
+    };
+    let verdict = check(act, target);
 
     match verdict.effect {
         Effect::Deny => {
@@ -1530,7 +1800,7 @@ async fn gate(
                 Decision::Approve { modified, remember } => {
                     let performed = modified.unwrap_or_else(|| request.clone());
                     // The rewritten action gets the same scrutiny as the original.
-                    let recheck = ws.check_path(act, &performed.target);
+                    let recheck = check(act, &performed.target);
                     if recheck.effect == Effect::Deny {
                         let mut ev = PolicyEvent::refusal(step, &kind, &performed.target);
                         ev.rule = recheck.rule.clone();
@@ -1544,8 +1814,7 @@ async fn gate(
                             ),
                         });
                     }
-                    let mut ev =
-                        PolicyEvent::decision(step, &kind, target, "approve", "approver");
+                    let mut ev = PolicyEvent::decision(step, &kind, target, "approve", "approver");
                     if performed.target != target {
                         ev = ev.with_performed(&performed.target);
                     }
@@ -1586,7 +1855,9 @@ fn tail(s: &str, cap: usize) -> String {
     } else {
         let start = s.len() - cap;
         // Snap to a char boundary so we never slice mid-UTF-8.
-        let start = (start..s.len()).find(|&i| s.is_char_boundary(i)).unwrap_or(s.len());
+        let start = (start..s.len())
+            .find(|&i| s.is_char_boundary(i))
+            .unwrap_or(s.len());
         format!("...(truncated)...{}", &s[start..])
     }
 }

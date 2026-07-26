@@ -4,10 +4,18 @@
 //! file. 0.3 adds a [`workspace::Workspace`] that scopes four tools to a root
 //! directory — `grep`, `find`, `read_file`, and a path-taking `write_file` — so
 //! the agent can search a repository and edit several files in one run.
+//!
+//! 0.9 opens the layer to the embedding program: [`custom::Tool`] is the public
+//! trait a caller implements to add an action of their own in-process, collected
+//! in a [`custom::Toolbox`] and offered to the model beside the built-ins under
+//! the same policy and the same trace. Out-of-process extension stays where
+//! 0.8.0 put it — the MCP client in [`crate::mcp`].
 
+pub mod custom;
 pub mod fs;
 pub mod workspace;
 
+pub use custom::{Tool, ToolFuture, Toolbox};
 pub use fs::FsTool;
 pub use workspace::{Match, Workspace};
 
@@ -19,3 +27,35 @@ pub const GREP_TOOL: &str = "grep";
 pub const FIND_TOOL: &str = "find";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
+/// How much of one tool result may enter the model's context.
+///
+/// A tool that returns a megabyte would otherwise spend the rest of the run's
+/// token budget on a single observation, every turn, since the observation log
+/// is re-sent whole. The bound is the same for every non-built-in tool — an MCP
+/// server's and a caller's registered [`Tool`] alike — because the model cannot
+/// tell them apart and neither should the ceiling.
+pub(crate) const TOOL_RESULT_CAP: usize = 8_000;
+
+/// Keep a tool result within [`TOOL_RESULT_CAP`], reporting whether it was cut.
+///
+/// Truncation is visible in the returned text rather than silent: a model that
+/// cannot see it was cut off will treat a partial answer as the whole one.
+pub(crate) fn cap_result(s: String) -> (String, bool) {
+    if s.len() <= TOOL_RESULT_CAP {
+        return (s, false);
+    }
+    let mut end = TOOL_RESULT_CAP;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (
+        format!("{}\n[truncated at {TOOL_RESULT_CAP} chars]", &s[..end]),
+        true,
+    )
+}
+
+/// The name the model uses to load one skill's body into its observations.
+///
+/// Offered only when the contract configures skills — a tool that could do
+/// nothing but fail would cost a slot in every request of every other run.
+pub const READ_SKILL_TOOL: &str = "read_skill";

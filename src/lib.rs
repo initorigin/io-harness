@@ -177,29 +177,33 @@ pub mod policy;
 pub mod provider;
 mod run;
 pub mod sandbox;
+pub mod skills;
 mod state;
 pub mod tools;
 mod verify;
 
+pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
+pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use contract::TaskContract;
 pub use error::{Error, Result};
+pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
+pub use policy::{Act, Effect, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
     ToolSpec, Usage,
 };
-pub use policy::{Act, Effect, Policy, Rule, Verdict};
-pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
-pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
 pub use run::{
     resume, resume_tree, resume_tree_with_decision, resume_with_decision, run, run_tree, run_with,
     RunOutcome, RunResult, SPAWN_TOOL,
 };
+pub use sandbox::{
+    copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
+    Selected,
+};
+pub use skills::{Skill, Skills};
 pub use state::{
     CheckpointEvent, McpEvent, Pending, PolicyEvent, RunStatus, SandboxEvent, StepRecord, Store,
     CHECKPOINT_FORMAT,
 };
-pub use sandbox::{
-    copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome, Selected,
-};
-pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
+pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

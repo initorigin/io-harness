@@ -1,0 +1,58 @@
+product: io-harness
+version: 0.9.0
+timestamp: 2026-07-26T00:00:00Z
+reason: capacity
+repository_state: passing
+completed_acceptance:
+  - >
+    F3 — a registered tool may not shadow a built-in, use the reserved `mcp__` prefix, or duplicate
+    another registered name, and the rejection happens before the provider is called once.
+  - >
+    F1 — a registered tool is offered to the model, invoked with the arguments it sent, and its
+    result reaches the next turn's prompt.
+  - >
+    F2 — the policy, not registration, authorizes the call: a denied tool is never entered and the
+    refusal is attributable in the trace.
+  - 'F4 — a failing tool is an observation, not a failed run.'
+  - 'F5 — an oversized tool result is truncated, visibly, before it enters the context.'
+  - >
+    O1 (tool half) — name, arguments, decision, and observation are all in the trace for a
+    registered-tool call. The skill half belongs to T05 and is not done.
+  - >
+    NF1 — no runtime dependency added; the frontmatter reader is standard-library only and the trait
+    uses `Pin<Box<dyn Future>>`.
+  - >
+    NF2 — additive public API; a 0.8.1-shaped contract compiles and runs unchanged, and all 197
+    pre-existing tests still pass alongside the 20 new ones.
+remaining_acceptance:
+  - 'F6 — a 0.5.0 child inherits the toolbox (threading done, test not written).'
+  - 'F7 — skills discovered from both layouts, names and descriptions in the prompt, bodies not.'
+  - 'F8 — a skill body loads on demand through `read_skill`.'
+  - 'F9 — a bad or over-cap skills directory fails honestly at run start.'
+  - 'F10 — reading a skill is a policy-governed read.'
+  - 'F11 — the live run against a real model, plus its negative control.'
+  - 'NF3 — measured dispatch overhead and skill-discovery cost.'
+  - 'NF4 — the three-OS matrix and the MSRV build. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` are already clean on this branch.'
+  - 'O2 — the v0.9 documentation, including the in-process privilege bound.'
+  - 'O3 — the two runnable examples.'
+active_hypotheses:
+  - >
+    A skill body read must be gated on an ABSOLUTE path, because the skills directory is normally
+    outside the workspace root. `gate()` currently sends Read/Write through
+    `Workspace::check_path`, which returns Deny for anything resolving outside the root — so
+    `read_skill` would be refused unconditionally if wired naively, and F10 would pass for the wrong
+    reason. Planned fix: extend the `check` closure already added in `gate()` so an absolute target
+    is decided by `ws.policy().check(...)` directly. Verified safe: `Workspace::resolve` rejects
+    absolute paths outright (src/tools/workspace.rs:124) and both `read_file` and `write_file` go
+    through it, so the gate is not the only containment guard and relaxing it for absolute paths
+    cannot open a workspace escape. Confirm that with a test before relying on it.
+  - >
+    F11's negative control needs a task that fails for the intended reason. Unverified.
+next_task: US-IO-HARNESS-0.9.0-T03
+required_context:
+  - src/tools/custom.rs
+  - src/skills.rs
+  - src/run.rs
+  - tests/custom_tools.rs
+  - .ultraship/products/io-harness/releases/0.9.0.yaml
+  - .ultraship/products/io-harness/execution/tasks.yaml

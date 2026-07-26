@@ -112,9 +112,42 @@ versions:
       io-cli and io-studio each add their own capabilities and behaviour over the shared engine. No
       dynamic loading and no plugin ABI — out-of-process extension is what 0.8.0's MCP client is
       for. Skills carry instructions, not code.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.10.0
+    outcome: >
+      A developer runs a long task and the agent's context stays relevant instead of merely
+      growing. What the model sees each turn is assembled to fit a stated share of the token
+      budget: superseded observations are compacted, an observation invalidated by a later write
+      is re-read rather than trusted, and each tool result is bounded where it enters the context
+      rather than where it enters the trace. The agent also keeps durable memory — facts and
+      decisions it writes deliberately and recalls on a later run over the same workspace — so a
+      second run does not rediscover what the first established. Closes the context-construction
+      and state-and-memory gaps; see iterations/US-IO-HARNESS-0.9.0-I01.
+    detail: outline
+    status: planned
+  - version: 0.11.0
+    outcome: >
+      A developer's long unattended run survives the failures that end runs today, not just the
+      crashes 0.7.0 covers. A provider that is down, rate-limited, or returning garbage falls back
+      to another configured provider instead of escalating; an agent spending steps without
+      changing the workspace is detected as stalled and replanned once rather than burning to the
+      step cap; and the escalation path distinguishes a retryable transport failure from a terminal
+      one so a caller learns which happened. Every fallback, stall, and replan is in the trace.
+    detail: outline
+    status: planned
+  - version: 0.12.0
+    outcome: >
+      A developer watching a run sees it as it happens, and a developer measuring the harness can.
+      The embedding application subscribes to a live event stream — steps, tool calls, approvals,
+      spend, outcomes — instead of polling the store, so io-cli and io-studio render progress off a
+      supported surface. The same release gives io-eval what it needs to score the harness: a
+      deterministic replay from recorded provider responses, so a case runs identically twice, and
+      a per-run outcome record carrying success, steps, spend, and latency. Closes the
+      observability and evaluation gaps; see iterations/US-IO-HARNESS-0.9.0-I01.
+    detail: outline
+    status: planned
+  - version: 0.13.0
     outcome: >
       A developer runs a task over real documents: the agent creates and edits Word, Excel,
       PowerPoint, and PDF files, watermarks and fills PDF forms, and reads text and codes off a page
@@ -122,7 +155,7 @@ versions:
       govern source edits.
     detail: outline
     status: planned
-  - version: 0.11.0
+  - version: 0.14.0
     outcome: >
       A developer hands the agent an image or video alongside the task and the harness passes it
       through to any provider whose model accepts it, and the agent works a real git repository —
@@ -130,7 +163,7 @@ versions:
       control rather than loose file edits.
     detail: hypothesis
     status: planned
-  - version: 0.12.0
+  - version: 0.15.0
     outcome: >
       A developer depends on io-harness under a public contract that is documented rather than
       frozen: every public item carries a worked example, each breaking change between 0.x minors is
