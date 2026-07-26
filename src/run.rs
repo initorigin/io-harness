@@ -130,6 +130,10 @@ pub async fn run_with<P: Provider>(
     // unambiguously is a configuration mistake, and the caller should hear about
     // it before a run row exists and before the provider is billed for a turn.
     contract.tools.validate()?;
+    // Same reason, same point: a skills directory that cannot be read is a
+    // configuration mistake, and the caller hears the path before a run row
+    // exists rather than getting a silently empty catalogue mid-run.
+    contract.discover_skills()?;
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
     store.set_provider(run_id, provider.name())?;
@@ -184,6 +188,7 @@ pub async fn resume<P: Provider>(
     run_id: i64,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
+    contract.discover_skills()?;
     // Refuse a store from a newer checkpoint format or a missing run with a
     // typed error, rather than misreading it or panicking.
     store.check_resumable(run_id)?;
@@ -243,6 +248,7 @@ pub async fn resume_with_decision<P: Provider>(
     approver: &dyn Approver,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
+    contract.discover_skills()?;
     let pending = store
         .pending(request_id)?
         .ok_or_else(|| crate::error::Error::Config(format!("no pending request {request_id}")))?;
@@ -418,6 +424,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
 ) -> Result<RunResult> {
     store.check_resumable(run_id)?;
     contract.tools.validate()?;
+    contract.discover_skills()?;
     let pending = store
         .pending(request_id)?
         .ok_or_else(|| crate::error::Error::Config(format!("no pending request {request_id}")))?;
@@ -944,6 +951,7 @@ pub async fn run_tree<P: Provider>(
     containment: &Containment,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
+    contract.discover_skills()?;
     let root = contract.root.clone().ok_or_else(|| {
         crate::error::Error::Config(
             "run_tree needs a workspace contract — build it with TaskContract::workspace".into(),
@@ -1004,6 +1012,7 @@ pub async fn resume_tree<P: Provider>(
     containment: &Containment,
 ) -> Result<RunResult> {
     contract.tools.validate()?;
+    contract.discover_skills()?;
     store.check_resumable(run_id)?;
 
     // A finished tree is returned as-is — resume is idempotent for the whole tree.

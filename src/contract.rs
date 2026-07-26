@@ -51,6 +51,15 @@ pub struct TaskContract {
     /// process, unlike [`TaskContract::mcp`]: see [`crate::tools::Tool`] for what
     /// registration does and does not authorize.
     pub tools: crate::tools::Toolbox,
+    /// Directory of skill files to offer the agent, or `None` (the default) for
+    /// no skills.
+    ///
+    /// The *path* is held rather than the discovered set, because reading a
+    /// directory is fallible and a builder method is not: discovery happens at
+    /// run start, so a directory that does not exist fails the run with
+    /// [`Error::Config`](crate::Error::Config) naming the path — the same point
+    /// and the same way [`TaskContract::tools`] is arbitrated.
+    pub skills: Option<PathBuf>,
 }
 
 impl TaskContract {
@@ -69,6 +78,7 @@ impl TaskContract {
             max_retries: 2,
             mcp: Vec::new(),
             tools: crate::tools::Toolbox::new(),
+            skills: None,
         }
     }
 
@@ -95,6 +105,7 @@ impl TaskContract {
             max_retries: 2,
             mcp: Vec::new(),
             tools: crate::tools::Toolbox::new(),
+            skills: None,
         }
     }
 
@@ -127,6 +138,32 @@ impl TaskContract {
     pub fn with_tools(mut self, tools: crate::tools::Toolbox) -> Self {
         self.tools = tools;
         self
+    }
+
+    /// Offer the agent the skills in `dir` — see [`crate::skills`] for the
+    /// layout.
+    ///
+    /// The directory is read at run start, not here, so a path that does not
+    /// exist, is not a directory, or holds more than
+    /// [`MAX_SKILLS`](crate::skills::MAX_SKILLS) skills fails the run with
+    /// [`Error::Config`](crate::Error::Config) naming it, before the first
+    /// completion.
+    ///
+    /// A skill is instructions the model may choose to read. Offering one grants
+    /// nothing: the read goes through the policy when it happens, and anything
+    /// the model then does is checked as it always is.
+    pub fn with_skills(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.skills = Some(dir.into());
+        self
+    }
+
+    /// Discover the configured skills. Called at run start by every entry point,
+    /// alongside [`Toolbox::validate`](crate::tools::Toolbox::validate).
+    pub(crate) fn discover_skills(&self) -> crate::Result<crate::skills::Skills> {
+        match &self.skills {
+            Some(dir) => crate::skills::Skills::discover(dir),
+            None => Ok(crate::skills::Skills::none()),
+        }
     }
 
     /// Override the step budget.
