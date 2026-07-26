@@ -273,18 +273,38 @@ impl<'a> ExecGuard<'a> {
                         .record_sandbox_event(&crate::state::SandboxEvent::destroy(run_id, step));
                 }
                 // A cap hit is a real failure of the gate, not a pass.
+                if !outcome.success() {
+                    // Do not throw away what the command said about its own
+                    // failure. `Ok(false)` on its own reads as "the model's code
+                    // is wrong" whatever the real cause was; the compiler's own
+                    // diagnostics are what tell the two apart, so keep them
+                    // where the next diagnosis can read them.
+                    tracing::debug!(
+                        backend = backend.as_str(),
+                        exit_code = ?outcome.exit_code,
+                        cap_hit = ?outcome.cap_hit.map(|c| c.as_str()),
+                        stderr = %outcome.stderr.trim(),
+                        "sandboxed command failed"
+                    );
+                }
                 Ok(outcome.success())
             }
             None => {
                 // Direct host execution — the exact 0.5.0 path.
-                let status = Command::new(&argv[0])
+                let out = Command::new(&argv[0])
                     .args(&argv[1..])
                     .current_dir(workdir)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
+                    .stdin(Stdio::null())
+                    .output()
                     .await?;
-                Ok(status.success())
+                if !out.status.success() {
+                    tracing::debug!(
+                        exit_code = ?out.status.code(),
+                        stderr = %String::from_utf8_lossy(&out.stderr).trim(),
+                        "host command failed"
+                    );
+                }
+                Ok(out.status.success())
             }
         }
     }

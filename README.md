@@ -393,7 +393,10 @@ execution through a `Sandbox`:
 - **Ephemeral workdir** — created per run and **destroyed** on every exit path
   (success, failure, cap kill), so nothing it writes or spawns outlives it.
 - **Resource caps that kill, not throttle** — `SandboxLimits` caps CPU time,
-  wall-clock, and memory; a breach returns a *typed* cap hit, never a hang.
+  wall-clock, and memory; a breach returns a *typed* cap hit, never a hang. The
+  CPU and memory caps are unix mechanisms (`RLIMIT_CPU`, an RSS monitor); on
+  Windows only the wall clock is enforced, and a cap that was not applied is
+  never reported as hit.
 - **Network denied by default** — a configurable egress allow-list is deferred to
   v0.8; v0.6 is deny-by-default only.
 - **Trace** — every create, the argv and the backend that ran it, each cap hit,
@@ -409,7 +412,7 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | --- | --- |
 | **macOS `sandbox-exec`** | profile confines writes to the workdir and **denies network**; rlimits cap CPU/fds; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
 | **Linux namespaces** | user/mount/pid/**net** namespaces — a *hard* network boundary and a private root — plus rlimits *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
-| **Windows** | **no native backend yet** — the Job Object is designed but unimplemented (no Win32 call is made), so a Windows run gets the portable floor and reports it as such. Tracked for a dedicated release |
+| **Windows** | **no native backend yet** — the Job Object is designed but unimplemented (no Win32 call is made), so a Windows run gets the portable floor and reports it as such. On Windows that floor enforces the **wall clock only**: no CPU cap, no memory cap, no process cap (all three are unix `rlimit`/`ps` mechanisms) and no kernel network boundary. The wall-clock kill does reach the whole process tree. Caps that are not applied are never reported — a Windows run never claims a CPU or memory cap hit. Tracked for a dedicated release |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
 
 `select` picks the strongest backend available on the running OS and records which
