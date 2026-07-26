@@ -116,6 +116,27 @@ pub struct RunResult {
 }
 
 impl RunResult {
+    /// What this run cost and whether it worked, read back from the store.
+    ///
+    /// Added in 0.12.0. Before it, a caller holding a `RunResult` had an outcome
+    /// discriminant and a `run_id`: spend needed a follow-up query, and latency
+    /// was not recorded anywhere at all.
+    ///
+    /// `None` when the run has not finished — a run paused awaiting a human has
+    /// no ending to summarise yet.
+    ///
+    /// A method rather than a field, deliberately. A field would have to be
+    /// filled at every one of the entry points' return sites, including the ones
+    /// that return `Err` and never build a `RunResult`, so the two could drift.
+    /// Reading it from the store means the caller and an auditor are looking at
+    /// the same row by construction. It also keeps this struct's existing
+    /// exhaustive-pattern compatibility intact: no new field, no break.
+    pub fn summary(&self, store: &Store) -> Result<Option<crate::RunSummary>> {
+        store.run_summary(self.run_id)
+    }
+}
+
+impl RunResult {
     fn new(outcome: RunOutcome, run_id: i64) -> Self {
         Self {
             outcome,

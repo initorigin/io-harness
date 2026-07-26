@@ -842,3 +842,455 @@ async fn a_step_left_uncommitted_for_replay_is_not_announced_as_a_step() {
     );
     assert_eq!(event_rows(&events_of(&events, child)).len(), 1);
 }
+
+// ------------------------------------- 5: the five kinds the enum only promised
+//
+// `ToolCall`, `Refused`, `ApprovalRequested`/`ApprovalDecided`, `MemoryWrote`,
+// `Sandbox` and `Mcp` were declared in 0.12.0's enum and emitted from nowhere, so
+// the wire shape promised more than the run delivered. These tests are the same
+// projection-equality shape as test 1: each event is compared against the row the
+// same run wrote, never against a literal beside it. An event that agrees with a
+// hand-written constant and disagrees with the trace is exactly the bug the
+// comparison exists to catch.
+
+use io_harness::McpServer;
+
+/// Every `Refused` event, as `(step, act, target, rule, layer)`.
+type Refusal = (u32, String, String, Option<String>, Option<String>);
+
+fn event_refusals(events: &[RunEvent]) -> Vec<Refusal> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Refused {
+                act,
+                target,
+                rule,
+                layer,
+            } => Some((
+                e.step,
+                act.clone(),
+                target.clone(),
+                rule.clone(),
+                layer.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The same, from `policy_events` — the surface that is authoritative.
+fn trace_refusals(store: &Store, run_id: i64) -> Vec<Refusal> {
+    store
+        .events(run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "refusal")
+        .map(|e| (e.step, e.act, e.target, e.rule, e.layer))
+        .collect()
+}
+
+/// Every approver decision, as `(step, act, target, decision)`.
+type Decided = (u32, String, String, String);
+
+fn event_decisions(events: &[RunEvent]) -> Vec<Decided> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ApprovalDecided {
+                act,
+                target,
+                decision,
+            } => Some((e.step, act.clone(), target.clone(), decision.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The same, from the rows an *approver* wrote. A `"policy"` decision is not a
+/// human answering, and a resumed one was answered in another process.
+fn trace_decisions(store: &Store, run_id: i64) -> Vec<Decided> {
+    store
+        .events(run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "decision" && e.source.as_deref() == Some("approver"))
+        .map(|e| (e.step, e.act, e.target, e.decision.unwrap_or_default()))
+        .collect()
+}
+
+/// Every tool the events say was invoked, as `(step, name)`.
+fn event_tool_calls(events: &[RunEvent]) -> Vec<(u32, String)> {
+    events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolCall { name, .. } => Some((e.step, name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The same, parsed out of each committed step's `tool_call` column, which the
+/// loop writes as `name:{args}` joined by `" | "`.
+fn trace_tool_calls(store: &Store, run_id: i64) -> Vec<(u32, String)> {
+    store
+        .steps(run_id)
+        .unwrap()
+        .into_iter()
+        .flat_map(|r| {
+            let step = r.step;
+            r.tool_call
+                .split(" | ")
+                .filter(|c| !c.is_empty())
+                .filter_map(|c| c.split_once(':').map(|(n, _)| (step, n.to_string())))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// F5 — a refused action is announced with the rule and layer that refused it,
+/// and with nothing the row does not also hold.
+#[tokio::test]
+async fn a_refusal_is_announced_with_exactly_what_the_policy_events_row_records() {
+    let dir = ws();
+    // secrets/ is denied outright, so the write below never reaches an approver.
+    let policy = Policy::default()
+        .layer("base")
+        .allow_read("*")
+        .allow_write("src/*")
+        .deny_write("secrets/*");
+    let provider = Mock::repeating(
+        2,
+        call(
+            "write_file",
+            json!({ "path": "secrets/key.txt", "content": "x" }),
+        ),
+    );
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+
+    let result = run_with_observed(
+        &never_passes(dir.path(), 2),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+
+    let rows = trace_refusals(&store, result.run_id);
+    assert!(
+        !rows.is_empty(),
+        "the run has to actually have been refused for this to test anything"
+    );
+    assert_eq!(
+        rows[0].3.as_deref(),
+        Some("secrets/*"),
+        "the row names the rule, so the event has something to agree with"
+    );
+    assert_eq!(
+        event_refusals(&watcher.events()),
+        rows,
+        "a Refused event must carry the same act, target, rule and layer as its row"
+    );
+}
+
+/// F5 — a sensitive action asks before it decides, and reports the answer the
+/// `policy_events` row records.
+#[tokio::test]
+async fn an_approval_is_announced_as_a_request_and_then_the_decision_the_row_holds() {
+    let dir = ws();
+    let provider = Mock::repeating(
+        2,
+        call("write_file", json!({ "path": "out.txt", "content": "OK" })),
+    );
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+
+    // `Policy::default` makes a write sensitive, so ApproveAll is consulted.
+    let result = run_with_observed(
+        &never_passes(dir.path(), 2),
+        &provider,
+        &store,
+        &Policy::default(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+
+    let events = watcher.events();
+    let rows = trace_decisions(&store, result.run_id);
+    assert!(!rows.is_empty(), "an approver has to have been consulted");
+    assert_eq!(
+        event_decisions(&events),
+        rows,
+        "an ApprovalDecided must report the decision its row records"
+    );
+
+    // And the request came first: a watcher that only ever hears the answer
+    // cannot show a run as waiting, which is the state the pair exists to expose.
+    let requested = events
+        .iter()
+        .position(|e| matches!(e.kind, EventKind::ApprovalRequested { .. }))
+        .expect("the run asked before it was answered");
+    let decided = events
+        .iter()
+        .position(|e| matches!(e.kind, EventKind::ApprovalDecided { .. }))
+        .expect("and heard an answer");
+    assert!(requested < decided, "the ask must precede the answer");
+    let (
+        EventKind::ApprovalRequested { act, target },
+        EventKind::ApprovalDecided {
+            act: a2,
+            target: t2,
+            ..
+        },
+    ) = (&events[requested].kind, &events[decided].kind)
+    else {
+        unreachable!("both were just matched")
+    };
+    assert_eq!(
+        (act, target),
+        (a2, t2),
+        "the pair must be about the same action"
+    );
+}
+
+/// F5 — every tool the loop dispatched is announced, in the order the step's own
+/// `tool_call` column records them.
+#[tokio::test]
+async fn every_dispatched_tool_is_announced_as_the_step_row_records_it() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.rs"), "fn a() {}\n").unwrap();
+    let provider = Mock::new(vec![
+        Turn::Calls(vec![
+            call("read_file", json!({ "path": "a.rs" })),
+            call("grep", json!({ "pattern": "fn" })),
+        ]),
+        Turn::Calls(vec![call("find", json!({ "name_glob": "*.rs" }))]),
+    ]);
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+
+    let result = run_with_observed(
+        &never_passes(dir.path(), 2),
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+
+    let events = watcher.events();
+    let rows = trace_tool_calls(&store, result.run_id);
+    assert_eq!(rows.len(), 3, "three calls over two steps: {rows:?}");
+    assert_eq!(
+        event_tool_calls(&events),
+        rows,
+        "the announced calls must be the calls the trace says were made"
+    );
+    // The subject travels with the name, so a consumer can show what was touched
+    // without re-parsing the arguments blob the step row keeps.
+    let targets: Vec<String> = events
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::ToolCall { target, .. } => Some(target.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(targets, vec!["a.rs", "fn", "*.rs"], "{targets:?}");
+}
+
+/// F5 — a note written to durable memory is announced under the key the
+/// `memory_write` row names.
+#[tokio::test]
+async fn a_memory_write_is_announced_under_the_key_the_trace_row_names() {
+    let dir = ws();
+    let provider = Mock::new(vec![
+        Turn::Calls(vec![call(
+            "remember",
+            json!({ "key": "build-command", "value": "cargo test --workspace" }),
+        )]),
+        Turn::Calls(vec![call(
+            "remember",
+            json!({ "key": "layout", "value": "the crate is one file" }),
+        )]),
+    ]);
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+
+    let result = run_with_observed(
+        &never_passes(dir.path(), 2),
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+
+    // The row's detail is `"<key> (<n> chars)"`; the key is the part the event
+    // carries, and the count is prose about the write rather than its identity.
+    let rows: Vec<(u32, String)> = store
+        .context_events(result.run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "memory_write")
+        .map(|e| {
+            let detail = e.detail.unwrap_or_default();
+            (e.step, detail.split(" (").next().unwrap_or("").to_string())
+        })
+        .collect();
+    assert_eq!(rows.len(), 2, "both notes are in the trace: {rows:?}");
+
+    let announced: Vec<(u32, String)> = watcher
+        .events()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::MemoryWrote { key } => Some((e.step, key.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        announced, rows,
+        "a MemoryWrote must name the key its row names, on the same step"
+    );
+}
+
+/// F5 — the sandbox the verify gate runs in is announced exactly as
+/// `sandbox_events` records it, including the backend that isolated it.
+///
+/// This is the one kind that comes from `src/verify.rs` rather than the loop, so
+/// it is also the test that the observer reaches the gate at all.
+#[tokio::test]
+async fn the_verify_gates_sandbox_is_announced_as_sandbox_events_records_it() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+    let contract = TaskContract::workspace(
+        "compile a.rs",
+        dir.path(),
+        Verification::EachCompilesRust(vec!["a.rs".into()]),
+    )
+    .with_max_steps(1);
+    let provider = Mock::new(vec![Turn::Calls(vec![call(
+        "read_file",
+        json!({ "path": "a.rs" }),
+    )])]);
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+
+    let result = run_with_observed(
+        &contract,
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+
+    let rows: Vec<(String, Option<String>)> = store
+        .sandbox_events(result.run_id)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.kind, e.backend))
+        .collect();
+    assert!(
+        rows.iter().any(|(k, _)| k == "create"),
+        "the gate has to have sandboxed something: {rows:?}"
+    );
+    let announced: Vec<(String, Option<String>)> = watcher
+        .events()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Sandbox { kind, backend } => Some((kind.clone(), backend.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        announced, rows,
+        "a Sandbox event must name the kind and backend its row names"
+    );
+}
+
+/// Where `cargo test` left the MCP fixture example binary. The same derivation
+/// `tests/mcp.rs` uses: `CARGO_BIN_EXE_*` covers `[[bin]]` targets only, and the
+/// fixture is an example so it never ships as an installable binary.
+fn mcp_fixture() -> McpServer {
+    let mut dir = std::env::current_exe().expect("the test binary has a path");
+    dir.pop();
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    let path = dir.join("examples").join(format!(
+        "mcp_fixture_server{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    assert!(
+        path.exists(),
+        "fixture server not built at {}. `cargo test` builds examples.",
+        path.display()
+    );
+    McpServer::stdio("fix", path.display().to_string())
+}
+
+/// F5 — connecting, discovering, calling and disconnecting an MCP server are all
+/// announced, each carrying what its `mcp_events` row carries.
+#[tokio::test]
+async fn every_mcp_row_is_announced_with_the_same_server_tool_outcome_and_latency() {
+    let dir = ws();
+    let contract = never_passes(dir.path(), 1).with_mcp([mcp_fixture()]);
+    let provider = Mock::new(vec![Turn::Calls(vec![call(
+        "mcp__fix__echo",
+        json!({ "text": "hello" }),
+    )])]);
+    let store = Store::memory().unwrap();
+    let watcher = Recorder::default();
+
+    let result = run_with_observed(
+        &contract,
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &watcher,
+    )
+    .await
+    .unwrap();
+
+    type Row = (String, Option<String>, Option<bool>, Option<u64>);
+    let rows: Vec<Row> = store
+        .mcp_events(result.run_id)
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.server, e.tool, e.ok, e.millis))
+        .collect();
+    assert!(
+        rows.iter().any(|r| r.2 == Some(true)),
+        "the tool call has to have succeeded: {rows:?}"
+    );
+    let announced: Vec<Row> = watcher
+        .events()
+        .iter()
+        .filter_map(|e| match &e.kind {
+            EventKind::Mcp {
+                server,
+                tool,
+                ok,
+                millis,
+            } => Some((server.clone(), tool.clone(), *ok, *millis)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        announced, rows,
+        "an Mcp event must report the server, tool, outcome and latency its row does"
+    );
+}

@@ -31,8 +31,16 @@ notes are produced from it.
   resumable. Previously the only way to stop a run in flight was to drop its
   future, which abandoned it mid-step and left `runs.status` as `running`
   forever — indistinguishable from a crashed process.
-- **A per-run outcome record.** `Store::run_summary` returns whether the run
-  succeeded, its step count, its token spend and its duration, from one read.
+- **A per-run outcome record.** `Store::run_summary`, or `RunResult::summary` if
+  you are holding a result, returns whether the run succeeded, its step count,
+  its token spend and its duration, from one read.
+
+  It is a method rather than a new `RunResult` field on purpose. A field would
+  have to be filled at every entry point's return site — including the ones that
+  return `Err` and never build a `RunResult` — so the caller's copy and the
+  store's row could drift. Reading it from the store makes them the same row by
+  construction, and as a side effect **this release breaks nothing**: no field is
+  added, so an exhaustive struct pattern over `RunResult` still compiles.
   Three of those were derivable only by knowing which of eleven free-text
   outcome strings means success, that steps is `MAX(step)` rather than
   `COUNT(*)` because retry rows share a step number, and that spend is

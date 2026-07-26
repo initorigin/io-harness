@@ -211,3 +211,75 @@ fn reading_a_summary_is_a_pure_read() {
     assert_eq!(first, second, "reading twice must give the same answer");
     assert_eq!(READS.load(Ordering::SeqCst), 2);
 }
+
+/// F13 — the summary reaches the caller, and agrees with the store.
+///
+/// A method rather than a field: a field would have to be filled at every entry
+/// point's return site, including the ones that return `Err` and never build a
+/// `RunResult` at all, so the two could drift. Reading it from the store means the
+/// caller and an auditor see the same row by construction — which is what this
+/// test asserts.
+#[tokio::test]
+async fn a_caller_reads_the_summary_off_its_own_run_result() {
+    use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
+    use io_harness::{run_with, ApproveAll, Policy, Provider, TaskContract, Verification};
+
+    struct Writer;
+    impl Provider for Writer {
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> io_harness::Result<CompletionResponse> {
+            Ok(CompletionResponse {
+                tool_calls: vec![ToolCall {
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({
+                        "path": "a.rs",
+                        "content": "fn hello() -> u32 { 42 }\n",
+                    }),
+                }],
+                usage: Some(io_harness::Usage {
+                    total_tokens: 123,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::memory().expect("memory");
+    let contract = TaskContract::workspace(
+        "write a hello function",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "a.rs".into(),
+            needle: "fn hello".into(),
+        },
+    )
+    .with_max_steps(2);
+    let policy = Policy::default()
+        .layer("test")
+        .allow_read("*")
+        .allow_write("*")
+        .allow_exec("*");
+
+    let result = run_with(&contract, &Writer, &store, &policy, &ApproveAll)
+        .await
+        .expect("run");
+
+    let summary = result
+        .summary(&store)
+        .expect("summary")
+        .expect("a finished run has one");
+
+    assert!(summary.success, "the run wrote the file: {summary:?}");
+    assert_eq!(summary.run_id, result.run_id);
+    assert_eq!(
+        summary.tokens,
+        store.spent_tokens(result.run_id).expect("spent"),
+        "the caller's view and the store's must be the same row"
+    );
+    assert_eq!(summary.steps, store.last_step(result.run_id).expect("last"));
+    assert!(summary.duration_ms.is_some(), "latency is recorded now");
+}
