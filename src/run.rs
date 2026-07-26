@@ -16,6 +16,9 @@ use tracing::info;
 
 use crate::approve::{ApproveAll, Approver, Decision, Request};
 use crate::containment::{Containment, Draw, Ledger};
+use crate::context::{
+    assemble, bound, entry_cap_chars, Ledger as ContextLedger, ObsKind, Observation,
+};
 use crate::contract::TaskContract;
 use crate::error::Result;
 use crate::mcp::McpSession;
@@ -34,10 +37,17 @@ use crate::verify::{ExecGuard, Verification};
 /// The tool a parent agent calls to spawn a contained sub-agent.
 pub const SPAWN_TOOL: &str = "spawn_agent";
 
-/// Cap on how much of a read file / grep result is folded into the observation
-/// log, so one large file cannot blow up the prompt.
-// ponytail: fixed char caps; make them budget-aware if long files starve the loop.
+/// The tree loop's trace-side tail bound on its observation log.
+///
+/// 0.10.0 made the workspace loop's caps budget-derived
+/// ([`entry_cap_chars`](crate::context::entry_cap_chars)), so this constant is
+/// down to one use: the sub-agent loop, whose context wiring lands separately.
+// ponytail: one fixed cap left, on one path. It goes when the tree loop gets its
+// own ledger.
 const OBS_READ_CAP: usize = 4_000;
+
+/// How many grep hits are folded into one observation. A relevance ceiling, not a
+/// size one — the size ceiling is the budget-derived per-entry cap on top of it.
 const OBS_GREP_CAP: usize = 50;
 
 /// Why a run stopped.
@@ -772,7 +782,11 @@ async fn run_workspace_from<P: Provider>(
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
-    let mut observations = String::new();
+    // History, append-only. What the model sees of it is decided per turn by
+    // `assemble`, under the contract's context budget — the log itself is never
+    // trimmed, so the trace keeps everything.
+    let mut ledger = ContextLedger::new();
+    let rid = run_id.to_string();
 
     for step in start_step..=contract.max_steps {
         if let Some(max) = contract.max_duration {
@@ -786,7 +800,23 @@ async fn run_workspace_from<P: Provider>(
             }
         }
 
-        let user = workspace_user_prompt(contract, &observations);
+        // One budget, derived once per turn: it sets both this request's ceiling
+        // and the per-observation cap the results of this step enter under.
+        let budget_tokens = contract
+            .context
+            .effective_tokens(contract.max_tokens.map(|m| m.saturating_sub(tokens_used)));
+        let entry_cap = entry_cap_chars(budget_tokens);
+        let assembled = assemble(
+            &ledger,
+            budget_tokens,
+            Some(root),
+            &effective,
+            store,
+            &rid,
+            step,
+        )
+        .await?;
+        let user = workspace_user_prompt(contract, &assembled.text);
         let request = CompletionRequest {
             system: system.clone(),
             user: user.clone(),
@@ -805,6 +835,12 @@ async fn run_workspace_from<P: Provider>(
 
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
+        // The provider's own number for the request `assemble` just built, beside
+        // the estimate: the pair is what makes the estimator's drift auditable. A
+        // silent provider leaves it null rather than recording a zero.
+        if step_tokens > 0 {
+            store.record_context_reported(&rid, step, step_tokens)?;
+        }
 
         // Dispatch every tool call the model made this step, in order, folding
         // each result into the observation log the next turn will see.
@@ -812,7 +848,16 @@ async fn run_workspace_from<P: Provider>(
         let mut calls_json: Vec<String> = Vec::new();
         if response.tool_calls.is_empty() {
             let said = response.text.clone().unwrap_or_default();
-            observations.push_str(&format!("\n[step {step}] (no tool call) {said}\n"));
+            ledger.push(Observation::new(
+                step,
+                ObsKind::Message,
+                None,
+                bound(
+                    &format!("\n[step {step}] (no tool call) {said}\n"),
+                    entry_cap,
+                    ObsKind::Message,
+                ),
+            ));
             decisions.push("no tool call".into());
         }
         let mut paused: Option<i64> = None;
@@ -829,15 +874,18 @@ async fn run_workspace_from<P: Provider>(
                 mcp,
                 &contract.tools,
                 skills,
+                entry_cap,
             )
             .await?
             {
                 Dispatched::Continue {
                     decision,
                     obs,
+                    kind,
+                    target,
                     remember,
                 } => {
-                    observations.push_str(&obs);
+                    ledger.push(Observation::new(step, kind, target, obs));
                     decisions.push(decision);
                     new_rules.extend(remember);
                 }
@@ -849,16 +897,29 @@ async fn run_workspace_from<P: Provider>(
             }
         }
 
+        // The trace gets the WHOLE log, unelided — bounding what the model sees
+        // must not bound what an operator can audit. Only the per-observation cap
+        // applies here, and it applied when the observation was made.
+        // ponytail: each row repeats the whole log, so the column grows with the
+        // square of the step count. Bounded in practice by the step budget times
+        // the entry cap; write per-step deltas if a long run's store size matters.
         store.checkpoint_step(
             run_id,
-            &StepRecord::new(
-                step,
-                decisions.join("; "),
-                tail(&observations, OBS_READ_CAP),
-            )
-            .with_trace(user, calls_json.join(" | "), step_tokens),
+            &StepRecord::new(step, decisions.join("; "), ledger.full_text()).with_trace(
+                user,
+                calls_json.join(" | "),
+                step_tokens,
+            ),
         )?;
-        info!(step, decisions = %decisions.join("; "), tokens = step_tokens, "workspace step");
+        info!(
+            step,
+            decisions = %decisions.join("; "),
+            tokens = step_tokens,
+            carried = assembled.carried,
+            stubbed = assembled.stubbed,
+            est_tokens = assembled.est_tokens,
+            "workspace step"
+        );
 
         // An approver deferred: persist nothing further, stop, and let the
         // caller resume once a human has decided.
@@ -1177,6 +1238,10 @@ fn run_agent<'f, P: Provider>(
                     tree.mcp,
                     tree.tools,
                     tree.skills,
+                    // The tree loop still accumulates a plain string (its own
+                    // ledger wiring lands separately), so it takes the cap the
+                    // default budget derives rather than a per-turn one.
+                    entry_cap_chars(contract.context.effective_tokens(None)),
                 )
                 .await?
                 {
@@ -1557,9 +1622,16 @@ async fn authorize_provider<P: Provider>(
 enum Dispatched {
     /// The call resolved; fold `obs` into the observation log and carry any
     /// rules an approver asked to remember.
+    ///
+    /// `kind` and `target` travel with `obs` because assembly reasons about them:
+    /// what a later observation supersedes, and which read a write invalidates,
+    /// is a question about the tool and its subject — not something to recover by
+    /// re-parsing the text afterwards.
     Continue {
         decision: String,
         obs: String,
+        kind: ObsKind,
+        target: Option<String>,
         remember: Vec<Rule>,
     },
     /// An approver deferred; the action is persisted under `request_id` and the
@@ -1568,12 +1640,26 @@ enum Dispatched {
 }
 
 impl Dispatched {
-    fn go(decision: impl Into<String>, obs: impl Into<String>) -> Self {
+    /// A tool result: what it was, and the subject it names (if any).
+    fn seen(
+        decision: impl Into<String>,
+        obs: impl Into<String>,
+        kind: ObsKind,
+        target: Option<String>,
+    ) -> Self {
         Dispatched::Continue {
             decision: decision.into(),
             obs: obs.into(),
+            kind,
+            target,
             remember: Vec::new(),
         }
+    }
+
+    /// A failure or a refusal. Kept subject-less on purpose: an error about a
+    /// path is not an observation *of* that path, so it must never supersede one.
+    fn go(decision: impl Into<String>, obs: impl Into<String>) -> Self {
+        Self::seen(decision, obs, ObsKind::Error, None)
     }
 }
 
@@ -1594,6 +1680,7 @@ async fn dispatch(
     mcp: &McpSession,
     custom: &Toolbox,
     skills: &Skills,
+    cap: usize,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -1607,9 +1694,15 @@ async fn dispatch(
                         .take(OBS_GREP_CAP)
                         .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
                         .collect();
-                    Dispatched::go(
+                    Dispatched::seen(
                         format!("grep {pattern:?} ({} hits)", hits.len()),
-                        format!("\n[grep {pattern:?}]\n{}\n", shown.join("\n")),
+                        bound(
+                            &format!("\n[grep {pattern:?}]\n{}\n", shown.join("\n")),
+                            cap,
+                            ObsKind::Grep,
+                        ),
+                        ObsKind::Grep,
+                        Some(pattern.to_string()),
                     )
                 }
                 Err(e) => Dispatched::go("grep error", format!("\n[grep error] {e}\n")),
@@ -1618,9 +1711,15 @@ async fn dispatch(
         FIND_TOOL => {
             let glob = s("name_glob").or_else(|| s("glob")).unwrap_or_default();
             match ws.find(glob) {
-                Ok(paths) => Dispatched::go(
+                Ok(paths) => Dispatched::seen(
                     format!("find {glob:?} ({} paths)", paths.len()),
-                    format!("\n[find {glob:?}]\n{}\n", paths.join("\n")),
+                    bound(
+                        &format!("\n[find {glob:?}]\n{}\n", paths.join("\n")),
+                        cap,
+                        ObsKind::Find,
+                    ),
+                    ObsKind::Find,
+                    Some(glob.to_string()),
                 ),
                 Err(e) => Dispatched::go("find error", format!("\n[find error] {e}\n")),
             }
@@ -1635,7 +1734,9 @@ async fn dispatch(
                 } => match ws.read_file(&target) {
                     Ok(c) => Dispatched::Continue {
                         decision: format!("read {target}"),
-                        obs: format!("\n[read {target}]\n{}\n", tail(&c, OBS_READ_CAP)),
+                        obs: format!("\n[read {target}]\n{}\n", bound(&c, cap, ObsKind::Read)),
+                        kind: ObsKind::Read,
+                        target: Some(target.clone()),
                         remember,
                     },
                     Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
@@ -1674,7 +1775,13 @@ async fn dispatch(
                     match ws.write_file(&target, &body) {
                         Ok(()) => Dispatched::Continue {
                             decision: format!("wrote {target}"),
-                            obs: format!("\n[wrote {target}]\n"),
+                            obs: bound(
+                                &format!("\n[wrote {target}] ({} chars)\n", body.chars().count()),
+                                cap,
+                                ObsKind::Write,
+                            ),
+                            kind: ObsKind::Write,
+                            target: Some(target.clone()),
                             remember,
                         },
                         Err(e) => Dispatched::go("write error", format!("\n[write error] {e}\n")),
@@ -1712,12 +1819,14 @@ async fn dispatch(
                 } => match std::fs::read_to_string(&target) {
                     Ok(body) => {
                         // Capped where it enters the context, like every other
-                        // tool result: the observation log is re-sent whole.
-                        let (body, truncated) = crate::tools::cap_result(body);
+                        // tool result, under the same budget-derived cap.
+                        let (body, truncated) = crate::tools::cap_result(body, cap);
                         info!(run_id, step, skill = name, truncated, "skill read");
                         Dispatched::Continue {
                             decision: format!("read skill {name}"),
                             obs: format!("\n[skill {name}]\n{body}\n"),
+                            kind: ObsKind::Skill,
+                            target: Some(name.to_string()),
                             remember,
                         }
                     }
@@ -1747,11 +1856,13 @@ async fn dispatch(
                     let tool = custom.get(name).expect("owns() and get() agree");
                     match tool.invoke(&call.arguments).await {
                         Ok(out) => {
-                            let (out, truncated) = crate::tools::cap_result(out);
+                            let (out, truncated) = crate::tools::cap_result(out, cap);
                             info!(run_id, step, tool = name, truncated, "registered tool call");
                             Dispatched::Continue {
                                 decision: format!("called {name}"),
                                 obs: format!("\n[{name}]\n{out}\n"),
+                                kind: ObsKind::Tool,
+                                target: Some(name.to_string()),
                                 remember,
                             }
                         }
@@ -1763,6 +1874,8 @@ async fn dispatch(
                             Dispatched::Continue {
                                 decision: format!("{name} failed"),
                                 obs: format!("\n[{name} error] {e}\n"),
+                                kind: ObsKind::Error,
+                                target: None,
                                 remember,
                             }
                         }
@@ -1789,8 +1902,15 @@ async fn dispatch(
                     format!("\n[{name} refused]{why} — the policy forbids calling this tool\n"),
                 ));
             }
-            let out = mcp.call(name, &call.arguments, store, run_id, step).await?;
-            Dispatched::go(format!("called {name}"), format!("\n[{name}]\n{out}\n"))
+            let out = mcp
+                .call(name, &call.arguments, store, run_id, step, cap)
+                .await?;
+            Dispatched::seen(
+                format!("called {name}"),
+                format!("\n[{name}]\n{out}\n"),
+                ObsKind::Mcp,
+                Some(name.to_string()),
+            )
         }
         other => Dispatched::go(
             format!("unknown tool {other}"),
