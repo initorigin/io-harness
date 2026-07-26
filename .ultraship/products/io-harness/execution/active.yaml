@@ -3,23 +3,21 @@ version: 0.12.0
 execution_state: DEVELOPING
 checkpoint: null
 blockers:
-- task: US-IO-HARNESS-0.12.0-T09
-  criterion: F10
-  evidence: F10 requires that a recorded case killed mid-run and resumed produces the same canonical trace
-    as the uninterrupted replay. Implemented and disproved. ContextLedger::new() (src/run.rs:1183 and
-    :1758) builds the observation ledger in memory, and 0.7.0's resume never restores it, so a resumed
-    run re-assembles context from the workspace and sends the model a prompt the recording never saw.
-    The replay correctly refuses with a typed divergence error rather than answering. Replay is not the
-    cause and no replay design fixes it.
-  why_out_of_scope: Making a resumed run reproduce an uninterrupted one means checkpointing the context
-    ledger, which is context-assembly work. This contract's excluded list names 'Any change to the 0.10.0
-    assembler's rules'.
-  consequence: 'A resumed run is not the same run as an uninterrupted one. That matters beyond replay:
-    anything scoring long unattended runs, which are the runs most likely to be resumed, is comparing
-    something subtly different.'
-  recommendation: Run /ultraship:iterate. Narrow F10 to uninterrupted replay plus the divergence-reporting
-    boundary the test now pins, and record the ledger limitation in known_limitations. Everything F10
-    does not block is continuing.
+- US-IO-HARNESS-0.12.0-T09 / criterion F10 — BLOCKED, needs /ultraship:iterate. F10 requires that a recorded
+  case killed mid-run and resumed produces the same canonical trace as the uninterrupted replay. Implemented
+  and disproved. ContextLedger::new() (src/run.rs:1183 and :1758) builds the observation ledger in memory,
+  and 0.7.0's resume never restores it, so a resumed run re-assembles context from the workspace and sends
+  the model a prompt the recording never saw. The replay correctly refuses with a typed divergence error
+  rather than answering. Replay is not the cause and no replay design fixes it.
+- 'Why it is out of scope to fix here: Making a resumed run reproduce an uninterrupted one means checkpointing
+  the context ledger, which is context-assembly work. This contract''s excluded list names ''Any change
+  to the 0.10.0 assembler''s rules''.'
+- 'Consequence beyond replay: A resumed run is not the same run as an uninterrupted one. That matters
+  beyond replay: anything scoring long unattended runs, which are the runs most likely to be resumed,
+  is comparing something subtly different.'
+- 'Recommendation: Run /ultraship:iterate. Narrow F10 to uninterrupted replay plus the divergence-reporting
+  boundary the test now pins, and record the ledger limitation in known_limitations. Everything F10 does
+  not block is continuing.'
 constraints:
   time: 'One working session, continuous. The owner asked for 0.12.0 to be planned, built and shipped
     in this session, as 0.10.0 and 0.11.0 both were before it. Stated this session as "commit constantly,
