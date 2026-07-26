@@ -164,7 +164,7 @@ versions:
       harness defines these surfaces on its own contract, and the applications are built against
       them, not the reverse.
     detail: specified
-    status: planned
+    status: released
   - version: 0.13.0
     outcome: >
       A developer runs a task over real documents: the agent creates and edits Word, Excel,
@@ -184,9 +184,9 @@ versions:
   - version: 0.15.0
     outcome: >
       A developer arriving at the crate cold can tell what it does and start using it, and a
-      developer depending on it knows what may change. The README becomes a landing page rather
-      than a release history — one description, a quickstart above the fold, badges, the MSRV, and
-      what the harness does today instead of what each version added — with the per-capability depth
+      developer depending on it knows what may change. The README becomes a landing page rather than
+      a release history — one description, a quickstart above the fold, badges, the MSRV, and what
+      the harness does today instead of what each version added — with the per-capability depth
       moved into guide pages under docs/ so nothing is lost. Every public item carries a worked
       example, each breaking change between 0.x minors is called out in the changelog with a
       migration note, and renamed or removed items go through a deprecation cycle instead of

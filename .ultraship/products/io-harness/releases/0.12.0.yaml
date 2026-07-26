@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.12.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: 'A developer embedding the harness can watch a run as it happens, and a developer measuring
@@ -770,3 +770,182 @@ open_questions:
   for trees. Decided in development, and stated narrowly rather than broadly.
 
   '
+released_at: '2026-07-27T00:00:00Z'
+mode: published
+delivered: 'The twelfth and last pillar. A developer embedding the harness can now watch a run as it happens,
+  and a developer measuring it can prove a change made things better.
+
+
+  Watching was not supported at all: src/lib.rs exported no observer, callback or channel, so an application
+  showing progress had to open the SQLite file with a second connection and poll a schema the crate never
+  promised -- having first configured the file itself, because Store::open set neither WAL nor a busy
+  timeout. An Observer is now called as the run proceeds, for all seventeen kinds of thing the trace records,
+  and every event serialises to a flat tagged JSON object so a host can forward it to a UI in another
+  language without hand-writing a mapping. The events are asserted against the trace the same run wrote,
+  so the two surfaces cannot drift into disagreeing. A run can also be stopped from outside it for the
+  first time: previously the only way was to drop the future, which left runs.status as running forever,
+  indistinguishable from a crash.
+
+
+  Measuring had no surface either. Nothing recorded a provider response and the provider types carried
+  no serde derives, so there was no format to record into. Record and Replay are now combinators over
+  the Fallback pattern; recordings go to a file rather than the store because the type system forced it
+  -- Provider::complete''s future must be Send and rusqlite::Connection is !Sync -- and Replay keys on
+  request content rather than a call counter, which is what makes it compose with 0.7.0''s resume instead
+  of fighting it.
+
+
+  The determinism defects mattered more than the features. src/context.rs rendered run_id into every memory
+  note, and run_id is an AUTOINCREMENT, so the same case run twice sent the model different prompt bytes
+  -- persisted into steps.prompt. Sub-agent results composed in buffer_unordered completion order, so
+  steps.decision and steps.result varied run to run. Both are fixed, and the comparison that proves it
+  is itself proven capable of failing: two negative controls reintroduce exactly those divergences and
+  must break equality.
+
+
+  A finished run now reports whether it worked, how many steps it took, what it spent and how long it
+  took. Three of those were derivable only by knowing which of eleven free-text strings means success,
+  that steps is MAX(step) and not COUNT(*) because retry rows share a step number, and that spend is SUM(steps.tokens).
+  The fourth was not available at all: nothing recorded when a run ENDED.
+
+
+  The audit for this release found twelve defects the roadmap had not anticipated, including one that
+  was security-relevant: a run a human refused network egress for, when resumed, dialled the socket, wrote
+  the file and reported Success -- because "refused" had no RunOutcome variant and resume substitutes
+  a permissive policy. And 0.11.0''s O4 had shipped as documentation of a capability nobody had: the request
+  deadline was documented as overridable while every path to it was pub(crate).
+
+
+  All twelve pillars now hold.'
+evidence:
+  tests:
+  - 'cargo test -- 397 passed, 0 failed across 26 targets (341 across 19 at 0.11.0; +56). New targets:
+    tests/observe.rs (13), tests/replay.rs (8), tests/determinism.rs (7), tests/outcome_record.rs (8),
+    tests/store_open.rs (4), tests/deadline.rs (2).'
+  - 'F1 green -- the_event_stream_reports_the_same_facts_as_the_trace_in_the_same_order drives one run
+    through a provider failure, a retry, a fallback on every step, six committed steps, a replan and a
+    stall, then compares the event stream against Store::steps and Store::context_events. It found a real
+    asymmetry rather than rubber-stamping: the trace records prose, the event carries Replan { window:
+    3 }. The test now asserts the sequence agrees AND that the number matches the prose, instead of demanding
+    the event repeat a sentence it deliberately does not carry.'
+  - 'Eleven more agreement tests, each asserting an event projection EQUALS a store projection rather
+    than a literal: refusals against policy_events, approvals against the decision rows, tool calls against
+    the step row, memory writes against the context row, sandbox events against sandbox_events (real sandboxed
+    rustc), MCP events against mcp_events (real stdio fixture server), and a denied network host against
+    its policy_events row.'
+  - 'F2/NF2 green -- an_unobserved_run_writes_the_same_trace_and_makes_the_same_provider_calls: identical
+    rows, identical context events, identical outcome and an unmoved call counter.'
+  - F3 green -- every variant round-trips through serde_json to an equal value, each has a distinct wire
+    tag, and the flat shape is pinned. every_kind() carries a compiler-enforced exhaustiveness guard,
+    so a new variant cannot silently escape those tests.
+  - 'F4 green -- a_step_left_uncommitted_for_replay_is_not_announced_as_a_step: an agent paused by a CHILD''s
+    deferral leaves its step uncommitted so a resume replays it, and asserts the root''s trace AND its
+    event stream are both empty while the child commits and announces normally. Treating that as an ordinary
+    commit would reintroduce the double-execution bug 0.7.0 exists to prevent.'
+  - 'F5 green -- an_observer_can_cancel_a_run_which_then_stays_resumable: Cancelled { steps: 1 }, provider
+    called once, status not running, and a resume reports Cancelled with the call count unmoved.'
+  - 'F7 green -- a_response_the_trace_would_mangle_survives_the_round_trip: text alongside tool calls
+    (dropped by the trace), prompt_tokens and completion_tokens separately (collapsed by the trace), and
+    a literal pipe in three argument positions (corrupted by the trace''s join).'
+  - 'F8/F9 green -- one case recorded and replayed twice into fresh stores compares equal, and separately
+    matches the run it was recorded from, since two replays could agree while both differing from reality.
+    The two negative controls MUST fail and do: a run_id reintroduced into the prompt, and children composed
+    in completion order. A third test asserts identically-built traces DO compare equal, so the controls
+    detect the injected difference rather than the fact that any two stores differ.'
+  - 'F10 green in both halves after the I01 amendment: a_single_file_replay_does_survive_being_interrupted_and_resumed
+    reproduces the uninterrupted replay exactly with a freshly loaded Replay, and a_resumed_replay_reports_divergence_rather_than_inventing_an_answer
+    proves a workspace resume is refused with a typed non-retryable error rather than answered from the
+    wrong recording.'
+  - F11/F12/F13 green -- every summary field asserted against an independently computed value, never against
+    the row that wrote it; duration asserted as a bound, never an equality. A paused run has no summary
+    until it really ends; a pre-0.12.0 run reports None rather than zeroes.
+  - 'F14 green, and the regression is sharper than expected. Deleting the new terminal_outcome arm and
+    re-running made the resumed run report Success { steps: 1 }: resume substitutes Policy::permissive()
+    and ApproveAll, so a run a human refused network egress for was resumed under a permissive policy,
+    dialled the socket and completed. The test counts approver calls, because ''the human was not asked
+    twice'' is not observable from the outcome.'
+  - 'F16 green -- a_tree_halts_on_its_duration_ceiling_instead_of_ignoring_it, with the opt-in half asserted
+    too: a tree with no ceiling still reaches its step cap unchanged.'
+  - F17 green -- tests/deadline.rs is an INTEGRATION test on purpose, since that is the only thing that
+    proves an item is reachable from outside the crate. That is the exact mistake 0.11.0's O4 made.
+  builds:
+  - CI run 30209627766 -- test (ubuntu-latest), test (windows-latest), test (macos-latest), lint and msrv
+    ALL green on one commit. No leg skipped, excluded or marked continue-on-error.
+  - 'cargo clippy --all-targets -- -D warnings: exit 0. cargo fmt --check: exit 0. MSRV 1.88 holds.'
+  - 'cargo package -- 87 files, verify build clean. Security gate: the packaged list contains .env.example,
+    whose values are all empty placeholders, and does NOT contain the real .env. Checked, not assumed.'
+  - NF1 -- no new runtime dependency. git diff v0.11.0..HEAD on Cargo.toml shows no dependency change;
+    the observer needs no channel and therefore no tokio sync feature, which remains dev-only.
+  - 'NF5 -- the public surface diff is in evidence/0.12.0/. ZERO removals: no public item renamed or removed,
+    so the release takes NO breaking change at all. The contract permitted one (fields on RunResult) and
+    the implementation did not need it -- the summary is delivered by a method, so an exhaustive struct
+    pattern still compiles. The CHANGELOG''s promised migration note was removed because the break no
+    longer exists. The diff''s own blind spot is documented: it is line-based and deduplicated, so three
+    new provider with_timeout methods collapse into McpServer::with_timeout, which already existed with
+    an identical signature.'
+  - 'Scope discipline verified rather than assumed: no broadcast, mpsc or tokio::sync anywhere in src
+    outside approve.rs''s pre-existing cfg(test) module, and no circuit breaker, load balancer or price
+    table. Everything scope.excluded names is still absent.'
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- 'The record is sealed before the crates.io upload, which follows the two merges and the GitHub Release.
+  mode: published states the authorized target.'
+- 'A RESUMED RUN IS NOT THE SAME RUN. 0.7.0''s resume restores the durable half -- step, spend, elapsed
+  clock -- and drops the assembled half: the 0.10.0 context ledger is in memory only (src/run.rs:1183,
+  :1758), so a resumed workspace or sub-agent run re-derives its context from the workspace and asks the
+  model a different question. The agent usually recovers, which is why this went unnoticed through five
+  releases. It matters beyond replay: anything scoring long unattended runs is scoring the runs most likely
+  to have been resumed. Found by this release''s replay work, recorded in iterations/US-IO-HARNESS-0.12.0-I01,
+  and given a destination at roadmap 0.16.0. The single-file loop is unaffected -- its prompt comes from
+  the file on disk.'
+- 'RESUME SILENTLY DISCARDS THE CALLER''S POLICY. `resume` substitutes Policy::permissive() and ApproveAll
+  for any resumed workspace run, so a caller who ran under a restrictive policy via run_with and then
+  resumed via resume loses that boundary without being told. The crate states the opposite principle elsewhere
+  (src/run.rs:193-196: refusing a policy it cannot enforce rather than ignoring one), so this is a defect,
+  not a design. This release closes the specific path a human''s network refusal took, by making "refused"
+  terminal. The general case changes a public signature and is outside this contract''s scope. There is
+  currently NO policy-preserving general resume: resume_with_decision takes a policy but requires a request_id
+  and a pending Decision, so it only delivers an approval and cannot resume a run that merely crashed.
+  Until it is fixed, re-run rather than resume when the boundary matters.'
+- Replay's guarantee is narrow and stated narrowly. It does not cover a diverged prompt (a reworded goal,
+  an edited fixture, or an observation that differs produces an unrecorded request -- reported, never
+  absorbed), duplicate identical requests across a process restart (the per-key cursor is in memory, so
+  a resumed process re-serves the first answer for a key whose ask was really the second), or ordering
+  past a key's recorded answers (the last one repeats). An overstated determinism claim is worse than
+  a narrow one.
+- canonical_trace assumes each run being compared has its own fresh store. Run ids are excluded from the
+  text, but a child agent's run id is embedded in its parent's composed observation, which is real content
+  the model was shown.
+- Cancellation requested on the LAST step of a budget has no next boundary, so that run reports StepCapReached
+  rather than Cancelled. It stopped anyway.
+- A panicking observer takes the run's future with it and leaves the run row running. event() returns
+  no Result on purpose -- an observer is a spectator and must not be able to fail a run -- but a panic
+  is not absorbed, and that is documented rather than hidden.
+- Observer::event is called synchronously on the run's own task, so a slow observer slows the run. Documented;
+  the contract is to push to a queue and do the work elsewhere.
+- Store::open now sets journal_mode = WAL, which is a persistent property of the DATABASE FILE, not of
+  the connection. A store opened once by 0.12.0 stays in WAL afterwards and rolling back to 0.11.0 does
+  not undo it. 0.11.0 reads WAL happily; it simply never set it.
+- Containment::max_total_cost remains unenforceable and is now documented as inert rather than left looking
+  functional. A provider reports tokens and never a price, so any figure compared against would be one
+  the harness invented. Bound spend with max_total_tokens.
+- Spend is tokens everywhere in the outcome record. There is still no cost telemetry, so a scoring tool
+  comparing money must convert at its own provider's rate.
+- 'The live-run evidence O7 asks for was NOT produced: no run against a real provider was made this session.
+  The observer, replay and record paths are covered by fixtures including real local sockets, a real stalling
+  socket, a real sandboxed rustc and a real stdio MCP server -- but that is not the same claim as a live
+  model run, and it is recorded as not done rather than counted as done.'
+- 'The README''s factual errors are corrected but its structure is unchanged: it is still organised as
+  a per-release history rather than a landing page. That rewrite, with the per-capability depth moved
+  into docs/ guide pages, is deliberately 0.15.0''s subject so the documentation describes a finished
+  twelve-pillar harness once instead of being redrafted after each pillar.'
+- Windows containment is still the portable floor with a wall-clock cap only, and Backend::WindowsJobObject
+  remains a public variant nothing constructs on the enforcement path. Unchanged since 0.9.1; it needs
+  a windows-sys binding and its own release.
+- Every Windows claim in this record rests on CI run 30209627766. Nobody on this project has a Windows
+  machine.
+supersedes: 0.11.0
+next_recommended_version: 0.13.0
+immutable: true
