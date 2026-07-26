@@ -10,6 +10,10 @@
 //! `explain` — so an explanation can never describe a boundary different from
 //! the one enforced.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::{OnceLock, PoisonError, RwLock};
+
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
@@ -346,7 +350,7 @@ impl Policy {
                 for rule in &layer.rules {
                     if rule.act == act
                         && rule.effect == effect
-                        && forms.iter().any(|t| matches(&rule.pattern, t))
+                        && forms.iter().any(|t| matches(act, &rule.pattern, t))
                     {
                         return Verdict {
                             effect,
@@ -377,15 +381,99 @@ impl Policy {
     }
 }
 
+/// Fold a path-valued pattern or target into the one form both sides are
+/// compared in. Windows only, and applied identically to pattern and target so
+/// there is a single definition of "the same path":
+///
+/// * a `\\?\` verbatim prefix is stripped (`\\?\UNC\srv\share` becomes
+///   `\\srv\share`), because that prefix is something [`std::fs::canonicalize`]
+///   adds and no human writes in a rule; then
+/// * `\` becomes `/`, because on Windows both are directory separators.
+///
+/// Without this a deny built from a canonicalized [`std::path::Path`] — which is
+/// what the harness itself and any caller doing `deny_read(format!("{}/*", p))`
+/// produce — never matched the backslash target it was meant to cover, and the
+/// read was *allowed*. A permission rule that misses fails open, so this is the
+/// security-relevant half of matching, not a cosmetic tidy-up.
+///
+/// Deliberately a no-op on unix, where `\` is an ordinary character in a file
+/// name: folding it to `/` there would make two genuinely different paths match,
+/// which is the same fail-open bug pointed the other way.
+#[cfg(windows)]
+fn normalise_path(s: &str) -> Cow<'_, str> {
+    let stripped = match s.strip_prefix(r"\\?\UNC\") {
+        Some(rest) => Cow::Owned(format!(r"\\{rest}")),
+        None => Cow::Borrowed(s.strip_prefix(r"\\?\").unwrap_or(s)),
+    };
+    match stripped.contains('\\') {
+        true => Cow::Owned(stripped.replace('\\', "/")),
+        false => stripped,
+    }
+}
+
+/// See the Windows definition. On unix `\` is a legal filename character, so
+/// normalising it would silently merge distinct paths — matching stays literal.
+#[cfg(not(windows))]
+fn normalise_path(s: &str) -> Cow<'_, str> {
+    Cow::Borrowed(s)
+}
+
+/// Compiled globs, keyed by the whole (normalised) pattern text.
+///
+/// The key is whatever text [`matches`] hands over — already run through
+/// [`normalise_path`] for a path act — so the key is always exactly the string
+/// that was compiled. Two raw patterns that normalise to one form share an
+/// entry, which is correct: they denote the same location.
+///
+/// Safe as a process-wide cache because compilation is a pure function of that
+/// text and nothing else: no act, no effect, no layer, no target enters
+/// [`glob_to_regex`], and the cache stores the regex, never a verdict. So a hit
+/// can only ever hand back the regex that same pattern would have compiled to,
+/// and a pattern appearing in two layers — or in a parent and the child that
+/// [`Policy::contain`] narrows — still decides through its own rule's act,
+/// effect, and layer position. A failed compile is cached as `None`, keeping a
+/// malformed glob matching nothing exactly as before.
+// ponytail: unbounded — one entry per distinct pattern text ever checked.
+// Patterns come from policy configs, not from the model, so the set is small and
+// fixed; bound it (LRU, or a per-Policy cache) only if a caller ever generates
+// pattern text at runtime.
+static GLOBS: OnceLock<RwLock<HashMap<String, Option<regex::Regex>>>> = OnceLock::new();
+
+/// [`glob_to_regex`] memoised on the pattern text. `None` is a malformed glob.
+fn compiled(pattern: &str) -> Option<regex::Regex> {
+    let cache = GLOBS.get_or_init(Default::default);
+    if let Some(hit) = cache
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(pattern)
+    {
+        return hit.clone();
+    }
+    // The error is dropped here as it always was — a bad glob is silent and
+    // matches nothing; surfacing it would be a behaviour change, not a fix.
+    let re = glob_to_regex(pattern).ok();
+    cache
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(pattern.to_string(), re.clone());
+    re
+}
+
 /// Does `pattern` match `target`, by full relative path or by basename?
 ///
 /// Basename matching is what lets a bare `.env` deny `config/.env`, and mirrors
 /// how the `find` tool already matches globs.
-// ponytail: compiles the glob per check. Cache compiled regexes if a policy ever
-// carries hundreds of rules; a handful per tool call is not worth the machinery.
-fn matches(pattern: &str, target: &str) -> bool {
-    let target = target.replace('\\', "/");
-    let Ok(re) = glob_to_regex(pattern) else {
+///
+/// `act` decides whether the two sides are paths. [`Act::Read`] and
+/// [`Act::Write`] target paths and are normalised (see [`normalise_path`]);
+/// [`Act::Exec`] targets a binary *name* and [`Act::Net`] a host, where `\` is
+/// not a separator and rewriting it would change what a rule means.
+fn matches(act: Act, pattern: &str, target: &str) -> bool {
+    let (pattern, target) = match act {
+        Act::Read | Act::Write => (normalise_path(pattern), normalise_path(target)),
+        Act::Exec | Act::Net => (Cow::Borrowed(pattern), Cow::Borrowed(target)),
+    };
+    let Some(re) = compiled(&pattern) else {
         return false; // a malformed glob matches nothing rather than everything
     };
     if re.is_match(&target) {
@@ -735,6 +823,175 @@ mod tests {
             p.check(Act::Net, "anywhere.example.com:443").effect,
             Effect::Allow
         );
+    }
+
+    #[test]
+    fn the_glob_cache_cannot_make_one_pattern_answer_another_pattern_s_question() {
+        // Patterns a sloppy key — a prefix, a basename, a normalised form, an
+        // invented hash — would conflate. Each pair must keep deciding apart,
+        // and must decide the same on the second pass, which runs off the cache.
+        let p = Policy::permissive()
+            .layer("l")
+            .deny_read("secrets/*")
+            .allow_read("secrets-public/*")
+            .deny_read("a?.txt")
+            .deny_read("build/*/out")
+            .allow_read("build/x/out.bak");
+        let probes = [
+            ("secrets/k", Effect::Deny),
+            ("secrets-public/k", Effect::Allow),
+            ("ab.txt", Effect::Deny),
+            ("abc.txt", Effect::Allow), // `?` is one char, `*` is any run
+            ("build/x/out", Effect::Deny),
+            ("build/x/out.bak", Effect::Allow),
+        ];
+        for pass in 0..2 {
+            for (path, want) in probes {
+                assert_eq!(p.check(Act::Read, path).effect, want, "pass {pass}: {path}");
+            }
+        }
+
+        // The same pattern text in two layers with opposite effects: the cache
+        // holds a regex, not a verdict, so deny-first still decides regardless
+        // of which layer compiled the text first, in either stacking order.
+        let allow_first = Policy::permissive()
+            .layer("a")
+            .allow_exec("tool")
+            .layer("b")
+            .deny_exec("tool");
+        let deny_first = Policy::permissive()
+            .layer("b")
+            .deny_exec("tool")
+            .layer("a")
+            .allow_exec("tool");
+        for p in [&allow_first, &deny_first] {
+            let v = p.check(Act::Exec, "tool");
+            assert_eq!(v.effect, Effect::Deny);
+            assert_eq!(v.layer.as_deref(), Some("b"));
+        }
+        // And a layer whose only rule allows that same text still allows it —
+        // it did not inherit the other stack's deny along with the regex.
+        let alone = Policy::permissive().layer("a").allow_exec("tool");
+        assert_eq!(alone.check(Act::Exec, "tool").effect, Effect::Allow);
+
+        // Same text again across a containment boundary: the child's allow is
+        // dropped, the parent's deny stands, and the parent alone is unchanged.
+        let parent = Policy::permissive().layer("parent").deny_write("shared/*");
+        let child = Policy::permissive().layer("child").allow_write("shared/*");
+        assert_eq!(
+            parent.contain(&child).check(Act::Write, "shared/f").effect,
+            Effect::Deny
+        );
+        assert_eq!(child.check(Act::Write, "shared/f").effect, Effect::Allow);
+    }
+
+    // --- 0.9.1: separator-agnostic path matching on Windows (fail-open fix). ---
+
+    #[cfg(windows)]
+    #[test]
+    fn a_path_rule_matches_whichever_separator_either_side_spelled() {
+        // The shape that failed open: a pattern built from a canonicalized Path
+        // (backslashes, verbatim prefix) with a `/*` suffix appended by the
+        // caller, against the backslash target canonicalize hands back.
+        let p = Policy::permissive()
+            .layer("base")
+            .deny_read(r"\\?\C:\Users\me\skills/*");
+        assert_eq!(
+            p.check(Act::Read, r"\\?\C:\Users\me\skills\beta\SKILL.md")
+                .effect,
+            Effect::Deny
+        );
+        // A human writing the same rule in the plain, forward-slash form covers
+        // that verbatim target too.
+        let plain = Policy::permissive().layer("base").deny_read("C:/secrets/*");
+        assert_eq!(
+            plain.check(Act::Read, r"\\?\C:\secrets\token.txt").effect,
+            Effect::Deny
+        );
+        // And backslash-for-backslash, the form 0.4.0 through 0.9.0 missed.
+        let backslash = Policy::permissive()
+            .layer("base")
+            .deny_write(r"C:\secrets\*");
+        assert_eq!(
+            backslash.check(Act::Write, r"C:\secrets\token.txt").effect,
+            Effect::Deny
+        );
+        // Symmetric: the same rule catches the forward-slash spelling too.
+        assert_eq!(
+            backslash.check(Act::Write, "C:/secrets/token.txt").effect,
+            Effect::Deny
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_unc_share_matches_with_or_without_the_verbatim_prefix() {
+        let p = Policy::permissive()
+            .layer("base")
+            .deny_read(r"\\srv\share\*");
+        assert_eq!(
+            p.check(Act::Read, r"\\?\UNC\srv\share\secret.txt").effect,
+            Effect::Deny
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn normalising_separators_does_not_make_two_different_paths_match() {
+        // The negative half: folding `\` to `/` must not widen a rule onto a
+        // path it never covered. If any of these turned Deny, normalisation is
+        // over-matching and the fix is worse than the bug.
+        let p = Policy::permissive()
+            .layer("base")
+            .deny_read(r"C:\secrets\*")
+            .deny_read(r"C:\a\b.txt");
+        for allowed in [
+            r"C:\secrets-public\k",  // prefix, not the same directory
+            r"D:\secrets\k",         // different volume
+            r"C:\other\secrets.txt", // basename is not the directory
+            r"C:\a\b.txt.bak",       // suffix past the pattern
+            r"C:\ab.txt",            // the separator is not nothing
+        ] {
+            assert_eq!(
+                p.check(Act::Read, allowed).effect,
+                Effect::Allow,
+                "{allowed} must not be caught by a rule for a different path"
+            );
+        }
+        // Exec and net are names, not paths: a `\` in one stays a literal
+        // character, so 0.9.0's routing of them through check() is untouched.
+        let names = Policy::permissive()
+            .layer("base")
+            .deny_exec(r"tools\build.exe")
+            .deny_net(r"a\b.example.com");
+        assert_eq!(
+            names.check(Act::Exec, "tools/build.exe").effect,
+            Effect::Allow
+        );
+        assert_eq!(
+            names.check(Act::Exec, r"tools\build.exe").effect,
+            Effect::Deny
+        );
+        assert_eq!(
+            names.check(Act::Net, "a/b.example.com:443").effect,
+            Effect::Allow
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_backslash_is_an_ordinary_filename_character_on_unix() {
+        // `a\b.txt` is one file here, not `a/b.txt`. Normalising would merge
+        // two distinct paths — a fail-open bug in the other direction — so the
+        // Windows folding is cfg'd out and matching stays literal.
+        let p = Policy::permissive().layer("base").deny_read(r"a/b.txt");
+        assert_eq!(p.check(Act::Read, r"a\b.txt").effect, Effect::Allow);
+        assert_eq!(p.check(Act::Read, "a/b.txt").effect, Effect::Deny);
+
+        // And a rule naming the literal backslash catches only it.
+        let literal = Policy::permissive().layer("base").deny_read(r"a\b.txt");
+        assert_eq!(literal.check(Act::Read, r"a\b.txt").effect, Effect::Deny);
+        assert_eq!(literal.check(Act::Read, "a/b.txt").effect, Effect::Allow);
     }
 
     #[test]

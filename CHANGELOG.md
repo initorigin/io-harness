@@ -26,6 +26,91 @@ notes are produced from it.
 
 ### Security
 
+## [0.9.1] - 2026-07-26
+
+The first release verified on more than one operating system. 0.9.0 added the
+repository's first CI and its Linux and Windows legs went red immediately —
+not from anything 0.9.0 introduced, but from defects that had been shipping
+since 0.3.0, 0.4.0 and 0.6.0 and that no amount of local testing could see.
+This release makes the three-OS matrix green.
+
+Nothing here changes the public API. Every fix is behaviour that was already
+promised and not delivered on a platform other than macOS.
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **A path deny rule no longer fails open on Windows.** `Act::Read` and
+  `Act::Write` patterns were matched against targets literally, so a rule and a
+  target that named the same file with different separators did not match — and
+  a rule built from a `Path`, as `std::fs::canonicalize` returns one
+  (`\\?\C:\...`, backslashes), never matched the target it was written to cover.
+  The deny simply did not fire and the access was **allowed**. Any consumer
+  writing `deny_read("C:/secrets/*")`, or deriving a pattern from a path, had no
+  protection there. Latent since 0.4.0 and unseen because the suite had never
+  run on Windows. Both the pattern and the target now go through one
+  normalisation — verbatim `\\?\` and `\\?\UNC\` prefixes stripped, `\` folded
+  to `/` — so the two sides agree on what "the same path" is. Scoped to path
+  acts: `Act::Exec` targets a binary name and `Act::Net` a host, where `\` is
+  not a separator, and both keep matching literally. Scoped to Windows: on unix
+  `\` is a legal filename character, and folding it would merge two distinct
+  paths — the same fail-open bug reversed — so unix matching is now literal
+  there too, where the target (but not the pattern) had previously been folded.
+- **The Linux sandbox no longer fails every verification on a kernel that
+  restricts unprivileged user namespaces.** The `unshare` wrapper was never
+  probed and was selected unconditionally on Linux, so on hosts such as Ubuntu
+  24.04 (`kernel.apparmor_restrict_unprivileged_userns=1`) every sandboxed
+  `rustc` spawn failed and the caller was told its code had failed to compile.
+  The wrapper is now probed once per process; when it does not work the run
+  degrades to the portable floor and *reports* `Backend::PortableFloor`, which
+  the trace records, so a degraded run is auditable rather than silent.
+- **A sandbox wrapper failure is no longer reported as a failed verification.**
+  When the `unshare` wrapper itself fails, the command never ran, and that is now
+  `Error::Sandbox` instead of an indistinguishable "verification failed". A
+  failing command's own stderr is also no longer discarded — both the sandboxed
+  and the direct-host exec paths log it, so a diagnosis reads the compiler's
+  error instead of inferring it.
+- **The CPU cap now names itself on Linux.** Caps were applied with the soft and
+  hard `rlimit` equal; Linux tests the hard limit first and `SIGKILL`s there, so
+  `SIGXCPU` was never sent and a CPU-exhausted run was reported with no
+  `cap_hit`. The hard limit is now kept one above the soft one, clamped to what
+  `getrlimit` reports so it is never raised. A cap that cannot be applied now
+  fails the spawn instead of silently running the payload uncapped.
+- **The memory cap now measures the process tree, not just the process it
+  spawned.** A payload that forks — which is what Linux `/bin/sh` does — grew in
+  a child the monitor never watched, so the cap never fired and the run finished
+  cleanly. The monitor now sums RSS across the process and its descendants and
+  kills descendants first. It also no longer treats an unreadable process table
+  as "the process is gone", which previously switched the cap off for the rest of
+  the run after a single hiccup.
+- **The wall-clock cap now actually kills on Windows, and its kill reaches the
+  whole process tree everywhere.** The timeout *owned* the child, so expiry
+  dropped it and the only kill left was `kill_on_drop`, which terminates the one
+  process the harness spawned and not the descendants a shell puts the real work
+  in. On unix those reparented; on Windows they also kept the pipes open, which
+  stranded the blocking reads tokio uses there and hung the caller's runtime long
+  after the cap had "fired" — a run that could never be stopped. The wait is now
+  its own task, so the child is still alive when the clock expires and is killed
+  by pid: `SIGKILL` descendants-first on unix, `taskkill /T` on Windows (a system
+  utility, not a new dependency).
+- **The sandbox no longer implies caps it cannot apply on Windows.** The CPU cap
+  (`RLIMIT_CPU`) and the memory cap (an RSS monitor over `ps`) are unix
+  mechanisms; on Windows neither is applied, so the floor there enforces the
+  **wall clock only** — no CPU, memory, or process cap, and no kernel network
+  boundary. A `Cap::Cpu` or `Cap::Memory` hit is never reported on a platform
+  that applied no such cap, a run configured with one warns once that it is not
+  in force, and the docs and README now say so, the same honesty 0.9.0 applied to
+  the backend label.
+
+### Security
+
 ## [0.9.0] - 2026-07-26
 
 The tool layer, closed. 0.8.0 made the crate extensible *out of process*, which

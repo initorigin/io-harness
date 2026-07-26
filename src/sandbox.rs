@@ -13,8 +13,9 @@
 //! unimplemented) — over a [portable floor](FloorSandbox) (fresh subprocess,
 //! ephemeral tempdir, resource caps, network env stripped) that compiles and runs
 //! on all three, so isolation is never *absent* on any OS the crate builds for.
-//! [`select`] picks the backend for this OS — at compile time, not by probing —
-//! and the one that ran is recorded.
+//! [`select`] picks the strongest backend this host can actually deliver — the
+//! candidate by cfg, degraded to the floor if its primitive turns out to be
+//! unavailable — and the one that ran is recorded.
 //!
 //! ## Backend isolation strength (documented, not hidden)
 //!
@@ -22,11 +23,20 @@
 //!   to the workdir and denies network; `setrlimit` caps CPU/procs/fds; memory is
 //!   capped by an RSS monitor (macOS does not enforce `RLIMIT_AS`/`RLIMIT_DATA`).
 //! - **Linux namespaces** — user + mount + pid + net namespaces give a hard
-//!   network boundary and a private tmpfs; seccomp + rlimits on top. *(cfg-gated,
-//!   not live-run on the macOS build host.)*
+//!   network boundary and a private tmpfs; seccomp + rlimits on top. Probed at
+//!   runtime: a kernel that restricts unprivileged user namespaces gets the
+//!   portable floor, reported as such. *(cfg-gated, not live-run on the macOS
+//!   build host.)*
 //! - **Windows** — *no native backend yet.* The Job Object was designed but
 //!   never implemented (no Win32 call is made), so a Windows run gets the
-//!   portable floor and reports it as such. See [`windows`].
+//!   portable floor and reports it as such. On Windows that floor enforces the
+//!   **wall clock only**: no CPU cap, no memory cap, and no process cap — all
+//!   three are unix `rlimit`/`ps` mechanisms with no Windows equivalent until the
+//!   Job Object lands — and no kernel network boundary either, only the
+//!   best-effort proxy-env strip. What it does have is an ephemeral workdir and a
+//!   wall-clock kill that reaches the whole process tree. A cap that is not
+//!   applied is never reported: [`Cap::Cpu`] and [`Cap::Memory`] are never
+//!   claimed on Windows. See [`windows`].
 //! - **Portable floor** — the weakest backend: filesystem-scoped (a fresh
 //!   ephemeral workdir) and resource-capped, **not a full syscall jail**. Network
 //!   deny is best-effort (proxy env stripped), *not* a kernel boundary. It exists
@@ -101,11 +111,18 @@ impl Cap {
 /// the sandbox entirely. Tighten via the fields for untrusted work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLimits {
-    /// Max CPU seconds before SIGXCPU. `None` = no CPU cap.
+    /// Max CPU seconds before SIGXCPU. `None` = no CPU cap. **Unix only** —
+    /// `RLIMIT_CPU` has no Windows equivalent, so this is not applied there and
+    /// [`Cap::Cpu`] is never reported.
     pub max_cpu_secs: Option<u64>,
     /// Max wall-clock seconds before the run is killed. `None` = no wall cap.
+    /// The one cap enforced on **every** platform, and on Windows the only one —
+    /// leaving it `None` there means the run is bounded by nothing.
     pub max_wall_secs: Option<u64>,
     /// Max resident bytes before the RSS monitor kills the run. `None` = no cap.
+    /// **Unix only** — the monitor reads the process table with `ps`, which does
+    /// not exist on Windows, so this is not applied there and [`Cap::Memory`] is
+    /// never reported.
     pub max_memory_bytes: Option<u64>,
     /// Max concurrent processes in the sandbox. Enforced only by the native
     /// backends that can scope it to the sandbox (Linux pid namespace, Windows
@@ -265,11 +282,18 @@ impl Sandbox for Selected {
     }
 }
 
-/// Pick the backend for this OS. The choice is made at **compile time** by cfg,
-/// not by probing the host: the native rung for this target, or the portable
-/// floor when `force_floor` skips it (so the floor can be exercised everywhere).
-/// There is no runtime capability check and so no runtime degradation — a native
-/// backend whose primitive is unavailable fails at spawn rather than falling back.
+/// Pick the strongest backend this host can actually deliver: the native rung
+/// for this target, or the portable floor when `force_floor` skips it (so the
+/// floor can be exercised everywhere).
+///
+/// The *candidate* is chosen at compile time by cfg, but a native backend whose
+/// primitive is unavailable degrades to the floor and reports
+/// [`Backend::PortableFloor`] rather than naming an isolation it did not apply —
+/// [`linux`] probes its `unshare` wrapper (0.9.1: Ubuntu 24.04 restricts
+/// unprivileged user namespaces, and every wrapped spawn failed there), and
+/// [`windows`] has no native backend to offer at all. Since the backend is
+/// recorded in the trace, a degraded run is auditable, not silent. Use
+/// [`Sandbox::backend`] on the result to see what will really run.
 pub fn select(config: &SandboxConfig) -> Selected {
     if !config.force_floor {
         #[cfg(target_os = "macos")]
@@ -305,10 +329,20 @@ impl Sandbox for FloorSandbox {
 /// live in one place.
 ///
 /// Caps:
-/// - **CPU** via `RLIMIT_CPU` (unix `pre_exec`) → SIGXCPU → [`Cap::Cpu`].
+/// - **CPU** via `RLIMIT_CPU` (unix `pre_exec`) → SIGXCPU → [`Cap::Cpu`]. *Unix
+///   only* — Windows has no equivalent and applies no CPU cap.
 /// - **Memory** via an RSS poll-and-kill monitor → [`Cap::Memory`] (macOS does
 ///   not enforce address-space rlimits, so a monitor is the portable mechanism).
-/// - **Wall** via a tokio timeout → [`Cap::Wall`].
+///   *Unix only* — the monitor reads the process table with `ps`, which does not
+///   exist on Windows, so no memory cap is applied there.
+/// - **Wall** via a tokio timeout → [`Cap::Wall`]. The one cap that applies on
+///   **every** platform, and therefore the only thing standing between a Windows
+///   run and running forever.
+///
+/// A cap the platform cannot apply is never *claimed*: [`SandboxOutcome::cap_hit`]
+/// only ever names a cap that really fired, and a run on a platform missing the
+/// CPU/memory mechanisms warns once rather than letting a caller believe the
+/// limits it configured are in force.
 async fn run_capped(
     backend: Backend,
     spec: RunSpec<'_>,
@@ -356,10 +390,12 @@ async fn run_capped(
                 // are c_int, and a no-op on Linux, where they are already u32 —
                 // so clippy's unnecessary_cast fires on Linux only. Keep the cast
                 // and silence it rather than cfg-splitting two lines.
+                // A cap that could not be applied fails the spawn: running the
+                // payload uncapped is worse than not running it.
                 #[allow(clippy::unnecessary_cast)]
                 {
-                    set_rlimit(libc::RLIMIT_CPU as u32, cpu);
-                    set_rlimit(libc::RLIMIT_NOFILE as u32, nofile);
+                    set_rlimit(libc::RLIMIT_CPU as u32, cpu)?;
+                    set_rlimit(libc::RLIMIT_NOFILE as u32, nofile)?;
                 }
                 Ok(())
             });
@@ -372,8 +408,21 @@ async fn run_capped(
         reason: format!("could not spawn {}: {e}", argv[0]),
     })?;
     let pid = child.id();
+
+    // Say once, out loud, what this platform cannot enforce. The CPU cap is
+    // `RLIMIT_CPU` and the memory cap is an RSS monitor over `ps` — both unix
+    // mechanisms — so a Windows run gets the wall clock and nothing else. A cap
+    // silently not applied is worse than no cap: the caller thinks it has one.
     #[cfg(not(unix))]
-    let _ = pid; // only the unix caps use the raw pid; kill_on_drop covers the rest
+    if spec.limits.max_cpu_secs.is_some() || spec.limits.max_memory_bytes.is_some() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                "sandbox: the CPU and memory caps are unix-only mechanisms and are NOT applied \
+                 on this platform; only the wall-clock cap is enforced"
+            )
+        });
+    }
 
     // A flag set by whichever killer fired, so the outcome can name the cap.
     const NONE: u8 = 0;
@@ -381,8 +430,10 @@ async fn run_capped(
     const WALL: u8 = 2;
     let flag = Arc::new(AtomicU8::new(NONE));
 
-    // Memory monitor: poll RSS and kill on breach. Unix-only (uses `ps`); the
-    // build host is macOS where address-space rlimits do not enforce.
+    // Memory monitor: poll the process *tree*'s RSS and kill it on breach.
+    // Unix-only (uses `ps`); the build host is macOS where address-space rlimits
+    // do not enforce. The tree rather than the pid because a payload that forks
+    // — which is what Linux `/bin/sh` does — otherwise evades the cap entirely.
     #[cfg(unix)]
     let mem_monitor = {
         let max = spec.limits.max_memory_bytes;
@@ -391,41 +442,60 @@ async fn run_capped(
             (Some(pid), Some(max)) => Some(tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                    match rss_bytes(pid) {
-                        Some(rss) if rss > max => {
-                            flag.store(MEM, Ordering::SeqCst);
-                            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
-                            return;
+                    let Some(tree) = process_tree(pid) else {
+                        // The process table could not be read this time. That is
+                        // not "the process is gone" — keep polling rather than
+                        // switching the cap off for the rest of the run.
+                        continue;
+                    };
+                    if tree.is_empty() {
+                        return; // process gone
+                    }
+                    if tree.iter().map(|(_, rss)| rss).sum::<u64>() > max {
+                        flag.store(MEM, Ordering::SeqCst);
+                        // Descendants first: killing the root alone would only
+                        // reparent the hog and leave it running.
+                        for (p, _) in tree.iter().rev() {
+                            unsafe { libc::kill(*p as libc::pid_t, libc::SIGKILL) };
                         }
-                        Some(_) => {}
-                        None => return, // process gone
+                        return;
                     }
                 }
             })),
             _ => None,
         }
     };
+    // No monitor where it cannot measure: `process_tree` is unix-only, so on
+    // Windows there is no RSS poller at all rather than one that reads nothing
+    // and quietly never fires.
     #[cfg(not(unix))]
     let mem_monitor: Option<tokio::task::JoinHandle<()>> = None;
 
     // Wall-clock cap: the OS-neutral backstop that always kills.
+    //
+    // The wait runs as its own task so the *timeout does not own the child*.
+    // Letting the timeout own it (the shape until 0.9.1) means expiry drops the
+    // child first, and the only kill left is `kill_on_drop` — which terminates
+    // just the process the harness spawned. Its descendants survive: on unix
+    // they reparent, and on Windows they also keep the stdout/stderr pipes open,
+    // which strands the blocking pipe reads tokio uses there and hangs the
+    // caller's runtime long after the cap "fired". Holding the child alive past
+    // expiry lets [`kill_tree`] reach the whole tree by pid instead.
+    let waiter = tokio::spawn(async move { child.wait_with_output().await });
     let wall = spec.limits.max_wall_secs;
-    let output = match wall {
+    let waited = match wall {
         Some(secs) => {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(secs),
-                child.wait_with_output(),
-            )
-            .await
-            {
-                Ok(res) => res?,
+            match tokio::time::timeout(std::time::Duration::from_secs(secs), waiter).await {
+                Ok(joined) => joined,
                 Err(_elapsed) => {
                     flag.store(WALL, Ordering::SeqCst);
-                    #[cfg(unix)]
-                    if let Some(pid) = pid {
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    // Dropping the JoinHandle detaches the wait, it does not
+                    // cancel it — the child is still running and still killable.
+                    kill_tree(pid);
+                    if let Some(m) = mem_monitor {
+                        m.abort();
                     }
-                    // Reap so nothing is orphaned; output is lost on a wall kill.
+                    // Output is lost on a wall kill; the detached wait reaps.
                     return Ok(SandboxOutcome {
                         backend,
                         argv,
@@ -437,8 +507,11 @@ async fn run_capped(
                 }
             }
         }
-        None => child.wait_with_output().await?,
+        None => waiter.await,
     };
+    let output = waited.map_err(|e| crate::error::Error::Sandbox {
+        reason: format!("the sandbox wait task did not finish: {e}"),
+    })??;
 
     if let Some(m) = mem_monitor {
         m.abort();
@@ -471,32 +544,128 @@ fn cpu_capped(_status: &std::process::ExitStatus) -> bool {
     false
 }
 
-/// Set a soft+hard rlimit to `value`; a `None` value leaves the limit alone.
+/// Set an rlimit's soft value to `value`, keeping the hard limit *above* it; a
+/// `None` value leaves the limit alone.
+///
+/// The soft/hard split is load-bearing on Linux: `check_process_timers` tests the
+/// hard limit first and `SIGKILL`s there, so a `RLIMIT_CPU` with soft == hard
+/// never sends `SIGXCPU` and [`cpu_capped`] never sees the cap it set. macOS
+/// sends `SIGXCPU` either way, which is why this only ever showed up on Linux.
+/// The hard limit is clamped to what `getrlimit` reports — lowering it is
+/// irreversible for the child and raising it is not permitted to an unprivileged
+/// process, so it is only ever lowered, never raised.
+///
 /// Runs in the forked child before exec, so it must be async-signal-safe: only
-/// `setrlimit`, no allocation.
+/// `getrlimit`/`setrlimit`, no allocation (`last_os_error` just wraps `errno`).
+/// A cap that could not be applied is an error, not a shrug — the caller fails
+/// the spawn rather than running the payload uncapped.
 #[cfg(unix)]
-fn set_rlimit(resource: u32, value: Option<u64>) {
-    if let Some(v) = value {
-        let lim = libc::rlimit {
-            rlim_cur: v as libc::rlim_t,
-            rlim_max: v as libc::rlim_t,
-        };
-        unsafe {
-            libc::setrlimit(resource as _, &lim);
+fn set_rlimit(resource: u32, value: Option<u64>) -> std::io::Result<()> {
+    let Some(v) = value else { return Ok(()) };
+    let v = v as libc::rlim_t;
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    unsafe {
+        if libc::getrlimit(resource as _, &mut lim) != 0 {
+            return Err(std::io::Error::last_os_error());
         }
+        // Never raise the hard limit, and never ask for a soft limit above it.
+        lim.rlim_cur = v.min(lim.rlim_max);
+        lim.rlim_max = lim.rlim_max.min(v.saturating_add(1));
+        if libc::setrlimit(resource as _, &lim) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+/// Kill `pid` and everything it spawned, on whatever OS this is.
+///
+/// Killing only `pid` is not enough anywhere: a payload run through a shell puts
+/// the real work in a *child*, so the single kill takes the shell and reparents
+/// the work. Unix walks [`process_tree`] and signals descendants first (killing
+/// the root first would orphan them before they can be found). Windows has
+/// neither signals nor `ps`, so it uses the tree kill the OS itself ships,
+/// `taskkill /T` — a system utility, not a new dependency. Best-effort by
+/// design: a process that is already gone is a success, not an error.
+fn kill_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(unix)]
+    {
+        for (p, _) in process_tree(pid).unwrap_or_default().iter().rev() {
+            unsafe { libc::kill(*p as libc::pid_t, libc::SIGKILL) };
+        }
+        // Always signal the root, even when the process table could not be read.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
-/// Resident set size of `pid` in bytes, via `ps`. `None` if the process is gone.
-/// macOS/BSD and Linux `ps` both report RSS in kibibytes.
+/// Every process in `pid`'s tree — the process and its descendants — with each
+/// one's RSS in bytes. macOS/BSD and Linux `ps` both report RSS in kibibytes.
+///
+/// The tree, not the pid, is what the memory cap has to measure: a shell that
+/// *forks* its payload (Linux `/bin/sh` does) leaves the monitor watching a
+/// 2 MiB shell while its child takes 400 MiB, and the cap silently never fires.
+///
+/// Two return shapes, deliberately distinct: `Some(empty)` means the pid is no
+/// longer in the process table (it is gone, stop polling); `None` means the
+/// table could not be read *this time* — a fork failure, an unexpected `ps` —
+/// which is not evidence of anything and must not switch the cap off.
+///
+// ponytail: one `ps` fork per poll and an O(tree × table) scan. Fine for a
+// handful of processes at 25 Hz; read /proc directly if a run ever spawns
+// hundreds.
 #[cfg(unix)]
-fn rss_bytes(pid: u32) -> Option<u64> {
+fn process_tree(pid: u32) -> Option<Vec<(u32, u64)>> {
     let out = std::process::Command::new("ps")
-        .args(["-o", "rss=", "-p", &pid.to_string()])
+        .args(["-eo", "pid=,ppid=,rss="])
         .output()
         .ok()?;
-    let kb: u64 = String::from_utf8_lossy(&out.stdout).trim().parse().ok()?;
-    Some(kb * 1024)
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let rows: Vec<(u32, u32, u64)> = text
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let p = f.next()?.parse().ok()?;
+            let pp = f.next()?.parse().ok()?;
+            let kb = f.next()?.parse::<u64>().ok()?;
+            Some((p, pp, kb * 1024))
+        })
+        .collect();
+    if rows.is_empty() {
+        return None; // the table itself is unreadable — not "the process is gone"
+    }
+    let mut tree: Vec<(u32, u64)> = rows
+        .iter()
+        .filter(|(p, _, _)| *p == pid)
+        .map(|(p, _, rss)| (*p, *rss))
+        .collect();
+    let mut i = 0;
+    while i < tree.len() {
+        let parent = tree[i].0;
+        for (p, pp, rss) in &rows {
+            if *pp == parent && *p != parent && !tree.iter().any(|(t, _)| t == p) {
+                tree.push((*p, *rss));
+            }
+        }
+        i += 1;
+    }
+    Some(tree)
 }
 
 /// Create an ephemeral working directory for one sandboxed run, seeding it with
@@ -601,6 +770,9 @@ mod tests {
         assert_eq!(cfg, back);
     }
 
+    // The CPU cap is `RLIMIT_CPU`, a unix mechanism with no Windows equivalent;
+    // asserting it there would assert a cap the floor deliberately never applies.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -619,6 +791,9 @@ mod tests {
         assert!(!out.success());
     }
 
+    // The memory cap is an RSS monitor over `ps`; both the monitor and `ps` are
+    // unix-only, so this is a unix mechanism asserted on unix.
+    #[cfg(unix)]
     #[tokio::test]
     async fn memory_cap_kills_a_heap_hog_and_names_the_memory_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -644,6 +819,140 @@ mod tests {
             "expected memory cap, got {out:?}"
         );
         assert!(!out.success());
+    }
+
+    // Same unix-only mechanism, exercised through a fork. See above.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn memory_cap_kills_a_hog_the_shell_forked() {
+        let dir = tempfile::tempdir().unwrap();
+        // The shell *forks* the hog instead of exec'ing it — which is what
+        // Linux /bin/sh (dash) does even without the explicit `&`. The monitor
+        // must sum the process tree, not the single pid it spawned, or the cap
+        // watches a 2 MiB shell while its child takes 400 MiB.
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "perl -e '$x=\"a\"x(400*1024*1024); sleep 5' & wait".into(),
+        ];
+        let limits = SandboxLimits {
+            max_memory_bytes: Some(64 * 1024 * 1024), // 64 MiB
+            max_wall_secs: Some(30),
+            ..SandboxLimits::default()
+        };
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.cap_hit,
+            Some(Cap::Memory),
+            "a forked hog must still hit the memory cap, got {out:?}"
+        );
+        assert!(!out.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_wall_clock_kill_reaches_the_children_the_run_forked() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        // The payload forks a child that outlives the wall clock and leaves a
+        // file behind if it is still alive. Killing only the pid the harness
+        // spawned reparents that child and it goes on to write the file.
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "(sleep 4; touch survived) & wait".into(),
+        ];
+        let limits = SandboxLimits {
+            max_wall_secs: Some(1),
+            max_cpu_secs: None,
+            ..SandboxLimits::default()
+        };
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.cap_hit,
+            Some(Cap::Wall),
+            "wall must kill it, got {out:?}"
+        );
+        assert!(!out.success());
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(
+            !marker.exists(),
+            "a forked child must not outlive the wall-clock kill"
+        );
+    }
+
+    // What is actually true on Windows: no CPU cap and no memory cap are applied
+    // there (both are unix mechanisms), so the wall clock is the only thing that
+    // can stop an endless run — and the outcome must name the cap that really
+    // fired rather than one of the two nobody enforced.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_enforces_the_wall_clock_and_claims_no_cap_it_did_not_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        // `for /L` with a step of 0 never terminates. Passed as separate argv
+        // entries, none containing a space, so nothing depends on how `cmd.exe`
+        // re-parses a quoted command line.
+        let argv: Vec<String> = [
+            "cmd", "/C", "for", "/L", "%i", "in", "(1,0,2)", "do", "@rem",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let limits = SandboxLimits {
+            max_cpu_secs: Some(1),
+            max_memory_bytes: Some(1024 * 1024),
+            max_wall_secs: Some(5),
+            ..SandboxLimits::default()
+        };
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.cap_hit,
+            Some(Cap::Wall),
+            "the wall clock is the only cap Windows applies, got {out:?}"
+        );
+        assert!(!out.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_capped_run_keeps_its_hard_limit_above_the_soft_one() {
+        let dir = tempfile::tempdir().unwrap();
+        // Linux's CPU timer tests the HARD limit first and SIGKILLs there, so a
+        // cap set with soft == hard never sends SIGXCPU and `cpu_capped` never
+        // sees it. The child's own view of its limits is the portable oracle.
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "ulimit -S -n; ulimit -H -n".into(),
+        ];
+        let limits = SandboxLimits {
+            max_open_files: Some(64),
+            ..SandboxLimits::default()
+        };
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        let seen: Vec<u64> = out
+            .stdout
+            .split_whitespace()
+            .filter_map(|s| s.parse().ok())
+            .collect();
+        assert_eq!(seen.len(), 2, "expected soft and hard, got {out:?}");
+        assert_eq!(seen[0], 64, "soft limit must be what was asked for");
+        assert!(
+            seen[1] > seen[0],
+            "hard limit must stay above the soft one, got {out:?}"
+        );
     }
 
     #[tokio::test]

@@ -5,10 +5,26 @@
 //! here, so there is **no** job object, **no** kill-on-close process-tree
 //! teardown, **no** active-process limit, and **no** restricted token. The CPU
 //! and memory caps are unenforced too — the shared path applies them via
-//! `RLIMIT_CPU` and an RSS monitor, both unix-only. What a Windows run does get
-//! is the floor: a fresh subprocess in an ephemeral workdir, `kill_on_drop`, the
-//! wall-clock timeout, and the best-effort proxy-env strip. Filesystem scoping
-//! and the wall cap, nothing stronger.
+//! `RLIMIT_CPU` and an RSS monitor over `ps`, all unix-only. What a Windows run
+//! does get is the floor: a fresh subprocess in an ephemeral workdir,
+//! `kill_on_drop`, the wall-clock timeout, and the best-effort proxy-env strip.
+//! Filesystem scoping and the wall cap, nothing stronger.
+//!
+//! **On Windows the floor enforces the wall clock and nothing else.** Stated
+//! plainly because it is the whole contract here:
+//!
+//! - **Wall clock** — enforced, and the kill reaches the whole process tree via
+//!   `taskkill /T` (Windows has no signals and no `ps`; `taskkill` ships with the
+//!   OS, so this costs no dependency). It is the only thing standing between a
+//!   Windows run and running forever, so `max_wall_secs: None` there means
+//!   *unbounded*.
+//! - **CPU, memory, processes** — not applied. `SandboxLimits` still carries
+//!   them, and `JobLimits` still maps them, but nothing enforces them until the
+//!   Job Object lands. They are never *claimed* either: a Windows outcome never
+//!   reports [`super::Cap::Cpu`] or [`super::Cap::Memory`], and the first run
+//!   configured with either cap logs a warning saying so.
+//! - **Network** — no kernel boundary. Only the floor's proxy-env strip, which a
+//!   payload that does not read those variables ignores entirely.
 //!
 //! So [`WindowsSandbox::run`] reports [`Backend::PortableFloor`] rather than
 //! [`Backend::WindowsJobObject`]: a run that creates no job object must not name

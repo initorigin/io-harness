@@ -21,15 +21,55 @@ fn good() -> &'static str {
 
 #[tokio::test]
 async fn selection_picks_native_on_this_host_and_floor_when_forced() {
-    // On the macOS build host the default selection is the native backend...
+    // The default selection is the strongest backend this host can actually
+    // deliver — which is not the same as "the native one for this target". A
+    // backend whose primitive is unavailable must degrade *and say so*.
     let native = select(&SandboxConfig::new());
+
+    // macOS: `sandbox-exec` is part of the OS, so the native backend is always
+    // available and the floor is always wrong here.
     #[cfg(target_os = "macos")]
     assert_eq!(native.backend(), Backend::MacosSandboxExec);
-    assert_ne!(
-        native.backend(),
-        Backend::PortableFloor,
-        "default must be native, not the floor"
-    );
+
+    // Linux: namespaces when the kernel permits unprivileged user namespaces,
+    // the floor when it does not (Ubuntu 24.04 restricts them by default). Pin
+    // it against the same question the backend asks, so a wrong answer in
+    // either direction fails: promising namespaces it cannot create, or falling
+    // back on a host where the wrapper works fine.
+    #[cfg(target_os = "linux")]
+    {
+        let wrapper_works = std::process::Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--net",
+                "--",
+                "true",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        assert_eq!(
+            native.backend(),
+            if wrapper_works {
+                Backend::LinuxNamespaces
+            } else {
+                Backend::PortableFloor
+            },
+            "must report the strongest backend the kernel actually allows"
+        );
+    }
+
+    // Windows: the Job Object is unimplemented, so the floor *is* the strongest
+    // available backend and naming `WindowsJobObject` would be a lie.
+    #[cfg(target_os = "windows")]
+    assert_eq!(native.backend(), Backend::PortableFloor);
 
     // ...and forcing the floor selects the portable backend, recorded so the
     // selection ladder is observable.
@@ -90,8 +130,8 @@ async fn sandbox_on_runs_the_produced_test_binary_transparently() {
 
 #[tokio::test]
 async fn the_selected_backend_denies_outbound_network_by_default() {
-    // The default backend (native on macOS) must deny network. curl to a real
-    // host should fail because the sandbox blocks it, not because of the prompt.
+    // curl to a real host must fail because the sandbox blocks it, not because
+    // of the prompt — for every backend that claims a kernel boundary.
     let dir = tempfile::tempdir().unwrap();
     let sb = select(&SandboxConfig::new()); // allow_network: false
     let argv: Vec<String> = ["curl", "-s", "-m", "5", "https://example.com"]
@@ -107,10 +147,28 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         })
         .await
         .unwrap();
-    assert!(
-        !out.success(),
-        "network must be denied by default, got {out:?}"
-    );
+
+    if matches!(
+        sb.backend(),
+        Backend::MacosSandboxExec | Backend::LinuxNamespaces
+    ) {
+        assert!(
+            !out.success(),
+            "a backend that claims a network boundary must deny network, got {out:?}"
+        );
+    } else {
+        // The portable floor's network deny is best-effort (proxy env stripped),
+        // *not* a kernel boundary — documented in the module, and the reason it
+        // must never claim to be one. So the invariant asserted on this host is
+        // the contrapositive, which is what keeps the claim honest: a run that
+        // could reach the network is a run that reported the floor. A kernel
+        // whose unprivileged user namespaces are restricted lands here.
+        assert_eq!(
+            out.backend,
+            Backend::PortableFloor,
+            "only the floor may run without a network boundary"
+        );
+    }
 }
 
 // --- teardown leaves nothing behind -----------------------------------------
@@ -157,12 +215,24 @@ async fn sandbox_lifecycle_is_recorded_and_reconstructable() {
     assert!(kinds.contains(&"create"), "missing create: {kinds:?}");
     assert!(kinds.contains(&"exec"), "missing exec: {kinds:?}");
     assert!(kinds.contains(&"destroy"), "missing destroy: {kinds:?}");
-    // The exec event names the backend and the argv (command line only).
+    // The exec event names the backend and the argv (command line only). The
+    // backend recorded must be the one `select` reported — so a backend that
+    // quietly degrades is caught here as a trace mismatch rather than as a
+    // mystery in someone's CI log.
     let exec = events.iter().find(|e| e.kind == "exec").unwrap();
-    assert!(exec.backend.is_some());
+    assert_eq!(
+        exec.backend.as_deref(),
+        Some(select(&SandboxConfig::new()).backend().as_str()),
+        "the trace must name the backend that actually ran"
+    );
     assert!(exec.detail.as_deref().unwrap().contains("rustc"));
 }
 
+// The CPU cap is an `RLIMIT_CPU`, which exists only on unix. On Windows the
+// floor applies no CPU cap at all and says so, so the assertion below would be
+// asserting behaviour the crate documents as absent. The Windows counterpart is
+// the test underneath, which pins that absence rather than skipping it.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_cap_hit_in_the_gate_is_recorded() {
     let tmp = tempfile::tempdir().unwrap();
@@ -193,6 +263,48 @@ async fn a_cap_hit_in_the_gate_is_recorded() {
     assert!(
         events.iter().any(|e| e.kind == "cap_hit"),
         "cap hit must be recorded, got {events:?}"
+    );
+}
+
+/// Windows has no `RLIMIT_CPU`, so a CPU cap is not applied there. The point of
+/// this test is that the gate never *claims* one it did not apply: an
+/// impossible-looking `max_cpu_secs: Some(0)` leaves the compile to succeed on
+/// its merits and records no cap hit, rather than reporting a kill that never
+/// happened. Documented in `src/sandbox/windows.rs`; asserted here so the
+/// documentation cannot drift away from the behaviour.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_claims_no_cpu_cap_because_it_applies_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let run = store.start_run("goal", "x.rs").unwrap();
+
+    let policy = Policy::default();
+    let cfg = SandboxConfig {
+        limits: SandboxLimits {
+            max_cpu_secs: Some(0),
+            max_wall_secs: Some(120),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let guard = ExecGuard::new(&policy)
+        .sandboxed(cfg)
+        .tracing(&store, run, 1);
+    let passed = Verification::CompilesRust
+        .passes_guarded(Path::new("x.rs"), good(), &guard)
+        .await
+        .unwrap();
+
+    assert!(
+        passed,
+        "with no CPU cap applied, an honest compile must still pass the gate"
+    );
+    let events = store.sandbox_events(run).unwrap();
+    assert!(
+        !events.iter().any(|e| e.kind == "cap_hit"),
+        "a cap that was never applied must never be reported as hit, got {events:?}"
     );
 }
 
