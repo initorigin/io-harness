@@ -508,7 +508,7 @@ pub struct MemoryEntry {
     /// The remembered text.
     pub value: String,
     /// The run that wrote it, so a later reader knows where a fact came from.
-    pub run_id: String,
+    pub run_id: i64,
     /// The step of that run which wrote it.
     pub step: u32,
     /// UTC write time, refreshed on every overwrite so ordering is by recency.
@@ -773,7 +773,7 @@ impl Store {
                  workspace  TEXT NOT NULL,
                  key        TEXT NOT NULL,
                  value      TEXT NOT NULL,
-                 run_id     TEXT NOT NULL,
+                 run_id     INTEGER NOT NULL,
                  step       INTEGER NOT NULL,
                  created_at TEXT NOT NULL,
                  UNIQUE(workspace, key)
@@ -789,7 +789,7 @@ impl Store {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS context_events (
                  id              INTEGER PRIMARY KEY,
-                 run_id          TEXT NOT NULL,
+                 run_id          INTEGER NOT NULL,
                  step            INTEGER NOT NULL,
                  kind            TEXT NOT NULL,
                  detail          TEXT,
@@ -1018,7 +1018,7 @@ impl Store {
     }
 
     /// Record one context-assembly event against a run.
-    pub fn record_context_event(&self, run_id: &str, e: &ContextEvent) -> Result<()> {
+    pub fn record_context_event(&self, run_id: i64, e: &ContextEvent) -> Result<()> {
         self.conn.execute(
             "INSERT INTO context_events (run_id, step, kind, detail, est_tokens, reported_tokens)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1037,7 +1037,7 @@ impl Store {
     /// Fill in what the provider said one turn's request cost, once the
     /// completion has returned. The estimate is left as it was: the pair is the
     /// point — one row carries both numbers, so drift is readable.
-    pub fn record_context_reported(&self, run_id: &str, step: u32, reported: u64) -> Result<()> {
+    pub fn record_context_reported(&self, run_id: i64, step: u32, reported: u64) -> Result<()> {
         self.conn.execute(
             "UPDATE context_events SET reported_tokens = ?1
              WHERE run_id = ?2 AND step = ?3 AND kind = 'assembled'",
@@ -1047,7 +1047,7 @@ impl Store {
     }
 
     /// Every context-assembly event recorded for a run, in order.
-    pub fn context_events(&self, run_id: &str) -> Result<Vec<ContextEvent>> {
+    pub fn context_events(&self, run_id: i64) -> Result<Vec<ContextEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT step, kind, detail, est_tokens, reported_tokens
              FROM context_events WHERE run_id = ?1 ORDER BY id ASC",
@@ -1459,7 +1459,7 @@ impl Store {
         workspace: &str,
         key: &str,
         value: &str,
-        run_id: &str,
+        run_id: i64,
         step: u32,
     ) -> Result<Vec<String>> {
         let value = truncate_memory_value(value);
@@ -2038,9 +2038,7 @@ mod tests {
     fn the_entry_count_cap_evicts_oldest_first_and_never_the_new_entry() {
         let store = Store::memory().unwrap();
         for i in 0..MEMORY_MAX_ENTRIES {
-            let evicted = store
-                .memory_put("ws", &format!("k{i}"), "v", "run-1", 1)
-                .unwrap();
+            let evicted = store.memory_put("ws", &format!("k{i}"), "v", 1, 1).unwrap();
             assert!(evicted.is_empty(), "no eviction while under the cap");
         }
         assert_eq!(store.memory_list("ws").unwrap().len(), MEMORY_MAX_ENTRIES);
@@ -2050,7 +2048,7 @@ mod tests {
         for i in 0..3 {
             evicted.extend(
                 store
-                    .memory_put("ws", &format!("new{i}"), "v", "run-2", 2)
+                    .memory_put("ws", &format!("new{i}"), "v", 2, 2)
                     .unwrap(),
             );
         }
@@ -2084,7 +2082,7 @@ mod tests {
         for i in 0..10 {
             evicted.extend(
                 store
-                    .memory_put("ws", &format!("k{i}"), &big, "run-1", 1)
+                    .memory_put("ws", &format!("k{i}"), &big, 1, 1)
                     .unwrap(),
             );
         }
@@ -2105,7 +2103,7 @@ mod tests {
         let store = Store::memory().unwrap();
         // Multibyte throughout, so a byte-wise cut would not be valid UTF-8.
         let huge = "é".repeat(MEMORY_MAX_ENTRY_CHARS * 2);
-        assert!(store.memory_put("ws", "k", &huge, "run-1", 1).is_ok());
+        assert!(store.memory_put("ws", "k", &huge, 1, 1).is_ok());
 
         let stored = store.memory_get("ws", "k").unwrap().unwrap().value;
         assert_eq!(stored.chars().count(), MEMORY_MAX_ENTRY_CHARS);
@@ -2182,7 +2180,7 @@ mod tests {
         assert_eq!(store.run_status(1).unwrap(), Some(RunStatus::Running));
         // And the new table is there and usable.
         assert!(store.memory_list("ws").unwrap().is_empty());
-        store.memory_put("ws", "k", "v", "run-1", 1).unwrap();
+        store.memory_put("ws", "k", "v", 1, 1).unwrap();
         assert_eq!(store.memory_get("ws", "k").unwrap().unwrap().value, "v");
     }
 }

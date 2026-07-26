@@ -20,7 +20,7 @@ use io_harness::context::{
     assemble, entry_cap_chars, estimate_tokens, ContextBudget, Ledger, ObsKind, Observation,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
-use io_harness::tools::{Tool, ToolFuture, Toolbox};
+use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
 use io_harness::{
     run_with, ApproveAll, McpServer, Policy, Provider, Store, TaskContract, ToolSpec, Verification,
 };
@@ -193,7 +193,14 @@ async fn the_assembled_prompt_stays_inside_the_ceiling_while_the_trace_keeps_eve
     // is more than twice that. The slack is for the one-line stubs, which are the
     // only part of the section that grows with the run's length.
     let last = provider.observations(provider.turns() - 1);
-    let raw = store.steps(result.run_id).unwrap().pop().unwrap().result;
+    // A row holds the step's own observations; the whole log is the rows
+    // concatenated in step order, which is what makes the delta lossless.
+    let raw: String = store
+        .steps(result.run_id)
+        .unwrap()
+        .iter()
+        .map(|s| s.result.as_str())
+        .collect();
     assert!(
         raw.chars().count() > 9_000,
         "the fixture must exceed the ceiling to be testing anything (raw {} chars)",
@@ -258,8 +265,16 @@ async fn prompt_size_stabilises_across_many_turns_instead_of_tracking_step_count
     let early = provider.observations(7).chars().count();
     let late = provider.observations(20).chars().count();
     let steps = store.steps(result.run_id).unwrap();
-    let early_log = steps[6].result.chars().count();
-    let late_log = steps[19].result.chars().count();
+    // Cumulative through each step: the log the run had accumulated by then, which
+    // is what "the log itself keeps growing" means now that a row is a delta.
+    let log_through = |n: usize| -> usize {
+        steps[..=n]
+            .iter()
+            .map(|s| s.result.chars().count())
+            .sum::<usize>()
+    };
+    let early_log = log_through(6);
+    let late_log = log_through(19);
 
     assert!(
         late_log > early_log * 2,
@@ -340,7 +355,7 @@ async fn a_write_invalidates_the_earlier_read_so_the_next_turn_sees_the_new_cont
         "the refresh must say why it happened, got:\n{third}"
     );
 
-    let rows = store.context_events(&result.run_id.to_string()).unwrap();
+    let rows = store.context_events(result.run_id).unwrap();
     assert!(
         rows.iter().any(|r| r.kind == "reread"),
         "a re-read must be in the trace, got {rows:?}"
@@ -391,17 +406,10 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         .allow_read("*")
         .deny_read("notes.txt");
 
-    let out = assemble(
-        &ledger,
-        24_000,
-        Some(dir.path()),
-        &policy,
-        &store,
-        "run-1",
-        3,
-    )
-    .await
-    .unwrap();
+    let ws = Workspace::with_policy(dir.path(), policy.clone());
+    let out = assemble(&ledger, 24_000, Some(&ws), &policy, &store, 1, 3)
+        .await
+        .unwrap();
 
     assert!(
         out.text.contains("invalidated by the write at step 2"),
@@ -418,7 +426,7 @@ async fn a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_
         "a refused re-read must carry no contents at all, got:\n{}",
         out.text
     );
-    let rows = store.context_events("run-1").unwrap();
+    let rows = store.context_events(1).unwrap();
     assert!(
         rows.iter()
             .any(|r| r.kind == "reread_refused" && r.detail.as_deref().unwrap().contains("notes")),
@@ -546,7 +554,14 @@ async fn every_observation_kind_is_bounded_where_it_enters_the_context() {
     assert!(tool.contains("truncated"), "the tool result must be cut");
 
     // The trace keeps every entry whole — bounded at entry, never stubbed.
-    let raw = store.steps(result.run_id).unwrap().pop().unwrap().result;
+    // A row holds the step's own observations; the whole log is the rows
+    // concatenated in step order, which is what makes the delta lossless.
+    let raw: String = store
+        .steps(result.run_id)
+        .unwrap()
+        .iter()
+        .map(|s| s.result.as_str())
+        .collect();
     for header in [
         "[read big.txt]",
         "[grep \"needle\"]",
@@ -608,6 +623,7 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
     let dir = ws();
     let store = Store::memory().unwrap();
     let policy = open_policy();
+    let workspace = Workspace::with_policy(dir.path(), policy.clone());
     let mut ledger = Ledger::new();
     for i in 0..200u32 {
         ledger.push(Observation::new(
@@ -625,17 +641,9 @@ async fn assembling_one_turn_costs_a_bounded_amount_of_time() {
     const TURNS: u32 = 50;
     let started = Instant::now();
     for step in 0..TURNS {
-        let out = assemble(
-            &ledger,
-            24_000,
-            Some(dir.path()),
-            &policy,
-            &store,
-            "perf",
-            step,
-        )
-        .await
-        .unwrap();
+        let out = assemble(&ledger, 24_000, Some(&workspace), &policy, &store, 1, step)
+            .await
+            .unwrap();
         assert!(out.carried > 0);
     }
     let per_turn = started.elapsed() / TURNS;
@@ -660,4 +668,118 @@ fn the_budget_derives_the_prompt_ceiling_and_the_entry_cap_from_one_number() {
     assert_eq!(entry_cap_chars(b.effective_tokens(None)), 12_000);
     assert_eq!(entry_cap_chars(b.effective_tokens(Some(4))), 2_000);
     assert_eq!(estimate_tokens(&"x".repeat(12_000)), 3_000);
+}
+
+// -------------------------------------------------- supersession is about subjects
+
+/// Supersession collapses two answers about one subject. A registered or MCP
+/// tool's target is its NAME, not its subject: called twice with different
+/// arguments it gave two different answers, and stubbing the first as
+/// "superseded" would throw one away.
+#[tokio::test]
+async fn two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_collapse() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let policy = open_policy();
+    let workspace = Workspace::with_policy(dir.path(), policy.clone());
+    std::fs::write(dir.path().join("a.txt"), "SECOND").unwrap();
+
+    let mut ledger = Ledger::new();
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Tool,
+        Some("weather".into()),
+        "\n[weather]\nLONDON-RAIN\n",
+    ));
+    ledger.push(Observation::new(
+        2,
+        ObsKind::Tool,
+        Some("weather".into()),
+        "\n[weather]\nCAIRO-SUN\n",
+    ));
+    ledger.push(Observation::new(
+        3,
+        ObsKind::Read,
+        Some("a.txt".into()),
+        "\n[read a.txt]\nFIRST\n",
+    ));
+    ledger.push(Observation::new(
+        4,
+        ObsKind::Read,
+        Some("a.txt".into()),
+        "\n[read a.txt]\nSECOND\n",
+    ));
+
+    let out = assemble(&ledger, 24_000, Some(&workspace), &policy, &store, 1, 5)
+        .await
+        .unwrap();
+
+    assert!(
+        out.text.contains("LONDON-RAIN") && out.text.contains("CAIRO-SUN"),
+        "both tool answers must survive, got:\n{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("SECOND") && !out.text.contains("FIRST"),
+        "the later read must replace the earlier one, got:\n{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("superseded by the read at step 4"),
+        "the superseded read must say what replaced it, got:\n{}",
+        out.text
+    );
+}
+
+// -------------------------------------------------- the re-read stays contained
+
+/// The assembly-time re-read must be as contained as the read it refreshes. The
+/// policy here is deliberately permissive — it is the workspace's own path
+/// resolution, not the policy, that has to stop a target pointing outside the
+/// root, which is why reading the filesystem directly would have been the wrong
+/// half of the pair to copy.
+#[tokio::test]
+async fn a_re_read_cannot_escape_the_workspace_root() {
+    let outer = ws();
+    let root = outer.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(outer.path().join("secret.txt"), "TOP-SECRET").unwrap();
+
+    let store = Store::memory().unwrap();
+    let policy = open_policy();
+    let workspace = Workspace::with_policy(&root, policy.clone());
+
+    let mut ledger = Ledger::new();
+    ledger.push(Observation::new(
+        1,
+        ObsKind::Read,
+        Some("../secret.txt".into()),
+        "\n[read ../secret.txt]\nOLD\n",
+    ));
+    ledger.push(Observation::new(
+        2,
+        ObsKind::Write,
+        Some("../secret.txt".into()),
+        "\n[wrote ../secret.txt] (3 chars)\n",
+    ));
+
+    let out = assemble(&ledger, 24_000, Some(&workspace), &policy, &store, 1, 3)
+        .await
+        .unwrap();
+
+    assert!(
+        !out.text.contains("TOP-SECRET"),
+        "a re-read must not reach outside the root, got:\n{}",
+        out.text
+    );
+    assert!(
+        out.text.contains("invalidated by the write at step 2"),
+        "the stub must still name the invalidating step, got:\n{}",
+        out.text
+    );
+    let rows = store.context_events(1).unwrap();
+    assert!(
+        rows.iter().any(|r| r.kind == "reread_refused"),
+        "the refused re-read must be in the trace, got {rows:?}"
+    );
 }

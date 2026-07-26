@@ -22,7 +22,7 @@ fn a_fact_written_by_one_run_is_readable_by_another() {
     {
         let store = Store::open(&path).unwrap();
         store
-            .memory_put("/ws/app", "build_cmd", "cargo test --lib", "run-1", 4)
+            .memory_put("/ws/app", "build_cmd", "cargo test --lib", 1, 4)
             .unwrap();
     }
 
@@ -34,7 +34,7 @@ fn a_fact_written_by_one_run_is_readable_by_another() {
         .expect("the earlier run's fact survived");
     assert_eq!(entry.value, "cargo test --lib");
     // Attribution survives too, so the reader knows where the fact came from.
-    assert_eq!(entry.run_id, "run-1");
+    assert_eq!(entry.run_id, 1);
     assert_eq!(entry.step, 4);
     assert!(!entry.created_at.is_empty());
 
@@ -47,12 +47,8 @@ fn a_fact_written_by_one_run_is_readable_by_another() {
 #[test]
 fn two_workspaces_never_see_each_others_entries() {
     let store = Store::memory().unwrap();
-    store
-        .memory_put("/ws/a", "k", "a's value", "run-1", 1)
-        .unwrap();
-    store
-        .memory_put("/ws/b", "k", "b's value", "run-1", 1)
-        .unwrap();
+    store.memory_put("/ws/a", "k", "a's value", 1, 1).unwrap();
+    store.memory_put("/ws/b", "k", "b's value", 1, 1).unwrap();
 
     assert_eq!(
         store.memory_get("/ws/a", "k").unwrap().unwrap().value,
@@ -73,10 +69,10 @@ fn two_workspaces_never_see_each_others_entries() {
 fn re_putting_a_key_replaces_the_value_and_re_attributes_it() {
     let store = Store::memory().unwrap();
     store
-        .memory_put("/ws", "api_base", "http://localhost:1", "run-1", 2)
+        .memory_put("/ws", "api_base", "http://localhost:1", 1, 2)
         .unwrap();
     let evicted = store
-        .memory_put("/ws", "api_base", "http://localhost:2", "run-9", 7)
+        .memory_put("/ws", "api_base", "http://localhost:2", 9, 7)
         .unwrap();
     assert!(evicted.is_empty(), "an overwrite evicts nothing");
 
@@ -85,7 +81,7 @@ fn re_putting_a_key_replaces_the_value_and_re_attributes_it() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].value, "http://localhost:2");
     // The latest writer owns the fact.
-    assert_eq!(entries[0].run_id, "run-9");
+    assert_eq!(entries[0].run_id, 9);
     assert_eq!(entries[0].step, 7);
 }
 
@@ -94,12 +90,12 @@ fn a_write_past_the_entry_cap_reports_the_keys_it_evicted() {
     let store = Store::memory().unwrap();
     for i in 0..MAX_ENTRIES {
         assert!(store
-            .memory_put("/ws", &format!("k{i}"), "v", "run-1", 1)
+            .memory_put("/ws", &format!("k{i}"), "v", 1, 1)
             .unwrap()
             .is_empty());
     }
     // The write that overflows names its cost, so the caller can trace it.
-    let evicted = store.memory_put("/ws", "newest", "v", "run-2", 1).unwrap();
+    let evicted = store.memory_put("/ws", "newest", "v", 2, 1).unwrap();
     assert_eq!(evicted, vec!["k0"]);
     assert_eq!(store.memory_list("/ws").unwrap().len(), MAX_ENTRIES);
     assert!(store.memory_get("/ws", "k0").unwrap().is_none());
@@ -110,7 +106,7 @@ fn a_write_past_the_entry_cap_reports_the_keys_it_evicted() {
 #[test]
 fn memory_delete_returns_true_then_false_and_the_key_stays_gone() {
     let store = Store::memory().unwrap();
-    store.memory_put("/ws", "k", "v", "run-1", 1).unwrap();
+    store.memory_put("/ws", "k", "v", 1, 1).unwrap();
 
     assert!(store.memory_delete("/ws", "k").unwrap());
     // Deleting again is honest about there being nothing left to delete.
@@ -124,10 +120,10 @@ fn memory_delete_returns_true_then_false_and_the_key_stays_gone() {
 #[test]
 fn memory_clear_empties_one_workspace_and_reports_the_count() {
     let store = Store::memory().unwrap();
-    store.memory_put("/ws/a", "k1", "v", "run-1", 1).unwrap();
-    store.memory_put("/ws/a", "k2", "v", "run-1", 1).unwrap();
-    store.memory_put("/ws/a", "k3", "v", "run-1", 1).unwrap();
-    store.memory_put("/ws/b", "k1", "v", "run-1", 1).unwrap();
+    store.memory_put("/ws/a", "k1", "v", 1, 1).unwrap();
+    store.memory_put("/ws/a", "k2", "v", 1, 1).unwrap();
+    store.memory_put("/ws/a", "k3", "v", 1, 1).unwrap();
+    store.memory_put("/ws/b", "k1", "v", 1, 1).unwrap();
 
     assert_eq!(store.memory_clear("/ws/a").unwrap(), 3);
     assert!(store.memory_list("/ws/a").unwrap().is_empty());
@@ -142,7 +138,7 @@ fn an_oversized_value_is_remembered_truncated_rather_than_refused() {
     let store = Store::memory().unwrap();
     // Multibyte throughout: a byte-wise cut would not be valid UTF-8 at all.
     let huge = "日".repeat(50_000);
-    store.memory_put("/ws", "log", &huge, "run-1", 1).unwrap();
+    store.memory_put("/ws", "log", &huge, 1, 1).unwrap();
 
     let stored = store.memory_get("/ws", "log").unwrap().unwrap().value;
     assert!(stored.chars().count() < huge.chars().count());

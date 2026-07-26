@@ -786,7 +786,6 @@ async fn run_workspace_from<P: Provider>(
     // `assemble`, under the contract's context budget — the log itself is never
     // trimmed, so the trace keeps everything.
     let mut ledger = ContextLedger::new();
-    let rid = run_id.to_string();
 
     for step in start_step..=contract.max_steps {
         if let Some(max) = contract.max_duration {
@@ -809,10 +808,10 @@ async fn run_workspace_from<P: Provider>(
         let assembled = assemble(
             &ledger,
             budget_tokens,
-            Some(root),
+            Some(&ws),
             &effective,
             store,
-            &rid,
+            run_id,
             step,
         )
         .await?;
@@ -839,7 +838,7 @@ async fn run_workspace_from<P: Provider>(
         // the estimate: the pair is what makes the estimator's drift auditable. A
         // silent provider leaves it null rather than recording a zero.
         if step_tokens > 0 {
-            store.record_context_reported(&rid, step, step_tokens)?;
+            store.record_context_reported(run_id, step, step_tokens)?;
         }
 
         // Dispatch every tool call the model made this step, in order, folding
@@ -897,15 +896,17 @@ async fn run_workspace_from<P: Provider>(
             }
         }
 
-        // The trace gets the WHOLE log, unelided — bounding what the model sees
-        // must not bound what an operator can audit. Only the per-observation cap
-        // applies here, and it applied when the observation was made.
+        // The trace gets this step's observations unelided, so concatenating the
+        // rows in step order reproduces the whole log: bounding what the model
+        // sees must not bound what an operator can audit. A delta rather than the
+        // whole log per row, so the trace is linear in the step count and a
+        // 24-hour run does not write the same text hundreds of times.
         // ponytail: each row repeats the whole log, so the column grows with the
         // square of the step count. Bounded in practice by the step budget times
         // the entry cap; write per-step deltas if a long run's store size matters.
         store.checkpoint_step(
             run_id,
-            &StepRecord::new(step, decisions.join("; "), ledger.full_text()).with_trace(
+            &StepRecord::new(step, decisions.join("; "), ledger.text_for_step(step)).with_trace(
                 user,
                 calls_json.join(" | "),
                 step_tokens,

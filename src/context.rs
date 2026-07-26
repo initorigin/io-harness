@@ -24,11 +24,10 @@
 //! ([`Ledger::full_text`]); eliding is a decision about the *request*, not about
 //! the trace.
 
-use std::path::Path;
-
 use crate::error::Result;
 use crate::policy::{Act, Effect, Policy};
 use crate::state::{ContextEvent, Store};
+use crate::tools::Workspace;
 
 /// What an observation was, so assembly can reason about it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +55,20 @@ pub enum ObsKind {
 }
 
 impl ObsKind {
+    /// Whether a later observation of the same target replaces this one.
+    ///
+    /// True where the target *is* the subject of the answer: a path, a search
+    /// pattern, a glob, a skill's name. False where the target is only the name
+    /// of the thing that answered — a registered or MCP tool called twice with
+    /// different arguments gave two different answers, and stubbing the first as
+    /// "superseded" would throw one of them away.
+    pub fn target_is_the_subject(self) -> bool {
+        matches!(
+            self,
+            ObsKind::Read | ObsKind::Grep | ObsKind::Find | ObsKind::Write | ObsKind::Skill
+        )
+    }
+
     /// The word a stub uses for this kind — the same word the observation's own
     /// header uses, so a stub reads as the thing it replaced.
     pub fn label(self) -> &'static str {
@@ -134,10 +147,24 @@ impl Ledger {
         &self.entries
     }
 
-    /// The whole log, unelided — what the trace records, so bounding what the
-    /// model sees never bounds what an operator can audit.
+    /// The whole log, unelided — what an operator reconstructing a run wants, so
+    /// bounding what the model sees never bounds what can be audited.
     pub fn full_text(&self) -> String {
         self.entries.iter().map(|e| e.text.as_str()).collect()
+    }
+
+    /// The observations made on one step: what that step's trace row records.
+    ///
+    /// The trace stores a per-step delta rather than the whole log per step, so
+    /// concatenating the rows in step order reproduces [`Ledger::full_text`]
+    /// exactly while the trace stays linear in the step count instead of
+    /// quadratic — which matters on the 24-hour runs 0.7.0 supports.
+    pub fn text_for_step(&self, step: u32) -> String {
+        self.entries
+            .iter()
+            .filter(|e| e.step == step)
+            .map(|e| e.text.as_str())
+            .collect()
     }
 }
 
@@ -279,10 +306,10 @@ enum Shape {
 pub async fn assemble(
     ledger: &Ledger,
     budget_tokens: u64,
-    root: Option<&Path>,
+    ws: Option<&Workspace>,
     policy: &Policy,
     store: &Store,
-    run_id: &str,
+    run_id: i64,
     step: u32,
 ) -> Result<Assembled> {
     let entries = ledger.entries();
@@ -294,6 +321,9 @@ pub async fn assemble(
     // that makes this one not the current answer".
     let superseded: Vec<Option<u32>> = (0..n)
         .map(|i| {
+            if !entries[i].kind.target_is_the_subject() {
+                return None;
+            }
             entries[i].target.as_ref().and_then(|t| {
                 entries[i + 1..]
                     .iter()
@@ -326,7 +356,7 @@ pub async fn assemble(
         };
         let target = entries[i].target.clone().unwrap_or_default();
         out.reread += 1;
-        match refresh(root, policy, &target, cap) {
+        match refresh(ws, policy, &target, cap) {
             Ok(fresh) => {
                 store.record_context_event(
                     run_id,
@@ -420,17 +450,20 @@ pub async fn assemble(
 
 /// Re-read `target`'s current contents for assembly, or say why not.
 ///
-/// The policy decides first: freshening a stale read must not read what the run
-/// itself may not read, and `Ask` is a refusal here because assembly has no
-/// approver and no turn to spend on one.
+/// Two guards, both the same ones the read being refreshed passed. The policy
+/// decides first, so freshening cannot read what the run itself may not read, and
+/// `Effect::Ask` is a refusal here because assembly has no approver and no turn to
+/// spend on one. The read itself then goes through [`Workspace::read_file`], whose
+/// `resolve` is what keeps a target inside the root — checking the policy while
+/// reading the filesystem directly would copy the wrong half of the pair.
 fn refresh(
-    root: Option<&Path>,
+    ws: Option<&Workspace>,
     policy: &Policy,
     target: &str,
     cap: usize,
 ) -> std::result::Result<String, String> {
-    let Some(root) = root else {
-        return Err("no workspace root".into());
+    let Some(ws) = ws else {
+        return Err("this run has no workspace to re-read from".into());
     };
     let verdict = policy.check(Act::Read, target);
     if verdict.effect != Effect::Allow {
@@ -447,13 +480,12 @@ fn refresh(
         };
         return Err(format!("{what}{rule}"));
     }
-    let path = root.join(target);
-    if !path.exists() {
-        return Err("the path no longer exists".into());
-    }
-    match std::fs::read_to_string(&path) {
+    match ws.read_file(target) {
+        // `read_file` reads a missing path as empty rather than failing, so an
+        // empty result is reported as what it is: nothing left to carry.
+        Ok(body) if body.is_empty() => Err("it is now empty, or gone".into()),
         Ok(body) => Ok(bound(&body, cap, ObsKind::Read)),
-        Err(e) => Err(format!("the read failed: {e}")),
+        Err(e) => Err(format!("the re-read failed: {e}")),
     }
 }
 
@@ -528,6 +560,54 @@ mod tests {
             let b = bound(&text, 7, kind);
             assert!(b.contains("elided 93 of 100 chars"));
             assert_eq!(b.matches('é').count(), 7, "kept exactly the cap in chars");
+        }
+    }
+
+    #[test]
+    fn concatenating_each_steps_text_reproduces_the_whole_log() {
+        let mut l = Ledger::new();
+        for (step, text) in [
+            (1u32, "\n[read a]\nA\n"),
+            (1, "\n[grep x]\nX\n"),
+            (2, "\n[wrote a] (1 chars)\n"),
+            (4, "\n[read a]\nB\n"),
+        ] {
+            l.push(Observation::new(step, ObsKind::Read, None, text));
+        }
+        // The property the trace's per-step delta rests on: rows concatenated in
+        // step order are the whole log, so nothing is lost by not repeating it.
+        let joined: String = (0..=5).map(|s| l.text_for_step(s)).collect();
+        assert_eq!(joined, l.full_text());
+        assert_eq!(
+            l.text_for_step(3),
+            "",
+            "a step with no observations is empty"
+        );
+        assert_eq!(l.text_for_step(1), "\n[read a]\nA\n\n[grep x]\nX\n");
+    }
+
+    #[test]
+    fn only_a_target_that_is_the_subject_supersedes() {
+        for kind in [
+            ObsKind::Read,
+            ObsKind::Grep,
+            ObsKind::Find,
+            ObsKind::Write,
+            ObsKind::Skill,
+        ] {
+            assert!(kind.target_is_the_subject(), "{kind:?} names its subject");
+        }
+        for kind in [
+            ObsKind::Tool,
+            ObsKind::Mcp,
+            ObsKind::Child,
+            ObsKind::Message,
+            ObsKind::Error,
+        ] {
+            assert!(
+                !kind.target_is_the_subject(),
+                "{kind:?} names the answerer, not the subject"
+            );
         }
     }
 
