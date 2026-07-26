@@ -15,6 +15,13 @@ use crate::error::{Error, Result};
 /// higher than this is from a newer binary and is refused on resume.
 pub const CHECKPOINT_FORMAT: i64 = 7;
 
+/// The one outcome string that means the run did what it was asked.
+///
+/// Named rather than inlined so that [`RunSummary::success`] and any future
+/// reader agree by construction. Eleven outcome strings exist; exactly one of
+/// them is the task being done.
+pub const SUCCESS_OUTCOME: &str = "success";
+
 /// The durable lifecycle status of a run, so a caller can tell a crashed run
 /// (still `Running`) from one paused for a human (`Paused`) or finished
 /// (`Completed`). OS- and rusqlite-free, so it is safe in the public API.
@@ -58,6 +65,57 @@ pub struct SpawnRow {
     pub max_steps: Option<u32>,
     /// JSON array of `deny_write` globs the parent narrowed the child with.
     pub deny_write: String,
+}
+
+/// What one finished run cost and whether it worked.
+///
+/// Written once by [`Store::finish_run`] and read back with
+/// [`Store::run_summary`]. Before 0.12.0 a consumer had to assemble this itself
+/// from three different queries plus knowledge of which of eleven outcome
+/// strings count as success — and could not get `duration_ms` at all, because
+/// nothing recorded when a run ended.
+///
+/// Serialisable, so a scoring tool can store or ship it without restating the
+/// shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RunSummary {
+    /// The run this describes.
+    pub run_id: i64,
+    /// The raw outcome string, as written to `runs.outcome`.
+    ///
+    /// Kept alongside [`Self::success`] rather than replaced by it: the string
+    /// says *which* ending, the flag says whether it was the good one, and
+    /// collapsing them would throw away the distinction between a step cap, a
+    /// stall and a human's refusal.
+    pub outcome: String,
+    /// Whether the run achieved what it was asked to do.
+    ///
+    /// True for exactly one outcome — `success`. Every other ending, including
+    /// the ones that are nobody's fault like a rate-limited provider, is not the
+    /// task being done.
+    pub success: bool,
+    /// Steps completed, as `MAX(step)`.
+    ///
+    /// Not `COUNT(*)` over `steps`: a retry writes its own row under the same
+    /// step number, so counting rows counts trace entries rather than agent
+    /// steps. For a tree this is the ROOT agent's step count, not the tree's
+    /// total — each agent has its own summary.
+    pub steps: u32,
+    /// Tokens spent by this run, summed from its committed steps.
+    ///
+    /// Tokens, not money. A provider reports usage and never a price, so the
+    /// crate has nothing to convert with; see
+    /// [`Containment::max_total_cost`](crate::Containment::max_total_cost).
+    pub tokens: u64,
+    /// Wall-clock milliseconds from the run's start to its end.
+    ///
+    /// `None` for a run started before 0.7.0, which has no `started_at` to
+    /// measure from. Includes time the process was not running — a run that
+    /// crashed at midnight and resumed at nine counts the nine hours, because
+    /// that is how long the run took even though it was not working.
+    pub duration_ms: Option<u64>,
+    /// When the run ended, from the database clock.
+    pub finished_at: String,
 }
 
 /// A persisted run store. Use [`Store::open`] for a file, or [`Store::memory`]
@@ -884,6 +942,41 @@ impl Store {
              );",
         )?;
 
+        // 0.12.0: one row per finished run, so "did it work, how long did it take,
+        // what did it cost" is one read rather than a reconstruction.
+        //
+        // Every field but the end stamp was already derivable, and derivable was
+        // not good enough: a consumer had to know that success is one of eleven
+        // free-text strings, that steps means MAX(step) and not COUNT(*) because
+        // retry rows share a step number, and that spend is SUM(steps.tokens). That
+        // is schema knowledge the crate never promised, so io-eval would have been
+        // coupled to internals from its first line.
+        //
+        // `finished_at` is the genuinely new fact. Nothing in the schema recorded
+        // when a run ENDED — only `runs.started_at` — and `Store::elapsed_secs`
+        // measures against `julianday('now')`, so it keeps growing after the run is
+        // over and cannot reconstruct a finished run's latency. Stamped from
+        // SQLite's clock for the same reason `started_at` is: the pair must come
+        // from one clock or the difference is meaningless.
+        //
+        // A separate table rather than columns on `runs`: additive, and `runs` is
+        // read by resume on the hot path. New table only, so a 0.11.0 database gains
+        // it and a 0.11.0 binary, which never queries it, still opens and resumes a
+        // migrated database. Deliberately NOT a `CHECKPOINT_FORMAT` bump — no
+        // checkpoint layout changed, and bumping it would make
+        // [`Store::check_resumable`] refuse every 0.11.0 store for an additive table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_outcomes (
+                 run_id      INTEGER PRIMARY KEY,
+                 outcome     TEXT NOT NULL,
+                 success     INTEGER NOT NULL,
+                 steps       INTEGER NOT NULL,
+                 tokens      INTEGER NOT NULL,
+                 duration_ms INTEGER,
+                 finished_at TEXT NOT NULL
+             );",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -1484,7 +1577,78 @@ impl Store {
             "UPDATE runs SET outcome = ?1, status = ?2 WHERE id = ?3",
             (outcome, status, run_id),
         )?;
+        // A paused run has not finished — it is waiting for a human and will be
+        // resumed — so it gets no summary yet. It gets one when it really ends.
+        if status == "completed" {
+            self.write_summary(run_id, outcome)?;
+        }
         Ok(())
+    }
+
+    /// Record the run's outcome summary. Called by [`Self::finish_run`].
+    ///
+    /// Written here rather than assembled by the caller because a run that
+    /// escalates or is refused returns `Err` and never reaches a
+    /// [`RunResult`](crate::RunResult) at all — so a summary built at the call
+    /// site would be missing for exactly the endings a scoring tool most wants to
+    /// count.
+    fn write_summary(&self, run_id: i64, outcome: &str) -> Result<()> {
+        // Both stamps from the database clock, like `started_at`. Mixing SQLite's
+        // clock with the process's would make the difference meaningless.
+        let (finished_at, duration_ms): (String, Option<f64>) = self.conn.query_row(
+            "SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+                    (julianday('now') - julianday(started_at)) * 86400000.0
+             FROM runs WHERE id = ?1",
+            [run_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        let duration_ms = duration_ms.map(|ms| ms.max(0.0) as u64);
+        // `INSERT OR REPLACE`, because `finish_run` is reachable more than once for
+        // one run: a paused run resumes and finishes, and a resume of an already
+        // finished run is documented as idempotent. The last ending is the true one.
+        self.conn.execute(
+            "INSERT OR REPLACE INTO run_outcomes
+                 (run_id, outcome, success, steps, tokens, duration_ms, finished_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                run_id,
+                outcome,
+                i64::from(outcome == SUCCESS_OUTCOME),
+                self.last_step(run_id)?,
+                self.spent_tokens(run_id)?,
+                duration_ms,
+                &finished_at,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// What a finished run cost and whether it worked.
+    ///
+    /// `None` if the run has not finished, is paused awaiting a human, or was
+    /// finished by a pre-0.12.0 binary — a missing summary is reported as absent
+    /// rather than as a row of zeroes, which would be indistinguishable from a run
+    /// that did nothing.
+    pub fn run_summary(&self, run_id: i64) -> Result<Option<RunSummary>> {
+        let mut q = self.conn.prepare(
+            "SELECT run_id, outcome, success, steps, tokens, duration_ms, finished_at
+             FROM run_outcomes WHERE run_id = ?1",
+        )?;
+        let mut rows = q.query_map([run_id], |r| {
+            Ok(RunSummary {
+                run_id: r.get(0)?,
+                outcome: r.get(1)?,
+                success: r.get::<_, i64>(2)? != 0,
+                steps: r.get(3)?,
+                tokens: r.get(4)?,
+                duration_ms: r.get(5)?,
+                finished_at: r.get(6)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
     }
 
     /// Every run in this store, newest first.

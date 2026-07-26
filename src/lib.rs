@@ -264,8 +264,9 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent,
-    RunStatus, SandboxEvent, SpawnRow, StepRecord, Store, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
-    MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, BUSY_TIMEOUT,
+    CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    SUCCESS_OUTCOME,
 };
 pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};
