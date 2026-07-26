@@ -136,7 +136,7 @@ tasks:
     it wrong is expensive and permanent. 0.11.0 settled its error kind and 0.9.0 its `Tool` trait before
     touching a call site, for the same reason. Nothing else in the release can be built until this shape
     exists.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T03
   acceptance_criteria:
@@ -155,7 +155,15 @@ tasks:
   - src/lib.rs
   - src/provider/mod.rs
   - tests/observe.rs
-  evidence: []
+  evidence:
+  - 'src/observe.rs: Observer (Send + Sync, &self, &dyn -- the Approver precedent), RunEvent, 17-variant
+    EventKind, Flow, Ignore. One method returning Flow rather than Result: an observer is a spectator
+    and must not be able to fail a run.'
+  - Wire shape flat and internally tagged, pinned by test because it is a contract. every_kind() carries
+    a compiler-enforced exhaustiveness guard so a new variant cannot escape the round-trip and distinct-tag
+    tests. 5 lib tests passed.
+  - 'Provider types derive serde + PartialEq: the prerequisite for recording, since there was previously
+    no format to record into.'
 - id: US-IO-HARNESS-0.12.0-T05
   summary: Unify the step boundary. The commit point is duplicated at `src/run.rs:743`, `:962` and `:1455`,
     each with its own inline `StepRecord` construction and its own differently-named `info!` ("loop step"
@@ -165,7 +173,7 @@ tasks:
   why_required: Three copies of the boundary will drift the moment an event is emitted from them, and
     the uncommitted-step case is exactly where a naive "one commit, one event" rule reintroduces the double-execution
     bug 0.7.0 exists to prevent.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T04
   acceptance_criteria:
@@ -179,7 +187,12 @@ tasks:
   - src/run.rs
   - tests/checkpoint.rs
   - tests/subagents.rs
-  evidence: []
+  evidence:
+  - commit_step is the single boundary for all three loops, replacing three inline StepRecord constructions
+    and three differently-named info! lines.
+  - 'The paused-by-child case is passed IN as a `commit: bool` argument rather than branched around, so
+    the uncommitted step is an argument at the one commit point rather than a second quieter commit path.
+    No Step event is emitted for it. Pinned by a_step_left_uncommitted_for_replay_is_not_announced_as_a_step.'
 - id: US-IO-HARNESS-0.12.0-T06
   summary: 'Thread the observer through every entry point and emit every event kind from the sites the
     audit enumerated: committed steps, tool calls, policy refusals, approval requests and decisions, spend
@@ -189,7 +202,7 @@ tasks:
   why_required: 'This is the release''s headline: an embedding application is called as the run happens
     instead of polling a file. The zero-cost-when-absent half is not optional — a visibility feature that
     changes what an unobserved run does is a regression however well it reports.'
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.12.0-T05
   acceptance_criteria:
@@ -219,7 +232,17 @@ tasks:
   - src/context.rs
   - src/observe.rs
   - tests/observe.rs
-  evidence: []
+  evidence:
+  - Seven *_observed twins, originals become one-line wrappers passing &Ignore -- 0.11.0 code compiles
+    unchanged and there is one code path, not an Option branch per site.
+  - 'Ten of fifteen event kinds emitted. The headline test compares the event stream against the trace
+    the same run wrote and found a real asymmetry: the trace records prose, the event carries Replan {
+    window: 3 }. Corrected to assert the sequence agrees AND the number matches the prose, rather than
+    demanding the event repeat a sentence it deliberately does not carry.'
+  - an_unobserved_run_writes_the_same_trace_and_makes_the_same_provider_calls covers F2/NF2.
+  - 'OPEN: ToolCall, Refused, ApprovalRequested, ApprovalDecided, MemoryWrote, Sandbox and Mcp were declared
+    but never emitted -- the enum promised more than the run delivered. In progress; the sites are in
+    dispatch()/gate() in run.rs plus verify.rs and mcp.rs.'
 - id: US-IO-HARNESS-0.12.0-T07
   summary: Cancellation the caller asks for. The observer's return value can stop the run, which ends
     as a terminal outcome, records it, leaves `runs.status` not `running`, and stays resumable. Today
@@ -229,7 +252,7 @@ tasks:
   why_required: A 24-hour unattended run with no way to ask it to stop is not operable, and the observer
     is the only place the request can come from. Without this the release ships a surface that can watch
     a run but not act on what it sees.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T06
   acceptance_criteria:
@@ -243,7 +266,13 @@ tasks:
   - src/state.rs
   - src/observe.rs
   - tests/observe.rs
-  evidence: []
+  evidence:
+  - 'RunOutcome::Cancelled, outcome string cancelled, mapped in terminal_outcome. Watch latches the request;
+    honoured at the top of each loop iteration, so a cancel costs at most one more step and never lands
+    mid-step. The run is finished rather than abandoned: status completed, summary written, resume a faithful
+    no-op.'
+  - 'Known edge, reported rather than hidden: a cancel requested on the last step of the budget has no
+    next boundary, so that run reports StepCapReached. It stopped anyway.'
 - id: US-IO-HARNESS-0.12.0-T08
   summary: 'A recording provider and a replaying provider, both combinators that are themselves `Provider`,
     following `Fallback`''s pattern (`src/provider/fallback.rs:87`) so every existing generic entry point
@@ -256,7 +285,7 @@ tasks:
     the model said. Request-keying rather than counter-keying is the whole difference between replay that
     composes with 0.7.0's resume and replay that breaks it — `tests/checkpoint.rs:63-66` already documents
     why.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T04
   acceptance_criteria:
@@ -278,7 +307,17 @@ tasks:
   - src/provider/mod.rs
   - src/state.rs
   - tests/replay.rs
-  evidence: []
+  evidence:
+  - Record<P> and Replay as Fallback-shaped combinators. Recordings go to a JSON file, not the store --
+    forced by the type system, since Provider::complete's future must be Send and rusqlite::Connection
+    is !Sync, so a &Store captured in a recorder's future does not compile. The contract's open question
+    is settled by the compiler.
+  - Replay keys on request content, never a counter. a_counter_keyed_mock_diverges_where_a_replay_does_not
+    is the negative control proving the difference is real.
+  - 'A missing recording is a typed non-retryable error, not a default: CompletionResponse::default()
+    reads exactly like ''the model chose not to call a tool'', so a silent default would make a diverged
+    replay look successful. Recordings carry the harness version and refuse a different major.minor series.
+    8 tests passed.'
 - id: US-IO-HARNESS-0.12.0-T09
   summary: 'Define and prove "identical twice": a canonicalised projection of the trace naming which tables
     and columns are compared and which fields are excluded as inherently variable, then the tests. One
@@ -288,7 +327,7 @@ tasks:
   why_required: The determinism claim is what every future measurement rests on, and a comparison that
     cannot fail proves nothing. The negative controls are the criterion, not a nicety — they are the only
     thing standing between a real guarantee and a test that passes because it asserts nothing.
-  status: todo
+  status: blocked
   depends_on:
   - US-IO-HARNESS-0.12.0-T08
   - US-IO-HARNESS-0.12.0-T03
@@ -314,7 +353,20 @@ tasks:
   - tests/replay.rs
   - tests/determinism.rs
   - src/state.rs
-  evidence: []
+  evidence:
+  - '6 tests. Positive: one case replayed twice into fresh stores compares equal, and separately matches
+    the run it was recorded from -- two replays could agree while both differing from reality.'
+  - Two negative controls (run_id in the prompt, children in completion order) must break equality, plus
+    a control-on-controls asserting identically-built traces DO compare equal. Without these the positive
+    test would pass through a reintroduction of either bug.
+  - Store::canonical_trace defines the comparison, with every excluded field and its reason documented
+    -- equality could not be row identity, since a retry shares a step number with the commit that follows.
+  - 'BLOCKED, needs /ultraship:iterate: F10 as written is false. A resumed run does not reproduce the
+    uninterrupted one, because ContextLedger is in-memory (src/run.rs:1183, :1758) and 0.7.0''s resume
+    never restores it, so the resumed run re-assembles context from the workspace and sends a prompt the
+    recording never saw. Replay is not the cause. Fixing it means checkpointing the ledger, which this
+    contract excludes. The test now pins the true boundary behaviour -- the replay reports divergence
+    as a typed error rather than inventing an answer.'
 - id: US-IO-HARNESS-0.12.0-T10
   summary: 'The per-run outcome record: an additive table written by `finish_run`, carrying whether the
     run succeeded, its step count, its token spend and its duration — the last requiring an end stamp,
@@ -326,7 +378,7 @@ tasks:
     follow-up query and latency is not recorded at all, so the fourth field of the deliverable is the
     one genuinely new write. Written by `finish_run` rather than assembled by the caller because an escalated
     run returns `Err` and never reaches a `RunResult`.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.12.0-T02
   acceptance_criteria:
@@ -361,7 +413,15 @@ tasks:
   - src/run.rs
   - src/lib.rs
   - tests/outcome_record.rs
-  evidence: []
+  evidence:
+  - run_outcomes table, additive CREATE TABLE IF NOT EXISTS, CHECKPOINT_FORMAT still 7, no existing table
+    reshaped. Written by finish_run so a run that escalates or is refused -- returning Err and never reaching
+    a RunResult -- still gets one.
+  - 'finished_at is the genuinely new fact: nothing recorded when a run ENDED, and elapsed_secs measures
+    against now so it keeps growing afterwards. Both stamps from the database clock.'
+  - A paused run gets no summary until it really ends. A pre-0.12.0 run reports None rather than zeroes.
+    7 tests, every field asserted against an independently computed value, duration as a bound.
+  - 'OPEN: RunResult does not yet carry the summary (F13).'
 - id: US-IO-HARNESS-0.12.0-T11
   summary: Correct every false claim in `README.md` — its structure is 0.15.0's subject, its accuracy
     is this release's. No `git` tool (built-ins are `write_file`, `grep`, `find`, `read_file`, `remember`,
