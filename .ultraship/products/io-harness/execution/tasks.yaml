@@ -490,7 +490,7 @@ tasks:
     rather than observed, and an over-broad determinism claim is worse than a narrow one because it will
     be relied on. The 0.11.0 record is immutable, so the correction has to be recorded somewhere a reader
     will find it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T07
   - US-IO-HARNESS-0.12.0-T09
@@ -529,7 +529,22 @@ tasks:
   - src/state.rs
   - CHANGELOG.md
   - docs/CAPABILITIES.md
-  evidence: []
+  evidence:
+  - 'The three contracts are documented at their definitions: src/observe.rs carries module docs on event
+    ordering, that events are in-process and synchronous, that one event is not one committed row, that
+    the durable trace stays authoritative, and that an observer must not panic. Store::canonical_trace
+    documents exactly what is compared, what is excluded and the reason for each exclusion. RunSummary
+    documents every field including that spend is tokens and never money, that duration is wall-clock
+    including downtime, and that steps is MAX(step) rather than a row count.'
+  - 'src/provider/replay.rs carries an explicit ''what it does not guarantee'' section: a diverged prompt,
+    duplicate identical requests across a process restart, and ordering past a key''s recorded answers.
+    An overstated determinism claim is worse than a narrow one.'
+  - 'O6 discharged: the CHANGELOG annotates 0.11.0''s entry in place rather than rewriting it, since that
+    is what 0.11.0 claimed and its record is sealed. The Security section carries the resume-drops-policy
+    finding, including the correction that resume_with_decision is not a general policy-aware resume --
+    it needs a request_id and a pending Decision, so there is no policy-preserving general resume at all.'
+  - docs/CAPABILITIES.md marks observability and evaluation shipped and states all twelve pillars now
+    hold.
 - id: US-IO-HARNESS-0.12.0-T13
   summary: 'Verify the whole release rather than assert it: the full suite from a cold cache, the three-OS
     matrix plus the msrv and lint jobs green on one commit with no leg skipped or marked `continue-on-error`,
@@ -539,7 +554,7 @@ tasks:
   why_required: Two of the last three releases had CI find a real Windows-specific behaviour nothing local
     could see, and the determinism comparison is the leg most likely to differ across platforms since
     path rendering and line endings both reach the trace. Nobody on this project has a Windows machine.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T11
   - US-IO-HARNESS-0.12.0-T12
@@ -562,4 +577,20 @@ tasks:
   files:
   - .github/workflows/ci.yml
   - evidence/0.12.0/
-  evidence: []
+  evidence:
+  - 'CI run 30209627766 on commit ''announce a denied network host'': test (ubuntu-latest), test (windows-latest),
+    test (macos-latest), lint and msrv ALL green on one commit. No leg skipped, excluded or marked continue-on-error.'
+  - 'cargo test locally: 396 passing across 26 targets, up from 341 at 0.11.0. cargo clippy --all-targets
+    -- -D warnings exit 0. cargo fmt --check clean. MSRV 1.88 holds.'
+  - 'Public surface diff recorded in evidence/0.12.0/. ZERO removals -- no public item renamed or removed,
+    so the release takes no breaking change at all, which is stronger than NF5 required. The diff''s own
+    blind spot is documented rather than hidden: it is line-based and deduplicated, so the three new provider
+    with_timeout methods collapse into McpServer::with_timeout, which already existed with a byte-identical
+    signature.'
+  - 'NF6: the 0.11.0 tests that changed are named with why each old assertion was wrong -- four stall
+    assertions replaced by the stronger cross-kind sequence assertion, and a memory test that asserted
+    the run_id leak as a REQUIREMENT (''a note must name the run that wrote it''), which was the defect
+    stated as a spec.'
+  - 'NOT DONE: the live-run evidence O7 asks for (a real provider run observed end to end, and a recorded
+    case replayed twice). The observer and replay paths are covered by fixtures including real local sockets,
+    a real sandboxed rustc and a real stdio MCP server, but no live provider run was made this session.'
