@@ -7,13 +7,13 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 **Type:** Rust library crate
 **Stack:** Rust · cargo · tokio · rusqlite · rmcp · own HTTP+SSE provider client
 **License:** Apache-2.0
-**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise. v0.6 adds the execution sandbox: every command the verification gate runs — the `rustc` compile and the test binary it has run since v0.2 — executes inside an ephemeral, per-run sandbox (isolated workdir, resource caps that kill, network denied by default, guaranteed teardown), so model-produced code no longer runs on the host directly. The sandbox is OS-native and OS-neutral — one trait, a native backend per platform (macOS `sandbox-exec`, Linux namespaces, Windows Job Objects) over a portable floor that runs everywhere. v0.7 makes a run durable and unattended: every step is checkpointed transactionally, and a crash or full restart resumes the whole agent tree from its own last committed step without re-running work, double-charging the budget, or re-applying an edit. v0.8 makes the harness extensible and its network reach governed: it is an MCP client (stdio and streamable HTTP) whose servers' tools reach the agent beside the built-ins under namespaced names, and outbound connections become a fourth permission act — deny-by-default, layered, contained downward, and traced.
+**Status:** Pre-release. v0.1 shipped the single-agent file-edit loop (filesystem tool, OpenRouter provider, deterministic verify, rusqlite audit). v0.2 adds step/time/cost budgets, retry with escalation, a full trace, resumable runs, and execution-based verification that compiles the produced file so a substring stub cannot pass. v0.3 adds repository-wide work — `grep` and `find` tools over a workspace and multi-file edits in one run — and two more providers (Anthropic and OpenAI) behind the same provider-agnostic surface, selected at run construction. v0.4 adds the permission boundary: a layered policy over reads, writes, and command execution, enforced in the tool layer rather than the prompt, plus a human-approval gate that can approve, rewrite, remember, deny, or defer a decision until after the process has exited. v0.5 adds agent composition with containment: a parent decomposes a task and spawns contained sub-agents (100+ concurrently) over one shared workspace and trace, composing their results back; a child inherits its parent's policy and can only narrow it, and the whole tree runs under one aggregate spend ceiling no spawned task can raise. v0.6 adds the execution sandbox: every command the verification gate runs — the `rustc` compile and the test binary it has run since v0.2 — executes inside an ephemeral, per-run sandbox (isolated workdir, resource caps that kill, network denied by default, guaranteed teardown), so model-produced code no longer runs on the host directly. The sandbox is OS-native and OS-neutral — one trait, a native backend per platform (macOS `sandbox-exec`, Linux namespaces, Windows Job Objects) over a portable floor that runs everywhere. v0.7 makes a run durable and unattended: every step is checkpointed transactionally, and a crash or full restart resumes the whole agent tree from its own last committed step without re-running work, double-charging the budget, or re-applying an edit. v0.8 makes the harness extensible and its network reach governed: it is an MCP client (stdio and streamable HTTP) whose servers' tools reach the agent beside the built-ins under namespaced names, and outbound connections become a fourth permission act — deny-by-default, layered, contained downward, and traced. v0.9 closes the tool layer with the in-process half of extensibility: implement the public `Tool` trait for an action your own binary already performs, register it on the task contract, and the model is offered it beside the built-ins — governed by the same policy, refused as an observation rather than a failed run, size-capped, traced, and inherited by a v0.5 child; plus skills, a directory of markdown instruction files whose names and descriptions reach the system prompt and whose bodies the agent loads on demand through a built-in `read_skill` tool.
 
 ## Capabilities
 
 - Task contract — goal, constraints, expected output, success criteria
 - Context construction — feed the model only relevant, current, trusted info
-- Tool layer — narrow, typed actions the agent invokes
+- Tool layer — narrow, typed actions the agent invokes ✅ **v0.9** completes it: the public `Tool` trait, in-process and policy-governed
 - Orchestration loop — observe, reason, act, check, stop
 - State and memory — progress, intermediate results, decisions (rusqlite)
 - Verification layer — tests, schemas, read-backs confirm the task is done
@@ -25,11 +25,11 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Providers — OpenRouter first, then Anthropic and OpenAI (own HTTP+SSE client)
 - Agent composition — spawn and nest many agents (100+) with shared context
 - Long-running autonomous tasks — 24h+ with no user input
-- Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, Windows Job Objects, portable floor)
+- Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, portable floor everywhere — Windows is the floor only, its Job Object is not implemented yet)
 - Built-in tools — filesystem, git, grep, find
 - Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete, PDF watermark, PDF form fill, OCR, barcode/QR read and generate
 - Media — image and video passthrough when the model supports it
-- Extensibility — MCP (rmcp) ✅ **v0.8** (client; stdio + streamable HTTP), plugins, skills
+- Extensibility — MCP (rmcp) ✅ **v0.8** (client; stdio + streamable HTTP), in-process `Tool` implementations and skills ✅ **v0.9**
 
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
 [docs/CONTRACT.md](docs/CONTRACT.md) for the public contract.
@@ -409,7 +409,7 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | --- | --- |
 | **macOS `sandbox-exec`** | profile confines writes to the workdir and **denies network**; rlimits cap CPU/fds; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
 | **Linux namespaces** | user/mount/pid/**net** namespaces — a *hard* network boundary and a private root — plus rlimits *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
-| **Windows Job Object** | kill-on-close + memory / active-process / CPU limits and a restricted token *(cfg-gated; compiled + unit-tested, not live-run here)* |
+| **Windows** | **no native backend yet** — the Job Object is designed but unimplemented (no Win32 call is made), so a Windows run gets the portable floor and reports it as such. Tracked for a dedicated release |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
 
 `select` picks the strongest backend available on the running OS and records which
@@ -530,6 +530,162 @@ The harness governs the connections **it** opens. A stdio MCP server is a separa
 process: the harness decides whether it may start and which of its tools may be
 called, but once running it dials whatever it likes. Isolating a server's own
 egress would need OS-level containment, which v0.8 does not build.
+
+## In-process tools and skills (v0.9)
+
+v0.8 made the harness extensible **out of process**. That is the right boundary
+for a capability that already lives elsewhere and the wrong one for a capability
+already linked into the same binary: a second process, a transport, and a
+serialization hop to call a function that is one `await` away. v0.9 adds the
+in-process half — implement `Tool` for something your product already knows how
+to do — plus **skills**, markdown instruction files that shape *how* the agent
+works without touching Rust.
+
+### Register a tool your program already has
+
+```rust
+use io_harness::tools::{Tool, ToolFuture, Toolbox};
+use io_harness::{run_with, ApproveAll, Policy, TaskContract, ToolSpec, Verification};
+use serde_json::json;
+
+struct LookupOrder { db: OrderDb }
+
+impl Tool for LookupOrder {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: "lookup_order".into(),
+            description: "Look up an order by id. Returns its status and line items.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "id": { "type": "string" } },
+                "required": ["id"]
+            }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        // Read defensively: a model can send a missing or mistyped field, and
+        // that is an observation to adapt to, not a crash.
+        let id = arguments.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        Box::pin(async move {
+            Ok(match self.db.order(&id).await {
+                Some(order) => format!("{order}"),
+                None => format!("no order with id {id:?}"),
+            })
+        })
+    }
+}
+
+let contract = TaskContract::workspace(
+    "Write the status of order 4471 into REPORT.md.",
+    "/path/to/repo",
+    Verification::WorkspaceFileContains { file: "REPORT.md".into(), needle: "4471".into() },
+)
+.with_tools(Toolbox::new().with(LookupOrder { db }));
+
+let policy = Policy::default()
+    .layer("app")
+    .allow_read("*")
+    .allow_write("*")
+    // Registering the tool offers it. This is what allows it to be called.
+    .allow_exec("lookup_order");
+
+let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+```
+
+- **Registration is availability, not authority** — a call is an `Act::Exec`
+  check on the tool's name, decided by the same deny-first stack that decides
+  paths, binaries, and hosts. Hand an agent a toolbox and still refuse one tool
+  in it; the refusal is an observation the agent adapts to, with the deciding
+  rule and layer in the trace. An `ask_exec` routes to the `Approver` and
+  survives a restart like any other v0.4 approval.
+- **Nothing may shadow anything** — a registered tool cannot take the name of a
+  built-in (`write_file`, `grep`, `find`, `read_file`, `spawn_agent`,
+  `read_skill`), cannot use the `mcp__` prefix reserved for server tools, and two
+  registered tools cannot share a name. Each is an `Error::Config` raised
+  **before the provider is called once**, not a silent shadowing found at
+  dispatch.
+- **A failing tool is an observation** — returning `Err` puts the message in the
+  observations and the run continues, the same treatment `grep` gives a bad
+  regex. Only the model can tell "try another id" from "give up on this
+  approach".
+- **It cannot flood the context** — a result over the cap is truncated with a
+  visible marker before it enters the observations, and the truncated form is
+  what the trace records.
+- **Inherited by the tree** — a v0.5 child is offered its parent's toolbox and
+  calls it under the child's own narrowed policy. Inheritance grants the tool;
+  `Policy::contain` still decides the call.
+- **Traced like a built-in** — same decision, argument, and observation rows, so
+  an audit does not have to distinguish extension from core.
+
+Run it live: `cargo run --example custom_tool`.
+
+### Skills: instructions, not code
+
+Point the contract at a directory of markdown. Both conventions in common use
+are accepted, so a directory written for another agent tool usually works
+unchanged:
+
+```text
+skills/
+  migrations.md          -> skill "migrations"
+  api-style/
+    SKILL.md             -> skill "api-style"
+```
+
+```rust
+let contract = TaskContract::workspace(
+    "Add the `orders` table migration.",
+    "/path/to/repo",
+    Verification::EachCompilesRust(vec!["migrations/003_orders.rs".into()]),
+)
+.with_skills("skills");   // discovered once per run, not once per step
+```
+
+Optional YAML frontmatter names and describes a skill; without it the name comes
+from the file stem (or the containing directory, for a `SKILL.md`) and the
+description from the first prose line:
+
+```text
+---
+name: migrations
+description: How to write a reversible database migration in this repo.
+---
+
+Always write the down-migration first...
+```
+
+- **Names and descriptions reach the prompt; bodies do not** — twenty skills
+  would otherwise be paid for on every turn of every run. The agent is told what
+  exists and calls the built-in `read_skill` tool for the one it judges
+  relevant, which enters the observations once. The harness does not rank,
+  match, or auto-inject — automatic relevance selection is a context-construction
+  question and is deliberately not here.
+- **Reading one is an ordinary policy-checked read** — a policy denying
+  `Act::Read` over the skills directory keeps the catalogue in the prompt and the
+  bodies out of the context, with the refusal in the trace. An unknown skill name
+  returns an observation listing what does exist, not an error.
+- **A bad directory fails honestly** — a missing path, a path that is not a
+  directory, more than 64 skills, or two skills with the same name is an
+  `Error::Config` at run start. A rejected set, not a silently truncated one the
+  caller believes is complete.
+
+Run it live: `cargo run --example skills_run`.
+
+### The boundary, stated plainly
+
+A registered tool runs **in the harness's own process, with the embedding
+program's privileges**. The policy governs whether it is *called*; it does not
+govern what it does once running — no sandbox, no path scoping, and no egress
+control applies inside it. This is exactly the bound v0.8 already states for a
+stdio MCP server, and for the same reason: the harness decides what starts, not
+what a started thing then does. A tool that shells out, writes outside the
+workspace, or dials a host has done so with your full authority.
+
+A **skill** is instructions with no execution of its own. A skill saying "run
+`rm -rf /`" is a sentence the model reads, and any action it then takes passes
+the same policy every other action does. Anything that should actually *do*
+something is a `Tool`, where the permission layer can see it.
 
 ## Part of initorigin
 

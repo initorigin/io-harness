@@ -48,12 +48,6 @@ pub const MCP_TOOL_PREFIX: &str = "mcp__";
 /// become a run that never ends.
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
-/// Cap on how much of a tool result is folded into the observation log.
-///
-/// Third-party tool output is the first genuinely unbounded input the harness
-/// feeds the model; truncation is recorded rather than silent.
-const RESULT_CAP: usize = 8_000;
-
 fn default_timeout_secs() -> u64 {
     DEFAULT_TIMEOUT_SECS
 }
@@ -304,7 +298,10 @@ impl McpSession {
         run_id: i64,
         step: u32,
     ) -> Result<String> {
-        let Some(server) = self.servers.iter().find(|s| s.tools.iter().any(|t| t.name == name))
+        let Some(server) = self
+            .servers
+            .iter()
+            .find(|s| s.tools.iter().any(|t| t.name == name))
         else {
             return Ok(format!("[unknown tool {name}]"));
         };
@@ -337,7 +334,7 @@ impl McpSession {
             }
         };
 
-        let (text, truncated) = cap(text);
+        let (text, truncated) = crate::tools::cap_result(text);
         store.record_mcp(
             run_id,
             &McpEvent::called(&server.id, name, ok)
@@ -422,21 +419,6 @@ fn render(result: &rmcp::model::CallToolResult) -> String {
     parts.join("\n")
 }
 
-/// Keep a result within [`RESULT_CAP`], reporting whether it was cut.
-fn cap(s: String) -> (String, bool) {
-    if s.len() <= RESULT_CAP {
-        return (s, false);
-    }
-    let mut end = RESULT_CAP;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (
-        format!("{}\n[truncated at {RESULT_CAP} chars]", &s[..end]),
-        true,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,13 +457,14 @@ mod tests {
 
     #[test]
     fn an_oversized_result_is_cut_on_a_char_boundary_and_says_so() {
-        let (short, cut) = cap("hello".into());
+        let (short, cut) = crate::tools::cap_result("hello".into());
         assert_eq!((short.as_str(), cut), ("hello", false));
 
         // Multi-byte characters, so a naive slice would panic.
-        let (long, cut) = cap("é".repeat(RESULT_CAP));
+        let cap_chars = crate::tools::TOOL_RESULT_CAP;
+        let (long, cut) = crate::tools::cap_result("é".repeat(cap_chars));
         assert!(cut);
         assert!(long.contains("[truncated at"));
-        assert!(long.len() < 2 * RESULT_CAP);
+        assert!(long.len() < 2 * cap_chars);
     }
 }

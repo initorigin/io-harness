@@ -44,6 +44,22 @@ pub struct TaskContract {
     /// extend.
     #[allow(clippy::doc_markdown)]
     pub mcp: Vec<crate::mcp::McpServer>,
+    /// Tools the embedding program supplies itself, offered to the model beside
+    /// the built-ins and governed by the same policy and trace.
+    ///
+    /// Empty by default, so a 0.8.1-era contract behaves exactly as before. In
+    /// process, unlike [`TaskContract::mcp`]: see [`crate::tools::Tool`] for what
+    /// registration does and does not authorize.
+    pub tools: crate::tools::Toolbox,
+    /// Directory of skill files to offer the agent, or `None` (the default) for
+    /// no skills.
+    ///
+    /// The *path* is held rather than the discovered set, because reading a
+    /// directory is fallible and a builder method is not: discovery happens at
+    /// run start, so a directory that does not exist fails the run with
+    /// [`Error::Config`](crate::Error::Config) naming the path — the same point
+    /// and the same way [`TaskContract::tools`] is arbitrated.
+    pub skills: Option<PathBuf>,
 }
 
 impl TaskContract {
@@ -61,6 +77,8 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            tools: crate::tools::Toolbox::new(),
+            skills: None,
         }
     }
 
@@ -86,6 +104,8 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            tools: crate::tools::Toolbox::new(),
+            skills: None,
         }
     }
 
@@ -100,6 +120,50 @@ impl TaskContract {
     {
         self.mcp = servers.into_iter().collect();
         self
+    }
+
+    /// Register in-process tools for the run and offer them to the model.
+    ///
+    /// Registration makes a tool available; it does not authorize it. Each call
+    /// is an [`Act::Exec`](crate::Act::Exec) check on the tool's name, and a
+    /// registered tool runs with the embedding program's own privileges — see
+    /// [`crate::tools::Tool`] for the full bound.
+    ///
+    /// A name that shadows a built-in, uses the `mcp__` prefix, or duplicates
+    /// another registered tool fails the run with [`Error::Config`](crate::Error::Config)
+    /// before the first completion.
+    ///
+    /// Workspace mode only, like [`TaskContract::with_mcp`]: single-file mode has
+    /// one tool and no tool layer to extend.
+    pub fn with_tools(mut self, tools: crate::tools::Toolbox) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    /// Offer the agent the skills in `dir` — see [`crate::skills`] for the
+    /// layout.
+    ///
+    /// The directory is read at run start, not here, so a path that does not
+    /// exist, is not a directory, or holds more than
+    /// [`MAX_SKILLS`](crate::skills::MAX_SKILLS) skills fails the run with
+    /// [`Error::Config`](crate::Error::Config) naming it, before the first
+    /// completion.
+    ///
+    /// A skill is instructions the model may choose to read. Offering one grants
+    /// nothing: the read goes through the policy when it happens, and anything
+    /// the model then does is checked as it always is.
+    pub fn with_skills(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.skills = Some(dir.into());
+        self
+    }
+
+    /// Discover the configured skills. Called at run start by every entry point,
+    /// alongside [`Toolbox::validate`](crate::tools::Toolbox::validate).
+    pub(crate) fn discover_skills(&self) -> crate::Result<crate::skills::Skills> {
+        match &self.skills {
+            Some(dir) => crate::skills::Skills::discover(dir),
+            None => Ok(crate::skills::Skills::none()),
+        }
     }
 
     /// Override the step budget.

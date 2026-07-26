@@ -1,0 +1,486 @@
+product: io-harness
+version: 0.9.0
+status: released
+release_type: minor
+outcome:
+  user_can: >
+    A developer embedding io-harness extends it inside their own binary, without MCP and without
+    forking the crate. They implement the public `Tool` trait for an action their product already
+    knows how to perform — query their database, call their internal API, render their template —
+    register it on the task contract next to the MCP servers, and the model is offered it beside
+    `grep`, `find`, `read_file`, and `write_file`. It is not a privileged back door: the same 0.4.0
+    policy decides whether it may be called, a refusal is an observation the agent adapts to rather
+    than a failed run, its result is size-capped where it enters the context, every call is in the
+    rusqlite trace, and a 0.5.0 child agent inherits the same set under the same narrowed policy.
+
+    The same developer shapes *how* the agent approaches a class of task without touching Rust.
+    They point the contract at a directory of skills — markdown instruction files, optionally with
+    the `name`/`description` frontmatter they already write for other agent tools — and the agent
+    is told what skills exist and loads the body of the one it needs, on demand, through a built-in
+    `read_skill` tool. Instructions, not code: a skill cannot execute anything, and reading one is
+    an ordinary policy-governed file read.
+
+    Upgrading from 0.8.1 is a version bump and nothing else. Every existing public item keeps its
+    name and shape; a contract that registers no tools and no skills behaves exactly as it did.
+  business_value: >
+    This closes the tool-layer pillar, the last of the twelve that a downstream product hits
+    immediately. io-cli and io-studio each need capabilities the engine will never carry — a
+    terminal-native prompt, a Tauri file dialog, product-specific project actions — and against
+    0.8.1 their only supported route is to stand up an MCP server: a second process, a transport,
+    and a serialization boundary for a function that is already linked into the same binary. MCP is
+    the right answer for a capability that lives elsewhere and the wrong one for a capability that
+    lives here.
+
+    Skills are the same argument for behaviour rather than capability. Both applications will want
+    to ship task-shaped guidance, iterate on it without a crate release, and let their users add
+    their own. A directory of markdown lets that happen at their release cadence rather than the
+    engine's, and keeps the engine out of the business of encoding each product's house style.
+
+    It is also the cheapest of the four remaining pillar releases and the one the others build on:
+    0.10.0's context construction has to decide what a tool result costs, and it needs the full
+    set of tool results — built-in, MCP, and in-process — to be flowing through one place first.
+  evidence_of_value: >
+    A live run against a real model in which the agent is given one caller-supplied tool and one
+    skill, and completes a task it cannot complete without them — the tool because the information
+    exists nowhere on disk, the skill because the required output shape is stated only there. The
+    same contract with the tool and skill removed reaches its step cap. Both runs are stored under
+    evidence/0.9.0/live_run.txt.
+
+    Plus the structural evidence: the 0.8.1 public API compiles unchanged against 0.9.0 (NF2), and
+    the diff adds no runtime dependency (NF1).
+scope:
+  included:
+    - >
+      A public, object-safe `Tool` trait: `spec()` returning the vendor-neutral `ToolSpec` already
+      used for built-ins and MCP tools, and an `invoke()` taking the parsed JSON arguments and
+      returning a string result or a typed error. Boxed futures, since the trait must be `dyn`-safe
+      (unlike `Provider`, which is generic and stays as it is).
+    - >
+      Registration on the task contract — `TaskContract::with_tools(...)`, mirroring `with_mcp(...)`
+      — so in-process and out-of-process extension are configured the same way and no public
+      function signature changes.
+    - >
+      Name arbitration. A registered tool may not take the name of a built-in (`write_file`, `grep`,
+      `find`, `read_file`, `spawn_agent`), may not use the `mcp__` prefix reserved for server tools,
+      and two registered tools may not share a name. A violation is a typed `Error::Config` raised
+      before the first completion, not a silent shadowing discovered at dispatch.
+    - >
+      Policy governance identical to MCP tools: calling a registered tool is an `Act::Exec` check on
+      its name, refusals recorded as `PolicyEvent`s and surfaced to the model as an observation, and
+      a `Effect::Ask` verdict routed through the `Approver` with the durable defer path intact.
+    - >
+      Trace parity: a registered tool call records the same decision, arguments, and observation
+      rows a built-in call does, so an audit does not distinguish extension from core.
+    - >
+      Containment: a 0.5.0 child inherits the parent's registered tools, and calls them under its
+      own narrowed policy — inheritance grants the tool, the policy still decides the call.
+    - >
+      Skills: `TaskContract::with_skills(dir)`, discovering `<dir>/<name>.md` and
+      `<dir>/<name>/SKILL.md`, reading optional `name`/`description` YAML frontmatter and falling
+      back to the file stem and first prose line. Names and descriptions go into the system prompt;
+      bodies do not.
+    - >
+      A built-in `read_skill` tool that loads one skill body into the observations on demand,
+      governed as an ordinary policy-checked read of that file's path.
+    - >
+      Bounds on both: a cap on the number of skills discovered, a cap on a skill body read into
+      context, and a cap on a registered tool's returned result, each applied where the text enters
+      the context.
+    - >
+      Documentation and examples: the v0.9 paragraph in lib.rs, README section, CHANGELOG entry,
+      `examples/custom_tool.rs`, `examples/skills_run.rs`, and the CAPABILITIES tool-layer row moved
+      to shipped.
+  excluded:
+    - >
+      Dynamic loading and any plugin ABI. Extension is compiled in or it is MCP. A `.so`/`.dll`
+      boundary would put an unversioned Rust ABI in the middle of the permission model, and 0.8.0's
+      MCP client is the supported answer for a capability that must live in another process.
+    - >
+      Executable skills. A skill carries instructions and nothing else; anything that runs is a
+      tool, where the policy can see it.
+    - >
+      Skill *selection* by the harness. The model is told what exists and chooses; the harness does
+      not rank, match, or auto-inject a skill body. Automatic relevance selection is a context
+      construction question and belongs to 0.10.0, which owns what the model sees.
+    - >
+      Any change to how observations are accumulated or trimmed. 0.9.0 adds a third source of tool
+      results to the existing mechanism; repairing that mechanism is 0.10.0's whole subject and
+      doing half of it here would leave two partial designs.
+    - Tool results that are not text. A `ToolSpec` result is a string, as MCP tool results already are.
+  fallback_scope:
+    - >
+      The `Tool` trait, contract registration, name arbitration, policy governance, trace parity,
+      and containment inheritance — in-process tools complete and correct, with skills deferred to
+      0.10.0. This is still a coherent release: it closes the tool-layer pillar, which is the part
+      io-cli and io-studio are blocked on, and skills change no API that tools introduce.
+acceptance:
+  functional:
+    - >
+      F1 — a caller-registered tool reaches the model and runs. A contract registering a tool whose
+      `spec()` names it `lookup_order` offers it in the request's tool list, and a scripted provider
+      calling `lookup_order` causes `invoke()` to run with the parsed arguments and its returned
+      string to appear in the next turn's observations. Asserted offline with the mock provider.
+    - >
+      F2 — a registered tool is governed by the policy, not trusted by registration. Under a policy
+      denying `Act::Exec` on `lookup_order`, the call is refused, `invoke()` is never entered
+      (asserted by a flag the fake tool sets), a `PolicyEvent` naming the rule and layer is in the
+      trace, the model receives a refusal observation, and the run continues rather than failing.
+    - >
+      F3 — a registered tool may not shadow anything. Registering `write_file`, `grep`, `find`,
+      `read_file`, or `spawn_agent`, or a name starting `mcp__`, or two tools sharing one name,
+      returns `Error::Config` naming the offending tool, and it does so before the provider is
+      called even once (asserted by a completion counter that stays at zero).
+    - >
+      F4 — a failing tool is an observation, not a failed run. A tool whose `invoke()` returns an
+      error produces an error observation the agent can act on, the step is committed, and the run
+      continues to its next turn — the same treatment `grep` gives a bad regex.
+    - >
+      F5 — a registered tool cannot flood the context. A tool returning far more than the result cap
+      has its output truncated with a visible marker before it enters the observations, and the
+      truncated form is what the trace records.
+    - >
+      F6 — a 0.5.0 child inherits the toolbox. In a `run_tree` where the parent spawns a child, the
+      child's request carries `lookup_order` and a child calling it runs the same implementation,
+      with the call attributed to the child's `run_id` in the trace.
+    - >
+      F7 — skills are discovered from both layouts. A directory containing `alpha.md` and
+      `beta/SKILL.md` yields exactly two skills named `alpha` and `beta`; frontmatter `name:` and
+      `description:` override the derived values when present; a file with no frontmatter takes the
+      file stem as name and its first non-empty prose line as description. Both names and both
+      descriptions appear in the system prompt and neither body does.
+    - >
+      F8 — a skill body loads on demand. A scripted provider calling `read_skill` with
+      `{"name": "beta"}` puts beta's body — and only beta's — into the observations; a call naming
+      an unknown skill yields an observation listing what does exist, not an error.
+    - >
+      F9 — a bad skills directory fails honestly. A `with_skills` path that does not exist, or is
+      not a directory, is an `Error::Config` at run start naming the path. A directory holding more
+      than the discovery cap is an `Error::Config` too, rather than a silently truncated set the
+      caller believes is complete.
+    - >
+      F10 — reading a skill is a policy-governed read. Under a policy denying `Act::Read` on the
+      skills directory, `read_skill` is refused with a `PolicyEvent` in the trace and the body never
+      enters the observations, while the skill's name and description remain in the system prompt.
+    - >
+      F11 — live run, real model. Contract: a workspace task whose required output shape is stated
+      only in a skill, and whose required datum is available only from a registered tool. The run
+      succeeds, the trace shows the `read_skill` call and the tool call, and the produced file
+      carries both the shape and the datum. The same contract with `with_tools` and `with_skills`
+      removed reaches its step cap. Both runs recorded in evidence/0.9.0/live_run.txt.
+  non_functional:
+    - >
+      NF1 — no new runtime dependency. `cargo tree --edges normal` for the crate is unchanged
+      against 0.8.1: the frontmatter reader is written in-crate against the standard library, and
+      the `dyn`-safe trait uses `std::pin::Pin<Box<dyn Future>>` as `run_agent` already does. A new
+      dev-dependency is permitted; a new runtime one is not.
+    - >
+      NF2 — additive public API. The 0.8.1 doc example and every existing example compile against
+      0.9.0 with no edit beyond the version. No public item is renamed, removed, or has its
+      signature changed; `with_tools` and `with_skills` are new builder methods and `Tool`,
+      `Toolbox`, and `Skill` are new exports. Asserted by a test that builds a 0.8.1-shaped contract
+      and runs it.
+    - >
+      NF3 — the harness is not the cost. Dispatching a registered tool that returns immediately adds
+      under 1 ms per call over calling the same closure directly, measured across 1000 calls and
+      recorded in evidence/0.9.0/latency.txt. Skill discovery over a 32-skill directory completes in
+      under 50 ms and happens once per run, not once per step.
+    - >
+      NF4 (amended by iterations/US-IO-HARNESS-0.9.0-I02) — the crate declares an MSRV it actually
+      holds, and the three-OS matrix that verifies it exists. `rust-version` is 1.88, the floor rmcp
+      2.2.0's let-chains impose; 1.87 was wrong from 0.8.0 onward and cargo could not catch it
+      because rmcp declares no `rust-version` of its own. A GitHub Actions workflow — added by this
+      release, having never existed before — builds and tests on macOS, Linux, and Windows, with a
+      lint job and an MSRV job that reads `rust-version` out of Cargo.toml so the declared and proven
+      floors cannot drift apart again. `cargo clippy --all-targets -- -D warnings` and `cargo fmt
+      --check` are clean on macOS and Linux. macOS passes the full suite. Linux and Windows are built
+      and run, and their failures are recorded in `known_limitations` rather than implied away: they
+      are defects in the 0.3.0 verify and 0.6.0 sandbox pillars, present since those releases and
+      undetectable without CI, and they are fixed in 0.9.1 rather than here.
+  operational:
+    - >
+      O1 — a run is reconstructable from the trace alone. For every registered-tool call the trace
+      holds the tool name, the arguments, the decision, and the observation; for every skill load it
+      holds which skill was read. An auditor reading the trace can say which skills shaped the run
+      and which caller-supplied tools it depended on, without the caller's source.
+    - >
+      O2 — the crate documents the boundary it is drawing. lib.rs states plainly that a registered
+      tool runs in the harness's own process with the embedding program's privileges, that the
+      policy governs whether it is *called* and not what it does once running — the same bound
+      0.8.0 already states for a stdio MCP server — and that a skill is instructions with no
+      execution of its own.
+    - >
+      O3 — both extension points ship with a runnable example. `examples/custom_tool.rs` and
+      `examples/skills_run.rs` run against a real provider from an API key in the environment, in
+      the style of the existing examples.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io, plus the GitHub Actions matrix (macOS, Linux, Windows) that this release adds. The
+    repository had no workflow of any kind before 0.9.0 and had never had an Actions run, so the
+    matrix earlier contracts referred to did not exist.
+  deployment_method: >
+    The initorigin release flow: all work including the sealed completion record on `feat/0.9.0`,
+    PR to `develop`, release PR `develop` to `main`, a GitHub Release titled `io-harness 0.9.0` with
+    notes from the CHANGELOG, then `cargo publish` last. The owner merges every PR by hand.
+  migrations:
+    - >
+      None. No stored-state schema change: registered tool calls and skill loads use the existing step
+      and event tables, so a 0.8.1 rusqlite store opens and resumes under 0.9.0 unchanged. A 0.7.0
+      checkpoint written before this release resumes without seeing a toolbox, which is correct — it
+      had none.
+  observability:
+    - >
+      The existing rusqlite trace and `tracing` spans. Registered-tool calls and skill loads are
+      recorded through the same `StepRecord`/`PolicyEvent` paths as built-in and MCP calls, so nothing
+      new needs to be watched and O1 is satisfied by parity rather than by a new channel.
+  rollback: >
+    A published version cannot be withdrawn. Rollback is `cargo yank --vers 0.9.0`, which leaves
+    0.8.1 as what `cargo install` and a fresh `cargo add` resolve to; existing lockfiles pinning
+    0.9.0 keep working, which is the point of yank rather than deletion. A defect found after
+    publication is corrected by a forward 0.9.1. Because the release is additive, a consumer's
+    rollback to 0.8.1 requires only dropping the `with_tools`/`with_skills` calls.
+dependencies:
+  products:
+    - >
+      io-cli and io-studio are the consumers this release is for; neither is blocked *by* it, and
+      neither needs to change to adopt it.
+  services:
+    - >
+      One provider API key in the environment for F11 and the two examples. Offline for F1–F10,
+      which use the scripted mock provider the existing test suite already drives the loop with.
+  human_approvals:
+    - >
+      The owner merges the two PRs and cuts the GitHub Release before `cargo publish` runs. Publish
+      is irreversible and stays an owner-gated step.
+resource_profile:
+  complexity: medium
+  uncertainty: low
+  likely_cost_drivers:
+    - >
+      Threading the toolbox through the tree. `Tree` is the shared per-run context and already
+      carries the MCP session; the toolbox follows the same path, but every construction site —
+      `run_with`, `run_tree`, `resume`, `resume_tree`, and both `resume_*_with_decision` — has to be
+      updated consistently, and a resume that silently lost the toolbox would be a correctness bug
+      that only shows up after a crash.
+    - >
+      The frontmatter reader. Writing one without a YAML dependency is small; the cost is in the
+      cases — no frontmatter, unterminated frontmatter, CRLF line endings, a `description` spanning
+      lines, a UTF-8 body — each of which needs a test.
+    - >
+      F11 needs a task genuinely unsolvable without the tool and the skill. Designing a contract
+      where the negative control honestly fails, rather than failing for an unrelated reason, is
+      the fiddly part of the release's headline evidence.
+  preferred_tools:
+    - The existing scripted mock provider in tests/ for F1–F10.
+    - rustc/cargo, clippy, rustfmt; the repository's existing three-OS CI matrix.
+  constraints:
+    - >
+      No new runtime dependency (NF1) and no public API break (NF2). Both are constraints on the
+      design, not preferences: the crate is published and 0.15.0 has already promised that breaks
+      are documented and survivable, which is cheapest to honour by not making one here.
+risks:
+  - >
+    Object safety pushes the trait shape around. `Provider` is generic over `impl Future` and cannot
+    be a trait object; `Tool` must be one, so it needs a boxed future and cannot borrow from `self`
+    in the return type without a lifetime that complicates every implementer. Mitigation: settle the
+    signature against three real implementations — a synchronous closure, an async one holding
+    state, and one returning an error — before threading it through the tree.
+  - >
+    Skills quietly becoming a second prompt system. If names and descriptions are injected without a
+    bound, a 40-skill directory silently doubles the system prompt on every turn of every run — the
+    exact failure 0.10.0 exists to fix, introduced by this release. Mitigation: the discovery cap in
+    F9 is a hard error rather than a truncation, and the system prompt cost of a full directory is
+    measured in NF3.
+  - >
+    Registration reading as a grant. A developer who registers a tool may reasonably assume
+    registering it is what authorizes it, and be surprised when a deny-based policy refuses the
+    call — or, worse, assume the policy sandboxes what the tool *does*. Mitigation: F2 pins the
+    behaviour, and O2 requires the crate to state the bound in the same paragraph that introduces
+    the feature rather than in a note further down.
+  - >
+    Inheritance is the wrong default for some callers. A child inheriting the whole toolbox may be
+    more than a parent intended to delegate. Mitigation: for 0.9.0 the answer is that containment
+    narrows through the policy, which is where narrowing already lives — a per-child tool subset
+    would be a second narrowing mechanism competing with `Policy::contain`. If real use shows one
+    mechanism is not enough, that is an iteration with evidence, not a guess now.
+open_questions:
+  - >
+    Does `invoke()` receive the parsed `serde_json::Value` or the raw argument string? Value matches
+    `ToolCall.arguments` and saves every implementer a parse; the raw string is what MCP's boundary
+    carries. Leaning to `Value` for symmetry with the type the model layer already produces, to be
+    settled against the three reference implementations named in the first risk.
+  - >
+    Should `read_skill` be offered when no skills are configured? Offering a tool that can only
+    fail wastes a slot in every request; omitting it makes the tool list vary by contract, which is
+    already true of MCP tools. Leaning to omitting it, consistent with how MCP tools appear only
+    when servers are configured.
+  - >
+    Where exactly the result cap applies for a registered tool — at the tool boundary, or with the
+    other observation caps. 0.10.0 will move all of these to one place; 0.9.0 should put it wherever
+    makes that move smallest, which likely means beside the existing `OBS_READ_CAP` constants rather
+    than inside the dispatch arm.
+
+released_at: '2026-07-26T07:00:00Z'
+mode: published
+delivered: >
+  A developer embedding io-harness extends it inside their own binary. They implement the public
+  `Tool` trait for an action their product already performs, register it with
+  `TaskContract::with_tools(...)`, and the model is offered it beside `grep`, `find`, `read_file`
+  and `write_file` — governed by the same 0.4.0 policy (an `Act::Exec` check on the tool's name),
+  refused rather than trusted when the policy says no, size-capped where its result enters the
+  context, recorded in the rusqlite trace like any built-in, and inherited by a 0.5.0 child under
+  that child's own narrowed policy. A tool that fails is an observation the agent adapts to, not a
+  failed run.
+
+  The same developer shapes how the agent approaches a class of task without writing Rust, by
+  pointing the contract at a directory of markdown skills. Names and descriptions go into the system
+  prompt; bodies do not. The agent loads the one body it wants through a built-in `read_skill` tool,
+  as an ordinary policy-checked file read, and a directory that is missing, is not a directory, or
+  exceeds the 64-skill cap is a typed `Error::Config` at run start rather than a silently partial
+  set. Skills carry instructions and execute nothing.
+
+  Upgrading from 0.8.1 is a version bump and nothing else: 42 public items added, none renamed,
+  removed, or changed in signature, and no runtime dependency added.
+evidence:
+  tests:
+    - >
+      cargo test — 225 passed, 0 failed across 14 targets (lib unit 102, custom_tools 15, skills 15,
+      mcp, net, policy, sandbox, subagents, checkpoint, multi_file, edit_file, parity, verify_gate,
+      doc 3). 28 are new to this release; the 197 that predate it are unchanged and still green,
+      which is half of NF2.
+    - >
+      F1 — a_registered_tool_is_offered_called_and_its_result_observed: the spec is in the request's
+      tool list, the name is in the system prompt, invoke() ran with the model's arguments (A-17),
+      and A-17=shipped appears in the next turn's prompt.
+    - >
+      F2 — a_registered_tool_is_refused_by_the_policy_without_being_entered: under
+      deny_exec("lookup_order") the tool's own call log stays empty, the trace holds a refusal with
+      act=exec, rule=lookup_order, layer=base, the model sees a refusal observation, and the run
+      continues rather than erroring.
+    - >
+      F3 — 4 tests: shadowing each of the six built-ins, the reserved `mcp__` prefix, a duplicate
+      name, and an empty name each return Error::Config naming the offender, with the mock provider's
+      completion counter asserted at 0, so arbitration is proven to run before the provider is
+      reached even once.
+    - >
+      F4 — a_failing_tool_becomes_an_observation_not_a_failed_run: the tool's own error text reaches
+      the model, the step is still committed (2 step rows), and the run continues.
+    - >
+      F5 — an_oversized_tool_result_is_truncated_before_it_enters_the_context: a 200,000-char result
+      reaches the model truncated, with the word 'truncated' visible, and the trace records the
+      truncated form.
+    - >
+      F6 — a_spawned_child_inherits_the_toolbox_and_the_call_is_its_own, plus
+      a_toolbox_survives_a_tree_resume_and_still_reaches_a_child. The child runs the parent's own
+      registered instance (asserted on the Arc the parent holds), the call is in the child's
+      store.steps(child_run) and absent from the parent's, and the same holds across a resume. Both
+      were watched failing first against a scratch build with the Tree threading broken, so they are
+      known not to have been vacuously green.
+    - >
+      F7 — 3 discovery tests plus the_catalog_reaches_the_system_prompt_and_no_body_does: alpha.md
+      and beta/SKILL.md yield exactly two skills, frontmatter overrides the derived name and
+      description, a file without frontmatter takes its stem and first prose line, and both names and
+      descriptions reach the prompt while neither body does.
+    - >
+      F8 — read_skill_loads_exactly_the_named_body_into_the_observations and
+      an_unknown_skill_name_is_an_observation_listing_what_exists.
+    - >
+      F9 — 4 tests driving run_with with a counting mock provider: a missing path, a non-directory
+      path, and a directory of MAX_SKILLS+1 files each return Error::Config naming the path with the
+      provider's call count at 0, plus a positive control proving a usable directory lets the run
+      start (calls == 1).
+    - >
+      F10 — a_denied_skills_directory_refuses_the_read_but_keeps_the_catalog. Related and load
+      bearing: an_absolute_path_still_cannot_escape_the_workspace_root pins the invariant that the
+      gate relaxation depends on — under Policy::permissive() an absolute read_file outside the root
+      still yields "[read error] path escapes workspace" and an absolute write_file leaves no file,
+      because Workspace::resolve rejects absolute paths before any policy question is asked.
+    - >
+      NF3 — dispatch overhead 0.442-0.453 ms/call debug and 0.059-0.072 ms release across 1000 calls
+      against calling the same closure directly; 32-skill discovery 2.28-3.19 ms debug. Discovery
+      running once per run rather than once per step is proven behaviourally: a run writes a new
+      skill file into its own skills directory at step 1 and at step 2 the catalogue still does not
+      mention it. Full numbers, machine, and method in evidence/0.9.0/latency.txt.
+  builds:
+    - cargo build --examples — exit 0 (11 examples, including the two new ones and live_f11).
+    - cargo clippy --all-targets -- -D warnings — exit 0 on macOS, and green on Linux in CI.
+    - cargo fmt --check — exit 0.
+    - >
+      cargo package — target/package/io-harness-0.9.0.crate produced, 218,184 bytes. Inspected for
+      secrets: no .env, credential, or secret-shaped path in the archive.
+    - >
+      NF1 — the [dependencies] section of Cargo.toml is byte-identical to shipped 0.8.1
+      (`diff` against `git show 381163f:Cargo.toml`). The frontmatter reader is standard-library
+      only and the dyn-safe trait uses std::pin::Pin<Box<dyn Future>>.
+    - >
+      MSRV — cargo +1.88 build --all-targets succeeds. cargo +1.87 now fails at resolve time with a
+      clear "requires rustc 1.88" rather than a compile error inside rmcp.
+    - >
+      CI run 30191362799 (the repository's first CI, added by this release): macOS test green, lint
+      green, MSRV green, Linux test FAILED, Windows test cancelled at the 20-minute job cap. Recorded
+      as-is; see known_limitations.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+  - >
+    The record is sealed before the crates.io upload. mode: published states the authorized target;
+    the upload itself is the last step of the initorigin release flow and follows the feat->develop
+    and develop->main merges and the GitHub Release, all of which the owner performs by hand.
+  - >
+    Linux: 9 lib tests fail (CI run 30191362799). 7 in verify::tests, where passes_guarded(...)
+    returns false — the 0.3.0 execution-based verification gate does not work on Linux at all. 2 in
+    sandbox::tests, where the CPU and memory caps never fire:
+    cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap observes
+    `SandboxOutcome { backend: PortableFloor, exit_code: None, cap_hit: None }` against an expected
+    Some(Cpu). These are defects in the released 0.3.0 and 0.6.0 pillars, not regressions from this
+    release, and they were undetectable before because the repository had no CI. Issues #25 and #26;
+    scheduled into 0.9.1.
+  - >
+    Windows: the suite does not terminate. verify::tests all pass there, then
+    memory_cap_kills_a_heap_hog_and_names_the_memory_cap fails and the job produces no further
+    output for roughly sixteen minutes until the 20-minute cap cancels it — the behaviour expected
+    when a cap never fires and the capped process is therefore never killed. Issue #27; scheduled
+    into 0.9.1.
+  - >
+    Containment on Windows is the portable floor only. src/sandbox/windows.rs creates no Job Object
+    and calls no Win32 API; it computed its JobLimits and dropped them. 0.9.0 corrects the false
+    claim rather than the gap: the Windows path now reports Backend::PortableFloor instead of
+    Backend::WindowsJobObject, and the module docs, the sandbox module docs, linux.rs and the README
+    no longer claim enforcement that does not happen. The real implementation needs a Win32 binding
+    (a new runtime dependency, which NF1 forbids here) and lands in 0.9.1. Consequently 0.6.0's
+    promise that "the same harness isolates code the same way on mac, linux, and windows" is not yet
+    true, and the crate now says so.
+  - >
+    The declared MSRV was wrong from 0.8.0 onward. 0.8.0 and 0.8.1 are live on crates.io declaring
+    rust-version 1.87 while depending on rmcp 2.2.0, which needs 1.88 for let-chains and declares no
+    rust-version of its own. 0.9.0 corrects the declaration going forward; the published 0.8.x
+    manifests are not corrected, since a published version cannot be edited. Neither is yanked: both
+    build fine on 1.88+, which is what anyone building them today has.
+  - >
+    NF3 holds with less headroom than the number suggests. The 0.442 ms debug dispatch figure is
+    dominated by Policy::check(Act::Exec, name) recompiling its globs to a regex on every call
+    (the standing ponytail: note at src/policy.rs:384) — the tool layer's own share is about 9 us
+    debug. The debug margin against the 1 ms bound is therefore 2.2x, not orders of magnitude, and it
+    scales with the number of exec rules in the policy. Caching compiled globs is the fix if it ever
+    needs to grow, and it belongs to the policy, not to this release.
+  - >
+    Single-file mode gets no skills catalogue. It has one tool and no tool layer, the same line
+    with_mcp and with_tools already draw.
+  - >
+    A skill's relevance is entirely the model's judgement. The harness tells it what exists and never
+    ranks, matches, or auto-injects a body; automatic selection is a context-construction question
+    and belongs to 0.10.0.
+  - >
+    A registered tool runs in the harness's own process with the embedding program's privileges. The
+    policy governs whether it is called, not what it does once running — the same bound 0.8.0 states
+    for a stdio MCP server. Stated in lib.rs, the README, and the CHANGELOG rather than left to be
+    discovered.
+  - >
+    TaskContract has public fields and is not #[non_exhaustive], so the new tools and skills fields
+    do break struct-literal construction. The public API is additive in every other respect (42 items
+    added, 0 removed, 0 signature-changed) and the type documents the builder as the supported path,
+    which is the pattern 0.8.0 set when it added mcp the same way.
+supersedes: null
+next_recommended_version: 0.9.1
+immutable: true

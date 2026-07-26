@@ -24,7 +24,10 @@ struct MockScript {
 
 impl MockScript {
     fn new(steps: Vec<Vec<ToolCall>>) -> Self {
-        Self { steps, at: AtomicUsize::new(0) }
+        Self {
+            steps,
+            at: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -39,7 +42,10 @@ impl Provider for MockScript {
 }
 
 fn call(name: &str, args: serde_json::Value) -> ToolCall {
-    ToolCall { name: name.into(), arguments: args }
+    ToolCall {
+        name: name.into(),
+        arguments: args,
+    }
 }
 
 fn spawn(goal: &str, file: &str, needle: &str) -> ToolCall {
@@ -67,7 +73,10 @@ async fn a_parent_spawns_three_children_over_a_shared_workspace() {
     let contract = TaskContract::workspace(
         "Split the work across three sub-agents, then combine.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "combined.txt".into(), needle: "abc".into() },
+        Verification::WorkspaceFileContains {
+            file: "combined.txt".into(),
+            needle: "abc".into(),
+        },
     )
     .with_max_steps(6);
 
@@ -98,7 +107,12 @@ async fn a_parent_spawns_three_children_over_a_shared_workspace() {
     assert_eq!(result.outcome, RunOutcome::Success { steps: 4 });
 
     // Each child's edit reached the shared workspace.
-    for (f, c) in [("a.txt", "A"), ("b.txt", "B"), ("c.txt", "C"), ("combined.txt", "abc")] {
+    for (f, c) in [
+        ("a.txt", "A"),
+        ("b.txt", "B"),
+        ("c.txt", "C"),
+        ("combined.txt", "abc"),
+    ] {
         assert_eq!(std::fs::read_to_string(dir.path().join(f)).unwrap(), c);
     }
 
@@ -122,7 +136,10 @@ async fn spawn_agent_composes_the_childs_result_back() {
     let contract = TaskContract::workspace(
         "Delegate producing the answer to a sub-agent.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "result.txt".into(), needle: "42".into() },
+        Verification::WorkspaceFileContains {
+            file: "result.txt".into(),
+            needle: "42".into(),
+        },
     );
 
     let script = MockScript::new(vec![
@@ -143,7 +160,10 @@ async fn spawn_agent_composes_the_childs_result_back() {
     .unwrap();
 
     assert_eq!(result.outcome, RunOutcome::Success { steps: 1 });
-    assert_eq!(std::fs::read_to_string(dir.path().join("result.txt")).unwrap(), "42");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("result.txt")).unwrap(),
+        "42"
+    );
     // The value came from a spawned child, not the parent.
     assert_eq!(store.children(result.run_id).unwrap().len(), 1);
 }
@@ -157,7 +177,10 @@ async fn a_spawn_beyond_the_agent_cap_is_refused_but_the_rest_complete() {
     let contract = TaskContract::workspace(
         "Try to spawn three children under an agent cap of three.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "done.txt".into(), needle: "ok".into() },
+        Verification::WorkspaceFileContains {
+            file: "done.txt".into(),
+            needle: "ok".into(),
+        },
     )
     .with_max_steps(6);
 
@@ -171,9 +194,16 @@ async fn a_spawn_beyond_the_agent_cap_is_refused_but_the_rest_complete() {
     ]);
     let store = Store::memory().unwrap();
 
-    let result = run_tree(&contract, &script, &store, &Policy::permissive(), &ApproveAll, &cap3)
-        .await
-        .unwrap();
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &cap3,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.outcome, RunOutcome::Success { steps: 4 });
     // Only the two in-cap children ran; c.txt was never created.
@@ -200,30 +230,43 @@ async fn a_spawn_beyond_max_depth_is_refused_and_depth_counts_from_the_root() {
     let contract = TaskContract::workspace(
         "Nest agents until the depth cap refuses the deepest spawn.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "top.txt".into(), needle: "T".into() },
+        Verification::WorkspaceFileContains {
+            file: "top.txt".into(),
+            needle: "T".into(),
+        },
     )
     .with_max_steps(4);
 
     let script = MockScript::new(vec![
-        vec![spawn("child", "child.txt", "C")],          // parent(0) -> child(1)
-        vec![spawn("grandchild", "gc.txt", "G")],        // child(1) -> grandchild(2)
+        vec![spawn("child", "child.txt", "C")], // parent(0) -> child(1)
+        vec![spawn("grandchild", "gc.txt", "G")], // child(1) -> grandchild(2)
         vec![spawn("great-grandchild", "ggc.txt", "X")], // grandchild(2) -> depth 3: REFUSED
-        vec![write("gc.txt", "G")],                      // grandchild finishes
-        vec![write("child.txt", "C")],                   // child finishes
-        vec![write("top.txt", "T")],                     // parent finishes
+        vec![write("gc.txt", "G")],             // grandchild finishes
+        vec![write("child.txt", "C")],          // child finishes
+        vec![write("top.txt", "T")],            // parent finishes
     ]);
     let store = Store::memory().unwrap();
 
-    let result = run_tree(&contract, &script, &store, &Policy::permissive(), &ApproveAll, &depth2)
-        .await
-        .unwrap();
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &depth2,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
     // Walk the chain to the grandchild and confirm its deepest spawn was refused.
     let child = store.children(result.run_id).unwrap()[0];
     let grandchild = store.children(child).unwrap()[0];
     assert_eq!(store.depth(grandchild).unwrap(), 2);
-    assert!(store.children(grandchild).unwrap().is_empty(), "the refused spawn created no run");
+    assert!(
+        store.children(grandchild).unwrap().is_empty(),
+        "the refused spawn created no run"
+    );
     assert!(!dir.path().join("ggc.txt").exists());
     let refused: Vec<_> = store
         .agent_events(grandchild)
@@ -243,7 +286,10 @@ async fn one_approver_serves_the_whole_tree_approve() {
     let contract = TaskContract::workspace(
         "Delegate a sensitive write to a child.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "out.txt".into(), needle: "OK".into() },
+        Verification::WorkspaceFileContains {
+            file: "out.txt".into(),
+            needle: "OK".into(),
+        },
     )
     .with_max_steps(2);
 
@@ -282,13 +328,19 @@ async fn one_approver_serves_the_whole_tree_deny() {
     let contract = TaskContract::workspace(
         "Delegate a sensitive write the approver will refuse.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "out.txt".into(), needle: "OK".into() },
+        Verification::WorkspaceFileContains {
+            file: "out.txt".into(),
+            needle: "OK".into(),
+        },
     )
     .with_max_steps(2);
 
     // The child keeps trying to write; DenyAll refuses every time.
     let script = MockScript::new(vec![
-        vec![call("spawn_agent", json!({ "goal": "write out", "verify_file": "out.txt", "verify_contains": "OK", "max_steps": 2 }))],
+        vec![call(
+            "spawn_agent",
+            json!({ "goal": "write out", "verify_file": "out.txt", "verify_contains": "OK", "max_steps": 2 }),
+        )],
         vec![write("out.txt", "OK")],
         vec![write("out.txt", "OK")],
     ]);
@@ -315,7 +367,10 @@ async fn one_approver_serves_the_whole_tree_deny() {
         .into_iter()
         .filter(|e| e.decision.as_deref() == Some("deny"))
         .count();
-    assert!(denied >= 1, "the child's write was denied by the tree's approver");
+    assert!(
+        denied >= 1,
+        "the child's write was denied by the tree's approver"
+    );
 }
 
 #[tokio::test]
@@ -327,7 +382,10 @@ async fn sub_agents_are_opt_in_a_plain_run_never_exposes_spawn() {
     let contract = TaskContract::workspace(
         "A plain workspace run that ignores a stray spawn call.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "f.txt".into(), needle: "V".into() },
+        Verification::WorkspaceFileContains {
+            file: "f.txt".into(),
+            needle: "V".into(),
+        },
     )
     .with_max_steps(3);
 
@@ -337,9 +395,15 @@ async fn sub_agents_are_opt_in_a_plain_run_never_exposes_spawn() {
     ]);
     let store = Store::memory().unwrap();
 
-    let result = run_with(&contract, &script, &store, &Policy::permissive(), &ApproveAll)
-        .await
-        .unwrap();
+    let result = run_with(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
 
     assert_eq!(result.outcome, RunOutcome::Success { steps: 2 });
     // No child run and no spawn event — spawning simply does not exist here.
@@ -364,7 +428,11 @@ struct ConcurrencyProbe {
 
 impl ConcurrencyProbe {
     fn new(fanout: usize) -> Self {
-        Self { fanout, active: Counter::new(0), peak: Counter::new(0) }
+        Self {
+            fanout,
+            active: Counter::new(0),
+            peak: Counter::new(0),
+        }
     }
 }
 
@@ -376,7 +444,10 @@ impl Provider for ConcurrencyProbe {
         self.active.fetch_sub(1, Ordering::SeqCst);
 
         let is_parent = req.user.contains("ROOT-FANOUT");
-        let usage = Some(Usage { total_tokens: 1, ..Default::default() });
+        let usage = Some(Usage {
+            total_tokens: 1,
+            ..Default::default()
+        });
         if is_parent {
             let calls: Vec<ToolCall> = (0..self.fanout)
                 .map(|i| {
@@ -391,10 +462,17 @@ impl Provider for ConcurrencyProbe {
                     )
                 })
                 .collect();
-            Ok(CompletionResponse { tool_calls: calls, usage, ..Default::default() })
+            Ok(CompletionResponse {
+                tool_calls: calls,
+                usage,
+                ..Default::default()
+            })
         } else {
             // A child: do nothing, so it reaches its 1-step cap and returns.
-            Ok(CompletionResponse { usage, ..Default::default() })
+            Ok(CompletionResponse {
+                usage,
+                ..Default::default()
+            })
         }
     }
 }
@@ -408,7 +486,10 @@ async fn concurrent_fanout_to_over_100_stays_bounded_and_completes() {
     let contract = TaskContract::workspace(
         "ROOT-FANOUT: spawn a large fleet of sub-agents at once.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "never.txt".into(), needle: "never".into() },
+        Verification::WorkspaceFileContains {
+            file: "never.txt".into(),
+            needle: "never".into(),
+        },
     )
     .with_max_steps(1);
 
@@ -433,7 +514,10 @@ async fn concurrent_fanout_to_over_100_stays_bounded_and_completes() {
     // Concurrency was real but never exceeded max_concurrent.
     let peak = probe.peak.load(Ordering::SeqCst);
     assert!(peak > 1, "children actually overlapped (peak {peak})");
-    assert!(peak <= 16, "never more than max_concurrent at once (peak {peak})");
+    assert!(
+        peak <= 16,
+        "never more than max_concurrent at once (peak {peak})"
+    );
 }
 
 // --- T02 at the tree level: the aggregate ceiling halts the whole tree. ---
@@ -448,7 +532,10 @@ struct TokenBurner {
 
 impl Provider for TokenBurner {
     async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
-        let usage = Some(Usage { total_tokens: self.per_call, ..Default::default() });
+        let usage = Some(Usage {
+            total_tokens: self.per_call,
+            ..Default::default()
+        });
         if req.user.contains("BUDGET-ROOT") {
             let calls = (0..self.children)
                 .map(|i| {
@@ -458,9 +545,16 @@ impl Provider for TokenBurner {
                     )
                 })
                 .collect();
-            Ok(CompletionResponse { tool_calls: calls, usage, ..Default::default() })
+            Ok(CompletionResponse {
+                tool_calls: calls,
+                usage,
+                ..Default::default()
+            })
         } else {
-            Ok(CompletionResponse { usage, ..Default::default() })
+            Ok(CompletionResponse {
+                usage,
+                ..Default::default()
+            })
         }
     }
 }
@@ -474,11 +568,17 @@ async fn the_aggregate_ceiling_halts_the_whole_tree() {
     let contract = TaskContract::workspace(
         "BUDGET-ROOT: spawn children until the tree's spend ceiling stops it.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "x.txt".into(), needle: "x".into() },
+        Verification::WorkspaceFileContains {
+            file: "x.txt".into(),
+            needle: "x".into(),
+        },
     )
     .with_max_steps(2);
 
-    let provider = TokenBurner { children: 4, per_call: 30 };
+    let provider = TokenBurner {
+        children: 4,
+        per_call: 30,
+    };
     let store = Store::memory().unwrap();
 
     let result = run_tree(
@@ -503,7 +603,13 @@ async fn the_aggregate_ceiling_halts_the_whole_tree() {
         .agent_events(result.run_id)
         .unwrap()
         .into_iter()
-        .filter_map(|e| if e.kind == "budget_draw" { e.tokens } else { None })
+        .filter_map(|e| {
+            if e.kind == "budget_draw" {
+                e.tokens
+            } else {
+                None
+            }
+        })
         .sum();
     assert!(root_draws <= 100);
 }
@@ -539,12 +645,18 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
     let contract = TaskContract::workspace(
         "Delegate a sensitive write; the child will defer to a human.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "out.txt".into(), needle: "OK".into() },
+        Verification::WorkspaceFileContains {
+            file: "out.txt".into(),
+            needle: "OK".into(),
+        },
     )
     .with_max_steps(3);
 
     let script = MockScript::new(vec![
-        vec![call("spawn_agent", json!({ "goal": "write out", "verify_file": "out.txt", "verify_contains": "OK" }))],
+        vec![call(
+            "spawn_agent",
+            json!({ "goal": "write out", "verify_file": "out.txt", "verify_contains": "OK" }),
+        )],
         vec![write("out.txt", "OK")], // child: write is Ask -> approver defers
     ]);
     let store = Store::memory().unwrap();
@@ -554,7 +666,9 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
         &script,
         &store,
         &Policy::default(),
-        &DeferOnce { asked: Counter::new(0) },
+        &DeferOnce {
+            asked: Counter::new(0),
+        },
         &containment(),
     )
     .await
@@ -568,7 +682,10 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
     assert!(!dir.path().join("out.txt").exists());
 
     // The pending action is persisted against the child's own run.
-    let pending = store.pending(request_id).unwrap().expect("pending survives");
+    let pending = store
+        .pending(request_id)
+        .unwrap()
+        .expect("pending survives");
     assert_eq!(pending.act, "write");
     assert_eq!(pending.target, "out.txt");
     let child_run = pending.run_id;
@@ -579,7 +696,10 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
     let child_contract = TaskContract::workspace(
         "write out",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "out.txt".into(), needle: "OK".into() },
+        Verification::WorkspaceFileContains {
+            file: "out.txt".into(),
+            needle: "OK".into(),
+        },
     );
     let resumed = resume_with_decision(
         &child_contract,
@@ -595,5 +715,8 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
     .unwrap();
 
     assert!(matches!(resumed.outcome, RunOutcome::Success { .. }));
-    assert_eq!(std::fs::read_to_string(dir.path().join("out.txt")).unwrap(), "OK");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("out.txt")).unwrap(),
+        "OK"
+    );
 }

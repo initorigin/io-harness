@@ -269,9 +269,8 @@ impl<'a> ExecGuard<'a> {
                     }
                     // The workdir is torn down when this call returns (tempdir
                     // drop in the caller); record the destroy now.
-                    let _ = store.record_sandbox_event(&crate::state::SandboxEvent::destroy(
-                        run_id, step,
-                    ));
+                    let _ = store
+                        .record_sandbox_event(&crate::state::SandboxEvent::destroy(run_id, step));
                 }
                 // A cap hit is a real failure of the gate, not a pass.
                 Ok(outcome.success())
@@ -303,7 +302,8 @@ impl Verification {
     ///
     /// `contents` is the current file text (already read by the caller).
     pub async fn passes(&self, path: &Path, contents: &str) -> Result<bool> {
-        self.passes_guarded(path, contents, &ExecGuard::permissive()).await
+        self.passes_guarded(path, contents, &ExecGuard::permissive())
+            .await
     }
 
     /// [`Verification::passes`], with every spawn checked against a policy.
@@ -338,12 +338,16 @@ impl Verification {
     pub async fn passes_in_guarded(&self, root: &Path, guard: &ExecGuard<'_>) -> Result<bool> {
         match self {
             Verification::WorkspaceFileContains { file, needle } => {
-                let src = tokio::fs::read_to_string(root.join(file)).await.unwrap_or_default();
+                let src = tokio::fs::read_to_string(root.join(file))
+                    .await
+                    .unwrap_or_default();
                 Ok(src.contains(needle))
             }
             Verification::EachCompilesRust(files) => {
                 for f in files {
-                    let src = tokio::fs::read_to_string(root.join(f)).await.unwrap_or_default();
+                    let src = tokio::fs::read_to_string(root.join(f))
+                        .await
+                        .unwrap_or_default();
                     if !compile_source(&src, None, guard).await? {
                         return Ok(false);
                     }
@@ -353,7 +357,9 @@ impl Verification {
             Verification::WorkspaceTestPasses { files, test_src } => {
                 let mut combined = String::new();
                 for f in files {
-                    let src = tokio::fs::read_to_string(root.join(f)).await.unwrap_or_default();
+                    let src = tokio::fs::read_to_string(root.join(f))
+                        .await
+                        .unwrap_or_default();
                     combined.push_str(&src);
                     combined.push('\n');
                 }
@@ -398,11 +404,22 @@ impl Verification {
 /// The argv that compiles the file under verification as its *own* crate, so
 /// nothing it declares can reach the crate the criterion lives in.
 fn subject_lib_args(subject: &Path, rlib: &Path) -> Vec<String> {
-    ["--edition", "2021", "--crate-type", "lib", "--crate-name", SUBJECT_CRATE]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([subject.display().to_string(), "-o".into(), rlib.display().to_string()])
-        .collect()
+    [
+        "--edition",
+        "2021",
+        "--crate-type",
+        "lib",
+        "--crate-name",
+        SUBJECT_CRATE,
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([
+        subject.display().to_string(),
+        "-o".into(),
+        rlib.display().to_string(),
+    ])
+    .collect()
 }
 
 /// The argv verification builds to compile and link the test binary from the
@@ -411,7 +428,11 @@ fn test_build_args(combined: &Path, bin: &Path) -> Vec<String> {
     ["--edition", "2021", "--test"]
         .iter()
         .map(|s| s.to_string())
-        .chain([combined.display().to_string(), "-o".into(), bin.display().to_string()])
+        .chain([
+            combined.display().to_string(),
+            "-o".into(),
+            bin.display().to_string(),
+        ])
         .collect()
 }
 
@@ -421,16 +442,24 @@ fn test_build_args(combined: &Path, bin: &Path) -> Vec<String> {
 /// which is why the command policy gates the binary name and records argv rather
 /// than parsing it. See the 0.4.0 contract.
 fn probe_args(dir: &Path, probe: &Path, rlib: &Path) -> Vec<String> {
-    ["--edition", "2021", "--crate-type", "lib", "--emit", "metadata", "--extern"]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            format!("{SUBJECT_CRATE}={}", rlib.display()),
-            "--out-dir".into(),
-            dir.display().to_string(),
-            probe.display().to_string(),
-        ])
-        .collect()
+    [
+        "--edition",
+        "2021",
+        "--crate-type",
+        "lib",
+        "--emit",
+        "metadata",
+        "--extern",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .chain([
+        format!("{SUBJECT_CRATE}={}", rlib.display()),
+        "--out-dir".into(),
+        dir.display().to_string(),
+        probe.display().to_string(),
+    ])
+    .collect()
 }
 
 /// The crate name the file under verification is compiled under.
@@ -650,11 +679,17 @@ mod tests {
 
         // The I01 case: the literal substring, which is not valid Rust.
         tokio::fs::write(&file, "fn hello").await.unwrap();
-        assert!(!Verification::CompilesRust.passes(&file, "fn hello").await.unwrap());
+        assert!(!Verification::CompilesRust
+            .passes(&file, "fn hello")
+            .await
+            .unwrap());
 
         let good = "pub fn hello() -> u32 { 42 }\n";
         tokio::fs::write(&file, good).await.unwrap();
-        assert!(Verification::CompilesRust.passes(&file, good).await.unwrap());
+        assert!(Verification::CompilesRust
+            .passes(&file, good)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]

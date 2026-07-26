@@ -84,15 +84,30 @@ pub struct CheckpointEvent {
 impl CheckpointEvent {
     /// A step was durably checkpointed.
     pub fn checkpoint(run_id: i64, step: u32) -> Self {
-        Self { run_id, step, kind: "checkpoint".into(), detail: None }
+        Self {
+            run_id,
+            step,
+            kind: "checkpoint".into(),
+            detail: None,
+        }
     }
     /// A run was resumed, re-driving from `step`.
     pub fn resume(run_id: i64, step: u32, detail: impl Into<String>) -> Self {
-        Self { run_id, step, kind: "resume".into(), detail: Some(detail.into()) }
+        Self {
+            run_id,
+            step,
+            kind: "resume".into(),
+            detail: Some(detail.into()),
+        }
     }
     /// An already-committed step was skipped on resume.
     pub fn skipped(run_id: i64, step: u32) -> Self {
-        Self { run_id, step, kind: "skipped".into(), detail: None }
+        Self {
+            run_id,
+            step,
+            kind: "skipped".into(),
+            detail: None,
+        }
     }
 }
 
@@ -327,7 +342,13 @@ pub struct SandboxEvent {
 impl SandboxEvent {
     /// A sandbox was created for a run, isolated by `backend`.
     pub fn create(run_id: i64, step: u32, backend: &str) -> Self {
-        Self { run_id, step, kind: "create".into(), backend: Some(backend.into()), detail: None }
+        Self {
+            run_id,
+            step,
+            kind: "create".into(),
+            backend: Some(backend.into()),
+            detail: None,
+        }
     }
 
     /// A command ran in the sandbox under `backend`.
@@ -343,12 +364,24 @@ impl SandboxEvent {
 
     /// A resource cap killed the run.
     pub fn cap_hit(run_id: i64, step: u32, cap: &str) -> Self {
-        Self { run_id, step, kind: "cap_hit".into(), backend: None, detail: Some(cap.into()) }
+        Self {
+            run_id,
+            step,
+            kind: "cap_hit".into(),
+            backend: None,
+            detail: Some(cap.into()),
+        }
     }
 
     /// The sandbox was torn down (workdir removed, processes reaped).
     pub fn destroy(run_id: i64, step: u32) -> Self {
-        Self { run_id, step, kind: "destroy".into(), backend: None, detail: None }
+        Self {
+            run_id,
+            step,
+            kind: "destroy".into(),
+            backend: None,
+            detail: None,
+        }
     }
 
     /// Which phase of an execution gate failed: `"subject-compile"` (the file
@@ -542,7 +575,10 @@ impl Store {
         // shared spend ceiling. All additive — a 0.4.0 database gains the column
         // and table and a 0.4.0 binary still reads a migrated database.
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN parent_run_id INTEGER", []);
-        let _ = conn.execute("ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0", []);
+        let _ = conn.execute(
+            "ALTER TABLE runs ADD COLUMN depth INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS agent_events (
                  id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -575,8 +611,10 @@ impl Store {
         // records checkpoint / resume / step-skipped events so a multi-crash run's
         // history is reconstructable from the store alone. All additive — a 0.6.0
         // database gains the columns/table and a 0.6.0 binary still reads it.
-        let _ =
-            conn.execute("ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'running'", []);
+        let _ = conn.execute(
+            "ALTER TABLE runs ADD COLUMN status TEXT NOT NULL DEFAULT 'running'",
+            [],
+        );
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN started_at TEXT", []);
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS checkpoint_events (
@@ -877,9 +915,11 @@ impl Store {
 
     /// The nesting depth recorded for a run (0 at the root).
     pub fn depth(&self, run_id: i64) -> Result<u32> {
-        let d: i64 = self
-            .conn
-            .query_row("SELECT depth FROM runs WHERE id = ?1", [run_id], |r| r.get(0))?;
+        let d: i64 =
+            self.conn
+                .query_row("SELECT depth FROM runs WHERE id = ?1", [run_id], |r| {
+                    r.get(0)
+                })?;
         Ok(d as u32)
     }
 
@@ -958,8 +998,10 @@ impl Store {
 
     /// Set the durable run status (`running`, `paused`, `completed`, `failed`).
     pub fn set_status(&self, run_id: i64, status: &str) -> Result<()> {
-        self.conn
-            .execute("UPDATE runs SET status = ?1 WHERE id = ?2", (status, run_id))?;
+        self.conn.execute(
+            "UPDATE runs SET status = ?1 WHERE id = ?2",
+            (status, run_id),
+        )?;
         Ok(())
     }
 
@@ -1081,7 +1123,12 @@ impl Store {
 
     /// Find the child spawned by `parent_run_id` at `step` for `goal`, if any —
     /// the adopt-on-resume lookup that makes a replayed spawn step idempotent.
-    pub fn find_spawn(&self, parent_run_id: i64, step: u32, goal: &str) -> Result<Option<SpawnRow>> {
+    pub fn find_spawn(
+        &self,
+        parent_run_id: i64,
+        step: u32,
+        goal: &str,
+    ) -> Result<Option<SpawnRow>> {
         Ok(self
             .conn
             .query_row(
@@ -1109,7 +1156,9 @@ impl Store {
     /// does not exist. An already-`completed` run is resumable as a no-op, so it
     /// is not refused here.
     pub fn check_resumable(&self, run_id: i64) -> Result<()> {
-        let format: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let format: i64 = self
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if format > CHECKPOINT_FORMAT {
             return Err(Error::Resume {
                 reason: format!(
@@ -1123,7 +1172,9 @@ impl Store {
             .query_row("SELECT 1 FROM runs WHERE id = ?1", [run_id], |_| Ok(true))
             .unwrap_or(false);
         if !exists {
-            return Err(Error::Resume { reason: format!("no run with id {run_id} in the store") });
+            return Err(Error::Resume {
+                reason: format!("no run with id {run_id} in the store"),
+            });
         }
         Ok(())
     }
@@ -1221,8 +1272,7 @@ mod tests {
         store
             .record_event(
                 run,
-                &PolicyEvent::refusal(2, "write", "secrets/key.txt")
-                    .with_rule("secrets/*", "base"),
+                &PolicyEvent::refusal(2, "write", "secrets/key.txt").with_rule("secrets/*", "base"),
             )
             .unwrap();
 
@@ -1366,7 +1416,10 @@ mod tests {
         let root_events = store.agent_events(root).unwrap();
         assert_eq!(root_events.iter().filter(|e| e.kind == "spawn").count(), 2);
         assert_eq!(
-            root_events.iter().filter(|e| e.kind == "spawn_refused").count(),
+            root_events
+                .iter()
+                .filter(|e| e.kind == "spawn_refused")
+                .count(),
             1
         );
         let draws = store.agent_events(c1).unwrap();
@@ -1452,8 +1505,11 @@ mod tests {
         store
             .record(
                 run,
-                &StepRecord::new(1, "wrote file", "content v1")
-                    .with_trace("the prompt", r#"{"content":"content v1"}"#, 128),
+                &StepRecord::new(1, "wrote file", "content v1").with_trace(
+                    "the prompt",
+                    r#"{"content":"content v1"}"#,
+                    128,
+                ),
             )
             .unwrap();
         store
@@ -1524,8 +1580,12 @@ mod tests {
     fn checkpoint_step_commits_the_step_and_its_event_together() {
         let store = Store::memory().unwrap();
         let run = store.start_run("goal", "root").unwrap();
-        store.checkpoint_step(run, &StepRecord::new(1, "act", "ok")).unwrap();
-        store.checkpoint_step(run, &StepRecord::new(2, "act", "ok")).unwrap();
+        store
+            .checkpoint_step(run, &StepRecord::new(1, "act", "ok"))
+            .unwrap();
+        store
+            .checkpoint_step(run, &StepRecord::new(2, "act", "ok"))
+            .unwrap();
 
         assert_eq!(store.last_step(run).unwrap(), 2);
         assert_eq!(store.steps(run).unwrap().len(), 2);
@@ -1547,7 +1607,9 @@ mod tests {
         // the prior checkpoint stands — never a torn half recorded as done.
         let store = Store::memory().unwrap();
         let run = store.start_run("goal", "root").unwrap();
-        store.checkpoint_step(run, &StepRecord::new(1, "act", "ok")).unwrap();
+        store
+            .checkpoint_step(run, &StepRecord::new(1, "act", "ok"))
+            .unwrap();
 
         // Simulate a crash mid-commit: open the step's transaction, write both
         // rows, then drop without committing (as a killed process would).
@@ -1566,7 +1628,11 @@ mod tests {
             // no tx.commit() — dropped here, rolling back.
         }
 
-        assert_eq!(store.last_step(run).unwrap(), 1, "the torn step must not survive");
+        assert_eq!(
+            store.last_step(run).unwrap(),
+            1,
+            "the torn step must not survive"
+        );
         assert_eq!(store.steps(run).unwrap().len(), 1);
     }
 
@@ -1577,7 +1643,10 @@ mod tests {
         assert!(store.check_resumable(run).is_ok());
 
         // A run id that does not exist is a typed Resume error, not a panic.
-        assert!(matches!(store.check_resumable(9999), Err(Error::Resume { .. })));
+        assert!(matches!(
+            store.check_resumable(9999),
+            Err(Error::Resume { .. })
+        ));
 
         // A store written by a newer checkpoint format is refused rather than
         // misread.
@@ -1585,7 +1654,10 @@ mod tests {
             .conn
             .execute_batch(&format!("PRAGMA user_version = {}", CHECKPOINT_FORMAT + 1))
             .unwrap();
-        assert!(matches!(store.check_resumable(run), Err(Error::Resume { .. })));
+        assert!(matches!(
+            store.check_resumable(run),
+            Err(Error::Resume { .. })
+        ));
     }
 
     #[test]
@@ -1608,13 +1680,29 @@ mod tests {
         let root = store.start_run("goal", "root").unwrap();
         let child = store.start_child_run("sub", "root", root, 1).unwrap();
         let grandchild = store.start_child_run("subsub", "root", child, 2).unwrap();
-        store.checkpoint_step(root, &StepRecord::new(1, "a", "ok").with_trace("p", "t", 10)).unwrap();
-        store.checkpoint_step(child, &StepRecord::new(1, "a", "ok").with_trace("p", "t", 20)).unwrap();
         store
-            .checkpoint_step(grandchild, &StepRecord::new(1, "a", "ok").with_trace("p", "t", 5))
+            .checkpoint_step(
+                root,
+                &StepRecord::new(1, "a", "ok").with_trace("p", "t", 10),
+            )
+            .unwrap();
+        store
+            .checkpoint_step(
+                child,
+                &StepRecord::new(1, "a", "ok").with_trace("p", "t", 20),
+            )
+            .unwrap();
+        store
+            .checkpoint_step(
+                grandchild,
+                &StepRecord::new(1, "a", "ok").with_trace("p", "t", 5),
+            )
             .unwrap();
 
-        assert_eq!(store.tree_run_ids(root).unwrap(), vec![root, child, grandchild]);
+        assert_eq!(
+            store.tree_run_ids(root).unwrap(),
+            vec![root, child, grandchild]
+        );
         assert_eq!(store.spent_tokens_tree(root).unwrap(), 35);
         assert_eq!(store.agent_count_tree(root).unwrap(), 3);
     }

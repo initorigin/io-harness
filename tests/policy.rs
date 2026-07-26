@@ -130,7 +130,10 @@ async fn a_denied_write_is_refused_and_the_run_still_reaches_its_goal() {
     );
     // The refusal is in the trace, attributable to the rule and layer.
     let events = store.events(result.run_id).unwrap();
-    let refusal = events.iter().find(|e| e.kind == "refusal").expect("refusal");
+    let refusal = events
+        .iter()
+        .find(|e| e.kind == "refusal")
+        .expect("refusal");
     assert_eq!(refusal.act, "write");
     assert_eq!(refusal.target, "secrets/key.txt");
     assert_eq!(refusal.rule.as_deref(), Some("secrets/*"));
@@ -140,8 +143,8 @@ async fn a_denied_write_is_refused_and_the_run_still_reaches_its_goal() {
 #[tokio::test]
 async fn a_denied_action_never_reaches_the_approver() {
     let dir = fixture();
-    let contract = TaskContract::workspace("touch the secret", dir.path(), verify())
-        .with_max_steps(1);
+    let contract =
+        TaskContract::workspace("touch the secret", dir.path(), verify()).with_max_steps(1);
     let script = MockScript::new(vec![vec![write("secrets/key.txt", "x")]]);
     let store = Store::memory().unwrap();
     let approver = Counting::new(Decision::approve());
@@ -151,18 +154,19 @@ async fn a_denied_action_never_reaches_the_approver() {
         .unwrap();
 
     // Refusal and approval are different things: a deny is not a prompt.
-    assert_eq!(approver.count(), 0, "a denied action must not be offered for approval");
+    assert_eq!(
+        approver.count(),
+        0,
+        "a denied action must not be offered for approval"
+    );
 }
 
 #[tokio::test]
 async fn approve_all_proceeds_where_deny_all_does_not() {
-    for (decision, expect_written) in [
-        (Decision::approve(), true),
-        (Decision::deny("nope"), false),
-    ] {
+    for (decision, expect_written) in [(Decision::approve(), true), (Decision::deny("nope"), false)]
+    {
         let dir = fixture();
-        let contract =
-            TaskContract::workspace("edit a", dir.path(), verify()).with_max_steps(1);
+        let contract = TaskContract::workspace("edit a", dir.path(), verify()).with_max_steps(1);
         let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
         let store = Store::memory().unwrap();
         let approver = Counting::new(decision);
@@ -180,8 +184,8 @@ async fn approve_all_proceeds_where_deny_all_does_not() {
 #[tokio::test]
 async fn reads_do_not_prompt_but_every_write_does_including_an_allowed_overwrite() {
     let dir = fixture();
-    let contract = TaskContract::workspace("read then write", dir.path(), verify())
-        .with_max_steps(2);
+    let contract =
+        TaskContract::workspace("read then write", dir.path(), verify()).with_max_steps(2);
     let script = MockScript::new(vec![
         vec![call("read_file", json!({ "path": "src/a.rs" }))],
         // src/a.rs already exists and the path rules allow it — it still asks.
@@ -223,7 +227,10 @@ async fn an_approver_can_redirect_the_write_and_the_trace_shows_both_forms() {
         "pub fn a() -> u32 { 0 }\n"
     );
     let events = store.events(result.run_id).unwrap();
-    let d = events.iter().find(|e| e.kind == "decision").expect("decision");
+    let d = events
+        .iter()
+        .find(|e| e.kind == "decision")
+        .expect("decision");
     assert_eq!(d.target, "src/a.rs");
     assert_eq!(d.performed.as_deref(), Some("src/redirected.rs"));
 }
@@ -295,8 +302,8 @@ async fn remembering_a_rule_stops_the_prompting_and_is_returned_to_the_caller() 
 #[tokio::test]
 async fn a_remembered_allow_cannot_override_a_base_deny() {
     let dir = fixture();
-    let contract = TaskContract::workspace("edit then exfiltrate", dir.path(), verify())
-        .with_max_steps(2);
+    let contract =
+        TaskContract::workspace("edit then exfiltrate", dir.path(), verify()).with_max_steps(2);
     let script = MockScript::new(vec![
         vec![write("src/a.rs", GOOD_A)],
         vec![write("secrets/key.txt", "stolen")],
@@ -326,8 +333,8 @@ async fn a_remembered_allow_cannot_override_a_base_deny() {
 #[tokio::test]
 async fn a_refused_action_consumes_a_step_so_retrying_it_hits_the_cap() {
     let dir = fixture();
-    let contract = TaskContract::workspace("keep trying the secret", dir.path(), verify())
-        .with_max_steps(3);
+    let contract =
+        TaskContract::workspace("keep trying the secret", dir.path(), verify()).with_max_steps(3);
     // The model requests the same denied write every step.
     let script = MockScript::new(vec![
         vec![write("secrets/key.txt", "x")],
@@ -386,7 +393,10 @@ async fn deferring_pauses_the_run_and_persists_the_pending_action() {
     // The pending action outlives this Store, as a different process would see it.
     drop(store);
     let reopened = Store::open(&path).unwrap();
-    let pending = reopened.pending(request_id).unwrap().expect("still pending");
+    let pending = reopened
+        .pending(request_id)
+        .unwrap()
+        .expect("still pending");
     assert_eq!(pending.act, "write");
     assert_eq!(pending.target, "src/a.rs");
     assert_eq!(pending.content.as_deref(), Some(GOOD_A));
@@ -418,9 +428,13 @@ async fn a_run_with_no_policy_behaves_exactly_as_0_3_0_did() {
     // add argument-level rules against a real baseline.
     let events = store.events(result.run_id).unwrap();
     assert!(!events.iter().any(|e| e.kind == "refusal"));
-    assert!(!events.iter().any(|e| e.source.as_deref() == Some("approver")));
+    assert!(!events
+        .iter()
+        .any(|e| e.source.as_deref() == Some("approver")));
     assert!(
-        events.iter().any(|e| e.act == "exec" && e.target.starts_with("rustc ")),
+        events
+            .iter()
+            .any(|e| e.act == "exec" && e.target.starts_with("rustc ")),
         "every spawn is recorded with its full argv"
     );
 }
@@ -467,7 +481,10 @@ async fn resuming_an_approval_performs_the_pending_action_and_finishes_the_run()
     .await
     .unwrap();
 
-    assert_eq!(resumed.run_id, run_id, "continues under the original run id");
+    assert_eq!(
+        resumed.run_id, run_id,
+        "continues under the original run id"
+    );
     assert_eq!(resumed.outcome, RunOutcome::Success { steps: 2 });
     // The approved action performed exactly what the human was shown.
     assert_eq!(
@@ -475,7 +492,12 @@ async fn resuming_an_approval_performs_the_pending_action_and_finishes_the_run()
         GOOD_A
     );
     assert_eq!(
-        store.pending(request_id).unwrap().unwrap().resolved.as_deref(),
+        store
+            .pending(request_id)
+            .unwrap()
+            .unwrap()
+            .resolved
+            .as_deref(),
         Some("approve")
     );
     let events = store.events(run_id).unwrap();
@@ -525,7 +547,12 @@ async fn resuming_a_denial_does_not_perform_the_action_and_closes_the_run() {
         "a denied action must not be performed on resume"
     );
     assert_eq!(
-        store.pending(request_id).unwrap().unwrap().resolved.as_deref(),
+        store
+            .pending(request_id)
+            .unwrap()
+            .unwrap()
+            .resolved
+            .as_deref(),
         Some("deny")
     );
 }

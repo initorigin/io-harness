@@ -1,37 +1,48 @@
-//! Windows native backend: a Job Object with kill-on-close plus memory /
-//! active-process / CPU limits, and a restricted token.
+//! Windows backend — **not yet native**. What runs on Windows today is the
+//! [portable floor](super::FloorSandbox), and the trace says so.
 //!
-//! cfg-gated to `target_os = "windows"`; compiled and unit-tested on the macOS
-//! build host under its cfg but **not live-run here** (see the 0.6.0 contract's
-//! excluded scope). The Job Object gives the caps Windows has no rlimit for; a
-//! new job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` guarantees teardown of the
-//! whole process tree when the job handle closes. Network is best-effort here
-//! (env strip via the shared path); a hard boundary would need WFP, deferred.
+//! The Job Object was designed but never implemented: no Win32 API is called
+//! here, so there is **no** job object, **no** kill-on-close process-tree
+//! teardown, **no** active-process limit, and **no** restricted token. The CPU
+//! and memory caps are unenforced too — the shared path applies them via
+//! `RLIMIT_CPU` and an RSS monitor, both unix-only. What a Windows run does get
+//! is the floor: a fresh subprocess in an ephemeral workdir, `kill_on_drop`, the
+//! wall-clock timeout, and the best-effort proxy-env strip. Filesystem scoping
+//! and the wall cap, nothing stronger.
+//!
+//! So [`WindowsSandbox::run`] reports [`Backend::PortableFloor`] rather than
+//! [`Backend::WindowsJobObject`]: a run that creates no job object must not name
+//! one in an audit trail. The real implementation needs `windows-sys`, which is
+//! a new runtime dependency, and lands in its own release; until then the type
+//! stays as the wiring point [`super::select`] already targets.
 
 use super::{run_capped, Backend, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::Result;
 
-/// The Windows Job Object backend.
+/// The Windows backend. Currently the portable floor — see the module docs; the
+/// Job Object is not implemented yet.
 pub struct WindowsSandbox;
 
 impl Sandbox for WindowsSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
-        // A Job Object is created and configured with the caps this run needs,
-        // then the command runs under the shared capture/teardown path. (Job
-        // assignment of the spawned child is applied by the OS to the job the
-        // process is created in; wall-clock and output capture are shared.)
+        // No job object is created. The limits are mapped so the shape is ready
+        // for the real implementation, then dropped unapplied; the run gets the
+        // floor's capture/teardown and nothing more.
         let _job = JobLimits::from(spec.limits);
-        run_capped(Backend::WindowsJobObject, spec, |_cmd| {}).await
+        run_capped(Backend::PortableFloor, spec, |_cmd| {}).await
     }
 
     fn backend(&self) -> Backend {
-        Backend::WindowsJobObject
+        Backend::PortableFloor
     }
 }
 
 /// The Job Object limits derived from [`super::SandboxLimits`], as the flags and
 /// values a `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` would carry. Factored out as
 /// pure data so it is unit-testable without the Win32 API.
+///
+/// **Prepared but not applied.** Nothing consumes this yet — it is the mapping
+/// the real Job Object implementation will use once it exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JobLimits {
     /// Process-memory cap in bytes, if any.

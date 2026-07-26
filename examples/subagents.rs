@@ -31,7 +31,10 @@ async fn main() -> io_harness::Result<()> {
          b.txt, verify_contains BETA). After both sub-agents finish, write \
          summary.txt containing the word DONE.",
         dir.path(),
-        Verification::WorkspaceFileContains { file: "summary.txt".into(), needle: "DONE".into() },
+        Verification::WorkspaceFileContains {
+            file: "summary.txt".into(),
+            needle: "DONE".into(),
+        },
     )
     .with_max_steps(8);
 
@@ -43,7 +46,15 @@ async fn main() -> io_harness::Result<()> {
     let containment = Containment::new(3, 2, 1, 200_000);
 
     let store = Store::open(dir.path().join("runs.db"))?;
-    let result = run_tree(&contract, &provider, &store, &policy, &ApproveAll, &containment).await?;
+    let result = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+        &containment,
+    )
+    .await?;
 
     println!("outcome: {:?}", result.outcome);
     println!("\ntree:");

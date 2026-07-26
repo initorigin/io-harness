@@ -145,12 +145,19 @@ impl Default for Policy {
             name: "builtin-exec".into(),
             rules: ["rustc", "<test-binary>"]
                 .iter()
-                .map(|p| Rule { act: Act::Exec, effect: Effect::Allow, pattern: (*p).to_string() })
+                .map(|p| Rule {
+                    act: Act::Exec,
+                    effect: Effect::Allow,
+                    pattern: (*p).to_string(),
+                })
                 .collect(),
         };
         Self {
             layers: vec![
-                Layer { name: "builtin-secrets".into(), rules },
+                Layer {
+                    name: "builtin-secrets".into(),
+                    rules,
+                },
                 exec,
             ],
             defaults: Defaults {
@@ -327,7 +334,9 @@ impl Policy {
         // port the URL resolved to, while `allow_net("api.example.com:443")`
         // still means that port and no other.
         let forms: Vec<&str> = match (act, target.rsplit_once(':')) {
-            (Act::Net, Some((host, port))) if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
+            (Act::Net, Some((host, port)))
+                if !port.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+            {
                 vec![target, host]
             }
             _ => vec![target],
@@ -498,7 +507,10 @@ mod tests {
     fn an_empty_overlay_leaves_the_base_unchanged() {
         let merged = base().merge(Policy::default());
         for (act, path) in [(Act::Write, "src/a.rs"), (Act::Write, "secrets/k")] {
-            assert_eq!(base().check(act, path).effect, merged.check(act, path).effect);
+            assert_eq!(
+                base().check(act, path).effect,
+                merged.check(act, path).effect
+            );
         }
     }
 
@@ -533,8 +545,14 @@ mod tests {
             .allow_read("secrets/*")
             .allow_write("secrets/*");
         let contained = parent.contain(&child);
-        assert_eq!(contained.check(Act::Write, "secrets/key.txt").effect, Effect::Deny);
-        assert_eq!(contained.check(Act::Read, "secrets/key.txt").effect, Effect::Deny);
+        assert_eq!(
+            contained.check(Act::Write, "secrets/key.txt").effect,
+            Effect::Deny
+        );
+        assert_eq!(
+            contained.check(Act::Read, "secrets/key.txt").effect,
+            Effect::Deny
+        );
     }
 
     #[test]
@@ -545,7 +563,11 @@ mod tests {
         let parent = Policy::default().layer("parent").allow_write("src/*");
         let child = Policy::permissive().layer("child").allow_write("docs/*");
         assert_eq!(
-            parent.clone().merge(child.clone()).check(Act::Write, "docs/x.md").effect,
+            parent
+                .clone()
+                .merge(child.clone())
+                .check(Act::Write, "docs/x.md")
+                .effect,
             Effect::Allow,
             "merge widens (0.4.0 behaviour)"
         );
@@ -561,10 +583,18 @@ mod tests {
         // A child adds a deny the parent lacked; denies union downward, and the
         // child may narrow. Paths the child did not deny still follow the parent.
         let parent = Policy::default().layer("parent").allow_write("src/*");
-        let child = Policy::permissive().layer("child").deny_write("src/generated/*");
+        let child = Policy::permissive()
+            .layer("child")
+            .deny_write("src/generated/*");
         let contained = parent.contain(&child);
-        assert_eq!(contained.check(Act::Write, "src/a.rs").effect, Effect::Allow);
-        assert_eq!(contained.check(Act::Write, "src/generated/x.rs").effect, Effect::Deny);
+        assert_eq!(
+            contained.check(Act::Write, "src/a.rs").effect,
+            Effect::Allow
+        );
+        assert_eq!(
+            contained.check(Act::Write, "src/generated/x.rs").effect,
+            Effect::Deny
+        );
     }
 
     #[test]
@@ -572,42 +602,81 @@ mod tests {
         // A grandchild cannot re-open what the root denied, nor widen a root
         // default — the invariant holds at depth > 1, not just parent->child.
         let root = base(); // denies secrets/*, allows src/*
-        let child = Policy::permissive().layer("child").deny_write("src/vendor/*");
+        let child = Policy::permissive()
+            .layer("child")
+            .deny_write("src/vendor/*");
         let grandchild = Policy::permissive()
             .layer("grandchild")
             .allow_write("secrets/*") // try to re-allow a root deny
             .allow_write("docs/*"); // try to widen past the root default
         let effective = root.contain(&child).contain(&grandchild);
-        assert_eq!(effective.check(Act::Write, "secrets/key.txt").effect, Effect::Deny);
+        assert_eq!(
+            effective.check(Act::Write, "secrets/key.txt").effect,
+            Effect::Deny
+        );
         assert_eq!(effective.check(Act::Write, "docs/x.md").effect, Effect::Ask);
-        assert_eq!(effective.check(Act::Write, "src/vendor/x.rs").effect, Effect::Deny);
-        assert_eq!(effective.check(Act::Write, "src/a.rs").effect, Effect::Allow);
+        assert_eq!(
+            effective.check(Act::Write, "src/vendor/x.rs").effect,
+            Effect::Deny
+        );
+        assert_eq!(
+            effective.check(Act::Write, "src/a.rs").effect,
+            Effect::Allow
+        );
     }
 
     #[test]
     fn net_is_denied_by_default_and_allowed_only_where_a_rule_says_so() {
-        let p = Policy::default().layer("egress").allow_net("api.example.com");
-        assert_eq!(p.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
-        assert_eq!(p.check(Act::Net, "evil.example.com:443").effect, Effect::Deny);
+        let p = Policy::default()
+            .layer("egress")
+            .allow_net("api.example.com");
+        assert_eq!(
+            p.check(Act::Net, "api.example.com:443").effect,
+            Effect::Allow
+        );
+        assert_eq!(
+            p.check(Act::Net, "evil.example.com:443").effect,
+            Effect::Deny
+        );
         // Deny is absolute across layers, network included.
         let tighter = p.layer("lockdown").deny_net("api.example.com");
-        assert_eq!(tighter.check(Act::Net, "api.example.com:443").effect, Effect::Deny);
+        assert_eq!(
+            tighter.check(Act::Net, "api.example.com:443").effect,
+            Effect::Deny
+        );
     }
 
     #[test]
     fn a_net_rule_matches_with_or_without_the_port() {
         let bare = Policy::default().layer("l").allow_net("api.example.com");
-        assert_eq!(bare.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
-        assert_eq!(bare.check(Act::Net, "api.example.com:8080").effect, Effect::Allow);
+        assert_eq!(
+            bare.check(Act::Net, "api.example.com:443").effect,
+            Effect::Allow
+        );
+        assert_eq!(
+            bare.check(Act::Net, "api.example.com:8080").effect,
+            Effect::Allow
+        );
 
         // A rule that names a port is honoured as written: that port only.
-        let ported = Policy::default().layer("l").allow_net("api.example.com:443");
-        assert_eq!(ported.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
-        assert_eq!(ported.check(Act::Net, "api.example.com:8080").effect, Effect::Deny);
+        let ported = Policy::default()
+            .layer("l")
+            .allow_net("api.example.com:443");
+        assert_eq!(
+            ported.check(Act::Net, "api.example.com:443").effect,
+            Effect::Allow
+        );
+        assert_eq!(
+            ported.check(Act::Net, "api.example.com:8080").effect,
+            Effect::Deny
+        );
 
         // Wildcards work on hosts the way they work on paths.
         let wild = Policy::default().layer("l").allow_net("*.example.com");
-        assert_eq!(wild.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
+        assert_eq!(
+            wild.check(Act::Net, "api.example.com:443").effect,
+            Effect::Allow
+        );
         assert_eq!(wild.check(Act::Net, "example.org:443").effect, Effect::Deny);
     }
 
@@ -619,8 +688,14 @@ mod tests {
             .allow_net("evil.example.com") // a child allow grants nothing
             .deny_net("api.example.com"); // a child deny binds
         let effective = root.contain(&child);
-        assert_eq!(effective.check(Act::Net, "evil.example.com:443").effect, Effect::Deny);
-        assert_eq!(effective.check(Act::Net, "api.example.com:443").effect, Effect::Deny);
+        assert_eq!(
+            effective.check(Act::Net, "evil.example.com:443").effect,
+            Effect::Deny
+        );
+        assert_eq!(
+            effective.check(Act::Net, "api.example.com:443").effect,
+            Effect::Deny
+        );
     }
 
     #[test]
@@ -629,7 +704,10 @@ mod tests {
         let old = r#"{"layers":[],"defaults":{"read":"allow","write":"ask","exec":"ask"}}"#;
         let p: Policy = serde_json::from_str(old).unwrap();
         assert_eq!(p.defaults.net, Effect::Deny);
-        assert_eq!(p.check(Act::Net, "anywhere.example.com:443").effect, Effect::Deny);
+        assert_eq!(
+            p.check(Act::Net, "anywhere.example.com:443").effect,
+            Effect::Deny
+        );
     }
 
     #[test]
@@ -640,7 +718,11 @@ mod tests {
             .deny_net("evil.example.com")
             .ask_net("maybe.example.com");
         let back: Policy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
-        for host in ["api.example.com:443", "evil.example.com:443", "maybe.example.com:443"] {
+        for host in [
+            "api.example.com:443",
+            "evil.example.com:443",
+            "maybe.example.com:443",
+        ] {
             assert_eq!(p.check(Act::Net, host), back.check(Act::Net, host));
         }
     }
@@ -649,7 +731,10 @@ mod tests {
     fn permissive_still_enforces_nothing_including_the_network() {
         let p = Policy::permissive();
         assert!(p.is_permissive());
-        assert_eq!(p.check(Act::Net, "anywhere.example.com:443").effect, Effect::Allow);
+        assert_eq!(
+            p.check(Act::Net, "anywhere.example.com:443").effect,
+            Effect::Allow
+        );
     }
 
     #[test]

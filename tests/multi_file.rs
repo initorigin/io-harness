@@ -18,7 +18,10 @@ struct MockScript {
 
 impl MockScript {
     fn new(steps: Vec<Vec<ToolCall>>) -> Self {
-        Self { steps, at: AtomicUsize::new(0) }
+        Self {
+            steps,
+            at: AtomicUsize::new(0),
+        }
     }
 }
 
@@ -33,7 +36,10 @@ impl Provider for MockScript {
 }
 
 fn call(name: &str, args: serde_json::Value) -> ToolCall {
-    ToolCall { name: name.into(), arguments: args }
+    ToolCall {
+        name: name.into(),
+        arguments: args,
+    }
 }
 
 /// A fixture repo with two stub files that don't yet satisfy the spec.
@@ -66,10 +72,19 @@ async fn agent_finds_then_edits_several_files_and_the_set_verifies() {
     // Scripted: locate files, inspect one, then edit both correctly.
     let script = MockScript::new(vec![
         vec![call("find", json!({ "name_glob": "*.rs" }))],
-        vec![call("grep", json!({ "pattern": "fn a", "path_glob": "src/*.rs" }))],
+        vec![call(
+            "grep",
+            json!({ "pattern": "fn a", "path_glob": "src/*.rs" }),
+        )],
         vec![call("read_file", json!({ "path": "src/a.rs" }))],
-        vec![call("write_file", json!({ "path": "src/a.rs", "content": "pub fn a() -> u32 { 40 }\n" }))],
-        vec![call("write_file", json!({ "path": "src/b.rs", "content": "pub fn b() -> u32 { 2 }\n" }))],
+        vec![call(
+            "write_file",
+            json!({ "path": "src/a.rs", "content": "pub fn a() -> u32 { 40 }\n" }),
+        )],
+        vec![call(
+            "write_file",
+            json!({ "path": "src/b.rs", "content": "pub fn b() -> u32 { 2 }\n" }),
+        )],
     ]);
     let store = Store::memory().unwrap();
 
@@ -104,8 +119,14 @@ async fn run_fails_when_one_of_the_edited_files_is_wrong() {
 
     // a is edited correctly, b is left wrong: the SET must never verify.
     let script = MockScript::new(vec![
-        vec![call("write_file", json!({ "path": "src/a.rs", "content": "pub fn a() -> u32 { 40 }\n" }))],
-        vec![call("write_file", json!({ "path": "src/b.rs", "content": "pub fn b() -> u32 { 99 }\n" }))],
+        vec![call(
+            "write_file",
+            json!({ "path": "src/a.rs", "content": "pub fn a() -> u32 { 40 }\n" }),
+        )],
+        vec![call(
+            "write_file",
+            json!({ "path": "src/b.rs", "content": "pub fn b() -> u32 { 99 }\n" }),
+        )],
     ]);
     let store = Store::memory().unwrap();
 

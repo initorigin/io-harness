@@ -153,7 +153,8 @@ impl Accumulator {
                 let delta = value.get("delta");
                 match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
                     Some("text_delta") => {
-                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str()) {
+                        if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
+                        {
                             self.text.push_str(t);
                         }
                     }

@@ -8,12 +8,13 @@
 //! teardown so nothing the run wrote or spawned outlives it.
 //!
 //! The sandbox is both **OS-native** and **OS-neutral**. One trait,
-//! [`Sandbox`], has a real native backend per platform — macOS `sandbox-exec`,
-//! Linux namespaces + seccomp, Windows Job Objects — over a [portable
-//! floor](FloorSandbox) (fresh subprocess, ephemeral tempdir, resource caps,
-//! network env stripped) that compiles and runs on all three, so isolation is
-//! never *absent* on any OS the crate builds for. [`select`] picks the strongest
-//! backend available at run time and records which one ran.
+//! [`Sandbox`], has a native backend per platform — macOS `sandbox-exec` and
+//! Linux namespaces + seccomp; Windows is still the floor (its Job Object is
+//! unimplemented) — over a [portable floor](FloorSandbox) (fresh subprocess,
+//! ephemeral tempdir, resource caps, network env stripped) that compiles and runs
+//! on all three, so isolation is never *absent* on any OS the crate builds for.
+//! [`select`] picks the backend for this OS — at compile time, not by probing —
+//! and the one that ran is recorded.
 //!
 //! ## Backend isolation strength (documented, not hidden)
 //!
@@ -23,8 +24,9 @@
 //! - **Linux namespaces** — user + mount + pid + net namespaces give a hard
 //!   network boundary and a private tmpfs; seccomp + rlimits on top. *(cfg-gated,
 //!   not live-run on the macOS build host.)*
-//! - **Windows Job Object** — kill-on-close plus memory / active-process / CPU
-//!   limits and a restricted token. *(cfg-gated, not live-run here.)*
+//! - **Windows** — *no native backend yet.* The Job Object was designed but
+//!   never implemented (no Win32 call is made), so a Windows run gets the
+//!   portable floor and reports it as such. See [`windows`].
 //! - **Portable floor** — the weakest backend: filesystem-scoped (a fresh
 //!   ephemeral workdir) and resource-capped, **not a full syscall jail**. Network
 //!   deny is best-effort (proxy env stripped), *not* a kernel boundary. It exists
@@ -47,7 +49,9 @@ pub enum Backend {
     MacosSandboxExec,
     /// Linux user/mount/pid/net namespaces + seccomp + rlimits.
     LinuxNamespaces,
-    /// Windows Job Object + restricted token.
+    /// Windows Job Object + restricted token. **Reserved, never reported** —
+    /// the Job Object is not implemented, so Windows runs report
+    /// [`Backend::PortableFloor`]. Kept so the variant is here when it is.
     WindowsJobObject,
     /// The portable floor: subprocess + ephemeral workdir + caps + env strip.
     PortableFloor,
@@ -261,9 +265,11 @@ impl Sandbox for Selected {
     }
 }
 
-/// Pick the strongest backend available on this OS for `config`. The ladder is
-/// native-for-this-OS, then the portable floor. `force_floor` skips the native
-/// rung so the floor can be exercised everywhere and the ladder proven.
+/// Pick the backend for this OS. The choice is made at **compile time** by cfg,
+/// not by probing the host: the native rung for this target, or the portable
+/// floor when `force_floor` skips it (so the floor can be exercised everywhere).
+/// There is no runtime capability check and so no runtime degradation — a native
+/// backend whose primitive is unavailable fails at spawn rather than falling back.
 pub fn select(config: &SandboxConfig) -> Selected {
     if !config.force_floor {
         #[cfg(target_os = "macos")]
@@ -324,7 +330,14 @@ async fn run_capped(
     // Deny network on the floor best-effort by stripping proxy configuration.
     // A real kernel boundary comes from the native backends; documented as such.
     if !spec.allow_network {
-        for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        for k in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
             cmd.env_remove(k);
         }
     }
@@ -339,8 +352,15 @@ async fn run_capped(
         // session, not the sandbox. The native backends scope it per-sandbox.
         unsafe {
             cmd.pre_exec(move || {
-                set_rlimit(libc::RLIMIT_CPU as u32, cpu);
-                set_rlimit(libc::RLIMIT_NOFILE as u32, nofile);
+                // The cast is load-bearing on macOS, where the RLIMIT_* constants
+                // are c_int, and a no-op on Linux, where they are already u32 —
+                // so clippy's unnecessary_cast fires on Linux only. Keep the cast
+                // and silence it rather than cfg-splitting two lines.
+                #[allow(clippy::unnecessary_cast)]
+                {
+                    set_rlimit(libc::RLIMIT_CPU as u32, cpu);
+                    set_rlimit(libc::RLIMIT_NOFILE as u32, nofile);
+                }
                 Ok(())
             });
         }
@@ -523,8 +543,8 @@ pub async fn copy_back(
 // backends "compile under their cfg and pass their backend unit tests" on a
 // macOS host without a cross toolchain (rusqlite's bundled C blocks a full
 // cross-check, which is an environment limit, not a limit of this code).
-pub mod macos;
 pub mod linux;
+pub mod macos;
 pub mod windows;
 
 #[cfg(test)]
@@ -532,7 +552,12 @@ mod tests {
     use super::*;
 
     fn spec<'a>(argv: &'a [String], dir: &'a Path, limits: &'a SandboxLimits) -> RunSpec<'a> {
-        RunSpec { argv, workdir: dir, limits, allow_network: false }
+        RunSpec {
+            argv,
+            workdir: dir,
+            limits,
+            allow_network: false,
+        }
     }
 
     #[tokio::test]
@@ -586,7 +611,10 @@ mod tests {
             max_wall_secs: Some(30), // wall is the backstop; CPU should fire first
             ..SandboxLimits::default()
         };
-        let out = FloorSandbox.run(spec(&argv, dir.path(), &limits)).await.unwrap();
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
         assert_eq!(out.cap_hit, Some(Cap::Cpu), "expected CPU cap, got {out:?}");
         assert!(!out.success());
     }
@@ -606,8 +634,15 @@ mod tests {
             max_wall_secs: Some(30),
             ..SandboxLimits::default()
         };
-        let out = FloorSandbox.run(spec(&argv, dir.path(), &limits)).await.unwrap();
-        assert_eq!(out.cap_hit, Some(Cap::Memory), "expected memory cap, got {out:?}");
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.cap_hit,
+            Some(Cap::Memory),
+            "expected memory cap, got {out:?}"
+        );
         assert!(!out.success());
     }
 
@@ -627,8 +662,12 @@ mod tests {
     async fn copy_back_honours_the_write_policy() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        tokio::fs::write(src.path().join("keep.txt"), "y").await.unwrap();
-        tokio::fs::write(src.path().join("secret.txt"), "n").await.unwrap();
+        tokio::fs::write(src.path().join("keep.txt"), "y")
+            .await
+            .unwrap();
+        tokio::fs::write(src.path().join("secret.txt"), "n")
+            .await
+            .unwrap();
 
         let files = vec![PathBuf::from("keep.txt"), PathBuf::from("secret.txt")];
         let copied = copy_back(src.path(), dst.path(), &files, |p| {
@@ -639,6 +678,9 @@ mod tests {
 
         assert_eq!(copied, vec![PathBuf::from("keep.txt")]);
         assert!(dst.path().join("keep.txt").exists());
-        assert!(!dst.path().join("secret.txt").exists(), "denied file must not be copied back");
+        assert!(
+            !dst.path().join("secret.txt").exists(),
+            "denied file must not be copied back"
+        );
     }
 }
