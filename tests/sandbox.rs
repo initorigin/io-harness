@@ -228,6 +228,11 @@ async fn sandbox_lifecycle_is_recorded_and_reconstructable() {
     assert!(exec.detail.as_deref().unwrap().contains("rustc"));
 }
 
+// The CPU cap is an `RLIMIT_CPU`, which exists only on unix. On Windows the
+// floor applies no CPU cap at all and says so, so the assertion below would be
+// asserting behaviour the crate documents as absent. The Windows counterpart is
+// the test underneath, which pins that absence rather than skipping it.
+#[cfg(unix)]
 #[tokio::test]
 async fn a_cap_hit_in_the_gate_is_recorded() {
     let tmp = tempfile::tempdir().unwrap();
@@ -258,6 +263,48 @@ async fn a_cap_hit_in_the_gate_is_recorded() {
     assert!(
         events.iter().any(|e| e.kind == "cap_hit"),
         "cap hit must be recorded, got {events:?}"
+    );
+}
+
+/// Windows has no `RLIMIT_CPU`, so a CPU cap is not applied there. The point of
+/// this test is that the gate never *claims* one it did not apply: an
+/// impossible-looking `max_cpu_secs: Some(0)` leaves the compile to succeed on
+/// its merits and records no cap hit, rather than reporting a kill that never
+/// happened. Documented in `src/sandbox/windows.rs`; asserted here so the
+/// documentation cannot drift away from the behaviour.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_claims_no_cpu_cap_because_it_applies_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let run = store.start_run("goal", "x.rs").unwrap();
+
+    let policy = Policy::default();
+    let cfg = SandboxConfig {
+        limits: SandboxLimits {
+            max_cpu_secs: Some(0),
+            max_wall_secs: Some(120),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let guard = ExecGuard::new(&policy)
+        .sandboxed(cfg)
+        .tracing(&store, run, 1);
+    let passed = Verification::CompilesRust
+        .passes_guarded(Path::new("x.rs"), good(), &guard)
+        .await
+        .unwrap();
+
+    assert!(
+        passed,
+        "with no CPU cap applied, an honest compile must still pass the gate"
+    );
+    let events = store.sandbox_events(run).unwrap();
+    assert!(
+        !events.iter().any(|e| e.kind == "cap_hit"),
+        "a cap that was never applied must never be reported as hit, got {events:?}"
     );
 }
 
