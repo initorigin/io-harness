@@ -238,12 +238,12 @@ pub async fn run_with_observed<P: Provider>(
     };
     match contract.root.clone() {
         Some(root) => {
-            let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &skills, watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result
         }
         // Single-file mode has no policy-aware tool layer in 0.4.0. Silently
@@ -313,7 +313,7 @@ pub async fn resume_observed<P: Provider>(
     match contract.root.clone() {
         Some(root) => {
             let policy = Policy::permissive();
-            let mcp = McpSession::connect(&contract.mcp, &policy, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &policy, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -328,7 +328,7 @@ pub async fn resume_observed<P: Provider>(
                 watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result
         }
         None => run_from(contract, provider, store, run_id, start_step, watch).await,
@@ -450,7 +450,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 ),
             )?;
             let remember = remember.clone();
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -465,7 +465,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result.map(|r| r.with_remembered(remember))
         }
         Decision::Approve { modified, remember } => {
@@ -500,6 +500,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 ev.rule = recheck.rule.clone();
                 ev.layer = recheck.layer.clone();
                 store.record_event(run_id, &ev)?;
+                refused(watch, run_id, 0, &ev);
                 store.resolve_pending(request_id, "deny")?;
                 finish(store, watch, run_id, 0, step, "denied")?;
                 return Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id));
@@ -522,7 +523,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             store.record_event(run_id, &ev)?;
 
             // Continue the run under its original id, from the next step.
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let result = run_workspace_from(
                 contract,
                 provider,
@@ -537,7 +538,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 watch,
             )
             .await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             result.map(|r| r.with_remembered(remember))
         }
     }
@@ -675,7 +676,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             ));
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
                 tools: &contract.tools,
@@ -690,7 +691,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 root_run_id: run_id,
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
         }
         Decision::Approve { modified, remember } => {
@@ -751,7 +752,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             ));
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
-            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id).await?;
+            let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
                 tools: &contract.tools,
@@ -766,7 +767,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 root_run_id: run_id,
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
-            mcp.shutdown(store, run_id).await;
+            mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
         }
     }
@@ -843,7 +844,7 @@ fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
 /// non-`Send` future, so a run and every agent in its tree are driven on one
 /// task. Nothing here needs a lock, and adding one would be the only `Sync`
 /// requirement in the loop.
-struct Watch<'a> {
+pub(crate) struct Watch<'a> {
     observer: &'a dyn Observer,
     cancelled: Cell<bool>,
 }
@@ -857,7 +858,7 @@ impl<'a> Watch<'a> {
     }
 
     /// Report one event, remembering a cancellation for the next step boundary.
-    fn emit(&self, event: RunEvent) {
+    pub(crate) fn emit(&self, event: RunEvent) {
         if self.observer.event(&event).is_cancel() {
             self.cancelled.set(true);
         }
@@ -867,6 +868,41 @@ impl<'a> Watch<'a> {
     fn cancelled(&self) -> bool {
         self.cancelled.get()
     }
+}
+
+/// Announce a refusal, reading the event straight off the row that records it.
+///
+/// Every `Refused` in the crate goes through here, and takes the `PolicyEvent`
+/// rather than the four fields, so an event cannot carry a rule or a layer the
+/// `policy_events` row does not. The two surfaces agree by construction instead
+/// of by four call sites remembering to keep in step.
+pub(crate) fn refused(watch: &Watch<'_>, run_id: i64, depth: u32, ev: &PolicyEvent) {
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        ev.step,
+        depth,
+        EventKind::Refused {
+            act: ev.act.clone(),
+            target: ev.target.clone(),
+            rule: ev.rule.clone(),
+            layer: ev.layer.clone(),
+        },
+    ));
+}
+
+/// Announce a human's answer, from the row that records it. As [`refused`]: the
+/// event's `decision` is the row's, never a second literal beside it.
+fn decided(watch: &Watch<'_>, run_id: i64, depth: u32, ev: &PolicyEvent) {
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        ev.step,
+        depth,
+        EventKind::ApprovalDecided {
+            act: ev.act.clone(),
+            target: ev.target.clone(),
+            decision: ev.decision.clone().unwrap_or_default(),
+        },
+    ));
 }
 
 /// The one step boundary: commit the step, log it, and tell the observer.
@@ -1112,7 +1148,9 @@ async fn run_from<P: Provider>(
         }
 
         let contents = fs.read().await?;
-        let guard = ExecGuard::new(&permissive).tracing(store, run_id, step);
+        let guard = ExecGuard::new(&permissive)
+            .tracing(store, run_id, step)
+            .watching(watch, 0);
         if contract
             .verify
             .passes_guarded(&contract.file, &contents, &guard)
@@ -1295,6 +1333,8 @@ async fn run_workspace_from<P: Provider>(
                 skills,
                 entry_cap,
                 &mem_key,
+                watch,
+                0,
             )
             .await?
             {
@@ -1440,7 +1480,9 @@ async fn run_workspace_from<P: Provider>(
             .verify
             .passes_in_guarded(
                 root,
-                &ExecGuard::new(&effective).tracing(store, run_id, step),
+                &ExecGuard::new(&effective)
+                    .tracing(store, run_id, step)
+                    .watching(watch, 0),
             )
             .await?
         {
@@ -1583,7 +1625,7 @@ pub async fn run_tree_observed<P: Provider>(
             ))
         }
     };
-    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let tree = Tree {
         mcp: &mcp,
         tools: &contract.tools,
@@ -1598,7 +1640,7 @@ pub async fn run_tree_observed<P: Provider>(
         root_run_id: run_id,
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await;
-    mcp.shutdown(store, run_id).await;
+    mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -1698,7 +1740,7 @@ pub async fn resume_tree_observed<P: Provider>(
             ))
         }
     };
-    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id).await?;
+    let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
     let tree = Tree {
         mcp: &mcp,
         tools: &contract.tools,
@@ -1713,7 +1755,7 @@ pub async fn resume_tree_observed<P: Provider>(
         root_run_id: run_id,
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await;
-    mcp.shutdown(store, run_id).await;
+    mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
 
@@ -1879,6 +1921,8 @@ fn run_agent<'f, P: Provider>(
                     tree.skills,
                     entry_cap,
                     &mem_key,
+                    tree.watch,
+                    depth,
                 )
                 .await?
                 {
@@ -2121,7 +2165,9 @@ fn run_agent<'f, P: Provider>(
                 .verify
                 .passes_in_guarded(
                     &tree.root,
-                    &ExecGuard::new(policy).tracing(tree.store, run_id, step),
+                    &ExecGuard::new(policy)
+                        .tracing(tree.store, run_id, step)
+                        .watching(tree.watch, depth),
                 )
                 .await?
             {
@@ -2410,19 +2456,27 @@ async fn authorize_provider<P: Provider>(
         return Ok(ProviderAccess::Granted(effective));
     };
 
+    // The run is now waiting on a human, before its first step. Step 0 for the
+    // same reason the rows below are: the authorization precedes step 1.
+    watch.emit(RunEvent::new(
+        run_id,
+        0,
+        EventKind::ApprovalRequested {
+            act: "net".into(),
+            target: target.clone(),
+        },
+    ));
     match approver.decide(&Request::new(Act::Net, &target)).await {
         Decision::Approve { .. } => {
-            store.record_event(
-                run_id,
-                &PolicyEvent::decision(0, "net", &target, "approve", "approver"),
-            )?;
+            let ev = PolicyEvent::decision(0, "net", &target, "approve", "approver");
+            store.record_event(run_id, &ev)?;
+            decided(watch, run_id, 0, &ev);
             Ok(ProviderAccess::Granted(effective))
         }
         Decision::Deny { reason } => {
-            store.record_event(
-                run_id,
-                &PolicyEvent::decision(0, "net", &target, "deny", "approver"),
-            )?;
+            let ev = PolicyEvent::decision(0, "net", &target, "deny", "approver");
+            store.record_event(run_id, &ev)?;
+            decided(watch, run_id, 0, &ev);
             // Step 0: the run never started, so it finished having taken no steps.
             finish(store, watch, run_id, 0, 0, "refused")?;
             Err(crate::error::Error::Refused {
@@ -2435,10 +2489,9 @@ async fn authorize_provider<P: Provider>(
             })
         }
         Decision::Defer => {
-            store.record_event(
-                run_id,
-                &PolicyEvent::decision(0, "net", &target, "defer", "approver"),
-            )?;
+            let ev = PolicyEvent::decision(0, "net", &target, "defer", "approver");
+            store.record_event(run_id, &ev)?;
+            decided(watch, run_id, 0, &ev);
             let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
             finish(store, watch, run_id, 0, 0, "awaiting_approval")?;
             Ok(ProviderAccess::Pending(request_id))
@@ -2514,9 +2567,28 @@ async fn dispatch(
     skills: &Skills,
     cap: usize,
     memory_key: &str,
+    watch: &Watch<'_>,
+    depth: u32,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
+    // Announced before the call is made, so a watcher sees what the run is about
+    // to do rather than only what it did. The subject is whichever of the
+    // conventional argument names this tool uses; a tool that names none of them
+    // is its own subject, which is what an MCP or registered tool call is.
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::ToolCall {
+            name: call.name.clone(),
+            target: ["path", "pattern", "name_glob", "glob", "key", "name"]
+                .into_iter()
+                .find_map(s)
+                .unwrap_or(&call.name)
+                .to_string(),
+        },
+    ));
     Ok(match call.name.as_str() {
         GREP_TOOL => {
             let pattern = s("pattern").unwrap_or_default();
@@ -2577,6 +2649,16 @@ async fn dispatch(
                     format!("{key} ({} chars)", value.chars().count()),
                 ),
             )?;
+            // The key only: the row's detail carries a character count too, but
+            // that is prose about the write, not the note's identity.
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::MemoryWrote {
+                    key: key.to_string(),
+                },
+            ));
             for gone in &evicted {
                 store.record_context_event(
                     run_id,
@@ -2595,7 +2677,20 @@ async fn dispatch(
         }
         READ_FILE_TOOL => {
             let path = s("path").unwrap_or_default();
-            match gate(ws, approver, store, run_id, step, Act::Read, path, None).await? {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
                 Gated::Go {
@@ -2631,6 +2726,8 @@ async fn dispatch(
                 Act::Write,
                 path,
                 Some(content),
+                watch,
+                depth,
             )
             .await?
             {
@@ -2695,7 +2792,20 @@ async fn dispatch(
                 ));
             };
             let path = skill.path.display().to_string();
-            match gate(ws, approver, store, run_id, step, Act::Read, &path, None).await? {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                &path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
                 Gated::Go {
@@ -2733,7 +2843,20 @@ async fn dispatch(
         // sets are disjoint, so the order is documentation rather than a
         // tie-break.
         name if custom.owns(name) => {
-            match gate(ws, approver, store, run_id, step, Act::Exec, name, None).await? {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Exec,
+                name,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
                 Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
                 Gated::Paused { request_id } => Dispatched::Pause { request_id },
                 Gated::Go { remember, .. } => {
@@ -2779,6 +2902,7 @@ async fn dispatch(
                 ev.rule = verdict.rule.clone();
                 ev.layer = verdict.layer.clone();
                 store.record_event(run_id, &ev)?;
+                refused(watch, run_id, depth, &ev);
                 let why = verdict
                     .rule
                     .as_deref()
@@ -2790,7 +2914,16 @@ async fn dispatch(
                 ));
             }
             let out = mcp
-                .call(name, &call.arguments, store, run_id, step, cap)
+                .call(
+                    name,
+                    &call.arguments,
+                    store,
+                    run_id,
+                    step,
+                    cap,
+                    watch,
+                    depth,
+                )
                 .await?;
             Dispatched::seen(
                 format!("called {name}"),
@@ -2837,6 +2970,8 @@ async fn gate(
     act: Act,
     target: &str,
     content: Option<&str>,
+    watch: &Watch<'_>,
+    depth: u32,
 ) -> Result<Gated> {
     let kind = format!("{act:?}").to_lowercase();
     // Read and write targets are workspace paths, and are resolved so a symlink
@@ -2868,6 +3003,7 @@ async fn gate(
                 ev.layer = layer;
             }
             store.record_event(run_id, &ev)?;
+            refused(watch, run_id, depth, &ev);
             let why = verdict
                 .rule
                 .as_deref()
@@ -2888,6 +3024,15 @@ async fn gate(
             if let Some(c) = content {
                 request = request.with_content(c);
             }
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::ApprovalRequested {
+                    act: kind.clone(),
+                    target: target.to_string(),
+                },
+            ));
             match approver.decide(&request).await {
                 Decision::Approve { modified, remember } => {
                     let performed = modified.unwrap_or_else(|| request.clone());
@@ -2898,6 +3043,9 @@ async fn gate(
                         ev.rule = recheck.rule.clone();
                         ev.layer = recheck.layer.clone();
                         store.record_event(run_id, &ev)?;
+                        // A refusal, not a decision: the row is a refusal too, and
+                        // the approval it overrode never took effect.
+                        refused(watch, run_id, depth, &ev);
                         return Ok(Gated::Refused {
                             decision: format!("{kind} refused after approval"),
                             obs: format!(
@@ -2911,6 +3059,7 @@ async fn gate(
                         ev = ev.with_performed(&performed.target);
                     }
                     store.record_event(run_id, &ev)?;
+                    decided(watch, run_id, depth, &ev);
                     Ok(Gated::Go {
                         target: performed.target,
                         content: performed.content,
@@ -2918,20 +3067,18 @@ async fn gate(
                     })
                 }
                 Decision::Deny { reason } => {
-                    store.record_event(
-                        run_id,
-                        &PolicyEvent::decision(step, &kind, target, "deny", "approver"),
-                    )?;
+                    let ev = PolicyEvent::decision(step, &kind, target, "deny", "approver");
+                    store.record_event(run_id, &ev)?;
+                    decided(watch, run_id, depth, &ev);
                     Ok(Gated::Refused {
                         decision: format!("{kind} denied"),
                         obs: format!("\n[{kind} denied] {target} — {reason}\n"),
                     })
                 }
                 Decision::Defer => {
-                    store.record_event(
-                        run_id,
-                        &PolicyEvent::decision(step, &kind, target, "defer", "approver"),
-                    )?;
+                    let ev = PolicyEvent::decision(step, &kind, target, "defer", "approver");
+                    store.record_event(run_id, &ev)?;
+                    decided(watch, run_id, depth, &ev);
                     let request_id = store.put_pending(run_id, step, &kind, target, content)?;
                     Ok(Gated::Paused { request_id })
                 }

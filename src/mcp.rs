@@ -33,8 +33,10 @@ use tracing::info;
 
 use crate::error::{Error, Result};
 use crate::net::{self, NetGuard};
+use crate::observe::{EventKind, RunEvent};
 use crate::policy::{Act, Effect, Policy};
 use crate::provider::ToolSpec;
+use crate::run::{refused, Watch};
 use crate::state::{McpEvent, PolicyEvent, Store};
 
 /// The prefix every MCP-provided tool name carries.
@@ -172,13 +174,14 @@ impl McpSession {
         policy: &Policy,
         store: &Store,
         run_id: i64,
+        watch: &Watch<'_>,
     ) -> Result<Self> {
         let mut connected = Vec::new();
         for server in servers {
             let started = Instant::now();
             let service = match &server.transport {
                 McpTransport::Stdio { command, args, env } => {
-                    authorize_spawn(command, policy, store, run_id)?;
+                    authorize_spawn(command, policy, store, run_id, watch)?;
                     let mut cmd = tokio::process::Command::new(command);
                     cmd.args(args);
                     for (k, v) in env {
@@ -244,17 +247,18 @@ impl McpSession {
                 })
                 .collect();
 
-            store.record_mcp(
-                run_id,
-                // `detail` carries the transport and nothing else — the tool
-                // count is already implied by the `discovered` events that
-                // follow, and overwriting it here would lose the one fact only
-                // this event records.
-                &McpEvent::connected(&server.id, transport_name(&server.transport))
-                    .with_millis(started.elapsed().as_millis() as u64),
-            )?;
+            // `detail` carries the transport and nothing else — the tool
+            // count is already implied by the `discovered` events that
+            // follow, and overwriting it here would lose the one fact only
+            // this event records.
+            let ev = McpEvent::connected(&server.id, transport_name(&server.transport))
+                .with_millis(started.elapsed().as_millis() as u64);
+            store.record_mcp(run_id, &ev)?;
+            announce(watch, run_id, 0, &ev);
             for t in &tools {
-                store.record_mcp(run_id, &McpEvent::discovered(&server.id, &t.name))?;
+                let ev = McpEvent::discovered(&server.id, &t.name);
+                store.record_mcp(run_id, &ev)?;
+                announce(watch, run_id, 0, &ev);
             }
             info!(server = %server.id, tools = tools.len(), "mcp server connected");
 
@@ -290,6 +294,7 @@ impl McpSession {
     /// things the *model* should react to rather than things that should end the
     /// run. That is the same choice the built-in tools already make for a bad
     /// regex or a refused path.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn call(
         &self,
         name: &str,
@@ -298,6 +303,8 @@ impl McpSession {
         run_id: i64,
         step: u32,
         cap: usize,
+        watch: &Watch<'_>,
+        depth: u32,
     ) -> Result<String> {
         let Some(server) = self
             .servers
@@ -336,24 +343,43 @@ impl McpSession {
         };
 
         let (text, truncated) = crate::tools::cap_result(text, cap);
-        store.record_mcp(
-            run_id,
-            &McpEvent::called(&server.id, name, ok)
-                .at_step(step)
-                .with_millis(millis)
-                .with_detail(if truncated { "truncated" } else { "" }),
-        )?;
+        let ev = McpEvent::called(&server.id, name, ok)
+            .at_step(step)
+            .with_millis(millis)
+            .with_detail(if truncated { "truncated" } else { "" });
+        store.record_mcp(run_id, &ev)?;
+        announce(watch, run_id, depth, &ev);
         Ok(text)
     }
 
     /// Close every connection. Best-effort: a server that already died needs no
     /// goodbye, and a shutdown failure must not mask the run's own outcome.
-    pub(crate) async fn shutdown(self, store: &Store, run_id: i64) {
+    pub(crate) async fn shutdown(self, store: &Store, run_id: i64, watch: &Watch<'_>) {
         for s in self.servers {
-            let _ = store.record_mcp(run_id, &McpEvent::disconnected(&s.id));
+            let ev = McpEvent::disconnected(&s.id);
+            let _ = store.record_mcp(run_id, &ev);
+            announce(watch, run_id, 0, &ev);
             let _ = s.service.cancel().await;
         }
     }
+}
+
+/// Announce one MCP row to the observer, built from the row itself so the event
+/// cannot report a server, tool, outcome or duration the `mcp_events` row does
+/// not. The row's own `step` is used — `0` for connect, discover and disconnect,
+/// which happen outside any step.
+fn announce(watch: &Watch<'_>, run_id: i64, depth: u32, e: &McpEvent) {
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        e.step,
+        depth,
+        EventKind::Mcp {
+            server: e.server.clone(),
+            tool: e.tool.clone(),
+            ok: e.ok,
+            millis: e.millis,
+        },
+    ));
 }
 
 /// Spawning a server binary is an exec, and the exec policy already governs it.
@@ -361,7 +387,13 @@ impl McpSession {
 /// `Ask` is refused rather than routed to a human: connecting happens before the
 /// run's first step, and a server is configuration the operator wrote, not an
 /// action the agent chose. Allow it in the policy or do not configure it.
-fn authorize_spawn(command: &str, policy: &Policy, store: &Store, run_id: i64) -> Result<()> {
+fn authorize_spawn(
+    command: &str,
+    policy: &Policy,
+    store: &Store,
+    run_id: i64,
+    watch: &Watch<'_>,
+) -> Result<()> {
     let verdict = policy.check(Act::Exec, command);
     let mut ev = if verdict.effect == Effect::Allow {
         PolicyEvent::decision(0, "exec", command, "allow", "policy")
@@ -374,6 +406,7 @@ fn authorize_spawn(command: &str, policy: &Policy, store: &Store, run_id: i64) -
     if verdict.effect == Effect::Allow {
         Ok(())
     } else {
+        refused(watch, run_id, 0, &ev);
         Err(Error::Refused {
             act: "exec".into(),
             target: command.to_string(),

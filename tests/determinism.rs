@@ -21,8 +21,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, Record, Replay, ToolCall};
-use io_harness::{run_with, ApproveAll, Policy, Provider, RunOutcome, Store, TaskContract,
-                 Verification};
+use io_harness::{
+    run_with, ApproveAll, Policy, Provider, RunOutcome, Store, TaskContract, Verification,
+};
 use serde_json::json;
 
 /// Writes a different file each turn, so the run makes real progress and its
@@ -228,12 +229,10 @@ fn the_comparison_fails_when_a_run_id_reappears_in_the_prompt() {
 /// miss.
 #[test]
 fn the_comparison_fails_when_children_are_composed_in_a_different_order() {
-    let spawn_order = trace_with_result(
-        "[child 2 \"ordered-0\" -> Success]\n[child 3 \"ordered-1\" -> Success]",
-    );
-    let completion_order = trace_with_result(
-        "[child 3 \"ordered-1\" -> Success]\n[child 2 \"ordered-0\" -> Success]",
-    );
+    let spawn_order =
+        trace_with_result("[child 2 \"ordered-0\" -> Success]\n[child 3 \"ordered-1\" -> Success]");
+    let completion_order =
+        trace_with_result("[child 3 \"ordered-1\" -> Success]\n[child 2 \"ordered-0\" -> Success]");
 
     assert_ne!(
         spawn_order, completion_order,
@@ -277,7 +276,11 @@ fn trace_with_result(result: &str) -> String {
     store
         .record(
             run,
-            &io_harness::StepRecord::new(1, "spawned", result).with_trace("p", "spawn_agent:{}", 10),
+            &io_harness::StepRecord::new(1, "spawned", result).with_trace(
+                "p",
+                "spawn_agent:{}",
+                10,
+            ),
         )
         .unwrap();
     store.canonical_trace(run).unwrap()
