@@ -12,10 +12,10 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 ## Capabilities
 
 - Task contract — goal, constraints, expected output, success criteria
-- Context construction — feed the model only relevant, current, trusted info
+- Context construction — feed the model only relevant, current, trusted info ✅ **v0.10**: per-turn assembly under a `ContextBudget`, superseded observations compacted, a read invalidated by a later write re-read
 - Tool layer — narrow, typed actions the agent invokes ✅ **v0.9** completes it: the public `Tool` trait, in-process and policy-governed
 - Orchestration loop — observe, reason, act, check, stop
-- State and memory — progress, intermediate results, decisions (rusqlite)
+- State and memory — progress, intermediate results, decisions (rusqlite) ✅ **v0.10** adds durable cross-run memory, keyed to the workspace
 - Verification layer — tests, schemas, read-backs confirm the task is done
 - Permissions and guardrails — what the agent may access, change, send, spend ✅ **v0.8** completes *send*: `Act::Net`, deny-by-default egress
 - Recovery and retry — retries, fallbacks, replanning, escalation
@@ -689,6 +689,85 @@ A **skill** is instructions with no execution of its own. A skill saying "run
 `rm -rf /`" is a sentence the model reads, and any action it then takes passes
 the same policy every other action does. Anything that should actually *do*
 something is a `Tool`, where the permission layer can see it.
+
+## Context and memory (v0.10)
+
+Through v0.9 the workspace loop kept one string, appended every tool result to
+it, and re-sent the whole thing verbatim every turn. Nothing bounded it, nothing
+dropped a read the agent had already replaced, and nothing noticed when a write
+made an earlier read wrong. A long run spent most of every request re-sending
+stale text: the token budget was enforced, it was just being spent on
+repetition.
+
+v0.10 assembles the prompt instead of accumulating it.
+
+```rust
+use io_harness::{context::ContextBudget, TaskContract, Verification};
+
+let contract = TaskContract::workspace("Refactor the parser.", &root, verify)
+    .with_token_budget(400_000)
+    // Absolute ceiling per request, and the share of the *unspent* token
+    // budget a request may carry of what the run has already observed.
+    .with_context_budget(ContextBudget { max_tokens: 24_000, share: 0.5 });
+```
+
+Each turn, under that budget:
+
+- **Superseded observations compact.** Two reads of one file, or two greps of
+  one pattern, are one answer. The later one is carried whole; the earlier
+  becomes a one-line stub naming the step that replaced it.
+- **A stale read is re-read, not trusted.** If the agent wrote to a file it read
+  earlier, the earlier read is refreshed at assembly time — through the same
+  policy and the same workspace containment as any other read. If the policy
+  refuses, or the path is gone, the entry becomes a stub naming the write that
+  invalidated it and why the refresh failed.
+- **Every observation is bounded where it enters the context**, with the elision
+  visible to the model so it can ask for the rest. One budget derives both the
+  request ceiling and the per-observation cap.
+- **The trace keeps everything.** `steps.result` records the full, unelided log.
+  Bounding what the model sees must never bound what an operator can audit.
+
+### Durable memory
+
+The agent can also record what it learned, keyed to the workspace rather than to
+the run, and get it back on a later run over the same workspace:
+
+```rust
+// The agent calls the built-in `remember` tool during a run; the operator reads
+// and clears what it wrote.
+for entry in store.memory_list(&workspace)? {
+    println!("{}: {}  (run {}, step {})", entry.key, entry.value, entry.run_id, entry.step);
+}
+store.memory_delete(&workspace, "build-command")?;
+store.memory_clear(&workspace)?;
+```
+
+Entries are attributed to the run and step that wrote them, capped in count and
+in total size with oldest-first eviction, and every write, eviction and recall is
+in the trace.
+
+### The limits, stated plainly
+
+Assembly **bounds** what a request carries and applies exactly the two staleness
+rules above. It does **not** promise the model sees everything relevant to the
+task: an observation older than the current window is a stub, and a stub the
+model does not act on is information it does not have. If your application needs
+a particular observation present, put it in the task contract, where it is not
+subject to elision.
+
+The token figure the assembler enforces against is an **estimate** — four chars
+per token, computed in-crate, no tokenizer dependency. The trace records that
+estimate beside the provider's own reported usage for the same request, so the
+drift is a number you can read rather than a claim. The default share leaves
+margin for it; a provider that rejects a request for context length is reported
+as such rather than retried identically.
+
+Memory entries are **agent-authored notes, not instructions**. A fact one run
+recorded is read by later runs over that workspace, so a wrong or planted note
+persists until someone removes it — which is why entries carry their origin, are
+rendered to the model as its own notes rather than as directives, and are
+listable and deletable through `Store`. An operator can always see and clear what
+the agent believes.
 
 ## Part of initorigin
 

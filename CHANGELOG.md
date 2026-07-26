@@ -26,6 +26,93 @@ notes are produced from it.
 
 ### Security
 
+## [0.10.0] - 2026-07-26
+
+The release that stops the prompt from growing. Through 0.9.1 the workspace loop
+kept a single string, appended every tool result to it, and re-sent the whole
+thing verbatim on every turn — so a twenty-step run spent most of each request
+re-sending text the agent had already acted on, and a file read at step 3 was
+still presented as current after being rewritten at step 7. The token budget was
+enforced; it was being spent on repetition.
+
+0.10.0 assembles what the model sees instead of accumulating it, and gives the
+agent memory that survives the run.
+
+Two of the twelve pillars close here: **context construction** and **state and
+memory**. Recovery and retry (0.11.0) and observability and evaluation (0.12.0)
+are the two that remain.
+
+### Added
+
+- **A context budget, and per-turn assembly under it.** The new `context` module
+  holds a `Ledger` of typed `Observation`s — history, never trimmed — and an
+  assembly step that decides per turn what of that history the request carries.
+  `TaskContract::with_context_budget(ContextBudget { max_tokens, share })` sets
+  the ceiling: an absolute per-request cap and a share of the token budget the
+  run has left, whichever is lower. One budget derives both that ceiling and the
+  per-observation cap, so they cannot drift apart.
+- **Compaction of superseded observations.** Two reads of one path, or two greps
+  of one pattern, are one answer: the later is carried whole, the earlier becomes
+  a one-line stub naming the step that replaced it. Supersession applies only
+  where the target *is* the subject of the answer — a registered or MCP tool
+  called twice with different arguments keeps both results, because the target
+  there is the tool's name.
+- **Re-read of an observation a later write invalidated.** A read whose path is
+  written later in the run is refreshed at assembly time, through the same policy
+  and the same workspace containment as any other read. A refusal or a missing
+  path becomes a stub naming the write that invalidated it and why the refresh
+  failed, and both outcomes are trace rows.
+- **Durable, workspace-keyed memory.** A built-in `remember` tool records a fact
+  or decision; a later run over the same workspace gets it back in its assembled
+  context, rendered as the agent's own notes rather than as instructions. On the
+  operator's side, `Store::memory_list`, `memory_get`, `memory_put`,
+  `memory_delete` and `memory_clear` list, read, write, remove and clear entries.
+  Every entry is attributed to the run and step that wrote it, and the set is
+  bounded by a count cap and a total-size cap with oldest-first eviction.
+- **Assembly is in the trace.** A new `context_events` table records, per turn,
+  how many observations were carried, stubbed and re-read, the estimated tokens
+  the assembler enforced against, and the provider's own reported usage for that
+  same request — so the estimator's drift is a recorded number rather than an
+  assumption. Memory writes, evictions and recalls are rows there too.
+
+### Changed
+
+- **Breaking (permitted pre-1.0): `TaskContract` gained a public field,
+  `context: ContextBudget`.** Code that builds the contract through
+  `TaskContract::new` or `TaskContract::workspace` — every documented path — is
+  unaffected. Code that built it with a struct literal must add
+  `context: ContextBudget::default()`, or move to the constructors. Nothing else
+  a 0.9.1 caller wrote changes: no public item was renamed or removed, a 0.9.1
+  store opens under 0.10.0, and a 0.9.1 checkpoint resumes — `CHECKPOINT_FORMAT`
+  is unchanged and both new tables are additive.
+- **`find` and `write_file` observations are bounded.** They had no cap at all;
+  one `find` over a large repository could exhaust a request on its own. Every
+  observation kind now enters the context under the same budget-derived cap, with
+  the elision visible to the model.
+- **`TOOL_RESULT_CAP`, `OBS_READ_CAP` and `OBS_GREP_CAP` are no longer
+  independent constants.** The size ceilings are derived from the context budget;
+  `OBS_GREP_CAP`'s 50-hit ceiling remains as what it always was — a relevance
+  choice, not a size one.
+- **The trace still records the whole log.** `steps.result` holds the full,
+  unelided observation text. Bounding what the model sees does not bound what an
+  operator can audit, and the two bounds are separate on purpose.
+- **The sub-agent loop and the single-file loop are bounded too.** 0.5.0's
+  concurrent children each assembled their own unbounded log, and the single-file
+  loop re-sent the entire current file every turn.
+
+### Security
+
+- **Memory is attributed, bounded, inspectable and clearable.** A fact one run
+  records is read by later runs over that workspace, which is the point and also
+  the risk: a wrong or planted note persists until it is removed. Entries carry
+  the run and step that wrote them, are rendered to the model as its own notes
+  rather than as directives, are capped in count and total size, and can be
+  listed and deleted through `Store`. The README states this limit plainly.
+- **Freshening a stale read is as contained as the read it replaces.** The
+  assembly-time re-read goes through the workspace's own path resolution and the
+  same `Act::Read` policy check, so it cannot reach a path the run itself may not
+  read, and `Ask` is treated as a refusal because assembly has no approver.
+
 ## [0.9.1] - 2026-07-26
 
 The first release verified on more than one operating system. 0.9.0 added the
