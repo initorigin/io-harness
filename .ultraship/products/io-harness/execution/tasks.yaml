@@ -372,6 +372,13 @@ tasks:
     recording never saw. Replay is not the cause. Fixing it means checkpointing the ledger, which this
     contract excludes. The test now pins the true boundary behaviour -- the replay reports divergence
     as a typed error rather than inventing an answer.'
+  - 'F10 RE-TESTED and it is PARTLY SATISFIED, which the first finding overstated. a_single_file_replay_does_survive_being_interrupted_and_resumed
+    passes: a recorded single-file case cut short and resumed reproduces the uninterrupted replay exactly,
+    with a freshly loaded Replay so the resume is treated as a new process. The single-file loop builds
+    its prompt from the file on disk (bound(&current, ...)), which survives the process. The divergence
+    is confined to the workspace and sub-agent loops, which assemble each turn from an in-memory ContextLedger
+    that a resume starts empty. So the true limitation is ''a resumed run whose prompt depends on accumulated
+    observations diverges'', NOT ''resume breaks replay''. Both halves are now pinned by a test.'
 - id: US-IO-HARNESS-0.12.0-T10
   summary: 'The per-run outcome record: an additive table written by `finish_run`, carrying whether the
     run succeeded, its step count, its token spend and its duration — the last requiring an end stamp,

@@ -3,21 +3,23 @@ version: 0.12.0
 execution_state: DEVELOPING
 checkpoint: null
 blockers:
-- US-IO-HARNESS-0.12.0-T09 / criterion F10 — BLOCKED, needs /ultraship:iterate. F10 requires that a recorded
-  case killed mid-run and resumed produces the same canonical trace as the uninterrupted replay. Implemented
-  and disproved. ContextLedger::new() (src/run.rs:1183 and :1758) builds the observation ledger in memory,
-  and 0.7.0's resume never restores it, so a resumed run re-assembles context from the workspace and sends
-  the model a prompt the recording never saw. The replay correctly refuses with a typed divergence error
-  rather than answering. Replay is not the cause and no replay design fixes it.
-- 'Why it is out of scope to fix here: Making a resumed run reproduce an uninterrupted one means checkpointing
-  the context ledger, which is context-assembly work. This contract''s excluded list names ''Any change
-  to the 0.10.0 assembler''s rules''.'
-- 'Consequence beyond replay: A resumed run is not the same run as an uninterrupted one. That matters
-  beyond replay: anything scoring long unattended runs, which are the runs most likely to be resumed,
-  is comparing something subtly different.'
-- 'Recommendation: Run /ultraship:iterate. Narrow F10 to uninterrupted replay plus the divergence-reporting
-  boundary the test now pins, and record the ledger limitation in known_limitations. Everything F10 does
-  not block is continuing.'
+- US-IO-HARNESS-0.12.0-T09 / criterion F10 — PARTLY MET, narrowed by re-testing. Still needs /ultraship:iterate,
+  but for a much smaller amendment than first reported.
+- 'What holds: a recorded SINGLE-FILE case interrupted and resumed reproduces the uninterrupted replay
+  exactly (tests/determinism.rs, a_single_file_replay_does_survive_being_interrupted_and_resumed, with
+  a freshly loaded Replay so the resume is the harder new-process case). That loop''s prompt comes from
+  the file on disk and survives the process.'
+- 'What does not: the workspace and sub-agent loops assemble each turn from an in-memory ContextLedger
+  (src/run.rs:1183, :1758) which 0.7.0''s resume never restores, so a resumed run there sends a prompt
+  the recording never saw. The replay refuses with a typed non-retryable error rather than inventing an
+  answer, which is pinned by a_resumed_replay_reports_divergence_rather_than_inventing_an_answer.'
+- My first report said resume breaks replay generally. That was too broad and I corrected it by testing
+  rather than by assuming.
+- Fixing the remaining half means checkpointing the context ledger, which this contract's excluded list
+  rules out as assembler work.
+- 'Recommendation: /ultraship:iterate to narrow F10 to ''a replay survives a resume wherever the prompt
+  does not depend on accumulated in-memory observations, and reports divergence rather than guessing where
+  it does'', and record the ledger limitation in known_limitations.'
 constraints:
   time: 'One working session, continuous. The owner asked for 0.12.0 to be planned, built and shipped
     in this session, as 0.10.0 and 0.11.0 both were before it. Stated this session as "commit constantly,

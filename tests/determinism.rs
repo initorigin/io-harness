@@ -357,3 +357,116 @@ async fn a_resumed_replay_reports_divergence_rather_than_inventing_an_answer() {
         "the error must name the divergence so it is debuggable, got: {rendered}"
     );
 }
+
+/// F10, for the loop where it actually holds: a single-file run interrupted and
+/// resumed DOES reproduce the uninterrupted replay.
+///
+/// The sibling test above shows a workspace run diverging across a resume. The
+/// cause is specific, not general: the workspace and sub-agent loops assemble each
+/// turn from an accumulating `ContextLedger` that lives only in memory, so a
+/// resume starts with an empty one. The single-file loop has no such ledger — its
+/// prompt is built from the file's current contents (`bound(&current, ...)`), which
+/// is on disk and survives the process.
+///
+/// So the limitation is "a resumed run whose prompt depends on accumulated
+/// observations", not "resume breaks replay". Worth pinning, because the narrower
+/// statement is the true one and the broad one would understate what works.
+#[tokio::test]
+async fn a_single_file_replay_does_survive_being_interrupted_and_resumed() {
+    let cassette = tempfile::tempdir().unwrap();
+    let path = cassette.path().join("single.json");
+
+    // A provider that appends one function per turn, so several steps are needed.
+    struct Grower {
+        at: AtomicUsize,
+    }
+    impl Provider for Grower {
+        fn name(&self) -> &str {
+            "grower"
+        }
+        async fn complete(
+            &self,
+            _req: CompletionRequest,
+        ) -> io_harness::Result<CompletionResponse> {
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            let mut body = String::new();
+            for n in 0..=i {
+                body.push_str(&format!("fn hello{n}() -> u32 {{ {n} }}\n"));
+            }
+            Ok(CompletionResponse {
+                tool_calls: vec![ToolCall {
+                    name: "write_file".into(),
+                    arguments: json!({ "content": body }),
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
+    let single = |dir: &std::path::Path| {
+        TaskContract::new(
+            "grow the file",
+            dir.join("a.rs"),
+            Verification::FileContains("fn hello2".into()),
+        )
+        .with_max_steps(4)
+    };
+
+    {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        let store = Store::memory().unwrap();
+        let provider = Record::new(Grower {
+            at: AtomicUsize::new(0),
+        });
+        let r = io_harness::run(&single(dir.path()), &provider, &store)
+            .await
+            .unwrap();
+        assert!(
+            matches!(r.outcome, RunOutcome::Success { .. }),
+            "the recorded run must succeed: {r:?}"
+        );
+        provider.save(&path).unwrap();
+    }
+
+    let straight = {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        let store = Store::memory().unwrap();
+        let p = Replay::load(&path).unwrap();
+        let r = io_harness::run(&single(dir.path()), &p, &store)
+            .await
+            .unwrap();
+        store.canonical_trace(r.run_id).unwrap()
+    };
+
+    let interrupted = {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "").unwrap();
+        let store = Store::memory().unwrap();
+
+        let p = Replay::load(&path).unwrap();
+        let cut = single(dir.path()).with_max_steps(1);
+        let first = io_harness::run(&cut, &p, &store).await.unwrap();
+        assert!(
+            matches!(first.outcome, RunOutcome::StepCapReached { .. }),
+            "the cap must cut it short: {first:?}"
+        );
+
+        // A fresh Replay: a real resume is a new process, which is the harder case.
+        let p2 = Replay::load(&path).unwrap();
+        let done = io_harness::resume(&single(dir.path()), &p2, &store, first.run_id)
+            .await
+            .unwrap();
+        assert!(
+            matches!(done.outcome, RunOutcome::Success { .. }),
+            "the resumed replay must finish: {done:?}"
+        );
+        store.canonical_trace(done.run_id).unwrap()
+    };
+
+    assert_eq!(
+        straight, interrupted,
+        "a single-file replay must survive an interruption"
+    );
+}
