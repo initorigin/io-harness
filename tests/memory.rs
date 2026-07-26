@@ -7,11 +7,7 @@
 //! tests (they need the private connection and the cap constants). These are the
 //! promises a caller sees: recall across runs, isolation, overwrite, forget.
 
-use io_harness::Store;
-
-/// Mirrors `state::MEMORY_MAX_ENTRIES`. Kept as a literal because the constant is
-/// not re-exported from the crate root yet.
-const MAX_ENTRIES: usize = 64;
+use io_harness::{Store, MEMORY_MAX_ENTRIES as MAX_ENTRIES};
 
 #[test]
 fn a_fact_written_by_one_run_is_readable_by_another() {
