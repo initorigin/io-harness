@@ -10,10 +10,14 @@ pub(crate) mod openai_wire;
 pub mod openrouter;
 
 pub mod fallback;
+pub mod record;
+pub mod replay;
 pub use anthropic::Anthropic;
 pub use fallback::Fallback;
 pub use openai::OpenAi;
 pub use openrouter::OpenRouter;
+pub use record::Record;
+pub use replay::Replay;
 
 use futures_util::StreamExt;
 
