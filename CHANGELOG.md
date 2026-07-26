@@ -26,6 +26,107 @@ notes are produced from it.
 
 ### Security
 
+## [0.11.0] - 2026-07-26
+
+The release that lets a long unattended run survive a bad afternoon at a
+provider. 0.7.0 made a run survive a crash; it did nothing for a rate limit, a
+rolling deploy, a 503, or a hung socket — and the audit for this release found
+three of those were worse than assumed rather than merely unhandled.
+
+Recovery and retry is the eleventh of the twelve pillars to close. Only
+observability and evaluation (0.12.0) remains.
+
+### Added
+
+- **Provider failures carry a kind.** `ProviderErrorKind` — `Transport`,
+  `Timeout`, `RateLimited`, `Server`, `Auth`, `Request`, `Malformed` — with
+  `is_retryable()`, the HTTP status preserved rather than formatted into prose,
+  and the server's `Retry-After` kept when it sent one (delta-seconds or an
+  HTTP-date; an unparseable value degrades to "no hint", never to a wrong wait).
+- **Retry waits, and only for what is worth waiting on.** `RetryPolicy` doubles
+  the delay per attempt to a ceiling, honours `Retry-After` above that ceiling
+  because the server knows its own limit better than a default does, and refuses
+  to sleep past the run's time budget — waiting is not a way to escape a limit.
+  An `Auth` failure now escalates on its first occurrence.
+- **A request deadline.** `net::http_client()` sets a request timeout, and
+  `http_client_with_timeout` overrides it. The default is 600s: chosen from the
+  slow end of the legitimate side, since a full 8192-token stream at a sluggish
+  15 tokens/second is about nine minutes, and killing a real completion is worse
+  than one hung socket costing ten minutes once.
+- **Provider fallback.** `Fallback::new(primary, secondary)` is itself a
+  `Provider`, so every existing entry point takes it unchanged, and it nests for
+  three. It falls through only on a failure another provider might not have — a
+  wrong key is not more valid at a different vendor. Which provider actually
+  served a step is recorded per step, since one label for a whole run stops being
+  true the moment a run can use two.
+- **`Provider::endpoints()`**, defaulted to whatever `endpoint()` reports. This
+  is what authorization uses, and it exists because a combinator reporting only
+  its primary's host would let a fallback dial the secondary's host without the
+  deny-by-default egress policy ever seeing it.
+- **Stall detection and one bounded replan.** `StallPolicy` decides when an agent
+  has stopped getting anywhere: `window` consecutive steps that change nothing in
+  the workspace AND repeat a tool call the window already saw. On the first stall
+  the agent is told, in its context, what it already tried; if it stalls again the
+  run ends as `RunOutcome::Stalled` rather than spending the rest of its budget.
+  `StallPolicy { window: 0, .. }` disables detection entirely.
+- **`Wrote`**, returned by `Workspace::write_file` and `FsTool::write`:
+  `Created`, `Changed`, or `Unchanged`. Content is compared, never metadata, so a
+  same-length different-content write is `Changed`.
+- **`RunOutcome::Escalated { steps, retryable }`**, so a caller learns whether
+  what ended the run was survivable.
+- **Trace rows** for every retry (naming the kind and the delay), every stall and
+  replan, and the provider that served a step.
+
+### Changed
+
+- **Breaking (permitted pre-1.0): `Error::Provider(String)` is now a struct
+  variant** — `{ kind, status, retry_after, message }`. Every `match` on it
+  breaks. Constructing one: `Error::provider_transport(msg)`,
+  `Error::provider_status(status, retry_after, msg)`,
+  `Error::provider_malformed(msg)`, or `Error::provider(kind, msg)`. Matching
+  one: bind the fields you need and branch on `kind`. The rendered `Display` text
+  now names the kind and the status.
+- **Breaking (permitted pre-1.0): `Workspace::write_file` and `FsTool::write`
+  return `Result<Wrote>`** instead of `Result<()>`. `write_file(..)?;`,
+  `let _ = ..`, `.is_ok()` and `.unwrap()` are all unaffected; only an explicit
+  `Ok(())` pattern or a `Result<()>` annotation needs changing.
+- **A malformed response is an error rather than a shrug.** A stream that
+  produced no text, no tool call and no usage is `ProviderErrorKind::Malformed`.
+  It used to return `Ok` with an empty response, which the loops read as "the
+  model chose not to call a tool" — so a garbage response spent a step, was never
+  retried, and was invisible in the trace. A response that parses and legitimately
+  contains no tool call keeps its previous meaning exactly.
+- **A retry trace row names what it retried and how long it waited**, where it
+  used to say only `retry N after error`.
+
+### Fixed
+
+- **An escalated run is no longer silently restarted by the next resume.**
+  `"escalated"` was absent from `terminal_outcome` and `finish_run` filed it as a
+  plain completion, so `resume` found no terminal outcome and fell straight back
+  into the loop — an unattended run that escalated at 3am was re-run by whatever
+  resumed it. It now reports `RunOutcome::Escalated`, and the retryable and
+  terminal cases are recorded distinctly so a resume, a trace reader and the
+  caller all reach the same conclusion.
+- **A hung provider no longer hangs a run forever.** With no request timeout, a
+  server that accepted a connection and then stopped writing produced no step, so
+  0.7.0's checkpointing never fired, the time budget — checked only at the top of
+  a step — was never reached, and the 0.5.0 ledger saw no draw. The run was simply
+  gone, with no remedy but killing the process.
+
+### Security
+
+- **A fallback cannot reach an unauthorized host.** Provider authorization now
+  checks every endpoint in the chain before the run's first step, not just the
+  first one, so the 0.8.0 deny-by-default egress policy governs a secondary
+  provider exactly as it governs a primary.
+- **Fallback does not promise equivalence.** Falling over swaps the model
+  mid-run, and the harness cannot see whether the replacement is as capable or
+  even the same size. An operator configuring two providers should expect a run
+  that fell over may behave differently from one that did not, which is why the
+  provider that answered is recorded per step rather than inferred from
+  configuration.
+
 ## [0.10.0] - 2026-07-26
 
 The release that stops the prompt from growing. Through 0.9.1 the workspace loop
