@@ -16,6 +16,23 @@ notes are produced from it.
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.12.0] - 2026-07-27
+
+The twelfth and last of the twelve pillars: observability and evaluation. The
+harness is now what it was defined to be.
+
+### Added
+
 - **Watch a run while it happens.** `Observer` is called as the run proceeds —
   steps, tool calls, refusals, approvals, spend draws, retries, fallbacks,
   stalls, spawns, memory writes, sandbox events, MCP calls and the outcome.
