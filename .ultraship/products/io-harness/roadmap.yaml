@@ -1,5 +1,8 @@
 product: io-harness
 status: active
+# Versioning policy: io-harness stays on 0.x.x. Every planned version is an incremental
+# 0.MINOR.PATCH bump. 1.0.0 is not on this roadmap and must not be added to it — the product
+# owner declares when the crate goes 1.0, and only then is a 1.0.0 entry planned.
 versions:
   - version: 0.1.0
     outcome: >
@@ -127,10 +130,13 @@ versions:
       control rather than loose file edits.
     detail: hypothesis
     status: planned
-  - version: 1.0.0
+  - version: 0.12.0
     outcome: >
-      A developer depends on io-harness under a stable public contract: the crate API is frozen for
-      1.x, every public item is documented with a worked example, and the SemVer promise the product
-      claims is one an external Rust developer can actually rely on.
+      A developer depends on io-harness under a public contract that is documented rather than
+      frozen: every public item carries a worked example, each breaking change between 0.x minors is
+      called out in the changelog with a migration note, and renamed or removed items go through a
+      deprecation cycle instead of vanishing. The crate stays pre-1.0, so a minor may still break —
+      what an external Rust developer can rely on is that the break is documented and survivable,
+      not that it will not happen.
     detail: hypothesis
     status: planned
