@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.8.1"
+version = "0.9.0"
 edition = "2021"
 # 0.8.0 raises the floor: rmcp's child-process transport pulls process-wrap (1.87)
 # and reqwest 0.13 requires 1.85. Declaring the old 1.75 would be a false claim.
