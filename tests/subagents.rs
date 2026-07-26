@@ -720,3 +720,109 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
         "OK"
     );
 }
+
+/// A provider that takes real wall-clock time per call and never finishes the
+/// task, so only a limit can stop it.
+struct Slow {
+    per_call: std::time::Duration,
+}
+
+impl Provider for Slow {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        tokio::time::sleep(self.per_call).await;
+        Ok(CompletionResponse::default())
+    }
+}
+
+/// F16 — a tree halts on its duration ceiling.
+///
+/// `Containment::max_total_duration` was declared in 0.5.0 and never read, so a
+/// caller could bound a 24-hour tree's wall-clock and have it silently ignored.
+/// The step cap was the only thing that ever stopped this run.
+///
+/// The provider sleeps longer than the whole ceiling, so the crossing is not a
+/// race: whatever the machine's speed, the first step overruns it. The
+/// assertions are therefore a loose upper bound on steps and never a duration.
+#[tokio::test]
+async fn a_tree_halts_on_its_duration_ceiling_instead_of_ignoring_it() {
+    let dir = ws();
+    let mut containment = Containment::new(10, 1, 3, 1_000_000);
+    containment.max_total_duration = Some(std::time::Duration::from_millis(200));
+
+    let contract = TaskContract::workspace(
+        "Run until something stops you.",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "never.txt".into(),
+            needle: "never".into(),
+        },
+    )
+    .with_max_steps(20);
+
+    let provider = Slow {
+        per_call: std::time::Duration::from_millis(400),
+    };
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment,
+    )
+    .await
+    .unwrap();
+
+    let steps = match result.outcome {
+        RunOutcome::BudgetCeilingReached { steps } => steps,
+        other => panic!("expected the duration ceiling to halt the tree, got {other:?}"),
+    };
+    assert!(
+        steps < 20,
+        "the ceiling must stop the tree well short of its step cap, stopped at {steps}"
+    );
+}
+
+/// The ceiling is opt-in: with none set, the same run reaches its step cap as it
+/// always did. A limit that changes an unbounded run's behaviour is a regression
+/// however correct it is when asked for.
+#[tokio::test]
+async fn a_tree_with_no_duration_ceiling_is_unaffected() {
+    let dir = ws();
+    let containment = Containment::new(10, 1, 3, 1_000_000);
+    assert!(containment.max_total_duration.is_none());
+
+    let contract = TaskContract::workspace(
+        "Run until something stops you.",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "never.txt".into(),
+            needle: "never".into(),
+        },
+    )
+    .with_max_steps(3);
+
+    let provider = Slow {
+        per_call: std::time::Duration::from_millis(50),
+    };
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(result.outcome, RunOutcome::StepCapReached { steps: 3 }),
+        "got {:?}",
+        result.outcome
+    );
+}

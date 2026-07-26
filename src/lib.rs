@@ -234,6 +234,11 @@ pub use context::ContextBudget;
 pub use contract::TaskContract;
 pub use error::{Error, ProviderErrorKind, Result};
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
+// The `net` module itself stays private, so the default request deadline is
+// surfaced here as well as from each provider module. A caller overriding it with
+// `with_timeout` should be able to name the value they are overriding without
+// reaching into a provider's namespace to find it.
+pub use net::REQUEST_TIMEOUT;
 pub use policy::{Act, Effect, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,

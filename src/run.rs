@@ -529,6 +529,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
                 ledger,
                 containment,
                 root,
+                root_run_id: run_id,
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
             mcp.shutdown(store, run_id).await;
@@ -603,6 +604,7 @@ pub async fn resume_tree_with_decision<P: Provider>(
                 ledger,
                 containment,
                 root,
+                root_run_id: run_id,
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
             mcp.shutdown(store, run_id).await;
@@ -1114,6 +1116,12 @@ struct Tree<'a, P: Provider> {
     ledger: Arc<Ledger>,
     containment: &'a Containment,
     root: PathBuf,
+    /// The tree root's run id, so `Containment::max_total_duration` can be
+    /// measured against when the TREE started rather than when this agent did.
+    /// A child spawned twenty hours into a run has its own young `started_at`;
+    /// the ceiling is about the whole tree, so the root's stamp is the only
+    /// correct clock. Held here because [`Ledger`] has no store access.
+    root_run_id: i64,
 }
 
 /// Run a workspace contract as the root of an agent tree under `containment`.
@@ -1170,6 +1178,7 @@ pub async fn run_tree<P: Provider>(
         ledger,
         containment,
         root,
+        root_run_id: run_id,
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await;
     mcp.shutdown(store, run_id).await;
@@ -1248,6 +1257,7 @@ pub async fn resume_tree<P: Provider>(
         ledger,
         containment,
         root,
+        root_run_id: run_id,
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await;
     mcp.shutdown(store, run_id).await;
@@ -1531,6 +1541,24 @@ fn run_agent<'f, P: Provider>(
             if draw == Draw::Halted {
                 tree.store.finish_run(run_id, "budget_ceiling_reached")?;
                 return Ok(RunOutcome::BudgetCeilingReached { steps: step });
+            }
+            // The tree's wall-clock ceiling, measured from the ROOT's `started_at`
+            // rather than this agent's: a child spawned twenty hours in has a young
+            // stamp of its own, and the ceiling is about the whole tree. Checked
+            // beside the token draw because both are the same kind of limit — one a
+            // contract cannot raise, crossing which halts the tree rather than the
+            // agent that noticed.
+            //
+            // `max_total_duration` has existed on `Containment` since 0.5.0 and was
+            // never read, so a caller could set a ceiling on a 24-hour tree and have
+            // it silently ignored. Enforced in 0.12.0. Its sibling `max_total_cost`
+            // still cannot be: there is no price telemetry to compare against.
+            if let Some(max) = tree.containment.max_total_duration {
+                if tree.store.elapsed_secs(tree.root_run_id)? > max.as_secs_f64() {
+                    tree.store.finish_run(run_id, "budget_ceiling_reached")?;
+                    info!(run_id, depth, step, "tree stopped: duration ceiling");
+                    return Ok(RunOutcome::BudgetCeilingReached { steps: step });
+                }
             }
             // This agent's own contract budget (never looser than the tree's).
             if tokens_used > token_cap {

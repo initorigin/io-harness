@@ -34,8 +34,26 @@ pub struct Containment {
     /// Optional aggregate cost ceiling, in whatever unit the caller supplies
     /// (there is no price telemetry, so the crate never derives this itself).
     #[serde(default)]
+    /// **Reserved, and not enforced.** Setting it has no effect.
+    ///
+    /// Enforcing a cost ceiling needs a price per token, and the crate has no
+    /// price telemetry — a provider reports tokens, never money, so any figure
+    /// the harness compared against would be one it invented. The field is kept
+    /// rather than removed because it serialises in callers' stored configuration
+    /// and deleting it would break their deserialisation for no gain; it is
+    /// documented as inert instead, which is the honest state.
+    ///
+    /// Spend that *is* enforced is [`Self::max_total_tokens`]. To bound money,
+    /// convert your budget to tokens at your provider's rate and set that.
     pub max_total_cost: Option<u64>,
-    /// Optional wall-clock ceiling for the whole tree.
+    /// Optional wall-clock ceiling for the whole tree, measured from when the
+    /// ROOT run started — so it counts a 24-hour tree's whole life, including
+    /// time the process was down, not the age of whichever agent notices.
+    ///
+    /// Crossing it halts the tree with
+    /// [`RunOutcome::BudgetCeilingReached`](crate::RunOutcome::BudgetCeilingReached),
+    /// the same way the token ceiling does, and a child's own contract cannot
+    /// raise it. Declared in 0.5.0 and not actually enforced until 0.12.0.
     #[serde(default)]
     pub max_total_duration: Option<Duration>,
 }
