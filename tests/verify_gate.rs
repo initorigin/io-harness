@@ -62,7 +62,10 @@ async fn a_subject_shadowing_assert_cannot_pass_an_impossible_gate() {
 #[tokio::test]
 async fn a_workspace_subject_shadowing_assert_cannot_pass_an_impossible_gate() {
     let passed = workspace(
-        &[("shadow.rs", SHADOWS_ASSERT), ("other.rs", "pub fn other() {}\n")],
+        &[
+            ("shadow.rs", SHADOWS_ASSERT),
+            ("other.rs", "pub fn other() {}\n"),
+        ],
         IMPOSSIBLE,
     )
     .await;
@@ -104,7 +107,10 @@ async fn a_subject_cannot_delete_the_criterion_with_a_crate_level_cfg() {
          exited 0, so the gate reported a pass"
     );
     let passed = workspace(&[("cfg.rs", subject)], IMPOSSIBLE).await;
-    assert!(!passed, "the same crate-level cfg defeated the workspace gate");
+    assert!(
+        !passed,
+        "the same crate-level cfg defeated the workspace gate"
+    );
 }
 
 /// F9 — the compile-only gates cannot be defeated by a subject that deletes
@@ -128,7 +134,9 @@ async fn a_compile_gate_rejects_a_subject_that_deletes_its_own_items() {
     );
 
     let dir = tempfile::tempdir().unwrap();
-    tokio::fs::write(dir.path().join("a.rs"), deletes_itself).await.unwrap();
+    tokio::fs::write(dir.path().join("a.rs"), deletes_itself)
+        .await
+        .unwrap();
     assert!(
         !Verification::EachCompilesRust(vec![PathBuf::from("a.rs")])
             .passes_in(dir.path())
@@ -149,13 +157,19 @@ async fn an_honest_file_still_passes_the_compile_gates() {
         .unwrap());
 
     let dir = tempfile::tempdir().unwrap();
-    tokio::fs::write(dir.path().join("a.rs"), good).await.unwrap();
-    tokio::fs::write(dir.path().join("b.rs"), "pub fn b() -> u32 { 1 }\n").await.unwrap();
+    tokio::fs::write(dir.path().join("a.rs"), good)
+        .await
+        .unwrap();
+    tokio::fs::write(dir.path().join("b.rs"), "pub fn b() -> u32 { 1 }\n")
+        .await
+        .unwrap();
     let each = Verification::EachCompilesRust(vec![PathBuf::from("a.rs"), PathBuf::from("b.rs")]);
     assert!(each.passes_in(dir.path()).await.unwrap());
 
     // And one broken file still fails the whole set.
-    tokio::fs::write(dir.path().join("b.rs"), "pub fn b").await.unwrap();
+    tokio::fs::write(dir.path().join("b.rs"), "pub fn b")
+        .await
+        .unwrap();
     assert!(!each.passes_in(dir.path()).await.unwrap());
 
     // A *legitimate* crate-level attribute must keep working. This is why the
@@ -192,7 +206,9 @@ async fn a_private_implementation_still_passes_the_gate() {
 
     // Private items reach a workspace criterion the same way.
     let dir = tempfile::tempdir().unwrap();
-    tokio::fs::write(dir.path().join("a.rs"), "fn a() -> u32 { 42 }\n").await.unwrap();
+    tokio::fs::write(dir.path().join("a.rs"), "fn a() -> u32 { 42 }\n")
+        .await
+        .unwrap();
     assert!(
         Verification::WorkspaceTestPasses {
             files: vec![PathBuf::from("a.rs")],
@@ -231,7 +247,10 @@ async fn an_honest_workspace_still_passes_across_files() {
         "#[test] fn t() { assert_eq!(a() + b(), 42); }",
     )
     .await;
-    assert!(passed, "a correct multi-file implementation failed the hardened gate");
+    assert!(
+        passed,
+        "a correct multi-file implementation failed the hardened gate"
+    );
 }
 
 /// NF1 — the hardening added a compiler spawn; it did not add an *unchecked*
@@ -312,12 +331,18 @@ async fn the_trace_distinguishes_a_closed_bypass_from_an_ordinary_failure() {
     // The blocked shadow: re-importing the prelude macros explicitly makes the
     // subject's `assert` ambiguous (E0659) rather than authoritative, so the
     // criterion does not compile beside it.
-    assert_eq!(phase_of(SHADOWS_ASSERT, IMPOSSIBLE).await, vec!["criterion-compile"]);
+    assert_eq!(
+        phase_of(SHADOWS_ASSERT, IMPOSSIBLE).await,
+        vec!["criterion-compile"]
+    );
 
     // An ordinary failure: everything compiled, the test ran and failed.
     assert_eq!(
-        phase_of("pub fn hello() -> u32 { 41 }\n", "#[test] fn t() { assert_eq!(hello(), 42); }")
-            .await,
+        phase_of(
+            "pub fn hello() -> u32 { 41 }\n",
+            "#[test] fn t() { assert_eq!(hello(), 42); }"
+        )
+        .await,
         vec!["test-run"],
     );
 
@@ -374,7 +399,11 @@ async fn a_macro_the_subject_legitimately_exports_still_reaches_the_criterion() 
 pub fn hello() -> u32 { 42 }
 "#;
     assert!(
-        single("#[test] fn t() { assert_eq!(answer!(), hello()); }", subject).await,
+        single(
+            "#[test] fn t() { assert_eq!(answer!(), hello()); }",
+            subject
+        )
+        .await,
         "the subject's own exported macro was not visible to the criterion — the fix over-reached \
          and changed what a caller may write in test_src"
     );

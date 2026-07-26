@@ -31,7 +31,10 @@ impl Provider for Working {
                 name: "write_file".into(),
                 arguments: json!({ "content": "WORKING\n" }),
             }],
-            usage: Some(Usage { total_tokens: 10, ..Default::default() }),
+            usage: Some(Usage {
+                total_tokens: 10,
+                ..Default::default()
+            }),
             ..Default::default()
         })
     }

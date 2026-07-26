@@ -149,10 +149,7 @@ mod tests {
     async fn built_in_approvers_decide_as_advertised() {
         let req = Request::new(Act::Write, "src/a.rs");
         assert_eq!(ApproveAll.decide(&req).await, Decision::approve());
-        assert!(matches!(
-            DenyAll.decide(&req).await,
-            Decision::Deny { .. }
-        ));
+        assert!(matches!(DenyAll.decide(&req).await, Decision::Deny { .. }));
     }
 
     /// io-studio's shape: an approver that is not a terminal, held behind a

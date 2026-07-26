@@ -60,13 +60,21 @@ mod tests {
     #[test]
     fn denies_network_with_a_new_net_namespace() {
         let argv = unshare_argv(&["echo".into(), "hi".into()], false);
-        assert!(argv.contains(&"--net".into()), "net namespace must isolate network by default");
-        assert!(argv.windows(2).any(|w| w == ["--".to_string(), "echo".to_string()]));
+        assert!(
+            argv.contains(&"--net".into()),
+            "net namespace must isolate network by default"
+        );
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--".to_string(), "echo".to_string()]));
     }
 
     #[test]
     fn allows_network_when_asked() {
         let argv = unshare_argv(&["echo".into()], true);
-        assert!(!argv.contains(&"--net".into()), "no net namespace when network is allowed");
+        assert!(
+            !argv.contains(&"--net".into()),
+            "no net namespace when network is allowed"
+        );
     }
 }

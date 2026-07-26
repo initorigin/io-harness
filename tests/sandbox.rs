@@ -25,7 +25,11 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
     let native = select(&SandboxConfig::new());
     #[cfg(target_os = "macos")]
     assert_eq!(native.backend(), Backend::MacosSandboxExec);
-    assert_ne!(native.backend(), Backend::PortableFloor, "default must be native, not the floor");
+    assert_ne!(
+        native.backend(),
+        Backend::PortableFloor,
+        "default must be native, not the floor"
+    );
 
     // ...and forcing the floor selects the portable backend, recorded so the
     // selection ladder is observable.
@@ -41,7 +45,10 @@ async fn sandbox_on_reaches_the_same_verified_success_as_direct() {
 
     // Sandbox on (the 0.6.0 default): real code passes, a substring stub fails.
     let on = ExecGuard::new(&policy);
-    assert!(Verification::CompilesRust.passes_guarded(Path::new("x.rs"), good(), &on).await.unwrap());
+    assert!(Verification::CompilesRust
+        .passes_guarded(Path::new("x.rs"), good(), &on)
+        .await
+        .unwrap());
     assert!(!Verification::CompilesRust
         .passes_guarded(Path::new("x.rs"), "fn hello", &on)
         .await
@@ -49,7 +56,10 @@ async fn sandbox_on_reaches_the_same_verified_success_as_direct() {
 
     // Sandbox opted off: the exact 0.5.0 direct-host path, same verdicts.
     let off = ExecGuard::new(&policy).no_sandbox();
-    assert!(Verification::CompilesRust.passes_guarded(Path::new("x.rs"), good(), &off).await.unwrap());
+    assert!(Verification::CompilesRust
+        .passes_guarded(Path::new("x.rs"), good(), &off)
+        .await
+        .unwrap());
     assert!(!Verification::CompilesRust
         .passes_guarded(Path::new("x.rs"), "fn hello", &off)
         .await
@@ -63,11 +73,17 @@ async fn sandbox_on_runs_the_produced_test_binary_transparently() {
     let ok = Verification::RustTestPasses {
         test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
     };
-    assert!(ok.passes_guarded(Path::new("x.rs"), good(), &guard).await.unwrap());
+    assert!(ok
+        .passes_guarded(Path::new("x.rs"), good(), &guard)
+        .await
+        .unwrap());
     let bad = Verification::RustTestPasses {
         test_src: "#[test] fn t() { assert_eq!(hello(), 41); }".into(),
     };
-    assert!(!bad.passes_guarded(Path::new("x.rs"), good(), &guard).await.unwrap());
+    assert!(!bad
+        .passes_guarded(Path::new("x.rs"), good(), &guard)
+        .await
+        .unwrap());
 }
 
 // --- default-deny network, enforced by the sandbox not the prompt -----------
@@ -91,7 +107,10 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         })
         .await
         .unwrap();
-    assert!(!out.success(), "network must be denied by default, got {out:?}");
+    assert!(
+        !out.success(),
+        "network must be denied by default, got {out:?}"
+    );
 }
 
 // --- teardown leaves nothing behind -----------------------------------------
@@ -155,10 +174,16 @@ async fn a_cap_hit_in_the_gate_is_recorded() {
     // record it and report failure, not hang.
     let policy = Policy::default();
     let cfg = SandboxConfig {
-        limits: SandboxLimits { max_cpu_secs: Some(0), max_wall_secs: Some(30), ..Default::default() },
+        limits: SandboxLimits {
+            max_cpu_secs: Some(0),
+            max_wall_secs: Some(30),
+            ..Default::default()
+        },
         ..Default::default()
     };
-    let guard = ExecGuard::new(&policy).sandboxed(cfg).tracing(&store, run, 1);
+    let guard = ExecGuard::new(&policy)
+        .sandboxed(cfg)
+        .tracing(&store, run, 1);
     let passed = Verification::CompilesRust
         .passes_guarded(Path::new("x.rs"), good(), &guard)
         .await

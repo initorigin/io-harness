@@ -29,16 +29,32 @@ struct Script {
 }
 impl Script {
     fn new(writes: Vec<(&str, u64)>) -> Self {
-        Self { writes: writes.into_iter().map(|(c, t)| (c.to_string(), t)).collect(), at: AtomicUsize::new(0) }
+        Self {
+            writes: writes
+                .into_iter()
+                .map(|(c, t)| (c.to_string(), t))
+                .collect(),
+            at: AtomicUsize::new(0),
+        }
     }
 }
 impl Provider for Script {
     async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
         let i = self.at.fetch_add(1, Ordering::SeqCst);
-        let (content, tokens) = self.writes.get(i).cloned().unwrap_or(("WORKING\n".into(), 1));
+        let (content, tokens) = self
+            .writes
+            .get(i)
+            .cloned()
+            .unwrap_or(("WORKING\n".into(), 1));
         Ok(CompletionResponse {
-            tool_calls: vec![ToolCall { name: "write_file".into(), arguments: json!({ "content": content }) }],
-            usage: Some(Usage { total_tokens: tokens, ..Default::default() }),
+            tool_calls: vec![ToolCall {
+                name: "write_file".into(),
+                arguments: json!({ "content": content }),
+            }],
+            usage: Some(Usage {
+                total_tokens: tokens,
+                ..Default::default()
+            }),
             ..Default::default()
         })
     }
@@ -68,13 +84,26 @@ impl Provider for TreeProvider {
                 tokio::time::sleep(self.child_delay).await;
             }
             let rest = &req.user[idx + 5..];
-            let file = rest.split_whitespace().next().unwrap_or("x.txt").to_string();
+            let file = rest
+                .split_whitespace()
+                .next()
+                .unwrap_or("x.txt")
+                .to_string();
             let content = rest
                 .find("CONTENT=")
-                .map(|c| rest[c + 8..].split_whitespace().next().unwrap_or("").to_string())
+                .map(|c| {
+                    rest[c + 8..]
+                        .split_whitespace()
+                        .next()
+                        .unwrap_or("")
+                        .to_string()
+                })
                 .unwrap_or_default();
             return Ok(CompletionResponse {
-                tool_calls: vec![call("write_file", json!({ "path": file, "content": content }))],
+                tool_calls: vec![call(
+                    "write_file",
+                    json!({ "path": file, "content": content }),
+                )],
                 ..Default::default()
             });
         }
@@ -83,10 +112,16 @@ impl Provider for TreeProvider {
 }
 
 fn call(name: &str, args: serde_json::Value) -> ToolCall {
-    ToolCall { name: name.into(), arguments: args }
+    ToolCall {
+        name: name.into(),
+        arguments: args,
+    }
 }
 fn spawn(goal: &str, file: &str, needle: &str) -> ToolCall {
-    call("spawn_agent", json!({ "goal": goal, "verify_file": file, "verify_contains": needle }))
+    call(
+        "spawn_agent",
+        json!({ "goal": goal, "verify_file": file, "verify_contains": needle }),
+    )
 }
 
 /// Approver that always defers (for the pause-across-restart test).
@@ -104,7 +139,10 @@ fn tree_contract(root: &std::path::Path) -> TaskContract {
     TaskContract::workspace(
         "COORDINATOR: delegate to sub-agents; do not write files yourself.",
         root,
-        Verification::WorkspaceFileContains { file: "b.txt".into(), needle: "BETA".into() },
+        Verification::WorkspaceFileContains {
+            file: "b.txt".into(),
+            needle: "BETA".into(),
+        },
     )
 }
 fn containment() -> Containment {
@@ -132,7 +170,9 @@ async fn crash_resume_after_a_real_sigkill_reaches_verified_success() {
     if !bin.exists() {
         // The example must be built for this test. `cargo test` builds examples,
         // but guard so a bare `cargo test --test checkpoint` fails loudly, not weirdly.
-        panic!("crash_fixture example not built at {bin:?} — run `cargo test` (which builds examples)");
+        panic!(
+            "crash_fixture example not built at {bin:?} — run `cargo test` (which builds examples)"
+        );
     }
     let dir = ws();
     let db = dir.path().join("runs.db");
@@ -159,28 +199,42 @@ async fn crash_resume_after_a_real_sigkill_reaches_verified_success() {
             }
         }
     }
-    assert!(committed >= 3, "fixture did not commit steps before kill (got {committed})");
+    assert!(
+        committed >= 3,
+        "fixture did not commit steps before kill (got {committed})"
+    );
     child.kill().await.expect("SIGKILL the fixture"); // tokio Child::kill is SIGKILL on unix
 
     // A fresh process (this one) resumes the same store to a verified result.
     let store = Store::open(&db).unwrap();
     let before = store.last_step(1).unwrap();
-    let contract =
-        TaskContract::new("write SOLUTION-DONE", &file, Verification::FileContains("SOLUTION-DONE".into()))
-            .with_max_steps(1000);
+    let contract = TaskContract::new(
+        "write SOLUTION-DONE",
+        &file,
+        Verification::FileContains("SOLUTION-DONE".into()),
+    )
+    .with_max_steps(1000);
     let finisher = Script::new(vec![("SOLUTION-DONE\n", 10)]);
     let r = resume(&contract, &finisher, &store, 1).await.unwrap();
 
     assert!(matches!(r.outcome, RunOutcome::Success { steps } if steps > before));
     // The edit is present exactly once (write overwrites; replay cannot double it).
     let out = std::fs::read_to_string(&file).unwrap();
-    assert_eq!(out.matches("SOLUTION-DONE").count(), 1, "edit applied exactly once");
+    assert_eq!(
+        out.matches("SOLUTION-DONE").count(),
+        1,
+        "edit applied exactly once"
+    );
     // Committed steps were not re-run: the trace has no duplicate step numbers.
     let steps: Vec<u32> = store.steps(1).unwrap().iter().map(|s| s.step).collect();
     let mut sorted = steps.clone();
     sorted.sort_unstable();
     sorted.dedup();
-    assert_eq!(sorted.len(), steps.len(), "no committed step was re-run on resume");
+    assert_eq!(
+        sorted.len(),
+        steps.len(),
+        "no committed step was re-run on resume"
+    );
 }
 
 // ---------- F2 / NF6: budget is continuous across a crash ----------
@@ -192,9 +246,13 @@ async fn no_double_charge_across_a_crash_resume() {
     let base_store = Store::memory().unwrap();
     let base = TaskContract::new("finish", &file, Verification::FileContains("DONE".into()))
         .with_max_steps(5);
-    let baseline = run(&base, &Script::new(vec![("W\n", 10), ("W\n", 10), ("DONE\n", 10)]), &base_store)
-        .await
-        .unwrap();
+    let baseline = run(
+        &base,
+        &Script::new(vec![("W\n", 10), ("W\n", 10), ("DONE\n", 10)]),
+        &base_store,
+    )
+    .await
+    .unwrap();
     let baseline_spent = base_store.spent_tokens(baseline.run_id).unwrap();
     assert_eq!(baseline_spent, 30);
 
@@ -202,12 +260,23 @@ async fn no_double_charge_across_a_crash_resume() {
     let store = Store::memory().unwrap();
     let capped = TaskContract::new("finish", &file, Verification::FileContains("DONE".into()))
         .with_max_steps(2);
-    let crashed = run(&capped, &Script::new(vec![("W\n", 10), ("W\n", 10)]), &store).await.unwrap();
+    let crashed = run(
+        &capped,
+        &Script::new(vec![("W\n", 10), ("W\n", 10)]),
+        &store,
+    )
+    .await
+    .unwrap();
     assert!(matches!(crashed.outcome, RunOutcome::StepCapReached { .. }));
-    assert_eq!(store.spent_tokens(crashed.run_id).unwrap(), 20, "durable spend after crash");
+    assert_eq!(
+        store.spent_tokens(crashed.run_id).unwrap(),
+        20,
+        "durable spend after crash"
+    );
 
     let resumed = resume(
-        &TaskContract::new("finish", &file, Verification::FileContains("DONE".into())).with_max_steps(5),
+        &TaskContract::new("finish", &file, Verification::FileContains("DONE".into()))
+            .with_max_steps(5),
         &Script::new(vec![("DONE\n", 10)]),
         &store,
         crashed.run_id,
@@ -228,8 +297,12 @@ async fn the_time_budget_is_wall_clock_and_durable_across_a_restart() {
     let store = Store::open(&db).unwrap();
     let run_id = {
         // A run row exists with a start stamp.
-        let c = TaskContract::new("x", &file, Verification::FileContains("DONE".into())).with_max_steps(1);
-        run(&c, &Script::new(vec![("W\n", 1)]), &store).await.unwrap().run_id
+        let c = TaskContract::new("x", &file, Verification::FileContains("DONE".into()))
+            .with_max_steps(1);
+        run(&c, &Script::new(vec![("W\n", 1)]), &store)
+            .await
+            .unwrap()
+            .run_id
     };
     let before = store.elapsed_secs(run_id).unwrap();
     drop(store);
@@ -237,7 +310,10 @@ async fn the_time_budget_is_wall_clock_and_durable_across_a_restart() {
     // A restarted process sees MORE elapsed time, not a reset to zero.
     let reopened = Store::open(&db).unwrap();
     let after = reopened.elapsed_secs(run_id).unwrap();
-    assert!(after >= before + 0.1, "elapsed must count wall-clock across a restart ({before} -> {after})");
+    assert!(
+        after >= before + 0.1,
+        "elapsed must count wall-clock across a restart ({before} -> {after})"
+    );
 }
 
 // ---------- F3 (in-process) / NF2: idempotent replay ----------
@@ -246,8 +322,14 @@ async fn the_time_budget_is_wall_clock_and_durable_across_a_restart() {
 async fn edit_applied_exactly_once_and_resume_is_idempotent() {
     let file = ws().path().join("out.txt");
     let store = Store::memory().unwrap();
-    let contract = TaskContract::new("write", &file, Verification::FileEquals("SOLUTION\n".into()));
-    let first = run(&contract, &Script::new(vec![("SOLUTION\n", 10)]), &store).await.unwrap();
+    let contract = TaskContract::new(
+        "write",
+        &file,
+        Verification::FileEquals("SOLUTION\n".into()),
+    );
+    let first = run(&contract, &Script::new(vec![("SOLUTION\n", 10)]), &store)
+        .await
+        .unwrap();
     assert!(matches!(first.outcome, RunOutcome::Success { .. }));
     let spent = store.spent_tokens(first.run_id).unwrap();
     let steps = store.steps(first.run_id).unwrap().len();
@@ -255,9 +337,14 @@ async fn edit_applied_exactly_once_and_resume_is_idempotent() {
     // Re-running resume twice on a finished run is a faithful no-op: same outcome,
     // no extra steps, no extra spend, and the file unchanged (edit exactly once).
     for _ in 0..2 {
-        let again = resume(&contract, &Script::new(vec![("SOLUTION\n", 10)]), &store, first.run_id)
-            .await
-            .unwrap();
+        let again = resume(
+            &contract,
+            &Script::new(vec![("SOLUTION\n", 10)]),
+            &store,
+            first.run_id,
+        )
+        .await
+        .unwrap();
         assert_eq!(again.outcome, first.outcome);
         assert_eq!(store.steps(first.run_id).unwrap().len(), steps);
         assert_eq!(store.spent_tokens(first.run_id).unwrap(), spent);
@@ -273,7 +360,10 @@ async fn resuming_an_unknown_run_returns_a_typed_error_not_a_panic() {
     let file = ws().path().join("out.txt");
     let contract = TaskContract::new("x", &file, Verification::FileContains("DONE".into()));
     let err = resume(&contract, &Script::new(vec![("DONE\n", 1)]), &store, 424242).await;
-    assert!(matches!(err, Err(io_harness::Error::Resume { .. })), "got {err:?}");
+    assert!(
+        matches!(err, Err(io_harness::Error::Resume { .. })),
+        "got {err:?}"
+    );
 }
 
 // ---------- F9: checkpoint / resume / skipped events reconstruct history ----------
@@ -283,20 +373,36 @@ async fn a_multi_crash_run_history_is_reconstructable_from_the_store() {
     let file = ws().path().join("out.txt");
     let store = Store::memory().unwrap();
     // Crash (step cap) at 2, resume and crash again at 3, then resume to success.
-    let c2 = TaskContract::new("f", &file, Verification::FileContains("DONE".into())).with_max_steps(2);
-    let r = run(&c2, &Script::new(vec![("W\n", 1), ("W\n", 1)]), &store).await.unwrap();
+    let c2 =
+        TaskContract::new("f", &file, Verification::FileContains("DONE".into())).with_max_steps(2);
+    let r = run(&c2, &Script::new(vec![("W\n", 1), ("W\n", 1)]), &store)
+        .await
+        .unwrap();
     let id = r.run_id;
-    let c3 = TaskContract::new("f", &file, Verification::FileContains("DONE".into())).with_max_steps(3);
-    resume(&c3, &Script::new(vec![("W\n", 1)]), &store, id).await.unwrap();
-    let c5 = TaskContract::new("f", &file, Verification::FileContains("DONE".into())).with_max_steps(5);
-    let done = resume(&c5, &Script::new(vec![("DONE\n", 1)]), &store, id).await.unwrap();
+    let c3 =
+        TaskContract::new("f", &file, Verification::FileContains("DONE".into())).with_max_steps(3);
+    resume(&c3, &Script::new(vec![("W\n", 1)]), &store, id)
+        .await
+        .unwrap();
+    let c5 =
+        TaskContract::new("f", &file, Verification::FileContains("DONE".into())).with_max_steps(5);
+    let done = resume(&c5, &Script::new(vec![("DONE\n", 1)]), &store, id)
+        .await
+        .unwrap();
     assert!(matches!(done.outcome, RunOutcome::Success { .. }));
 
     let events = store.checkpoint_events(id).unwrap();
     let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
     assert!(kinds.contains(&"checkpoint"), "steps are checkpointed");
-    assert_eq!(kinds.iter().filter(|k| **k == "resume").count(), 2, "two resumes recorded");
-    assert!(kinds.contains(&"skipped"), "already-committed steps are recorded as skipped");
+    assert_eq!(
+        kinds.iter().filter(|k| **k == "resume").count(),
+        2,
+        "two resumes recorded"
+    );
+    assert!(
+        kinds.contains(&"skipped"),
+        "already-committed steps are recorded as skipped"
+    );
     // Every committed step is checkpointed exactly once.
     let checkpoints = kinds.iter().filter(|k| **k == "checkpoint").count();
     assert_eq!(checkpoints, store.steps(id).unwrap().len());
@@ -317,8 +423,16 @@ async fn a_long_unattended_run_sustains_the_loop_and_checkpoints_throughout() {
         .with_max_steps(N as u32);
     let r = run(&contract, &Script::new(writes), &store).await.unwrap();
     assert_eq!(r.outcome, RunOutcome::Success { steps: N as u32 });
-    let checkpoints = store.checkpoint_events(r.run_id).unwrap().iter().filter(|e| e.kind == "checkpoint").count();
-    assert_eq!(checkpoints, N, "every one of the {N} steps was checkpointed");
+    let checkpoints = store
+        .checkpoint_events(r.run_id)
+        .unwrap()
+        .iter()
+        .filter(|e| e.kind == "checkpoint")
+        .count();
+    assert_eq!(
+        checkpoints, N,
+        "every one of the {N} steps was checkpointed"
+    );
 }
 
 // ---------- F4: a tree crashed mid-fan-out resumes every agent ----------
@@ -331,30 +445,73 @@ async fn a_tree_crash_resumes_every_agent_from_its_checkpoint() {
     let contract = tree_contract(dir.path());
 
     // Crash: drop the run mid-fan-out while children are still sleeping.
-    let slow = TreeProvider { child_delay: Duration::from_millis(500) };
+    let slow = TreeProvider {
+        child_delay: Duration::from_millis(500),
+    };
     let crashed = tokio::time::timeout(
         Duration::from_millis(150),
-        run_tree(&contract, &slow, &store, &Policy::permissive(), &ApproveAll, &containment()),
+        run_tree(
+            &contract,
+            &slow,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &containment(),
+        ),
     )
     .await;
-    assert!(crashed.is_err(), "the run should have been cut off mid-fan-out");
+    assert!(
+        crashed.is_err(),
+        "the run should have been cut off mid-fan-out"
+    );
     // Children were spawned (rows + spawn records) but nothing finished.
     let agents_before = store.agent_count_tree(1).unwrap();
-    assert!(agents_before >= 2, "children were spawned before the crash (got {agents_before})");
+    assert!(
+        agents_before >= 2,
+        "children were spawned before the crash (got {agents_before})"
+    );
     drop(store);
 
     // Restart: a fresh Store, fresh ledger. Resume the tree to completion.
     let store = Store::open(&db).unwrap();
-    let fast = TreeProvider { child_delay: Duration::ZERO };
-    let r = resume_tree(&contract, &fast, &store, 1, &Policy::permissive(), &ApproveAll, &containment())
-        .await
-        .unwrap();
+    let fast = TreeProvider {
+        child_delay: Duration::ZERO,
+    };
+    let r = resume_tree(
+        &contract,
+        &fast,
+        &store,
+        1,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
 
-    assert!(matches!(r.outcome, RunOutcome::Success { .. }), "tree completed on resume: {:?}", r.outcome);
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap().trim(), "ALPHA");
-    assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap().trim(), "BETA");
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { .. }),
+        "tree completed on resume: {:?}",
+        r.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt"))
+            .unwrap()
+            .trim(),
+        "ALPHA"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt"))
+            .unwrap()
+            .trim(),
+        "BETA"
+    );
     // Adopted, not duplicated: the same children were resumed, no new agents spawned.
-    assert_eq!(store.agent_count_tree(1).unwrap(), agents_before, "children adopted, not re-spawned");
+    assert_eq!(
+        store.agent_count_tree(1).unwrap(),
+        agents_before,
+        "children adopted, not re-spawned"
+    );
 }
 
 // ---------- F5: a tree approval survives a full process restart ----------
@@ -366,10 +523,18 @@ async fn a_tree_approval_survives_a_full_restart() {
     let store = Store::open(&db).unwrap();
     let contract = tree_contract(dir.path());
     // Writing a.txt asks; writing b.txt is allowed outright.
-    let policy = Policy::default().layer("base").allow_read("*").allow_write("b.txt").ask_write("a.txt");
+    let policy = Policy::default()
+        .layer("base")
+        .allow_read("*")
+        .allow_write("b.txt")
+        .ask_write("a.txt");
 
-    let fast = TreeProvider { child_delay: Duration::ZERO };
-    let paused = run_tree(&contract, &fast, &store, &policy, &Defer, &containment()).await.unwrap();
+    let fast = TreeProvider {
+        child_delay: Duration::ZERO,
+    };
+    let paused = run_tree(&contract, &fast, &store, &policy, &Defer, &containment())
+        .await
+        .unwrap();
     let request_id = match paused.outcome {
         RunOutcome::AwaitingApproval { request_id, .. } => request_id,
         other => panic!("expected the tree to pause, got {other:?}"),
@@ -386,7 +551,10 @@ async fn a_tree_approval_survives_a_full_restart() {
         &store,
         1,
         request_id,
-        Decision::Approve { modified: None, remember: vec![] },
+        Decision::Approve {
+            modified: None,
+            remember: vec![],
+        },
         &policy,
         &ApproveAll,
         &containment(),
@@ -394,9 +562,23 @@ async fn a_tree_approval_survives_a_full_restart() {
     .await
     .unwrap();
 
-    assert!(matches!(r.outcome, RunOutcome::Success { .. }), "tree resumed to success: {:?}", r.outcome);
-    assert_eq!(std::fs::read_to_string(dir.path().join("a.txt")).unwrap().trim(), "ALPHA");
-    assert_eq!(std::fs::read_to_string(dir.path().join("b.txt")).unwrap().trim(), "BETA");
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { .. }),
+        "tree resumed to success: {:?}",
+        r.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt"))
+            .unwrap()
+            .trim(),
+        "ALPHA"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt"))
+            .unwrap()
+            .trim(),
+        "BETA"
+    );
 }
 
 // ---------- F6: an in-flight sandboxed exec is re-created on resume ----------
@@ -409,14 +591,27 @@ async fn a_sandboxed_verification_is_recreated_on_resume() {
     // steps are not re-run.
     let file = ws().path().join("lib.rs");
     let store = Store::memory().unwrap();
-    let capped = TaskContract::new("make it compile", &file, Verification::CompilesRust).with_max_steps(1);
-    let broken = run(&capped, &Script::new(vec![("fn main( {\n", 5)]), &store).await.unwrap();
+    let capped =
+        TaskContract::new("make it compile", &file, Verification::CompilesRust).with_max_steps(1);
+    let broken = run(&capped, &Script::new(vec![("fn main( {\n", 5)]), &store)
+        .await
+        .unwrap();
     assert!(matches!(broken.outcome, RunOutcome::StepCapReached { .. }));
     let before = store.last_step(broken.run_id).unwrap();
 
-    let contract = TaskContract::new("make it compile", &file, Verification::CompilesRust).with_max_steps(4);
-    let r = resume(&contract, &Script::new(vec![("pub fn f() -> u32 { 42 }\n", 5)]), &store, broken.run_id)
-        .await
-        .unwrap();
-    assert!(matches!(r.outcome, RunOutcome::Success { steps } if steps > before), "compiled on resume: {:?}", r.outcome);
+    let contract =
+        TaskContract::new("make it compile", &file, Verification::CompilesRust).with_max_steps(4);
+    let r = resume(
+        &contract,
+        &Script::new(vec![("pub fn f() -> u32 { 42 }\n", 5)]),
+        &store,
+        broken.run_id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { steps } if steps > before),
+        "compiled on resume: {:?}",
+        r.outcome
+    );
 }

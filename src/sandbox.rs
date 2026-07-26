@@ -324,7 +324,14 @@ async fn run_capped(
     // Deny network on the floor best-effort by stripping proxy configuration.
     // A real kernel boundary comes from the native backends; documented as such.
     if !spec.allow_network {
-        for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        for k in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
             cmd.env_remove(k);
         }
     }
@@ -523,8 +530,8 @@ pub async fn copy_back(
 // backends "compile under their cfg and pass their backend unit tests" on a
 // macOS host without a cross toolchain (rusqlite's bundled C blocks a full
 // cross-check, which is an environment limit, not a limit of this code).
-pub mod macos;
 pub mod linux;
+pub mod macos;
 pub mod windows;
 
 #[cfg(test)]
@@ -532,7 +539,12 @@ mod tests {
     use super::*;
 
     fn spec<'a>(argv: &'a [String], dir: &'a Path, limits: &'a SandboxLimits) -> RunSpec<'a> {
-        RunSpec { argv, workdir: dir, limits, allow_network: false }
+        RunSpec {
+            argv,
+            workdir: dir,
+            limits,
+            allow_network: false,
+        }
     }
 
     #[tokio::test]
@@ -586,7 +598,10 @@ mod tests {
             max_wall_secs: Some(30), // wall is the backstop; CPU should fire first
             ..SandboxLimits::default()
         };
-        let out = FloorSandbox.run(spec(&argv, dir.path(), &limits)).await.unwrap();
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
         assert_eq!(out.cap_hit, Some(Cap::Cpu), "expected CPU cap, got {out:?}");
         assert!(!out.success());
     }
@@ -606,8 +621,15 @@ mod tests {
             max_wall_secs: Some(30),
             ..SandboxLimits::default()
         };
-        let out = FloorSandbox.run(spec(&argv, dir.path(), &limits)).await.unwrap();
-        assert_eq!(out.cap_hit, Some(Cap::Memory), "expected memory cap, got {out:?}");
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.cap_hit,
+            Some(Cap::Memory),
+            "expected memory cap, got {out:?}"
+        );
         assert!(!out.success());
     }
 
@@ -627,8 +649,12 @@ mod tests {
     async fn copy_back_honours_the_write_policy() {
         let src = tempfile::tempdir().unwrap();
         let dst = tempfile::tempdir().unwrap();
-        tokio::fs::write(src.path().join("keep.txt"), "y").await.unwrap();
-        tokio::fs::write(src.path().join("secret.txt"), "n").await.unwrap();
+        tokio::fs::write(src.path().join("keep.txt"), "y")
+            .await
+            .unwrap();
+        tokio::fs::write(src.path().join("secret.txt"), "n")
+            .await
+            .unwrap();
 
         let files = vec![PathBuf::from("keep.txt"), PathBuf::from("secret.txt")];
         let copied = copy_back(src.path(), dst.path(), &files, |p| {
@@ -639,6 +665,9 @@ mod tests {
 
         assert_eq!(copied, vec![PathBuf::from("keep.txt")]);
         assert!(dst.path().join("keep.txt").exists());
-        assert!(!dst.path().join("secret.txt").exists(), "denied file must not be copied back");
+        assert!(
+            !dst.path().join("secret.txt").exists(),
+            "denied file must not be copied back"
+        );
     }
 }

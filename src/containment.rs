@@ -154,7 +154,10 @@ impl Ledger {
             max_total_tokens: c.max_total_tokens,
             max_total_agents: c.max_total_agents,
             max_depth: c.max_depth,
-            state: Mutex::new(State { spent_tokens, agents: agents.max(1) }),
+            state: Mutex::new(State {
+                spent_tokens,
+                agents: agents.max(1),
+            }),
         }
     }
 
@@ -249,7 +252,7 @@ mod tests {
         assert_eq!(led.draw_tokens(40), Draw::Ok); // 40
         assert_eq!(led.draw_tokens(40), Draw::Ok); // 80
         assert_eq!(led.draw_tokens(40), Draw::Halted); // 80+40 > 100: rejected, tree halts
-        // Recorded spend never crosses the ceiling — the over-draw is not counted.
+                                                       // Recorded spend never crosses the ceiling — the over-draw is not counted.
         assert_eq!(led.spent_tokens(), 80);
         assert!(led.spent_tokens() <= 100);
     }
@@ -257,7 +260,7 @@ mod tests {
     #[test]
     fn a_contract_cannot_raise_the_ceiling() {
         let led = Ledger::new(&containment()); // 100 remaining
-        // A child asking for 500 tokens is capped at what the tree has left.
+                                               // A child asking for 500 tokens is capped at what the tree has left.
         assert_eq!(led.effective_token_budget(Some(500)), 100);
         // After the tree spends 70, a greedy child is capped at the remaining 30.
         led.draw_tokens(70);

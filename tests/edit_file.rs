@@ -21,10 +21,16 @@ struct MockWriter {
 
 impl MockWriter {
     fn new(content: impl Into<String>) -> Self {
-        Self { content: content.into(), tokens: 0 }
+        Self {
+            content: content.into(),
+            tokens: 0,
+        }
     }
     fn with_tokens(content: impl Into<String>, tokens: u64) -> Self {
-        Self { content: content.into(), tokens }
+        Self {
+            content: content.into(),
+            tokens,
+        }
     }
 }
 
@@ -140,9 +146,15 @@ async fn stops_at_step_cap_when_never_verified() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("out.txt");
 
-    let contract = TaskContract::new("unreachable", &file, Verification::FileContains("NEVER".into()))
-        .with_max_steps(3);
-    let provider = MockNoop { calls: AtomicU32::new(0) };
+    let contract = TaskContract::new(
+        "unreachable",
+        &file,
+        Verification::FileContains("NEVER".into()),
+    )
+    .with_max_steps(3);
+    let provider = MockNoop {
+        calls: AtomicU32::new(0),
+    };
     let store = Store::memory().unwrap();
 
     let result = run(&contract, &provider, &store).await.unwrap();
@@ -189,7 +201,10 @@ async fn stops_at_time_budget() {
     let contract = TaskContract::new("slow", &file, Verification::FileContains("NEVER".into()))
         .with_max_steps(5)
         .with_time_budget(Duration::from_millis(20));
-    let provider = MockSlow { content: "x".into(), delay: Duration::from_millis(30) };
+    let provider = MockSlow {
+        content: "x".into(),
+        delay: Duration::from_millis(30),
+    };
     let store = Store::memory().unwrap();
 
     let result = run(&contract, &provider, &store).await.unwrap();

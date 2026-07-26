@@ -177,7 +177,10 @@ async fn a_stdio_server_is_discovered_called_and_its_result_reaches_the_loop() {
     let result = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
         .unwrap();
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
 
     // The model was offered the server's tools beside the built-ins.
     let offered = provider.tools_offered();
@@ -189,7 +192,9 @@ async fn a_stdio_server_is_discovered_called_and_its_result_reaches_the_loop() {
 
     // The call happened, and the server's answer came back through the trace.
     let events = store.mcp_events(1).unwrap();
-    assert!(events.iter().any(|e| e.kind == "connected" && e.detail.as_deref() == Some("stdio")));
+    assert!(events
+        .iter()
+        .any(|e| e.kind == "connected" && e.detail.as_deref() == Some("stdio")));
     assert!(events
         .iter()
         .any(|e| e.kind == "discovered" && e.tool.as_deref() == Some("mcp__fix__echo")));
@@ -221,7 +226,10 @@ async fn a_server_tool_named_like_a_builtin_does_not_shadow_it() {
     let result = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
         .unwrap();
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
 
     // Both names were offered, and they are different names.
     let offered = provider.tools_offered();
@@ -263,7 +271,10 @@ async fn a_single_mcp_tool_can_be_denied_while_the_server_is_allowed() {
         .unwrap();
     // The refusal is an observation, not a run failure — the agent carried on
     // and finished with the built-in.
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
 
     assert!(
         !store
@@ -300,7 +311,10 @@ async fn a_tool_that_reports_an_error_does_not_end_the_run() {
     let result = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
         .unwrap();
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
 
     let called = store
         .mcp_events(1)
@@ -308,7 +322,11 @@ async fn a_tool_that_reports_an_error_does_not_end_the_run() {
         .into_iter()
         .find(|e| e.kind == "called" && e.tool.as_deref() == Some("mcp__fix__boom"))
         .expect("the failed call is recorded");
-    assert_eq!(called.ok, Some(false), "recorded as a failure, not a success");
+    assert_eq!(
+        called.ok,
+        Some(false),
+        "recorded as a failure, not a success"
+    );
 }
 
 /// F9 — a tool that never returns is cut off by the per-call timeout, and the
@@ -324,13 +342,16 @@ async fn a_tool_that_never_returns_times_out_and_the_run_continues() {
             json!({"path": "src/a.rs", "content": "fn hello() {}"}),
         )],
     ]);
-    let contract = contract(dir.path(), 4)
-        .with_mcp([fixture("fix").with_timeout(Duration::from_secs(1))]);
+    let contract =
+        contract(dir.path(), 4).with_mcp([fixture("fix").with_timeout(Duration::from_secs(1))]);
 
     let result = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
         .unwrap();
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
 
     let called = store
         .mcp_events(1)
@@ -348,8 +369,10 @@ async fn a_server_that_cannot_start_fails_the_run_with_a_typed_error() {
     let dir = workspace();
     let store = Store::memory().unwrap();
     let provider = Script::new(vec![vec![]]);
-    let contract = contract(dir.path(), 2)
-        .with_mcp([McpServer::stdio("missing", "definitely-not-a-real-binary-xyz")]);
+    let contract = contract(dir.path(), 2).with_mcp([McpServer::stdio(
+        "missing",
+        "definitely-not-a-real-binary-xyz",
+    )]);
 
     let err = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
@@ -368,7 +391,10 @@ async fn a_server_binary_the_policy_denies_is_never_spawned() {
     let store = Store::memory().unwrap();
     let provider = Script::new(vec![vec![]]);
     // Reads and writes are fine; nothing may be executed.
-    let policy = Policy::default().layer("app").allow_read("*").allow_write("*");
+    let policy = Policy::default()
+        .layer("app")
+        .allow_read("*")
+        .allow_write("*");
     let contract = contract(dir.path(), 2).with_mcp([fixture("fix")]);
 
     let err = run_with(&contract, &provider, &store, &policy, &ApproveAll)
@@ -399,13 +425,16 @@ async fn a_server_that_dies_mid_run_becomes_an_observation_not_a_crash() {
             json!({"path": "src/a.rs", "content": "fn hello() {}"}),
         )],
     ]);
-    let contract = contract(dir.path(), 5)
-        .with_mcp([fixture("fix").with_timeout(Duration::from_secs(2))]);
+    let contract =
+        contract(dir.path(), 5).with_mcp([fixture("fix").with_timeout(Duration::from_secs(2))]);
 
     let result = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
         .unwrap();
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
 
     let failures: Vec<_> = store
         .mcp_events(1)
@@ -439,7 +468,10 @@ async fn an_http_server_is_discovered_called_and_its_result_reaches_the_loop() {
     let result = run_with(&contract, &provider, &store, &policy, &ApproveAll)
         .await
         .unwrap();
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
 
     assert!(provider
         .tools_offered()
@@ -487,8 +519,8 @@ async fn an_unlisted_mcp_host_is_refused_before_anything_is_dialled() {
     let store = Store::memory().unwrap();
     let provider = Script::new(vec![vec![]]);
     // Everything permitted except the network, which stays at its deny default.
-    let contract = contract(dir.path(), 2)
-        .with_mcp([McpServer::http("web", format!("http://{addr}/"))]);
+    let contract =
+        contract(dir.path(), 2).with_mcp([McpServer::http("web", format!("http://{addr}/"))]);
 
     let err = run_with(&contract, &provider, &store, &permitted(), &ApproveAll)
         .await
@@ -530,7 +562,10 @@ async fn a_contract_without_mcp_offers_exactly_the_builtin_tools() {
     .await
     .unwrap();
 
-    assert!(matches!(result.outcome, RunOutcome::Success { .. }), "{result:?}");
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "{result:?}"
+    );
     assert!(store.mcp_events(1).unwrap().is_empty());
     assert!(
         !provider

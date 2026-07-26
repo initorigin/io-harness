@@ -53,7 +53,9 @@ async fn the_same_contract_verifies_under_every_provider_and_records_which_ran()
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("hello.rs");
         let store = Store::memory().unwrap();
-        let provider = NamedMock { name: provider_name };
+        let provider = NamedMock {
+            name: provider_name,
+        };
 
         // Selection is *only* which provider is passed here — the contract is
         // constructed the same way regardless.

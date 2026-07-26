@@ -71,9 +71,21 @@ impl ServerHandler for Fixture {
                     "path": { "type": "string", "description": "Ignored." }
                 })),
             ),
-            Tool::new("boom", "Always reports an error.", schema(serde_json::json!({}))),
-            Tool::new("sleep", "Never returns in time.", schema(serde_json::json!({}))),
-            Tool::new("die", "Exits the server process.", schema(serde_json::json!({}))),
+            Tool::new(
+                "boom",
+                "Always reports an error.",
+                schema(serde_json::json!({})),
+            ),
+            Tool::new(
+                "sleep",
+                "Never returns in time.",
+                schema(serde_json::json!({})),
+            ),
+            Tool::new(
+                "die",
+                "Exits the server process.",
+                schema(serde_json::json!({})),
+            ),
         ]))
     }
 
