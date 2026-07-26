@@ -197,3 +197,20 @@ versions:
       the README's factual errors, which are a different problem from its structure.
     detail: hypothesis
     status: planned
+  - version: 0.16.0
+    outcome: >
+      A developer who resumes an interrupted run gets the run they had, not a similar one. Today
+      0.7.0's resume restores the durable half of a run — the step it reached, what it spent, how
+      long it has been alive — and silently drops the assembled half: the observation ledger the
+      0.10.0 context assembler builds is in memory only (src/run.rs:1183, :1758), so a resumed
+      workspace or sub-agent run re-derives its context from the workspace and asks the model a
+      different question than the process before it would have. The agent usually recovers, which is
+      why this went unnoticed through five releases; what it costs is that a resumed run is not
+      comparable to an uninterrupted one. After this release the ledger is durable and restored, so
+      a 24-hour run that crashes at hour twenty continues with the context it had rather than a
+      reconstruction, and a recorded case replays identically across an interruption in every loop
+      rather than only the single-file one. Found by 0.12.0's replay work and recorded in
+      iterations/US-IO-HARNESS-0.12.0-I01; 0.12.0 ships the honest boundary instead, where a replay
+      that cannot reproduce a request refuses loudly rather than answering from the wrong recording.
+    detail: outline
+    status: planned

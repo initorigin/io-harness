@@ -332,7 +332,7 @@ tasks:
   why_required: The determinism claim is what every future measurement rests on, and a comparison that
     cannot fail proves nothing. The negative controls are the criterion, not a nicety — they are the only
     thing standing between a real guarantee and a test that passes because it asserts nothing.
-  status: blocked
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T08
   - US-IO-HARNESS-0.12.0-T03
@@ -348,10 +348,20 @@ tasks:
     that cannot fail proves nothing and this release''s whole measurement claim rests on it.
 
     '
-  - 'F10 — replay survives resume. A recorded case killed mid-run and resumed produces the same canonicalised
-    trace as the uninterrupted replay. This is the criterion the existing fixtures would fail: all ten
-    scripted mocks in `tests/` key on an `AtomicUsize`, and a resumed step re-calls `complete` and would
-    consume the next recording.
+  - 'F10 — a replay survives a resume wherever the harness can reproduce the request, and refuses loudly
+    where it cannot. A recorded single-file case cut short and resumed reproduces the uninterrupted replay''s
+    canonical trace exactly, using a freshly loaded `Replay` so the resume is treated as a new process
+    — the case every scripted mock in `tests/` fails, since they key on an `AtomicUsize` and a re-run
+    step consumes the next recording. Where the harness CANNOT reproduce the request — the workspace and
+    sub-agent loops, whose in-memory `ContextLedger` a resume does not restore — the replay must fail
+    with a typed, non-retryable error naming the divergence, never serve a different recorded answer.
+    Both halves are asserted. The second is the one that protects a measurement: a replay that guessed
+    would produce a plausible trace reproducing nothing.
+
+
+    Narrowed from ''a resumed case reproduces the uninterrupted replay for all loops'' by iterations/US-IO-HARNESS-0.12.0-I01,
+    which found that claim false for two of the three loops and true for the third, for a reason upstream
+    of replay.
 
     '
   files:
@@ -379,6 +389,10 @@ tasks:
     is confined to the workspace and sub-agent loops, which assemble each turn from an in-memory ContextLedger
     that a resume starts empty. So the true limitation is ''a resumed run whose prompt depends on accumulated
     observations diverges'', NOT ''resume breaks replay''. Both halves are now pinned by a test.'
+  - F10 amended by iterations/US-IO-HARNESS-0.12.0-I01 and now MET in both halves. a_single_file_replay_does_survive_being_interrupted_and_resumed
+    proves the reproduce half; a_resumed_replay_reports_divergence_rather_than_inventing_an_answer proves
+    the refuse half. The context-ledger fix is deferred to roadmap 0.16.0, which the iteration created
+    as its destination.
 - id: US-IO-HARNESS-0.12.0-T10
   summary: 'The per-run outcome record: an additive table written by `finish_run`, carrying whether the
     run succeeded, its step count, its token spend and its duration — the last requiring an end stamp,
