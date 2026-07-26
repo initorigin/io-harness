@@ -127,7 +127,7 @@ versions:
       promise. The matrix stays green on all three platforms afterwards, which is what makes 0.6.0's
       "the same harness isolates code the same way on mac, linux, and windows" a true sentence.
     detail: specified
-    status: planned
+    status: released
   - version: 0.10.0
     outcome: >
       A developer runs a long task and the agent's context stays relevant instead of merely growing.

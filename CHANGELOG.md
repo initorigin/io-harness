@@ -24,6 +24,29 @@ notes are produced from it.
 
 ### Fixed
 
+### Security
+
+## [0.9.1] - 2026-07-26
+
+The first release verified on more than one operating system. 0.9.0 added the
+repository's first CI and its Linux and Windows legs went red immediately —
+not from anything 0.9.0 introduced, but from defects that had been shipping
+since 0.3.0, 0.4.0 and 0.6.0 and that no amount of local testing could see.
+This release makes the three-OS matrix green.
+
+Nothing here changes the public API. Every fix is behaviour that was already
+promised and not delivered on a platform other than macOS.
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
 - **A path deny rule no longer fails open on Windows.** `Act::Read` and
   `Act::Write` patterns were matched against targets literally, so a rule and a
   target that named the same file with different separators did not match — and

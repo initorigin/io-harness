@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.9.1
-status: planned
+status: released
 release_type: patch
 outcome:
   user_can: >
@@ -252,3 +252,120 @@ open_questions:
     `rlim_max` at all? If the fd cap is the Linux cause, the narrow fix and the correct fix may
     differ, and the correct one is likely to leave the soft limit as the knob and the hard limit
     alone.
+
+released_at: '2026-07-26T09:00:00Z'
+mode: published
+delivered: >
+  The three-OS matrix is green on one commit for the first time in the project's history. A
+  developer running io-harness on Linux gets the execution-based verification gate that has been
+  advertised since 0.3.0 and the sandbox caps advertised since 0.6.0; both were entirely broken
+  there. On Windows the suite terminates, the wall-clock cap kills the process tree, and the caps
+  the platform cannot apply are documented as absent and never claimed in a trace.
+
+  The most consequential fix is one nobody had filed, because nobody could see it: a path deny rule
+  failed OPEN on Windows. `matches()` normalised the target's separators but not the pattern's, so
+  `deny_read("C:/secrets/*")` silently protected nothing. That is the permission model — shipped in
+  every release since 0.4.0 — and it is now symmetric, Windows-only, and scoped to path acts.
+
+  No public API change. A 0.9.0 caller upgrades by changing the version number.
+evidence:
+  tests:
+    - >
+      cargo test — 233 passed, 0 failed across 14 targets on macOS (225 at 0.9.0; 8 new regression
+      tests). Every pre-existing policy, net and containment test passes unmodified.
+    - >
+      F1 green — the 7 `verify::tests` failures are gone on ubuntu-latest. Root cause established
+      before the fix, not inferred from a green run: Ubuntu 24.04 sets
+      `kernel.apparmor_restrict_unprivileged_userns=1`, and a CI probe reproduced the exact wrapper
+      failing with `unshare: write failed /proc/self/uid_map: Operation not permitted`. `select()`
+      now probes the wrapper once per process and degrades to the floor, reporting `PortableFloor`
+      so a degraded run is auditable rather than silent. A wrapper failure is now `Err(Error::Sandbox)`
+      rather than being laundered into `Ok(false)`, which is what made this take a CI log to diagnose.
+    - >
+      F2 green — `cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap` passes on Linux. `set_rlimit` set
+      `rlim_max == rlim_cur`; Linux checks the hard limit first and SIGKILLs before reaching the
+      SIGXCPU branch, so `cap_hit` was always None. The hard limit is now `min(existing_hard, soft+1)`,
+      clamped via `getrlimit` so it is only ever lowered, and a cap that cannot be applied fails the
+      spawn instead of running uncapped.
+    - >
+      The memory cap was broken on EVERY platform, which neither issue said. The RSS monitor watched
+      the direct child — `sh` on Linux (which forked), `sandbox-exec` on macOS — so it measured a
+      1.8 MB shell while the real hog held 824 MB. Confirmed by CI probe:
+      `2135 sh 1860 KB` with child `2137 perl 824452 KB`. The monitor now walks the process tree, and
+      an unreadable process table keeps polling rather than silently disabling the cap for the rest
+      of the run, which the old `None => return` did.
+    - >
+      F3 green — the Windows suite terminates. `run_capped` passed the child INTO
+      `tokio::time::timeout`, so expiry dropped the child and only `kill_on_drop` ran, killing one
+      process while descendants survived holding the stdout pipe open; tokio's Windows stdio is
+      blocking-pool reads, which then never hit EOF. The wait is now a spawned task, so the child is
+      alive at expiry and `kill_tree` runs — `taskkill /F /T` on Windows, descendants-first SIGKILL
+      on unix.
+    - >
+      F4 green — `windows_claims_no_cpu_cap_because_it_applies_none` and
+      `windows_enforces_the_wall_clock_and_claims_no_cap_it_did_not_apply` assert the honest
+      contract: the wall clock is enforced and named, and a cap that was never applied is never
+      reported as hit. `Cap::Cpu` and `Cap::Memory` are structurally unreachable on non-unix.
+    - >
+      The Windows path fail-open — `a_denied_skills_directory_refuses_the_read_but_keeps_the_catalog`
+      passes on windows-latest with the test unmodified, which is the point: the engine was fixed,
+      not the symptom. `normalising_separators_does_not_make_two_different_paths_match` pins five
+      paths that must stay Allow, so the fix is proven not to have over-matched, and exec and net
+      still treat a backslash literally.
+    - >
+      NF3 — the dispatch overhead claim is now true rather than marginal. The policy recompiled its
+      globs to a regex on every check; on windows-latest that pushed the measured overhead to
+      1,108,963 ns against a 1 ms bound. Compiled globs are now memoised, keyed on the full pattern
+      text, storing the regex and never a verdict. macOS overhead fell from ~404,000 ns to ~48,000 ns
+      per call, roughly 8.4x, and the 1 ms bound was not touched.
+  builds:
+    - >
+      CI run 30195506996 — ubuntu-latest, macos-latest, windows-latest, msrv and lint ALL green on
+      one commit. This is the first fully green matrix in the project's history and the criterion
+      0.9.0 could not meet.
+    - cargo clippy --all-targets -- -D warnings — exit 0. cargo fmt --check — exit 0.
+    - >
+      cargo package — io-harness-0.9.1.crate, 230,995 bytes. Inspected: no .env, no secret-shaped
+      path, and no diagnostic scaffolding.
+    - >
+      No public API change — `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` is empty for the
+      whole branch. No new runtime dependency; `taskkill` is a system utility invoked through
+      std::process::Command, symmetric with the existing `ps` call.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+  - >
+    The record is sealed before the crates.io upload, which follows the two merges and the GitHub
+    Release. mode: published states the authorized target.
+  - >
+    Windows containment is the portable floor with the wall clock only. No CPU, memory, or process
+    caps, and no kernel network boundary. The Job Object needs a Win32 binding and is deliberately
+    not in a patch release; this is the fallback scope the contract planned for, chosen rather than
+    stumbled into. It is documented in src/sandbox.rs, src/sandbox/windows.rs and the README, and
+    asserted by a test so the documentation cannot drift away from the behaviour.
+  - >
+    On a Linux host that restricts unprivileged user namespaces — Ubuntu 24.04 and its derivatives,
+    which includes GitHub's own runners — io-harness now degrades to the portable floor and has NO
+    kernel network boundary; network denial there is proxy-env stripping only. This is strictly
+    better than the previous behaviour, where every gate simply failed, and the degradation is
+    reported in the trace rather than claimed away. It does mean a Linux operator who needs a hard
+    network boundary must run on a host that permits user namespaces.
+  - >
+    The glob cache is unbounded, holding one compiled regex per distinct pattern. Patterns come from
+    configuration rather than from the model, so this is bounded in practice; a caller that generates
+    pattern text at runtime would want an LRU.
+  - >
+    `cpu_capped` still matches SIGXCPU only. With the hard limit now above the soft one that is the
+    signal Linux sends, but a process killed by SIGKILL for an unrelated reason is still not
+    attributed to a cap, which is correct and worth stating.
+  - >
+    Windows was verified only through CI. Nobody on this project has a Windows machine, so every
+    Windows claim in this record rests on run 30195506996 rather than on local reproduction.
+  - >
+    The verify gate's per-platform behaviour is now asserted, but the 9 integration binaries had
+    never run on Linux or Windows before this release. Two further defects surfaced the moment they
+    did. A third wave is possible as more of the suite is exercised on more platforms.
+supersedes: 0.9.0
+next_recommended_version: 0.10.0
+immutable: true
