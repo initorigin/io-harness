@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.9.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -319,3 +319,168 @@ open_questions:
     other observation caps. 0.10.0 will move all of these to one place; 0.9.0 should put it wherever
     makes that move smallest, which likely means beside the existing `OBS_READ_CAP` constants rather
     than inside the dispatch arm.
+
+released_at: '2026-07-26T07:00:00Z'
+mode: published
+delivered: >
+  A developer embedding io-harness extends it inside their own binary. They implement the public
+  `Tool` trait for an action their product already performs, register it with
+  `TaskContract::with_tools(...)`, and the model is offered it beside `grep`, `find`, `read_file`
+  and `write_file` — governed by the same 0.4.0 policy (an `Act::Exec` check on the tool's name),
+  refused rather than trusted when the policy says no, size-capped where its result enters the
+  context, recorded in the rusqlite trace like any built-in, and inherited by a 0.5.0 child under
+  that child's own narrowed policy. A tool that fails is an observation the agent adapts to, not a
+  failed run.
+
+  The same developer shapes how the agent approaches a class of task without writing Rust, by
+  pointing the contract at a directory of markdown skills. Names and descriptions go into the system
+  prompt; bodies do not. The agent loads the one body it wants through a built-in `read_skill` tool,
+  as an ordinary policy-checked file read, and a directory that is missing, is not a directory, or
+  exceeds the 64-skill cap is a typed `Error::Config` at run start rather than a silently partial
+  set. Skills carry instructions and execute nothing.
+
+  Upgrading from 0.8.1 is a version bump and nothing else: 42 public items added, none renamed,
+  removed, or changed in signature, and no runtime dependency added.
+evidence:
+  tests:
+    - >
+      cargo test — 225 passed, 0 failed across 14 targets (lib unit 102, custom_tools 15, skills 15,
+      mcp, net, policy, sandbox, subagents, checkpoint, multi_file, edit_file, parity, verify_gate,
+      doc 3). 28 are new to this release; the 197 that predate it are unchanged and still green,
+      which is half of NF2.
+    - >
+      F1 — a_registered_tool_is_offered_called_and_its_result_observed: the spec is in the request's
+      tool list, the name is in the system prompt, invoke() ran with the model's arguments (A-17),
+      and A-17=shipped appears in the next turn's prompt.
+    - >
+      F2 — a_registered_tool_is_refused_by_the_policy_without_being_entered: under
+      deny_exec("lookup_order") the tool's own call log stays empty, the trace holds a refusal with
+      act=exec, rule=lookup_order, layer=base, the model sees a refusal observation, and the run
+      continues rather than erroring.
+    - >
+      F3 — 4 tests: shadowing each of the six built-ins, the reserved `mcp__` prefix, a duplicate
+      name, and an empty name each return Error::Config naming the offender, with the mock provider's
+      completion counter asserted at 0, so arbitration is proven to run before the provider is
+      reached even once.
+    - >
+      F4 — a_failing_tool_becomes_an_observation_not_a_failed_run: the tool's own error text reaches
+      the model, the step is still committed (2 step rows), and the run continues.
+    - >
+      F5 — an_oversized_tool_result_is_truncated_before_it_enters_the_context: a 200,000-char result
+      reaches the model truncated, with the word 'truncated' visible, and the trace records the
+      truncated form.
+    - >
+      F6 — a_spawned_child_inherits_the_toolbox_and_the_call_is_its_own, plus
+      a_toolbox_survives_a_tree_resume_and_still_reaches_a_child. The child runs the parent's own
+      registered instance (asserted on the Arc the parent holds), the call is in the child's
+      store.steps(child_run) and absent from the parent's, and the same holds across a resume. Both
+      were watched failing first against a scratch build with the Tree threading broken, so they are
+      known not to have been vacuously green.
+    - >
+      F7 — 3 discovery tests plus the_catalog_reaches_the_system_prompt_and_no_body_does: alpha.md
+      and beta/SKILL.md yield exactly two skills, frontmatter overrides the derived name and
+      description, a file without frontmatter takes its stem and first prose line, and both names and
+      descriptions reach the prompt while neither body does.
+    - >
+      F8 — read_skill_loads_exactly_the_named_body_into_the_observations and
+      an_unknown_skill_name_is_an_observation_listing_what_exists.
+    - >
+      F9 — 4 tests driving run_with with a counting mock provider: a missing path, a non-directory
+      path, and a directory of MAX_SKILLS+1 files each return Error::Config naming the path with the
+      provider's call count at 0, plus a positive control proving a usable directory lets the run
+      start (calls == 1).
+    - >
+      F10 — a_denied_skills_directory_refuses_the_read_but_keeps_the_catalog. Related and load
+      bearing: an_absolute_path_still_cannot_escape_the_workspace_root pins the invariant that the
+      gate relaxation depends on — under Policy::permissive() an absolute read_file outside the root
+      still yields "[read error] path escapes workspace" and an absolute write_file leaves no file,
+      because Workspace::resolve rejects absolute paths before any policy question is asked.
+    - >
+      NF3 — dispatch overhead 0.442-0.453 ms/call debug and 0.059-0.072 ms release across 1000 calls
+      against calling the same closure directly; 32-skill discovery 2.28-3.19 ms debug. Discovery
+      running once per run rather than once per step is proven behaviourally: a run writes a new
+      skill file into its own skills directory at step 1 and at step 2 the catalogue still does not
+      mention it. Full numbers, machine, and method in evidence/0.9.0/latency.txt.
+  builds:
+    - cargo build --examples — exit 0 (11 examples, including the two new ones and live_f11).
+    - cargo clippy --all-targets -- -D warnings — exit 0 on macOS, and green on Linux in CI.
+    - cargo fmt --check — exit 0.
+    - >
+      cargo package — target/package/io-harness-0.9.0.crate produced, 218,184 bytes. Inspected for
+      secrets: no .env, credential, or secret-shaped path in the archive.
+    - >
+      NF1 — the [dependencies] section of Cargo.toml is byte-identical to shipped 0.8.1
+      (`diff` against `git show 381163f:Cargo.toml`). The frontmatter reader is standard-library
+      only and the dyn-safe trait uses std::pin::Pin<Box<dyn Future>>.
+    - >
+      MSRV — cargo +1.88 build --all-targets succeeds. cargo +1.87 now fails at resolve time with a
+      clear "requires rustc 1.88" rather than a compile error inside rmcp.
+    - >
+      CI run 30191362799 (the repository's first CI, added by this release): macOS test green, lint
+      green, MSRV green, Linux test FAILED, Windows test cancelled at the 20-minute job cap. Recorded
+      as-is; see known_limitations.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+  - >
+    The record is sealed before the crates.io upload. mode: published states the authorized target;
+    the upload itself is the last step of the initorigin release flow and follows the feat->develop
+    and develop->main merges and the GitHub Release, all of which the owner performs by hand.
+  - >
+    Linux: 9 lib tests fail (CI run 30191362799). 7 in verify::tests, where passes_guarded(...)
+    returns false — the 0.3.0 execution-based verification gate does not work on Linux at all. 2 in
+    sandbox::tests, where the CPU and memory caps never fire:
+    cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap observes
+    `SandboxOutcome { backend: PortableFloor, exit_code: None, cap_hit: None }` against an expected
+    Some(Cpu). These are defects in the released 0.3.0 and 0.6.0 pillars, not regressions from this
+    release, and they were undetectable before because the repository had no CI. Issues #25 and #26;
+    scheduled into 0.9.1.
+  - >
+    Windows: the suite does not terminate. verify::tests all pass there, then
+    memory_cap_kills_a_heap_hog_and_names_the_memory_cap fails and the job produces no further
+    output for roughly sixteen minutes until the 20-minute cap cancels it — the behaviour expected
+    when a cap never fires and the capped process is therefore never killed. Issue #27; scheduled
+    into 0.9.1.
+  - >
+    Containment on Windows is the portable floor only. src/sandbox/windows.rs creates no Job Object
+    and calls no Win32 API; it computed its JobLimits and dropped them. 0.9.0 corrects the false
+    claim rather than the gap: the Windows path now reports Backend::PortableFloor instead of
+    Backend::WindowsJobObject, and the module docs, the sandbox module docs, linux.rs and the README
+    no longer claim enforcement that does not happen. The real implementation needs a Win32 binding
+    (a new runtime dependency, which NF1 forbids here) and lands in 0.9.1. Consequently 0.6.0's
+    promise that "the same harness isolates code the same way on mac, linux, and windows" is not yet
+    true, and the crate now says so.
+  - >
+    The declared MSRV was wrong from 0.8.0 onward. 0.8.0 and 0.8.1 are live on crates.io declaring
+    rust-version 1.87 while depending on rmcp 2.2.0, which needs 1.88 for let-chains and declares no
+    rust-version of its own. 0.9.0 corrects the declaration going forward; the published 0.8.x
+    manifests are not corrected, since a published version cannot be edited. Neither is yanked: both
+    build fine on 1.88+, which is what anyone building them today has.
+  - >
+    NF3 holds with less headroom than the number suggests. The 0.442 ms debug dispatch figure is
+    dominated by Policy::check(Act::Exec, name) recompiling its globs to a regex on every call
+    (the standing ponytail: note at src/policy.rs:384) — the tool layer's own share is about 9 us
+    debug. The debug margin against the 1 ms bound is therefore 2.2x, not orders of magnitude, and it
+    scales with the number of exec rules in the policy. Caching compiled globs is the fix if it ever
+    needs to grow, and it belongs to the policy, not to this release.
+  - >
+    Single-file mode gets no skills catalogue. It has one tool and no tool layer, the same line
+    with_mcp and with_tools already draw.
+  - >
+    A skill's relevance is entirely the model's judgement. The harness tells it what exists and never
+    ranks, matches, or auto-injects a body; automatic selection is a context-construction question
+    and belongs to 0.10.0.
+  - >
+    A registered tool runs in the harness's own process with the embedding program's privileges. The
+    policy governs whether it is called, not what it does once running — the same bound 0.8.0 states
+    for a stdio MCP server. Stated in lib.rs, the README, and the CHANGELOG rather than left to be
+    discovered.
+  - >
+    TaskContract has public fields and is not #[non_exhaustive], so the new tools and skills fields
+    do break struct-literal construction. The public API is additive in every other respect (42 items
+    added, 0 removed, 0 signature-changed) and the type documents the builder as the supported path,
+    which is the pattern 0.8.0 set when it added mcp the same way.
+supersedes: null
+next_recommended_version: 0.9.1
+immutable: true
