@@ -5,8 +5,14 @@
 //! [`super::openai_wire`]; this module only adds the endpoint, bearer auth, and
 //! model configuration.
 
+use std::time::Duration;
+
 use super::{openai_wire, CompletionRequest, CompletionResponse, Provider};
 use crate::error::{Error, Result};
+
+/// The request deadline this provider uses unless [`OpenAi::with_timeout`]
+/// replaces it.
+pub use crate::net::REQUEST_TIMEOUT;
 
 const ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
@@ -27,6 +33,17 @@ impl OpenAi {
             model: model.into(),
             endpoint: ENDPOINT.to_string(),
         }
+    }
+
+    /// Set the deadline for one request, replacing the [`REQUEST_TIMEOUT`] default.
+    ///
+    /// For the case [`REQUEST_TIMEOUT`] names and could not serve until now: a
+    /// model slower than ten minutes per completion, or a caller who would rather
+    /// abandon a hung socket sooner than the default does. Rebuilds the client, so
+    /// call it before handing the provider to a run.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.client = crate::net::http_client_with_timeout(timeout);
+        self
     }
 
     /// The same provider pointed at `endpoint` with `timeout` as its deadline, so

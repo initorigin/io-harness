@@ -260,9 +260,17 @@ mod live {
             first_prompt.contains("not instructions"),
             "the block must say what it is, got:\n{first_prompt}"
         );
+        // A note names the step it was written on and nothing else. The run id is
+        // the store's autoincrement row id, so rendering it would make the same
+        // case replayed over the same workspace send different prompt bytes.
         assert!(
-            first_prompt.contains(&format!("run {}", a.run_id)),
-            "a note must name the run that wrote it, got:\n{first_prompt}"
+            first_prompt
+                .contains("- build-command: cargo test --workspace, not cargo build  (step 1)"),
+            "a note must render as key, value and step only, got:\n{first_prompt}"
+        );
+        assert!(
+            !first_prompt.contains(&format!("run {}", a.run_id)),
+            "the prompt must not name the run that wrote a note, got:\n{first_prompt}"
         );
 
         // And the second run did not re-execute the call that established it.

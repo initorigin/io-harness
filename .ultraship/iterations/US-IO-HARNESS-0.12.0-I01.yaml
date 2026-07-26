@@ -1,0 +1,118 @@
+id: US-IO-HARNESS-0.12.0-I01
+timestamp: '2026-07-27T00:00:00Z'
+category:
+  - release-level
+  - implementation-level
+trigger: >
+  F10 was written as "a recorded case killed mid-run and resumed produces the same canonical trace
+  as the uninterrupted replay". Implementing it disproved it, and re-testing then showed the failure
+  is narrower than the first finding claimed. The criterion is true for one of the three loops and
+  false for the other two, for a reason that has nothing to do with replay and cannot be fixed
+  inside this release's scope.
+evidence:
+  - >
+    The workspace loop diverges across a resume. `tests/determinism.rs` drove a recorded case to a
+    one-step cap and resumed it; the resumed run produced a request the recording had never seen,
+    and `Replay` refused it with `Error::Provider { kind: Request }` carrying "the replay has
+    diverged from what was recorded". The prompt shown in that error begins at the contract's own
+    preamble, i.e. the assembled context differs, not the provider.
+  - >
+    The cause is `ContextLedger::new()` at `src/run.rs:1183` and `src/run.rs:1758`. The workspace and
+    sub-agent loops accumulate each turn's observations into a ledger that lives only in memory, and
+    0.7.0's resume restores the step number, the token spend and the elapsed clock but never the
+    ledger. A resumed run therefore re-assembles its context from the workspace instead of from what
+    the first process had accumulated. No replay design changes this: the harness is genuinely asking
+    the model a different question.
+  - >
+    It is NOT general. `a_single_file_replay_does_survive_being_interrupted_and_resumed` passes: a
+    recorded single-file case cut short at one step and resumed reproduces the uninterrupted replay's
+    canonical trace exactly, using a freshly loaded `Replay` so the resume is treated as the harder
+    new-process case. The single-file loop builds its prompt with `bound(&current, ...)` from the
+    file's contents on disk, which survive the process, so it has no in-memory ledger to lose.
+  - >
+    My first report to the owner said "a resume breaks replay" and recommended amending F10 against
+    that. Testing the single-file loop rather than assuming showed that statement was too broad. The
+    correction is recorded here because the broader claim would have understated what the release
+    delivers.
+before:
+  scope:
+    - >
+      F10 — replay survives resume. A recorded case killed mid-run and resumed produces the same
+      canonical trace as the uninterrupted replay, for all loops.
+  assumptions:
+    - >
+      That 0.7.0's resume reconstructs enough of a run's state for the harness to ask the model the
+      same question it asked before the interruption. It reconstructs the durable state — step,
+      spend, elapsed — and not the assembled context, which was never checkpointed because context
+      assembly (0.10.0) came after durability (0.7.0) and nothing since has joined them.
+    - >
+      That deterministic replay is a property of the provider alone. It is not: it is a property of
+      the provider AND of whether the harness reproduces the same request.
+  implementation: >
+    `Replay` keyed on request content, which is correct and unchanged by this iteration. The gap is
+    upstream of it.
+change:
+  summary: >
+    Narrow F10 to what is true and testable, and add the boundary behaviour as the criterion that
+    actually protects a measurement. Replay must survive a resume wherever the harness reproduces the
+    same request — proven for the single-file loop — and must report divergence as a typed,
+    non-retryable error rather than inventing an answer wherever it does not. The context-ledger
+    limitation is recorded in the release's known limitations. Nothing is dropped from the release
+    and no scope moves to a later version; this corrects a criterion that was wrong about the
+    codebase, not work that will not fit.
+  added:
+    - >
+      F10 gains its second half: a resumed run whose assembled context cannot be reproduced must fail
+      loudly rather than be served some other recorded answer. This is the property that stops a
+      diverged replay from producing a plausible trace that reproduces nothing, and it was not
+      previously required by any criterion.
+  removed:
+    - >
+      The claim that a resumed WORKSPACE or SUB-AGENT run reproduces the uninterrupted replay. It is
+      false and cannot be made true without checkpointing the context ledger.
+  deferred:
+    - >
+      Checkpointing the context ledger so a resumed run re-assembles the context it had before the
+      interruption. Destination: roadmap 0.16.0, added by this iteration. It is context-assembly
+      work, which this contract's excluded list already names ("Any change to the 0.10.0 assembler's
+      rules"), and it is larger than a criterion tweak — the ledger would need a durable
+      representation, a restore path in both resume entry points, and its own migration.
+  replaced:
+    - >
+      The assumption that a resumed run is the same run as an uninterrupted one. It is not, and that
+      is now stated in the release record rather than left for a consumer to discover. It matters
+      beyond replay: anything scoring long unattended runs is scoring the runs most likely to have
+      been resumed.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.12.0
+    - 0.16.0
+  tasks:
+    - US-IO-HARNESS-0.12.0-T09
+  dependencies:
+    - >
+      io-eval, when it is built, gets a determinism guarantee that is narrower than the roadmap
+      implied but is stated precisely and is proven by tests in both directions. A scoring harness
+      that replays interrupted workspace runs must either avoid resuming them or accept that the
+      replay will refuse rather than silently diverge — the refusal is the safe failure.
+  resource_effect: >
+    None. The implementation is already complete and tested; this records what it does. It removes no
+    work from 0.12.0 and adds none.
+versioning:
+  previous_target: 0.12.0
+  new_target: 0.12.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Session 2026-07-27. The blocker, the evidence, the narrowed finding and the recommended amendment
+    were reported to the owner in full — including that F10 holds for the single-file loop and fails
+    for the other two, and that I would not rewrite the criterion to match what I had built. The
+    owner replied "continue", which is the approval for this amendment.
+canonical_updates:
+  - products/io-harness/releases/0.12.0.yaml
+  - products/io-harness/roadmap.yaml
+  - products/io-harness/execution/tasks.yaml
+  - products/io-harness/execution/active.yaml
