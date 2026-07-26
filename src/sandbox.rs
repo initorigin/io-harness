@@ -29,7 +29,14 @@
 //!   build host.)*
 //! - **Windows** — *no native backend yet.* The Job Object was designed but
 //!   never implemented (no Win32 call is made), so a Windows run gets the
-//!   portable floor and reports it as such. See [`windows`].
+//!   portable floor and reports it as such. On Windows that floor enforces the
+//!   **wall clock only**: no CPU cap, no memory cap, and no process cap — all
+//!   three are unix `rlimit`/`ps` mechanisms with no Windows equivalent until the
+//!   Job Object lands — and no kernel network boundary either, only the
+//!   best-effort proxy-env strip. What it does have is an ephemeral workdir and a
+//!   wall-clock kill that reaches the whole process tree. A cap that is not
+//!   applied is never reported: [`Cap::Cpu`] and [`Cap::Memory`] are never
+//!   claimed on Windows. See [`windows`].
 //! - **Portable floor** — the weakest backend: filesystem-scoped (a fresh
 //!   ephemeral workdir) and resource-capped, **not a full syscall jail**. Network
 //!   deny is best-effort (proxy env stripped), *not* a kernel boundary. It exists
@@ -104,11 +111,18 @@ impl Cap {
 /// the sandbox entirely. Tighten via the fields for untrusted work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLimits {
-    /// Max CPU seconds before SIGXCPU. `None` = no CPU cap.
+    /// Max CPU seconds before SIGXCPU. `None` = no CPU cap. **Unix only** —
+    /// `RLIMIT_CPU` has no Windows equivalent, so this is not applied there and
+    /// [`Cap::Cpu`] is never reported.
     pub max_cpu_secs: Option<u64>,
     /// Max wall-clock seconds before the run is killed. `None` = no wall cap.
+    /// The one cap enforced on **every** platform, and on Windows the only one —
+    /// leaving it `None` there means the run is bounded by nothing.
     pub max_wall_secs: Option<u64>,
     /// Max resident bytes before the RSS monitor kills the run. `None` = no cap.
+    /// **Unix only** — the monitor reads the process table with `ps`, which does
+    /// not exist on Windows, so this is not applied there and [`Cap::Memory`] is
+    /// never reported.
     pub max_memory_bytes: Option<u64>,
     /// Max concurrent processes in the sandbox. Enforced only by the native
     /// backends that can scope it to the sandbox (Linux pid namespace, Windows
@@ -315,10 +329,20 @@ impl Sandbox for FloorSandbox {
 /// live in one place.
 ///
 /// Caps:
-/// - **CPU** via `RLIMIT_CPU` (unix `pre_exec`) → SIGXCPU → [`Cap::Cpu`].
+/// - **CPU** via `RLIMIT_CPU` (unix `pre_exec`) → SIGXCPU → [`Cap::Cpu`]. *Unix
+///   only* — Windows has no equivalent and applies no CPU cap.
 /// - **Memory** via an RSS poll-and-kill monitor → [`Cap::Memory`] (macOS does
 ///   not enforce address-space rlimits, so a monitor is the portable mechanism).
-/// - **Wall** via a tokio timeout → [`Cap::Wall`].
+///   *Unix only* — the monitor reads the process table with `ps`, which does not
+///   exist on Windows, so no memory cap is applied there.
+/// - **Wall** via a tokio timeout → [`Cap::Wall`]. The one cap that applies on
+///   **every** platform, and therefore the only thing standing between a Windows
+///   run and running forever.
+///
+/// A cap the platform cannot apply is never *claimed*: [`SandboxOutcome::cap_hit`]
+/// only ever names a cap that really fired, and a run on a platform missing the
+/// CPU/memory mechanisms warns once rather than letting a caller believe the
+/// limits it configured are in force.
 async fn run_capped(
     backend: Backend,
     spec: RunSpec<'_>,
@@ -384,8 +408,21 @@ async fn run_capped(
         reason: format!("could not spawn {}: {e}", argv[0]),
     })?;
     let pid = child.id();
+
+    // Say once, out loud, what this platform cannot enforce. The CPU cap is
+    // `RLIMIT_CPU` and the memory cap is an RSS monitor over `ps` — both unix
+    // mechanisms — so a Windows run gets the wall clock and nothing else. A cap
+    // silently not applied is worse than no cap: the caller thinks it has one.
     #[cfg(not(unix))]
-    let _ = pid; // only the unix caps use the raw pid; kill_on_drop covers the rest
+    if spec.limits.max_cpu_secs.is_some() || spec.limits.max_memory_bytes.is_some() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                "sandbox: the CPU and memory caps are unix-only mechanisms and are NOT applied \
+                 on this platform; only the wall-clock cap is enforced"
+            )
+        });
+    }
 
     // A flag set by whichever killer fired, so the outcome can name the cap.
     const NONE: u8 = 0;
@@ -428,27 +465,37 @@ async fn run_capped(
             _ => None,
         }
     };
+    // No monitor where it cannot measure: `process_tree` is unix-only, so on
+    // Windows there is no RSS poller at all rather than one that reads nothing
+    // and quietly never fires.
     #[cfg(not(unix))]
     let mem_monitor: Option<tokio::task::JoinHandle<()>> = None;
 
     // Wall-clock cap: the OS-neutral backstop that always kills.
+    //
+    // The wait runs as its own task so the *timeout does not own the child*.
+    // Letting the timeout own it (the shape until 0.9.1) means expiry drops the
+    // child first, and the only kill left is `kill_on_drop` — which terminates
+    // just the process the harness spawned. Its descendants survive: on unix
+    // they reparent, and on Windows they also keep the stdout/stderr pipes open,
+    // which strands the blocking pipe reads tokio uses there and hangs the
+    // caller's runtime long after the cap "fired". Holding the child alive past
+    // expiry lets [`kill_tree`] reach the whole tree by pid instead.
+    let waiter = tokio::spawn(async move { child.wait_with_output().await });
     let wall = spec.limits.max_wall_secs;
-    let output = match wall {
+    let waited = match wall {
         Some(secs) => {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(secs),
-                child.wait_with_output(),
-            )
-            .await
-            {
-                Ok(res) => res?,
+            match tokio::time::timeout(std::time::Duration::from_secs(secs), waiter).await {
+                Ok(joined) => joined,
                 Err(_elapsed) => {
                     flag.store(WALL, Ordering::SeqCst);
-                    #[cfg(unix)]
-                    if let Some(pid) = pid {
-                        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+                    // Dropping the JoinHandle detaches the wait, it does not
+                    // cancel it — the child is still running and still killable.
+                    kill_tree(pid);
+                    if let Some(m) = mem_monitor {
+                        m.abort();
                     }
-                    // Reap so nothing is orphaned; output is lost on a wall kill.
+                    // Output is lost on a wall kill; the detached wait reaps.
                     return Ok(SandboxOutcome {
                         backend,
                         argv,
@@ -460,8 +507,11 @@ async fn run_capped(
                 }
             }
         }
-        None => child.wait_with_output().await?,
+        None => waiter.await,
     };
+    let output = waited.map_err(|e| crate::error::Error::Sandbox {
+        reason: format!("the sandbox wait task did not finish: {e}"),
+    })??;
 
     if let Some(m) = mem_monitor {
         m.abort();
@@ -529,6 +579,37 @@ fn set_rlimit(resource: u32, value: Option<u64>) -> std::io::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Kill `pid` and everything it spawned, on whatever OS this is.
+///
+/// Killing only `pid` is not enough anywhere: a payload run through a shell puts
+/// the real work in a *child*, so the single kill takes the shell and reparents
+/// the work. Unix walks [`process_tree`] and signals descendants first (killing
+/// the root first would orphan them before they can be found). Windows has
+/// neither signals nor `ps`, so it uses the tree kill the OS itself ships,
+/// `taskkill /T` — a system utility, not a new dependency. Best-effort by
+/// design: a process that is already gone is a success, not an error.
+fn kill_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(unix)]
+    {
+        for (p, _) in process_tree(pid).unwrap_or_default().iter().rev() {
+            unsafe { libc::kill(*p as libc::pid_t, libc::SIGKILL) };
+        }
+        // Always signal the root, even when the process table could not be read.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Stdio;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// Every process in `pid`'s tree — the process and its descendants — with each
@@ -689,6 +770,9 @@ mod tests {
         assert_eq!(cfg, back);
     }
 
+    // The CPU cap is `RLIMIT_CPU`, a unix mechanism with no Windows equivalent;
+    // asserting it there would assert a cap the floor deliberately never applies.
+    #[cfg(unix)]
     #[tokio::test]
     async fn cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -707,6 +791,9 @@ mod tests {
         assert!(!out.success());
     }
 
+    // The memory cap is an RSS monitor over `ps`; both the monitor and `ps` are
+    // unix-only, so this is a unix mechanism asserted on unix.
+    #[cfg(unix)]
     #[tokio::test]
     async fn memory_cap_kills_a_heap_hog_and_names_the_memory_cap() {
         let dir = tempfile::tempdir().unwrap();
@@ -734,6 +821,8 @@ mod tests {
         assert!(!out.success());
     }
 
+    // Same unix-only mechanism, exercised through a fork. See above.
+    #[cfg(unix)]
     #[tokio::test]
     async fn memory_cap_kills_a_hog_the_shell_forked() {
         let dir = tempfile::tempdir().unwrap();
@@ -759,6 +848,76 @@ mod tests {
             out.cap_hit,
             Some(Cap::Memory),
             "a forked hog must still hit the memory cap, got {out:?}"
+        );
+        assert!(!out.success());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_wall_clock_kill_reaches_the_children_the_run_forked() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived");
+        // The payload forks a child that outlives the wall clock and leaves a
+        // file behind if it is still alive. Killing only the pid the harness
+        // spawned reparents that child and it goes on to write the file.
+        let argv = vec![
+            "sh".into(),
+            "-c".into(),
+            "(sleep 4; touch survived) & wait".into(),
+        ];
+        let limits = SandboxLimits {
+            max_wall_secs: Some(1),
+            max_cpu_secs: None,
+            ..SandboxLimits::default()
+        };
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.cap_hit,
+            Some(Cap::Wall),
+            "wall must kill it, got {out:?}"
+        );
+        assert!(!out.success());
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        assert!(
+            !marker.exists(),
+            "a forked child must not outlive the wall-clock kill"
+        );
+    }
+
+    // What is actually true on Windows: no CPU cap and no memory cap are applied
+    // there (both are unix mechanisms), so the wall clock is the only thing that
+    // can stop an endless run — and the outcome must name the cap that really
+    // fired rather than one of the two nobody enforced.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_enforces_the_wall_clock_and_claims_no_cap_it_did_not_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        // `for /L` with a step of 0 never terminates. Passed as separate argv
+        // entries, none containing a space, so nothing depends on how `cmd.exe`
+        // re-parses a quoted command line.
+        let argv: Vec<String> = [
+            "cmd", "/C", "for", "/L", "%i", "in", "(1,0,2)", "do", "@rem",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let limits = SandboxLimits {
+            max_cpu_secs: Some(1),
+            max_memory_bytes: Some(1024 * 1024),
+            max_wall_secs: Some(5),
+            ..SandboxLimits::default()
+        };
+        let out = FloorSandbox
+            .run(spec(&argv, dir.path(), &limits))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.cap_hit,
+            Some(Cap::Wall),
+            "the wall clock is the only cap Windows applies, got {out:?}"
         );
         assert!(!out.success());
     }
