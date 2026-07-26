@@ -863,7 +863,7 @@ async fn dispatching_a_registered_tool_costs_under_a_millisecond_over_a_direct_c
     println!(
         "NF3 dispatch: {CALLS} calls harness {harness_elapsed:?}, direct {direct_elapsed:?}, \
          overhead {overhead_ns} ns/call (toolbox half alone {toolbox_elapsed:?}; the rest is the \
-         policy's Act::Exec check, which compiles its globs per call)"
+         policy's Act::Exec check, which matches its globs against the tool name)"
     );
     assert!(
         overhead_ns < 1_000_000,
