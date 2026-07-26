@@ -1,0 +1,50 @@
+product: io-harness
+version: 0.10.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The user's own stated capacity for this session is three releases — 0.10.0, 0.11.0 and 0.12.0 —
+      with the instruction to parallelise across subagents and commit constantly. That is a
+      user-estimate, not anything measured here, and it is what makes scope discipline rather than
+      scope size the risk: 0.10.0 must not absorb work that belongs to the two releases behind it.
+    - >
+      The change is concentrated, not spread. The accumulator is two `String` declarations
+      (`src/run.rs:775`, `1122`) read through one function (`workspace_user_prompt`, `src/run.rs:2087`),
+      so the ledger has a single seam to replace rather than a pattern scattered across the crate.
+    - >
+      The store already absorbs additive schema the way memory needs: nine tables created idempotently
+      in `Store::from_conn`, `PRAGMA user_version` used only for checkpoint compatibility. Memory is a
+      new table and four methods, not a migration framework.
+    - >
+      Per-result capping is half-built already — `cap_result` and `TOOL_RESULT_CAP` exist and are
+      applied at context entry for MCP, registered tools and skill bodies. T04 unifies four constants
+      and covers the two kinds that were missed; it does not invent the mechanism.
+    - >
+      The suite is strong where this release is dangerous: `tests/checkpoint.rs` (10 tests) and
+      `tests/subagents.rs` (9) cover the two features that read the accumulator indirectly, so a
+      regression in 0.7.0 resume or 0.5.0 composition fails loudly rather than silently.
+    - >
+      Every acceptance criterion except O4 is reachable against a mock provider, which the suite
+      already uses in all twelve integration files. Only the before/after evidence needs live
+      inference.
+  major_cost_drivers:
+    - >
+      `src/run.rs` is 2,193 lines with zero unit tests; the loop is covered only from `tests/`. The
+      assembler's own tests are new coverage at a boundary that has never had any (NF7), which is why
+      it is in scope rather than optional.
+    - >
+      Compaction quality is a judgment call no size assertion can check. The live before/after
+      comparison is the only instrument, and it costs real inference twice on the same task.
+    - >
+      `CompletionRequest` has no message-list — every turn is a stateless rebuild of `{system, user}`.
+      Assembly must therefore produce a single string, which is simpler, but it means there is no
+      per-message structure to hang compaction markers on and the markers have to read well as text.
+    - >
+      Token estimation has no prior art in the crate: every existing number is post-hoc provider usage,
+      and a silent provider is counted as zero. The estimator is new surface whose accuracy cannot be
+      verified except by recording drift.
+  recommended_scope_change: null
