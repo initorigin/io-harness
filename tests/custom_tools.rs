@@ -7,13 +7,15 @@
 //! through the tree. If a shape only works for the easy case, it fails here
 //! first.
 
+use std::hint::black_box;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox};
 use io_harness::{
-    resume_tree, run_tree, run_with, ApproveAll, Containment, Policy, Provider, Store,
+    resume_tree, run_tree, run_with, Act, ApproveAll, Containment, Effect, Policy, Provider, Store,
     TaskContract, ToolSpec, Verification,
 };
 use serde_json::json;
@@ -769,6 +771,104 @@ async fn a_toolbox_survives_a_tree_resume_and_still_reaches_a_child() {
             .iter()
             .any(|s| s.tool_call.contains("lookup_order")),
         "the resumed child's call is in its own trace"
+    );
+}
+
+// ---------------------------------------------------------------- NF3: the harness is not the cost
+
+/// NF3 — dispatching a registered tool that returns immediately costs under 1 ms
+/// per call over calling the same closure directly, across 1000 calls.
+///
+/// What is timed is the harness's own dispatch path, exercised through the
+/// public API in the order `run::dispatch` uses it: `Toolbox::owns` (the match
+/// guard), the policy's `Act::Exec` check on the tool's name (what `gate` does
+/// for an allowed call), `Toolbox::get`, and the boxed-future `Tool::invoke`
+/// await. The baseline is the same closure `Echo` wraps, called straight, over
+/// the same `serde_json::Value`.
+///
+/// Deliberately *not* a whole run-loop turn per call. A turn also builds a
+/// prompt, calls a provider, and commits a step record to SQLite — real costs,
+/// but not the harness's dispatch cost, and letting a mock provider and a store
+/// write dominate the number would flatter the claim rather than test it. What
+/// is excluded from the measured path is the result cap and the observation
+/// formatting (`cap_result` is crate-private); both are a length check and two
+/// `format!`s on a short string. Numbers on the machine that recorded this are
+/// in `.ultraship/products/io-harness/evidence/0.9.0/latency.txt`.
+#[tokio::test]
+async fn dispatching_a_registered_tool_costs_under_a_millisecond_over_a_direct_call() {
+    const CALLS: u32 = 1000;
+    let args = json!({ "text": "ping" });
+
+    // The closure `Echo::invoke` wraps, with no harness around it.
+    let direct = |a: &serde_json::Value| {
+        a.get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    // Three registered tools with `echo` last: `owns`/`get` scan in registration
+    // order, so this times the worst position rather than the best.
+    let toolbox = Toolbox::new()
+        .with(Ledger::new("lookup_order", "shipped"))
+        .with(Fixed::new("firehose", "x"))
+        .with(Echo);
+    let policy = open_policy();
+
+    // The path is a path, not an assertion, in the timed loops below.
+    assert!(toolbox.owns("echo"));
+    assert_eq!(policy.check(Act::Exec, "echo").effect, Effect::Allow);
+    assert_eq!(
+        toolbox.get("echo").unwrap().invoke(&args).await.unwrap(),
+        direct(&args)
+    );
+
+    let direct_elapsed = {
+        let start = Instant::now();
+        for _ in 0..CALLS {
+            black_box(direct(black_box(&args)));
+        }
+        start.elapsed()
+    };
+
+    // The toolbox half alone — name lookup, trait-object indirection, boxed
+    // future — so the number below can be attributed rather than just reported.
+    let toolbox_elapsed = {
+        let start = Instant::now();
+        for _ in 0..CALLS {
+            let name = black_box("echo");
+            black_box(toolbox.owns(name));
+            let out = toolbox.get(name).unwrap().invoke(black_box(&args)).await;
+            black_box(out.unwrap());
+        }
+        start.elapsed()
+    };
+
+    let harness_elapsed = {
+        let start = Instant::now();
+        for _ in 0..CALLS {
+            let name = black_box("echo");
+            black_box(toolbox.owns(name));
+            black_box(policy.check(Act::Exec, name));
+            let out = toolbox.get(name).unwrap().invoke(black_box(&args)).await;
+            black_box(out.unwrap());
+        }
+        start.elapsed()
+    };
+
+    // Signed: a run where the baseline lands slower than the harness path is
+    // noise, not a negative overhead, and must not wrap around.
+    let overhead_ns = (harness_elapsed.as_nanos() as i128 - direct_elapsed.as_nanos() as i128)
+        / i128::from(CALLS);
+    println!(
+        "NF3 dispatch: {CALLS} calls harness {harness_elapsed:?}, direct {direct_elapsed:?}, \
+         overhead {overhead_ns} ns/call (toolbox half alone {toolbox_elapsed:?}; the rest is the \
+         policy's Act::Exec check, which compiles its globs per call)"
+    );
+    assert!(
+        overhead_ns < 1_000_000,
+        "dispatch must add under 1 ms per call; added {overhead_ns} ns \
+         (harness {harness_elapsed:?} vs direct {direct_elapsed:?} over {CALLS} calls)"
     );
 }
 

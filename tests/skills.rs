@@ -190,6 +190,107 @@ fn the_catalog_carries_names_and_descriptions_but_no_bodies() {
     assert!(!catalog.contains("SECRET BODY LINE"));
 }
 
+// ---------------------------------------------------------------- NF3: discovery is cheap, and once
+
+/// NF3 — discovery over a 32-skill directory completes in under 50 ms.
+///
+/// 32 is half the [`MAX_SKILLS`] cap, in both layouts, each file carrying
+/// frontmatter and a body — so the timed work is 32 opens, 32 reads, 32
+/// frontmatter parses, and a canonicalize each. The measured number on the
+/// machine that recorded this is in
+/// `.ultraship/products/io-harness/evidence/0.9.0/latency.txt`; the bound
+/// asserted here is the criterion's, with room for a loaded CI box.
+#[test]
+fn discovery_over_a_32_skill_directory_is_under_50ms() {
+    let dir = tmp();
+    for i in 0..32 {
+        let body = format!(
+            "---\nname: skill-{i:02}\ndescription: what skill {i:02} is for\n---\n\n\
+             # Skill {i:02}\n\n{}\n",
+            "a paragraph of guidance. ".repeat(40)
+        );
+        // Both layouts, so neither branch of discovery is timed out of the run.
+        if i % 2 == 0 {
+            write(&dir.path().join(format!("skill-{i:02}.md")), &body);
+        } else {
+            write(&dir.path().join(format!("skill-{i:02}/SKILL.md")), &body);
+        }
+    }
+
+    let start = std::time::Instant::now();
+    let skills = Skills::discover(dir.path()).unwrap();
+    let elapsed = start.elapsed();
+
+    assert_eq!(skills.len(), 32, "got {:?}", skills.names());
+    println!("NF3 discovery: 32 skills in {elapsed:?}");
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "discovery over 32 skills must take under 50 ms, took {elapsed:?}"
+    );
+}
+
+/// NF3 — discovery happens once per run, not once per step.
+///
+/// Structural proof rather than a timing one: the skills directory is *changed
+/// while the run is in progress*. Step 1 writes a new skill file into it with
+/// the ordinary `write_file` tool; if discovery ran per step, step 2's catalogue
+/// would list it and `read_skill` would find it. Neither happens, because
+/// `contract.discover_skills()` is called once at each entry point in
+/// `src/run.rs` and the catalogue is folded into the system prompt before the
+/// step loop begins — the `Skills` a run uses is the snapshot taken at run
+/// start.
+#[tokio::test]
+async fn discovery_happens_once_per_run_not_once_per_step() {
+    let root = tmp();
+    // Inside the workspace root, so the agent's own write_file can reach it.
+    let dir = root.path().join("skills");
+    two_skills(&dir);
+    let contract = never_passes(root.path(), &dir).with_max_steps(3);
+    let provider = MockScript::scripted(vec![
+        vec![call(
+            "write_file",
+            json!({
+                "path": "skills/gamma.md",
+                "content": "---\nname: gamma\ndescription: added mid-run\n---\n\nGAMMA BODY LINE\n"
+            }),
+        )],
+        vec![call("read_skill", json!({ "name": "gamma" }))],
+    ]);
+
+    run_with(
+        &contract,
+        &provider,
+        &Store::memory().unwrap(),
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        dir.join("gamma.md").is_file(),
+        "the run must actually have added a skill file mid-run"
+    );
+    for i in 0..3 {
+        assert!(
+            !provider.request(i).system.contains("gamma"),
+            "the catalogue is built once at run start; turn {i} must not list a skill added \
+             afterwards, got: {}",
+            provider.request(i).system
+        );
+    }
+    let after_read = provider.request(2);
+    assert!(
+        after_read.user.contains("there is no skill named"),
+        "read_skill must see the run-start snapshot, not the directory as it is now, got: {}",
+        after_read.user
+    );
+    assert!(
+        !after_read.user.contains("GAMMA BODY LINE"),
+        "a skill added mid-run must not be loadable in the same run"
+    );
+}
+
 // ---------------------------------------------------------------- F9: run-start failure
 
 /// F9 — a skills directory that is not there fails the run with a Config error
