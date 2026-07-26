@@ -251,8 +251,8 @@ pub use sandbox::{
 pub use skills::{Skill, Skills};
 pub use state::{
     CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent, RunStatus,
-    SandboxEvent, StepRecord, Store, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
-    MEMORY_MAX_ENTRY_CHARS,
+    SandboxEvent, StepRecord, Store, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS,
+    MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
 };
 pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

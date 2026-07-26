@@ -639,10 +639,35 @@ impl ContextEvent {
     }
 }
 
+/// How long a contended statement waits for the writer before giving up, set on
+/// every store opened from a file. Without it rusqlite's default is to fail
+/// immediately with `SQLITE_BUSY`, which turns a moment of contention into an
+/// error rather than a short wait.
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
+    ///
+    /// Sets `journal_mode = WAL` and a [`BUSY_TIMEOUT`], so a second process may
+    /// read the trace while a run is still writing it without either side
+    /// blocking or aborting the other. Before 0.12.0 this was a bare
+    /// `Connection::open`, which left every reader to configure the file itself
+    /// — reaching around this API to do it, and having to do it before the
+    /// harness opened the file at all.
+    ///
+    /// WAL is a persistent property of the database file, not of this
+    /// connection: a store opened once by 0.12.0 stays in WAL mode afterwards.
+    /// That is why it is documented as a migration.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
-        Self::from_conn(Connection::open(path)?)
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
+        // `query_row` rather than `execute`: this pragma returns the resulting
+        // mode as a row, and rusqlite's `execute` rejects a statement that
+        // yields rows. The returned mode is not asserted — a database on a
+        // filesystem that cannot support WAL stays in its previous journal mode
+        // and still works, just without concurrent readers.
+        let _: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
+        Self::from_conn(conn)
     }
 
     /// An in-memory store, for tests and throwaway runs.
