@@ -22,7 +22,10 @@ use io_harness::{run, Error, OpenRouter, Store, TaskContract, Verification};
 struct Down;
 
 impl Provider for Down {
-    async fn complete(&self, _request: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    async fn complete(
+        &self,
+        _request: CompletionRequest,
+    ) -> io_harness::Result<CompletionResponse> {
         Err(Error::provider_status(503, None, "service unavailable"))
     }
     fn name(&self) -> &str {
@@ -62,6 +65,9 @@ async fn main() -> io_harness::Result<()> {
             println!("  step {}: {}", e.step, e.detail.unwrap_or_default());
         }
     }
-    println!("\nfinal file:\n{}", std::fs::read_to_string(src.join("a.rs"))?);
+    println!(
+        "\nfinal file:\n{}",
+        std::fs::read_to_string(src.join("a.rs"))?
+    );
     Ok(())
 }

@@ -318,7 +318,21 @@ mod failures {
         drop(dead);
 
         let (kind, status, _) = failure(openrouter(&url).complete(request()).await);
-        assert_eq!(kind, Kind::Transport);
+        // `Transport` on unix, where the stack refuses immediately. On Windows a
+        // connect to a closed local port is retransmitted rather than refused, so
+        // the client's own deadline fires first and the kind is `Timeout`. Both mean
+        // the request never reached a model and both are retryable, which is the
+        // property that matters; which of the two the OS reports is not ours to
+        // decide, and asserting one made the Windows leg red for a platform
+        // difference rather than a defect.
+        assert!(
+            matches!(kind, Kind::Transport | Kind::Timeout),
+            "a connection that never opened must be Transport or Timeout, got {kind:?}"
+        );
+        assert!(
+            kind.is_retryable(),
+            "a connection that never opened is worth another attempt"
+        );
         assert_eq!(
             status, None,
             "a connection that never happened has no status"
