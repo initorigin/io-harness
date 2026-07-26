@@ -202,7 +202,7 @@ tasks:
   why_required: 'This is the release''s headline: an embedding application is called as the run happens
     instead of polling a file. The zero-cost-when-absent half is not optional — a visibility feature that
     changes what an unobserved run does is a regression however well it reports.'
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T05
   acceptance_criteria:
@@ -243,6 +243,11 @@ tasks:
   - 'OPEN: ToolCall, Refused, ApprovalRequested, ApprovalDecided, MemoryWrote, Sandbox and Mcp were declared
     but never emitted -- the enum promised more than the run delivered. In progress; the sites are in
     dispatch()/gate() in run.rs plus verify.rs and mcp.rs.'
+  - All seventeen EventKind variants now emitted. ToolCall, Refused, ApprovalRequested, ApprovalDecided
+    and MemoryWrote were declared and never fired from run.rs; Sandbox and Mcp never fired from verify.rs
+    and mcp.rs. A declared variant nothing emits is a lie in the public API. The plan wrongly assumed
+    these were leaf sites in other files -- dispatch() and gate() are in run.rs. 12 observe tests, each
+    asserting the event against the stored row rather than a literal.
 - id: US-IO-HARNESS-0.12.0-T07
   summary: Cancellation the caller asks for. The observer's return value can stop the run, which ends
     as a terminal outcome, records it, leaves `runs.status` not `running`, and stays resumable. Today
@@ -378,7 +383,7 @@ tasks:
     follow-up query and latency is not recorded at all, so the fourth field of the deliverable is the
     one genuinely new write. Written by `finish_run` rather than assembled by the caller because an escalated
     run returns `Err` and never reaches a `RunResult`.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.12.0-T02
   acceptance_criteria:
@@ -422,6 +427,11 @@ tasks:
   - A paused run gets no summary until it really ends. A pre-0.12.0 run reports None rather than zeroes.
     7 tests, every field asserted against an independently computed value, duration as a bound.
   - 'OPEN: RunResult does not yet carry the summary (F13).'
+  - 'RunResult::summary(&store) delivers the record to the caller. A method rather than the field the
+    contract anticipated: a field would have to be filled at every return site including the Err paths
+    that never build a RunResult, so the two could drift. Consequence worth noting -- with no field added,
+    this release takes NO breaking change at all, and the CHANGELOG''s promised migration note was removed
+    because the break no longer exists.'
 - id: US-IO-HARNESS-0.12.0-T11
   summary: Correct every false claim in `README.md` — its structure is 0.15.0's subject, its accuracy
     is this release's. No `git` tool (built-ins are `write_file`, `grep`, `find`, `read_file`, `remember`,
