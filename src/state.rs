@@ -497,6 +497,133 @@ impl McpEvent {
     }
 }
 
+// ---- 0.10.0: durable cross-run memory ----
+
+/// One durable memory entry: a fact or decision an agent wrote deliberately,
+/// keyed to a workspace rather than to a run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryEntry {
+    /// The name it is recalled by, unique within its workspace.
+    pub key: String,
+    /// The remembered text.
+    pub value: String,
+    /// The run that wrote it, so a later reader knows where a fact came from.
+    pub run_id: i64,
+    /// The step of that run which wrote it.
+    pub step: u32,
+    /// UTC write time, refreshed on every overwrite so ordering is by recency.
+    pub created_at: String,
+}
+
+/// Most entries one workspace may hold.
+pub const MEMORY_MAX_ENTRIES: usize = 64;
+/// Most characters one workspace's entries may total.
+pub const MEMORY_MAX_CHARS: usize = 16_000;
+
+/// Most characters one entry may hold. A longer value is cut down to this and
+/// marked, never refused — a too-long fact is still worth remembering.
+pub const MEMORY_MAX_ENTRY_CHARS: usize = MEMORY_MAX_CHARS / 8;
+
+/// The visible marker appended to a value that was cut to the per-entry ceiling.
+const MEMORY_TRUNCATED: &str = "…[truncated]";
+
+/// Cut `value` to [`MEMORY_MAX_ENTRY_CHARS`] on a char boundary, marking the
+/// cut. Returned unchanged when it already fits.
+fn truncate_memory_value(value: &str) -> String {
+    if value.chars().count() <= MEMORY_MAX_ENTRY_CHARS {
+        return value.to_string();
+    }
+    let keep = MEMORY_MAX_ENTRY_CHARS - MEMORY_TRUNCATED.chars().count();
+    let mut out: String = value.chars().take(keep).collect();
+    out.push_str(MEMORY_TRUNCATED);
+    out
+}
+
+// ---- 0.10.0: what the context assembler decided ----
+
+/// One decision the context assembler made: the section it built for a turn, or
+/// a stale read it re-read (or was refused).
+///
+/// One row per turn plus one per re-read — never one per elided observation,
+/// which would put a row explosion in the trace to say nothing new. Together
+/// they answer "why did the model not see the thing it read at step 3", and
+/// `est_tokens` beside `reported_tokens` is what records the estimator's drift
+/// from the provider's own count (see [`crate::context::estimate_tokens`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextEvent {
+    /// The step it belongs to.
+    pub step: u32,
+    /// `"assembled"`, `"reread"`, or `"reread_refused"`.
+    pub kind: String,
+    /// For `"assembled"`, the turn's summary (`carried=3 stubbed=5 reread=1`);
+    /// for a re-read, the path and why it was or was not re-read.
+    pub detail: Option<String>,
+    /// The assembler's own estimate for the section it built.
+    pub est_tokens: Option<u64>,
+    /// What the provider said the request actually cost, when it says anything.
+    pub reported_tokens: Option<u64>,
+}
+
+impl ContextEvent {
+    /// The section built for one turn.
+    pub fn assembled(step: u32, detail: impl Into<String>, est_tokens: u64) -> Self {
+        Self {
+            step,
+            kind: "assembled".into(),
+            detail: Some(detail.into()),
+            est_tokens: Some(est_tokens),
+            reported_tokens: None,
+        }
+    }
+
+    /// A stale read was re-read at assembly time.
+    pub fn reread(step: u32, detail: impl Into<String>) -> Self {
+        Self {
+            step,
+            kind: "reread".into(),
+            detail: Some(detail.into()),
+            est_tokens: None,
+            reported_tokens: None,
+        }
+    }
+
+    /// A stale read could not be re-read — the policy refused it, or it is gone.
+    pub fn reread_refused(step: u32, detail: impl Into<String>) -> Self {
+        Self {
+            step,
+            kind: "reread_refused".into(),
+            detail: Some(detail.into()),
+            est_tokens: None,
+            reported_tokens: None,
+        }
+    }
+
+    /// The agent recorded a durable note for later runs over this workspace.
+    pub fn memory_write(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_write", step, detail)
+    }
+
+    /// A note was dropped to hold the workspace's memory caps.
+    pub fn memory_evict(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_evict", step, detail)
+    }
+
+    /// Notes from earlier runs were carried into this turn's context.
+    pub fn memory_recall(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_recall", step, detail)
+    }
+
+    fn of(kind: &str, step: u32, detail: impl Into<String>) -> Self {
+        Self {
+            step,
+            kind: kind.into(),
+            detail: Some(detail.into()),
+            est_tokens: None,
+            reported_tokens: None,
+        }
+    }
+}
+
 impl Store {
     /// Open (creating if absent) a store at `path` and ensure the schema exists.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
@@ -655,6 +782,44 @@ impl Store {
                  ok     INTEGER,
                  millis INTEGER,
                  detail TEXT
+             );",
+        )?;
+
+        // 0.10.0: durable cross-run memory — facts and decisions an agent wrote
+        // deliberately, keyed to a *workspace* instead of a run, so a later run
+        // recalls what an earlier one learned. New table only, so a 0.9.1
+        // database gains it and a 0.9.1 binary, which never queries it, still
+        // reads a migrated database. Deliberately NOT a CHECKPOINT_FORMAT bump:
+        // no checkpoint layout changed, and bumping it would make
+        // [`Store::check_resumable`] refuse every 0.9.1 checkpoint.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory (
+                 id         INTEGER PRIMARY KEY,
+                 workspace  TEXT NOT NULL,
+                 key        TEXT NOT NULL,
+                 value      TEXT NOT NULL,
+                 run_id     INTEGER NOT NULL,
+                 step       INTEGER NOT NULL,
+                 created_at TEXT NOT NULL,
+                 UNIQUE(workspace, key)
+             );",
+        )?;
+
+        // 0.10.0: what the context assembler decided each turn — one row per turn
+        // plus one per re-read. New table only, so a 0.9.1 database gains it and a
+        // 0.9.1 binary, which never queries it, still opens and resumes a migrated
+        // database. Deliberately NOT a `CHECKPOINT_FORMAT` bump: nothing about a
+        // checkpoint's layout changed, and bumping it would refuse every 0.9.1
+        // store on resume for an additive audit table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS context_events (
+                 id              INTEGER PRIMARY KEY,
+                 run_id          INTEGER NOT NULL,
+                 step            INTEGER NOT NULL,
+                 kind            TEXT NOT NULL,
+                 detail          TEXT,
+                 est_tokens      INTEGER,
+                 reported_tokens INTEGER
              );",
         )?;
 
@@ -872,6 +1037,53 @@ impl Store {
                 ok: r.get(4)?,
                 millis: r.get::<_, Option<i64>>(5)?.map(|m| m as u64),
                 detail: r.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record one context-assembly event against a run.
+    pub fn record_context_event(&self, run_id: i64, e: &ContextEvent) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO context_events (run_id, step, kind, detail, est_tokens, reported_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                run_id,
+                e.step,
+                &e.kind,
+                &e.detail,
+                e.est_tokens.map(|n| n as i64),
+                e.reported_tokens.map(|n| n as i64),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Fill in what the provider said one turn's request cost, once the
+    /// completion has returned. The estimate is left as it was: the pair is the
+    /// point — one row carries both numbers, so drift is readable.
+    pub fn record_context_reported(&self, run_id: i64, step: u32, reported: u64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE context_events SET reported_tokens = ?1
+             WHERE run_id = ?2 AND step = ?3 AND kind = 'assembled'",
+            (reported as i64, run_id, step),
+        )?;
+        Ok(())
+    }
+
+    /// Every context-assembly event recorded for a run, in order.
+    pub fn context_events(&self, run_id: i64) -> Result<Vec<ContextEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT step, kind, detail, est_tokens, reported_tokens
+             FROM context_events WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(ContextEvent {
+                step: r.get::<_, i64>(0)? as u32,
+                kind: r.get(1)?,
+                detail: r.get(2)?,
+                est_tokens: r.get::<_, Option<i64>>(3)?.map(|n| n as u64),
+                reported_tokens: r.get::<_, Option<i64>>(4)?.map(|n| n as u64),
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
@@ -1258,6 +1470,128 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- 0.10.0: durable cross-run memory ----
+
+    /// Write or replace `key` for `workspace`, attributed to the run and step
+    /// that wrote it. A value past [`MEMORY_MAX_ENTRY_CHARS`] is truncated with
+    /// a visible marker rather than refused. Returns the keys evicted to stay
+    /// inside the caps, oldest first — the caller records the eviction in the
+    /// trace; this never writes a trace row itself.
+    pub fn memory_put(
+        &self,
+        workspace: &str,
+        key: &str,
+        value: &str,
+        run_id: i64,
+        step: u32,
+    ) -> Result<Vec<String>> {
+        let value = truncate_memory_value(value);
+        // An overwrite re-attributes the entry and refreshes `created_at`, so
+        // recency ordering reflects the latest write rather than the first.
+        self.conn.execute(
+            "INSERT INTO memory (workspace, key, value, run_id, step, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             ON CONFLICT(workspace, key) DO UPDATE SET
+                 value      = excluded.value,
+                 run_id     = excluded.run_id,
+                 step       = excluded.step,
+                 created_at = excluded.created_at",
+            (workspace, key, &value, run_id, step),
+        )?;
+        self.enforce_memory_caps(workspace, key)
+    }
+
+    /// Evict this workspace's oldest entries until both caps hold, never the
+    /// entry `keep` (the one just written — evicting it would make a write a
+    /// silent no-op). Returns the evicted keys in eviction order.
+    fn enforce_memory_caps(&self, workspace: &str, keep: &str) -> Result<Vec<String>> {
+        // LENGTH() on TEXT counts characters, not bytes — the cap is in chars.
+        let rows: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT key, LENGTH(value) FROM memory WHERE workspace = ?1
+                 ORDER BY created_at ASC, id ASC",
+            )?;
+            let rows = stmt.query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+
+        let mut count = rows.len();
+        let mut chars: i64 = rows.iter().map(|(_, n)| *n).sum();
+        let mut evicted = Vec::new();
+        for (key, n) in &rows {
+            if count <= MEMORY_MAX_ENTRIES && chars <= MEMORY_MAX_CHARS as i64 {
+                break;
+            }
+            if key == keep {
+                continue;
+            }
+            self.conn.execute(
+                "DELETE FROM memory WHERE workspace = ?1 AND key = ?2",
+                (workspace, key),
+            )?;
+            count -= 1;
+            chars -= n;
+            evicted.push(key.clone());
+        }
+        Ok(evicted)
+    }
+
+    /// Every entry for `workspace`, oldest first. Never another workspace's.
+    pub fn memory_list(&self, workspace: &str) -> Result<Vec<MemoryEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, value, run_id, step, created_at FROM memory
+             WHERE workspace = ?1 ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([workspace], |r| {
+            Ok(MemoryEntry {
+                key: r.get(0)?,
+                value: r.get(1)?,
+                run_id: r.get(2)?,
+                step: r.get::<_, i64>(3)? as u32,
+                created_at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// One entry of `workspace` by key, if it holds one.
+    pub fn memory_get(&self, workspace: &str, key: &str) -> Result<Option<MemoryEntry>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT key, value, run_id, step, created_at FROM memory
+                 WHERE workspace = ?1 AND key = ?2",
+                (workspace, key),
+                |r| {
+                    Ok(MemoryEntry {
+                        key: r.get(0)?,
+                        value: r.get(1)?,
+                        run_id: r.get(2)?,
+                        step: r.get::<_, i64>(3)? as u32,
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .ok())
+    }
+
+    /// Forget one entry of `workspace`. True when an entry was removed.
+    pub fn memory_delete(&self, workspace: &str, key: &str) -> Result<bool> {
+        let n = self.conn.execute(
+            "DELETE FROM memory WHERE workspace = ?1 AND key = ?2",
+            (workspace, key),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Removes every entry for `workspace`; returns how many. Other workspaces
+    /// keep theirs.
+    pub fn memory_clear(&self, workspace: &str) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM memory WHERE workspace = ?1", [workspace])?)
     }
 }
 
@@ -1721,5 +2055,157 @@ mod tests {
         assert_eq!(store.status(1).unwrap().as_deref(), Some("running"));
         store.set_status(1, "completed").unwrap();
         assert_eq!(store.status(1).unwrap().as_deref(), Some("completed"));
+    }
+
+    // ---- 0.10.0: durable cross-run memory ----
+
+    #[test]
+    fn the_entry_count_cap_evicts_oldest_first_and_never_the_new_entry() {
+        let store = Store::memory().unwrap();
+        for i in 0..MEMORY_MAX_ENTRIES {
+            let evicted = store.memory_put("ws", &format!("k{i}"), "v", 1, 1).unwrap();
+            assert!(evicted.is_empty(), "no eviction while under the cap");
+        }
+        assert_eq!(store.memory_list("ws").unwrap().len(), MEMORY_MAX_ENTRIES);
+
+        // Three more writes cost exactly the three oldest keys, in order.
+        let mut evicted = Vec::new();
+        for i in 0..3 {
+            evicted.extend(
+                store
+                    .memory_put("ws", &format!("new{i}"), "v", 2, 2)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(evicted, vec!["k0", "k1", "k2"]);
+
+        let keys: Vec<String> = store
+            .memory_list("ws")
+            .unwrap()
+            .into_iter()
+            .map(|e| e.key)
+            .collect();
+        assert_eq!(
+            keys.len(),
+            MEMORY_MAX_ENTRIES,
+            "the cap holds after eviction"
+        );
+        assert!(!keys.contains(&"k0".to_string()));
+        // The entry just written is never the one evicted to make room for it.
+        for i in 0..3 {
+            assert!(keys.contains(&format!("new{i}")));
+        }
+    }
+
+    #[test]
+    fn the_total_chars_cap_evicts_before_the_count_cap_is_reached() {
+        let store = Store::memory().unwrap();
+        let big = "x".repeat(MEMORY_MAX_ENTRY_CHARS);
+        let mut evicted = Vec::new();
+        // 10 entries of 2_000 chars = 20_000, past the 16_000 char cap while the
+        // 64-entry cap is nowhere near.
+        for i in 0..10 {
+            evicted.extend(
+                store
+                    .memory_put("ws", &format!("k{i}"), &big, 1, 1)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(
+            evicted,
+            vec!["k0", "k1"],
+            "oldest first, count cap untouched"
+        );
+
+        let entries = store.memory_list("ws").unwrap();
+        assert!(entries.len() < MEMORY_MAX_ENTRIES);
+        let total: usize = entries.iter().map(|e| e.value.chars().count()).sum();
+        assert!(total <= MEMORY_MAX_CHARS, "{total} chars is over the cap");
+    }
+
+    #[test]
+    fn an_oversized_value_is_truncated_with_a_marker_not_rejected() {
+        let store = Store::memory().unwrap();
+        // Multibyte throughout, so a byte-wise cut would not be valid UTF-8.
+        let huge = "é".repeat(MEMORY_MAX_ENTRY_CHARS * 2);
+        assert!(store.memory_put("ws", "k", &huge, 1, 1).is_ok());
+
+        let stored = store.memory_get("ws", "k").unwrap().unwrap().value;
+        assert_eq!(stored.chars().count(), MEMORY_MAX_ENTRY_CHARS);
+        assert!(stored.ends_with(MEMORY_TRUNCATED), "the cut is visible");
+        // Cut on a char boundary: every kept char is the whole 'é', never a half.
+        let kept = MEMORY_MAX_ENTRY_CHARS - MEMORY_TRUNCATED.chars().count();
+        assert!(stored.chars().take(kept).all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn a_0_9_1_store_opens_unchanged_and_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        // A 0.9.1-shaped database: every table through mcp_events, rows in the
+        // ones a resume reads, and no `memory` table.
+        let before_format: i64 = {
+            let store = Store::open(&path).unwrap();
+            let run = store.start_run("old goal", "old.txt").unwrap();
+            store
+                .checkpoint_step(run, &StepRecord::new(1, "wrote", "ok"))
+                .unwrap();
+            store
+                .record_event(run, &PolicyEvent::refusal(1, "write", "secrets/k"))
+                .unwrap();
+            store
+                .put_pending(run, 1, "write", "src/a.rs", None)
+                .unwrap();
+            let child = store.start_child_run("sub", "ws", run, 1).unwrap();
+            store
+                .record_agent_event(&AgentEvent::spawn(run, 1, child, "sub"))
+                .unwrap();
+            store
+                .record_sandbox_event(&SandboxEvent::create(run, 1, "proc"))
+                .unwrap();
+            store
+                .record_spawn(run, 1, child, "sub", "out.txt", "ok", None, "[]")
+                .unwrap();
+            store
+                .record_mcp(run, &McpEvent::connected("files", "stdio"))
+                .unwrap();
+            store.conn.execute("DROP TABLE memory", []).unwrap();
+            store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        // Reopening under 0.10.0 adds `memory` and touches nothing else.
+        let store = Store::open(&path).unwrap();
+        let after_format: i64 = store
+            .conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            after_format, before_format,
+            "the checkpoint format must not move — a 0.9.1 checkpoint still resumes"
+        );
+        assert_eq!(after_format, CHECKPOINT_FORMAT);
+        // The 0.7.0 durability promise: the pre-existing run still resumes.
+        assert!(store.check_resumable(1).is_ok());
+
+        // Every pre-existing table is intact, with its rows.
+        assert_eq!(store.steps(1).unwrap().len(), 1);
+        assert_eq!(store.last_step(1).unwrap(), 1);
+        assert_eq!(store.events(1).unwrap().len(), 1);
+        assert_eq!(store.pending(1).unwrap().unwrap().act, "write");
+        assert_eq!(store.checkpoint_events(1).unwrap().len(), 1);
+        assert_eq!(store.agent_events(1).unwrap().len(), 1);
+        assert_eq!(store.sandbox_events(1).unwrap().len(), 1);
+        assert_eq!(store.mcp_events(1).unwrap().len(), 1);
+        assert_eq!(store.children(1).unwrap(), vec![2]);
+        assert!(store.find_spawn(1, 1, "sub").is_ok());
+        assert_eq!(store.run_status(1).unwrap(), Some(RunStatus::Running));
+        // And the new table is there and usable.
+        assert!(store.memory_list("ws").unwrap().is_empty());
+        store.memory_put("ws", "k", "v", 1, 1).unwrap();
+        assert_eq!(store.memory_get("ws", "k").unwrap().unwrap().value, "v");
     }
 }

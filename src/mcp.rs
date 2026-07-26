@@ -297,6 +297,7 @@ impl McpSession {
         store: &Store,
         run_id: i64,
         step: u32,
+        cap: usize,
     ) -> Result<String> {
         let Some(server) = self
             .servers
@@ -334,7 +335,7 @@ impl McpSession {
             }
         };
 
-        let (text, truncated) = crate::tools::cap_result(text);
+        let (text, truncated) = crate::tools::cap_result(text, cap);
         store.record_mcp(
             run_id,
             &McpEvent::called(&server.id, name, ok)
@@ -457,12 +458,15 @@ mod tests {
 
     #[test]
     fn an_oversized_result_is_cut_on_a_char_boundary_and_says_so() {
-        let (short, cut) = crate::tools::cap_result("hello".into());
+        // The cap is the run's derived per-entry cap (0.10.0) rather than a
+        // constant of this module's own; the boundary behaviour is what is asserted.
+        let cap_chars =
+            crate::context::entry_cap_chars(crate::context::ContextBudget::default().max_tokens);
+        let (short, cut) = crate::tools::cap_result("hello".into(), cap_chars);
         assert_eq!((short.as_str(), cut), ("hello", false));
 
         // Multi-byte characters, so a naive slice would panic.
-        let cap_chars = crate::tools::TOOL_RESULT_CAP;
-        let (long, cut) = crate::tools::cap_result("é".repeat(cap_chars));
+        let (long, cut) = crate::tools::cap_result("é".repeat(cap_chars), cap_chars);
         assert!(cut);
         assert!(long.contains("[truncated at"));
         assert!(long.len() < 2 * cap_chars);
