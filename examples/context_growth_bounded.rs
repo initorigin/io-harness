@@ -1,4 +1,7 @@
-//! Live run that measures what the harness sends the model each turn.
+//! The 0.10.0 half of the before/after: the same task and the same provider as
+//! `context_growth`, with an explicit context ceiling so compaction is exercised
+//! rather than merely available. `context_growth` is the baseline and compiles on
+//! 0.9.1; this one uses the 0.10.0 knob that release added.
 //!
 //! Prints one line per step: the recorded prompt length in chars and the
 //! estimated tokens for it. Run it on 0.9.1 and on 0.10.0 against the same
@@ -12,16 +15,16 @@
 //! ```text
 //! export OPENROUTER_API_KEY=sk-or-...
 //! export OPENROUTER_MODEL=anthropic/claude-sonnet-4
-//! cargo run --example context_growth
+//! cargo run --example context_growth_bounded
 //! ```
 
-use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
+use io_harness::{context::ContextBudget, run, OpenRouter, Store, TaskContract, Verification};
 
 #[tokio::main]
 async fn main() -> io_harness::Result<()> {
     // A four-file workspace, so the agent greps, reads and writes enough times
     // for the observation log to matter.
-    let root = std::env::temp_dir().join("io-harness-context-growth");
+    let root = std::env::temp_dir().join("io-harness-context-growth-bounded");
     std::fs::remove_dir_all(&root).ok();
     let src = root.join("src");
     std::fs::create_dir_all(&src).ok();
@@ -53,7 +56,13 @@ async fn main() -> io_harness::Result<()> {
         },
     )
     .with_max_steps(20)
-    .with_token_budget(400_000);
+    .with_token_budget(400_000)
+    // A deliberately tight ceiling: the point is to watch the assembler hold a
+    // line, not to watch a generous default never be reached.
+    .with_context_budget(ContextBudget {
+        max_tokens: 1_500,
+        share: 0.5,
+    });
 
     let provider = OpenRouter::from_env()?;
     let store = Store::open(root.join("runs.db"))?;

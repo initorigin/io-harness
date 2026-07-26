@@ -304,6 +304,8 @@ pub struct Assembled {
     pub reread: usize,
     /// Notes from earlier runs carried into this turn.
     pub recalled: usize,
+    /// Whether the stubs were collapsed into one line to hold the ceiling.
+    pub collapsed: bool,
     /// Estimated tokens for `text` — see [`estimate_tokens`].
     pub est_tokens: u64,
 }
@@ -437,21 +439,25 @@ pub async fn assemble(
         whole[i] = true;
     }
 
-    // 5. Emit: the notes first, so the model reads what it knew before this run and
-    // then the run itself, chronologically.
-    out.text.push_str(&notes_text);
-    // 5. Emit chronologically, so the model reads the run forwards.
-    // ponytail: one stub line per elided entry, so a very long run's section still
-    // creeps up by ~20 tokens a step. Collapse consecutive stubs into one line if
-    // that residual ever matters; naming each one is worth more while it does not.
+    // 5. Emit chronologically, so the model reads the run forwards — the notes it
+    // had before this run first, then the run itself.
+    //
+    // Stub lines are the one part of the section that grows with a run's LENGTH
+    // rather than with what it observed: 4 elisions a step is ~60 tokens a step,
+    // which on a 200-step run would exceed the ceiling one stub at a time. Past a
+    // slice of the budget they collapse into a single line, so the ceiling holds on
+    // a long run instead of merely holding on a short one.
+    let stub_ceiling = (budget_tokens / 8).max(64);
+    let mut pieces: Vec<(bool, String)> = Vec::with_capacity(n);
     for i in 0..n {
         let e = &entries[i];
         if whole[i] {
             out.carried += 1;
-            match &shapes[i] {
-                Some(Shape::Whole(t)) => out.text.push_str(t),
-                _ => out.text.push_str(&e.text),
-            }
+            let text = match &shapes[i] {
+                Some(Shape::Whole(t)) => t.clone(),
+                _ => e.text.clone(),
+            };
+            pieces.push((true, text));
             continue;
         }
         out.stubbed += 1;
@@ -467,8 +473,34 @@ pub async fn assemble(
             Some(t) => format!("{} {t}", e.kind.label()),
             None => e.kind.label().to_string(),
         };
-        out.text
-            .push_str(&format!("\n[{subject}] (elided: {why})\n"));
+        pieces.push((false, format!("\n[{subject}] (elided: {why})\n")));
+    }
+
+    let stub_tokens: u64 = pieces
+        .iter()
+        .filter(|(whole, _)| !whole)
+        .map(|(_, t)| estimate_tokens(t))
+        .sum();
+    out.text.push_str(&notes_text);
+    if stub_tokens <= stub_ceiling {
+        for (_, t) in &pieces {
+            out.text.push_str(t);
+        }
+    } else {
+        // One line for all of them, where the oldest of them sat. Naming each
+        // elision is worth more than the space it takes right up to the point it
+        // costs more than the observations themselves.
+        out.collapsed = true;
+        out.text.push_str(&format!(
+            "\n[{} earlier observation(s) elided: superseded, or older than this \
+             turn's context window — re-read or re-run what you need]\n",
+            out.stubbed
+        ));
+        for (whole, t) in &pieces {
+            if *whole {
+                out.text.push_str(t);
+            }
+        }
     }
 
     if !notes.is_empty() {
@@ -486,8 +518,8 @@ pub async fn assemble(
         &ContextEvent::assembled(
             step,
             format!(
-                "carried={} stubbed={} reread={}",
-                out.carried, out.stubbed, out.reread
+                "carried={} stubbed={} reread={} recalled={} collapsed={}",
+                out.carried, out.stubbed, out.reread, out.recalled, out.collapsed
             ),
             out.est_tokens,
         ),

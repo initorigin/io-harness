@@ -903,3 +903,68 @@ async fn a_sub_agent_loops_prompt_stays_inside_the_ceiling() {
         raw.chars().count()
     );
 }
+
+// -------------------------------------------------- the ceiling holds on a long run
+
+/// F1/F2 — stub lines grow with a run's LENGTH rather than with what it observed,
+/// so on a long run they would exceed the ceiling one elision at a time. Past a
+/// slice of the budget they collapse into a single line. The live 0.10.0 run that
+/// found this had reached 2,264 estimated tokens against a 1,500-token ceiling by
+/// step 20, purely in stubs.
+#[tokio::test]
+async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let policy = open_policy();
+    let workspace = Workspace::with_policy(dir.path(), policy.clone());
+
+    // 400 observations of 40 subjects: nearly all superseded, so nearly all stubs.
+    let mut ledger = Ledger::new();
+    for i in 0..400u32 {
+        ledger.push(Observation::new(
+            i + 1,
+            ObsKind::Grep,
+            Some(format!("pattern-{}", i % 40)),
+            format!("\n[grep \"pattern-{}\"]\n{}\n", i % 40, "m".repeat(200)),
+        ));
+    }
+
+    const CEILING: u64 = 1_500;
+    let out = assemble(
+        &ledger,
+        CEILING,
+        &[],
+        Assembly {
+            ws: Some(&workspace),
+            policy: &policy,
+            store: &store,
+            run_id: 1,
+            step: 401,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(out.stubbed > 300, "the fixture must be mostly stubs");
+    assert!(
+        out.collapsed,
+        "past its slice of the budget the stub block must collapse"
+    );
+    assert!(
+        out.est_tokens <= CEILING,
+        "the ceiling must hold on a long run, got {} est. tokens",
+        out.est_tokens
+    );
+    assert!(
+        out.text.contains("earlier observation(s) elided"),
+        "the collapse must say how many it stands for, got:\n{}",
+        out.text
+    );
+    // The row says so too, so a trace reader can see why the section is short.
+    let rows = store.context_events(1).unwrap();
+    assert!(
+        rows.iter()
+            .any(|r| r.detail.as_deref().unwrap_or("").contains("collapsed=true")),
+        "the assembled row must record the collapse, got {rows:?}"
+    );
+}
