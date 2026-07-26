@@ -705,6 +705,12 @@ async fn run_from<P: Provider>(
         let response =
             complete_with_retry(provider, &request, contract, store, run_id, step).await?;
 
+        // Which provider answered, when that is not a foregone conclusion. A
+        // `Fallback` that fell over served this step from its secondary, and a trace
+        // reader has no other way to know.
+        if let Some(served) = provider.last_served() {
+            store.record_context_event(run_id, &ContextEvent::served(step, served))?;
+        }
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
 
@@ -860,6 +866,12 @@ async fn run_workspace_from<P: Provider>(
         let response =
             complete_with_retry(provider, &request, contract, store, run_id, step).await?;
 
+        // Which provider answered, when that is not a foregone conclusion. A
+        // `Fallback` that fell over served this step from its secondary, and a trace
+        // reader has no other way to know.
+        if let Some(served) = provider.last_served() {
+            store.record_context_event(run_id, &ContextEvent::served(step, served))?;
+        }
         let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
         tokens_used += step_tokens;
         // The provider's own number for the request `assemble` just built, beside
@@ -1306,6 +1318,13 @@ fn run_agent<'f, P: Provider>(
                 complete_with_retry(tree.provider, &request, contract, tree.store, run_id, step)
                     .await?;
 
+            // Which provider answered, when that is not a foregone conclusion. A
+            // `Fallback` that fell over served this step from its secondary, and a
+            // trace reader has no other way to know.
+            if let Some(served) = tree.provider.last_served() {
+                tree.store
+                    .record_context_event(run_id, &ContextEvent::served(step, served))?;
+            }
             let step_tokens = response.usage.map(|u| u.total_tokens).unwrap_or(0);
             tokens_used += step_tokens;
             if step_tokens > 0 {
@@ -2341,7 +2360,13 @@ async fn complete_with_retry<P: Provider>(
                             run_id,
                             &StepRecord::new(
                                 step,
-                                "escalated (retry would outlast the time budget)",
+                                // Same "escalated after <kind>" prefix as every
+                                // other escalation, so a trace reader grepping for
+                                // escalations does not miss this class of them.
+                                format!(
+                                    "escalated after {} (a retry would outlast the time budget)",
+                                    kind_of(&e)
+                                ),
                                 e.to_string(),
                             ),
                         )?;

@@ -99,14 +99,15 @@ impl<A: Provider + Sync, B: Provider + Sync> Provider for Fallback<A, B> {
                     "provider failed; falling over"
                 );
                 let out = self.secondary.complete(request).await;
-                if out.is_ok() {
-                    self.note(2);
-                }
+                self.note(if out.is_ok() { 2 } else { 0 });
                 out
             }
             Err(e) => {
                 // Not worth another provider. The caller gets the primary's error,
-                // unchanged, so the kind they branch on is the real one.
+                // unchanged, so the kind they branch on is the real one. Nobody
+                // served this call, and nothing must be able to read that anybody
+                // did — a stale marker is worse than none.
+                self.note(0);
                 Err(e)
             }
         }
@@ -135,10 +136,24 @@ impl<A: Provider + Sync, B: Provider + Sync> Provider for Fallback<A, B> {
         out
     }
 
+    /// The LEAF that answered, not the branch it sits in.
+    ///
+    /// A nested `Fallback::new(a, Fallback::new(b, c))` whose `c` answered must
+    /// record `"c"`, not `"b -> c"`: the row exists because one label for a whole
+    /// run stops being true the moment a run can use two, and naming a sub-chain
+    /// reintroduces exactly that ambiguity one level down.
     fn last_served(&self) -> Option<String> {
         match self.served.load(Ordering::Relaxed) {
-            1 => Some(self.primary.name().to_string()),
-            2 => Some(self.secondary.name().to_string()),
+            1 => Some(
+                self.primary
+                    .last_served()
+                    .unwrap_or_else(|| self.primary.name().to_string()),
+            ),
+            2 => Some(
+                self.secondary
+                    .last_served()
+                    .unwrap_or_else(|| self.secondary.name().to_string()),
+            ),
             _ => None,
         }
     }
@@ -243,10 +258,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn three_providers_nest() {
+    async fn three_providers_nest_and_the_leaf_is_what_gets_recorded() {
         let f = Fallback::new(p("a", down), Fallback::new(p("b", down), p("c", ok)));
         assert!(f.complete(req()).await.is_ok());
         assert_eq!(f.name(), "a -> b -> c");
+        // Not "b -> c": the row has to name the provider, not the branch.
+        assert_eq!(f.last_served().as_deref(), Some("c"));
     }
 
     #[test]

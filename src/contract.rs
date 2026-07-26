@@ -230,6 +230,10 @@ impl TaskContract {
     ///
     /// `StallPolicy { window: 0, .. }` disables detection, restoring 0.10.0
     /// behaviour exactly.
+    ///
+    /// Applies to workspace and sub-agent runs. A single-file run
+    /// ([`TaskContract::new`]) ignores it: it has one tool and one file, so
+    /// "repeated a call without changing anything" describes its only move.
     pub fn with_stall_policy(mut self, stall: StallPolicy) -> Self {
         self.stall = stall;
         self
