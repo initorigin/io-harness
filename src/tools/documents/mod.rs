@@ -9,11 +9,12 @@
 //! `deny_write("secrets/*")` that stops `write_file` but not `set_cell` is not a
 //! policy, it is a suggestion.
 //!
-//! 0.14.0 ships spreadsheets ([`xlsx`]).
-
-pub mod xlsx;
+//! 0.14.0 ships spreadsheets ([`xlsx`]), Word ([`docx`]), PowerPoint text
+//! ([`pptx`], read-only), PDF ([`pdf`]) and barcode decoding ([`barcode`]).
+//! Each is behind its own feature; the `documents` umbrella turns on all five.
 
 pub mod barcode;
-
 pub mod docx;
+pub mod pdf;
 pub mod pptx;
+pub mod xlsx;
