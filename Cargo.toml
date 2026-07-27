@@ -35,6 +35,20 @@ tempfile = "3"
 regex = "1"
 # MCP client only — no server mode, no macros. Stdio servers over the child-process
 # transport, remote servers over streamable HTTP with our own (no-redirect) Client.
+# Documents (0.14.0), all optional and all behind the `documents` feature. The
+# default build's dependency tree is unchanged — a consumer who does not ask for
+# documents pays nothing for them, which is the standing dependency discipline
+# this crate has kept since 0.1.0.
+#
+# Spreadsheets take three crates rather than one because the three operations are
+# genuinely separate: calamine reads and cannot write, rust_xlsxwriter writes new
+# files and explicitly cannot modify an existing one, and umya-spreadsheet is the
+# only one that round-trips an existing workbook. Nothing here binds a C or C++
+# library, so no runner needs a system package.
+calamine = { version = "0.36", optional = true }
+rust_xlsxwriter = { version = "0.96", optional = true }
+umya-spreadsheet = { version = "3.0", optional = true }
+
 rmcp = { version = "2.2.0", default-features = false, features = [
     "client",
     "transport-child-process",
@@ -53,3 +67,11 @@ hyper-util = { version = "0.1.20", features = ["tokio", "service", "server"] }
 # MCP server the tests drive. Dev-only: the crate itself ships client-side only.
 rmcp = { version = "2.2.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
+
+[features]
+# The crate's first feature section (0.14.0). Per-format features so a consumer
+# who wants spreadsheets does not compile a PDF stack, and an umbrella so the
+# common case is one word.
+default = []
+documents = ["xlsx"]
+xlsx = ["dep:calamine", "dep:rust_xlsxwriter", "dep:umya-spreadsheet"]
