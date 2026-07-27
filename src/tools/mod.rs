@@ -29,6 +29,25 @@ pub const GREP_TOOL: &str = "grep";
 pub const FIND_TOOL: &str = "find";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
+/// The names the model uses for git work (0.15.0).
+///
+/// Built-ins for the reason the document tools are, and one sharper: the exec
+/// policy enforces a program *name* and records argv without checking it
+/// (src/verify.rs:248), so `Act::Exec("git")` cannot tell `git log` from
+/// `git push --force`. Each of these constructs its own complete argv instead —
+/// the model supplies paths and a message and never an argument — so the
+/// networked and destructive surface is unreachable by construction rather than
+/// excluded by a rule someone has to maintain.
+pub const GIT_LOG_TOOL: &str = "git_log";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_STATUS_TOOL: &str = "git_status";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_DIFF_TOOL: &str = "git_diff";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_ADD_TOOL: &str = "git_add";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_COMMIT_TOOL: &str = "git_commit";
+
 /// The name the model uses to look at an image in the workspace (0.15.0,
 /// `media` feature).
 ///

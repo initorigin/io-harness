@@ -29,7 +29,6 @@
 
 // The git built-ins that call this land in a follow-up task; until they do, the
 // default lib build sees the module as unused. Remove this once they exist.
-#![allow(dead_code)]
 
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -108,6 +107,73 @@ pub(crate) enum GitCmd {
         /// Model-supplied paths to limit the history to.
         paths: Vec<String>,
     },
+    /// `git add -- <paths>`
+    ///
+    /// No `-f`: staging honours `.gitignore`, and the flag that overrides it is
+    /// not reachable from here. An ignored path comes back as git's own message,
+    /// which is what lets the model tell "ignored" from "no such path".
+    Add {
+        /// Model-supplied paths to stage.
+        paths: Vec<String>,
+    },
+    /// `git -c user.name=… -c user.email=… commit --no-verify -m <message>`
+    ///
+    /// Commits what is staged, on the branch that is checked out. No paths: a
+    /// commit is of the index, and `git_add` is what decides the index.
+    Commit {
+        /// The model's commit message. Safe as data because it is the operand of
+        /// `-m`: git takes the next argv element literally, so a message
+        /// beginning with `-` is a message and not an option.
+        message: String,
+        /// Who the commit is attributed to.
+        identity: Identity,
+    },
+}
+
+/// Who a commit is attributed to.
+///
+/// `git commit` fails outright with no `user.email` configured, so this cannot
+/// be left to the machine. Inheriting the repository's identity would attribute
+/// the agent's commit to whichever human configured that checkout, which is the
+/// wrong default; requiring configuration would fail on a fresh machine, which
+/// is the wrong other one. So the harness supplies one and the caller may
+/// replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    /// The committer name.
+    pub name: String,
+    /// The committer email.
+    pub email: String,
+}
+
+impl Default for Identity {
+    /// An agent identity at a domain that can never exist. `.invalid` is
+    /// reserved by RFC 2606 precisely so that a synthetic address cannot
+    /// accidentally be someone's.
+    fn default() -> Self {
+        Self {
+            name: "io-harness agent".into(),
+            email: "agent@io-harness.invalid".into(),
+        }
+    }
+}
+
+impl Identity {
+    /// Refuse an identity that could split into more than one `-c` setting.
+    ///
+    /// `-c key=value` is a single argv element, so a value cannot introduce a
+    /// second setting — but a newline in a name reaches the commit object and
+    /// the reflog, and there is no reason to carry one.
+    fn check(&self) -> Result<()> {
+        for (what, v) in [("name", &self.name), ("email", &self.email)] {
+            if v.is_empty() || v.chars().any(char::is_control) {
+                return Err(Error::Config(format!(
+                    "commit identity {what} must be non-empty and free of control characters"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl GitCmd {
@@ -136,6 +202,15 @@ impl GitCmd {
                 v.push("--no-decorate".into());
                 v.push(format!("--max-count={max_count}"));
             }
+            Self::Add { .. } => v.push("add".into()),
+            Self::Commit { message, .. } => {
+                v.push("commit".into());
+                // Belt and braces with `core.hooksPath`: that stops the hook
+                // being found, this stops it being asked for.
+                v.push("--no-verify".into());
+                v.push("-m".into());
+                v.push(message.clone());
+            }
         }
         v
     }
@@ -143,7 +218,28 @@ impl GitCmd {
     /// The model-supplied half.
     fn paths(&self) -> &[String] {
         match self {
-            Self::Status { paths } | Self::Diff { paths, .. } | Self::Log { paths, .. } => paths,
+            Self::Status { paths }
+            | Self::Diff { paths, .. }
+            | Self::Log { paths, .. }
+            | Self::Add { paths } => paths,
+            // A commit takes the index, not a pathspec.
+            Self::Commit { .. } => &[],
+        }
+    }
+
+    /// The `-c` settings this command needs before its subcommand.
+    fn config(&self) -> Result<Vec<String>> {
+        match self {
+            Self::Commit { identity, .. } => {
+                identity.check()?;
+                Ok(vec![
+                    "-c".into(),
+                    format!("user.name={}", identity.name),
+                    "-c".into(),
+                    format!("user.email={}", identity.email),
+                ])
+            }
+            _ => Ok(Vec::new()),
         }
     }
 }
@@ -222,6 +318,7 @@ impl<'a> Git<'a> {
             "-c".into(),
             format!("{NO_HOOKS}={NULL_DEVICE}"),
         ];
+        argv.extend(cmd.config()?);
         argv.extend(cmd.options());
         argv.push("--".into());
         for p in cmd.paths() {
@@ -332,7 +429,64 @@ mod tests {
                 max_count: 20,
                 paths: vec!["src/main.rs".into()],
             },
+            GitCmd::Add {
+                paths: vec!["src/main.rs".into()],
+            },
+            GitCmd::Commit {
+                message: "a message".into(),
+                identity: Identity::default(),
+            },
         ]
+    }
+
+    /// Fails to compile if a variant is added without adding it to
+    /// [`every_shape`]. Without this the surface tests below would silently stop
+    /// covering the new capability while continuing to pass, which is the exact
+    /// way a closed surface quietly opens.
+    #[test]
+    fn every_shape_covers_every_variant() {
+        for cmd in every_shape() {
+            match cmd {
+                GitCmd::Status { .. }
+                | GitCmd::Diff { .. }
+                | GitCmd::Log { .. }
+                | GitCmd::Add { .. }
+                | GitCmd::Commit { .. } => {}
+            }
+        }
+        let mut kinds: Vec<_> = every_shape().iter().map(std::mem::discriminant).collect();
+        let before = kinds.len();
+        kinds.dedup_by(|a, b| a == b);
+        assert_eq!(before, 6, "every_shape lists six commands");
+        assert_eq!(
+            kinds.len(),
+            5,
+            "every_shape must contain one of each variant; add the new one"
+        );
+    }
+
+    /// The subcommand is the invariant, and it is checked directly rather than
+    /// by scanning the whole argv — the whole argv contains model-supplied data,
+    /// and a path named `push` is a path.
+    #[test]
+    fn the_subcommand_is_always_one_of_the_five_this_crate_ships() {
+        let p = Policy::permissive();
+        let dir = tempfile::tempdir().unwrap();
+        let g = git(&p, dir.path());
+        for cmd in every_shape() {
+            let argv = g.argv(&cmd).unwrap();
+            // The fixed prefix is program, --no-pager, -c, hooksPath, then any
+            // -c config pairs, then the subcommand.
+            let sub = argv
+                .iter()
+                .skip(1)
+                .find(|a| !a.starts_with('-') && !a.contains('='))
+                .expect("every argv has a subcommand");
+            assert!(
+                ["status", "diff", "log", "add", "commit"].contains(&sub.as_str()),
+                "{cmd:?} produced subcommand {sub:?}"
+            );
+        }
     }
 
     #[test]

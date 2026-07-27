@@ -59,6 +59,14 @@ pub struct TaskContract {
     /// anything is sent; see [`crate::Provider::accepts_images`].
     #[cfg(feature = "media")]
     pub images: Vec<crate::provider::Media>,
+    /// Who a commit the agent makes is attributed to.
+    ///
+    /// Defaults to an agent identity at a domain reserved so it can never exist.
+    /// `git commit` fails outright with no `user.email` configured, so this
+    /// cannot be left to the machine, and inheriting the repository's identity
+    /// would attribute the agent's commit to whichever human configured that
+    /// checkout.
+    pub commit_identity: crate::tools::git::Identity,
     /// Tools the embedding program supplies itself, offered to the model beside
     /// the built-ins and governed by the same policy and trace.
     ///
@@ -110,6 +118,7 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
@@ -142,6 +151,7 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            commit_identity: crate::tools::git::Identity::default(),
             #[cfg(feature = "media")]
             images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
@@ -195,6 +205,23 @@ impl TaskContract {
         I: IntoIterator<Item = crate::provider::Media>,
     {
         self.images.extend(images);
+        self
+    }
+
+    /// Attribute the agent's commits to this name and address.
+    ///
+    /// Replaces the default agent identity. Neither may be empty or contain a
+    /// control character — both reach the commit object and the reflog.
+    #[must_use]
+    pub fn with_commit_identity(
+        mut self,
+        name: impl Into<String>,
+        email: impl Into<String>,
+    ) -> Self {
+        self.commit_identity = crate::tools::git::Identity {
+            name: name.into(),
+            email: email.into(),
+        };
         self
     }
 

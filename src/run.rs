@@ -31,10 +31,17 @@ use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
+use crate::tools::git::{Git, GitCmd, GitOutcome};
 #[cfg(feature = "barcode")]
 use crate::tools::BARCODE_DECODE_TOOL;
 #[cfg(feature = "pptx")]
 use crate::tools::PPTX_READ_TOOL;
+
+/// The path a git built-in names when it asks the policy about the repository
+/// itself. Reading history reads it; committing writes it. A run under a narrow
+/// write policy must allow it explicitly, which is stated where the tools are
+/// documented rather than left to be discovered by a refusal.
+const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
@@ -43,6 +50,7 @@ use crate::tools::{
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
+use crate::tools::{GIT_ADD_TOOL, GIT_COMMIT_TOOL, GIT_DIFF_TOOL, GIT_LOG_TOOL, GIT_STATUS_TOOL};
 #[cfg(feature = "pdf")]
 use crate::tools::{PDF_FILL_FORM_TOOL, PDF_READ_TOOL, PDF_WATERMARK_TOOL, PDF_WRITE_TOOL};
 #[cfg(feature = "xlsx")]
@@ -1542,6 +1550,7 @@ async fn run_workspace_from<P: Provider>(
                 watch,
                 0,
                 pending_media,
+                &contract.commit_identity,
             )
             .await?
             {
@@ -2151,6 +2160,7 @@ fn run_agent<'f, P: Provider>(
                     tree.watch,
                     depth,
                     pending_media,
+                    &contract.commit_identity,
                 )
                 .await?
                 {
@@ -2852,6 +2862,7 @@ async fn dispatch(
     watch: &Watch<'_>,
     depth: u32,
     pending_media: &mut PendingMedia,
+    identity: &crate::tools::git::Identity,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -3435,6 +3446,153 @@ async fn dispatch(
         // built-ins, and `Toolbox::validate` has already guaranteed the three
         // sets are disjoint, so the order is documentation rather than a
         // tie-break.
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL | GIT_ADD_TOOL | GIT_COMMIT_TOOL => {
+            // Paths the model named, if any. Every one of them is data: `argv`
+            // puts them after `--` and refuses a leading `-`.
+            let paths: Vec<String> = a
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // What the policy is asked, per tool. Reading history reads `.git`.
+            // Staging copies a file's bytes into the object store, so it needs
+            // `Act::Read` on that file — which is what stops a path the policy
+            // denies from reaching a commit. Committing writes `.git`.
+            let (repo_act, path_act) = match name {
+                GIT_ADD_TOOL => (Act::Write, Some(Act::Read)),
+                GIT_COMMIT_TOOL => (Act::Write, None),
+                _ => (Act::Read, Some(Act::Read)),
+            };
+
+            let mut remembered: Vec<Rule> = Vec::new();
+            let mut targets: Vec<(Act, String)> = vec![(repo_act, GIT_DIR.to_string())];
+            if let Some(act) = path_act {
+                targets.extend(paths.iter().map(|p| (act, p.clone())));
+            }
+            let mut refused: Option<Dispatched> = None;
+            for (act, target) in targets {
+                match gate(
+                    ws, approver, store, run_id, step, act, &target, None, watch, depth,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => {
+                        refused = Some(Dispatched::go(decision, obs));
+                        break;
+                    }
+                    Gated::Paused { request_id } => {
+                        refused = Some(Dispatched::Pause { request_id });
+                        break;
+                    }
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+            }
+            if let Some(d) = refused {
+                return Ok(d);
+            }
+
+            let cmd = match name {
+                GIT_STATUS_TOOL => GitCmd::Status { paths },
+                GIT_DIFF_TOOL => GitCmd::Diff {
+                    staged: a.get("staged").and_then(serde_json::Value::as_bool) == Some(true),
+                    paths,
+                },
+                GIT_LOG_TOOL => GitCmd::Log {
+                    // Clamped rather than trusted: a model asking for the whole
+                    // history of a large repository would blow the observation
+                    // cap and learn nothing the first twenty commits do not say.
+                    max_count: a
+                        .get("max_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(20)
+                        .clamp(1, 200) as u32,
+                    paths,
+                },
+                GIT_ADD_TOOL => {
+                    if paths.is_empty() {
+                        return Ok(Dispatched::go(
+                            "git_add missing paths",
+                            "\n[git error] git_add needs a non-empty \"paths\" array\n".to_string(),
+                        ));
+                    }
+                    GitCmd::Add { paths }
+                }
+                _ => {
+                    let Some(message) = s("message").filter(|m| !m.trim().is_empty()) else {
+                        return Ok(Dispatched::go(
+                            "git_commit missing message",
+                            "\n[git error] git_commit needs a non-empty \"message\"\n".to_string(),
+                        ));
+                    };
+                    GitCmd::Commit {
+                        message: message.to_string(),
+                        identity: identity.clone(),
+                    }
+                }
+            };
+
+            let git = Git::new(ws.policy(), ws.root(), cap);
+            match git.run(&cmd).await? {
+                GitOutcome::Unavailable { reason } => Dispatched::go(
+                    "git unavailable",
+                    format!(
+                        "\n[git unavailable] {reason}. This workspace cannot be worked as a git \
+                         repository; carry on without it.\n"
+                    ),
+                ),
+                out @ GitOutcome::Ran { .. } => {
+                    let GitOutcome::Ran {
+                        code,
+                        stdout,
+                        stderr,
+                    } = &out
+                    else {
+                        unreachable!()
+                    };
+                    let ok = out.ok();
+                    let body = if stdout.trim().is_empty() && !ok {
+                        stderr.clone()
+                    } else {
+                        stdout.clone()
+                    };
+                    // A git that ran and failed is an observation, not a run
+                    // failure — the same treatment a malformed regex gets from
+                    // `grep`. The model reads the message and adapts.
+                    Dispatched::Continue {
+                        decision: format!(
+                            "{name} {}",
+                            if ok {
+                                "ok".to_string()
+                            } else {
+                                format!("exit {}", code.map_or("signal".into(), |c| c.to_string()))
+                            }
+                        ),
+                        obs: format!(
+                            "\n[{name}{}]\n{}\n",
+                            if ok {
+                                String::new()
+                            } else {
+                                " failed".to_string()
+                            },
+                            if body.trim().is_empty() {
+                                "(no output)"
+                            } else {
+                                body.trim_end()
+                            }
+                        ),
+                        kind: ObsKind::Tool,
+                        target: None,
+                        changed: matches!(cmd, GitCmd::Add { .. } | GitCmd::Commit { .. }) && ok,
+                        remember: remembered,
+                    }
+                }
+            }
+        }
         name if custom.owns(name) => {
             match gate(
                 ws,
@@ -4197,6 +4355,67 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "path": { "type": "string", "description": "File path relative to the workspace root." }
                 },
                 "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_STATUS_TOOL.to_string(),
+            description: "Show what has changed in the git repository at the workspace root: \
+                          modified, staged and untracked files."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional paths to limit the report to." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: GIT_DIFF_TOOL.to_string(),
+            description: "Show the diff of the working tree, or of what is staged.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "staged": { "type": "boolean", "description": "Diff what is staged instead of the working tree." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional paths to limit the diff to." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: GIT_LOG_TOOL.to_string(),
+            description: "Read the repository's recent commit history, newest first.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "max_count": { "type": "integer", "description": "How many commits to show (1-200, default 20)." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional paths to limit the history to." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: GIT_ADD_TOOL.to_string(),
+            description: "Stage the named files for the next commit. Honours .gitignore; an \
+                          ignored file is reported rather than staged."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Files to stage, relative to the workspace root." }
+                },
+                "required": ["paths"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_COMMIT_TOOL.to_string(),
+            description: "Commit what you have staged, on the branch that is checked out. There \
+                          is no push, no branch switching and no history rewriting: your work \
+                          stays local for a human to review."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "The commit message." }
+                },
+                "required": ["message"]
             }),
         },
         #[cfg(feature = "media")]

@@ -36,7 +36,7 @@ use crate::net::{self, NetGuard};
 use crate::observe::{EventKind, RunEvent};
 use crate::policy::{Act, Effect, Policy};
 use crate::provider::ToolSpec;
-use crate::run::{refused, Watch};
+use crate::run::{refused, PendingMedia, Watch};
 use crate::state::{McpEvent, PolicyEvent, Store};
 
 /// The prefix every MCP-provided tool name carries.
@@ -309,6 +309,41 @@ impl McpSession {
         watch: &Watch<'_>,
         depth: u32,
     ) -> Result<String> {
+        self.call_media(
+            name,
+            arguments,
+            store,
+            run_id,
+            step,
+            cap,
+            watch,
+            depth,
+            &mut PendingMedia::default(),
+        )
+        .await
+    }
+
+    /// [`McpSession::call`], additionally collecting any images the tool
+    /// returned into `pending_media` for the next request to carry.
+    ///
+    /// Images are collected only from a result the tool did not mark as its own
+    /// error: attaching the picture that came with a failure spends the request
+    /// budget on something the model was not asked to look at.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn call_media(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+        store: &Store,
+        run_id: i64,
+        step: u32,
+        cap: usize,
+        watch: &Watch<'_>,
+        depth: u32,
+        pending_media: &mut PendingMedia,
+    ) -> Result<String> {
+        #[cfg(not(feature = "media"))]
+        let _ = pending_media;
         let Some(server) = self
             .servers
             .iter()
@@ -335,8 +370,17 @@ impl McpSession {
             ),
             Ok(Err(e)) => (format!("[{name} failed] {e}"), false),
             Ok(Ok(result)) => {
-                let body = render(&result);
+                let rendered = render(&result);
                 let failed = result.is_error.unwrap_or(false);
+                #[cfg(feature = "media")]
+                let body = {
+                    if !failed {
+                        pending_media.extend(rendered.images);
+                    }
+                    rendered.text
+                };
+                #[cfg(not(feature = "media"))]
+                let body = rendered;
                 if failed {
                     (format!("[{name} reported an error] {body}"), false)
                 } else {
@@ -436,7 +480,105 @@ fn transport_name(t: &McpTransport) -> &'static str {
     }
 }
 
+/// What one tool result flattened to: the text the model reads, and the images
+/// the caller attaches to the next request.
+///
+/// The text names every image it found even when the image was attached, so a
+/// model reading only the observation still knows one arrived — and so a
+/// transcript replayed without the image is still legible.
+#[cfg(feature = "media")]
+pub(crate) struct Rendered {
+    /// The observation text.
+    pub text: String,
+    /// Images the server returned that are within the provider bounds. An image
+    /// outside them is described in `text` instead, never silently dropped.
+    pub images: Vec<crate::provider::Media>,
+}
+
+/// Flatten a tool result into text the model can read, and the images it may see.
+#[cfg(feature = "media")]
+pub(crate) fn render(result: &rmcp::model::CallToolResult) -> Rendered {
+    use rmcp::model::ContentBlock;
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut images = Vec::new();
+    let mut saw_text = false;
+    for c in &result.content {
+        match c {
+            ContentBlock::Text(t) => {
+                saw_text = true;
+                parts.push(t.text.clone());
+            }
+            ContentBlock::Image(i) => parts.push(take_image(i, &mut images)),
+            ContentBlock::Audio(a) => parts.push(format!(
+                "[audio: {}, not attached — only images are passed to the model]",
+                a.mime_type
+            )),
+            ContentBlock::Resource(_) => parts.push("[embedded resource, not attached]".into()),
+            ContentBlock::ResourceLink(_) => parts.push("[resource link, not attached]".into()),
+            // `ContentBlock` is `#[non_exhaustive]`: a content type added to the
+            // protocol is described rather than dropped.
+            _ => parts.push("[non-text content, not attached]".into()),
+        }
+    }
+    // Gated on the absence of *text*, not of parts, so a result that is one
+    // image plus structured content keeps the structured content it had before.
+    if !saw_text {
+        if let Some(structured) = &result.structured_content {
+            parts.push(structured.to_string());
+        }
+    }
+    let text = if parts.is_empty() {
+        "(no text content)".to_string()
+    } else {
+        parts.join("\n")
+    };
+    Rendered { text, images }
+}
+
+/// Validate one MCP image and, if it passes, hand it to `images`.
+///
+/// Returns the line that goes in the observation either way. The base64 is
+/// moved across as-is — MCP already delivers it encoded, and decoding to
+/// re-encode would cost a megabyte of work to produce the same string.
+///
+/// A refusal is a readable note, not an error: a server returning an image the
+/// vendor will not accept is not a reason to end the run, and sending it anyway
+/// buys an HTTP 400 that reads like a transport failure.
+#[cfg(feature = "media")]
+fn take_image(img: &rmcp::model::ImageContent, images: &mut Vec<crate::provider::Media>) -> String {
+    use crate::provider::{Media, IMAGE_MEDIA_TYPES, MAX_IMAGE_BYTES};
+
+    if !IMAGE_MEDIA_TYPES.contains(&img.mime_type.as_str()) {
+        return format!(
+            "[image not attached: unsupported media type {:?}; expected one of {}]",
+            img.mime_type,
+            IMAGE_MEDIA_TYPES.join(", ")
+        );
+    }
+    // `Media::byte_len` derives the size from the encoded length and would
+    // underflow on a stub like "="; a server is a trust boundary, so the shape
+    // is checked before the arithmetic runs.
+    if img.data.len() < 4 || !img.data.len().is_multiple_of(4) {
+        return "[image not attached: malformed base64 payload]".to_string();
+    }
+    let media = Media {
+        media_type: img.mime_type.clone(),
+        base64: img.data.clone(),
+    };
+    let bytes = media.byte_len();
+    if bytes > MAX_IMAGE_BYTES {
+        return format!(
+            "[image not attached: {bytes} bytes, over the {MAX_IMAGE_BYTES}-byte per-image bound]"
+        );
+    }
+    let line = format!("[image: {}, {bytes} bytes]", media.media_type);
+    images.push(media);
+    line
+}
+
 /// Flatten a tool result into text the model can read.
+#[cfg(not(feature = "media"))]
 fn render(result: &rmcp::model::CallToolResult) -> String {
     let mut parts: Vec<String> = result
         .content
@@ -449,8 +591,6 @@ fn render(result: &rmcp::model::CallToolResult) -> String {
         }
     }
     if parts.is_empty() {
-        // Non-text content (an image, an embedded resource) is not passed
-        // through in 0.8 — media is 0.11 — so say so rather than return blank.
         return "(no text content)".to_string();
     }
     parts.join("\n")
@@ -506,5 +646,140 @@ mod tests {
         assert!(cut);
         assert!(long.contains("[truncated at"));
         assert!(long.len() < 2 * cap_chars);
+    }
+
+    /// The control every media test below is measured against: without the
+    /// feature this is the whole contract, and with it the text-only path must
+    /// still produce the byte-identical string it produced in 0.8.
+    #[test]
+    fn a_text_only_result_renders_exactly_its_text_and_attaches_nothing() {
+        use rmcp::model::{CallToolResult, ContentBlock};
+        let r = CallToolResult::success(vec![
+            ContentBlock::text("first line"),
+            ContentBlock::text("second line"),
+        ]);
+        let out = render(&r);
+        #[cfg(feature = "media")]
+        {
+            assert_eq!(out.text, "first line\nsecond line");
+            assert!(out.images.is_empty(), "text carries no images");
+        }
+        #[cfg(not(feature = "media"))]
+        assert_eq!(out, "first line\nsecond line");
+    }
+
+    #[cfg(feature = "media")]
+    mod media {
+        use super::super::{render, take_image};
+        use crate::provider::MAX_IMAGE_BYTES;
+        use rmcp::model::{CallToolResult, ContentBlock};
+
+        /// Valid base64: length a multiple of four, no padding, so `byte_len`
+        /// is exactly three quarters of it.
+        const PIXEL: &str = "aGVsbG8h";
+
+        fn b64(decoded_bytes: usize) -> String {
+            "A".repeat(decoded_bytes.div_ceil(3) * 4)
+        }
+
+        #[test]
+        fn an_image_result_attaches_the_image_and_names_it_in_the_text() {
+            let r = CallToolResult::success(vec![ContentBlock::image(PIXEL, "image/png")]);
+            let out = render(&r);
+            assert_eq!(out.images.len(), 1, "the image is passed through");
+            assert_eq!(out.images[0].media_type, "image/png");
+            assert_eq!(
+                out.images[0].base64, PIXEL,
+                "base64 is moved, not re-encoded"
+            );
+            assert_eq!(out.text, "[image: image/png, 6 bytes]");
+            assert_ne!(
+                out.text, "(no text content)",
+                "the 0.8 bug, not reintroduced"
+            );
+        }
+
+        #[test]
+        fn an_unsupported_media_type_is_a_note_not_an_attachment() {
+            let bad = CallToolResult::success(vec![ContentBlock::image(PIXEL, "image/tiff")]);
+            let out = render(&bad);
+            assert!(out.images.is_empty(), "no vendor accepts image/tiff");
+            assert!(
+                out.text.contains("unsupported media type") && out.text.contains("image/tiff"),
+                "{}",
+                out.text
+            );
+
+            // Control: the same payload under a type every vendor takes.
+            let good = CallToolResult::success(vec![ContentBlock::image(PIXEL, "image/webp")]);
+            let out = render(&good);
+            assert_eq!(out.images.len(), 1);
+            assert_eq!(out.images[0].media_type, "image/webp");
+        }
+
+        #[test]
+        fn an_oversized_image_is_a_note_not_an_attachment() {
+            let over = CallToolResult::success(vec![ContentBlock::image(
+                b64(MAX_IMAGE_BYTES + 3),
+                "image/jpeg",
+            )]);
+            let out = render(&over);
+            assert!(out.images.is_empty(), "over the per-image bound");
+            assert!(
+                out.text.contains("over the") && out.text.contains("per-image bound"),
+                "{}",
+                out.text
+            );
+
+            // Control: the largest payload that still fits does attach.
+            let under = CallToolResult::success(vec![ContentBlock::image(
+                b64(MAX_IMAGE_BYTES - 3),
+                "image/jpeg",
+            )]);
+            let out = render(&under);
+            assert_eq!(out.images.len(), 1);
+            assert!(out.images[0].byte_len() <= MAX_IMAGE_BYTES);
+        }
+
+        #[test]
+        fn text_and_an_image_together_yield_both() {
+            let r = CallToolResult::success(vec![
+                ContentBlock::text("here is the chart"),
+                ContentBlock::image(PIXEL, "image/gif"),
+            ]);
+            let out = render(&r);
+            assert_eq!(out.images.len(), 1);
+            assert_eq!(out.text, "here is the chart\n[image: image/gif, 6 bytes]");
+        }
+
+        #[test]
+        fn a_malformed_base64_payload_is_a_note_rather_than_a_panic() {
+            // `Media::byte_len` subtracts padding from a quarter-of-the-length
+            // estimate, so a stub like this underflows if it reaches it.
+            let mut images = Vec::new();
+            let note = take_image(
+                &rmcp::model::ImageContent::new("=", "image/png"),
+                &mut images,
+            );
+            assert!(images.is_empty());
+            assert!(note.contains("malformed base64"), "{note}");
+
+            // Control: a well-formed payload of the same type attaches.
+            let ok = take_image(
+                &rmcp::model::ImageContent::new(PIXEL, "image/png"),
+                &mut images,
+            );
+            assert_eq!(images.len(), 1);
+            assert!(ok.starts_with("[image: image/png"), "{ok}");
+        }
+
+        #[test]
+        fn non_image_content_is_described_rather_than_dropped() {
+            let r = CallToolResult::success(vec![ContentBlock::audio("AAAA", "audio/wav")]);
+            let out = render(&r);
+            assert!(out.images.is_empty(), "audio is not sent to any provider");
+            assert!(out.text.contains("audio/wav"), "{}", out.text);
+            assert_ne!(out.text, "(no text content)");
+        }
     }
 }

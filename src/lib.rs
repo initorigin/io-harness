@@ -297,5 +297,6 @@ pub use state::{
     CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
     SUCCESS_OUTCOME,
 };
+pub use tools::git::Identity;
 pub use tools::{Tool, ToolFuture, Toolbox};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};
