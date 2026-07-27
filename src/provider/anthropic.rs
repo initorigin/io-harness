@@ -98,10 +98,45 @@ impl Anthropic {
             "stream": true,
             "system": request.system,
             "messages": [
-                { "role": "user", "content": request.user },
+                { "role": "user", "content": Self::user_content(request) },
             ],
             "tools": tools,
         })
+    }
+
+    /// The user turn's `content`: a bare string when there is no image, and
+    /// Anthropic's content-block array when there is.
+    ///
+    /// Text-only requests keep exactly the body 0.14.0 sent, so upgrading
+    /// changes nothing on the wire for a caller who sends no image.
+    #[cfg(feature = "media")]
+    fn user_content(request: &CompletionRequest) -> serde_json::Value {
+        if request.media.is_empty() {
+            return json!(request.user);
+        }
+        // Images before text: what Anthropic's own guidance recommends for
+        // prompts that ask a question about an image.
+        let mut parts: Vec<serde_json::Value> = request
+            .media
+            .iter()
+            .map(|m| {
+                json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": m.media_type,
+                        "data": m.base64,
+                    },
+                })
+            })
+            .collect();
+        parts.push(json!({ "type": "text", "text": request.user }));
+        json!(parts)
+    }
+
+    #[cfg(not(feature = "media"))]
+    fn user_content(request: &CompletionRequest) -> serde_json::Value {
+        json!(request.user)
     }
 }
 
@@ -114,7 +149,14 @@ impl Provider for Anthropic {
         Some(&self.endpoint)
     }
 
+    #[cfg(feature = "media")]
+    fn accepts_images(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        #[cfg(feature = "media")]
+        super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
         let resp = self
             .client
             .post(&self.endpoint)
@@ -253,6 +295,7 @@ mod tests {
                 description: "w".into(),
                 parameters: json!({"type":"object"}),
             }],
+            ..Default::default()
         };
         let b = a.body(&req);
         assert_eq!(b["system"], "sys");
@@ -295,5 +338,49 @@ mod tests {
         let out = acc.finish();
         assert_eq!(out.text.as_deref(), Some("hello world"));
         assert!(out.tool_calls.is_empty());
+    }
+}
+
+/// The image content-block shape, against Anthropic's documented format.
+#[cfg(all(test, feature = "media"))]
+mod media_wire {
+    use super::*;
+    use crate::provider::Media;
+
+    fn req_with_image() -> CompletionRequest {
+        CompletionRequest {
+            system: "sys".into(),
+            user: "what is this".into(),
+            media: vec![Media::image("image/png", &[1, 2, 3]).unwrap()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_image_becomes_a_base64_source_block_before_the_text() {
+        let b = Anthropic::new("k", "claude-x").body(&req_with_image());
+        let content = &b["messages"][0]["content"];
+        assert!(content.is_array(), "content must be blocks, got {content}");
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "AQID");
+        // Text after the image, which is what Anthropic's guidance recommends
+        // when the question is about the picture.
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "what is this");
+    }
+
+    #[test]
+    fn a_request_without_an_image_still_sends_a_bare_string() {
+        // The negative control, and the compatibility guarantee: a text-only
+        // body is byte-identical to the one 0.14.0 sent, so upgrading alone
+        // changes nothing on the wire and invalidates no recording.
+        let b = Anthropic::new("k", "claude-x").body(&CompletionRequest {
+            system: "sys".into(),
+            user: "no picture".into(),
+            ..Default::default()
+        });
+        assert_eq!(b["messages"][0]["content"], "no picture");
     }
 }

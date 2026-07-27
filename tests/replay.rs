@@ -136,6 +136,7 @@ fn req(user: &str) -> CompletionRequest {
         system: "you are an agent".into(),
         user: user.into(),
         tools: Vec::new(),
+        ..Default::default()
     }
 }
 

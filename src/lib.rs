@@ -267,6 +267,8 @@ pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
     ToolSpec, Usage,
 };
+#[cfg(feature = "media")]
+pub use provider::{Media, IMAGE_MEDIA_TYPES};
 pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
 // Each entry point has an observed twin: a separate function rather than an extra
 // parameter on the existing seven, so 0.11.0 code compiles unchanged against

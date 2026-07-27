@@ -85,6 +85,17 @@ fn worth_another_provider(e: &Error) -> bool {
 // which needs its fields `Sync`. Every real provider is (they hold a `reqwest::Client`
 // and two `String`s), so this costs nothing a caller would notice.
 impl<A: Provider + Sync, B: Provider + Sync> Provider for Fallback<A, B> {
+    /// Both, or neither. Reporting the primary's answer would let an image reach
+    /// a secondary that cannot read it on the one call that matters — the
+    /// fallover — and a fallover already means something has gone wrong. The
+    /// secondary would refuse it (`ensure_media_accepted` runs inside every
+    /// built-in provider too), so the only thing the conjunction changes is
+    /// *when* the caller finds out: before the run, rather than mid-fallover.
+    #[cfg(feature = "media")]
+    fn accepts_images(&self) -> bool {
+        self.primary.accepts_images() && self.secondary.accepts_images()
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         match self.primary.complete(request.clone()).await {
             Ok(response) => {
@@ -203,6 +214,7 @@ mod tests {
             system: String::new(),
             user: "hi".into(),
             tools: Vec::new(),
+            ..Default::default()
         }
     }
 

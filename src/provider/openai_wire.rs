@@ -37,10 +37,37 @@ pub(crate) fn body(model: &str, request: &CompletionRequest) -> serde_json::Valu
         "stream_options": { "include_usage": true },
         "messages": [
             { "role": "system", "content": request.system },
-            { "role": "user", "content": request.user },
+            { "role": "user", "content": user_content(request) },
         ],
         "tools": tools,
     })
+}
+
+/// The user turn's `content`: a bare string when there is no image, and the
+/// parts array when there is.
+///
+/// Staying a bare string in the common case is deliberate. It keeps every
+/// text-only request byte-identical to what 0.14.0 sent, so no existing
+/// behaviour changes and no recording is invalidated by merely upgrading.
+#[cfg(feature = "media")]
+fn user_content(request: &CompletionRequest) -> serde_json::Value {
+    if request.media.is_empty() {
+        return json!(request.user);
+    }
+    // Text first, then images: the order OpenAI's own examples use.
+    let mut parts = vec![json!({ "type": "text", "text": request.user })];
+    parts.extend(request.media.iter().map(|m| {
+        json!({
+            "type": "image_url",
+            "image_url": { "url": format!("data:{};base64,{}", m.media_type, m.base64) },
+        })
+    }));
+    json!(parts)
+}
+
+#[cfg(not(feature = "media"))]
+fn user_content(request: &CompletionRequest) -> serde_json::Value {
+    json!(request.user)
 }
 
 /// Parse the SSE stream of an OpenAI-style response into one completion.
@@ -159,6 +186,7 @@ mod tests {
                 description: "g".into(),
                 parameters: json!({"type":"object"}),
             }],
+            ..Default::default()
         };
         let b = body("some/model", &req);
         assert_eq!(b["model"], "some/model");
@@ -166,5 +194,69 @@ mod tests {
         assert_eq!(b["messages"][1]["content"], "hi");
         assert_eq!(b["tools"][0]["function"]["name"], "grep");
         assert_eq!(b["stream_options"]["include_usage"], true);
+    }
+}
+
+/// The `image_url` part shape, against OpenAI's documented format. OpenRouter
+/// speaks the same body, so this covers both providers that share it.
+#[cfg(all(test, feature = "media"))]
+mod media_wire {
+    use super::*;
+    use crate::provider::Media;
+
+    #[test]
+    fn an_image_becomes_a_data_url_part_after_the_text() {
+        let req = CompletionRequest {
+            system: "sys".into(),
+            user: "what is this".into(),
+            media: vec![Media::image("image/jpeg", &[1, 2, 3]).unwrap()],
+            ..Default::default()
+        };
+        let b = body("some/model", &req);
+        let content = &b["messages"][1]["content"];
+        assert!(content.is_array(), "content must be parts, got {content}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "what is this");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/jpeg;base64,AQID"
+        );
+        // The system turn is untouched: only the user turn carries parts.
+        assert_eq!(b["messages"][0]["content"], "sys");
+    }
+
+    #[test]
+    fn a_request_without_an_image_still_sends_a_bare_string() {
+        // The negative control. Without it the test above would pass against an
+        // implementation that wrapped every request in a parts array, which
+        // would change the body of every text-only run in the crate.
+        let b = body(
+            "some/model",
+            &CompletionRequest {
+                user: "no picture".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(b["messages"][1]["content"], "no picture");
+    }
+
+    #[test]
+    fn several_images_all_reach_the_body_in_order() {
+        let req = CompletionRequest {
+            user: "compare".into(),
+            media: vec![
+                Media::image("image/png", &[1]).unwrap(),
+                Media::image("image/webp", &[2]).unwrap(),
+            ],
+            ..Default::default()
+        };
+        let content = body("m", &req)["messages"][1]["content"].clone();
+        assert_eq!(content.as_array().map(Vec::len), Some(3));
+        assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AQ==");
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            "data:image/webp;base64,Ag=="
+        );
     }
 }

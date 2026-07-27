@@ -66,6 +66,7 @@ fn request() -> CompletionRequest {
         system: "s".into(),
         user: "u".into(),
         tools: Vec::new(),
+        ..Default::default()
     }
 }
 
