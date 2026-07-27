@@ -27,6 +27,29 @@ pub const GREP_TOOL: &str = "grep";
 pub const FIND_TOOL: &str = "find";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
+/// The names the model uses for spreadsheet work (0.14.0, `xlsx` feature).
+///
+/// These are built-ins rather than registered [`Tool`]s on purpose. A registered
+/// tool is authorised once, by an exec check on its name, and the crate is
+/// explicit that the policy governs whether a tool is *called* and not what it
+/// does once running. A spreadsheet tool's whole job is reading and writing files
+/// in the user's workspace, so it is dispatched here instead, gated per call on
+/// the real path it names — `deny_write("secrets/*")` refuses
+/// `xlsx_set_cell("secrets/book.xlsx", ...)` for exactly the reason it refuses
+/// `write_file` to the same path.
+#[cfg(feature = "xlsx")]
+pub const XLSX_READ_TOOL: &str = "xlsx_read";
+/// The name the model uses to list a workbook's sheets. See [`XLSX_READ_TOOL`].
+#[cfg(feature = "xlsx")]
+pub const XLSX_SHEETS_TOOL: &str = "xlsx_sheets";
+/// The name the model uses to create a new workbook. See [`XLSX_READ_TOOL`].
+#[cfg(feature = "xlsx")]
+pub const XLSX_WRITE_TOOL: &str = "xlsx_write";
+/// The name the model uses to change one cell of an existing workbook, keeping
+/// the rest of it. See [`XLSX_READ_TOOL`].
+#[cfg(feature = "xlsx")]
+pub const XLSX_SET_CELL_TOOL: &str = "xlsx_set_cell";
+
 /// The name the model uses to record a fact for later runs over this workspace.
 ///
 /// Deliberately narrow: it writes one keyed note into the harness's own store, not

@@ -35,6 +35,8 @@ use crate::tools::{
     FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
     REMEMBER_TOOL, WRITE_FILE_TOOL,
 };
+#[cfg(feature = "xlsx")]
+use crate::tools::{XLSX_READ_TOOL, XLSX_SET_CELL_TOOL, XLSX_SHEETS_TOOL, XLSX_WRITE_TOOL};
 use crate::verify::{ExecGuard, Verification};
 
 /// The tool a parent agent calls to spawn a contained sub-agent.
@@ -3033,6 +3035,148 @@ async fn dispatch(
                 },
             }
         }
+        // Spreadsheet built-ins (0.14.0). Each one gates on the path the model
+        // named, with `Act::Read` or `Act::Write`, through the same `gate` the
+        // file built-ins use — so a refusal names the workbook rather than the
+        // tool, a child's narrowed policy applies to documents exactly as it
+        // applies to source, and the underlying module reaches the file only
+        // through `Workspace`'s policy-checked byte IO.
+        //
+        // This is why they are built-ins and not registered `Tool`s: a registered
+        // tool is authorised once by an exec check on its name and then does
+        // whatever it likes to the filesystem, which for a capability whose whole
+        // job is reading and writing the user's files is the wrong boundary.
+        #[cfg(feature = "xlsx")]
+        XLSX_SHEETS_TOOL | XLSX_READ_TOOL => {
+            let path = s("path").unwrap_or_default();
+            let sheet = s("sheet");
+            let listing = name == XLSX_SHEETS_TOOL;
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => {
+                    let read = if listing {
+                        crate::tools::documents::xlsx::sheet_names(ws, &target)
+                            .map(|names| names.join("\n"))
+                    } else {
+                        crate::tools::documents::xlsx::read_sheet(ws, &target, sheet)
+                    };
+                    match read {
+                        Ok(text) => Dispatched::Continue {
+                            decision: format!("read {target}"),
+                            obs: format!(
+                                "\n[{name} {target}]\n{}\n",
+                                bound(&text, cap, ObsKind::Read)
+                            ),
+                            kind: ObsKind::Read,
+                            target: Some(target.clone()),
+                            changed: false,
+                            remember,
+                        },
+                        // A corrupt or non-xlsx file is the model's problem to
+                        // route around, not the run's to die on.
+                        Err(e) => Dispatched::go(
+                            "spreadsheet read error",
+                            format!("\n[{name} error] {e}\n"),
+                        ),
+                    }
+                }
+            }
+        }
+        #[cfg(feature = "xlsx")]
+        XLSX_WRITE_TOOL | XLSX_SET_CELL_TOOL => {
+            let path = s("path").unwrap_or_default();
+            if path.is_empty() {
+                return Ok(Dispatched::go(
+                    "spreadsheet missing path",
+                    format!("\n[{name} error] needs a \"path\" relative to the workspace root\n"),
+                ));
+            }
+            let sheet = s("sheet").unwrap_or_default().to_string();
+            let cell = s("cell").unwrap_or_default().to_string();
+            let value = s("value").unwrap_or_default().to_string();
+            let rows: Vec<Vec<String>> = call
+                .arguments
+                .get("rows")
+                .and_then(|r| serde_json::from_value(r.clone()).ok())
+                .unwrap_or_default();
+            let creating = name == XLSX_WRITE_TOOL;
+            // The approval preview is the change being asked for, not the file's
+            // bytes: a human deciding on a spreadsheet write needs to see what it
+            // does, and a workbook's raw bytes tell them nothing.
+            let preview = if creating {
+                format!(
+                    "create workbook {path} sheet {sheet} with {} row(s)",
+                    rows.len()
+                )
+            } else {
+                format!("set {sheet}!{cell} to {value:?} in {path}")
+            };
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Write,
+                path,
+                Some(&preview),
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => {
+                    let wrote = if creating {
+                        crate::tools::documents::xlsx::write_new(ws, &target, &sheet, &rows)
+                    } else {
+                        crate::tools::documents::xlsx::set_cell(ws, &target, &sheet, &cell, &value)
+                    };
+                    match wrote {
+                        Ok(w) => Dispatched::Continue {
+                            decision: format!("wrote {target}"),
+                            obs: format!(
+                                "\n[{name} {target}] {}{}\n",
+                                preview,
+                                if w.moved_the_workspace() {
+                                    ""
+                                } else {
+                                    " — identical to what was already there, the \
+                                     workspace did not change"
+                                }
+                            ),
+                            kind: ObsKind::Write,
+                            target: Some(target.clone()),
+                            changed: w.moved_the_workspace(),
+                            remember,
+                        },
+                        Err(e) => Dispatched::go(
+                            "spreadsheet write error",
+                            format!("\n[{name} error] {e}\n"),
+                        ),
+                    }
+                }
+            }
+        }
         // A tool the embedding program registered. Registration made it
         // available; this check is what authorizes the call, on exactly the terms
         // an MCP tool gets — an exec check on the name the model used. Deciding
@@ -3602,7 +3746,8 @@ fn tree_tools() -> Vec<ToolSpec> {
 }
 
 fn workspace_tools() -> Vec<ToolSpec> {
-    vec![
+    #[allow(unused_mut)]
+    let mut v = vec![
         ToolSpec {
             name: GREP_TOOL.to_string(),
             description: "Search file contents by regex (a plain substring is valid). Returns file:line: matches.".to_string(),
@@ -3665,5 +3810,65 @@ fn workspace_tools() -> Vec<ToolSpec> {
                 "required": ["path", "content"]
             }),
         },
-    ]
+    ];
+    #[cfg(feature = "xlsx")]
+    // Offered only when the feature is on. A model is told about a tool it can
+    // actually call, never about one the build does not contain.
+    v.extend([
+        ToolSpec {
+            name: XLSX_SHEETS_TOOL.to_string(),
+            description: "List the sheet names of an .xlsx workbook in the workspace.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workbook path relative to the workspace root." }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: XLSX_READ_TOOL.to_string(),
+            description: "Read one sheet of an .xlsx workbook as text. Omit \"sheet\" for the first sheet.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workbook path relative to the workspace root." },
+                    "sheet": { "type": "string", "description": "Sheet name; the first sheet if omitted." }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: XLSX_WRITE_TOOL.to_string(),
+            description: "Create a NEW .xlsx workbook with one sheet of rows. Replaces the file if it exists; to change one cell of an existing workbook use xlsx_set_cell instead, which keeps the rest of it.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workbook path relative to the workspace root." },
+                    "sheet": { "type": "string", "description": "Name for the sheet." },
+                    "rows": {
+                        "type": "array",
+                        "description": "Rows, each an array of cell values as strings.",
+                        "items": { "type": "array", "items": { "type": "string" } }
+                    }
+                },
+                "required": ["path", "sheet", "rows"]
+            }),
+        },
+        ToolSpec {
+            name: XLSX_SET_CELL_TOOL.to_string(),
+            description: "Set one cell of an EXISTING .xlsx workbook, keeping every other sheet, cell and format as it was.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workbook path relative to the workspace root." },
+                    "sheet": { "type": "string", "description": "Sheet name." },
+                    "cell": { "type": "string", "description": "A1-style cell reference, e.g. B7." },
+                    "value": { "type": "string", "description": "New cell value." }
+                },
+                "required": ["path", "sheet", "cell", "value"]
+            }),
+        },
+    ]);
+    v
 }
