@@ -26,6 +26,112 @@ notes are produced from it.
 
 ### Security
 
+## [0.13.0] - 2026-07-27
+
+A resumed run is the run it was. Resume restored the durable half of a run —
+the step it reached, what it spent, how long it had been alive — and silently
+substituted the rest: the permission policy it was executing under, and the
+context it had assembled.
+
+### Added
+
+- **`resume_with` and `resume_with_observed`** — resume an interrupted run under
+  a permission policy, taking `policy` and `approver` in the same positions
+  `run_with` uses. Until now there was no policy-preserving general resume at
+  all: `resume` took no policy, and `resume_with_decision` took one but required
+  a pending approval, so it served a run that paused for a human and not a run
+  that crashed. The policy supplied is recorded against the run, so the store
+  answers what rules the run actually executed under rather than only what it
+  started under. The provider is re-authorized on resume rather than trusted from
+  the interrupted run, matching what `resume_tree` already did: a host allowed
+  before a crash may not be allowed after.
+- **`Store::run_policy` and `Store::record_run_policy`** — the policy a run was
+  started under, kept in a new `run_policies` table. `policy_events` recorded the
+  decisions a policy produced, which is the opposite direction: a run that was
+  never asked to do anything forbidden leaves no events, and a permissive run
+  leaves none either, so the two were indistinguishable after the fact.
+  `run_policy` returns `None` for a run that recorded nothing, which is
+  deliberately not the same answer as a recorded permissive policy.
+- **`Store::observations` and `Store::record_observations`** — the context
+  observation ledger, made durable in a new `ledger_observations` table, one row
+  per observation.
+- **`Layer` and `Defaults` are re-exported** from the crate root, so a caller who
+  reads a policy back can name the types inside it.
+- **`Serialize`/`Deserialize` on `context::Ledger`, `Observation` and
+  `ObsKind`**, with `ObsKind` rendering as ten stable snake_case strings.
+
+### Changed
+
+- **`resume` and `resume_observed` now refuse a run that was started under a
+  permission policy**, returning `Error::Resume` naming the run and pointing at
+  `resume_with`. See the migration note below. A run started permissively, and a
+  run recorded before 0.13.0, resume exactly as they did.
+- **A run's context is restored on resume rather than re-derived.** The
+  observation ledger the 0.10.0 context assembler builds was in memory only, and
+  was constructed empty at the top of both the workspace and sub-agent loops
+  after the resume step was already known. A resumed run therefore re-assembled
+  its context from the workspace and asked the model a different question than
+  the process before it would have. It usually recovered, which is why this
+  survived five releases; what it cost is that a resumed run was not comparable
+  to an uninterrupted one.
+- **A recorded case now replays identically across an interruption in every
+  loop**, not only the single-file one. 0.12.0 shipped the honest boundary here —
+  a replay that could not reproduce a request refused loudly rather than
+  answering from the wrong recording — and recorded the cause in
+  `iterations/US-IO-HARNESS-0.12.0-I01`. The refusal remains for a request that
+  genuinely was never recorded; what is gone is the reason it was being reached
+  falsely.
+
+**Migrating from 0.12.0.**
+
+`resume` on a run that was started under a non-permissive policy now returns
+`Error::Resume` where it previously ran the agent permissively. Change:
+
+```rust
+// Before — the boundary was silently dropped.
+io_harness::resume(&contract, &provider, &store, run_id).await?;
+
+// After — supply the policy the run was executing under.
+io_harness::resume_with(&contract, &provider, &store, run_id, &policy, &approver).await?;
+```
+
+An error is the default rather than a silent downgrade because the two failure
+modes are not symmetric: a refused resume is visible and fixed in one line,
+while a silently permissive one is a boundary the caller believes is enforced
+and is not. If a permissive resume is genuinely what you want, pass
+`Policy::permissive()` to `resume_with` and the decision is recorded as yours.
+
+Every other resume entry point is unchanged. `resume` on a run started
+permissively, on a run with no recorded policy, or on a run that has already
+finished behaves exactly as it did in 0.12.0 — a finished run reports its
+outcome regardless of policy, because it drives nothing.
+
+Two new tables are created additively in `Store::from_conn`;
+`CHECKPOINT_FORMAT` stays at 7, so a 0.12.0 store opens and a 0.12.0 checkpoint
+resumes. A run checkpointed before 0.13.0 has no recorded policy and no durable
+ledger, and resumes with 0.12.0's behaviour rather than being refused or having
+a boundary invented for it.
+
+
+### Fixed
+
+- **A resumed workspace run no longer loses its permission boundary.** Through
+  0.12.0, `resume` and `resume_observed` substituted `Policy::permissive()` and
+  `ApproveAll` for every workspace run they resumed. A caller who ran under a
+  deny-by-default path policy through `run_with`, whose process then died, got an
+  agent with no boundary at all under the same run id — and nothing said so,
+  because the trace showed no refusals for the simple reason that nothing
+  refused. The crate stated the opposite principle sixty lines earlier, where
+  single-file mode refuses a policy loudly so that a caller never believes a
+  boundary is enforced when nothing is checking.
+
+### Security
+
+- The fix above is the security-relevant one. If you resume workspace runs and
+  pass a policy to `run_with`, treat 0.12.0 and earlier as not enforcing that
+  policy across a resume, and upgrade. Nothing needs to be re-issued or revoked:
+  the boundary was dropped on resume, not leaked.
+
 ## [0.12.0] - 2026-07-27
 
 The twelfth and last of the twelve pillars: observability and evaluation. The

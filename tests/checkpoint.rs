@@ -13,8 +13,8 @@ use std::time::Duration;
 use io_harness::approve::{Approver, Decision, DecisionFuture, Request};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    resume, resume_tree, resume_tree_with_decision, run, run_tree, ApproveAll, Containment, Policy,
-    Provider, RunOutcome, Store, TaskContract, Verification,
+    resume, resume_tree, resume_tree_with_decision, run, run_tree, run_with, ApproveAll,
+    Containment, Policy, Provider, RunOutcome, Store, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -124,6 +124,29 @@ fn spawn(goal: &str, file: &str, needle: &str) -> ToolCall {
     )
 }
 
+/// A workspace provider that writes one fixed (path, content) on every turn.
+///
+/// Stateless, so a replayed or resumed step behaves identically. Pointed at a
+/// contract whose verification the content does NOT satisfy it produces a run
+/// that reaches its step cap with real committed state — the interrupted run the
+/// back-compatibility tests below resume from; pointed at content that does
+/// satisfy it, it finishes one.
+struct WriteOnce {
+    path: &'static str,
+    content: &'static str,
+}
+impl Provider for WriteOnce {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        Ok(CompletionResponse {
+            tool_calls: vec![call(
+                "write_file",
+                json!({ "path": self.path, "content": self.content }),
+            )],
+            ..Default::default()
+        })
+    }
+}
+
 /// Approver that always defers (for the pause-across-restart test).
 struct Defer;
 impl Approver for Defer {
@@ -147,6 +170,30 @@ fn tree_contract(root: &std::path::Path) -> TaskContract {
 }
 fn containment() -> Containment {
     Containment::new(10, 4, 3, 1_000_000)
+}
+
+/// A workspace contract over `root` satisfied by `needle` landing in `out.txt`.
+/// Workspace mode on purpose: the observation ledger and the policy gate only
+/// exist on that path, so a single-file contract would prove nothing about
+/// either.
+fn out_contract(root: &std::path::Path, needle: &str, max_steps: u32) -> TaskContract {
+    TaskContract::workspace(
+        "write out.txt",
+        root,
+        Verification::WorkspaceFileContains {
+            file: "out.txt".into(),
+            needle: needle.into(),
+        },
+    )
+    .with_max_steps(max_steps)
+}
+
+/// The store as a plain SQLite file, for reaching past the public API to make a
+/// 0.13.0 database look like a 0.12.0 one. `rusqlite` is the crate's own storage
+/// dependency and other tests in this suite (`store_open`, `outcome_record`)
+/// already open the file this way.
+fn sqlite(db: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(db).expect("open the store as a plain SQLite file")
 }
 
 /// Locate the compiled `crash_fixture` example next to this test binary, for the
@@ -578,6 +625,269 @@ async fn a_tree_approval_survives_a_full_restart() {
             .unwrap()
             .trim(),
         "BETA"
+    );
+}
+
+// ---------- 0.13.0: the back-compatibility promises, proven not asserted ----------
+
+/// The checkpoint format is still 7, and that is a promise, not an accident.
+///
+/// [`Store::check_resumable`] refuses any store whose `PRAGMA user_version` is
+/// *higher* than this constant, so a bump makes every 0.12.0 database written by
+/// an older binary unresumable by the newer one — an unattended run that crashed
+/// before the upgrade could never be finished. 0.13.0 added `run_policies` and
+/// `ledger_observations` and changed nothing about the layout of a checkpoint:
+/// both are additive tables an older binary never queries. If this assertion
+/// ever fails, the release notes have to say so and a migration has to exist.
+#[test]
+fn the_checkpoint_format_is_still_7_because_0_13_0_only_added_tables() {
+    assert_eq!(
+        io_harness::CHECKPOINT_FORMAT,
+        7,
+        "0.13.0's two new tables are additive; bumping the format would make \
+         check_resumable refuse every 0.12.0 store"
+    );
+}
+
+/// A store written by 0.12.0 — one with neither 0.13.0 table in it — opens and
+/// resumes to a verified result.
+///
+/// The 0.12.0 shape is produced honestly: let `Store::open` build the schema,
+/// then `DROP` the two tables 0.13.0 introduced, which is byte-for-byte what an
+/// older binary leaves on disk. Reopening recreates them empty (`CREATE TABLE IF
+/// NOT EXISTS` is the whole migration) and the interrupted run continues from its
+/// last committed step. If this regressed, every checkpoint written before the
+/// upgrade would be dead on arrival.
+#[tokio::test]
+async fn a_store_written_without_the_0_13_0_tables_opens_and_resumes() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let crashed = run(
+        &out_contract(dir.path(), "DONE", 1),
+        &WriteOnce {
+            path: "out.txt",
+            content: "WORKING\n",
+        },
+        &store,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(crashed.outcome, RunOutcome::StepCapReached { .. }),
+        "an interrupted run to resume: {:?}",
+        crashed.outcome
+    );
+    let id = crashed.run_id;
+    let before = store.last_step(id).unwrap();
+    drop(store);
+
+    // Rewind the file to 0.12.0: the two tables simply are not there.
+    let c = sqlite(&db);
+    c.execute_batch("DROP TABLE run_policies; DROP TABLE ledger_observations;")
+        .unwrap();
+    for table in ["run_policies", "ledger_observations"] {
+        assert!(
+            c.query_row(&format!("SELECT 1 FROM {table}"), [], |_| Ok(()))
+                .is_err(),
+            "{table} is really gone before the reopen"
+        );
+    }
+    drop(c);
+
+    // A 0.13.0 binary opens that file: the tables come back empty, and the run
+    // recorded in it resumes and completes.
+    let store = Store::open(&db).unwrap();
+    assert!(
+        store.run_policy(id).unwrap().is_none(),
+        "a 0.12.0 store records no policy for its runs"
+    );
+    assert!(
+        store.observations(id).unwrap().is_empty(),
+        "a 0.12.0 store has no durable ledger"
+    );
+    let r = resume(
+        &out_contract(dir.path(), "DONE", 5),
+        &WriteOnce {
+            path: "out.txt",
+            content: "DONE\n",
+        },
+        &store,
+        id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { steps } if steps > before),
+        "the 0.12.0 checkpoint resumed to success: {:?}",
+        r.outcome
+    );
+}
+
+/// A run with no recorded policy resumes through the bare [`resume`], because
+/// absence is not a policy.
+///
+/// Every run started by 0.12.0 or earlier has no `run_policies` row. The 0.13.0
+/// gate refuses a run whose *recorded* policy is not permissive; a missing row is
+/// deliberately a third case, resumed exactly as 0.7.0's contract promised. Read
+/// as "the caller chose permissive" it would be the same behaviour by the wrong
+/// reasoning — and read as "unknown, therefore refuse" it would strand every
+/// pre-0.13.0 checkpoint.
+#[tokio::test]
+async fn a_run_with_no_recorded_policy_resumes_through_the_bare_resume() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let crashed = run(
+        &out_contract(dir.path(), "DONE", 1),
+        &WriteOnce {
+            path: "out.txt",
+            content: "WORKING\n",
+        },
+        &store,
+    )
+    .await
+    .unwrap();
+    let id = crashed.run_id;
+    assert!(
+        store.run_policy(id).unwrap().is_some(),
+        "0.13.0 does record one, so deleting it below is a real difference"
+    );
+    drop(store);
+
+    // The run as 0.12.0 would have left it: a run row, no policy row.
+    sqlite(&db)
+        .execute("DELETE FROM run_policies WHERE run_id = ?1", [id])
+        .unwrap();
+
+    let store = Store::open(&db).unwrap();
+    assert!(store.run_policy(id).unwrap().is_none());
+    let r = resume(
+        &out_contract(dir.path(), "DONE", 5),
+        &WriteOnce {
+            path: "out.txt",
+            content: "DONE\n",
+        },
+        &store,
+        id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { .. }),
+        "a policy-less run is driven, not refused: {:?}",
+        r.outcome
+    );
+}
+
+/// A run with no durable observations resumes and re-derives its context.
+///
+/// 0.13.0 restores the observation ledger from `ledger_observations` at the top
+/// of the resumed loop. A pre-0.13.0 checkpoint has no rows there, so the restore
+/// yields an empty ledger — which must mean "re-derive from the workspace, as
+/// 0.12.0 always did", not an error and not a run that assembles context from
+/// nothing and stalls.
+#[tokio::test]
+async fn a_run_with_no_durable_observations_resumes_and_re_derives() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    let store = Store::open(&db).unwrap();
+    let crashed = run(
+        &out_contract(dir.path(), "DONE", 1),
+        &WriteOnce {
+            path: "out.txt",
+            content: "WORKING\n",
+        },
+        &store,
+    )
+    .await
+    .unwrap();
+    let id = crashed.run_id;
+    assert!(
+        !store.observations(id).unwrap().is_empty(),
+        "0.13.0 does write a ledger, so emptying it below is a real difference"
+    );
+    drop(store);
+
+    // The run as 0.12.0 would have left it: committed steps, no ledger.
+    sqlite(&db)
+        .execute("DELETE FROM ledger_observations WHERE run_id = ?1", [id])
+        .unwrap();
+
+    let store = Store::open(&db).unwrap();
+    assert!(store.observations(id).unwrap().is_empty());
+    let r = resume(
+        &out_contract(dir.path(), "DONE", 5),
+        &WriteOnce {
+            path: "out.txt",
+            content: "DONE\n",
+        },
+        &store,
+        id,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { .. }),
+        "an empty restore re-derives rather than failing: {:?}",
+        r.outcome
+    );
+    assert!(
+        !store.observations(id).unwrap().is_empty(),
+        "the resumed run wrote its own observations from there on"
+    );
+}
+
+/// A finished run reports its outcome through the bare [`resume`] even though it
+/// was started under a policy.
+///
+/// The policy gate sits *after* the finished-run short-circuit, and that ordering
+/// is the whole contract: a run that is already over drives no loop, asks no
+/// provider and performs no action, so there is no boundary to drop by reading
+/// it. Gating it first would turn every terminal outcome — the refused and
+/// escalated ones `tests/net.rs` depends on reporting — into an error for any
+/// run that had a policy, which is most of them.
+#[tokio::test]
+async fn a_finished_policy_bearing_run_still_reports_its_outcome_through_the_bare_resume() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let policy = Policy::default()
+        .layer("base")
+        .allow_read("*")
+        .allow_write("*");
+    assert!(
+        !policy.is_permissive(),
+        "the gate only has something to refuse if the policy is a real boundary"
+    );
+    let contract = out_contract(dir.path(), "DONE", 5);
+    let finisher = || WriteOnce {
+        path: "out.txt",
+        content: "DONE\n",
+    };
+    let done = run_with(&contract, &finisher(), &store, &policy, &ApproveAll)
+        .await
+        .unwrap();
+    assert!(
+        matches!(done.outcome, RunOutcome::Success { .. }),
+        "{:?}",
+        done.outcome
+    );
+    let recorded = store
+        .run_policy(done.run_id)
+        .unwrap()
+        .expect("the run carries a recorded policy");
+    assert!(
+        !recorded.is_permissive(),
+        "the recorded policy is the kind the gate refuses, so the short-circuit \
+         below is what lets this through — not a permissive row"
+    );
+
+    let again = resume(&contract, &finisher(), &store, done.run_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        again.outcome, done.outcome,
+        "a finished run is reported, not refused and not re-driven"
     );
 }
 

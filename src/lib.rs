@@ -241,7 +241,7 @@ pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // reaching into a provider's namespace to find it.
 pub use net::REQUEST_TIMEOUT;
 pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
-pub use policy::{Act, Effect, Policy, Rule, Verdict};
+pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
     ToolSpec, Usage,
@@ -253,9 +253,9 @@ pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
 // caller that does not want one.
 pub use run::{
     resume, resume_observed, resume_tree, resume_tree_observed, resume_tree_with_decision,
-    resume_tree_with_decision_observed, resume_with_decision, resume_with_decision_observed, run,
-    run_observed, run_tree, run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult,
-    SPAWN_TOOL,
+    resume_tree_with_decision_observed, resume_with, resume_with_decision,
+    resume_with_decision_observed, resume_with_observed, run, run_observed, run_tree,
+    run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,

@@ -8,7 +8,34 @@
 
 use rusqlite::Connection;
 
+use crate::context::{ObsKind, Observation};
 use crate::error::{Error, Result};
+use crate::policy::Policy;
+
+/// An observation kind as it is stored: the serde rendering, not
+/// [`ObsKind::label`], which is English for a prompt reader and renders `Write`
+/// as "wrote". Going through serde rather than a hand-written match is what
+/// keeps the mapping total — a new variant cannot be added without a rendering,
+/// and the pair below cannot drift apart.
+fn kind_wire(kind: ObsKind) -> String {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(s)) => s,
+        // Unreachable for a unit-variant enum with `rename_all`; falling back to
+        // the debug form keeps the write infallible without inventing a kind that
+        // would read back as a different observation.
+        other => format!("{other:?}"),
+    }
+}
+
+/// The inverse of [`kind_wire`]. A kind that does not parse is an error and not
+/// a skipped row: a ledger that came back silently shorter than it was would
+/// assemble a context nobody can account for, which is worse than refusing to
+/// restore it at all.
+fn kind_from_wire(kind: &str, run_id: i64) -> Result<ObsKind> {
+    serde_json::from_value(serde_json::Value::String(kind.to_string())).map_err(|e| Error::Resume {
+        reason: format!("run {run_id} has a ledger observation of unknown kind {kind:?}: {e}"),
+    })
+}
 
 /// The checkpoint layout version stamped into `PRAGMA user_version`. Bump when
 /// the on-disk checkpoint format changes incompatibly. A store whose version is
@@ -977,6 +1004,62 @@ impl Store {
              );",
         )?;
 
+        // 0.13.0: the policy a run was started under, kept so a later resume can
+        // tell what boundary the caller enforced instead of guessing. Nothing in
+        // the schema recorded it: `policy_events` holds the decisions a policy
+        // produced, which is the opposite direction — a run that was never asked
+        // to do anything forbidden leaves no events at all, and a permissive run
+        // leaves none either, so the two are indistinguishable after the fact.
+        //
+        // Stored as JSON in one column rather than shredded into rule rows: the
+        // only reader wants the whole [`Policy`] back, and a serialised blob
+        // cannot drift from the type the way a hand-written flattening would.
+        //
+        // New table only, so a 0.12.0 database gains it and a 0.12.0 binary, which
+        // never queries it, still opens and resumes a migrated database.
+        // Deliberately NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout
+        // changed, and bumping it would make [`Store::check_resumable`] refuse
+        // every 0.12.0 store for an additive table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_policies (
+                 run_id INTEGER PRIMARY KEY,
+                 policy TEXT NOT NULL
+             );",
+        )?;
+
+        // 0.13.0: the observation ledger the context assembler builds, made
+        // durable so a resumed run restores the context it had instead of
+        // re-deriving one from the workspace.
+        //
+        // The text was already durable — `steps.result` holds one step's
+        // observations concatenated — but concatenated is the problem: a step with
+        // three observations stores one string, and the typed triple assembly
+        // actually reasons about (`step`, `kind`, `target`) is not recoverable
+        // from it at all. `ObsKind::target_is_the_subject` decides supersession
+        // from `kind`, so a ledger rebuilt from `steps.result` would assemble
+        // differently from the one it replaced, which is worse than the honest
+        // re-derivation it would be replacing.
+        //
+        // One row per observation, ordered by `id` like every other event table
+        // here, because the ledger is an ordered log and `step` alone does not
+        // order the observations within a step.
+        //
+        // New table only, so a 0.12.0 database gains it and a 0.12.0 binary, which
+        // never queries it, still opens and resumes a migrated database.
+        // Deliberately NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout
+        // changed, and bumping it would make [`Store::check_resumable`] refuse
+        // every 0.12.0 store for an additive table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ledger_observations (
+                 id     INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 step   INTEGER NOT NULL,
+                 kind   TEXT NOT NULL,
+                 target TEXT,
+                 text   TEXT NOT NULL
+             );",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -1241,6 +1324,109 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record the policy a run was started under.
+    ///
+    /// `INSERT OR REPLACE`, like every other per-run row, so recording twice for
+    /// one run — a resume that re-states its boundary — replaces rather than
+    /// duplicates or fails.
+    pub fn record_run_policy(&self, run_id: i64, policy: &Policy) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO run_policies (run_id, policy) VALUES (?1, ?2)",
+            (
+                run_id,
+                serde_json::to_string(policy).expect("a Policy is always serialisable"),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// The policy a run was started under, or `None` if none was recorded.
+    ///
+    /// `None` is not [`Policy::permissive`] and must never be read as it: a run
+    /// written by 0.12.0 has no row at all, so the honest answer is "nobody
+    /// recorded what the boundary was", not "the caller chose to enforce
+    /// nothing". A caller that needs a policy either way has to decide which to
+    /// assume, and it should decide that knowingly.
+    /// Unlike the other getters in this file, a failed read is an error rather
+    /// than `None`. They can fold the two together because a missing memory
+    /// entry and an unreadable one lead to the same recovery; here they do not.
+    /// `None` is what tells [`crate::resume`] the run had no boundary and may be
+    /// resumed permissively, so a disk error that read as `None` would hand a
+    /// policy-bearing run an agent with no policy — silently, and by exactly the
+    /// route this table exists to close.
+    pub fn run_policy(&self, run_id: i64) -> Result<Option<Policy>> {
+        let json: Option<String> = match self.conn.query_row(
+            "SELECT policy FROM run_policies WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        ) {
+            Ok(json) => Some(json),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        json.map(|j| {
+            serde_json::from_str(&j).map_err(|e| Error::Resume {
+                reason: format!("run {run_id} has an unreadable recorded policy: {e}"),
+            })
+        })
+        .transpose()
+    }
+
+    /// Append observations to a run's durable ledger, in one transaction.
+    ///
+    /// Called once at a committed step boundary rather than once per
+    /// observation: the step is the unit the rest of the checkpoint works in, and
+    /// an observation belonging to a step that never committed must not survive a
+    /// crash the step itself did not survive.
+    pub fn record_observations(&self, run_id: i64, entries: &[Observation]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO ledger_observations (run_id, step, kind, target, text)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for e in entries {
+                stmt.execute((run_id, e.step as i64, kind_wire(e.kind), &e.target, &e.text))?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A run's durable ledger, in the order it was observed.
+    ///
+    /// Empty for a run that recorded nothing and for a run written before 0.13.0
+    /// — the two are the same to a reader, and both mean "there is nothing to
+    /// restore", which is 0.12.0's behaviour and not a lie about it.
+    pub fn observations(&self, run_id: i64) -> Result<Vec<Observation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT step, kind, target, text
+             FROM ledger_observations WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u32,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (step, kind, target, text) = row?;
+            out.push(Observation::new(
+                step,
+                kind_from_wire(&kind, run_id)?,
+                target,
+                text,
+            ));
+        }
+        Ok(out)
     }
 
     /// Every sandbox event recorded for a run, in order.
@@ -2522,5 +2708,70 @@ mod tests {
         assert!(store.memory_list("ws").unwrap().is_empty());
         store.memory_put("ws", "k", "v", 1, 1).unwrap();
         assert_eq!(store.memory_get("ws", "k").unwrap().unwrap().value, "v");
+    }
+
+    #[test]
+    fn a_layered_policy_reads_back_exactly_as_it_was_recorded() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        let policy = Policy::default()
+            .layer("task")
+            .deny_write("vendor/**")
+            .rule(
+                crate::policy::Act::Exec,
+                crate::policy::Effect::Allow,
+                "cargo",
+            );
+
+        store.record_run_policy(run, &policy).unwrap();
+
+        // Equal, not merely similar: the layers, their order, and the defaults
+        // are the boundary, so a lossy round trip is a wrong boundary.
+        assert_eq!(store.run_policy(run).unwrap(), Some(policy));
+    }
+
+    #[test]
+    fn a_permissive_policy_reads_back_permissive() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store.record_run_policy(run, &Policy::permissive()).unwrap();
+
+        let back = store.run_policy(run).unwrap().expect("a row was recorded");
+        assert!(back.is_permissive());
+    }
+
+    #[test]
+    fn a_run_with_no_recorded_policy_reads_back_none_not_permissive() {
+        let store = Store::memory().unwrap();
+        let unrecorded = store.start_run("goal", "root").unwrap();
+        let permissive = store.start_run("goal", "root").unwrap();
+        store
+            .record_run_policy(permissive, &Policy::permissive())
+            .unwrap();
+
+        // The distinction the table exists for: a 0.12.0 run wrote no row, and
+        // "nobody recorded a policy" must never be read as "the caller chose to
+        // enforce nothing".
+        assert_eq!(store.run_policy(unrecorded).unwrap(), None);
+        assert!(store.run_policy(permissive).unwrap().is_some());
+    }
+
+    #[test]
+    fn re_recording_a_policy_for_the_same_run_replaces_it() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store.record_run_policy(run, &Policy::permissive()).unwrap();
+        store.record_run_policy(run, &Policy::default()).unwrap();
+
+        assert_eq!(store.run_policy(run).unwrap(), Some(Policy::default()));
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_policies WHERE run_id = ?1",
+                [run],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 }
