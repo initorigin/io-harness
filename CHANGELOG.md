@@ -26,6 +26,144 @@ notes are produced from it.
 
 ### Security
 
+## [0.14.0] - 2026-07-27
+
+Documents, governed by the rules that already govern source. An agent reads a
+real `.xlsx`, changes one cell and writes the workbook back with the sheets it
+did not touch intact; reads a `.docx` and generates one; generates a PDF,
+extracts the text of an existing one, stamps a watermark across its pages and
+fills its AcroForm fields; decodes a barcode or QR code out of an image; reads
+the text of a slide deck.
+
+That every one of those passes the 0.4.0 path policy on the path the model
+actually named is the release, not a qualifier. The obvious way to ship a
+document capability is a registered `Tool`, and the crate is explicit that a
+registered tool is authorised once, by name, and that the policy "governs
+whether it is *called*; it does not govern what it does once running — no
+sandbox, no path scoping, and no egress control applies inside it." A
+`docx_write` tool taking a path from the model would therefore write wherever
+the model said, and `deny_write("secrets/*")` would not stop it. So these are
+built-ins, dispatched in the same `match` as `read_file` and `write_file` and
+gated per call on `Act::Read` or `Act::Write` against the path they name, over
+new byte-level workspace IO that no document module bypasses. A refusal names
+the file rather than the tool, and a sub-agent's narrowed policy applies to
+documents exactly as it applies to source.
+
+**What was cut, and why.** A reader who remembers the roadmap promising more
+than this should find the reason here.
+
+- **OCR is cut — off the roadmap, not deferred to a later release.** The owner's
+  decision on 2026-07-27, and the evidence supported it independently. Every
+  viable Rust path breaks a standing constraint that no CI runner installs a
+  system package: the Tesseract binding needs the system library on all three
+  runners, worst on Windows where it means vcpkg and a from-source C++ build
+  plus libclang for bindgen, with language data distributed to every user. The
+  pure-Rust alternative needs MSRV 1.89 against this crate's 1.88 floor, fetches
+  its models over the network on first use, and recognises Latin script only. A
+  capability that only works on machines that were prepared for it is not a
+  capability this crate can claim. It appears in no planned release.
+- **PowerPoint authoring is cut — off the roadmap, not deferred.** Same
+  decision, same day. Generating a deck means writing slide layouts, masters,
+  theme parts and the relationship graph that ties them together; hand-rolled on
+  top of a zip writer, that produces a file PowerPoint may or may not open, and
+  "may or may not" is not a capability. The one credible Rust crate is a
+  46-star, single-maintainer, pre-0.3 project. Reading a deck is a projection
+  and cannot corrupt anything, so the read half stays: `.pptx` is read-only
+  here, and no write path for it exists in the public surface.
+- **Editing a Word document in place is not claimed.** `docx-rs`'s reader models
+  the OOXML it knows and drops what it does not, so read-then-write is a lossy
+  rewrite rather than an edit. On a document this harness generated that costs
+  nothing; on a user's real one — a comment thread, a content control, a field,
+  a shape, a vendor extension — it silently deletes the parts the reader could
+  not name, which is data loss presented as an edit. `xlsx_set_cell` exists
+  because `umya-spreadsheet` genuinely round-trips a workbook it did not create;
+  nothing in the Word ecosystem earns the same call yet.
+- **Barcode and QR *generation* is not here.** The README's capability line
+  promises read and generate; this release decodes and does not encode. The
+  roadmap entry for 0.14.0 scoped barcodes to decoding off a page, and that is
+  what shipped.
+- **Deleting a document is not here either.** The same capability line promises
+  create/edit/delete, but the harness has no delete for any file — there is no
+  `delete_file` built-in for source text — so deletion is an absent file
+  operation rather than a document gap, and this release does not introduce one.
+- **High-fidelity PDF rendering and rasterisation is out of scope.** It means
+  binding Pdfium, a per-OS binary the crate would have to tell users to install,
+  which is the same constraint that removed OCR plus a redistribution question.
+
+### Added
+
+- **The crate's first `[features]` section, with `default = []`.** The default
+  build is unchanged: every document dependency is optional, so a consumer who
+  does not want documents pays nothing for them. `documents` is an umbrella over
+  the per-format features `xlsx`, `docx`, `pptx`, `pdf` and `barcode`, so a
+  caller who wants spreadsheets does not compile a PDF stack:
+
+  ```toml
+  io-harness = { version = "0.14.0", features = ["documents"] }
+  ```
+
+  The MSRV floor stays at 1.88 with the features enabled; nothing here moves it.
+- **Spreadsheets (`xlsx`)** — `sheet_names`, `read_sheet`, `write_new`, and
+  `set_cell`, which changes one cell of an existing workbook and keeps the rest
+  of it. Three crates, because the three jobs are separate: `calamine` reads and
+  cannot write, `rust_xlsxwriter` writes new files and explicitly cannot modify
+  an existing one, and `umya-spreadsheet` is the only one that round-trips a
+  workbook it did not create. Preserving-edit fidelity is not promised for chart
+  and drawing heavy workbooks, and the doc comment says so where a caller meets
+  it rather than here.
+- **Word (`docx`)** — `read_text` and `write_new`. Generate and read; there is
+  deliberately no third function that edits an existing document, for the reason
+  above.
+- **PowerPoint (`pptx`)** — `read_text`, read-only. No presentation crate: a
+  deck is a zip of XML and the slide text is the `<a:t>` content of
+  `ppt/slides/slideN.xml`, which is a short walk over `zip` and `quick-xml`,
+  two dependencies this tree can already justify. Layouts, masters and speaker
+  notes are deliberately not read — boilerplate placeholder text and private
+  notes are not what "the text of this deck" means.
+- **PDF (`pdf`)** — `write_new`, `read_text`, `watermark` and `fill_form`. Text
+  extraction is best-effort on reading order and says so: a PDF stores placed
+  glyphs, not a document, so columns can interleave, tables lose their shape,
+  and a scanned page contains no text at all and returns an empty string. Form
+  filling sets `/NeedAppearances` as well as the field value, without which many
+  viewers render a filled field blank — but that flag is a request to the viewer
+  and not a rendered result, so a viewer that ignores it will still show the
+  field empty.
+- **Barcodes (`barcode`)** — `decode` returns every 1D and 2D symbol `rxing`
+  supports (QR, Data Matrix, Aztec, PDF417, Code 128, Code 39/93, EAN-8/13,
+  UPC-A/E, ITF, Codabar) without the caller naming the symbology first. An image
+  with no code in it returns an empty result rather than an error, because "I
+  looked and there was nothing there" is something the model can act on.
+- **Twelve built-in tools the model can call**: `xlsx_read`, `xlsx_sheets`,
+  `xlsx_write`, `xlsx_set_cell`, `docx_read`, `docx_write`, `pptx_read`,
+  `pdf_read`, `pdf_write`, `pdf_watermark`, `pdf_fill_form` and
+  `barcode_decode`, each present only when its feature is. A failure — a corrupt
+  file, a form field that does not exist, a bad cell reference — comes back as an
+  observation the model can read and adapt to, the same treatment a malformed
+  regex gets from `grep`, and the run continues.
+- **`Workspace::read_bytes` and `Workspace::write_bytes`** — byte-level IO
+  through the same `check_path` gate every text read and write goes through,
+  returning the same `Wrote` outcome. Every document byte in this release moves
+  through them and no module opens a path itself, which is what makes the
+  capability governable; they are useful on their own to any caller handling
+  binary files. One deliberate difference from `read_file`: a missing file is an
+  error rather than an empty buffer, because handing a parser zero bytes turns
+  "there is no such file" into "this file is corrupt".
+- **`Verification::DocumentContains { file, needle }`** — a stop condition that
+  gates on a document's *extracted text*. It exists because
+  `Verification::WorkspaceFileContains` reads with
+  `read_to_string(..).unwrap_or_default()`, and every format here is a binary
+  container, so on a document it reads the empty string and reports "does not
+  contain" for every needle. That is a silent, permanent false FAIL rather than
+  a false pass — a document task using the existing variant could not succeed at
+  all. The variant is present in every build, feature or no feature: without the
+  format's feature it returns a typed `Error::Config` naming the feature that
+  was not enabled, rather than disappearing from the enum and breaking a
+  consumer's exhaustive `match`.
+
+Everything in this release is additive. No public item was renamed or removed,
+no existing behaviour changed, no schema reshaped, and `CHECKPOINT_FORMAT` stays
+at 7 — a consumer upgrades by changing the version number.
+
 ## [0.13.0] - 2026-07-27
 
 A resumed run is the run it was. Resume restored the durable half of a run —

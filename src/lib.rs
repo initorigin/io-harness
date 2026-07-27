@@ -182,6 +182,27 @@
 //! policy every other action does. Anything that should actually *do* something
 //! is a [`Tool`], where the permission layer can see it.
 //!
+//! v0.14 adds **documents**, behind an opt-in `documents` feature — an umbrella
+//! over `xlsx`, `docx`, `pptx`, `pdf` and `barcode`, none of which the default
+//! build compiles. With it on the agent gains built-in tools for spreadsheets
+//! (read a sheet, list the sheets, generate a workbook, and change one cell of an
+//! existing one, which is a real round trip rather than a rewrite), Word (read
+//! and generate; there is deliberately no in-place edit, because the reader drops
+//! the OOXML it does not model), PowerPoint text (read-only, with no writer), PDF
+//! (generate, extract text, watermark, fill AcroForm fields) and barcode and QR
+//! decoding out of an image. They are built-ins rather than registered [`Tool`]s
+//! because a registered tool is authorised once by name and the policy does not
+//! govern what it does afterwards: each document call is instead gated on
+//! [`Act::Read`] or [`Act::Write`] against the path the model named — so
+//! `deny_write("secrets/*")` stops `xlsx_set_cell` where it stops `write_file` —
+//! and every byte in and out goes through
+//! [`Workspace::read_bytes`](tools::Workspace::read_bytes) and
+//! [`write_bytes`](tools::Workspace::write_bytes), with no parser ever handed a
+//! path. [`Verification::DocumentContains`] gates on a document's extracted text:
+//! [`Verification::WorkspaceFileContains`] reads a binary container as the empty
+//! string and so reports "does not contain" for *every* document, which is a
+//! silent permanent false fail rather than a false pass.
+//!
 //! v0.3 adds repository work: [`TaskContract::workspace`] runs a multi-tool loop
 //! where the agent greps, finds, reads, and writes several files under one root,
 //! verified together ([`Verification::WorkspaceTestPasses`]). It also adds the

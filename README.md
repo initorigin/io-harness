@@ -18,8 +18,9 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
   `rust-version` of its own, so cargo cannot catch it at resolve time — on 1.87
   the build fails inside that dependency rather than here.
 - **Status:** Pre-release (0.x), published on crates.io. Released through
-  0.12.0, which closes the twelfth of the twelve pillars — all twelve now hold.
-  Per-release detail is in [CHANGELOG.md](CHANGELOG.md).
+  0.13.0; 0.12.0 closed the twelfth of the twelve pillars and all twelve still
+  hold. 0.14.0 (documents) is the release in progress. Per-release detail is in
+  [CHANGELOG.md](CHANGELOG.md).
 
 ## Capabilities
 
@@ -40,8 +41,8 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Long-running autonomous tasks — 24h+ with no user input
 - Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, portable floor everywhere — on Windows the floor only, where the Job Object is designed but not implemented and just the wall clock is enforced)
 - Built-in tools — `write_file`, `read_file`, `grep`, `find` ✅ **v0.1**, **v0.3**; `read_skill` ✅ **v0.9**; `remember` ✅ **v0.10**; `spawn_agent` (in `run_tree` only) ✅ **v0.5**
-- Office and document tools — Word/Excel/PowerPoint/PDF create/edit/delete, PDF watermark, PDF form fill, OCR, barcode/QR read and generate — 🚧 **planned v0.13**
-- Media and git — image and video passthrough when the model supports it; real repository work — 🚧 **planned v0.14**
+- Office and document tools ✅ **v0.14**, behind an opt-in `documents` feature: Excel read/generate/preserving-edit, Word read and generate, PowerPoint text read-only, PDF generate/extract/watermark/AcroForm form-fill, barcode and QR decode. OCR, PowerPoint authoring, barcode/QR generation, in-place Word edit, and document delete are **cut from the roadmap**, not deferred
+- Media and git — image and video passthrough when the model supports it; real repository work — 🚧 **planned v0.15**
 - Extensibility — MCP (rmcp) ✅ **v0.8** (client; stdio + streamable HTTP), in-process `Tool` implementations and skills ✅ **v0.9**
 
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
@@ -905,6 +906,97 @@ the window is configurable and can be disabled.
 **A retry is not a queue.** Honouring `Retry-After` is not the same as modelling a
 provider's rate limit, and nothing here tracks a provider's health across runs: a
 provider that failed the last run starts the next one trusted.
+
+## Documents (v0.14)
+
+Through v0.13 every file the agent could open was text. A workbook, a report, or
+a form was a byte blob it could neither read nor produce. v0.14 adds five
+formats, all optional:
+
+```toml
+io-harness = { version = "0.14", features = ["documents"] }
+```
+
+`documents` is an umbrella over five per-format features — `xlsx`, `docx`,
+`pptx`, `pdf`, `barcode` — so a consumer who wants spreadsheets does not compile
+a PDF stack. The default build is unchanged: `default = []`, every document
+dependency optional, nothing paid for by a consumer who does not ask.
+
+### What the agent gains
+
+Twelve tools, offered beside `read_file` and `write_file` when the feature is on:
+`xlsx_read`, `xlsx_sheets`, `xlsx_write`, `xlsx_set_cell`, `docx_read`,
+`docx_write`, `pptx_read`, `pdf_read`, `pdf_write`, `pdf_watermark`,
+`pdf_fill_form`, `barcode_decode`.
+
+They are **built-ins, not registered `Tool` implementations**, and that is
+deliberate. A registered tool is authorised once by an `Act::Exec` check on its
+name, and v0.9 states plainly that the policy governs whether a tool is *called*
+and not what it does once running. A document tool's whole job is reading and
+writing files in the user's workspace, so dispatch gates each call on `Act::Read`
+or `Act::Write` against the path the model named: `deny_write("secrets/*")` stops
+`xlsx_set_cell` in the same place and for the same reason it stops `write_file`.
+Every byte in and out goes through `Workspace::read_bytes` / `write_bytes` —
+nothing here opens a path itself.
+
+### Verifying a document
+
+```rust
+use io_harness::{TaskContract, Verification};
+
+let contract = TaskContract::workspace(
+    "Add the Q3 revenue row to the summary workbook.",
+    "/path/to/repo",
+    Verification::DocumentContains {
+        file: "reports/summary.xlsx".into(),
+        needle: "Q3".into(),
+    },
+);
+```
+
+It gates on the document's *extracted* text, and it exists because the criterion
+you would otherwise reach for cannot work here.
+`Verification::WorkspaceFileContains` reads with
+`read_to_string(..).unwrap_or_default()`; every format above is a binary
+container, so that read yields the empty string and the criterion reports "does
+not contain" for every document — including one whose visible text plainly does
+contain the needle. That is a silent, permanent false FAIL, not a false pass: a
+gate that can never say yes, ending the run as `StepCapReached` so it looks like
+an agent that could not do the work.
+
+The reader is chosen by extension — `.xlsx`, `.docx`, `.pptx`, `.pdf`. Anything
+else is an error, not a fallback to matching raw bytes. The variant exists in
+every build; one compiled without the matching feature returns a typed
+`Error::Config` saying so rather than vanishing from the enum.
+
+### The limits, stated plainly
+
+**Word is generate-and-read, with no in-place edit.** `docx-rs`'s reader models
+the OOXML it knows and drops what it does not, so read-then-write is a lossy
+rewrite rather than an edit — on a user's real document it silently deletes the
+comment thread, content control, field or vendor extension the reader could not
+name. The capability is not claimed rather than claimed and unsafe.
+
+**PowerPoint is read-only and deliberately has no writer.** `pptx_read` pulls the
+slide text out; there is no `pptx_write`.
+
+**PDF text extraction is best-effort on reading order.** A PDF stores placed
+glyphs, not a document: columns can interleave, tables lose their shape, and a
+scanned page returns empty text rather than an error. Treat the output as
+evidence, not as the document. `pdf-extract` is also written to panic on input it
+does not understand, so the call catches the unwind and reports a typed error —
+which does nothing under a `panic = "abort"` profile.
+
+**The spreadsheet preserving-edit is preservation in practice, not a guarantee.**
+`xlsx_set_cell` is a real `umya-spreadsheet` round trip: what the library models
+it keeps, what it does not model it can drop or normalise on the way out. It is
+not guaranteed for chart-, drawing-, pivot- or macro-heavy workbooks — that is
+the case to check before trusting an edit, not the case to assume.
+
+**OCR and PowerPoint authoring were cut from the roadmap, not deferred.** Barcode
+generation, the in-place Word edit and document delete were on the old capability
+line and are not here either; none of the three is on a later release. See
+[CHANGELOG.md](CHANGELOG.md) for what each cut cost and why it was made.
 
 ## Part of initorigin
 
