@@ -170,10 +170,10 @@ versions:
       A developer who resumes an interrupted run gets the run they had, not a similar one. Resume
       today restores only the durable half — the step it reached, what it spent, how long it has
       been alive — and silently substitutes the rest. Two things go missing, and both are the same
-      defect. The permission boundary: `resume` and `resume_observed` hardcode `Policy::permissive()`
-      and `ApproveAll` for every workspace run (src/run.rs:334-356), so a caller who started under a
-      restrictive policy through `run_with` and resumes after a crash gets an agent with no
-      boundary, and no policy-preserving general resume exists to reach for —
+      defect. The permission boundary: `resume` and `resume_observed` hardcode
+      `Policy::permissive()` and `ApproveAll` for every workspace run (src/run.rs:334-356), so a
+      caller who started under a restrictive policy through `run_with` and resumes after a crash
+      gets an agent with no boundary, and no policy-preserving general resume exists to reach for —
       `resume_with_decision` takes a policy but demands a `request_id` and a pending `Decision`, so
       it only serves a run that paused for approval. The crate states the opposite principle 60
       lines earlier at src/run.rs:270-279, where single-file mode refuses a policy loudly precisely
@@ -181,19 +181,19 @@ versions:
       half: the observation ledger the 0.10.0 context assembler builds is in memory only, built
       fresh at src/run.rs:1242 and :1821 after the resume step is already known, so a resumed
       workspace or sub-agent run re-derives its context from the workspace and asks the model a
-      different question than the process before it would have.
-      After this release a resumed run carries the policy it was started under and the context it
-      had: `resume` gains a policy-bearing form, a run that was started under a policy cannot be
-      silently resumed without one, the ledger is durable and restored, and a recorded case replays
-      identically across an interruption in every loop rather than only the single-file one. Pulled
-      ahead of documents because a boundary a caller believes is enforced and is not is worth more
-      than breadth, and because both halves live in the same functions — worth touching resume once,
-      not twice. The ledger half was found by 0.12.0's replay work and recorded in
+      different question than the process before it would have. After this release a resumed run
+      carries the policy it was started under and the context it had: `resume` gains a
+      policy-bearing form, a run that was started under a policy cannot be silently resumed without
+      one, the ledger is durable and restored, and a recorded case replays identically across an
+      interruption in every loop rather than only the single-file one. Pulled ahead of documents
+      because a boundary a caller believes is enforced and is not is worth more than breadth, and
+      because both halves live in the same functions — worth touching resume once, not twice. The
+      ledger half was found by 0.12.0's replay work and recorded in
       iterations/US-IO-HARNESS-0.12.0-I01, where 0.12.0 shipped the honest boundary instead: a
       replay that cannot reproduce a request refuses loudly rather than answering from the wrong
       recording.
     detail: specified
-    status: planned
+    status: released
   - version: 0.14.0
     outcome: >
       A developer runs a task over real documents: the agent creates and edits Word, Excel,

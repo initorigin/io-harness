@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.13.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -472,3 +472,109 @@ open_questions:
   specified here because it cannot be wrong — an explicit argument beats a rule about which of two
   policies wins. If development finds the stored policy is faithful enough to enforce directly, that
   is an iteration with evidence, not a quiet substitution.
+released_at: 2026-07-27T02:35:00Z
+mode: published
+delivered: >
+  A developer who resumes an interrupted run gets the run they had. `resume_with` and
+  `resume_with_observed` resume under the caller's policy; the bare `resume` refuses a run that was
+  started under a policy rather than continuing it permissively; the policy a run was started under
+  is durable and readable; and the observation ledger is durable and restored in both the workspace
+  and sub-agent loops, so a resumed run asks the model what the uninterrupted one would have.
+  Proven live: a real model tried to read a denied path on a resume-driven step and was refused.
+evidence:
+  tests:
+  - cargo test — 419 passing, 0 failing, across 25 test targets (was 397 at 0.12.0)
+  - 'tests/policy.rs — 4 new tests including the negative control
+    `the_same_resume_performs_the_write_when_no_policy_is_supplied`, which asserts the secret IS
+    overwritten when no policy is supplied, so the enforcement test is measuring the boundary'
+  - 'tests/context.rs — `a_resumed_run_asks_the_model_what_an_uninterrupted_run_would_have` and
+    `what_the_run_observed_before_the_interruption_is_in_the_prompt_after_it`; both verified to FAIL
+    with the ledger restore stubbed out, then to pass with it'
+  - 'tests/subagents.rs — `each_agent_keeps_its_own_durable_ledger_under_its_own_run_id`: a child''s
+    observations are durable under the child''s run id and absent from the parent''s'
+  - 'tests/determinism.rs — `a_workspace_replay_survives_being_interrupted_and_resumed` asserts
+    canonical-trace equality across an interruption, closing the second half of 0.12.0''s F10;
+    `a_replay_still_refuses_a_request_that_was_never_recorded` keeps the refusal where it is correct'
+  - 'tests/checkpoint.rs — 5 new tests: CHECKPOINT_FORMAT still 7; a store with both new tables
+    dropped opens, migrates and resumes; a run with no recorded policy resumes through the bare
+    resume; a run with no durable observations resumes and re-derives; a finished policy-bearing run
+    still reports its outcome'
+  - src/state.rs — 4 unit tests on the policy round-trip, including absence reading as None and not
+    as permissive
+  - src/context.rs — 5 unit tests pinning all ten ObsKind wire strings and asserting an unknown kind
+    errors rather than defaulting
+  builds:
+  - cargo build --release — exit 0
+  - cargo clippy --all-targets -- -D warnings — exit 0, no warnings
+  - cargo fmt --check — exit 0
+  - cargo doc --no-deps — exit 0, no new warnings (the four that remain predate this release)
+  - cargo package — io-harness-0.13.0.crate produced, 376,774 bytes
+  - 'GitHub Actions run 30232343055, all five legs success: test (ubuntu-latest), test
+    (macos-latest), test (windows-latest), msrv, lint'
+  reviews:
+  - 'Self-review caught two vacuous assertions and both were fixed rather than kept: the first
+    ledger test compared durable rows, which are identical whether or not the restore happens, and
+    the live example compared `store.last_step` to itself inside one `assert_eq`.'
+  - 'A misplaced policy gate was caught by tests/net.rs rather than by review: the gate sat before
+    the finished-run short-circuit, which broke the report-don''t-re-drive contract for a refused
+    run. Fixed in the gate, not in the test.'
+  deployments:
+  - 'crates.io — cargo publish, see known_limitations: sealed before the upload, per the repo''s
+    release order'
+  health_checks:
+  - 'Live run against OpenRouter (openai/gpt-5.6-luna), examples/live_resume.rs: run started under a
+    deny-by-default policy, cut short at one step, refused by the bare `resume`, then resumed with
+    `resume_with` — the model attempted `secrets/key.txt` on a resume-driven step, the policy
+    refused it, the file is unchanged and the refusal is in the trace under the original run id.
+    Ledger 3 -> 6 observations under one run id. 4 steps, 2,664 tokens, Success. Transcript at
+    evidence/0.13.0/live_run_0.13.0_policy_resume.txt'
+  - 'Public surface diff at evidence/0.13.0/public_surface_diff.md: no public item renamed or
+    removed; six additions plus two new re-exports'
+known_limitations:
+- >
+  F5 is satisfied one step removed from its own wording. The criterion asks for the restored ledger
+  to be asserted equal to the ledger an uninterrupted run held "on the ledger itself, not only on
+  the resulting trace". There is no API that hands a caller a running run's in-memory `Ledger`, and
+  exposing one to satisfy a test would be the wrong trade, so the assertion is made on the two
+  surfaces that ledger produces: the observation section of the prompt the model was sent, and the
+  durable rows. The prompt comparison is the one that carries the claim, and it was verified to fail
+  when the restore is removed. The durable-row comparison alone is vacuous — it was written first,
+  found to pass with the restore disabled, and kept only for what it does prove, which is that the
+  watermark does not re-write what the restore just read.
+- >
+  F1's negative control is permanent rather than historical. The criterion described running the
+  same scenario "through today's code path" to show the action performed. That path no longer
+  exists after the fix, so the control is `resume_with` supplied with `Policy::permissive()`
+  instead, which shows the same thing — the write lands when no boundary is supplied — and keeps
+  working in every future release rather than only during this one.
+- >
+  The store cannot be observed in the state where the new tables are genuinely absent.
+  `Store::from_conn` runs every `CREATE TABLE IF NOT EXISTS` before it returns, so a query against a
+  missing table is unreachable through the public API. What the back-compatibility test proves is
+  that a 0.12.0-shaped file — both tables dropped, verified absent through a raw connection first —
+  opens, migrates and resumes. "Tolerates missing tables" is not a state the code can be in, and the
+  CHANGELOG does not claim it.
+- >
+  The live run used one provider and one model (OpenRouter, openai/gpt-5.6-luna). It exercises the
+  resume; the observer and recording paths are only incidental to it. A second provider would say
+  more about portability and nothing more about this release's subject.
+- >
+  The record is sealed before the crates.io upload, which follows the develop->main merge and the
+  GitHub Release per the repo's release order. `mode: published` states the authorized target; the
+  flow makes it true.
+- >
+  The stored policy is written but there is no entry point that resumes from it without the caller
+  supplying one. That was excluded deliberately — it would require deciding what happens when a
+  stored policy and a passed policy disagree, and that question deserves a caller who has hit it.
+- >
+  The public surface diffs published for 0.11.0 and 0.12.0 were generated with a pattern that missed
+  every indented item and every `async` entry point. Their conclusions stand — both were separately
+  asserted to remove nothing — but their item counts are not comparable to this release's. Corrected
+  method and the reasoning are recorded in evidence/0.13.0/public_surface_diff.md.
+- >
+  The Windows Job Object is still unimplemented; Windows containment remains the portable floor with
+  a wall-clock cap only. It needs a `windows-sys` dependency scoped to
+  `[target.'cfg(windows)'.dependencies]` and its own release.
+supersedes: 0.12.0
+next_recommended_version: 0.14.0
+immutable: true
