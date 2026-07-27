@@ -8,6 +8,15 @@ recorded in the [CHANGELOG](../CHANGELOG.md).
 
 A versioned Rust crate API following SemVer. No network API in v0.1; the daemon/IPC contract is deferred.
 
+Since 0.14.0 part of that surface sits behind cargo features: `documents`, and
+the per-format `xlsx`, `docx`, `pptx`, `pdf` and `barcode` it turns on together.
+`default = []`, so the default build is the surface described above and enabling
+a feature only adds to it — the `tools::documents` modules, the twelve document
+tool-name constants, and `barcode::Decoded`. `Workspace::read_bytes`,
+`Workspace::write_bytes` and `Verification::DocumentContains` are present in
+every build; without the features, `DocumentContains` returns a typed error
+naming the missing feature rather than the variant disappearing.
+
 ## Compatibility
 
 - **MAJOR** — breaking change to the surface above.

@@ -167,6 +167,22 @@ pub fn write_new(ws: &Workspace, rel: &str, sheet: &str, rows: &[Vec<String>]) -
 /// formulas the caller did not touch come out the way they went in. `cell` is an
 /// A1 reference (`"B7"`); a reference that is not one is refused before it
 /// reaches the library.
+///
+/// # What "preserving" is worth
+///
+/// It is a real round trip, not a rewrite — but it is `umya-spreadsheet`'s round
+/// trip, and it is preservation in practice rather than a guarantee. What the
+/// library models it keeps; what it does not model it can drop or normalise on
+/// the way out. Charts, drawings, pivot tables, slicers, macros and vendor
+/// extensions are where that bites, so a chart- and drawing-heavy workbook is
+/// the case to check before trusting an edit, not the case to assume. A cell
+/// value in a data sheet is the operation this is sound for.
+///
+/// Nothing here can tell the caller which of those a given workbook contains, so
+/// the honest form of that limit is this paragraph rather than a check that would
+/// pass on the workbook it could not understand. An edit the caller cannot afford
+/// to get subtly wrong wants a copy first — the same advice that applies to any
+/// in-place edit of a file only one library claims to understand.
 pub fn set_cell(ws: &Workspace, rel: &str, sheet: &str, cell: &str, value: &str) -> Result<Wrote> {
     if !is_a1(cell) {
         return Err(Error::Config(format!(
