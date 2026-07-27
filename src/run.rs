@@ -35,6 +35,8 @@ use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
 use crate::tools::BARCODE_DECODE_TOOL;
 #[cfg(feature = "pptx")]
 use crate::tools::PPTX_READ_TOOL;
+#[cfg(feature = "media")]
+use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
     REMEMBER_TOOL, WRITE_FILE_TOOL,
@@ -1264,6 +1266,10 @@ async fn run_from<P: Provider>(
             system: system.clone(),
             user: user.clone(),
             tools: vec![tool.clone()],
+            // Single-file mode has no `view_image` tool, so only the caller's
+            // images are in play here.
+            #[cfg(feature = "media")]
+            media: attach_media(contract, &mut PendingMedia::default())?,
             ..Default::default()
         };
 
@@ -1415,6 +1421,11 @@ async fn run_workspace_from<P: Provider>(
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
     let mem_key = memory_key(root);
+    // Images the agent looked at last step, carried into this one's request and
+    // dropped once shown. A viewed image is a tool result, not a permanent part
+    // of the conversation: the model that wants it again asks again, and the
+    // request stays bounded by what one step actually needed.
+    let pending_media = &mut PendingMedia::default();
 
     for step in start_step..=contract.max_steps {
         // The step boundary, where a cancellation is honoured (see `cancelled`).
@@ -1461,6 +1472,8 @@ async fn run_workspace_from<P: Provider>(
             system: system.clone(),
             user: user.clone(),
             tools: tools.clone(),
+            #[cfg(feature = "media")]
+            media: attach_media(contract, pending_media)?,
             ..Default::default()
         };
 
@@ -1528,6 +1541,7 @@ async fn run_workspace_from<P: Provider>(
                 &mem_key,
                 watch,
                 0,
+                pending_media,
             )
             .await?
             {
@@ -2009,6 +2023,8 @@ fn run_agent<'f, P: Provider>(
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);
+        // See the workspace loop: viewed images ride one step and are dropped.
+        let pending_media = &mut PendingMedia::default();
 
         for step in start_step..=contract.max_steps {
             // The step boundary, where a cancellation is honoured (see `cancelled`).
@@ -2055,6 +2071,8 @@ fn run_agent<'f, P: Provider>(
                 system: system.clone(),
                 user: user.clone(),
                 tools: tools.clone(),
+                #[cfg(feature = "media")]
+                media: attach_media(contract, pending_media)?,
                 ..Default::default()
             };
             let response = complete_with_retry(
@@ -2132,6 +2150,7 @@ fn run_agent<'f, P: Provider>(
                     &mem_key,
                     tree.watch,
                     depth,
+                    pending_media,
                 )
                 .await?
                 {
@@ -2769,6 +2788,52 @@ impl Dispatched {
 /// consulting `approver` for anything it marks [`Effect::Ask`].
 ///
 /// Tool-level failures (bad regex, path escape, a policy refusal) become
+/// The images one request carries: the caller's, which are the task's subject and
+/// ride every step, plus whatever the agent looked at last step, which rides one.
+///
+/// Bounded here rather than at either source, because neither can see the total.
+/// Over the bound the oldest viewed images are dropped first and the model is not
+/// told a lie about it — the drop is reported in the trace by the caller. The
+/// caller's own images are never dropped: a task about an image that silently
+/// stops carrying it is the failure this whole boundary exists to prevent, so an
+/// over-budget contract is an error at the first step instead.
+#[cfg(feature = "media")]
+fn attach_media(
+    contract: &TaskContract,
+    pending: &mut PendingMedia,
+) -> Result<Vec<crate::provider::Media>> {
+    use crate::provider::MAX_REQUEST_IMAGE_BYTES;
+    let fixed: usize = contract.images.iter().map(|m| m.byte_len()).sum();
+    if fixed > MAX_REQUEST_IMAGE_BYTES {
+        return Err(Error::Config(format!(
+            "the contract's images total {fixed} bytes, over the \
+             {MAX_REQUEST_IMAGE_BYTES}-byte per-request bound"
+        )));
+    }
+    let mut out = contract.images.clone();
+    let mut used = fixed;
+    for m in pending.drain(..) {
+        if used + m.byte_len() > MAX_REQUEST_IMAGE_BYTES {
+            continue;
+        }
+        used += m.byte_len();
+        out.push(m);
+    }
+    Ok(out)
+}
+
+/// Images the agent looked at this step, waiting to be attached to the next
+/// request.
+///
+/// An alias rather than a `cfg` on the parameter itself, so the two call sites
+/// and the signature read the same in both feature states. Without the feature
+/// it is `()`: there is nothing to carry and nothing to bound.
+#[cfg(feature = "media")]
+pub(crate) type PendingMedia = Vec<crate::provider::Media>;
+/// See the `media` form above.
+#[cfg(not(feature = "media"))]
+pub(crate) type PendingMedia = ();
+
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
@@ -2786,6 +2851,7 @@ async fn dispatch(
     memory_key: &str,
     watch: &Watch<'_>,
     depth: u32,
+    pending_media: &mut PendingMedia,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -2923,6 +2989,75 @@ async fn dispatch(
                         remember,
                     },
                     Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
+                },
+            }
+        }
+        #[cfg(feature = "media")]
+        VIEW_IMAGE_TOOL => {
+            let path = s("path").unwrap_or_default();
+            // The extension decides the media type, and an unknown one is
+            // reported rather than guessed. Checked before the gate only because
+            // it costs nothing: the gate still runs for every path that could
+            // actually be read, so this cannot be used to probe for a file's
+            // existence outside the policy.
+            let Some(media_type) = crate::provider::Media::media_type_for(path) else {
+                return Ok(Dispatched::go(
+                    "view_image unsupported type",
+                    format!(
+                        "\n[view_image error] {path} is not an image this crate can send. \
+                         Supported: {}\n",
+                        crate::provider::IMAGE_MEDIA_TYPES.join(", ")
+                    ),
+                ));
+            };
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => match ws
+                    .read_bytes(&target)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| {
+                        crate::provider::Media::image(media_type, &bytes).map_err(|e| e.to_string())
+                    }) {
+                    Ok(media) => {
+                        // The observation records what was sent, not the image:
+                        // a digest, a size and a type. A trace that held the
+                        // bytes would grow by megabytes a step in exactly the
+                        // long unattended runs this crate exists for.
+                        let obs = format!(
+                            "\n[view_image {target}] attached to the next request \
+                             ({media_type}, {} bytes, digest {})\n",
+                            media.byte_len(),
+                            media.digest()
+                        );
+                        pending_media.push(media);
+                        Dispatched::Continue {
+                            decision: format!("viewed {target}"),
+                            obs,
+                            kind: ObsKind::Read,
+                            target: Some(target.clone()),
+                            changed: false,
+                            remember,
+                        }
+                    }
+                    Err(e) => {
+                        Dispatched::go("view_image error", format!("\n[view_image error] {e}\n"))
+                    }
                 },
             }
         }
@@ -3571,6 +3706,14 @@ async fn complete_with_retry<P: Provider>(
     watch: &Watch<'_>,
     depth: u32,
 ) -> Result<CompletionResponse> {
+    // The general media boundary. Every completion in every loop goes through
+    // here, so this covers an out-of-tree `Provider` as well as the three built
+    // in — and it runs before the first attempt, so a refused request costs no
+    // retry, no token and no wall clock. The built-in providers check again
+    // inside their own `complete`, which is what stops a caller reaching one
+    // directly from bypassing it.
+    #[cfg(feature = "media")]
+    crate::provider::ensure_media_accepted(provider.name(), provider.accepts_images(), request)?;
     let max_retries = contract.max_retries;
     let retry = contract.retry;
     let max_duration = contract.max_duration;
@@ -4052,6 +4195,21 @@ fn workspace_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path relative to the workspace root." }
+                },
+                "required": ["path"]
+            }),
+        },
+        #[cfg(feature = "media")]
+        ToolSpec {
+            name: VIEW_IMAGE_TOOL.to_string(),
+            description: "Look at an image in the workspace. The image is attached to your next \
+                          message, so you see it on the following step rather than in this tool's \
+                          result. Costs a step; the file must be a jpeg, png, gif or webp."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Image path relative to the workspace root." }
                 },
                 "required": ["path"]
             }),
