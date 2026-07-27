@@ -41,7 +41,7 @@ impl FsTool {
     /// The write happens in every case, [`Wrote::Unchanged`] included: this
     /// reports, it does not skip work.
     pub async fn write(&self, contents: &str) -> Result<Wrote> {
-        let did = Wrote::classify(tokio::fs::read(&self.path).await, contents);
+        let did = Wrote::classify(tokio::fs::read(&self.path).await, contents.as_bytes());
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 tokio::fs::create_dir_all(parent).await?;
