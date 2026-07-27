@@ -8,7 +8,7 @@ tasks:
   why_required: Every document capability in the release routes through these two functions. Until they
     exist there is no governed way to touch a binary file, and the release's whole subject is that documents
     are governed. Nothing else can start.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F1 — a document write is refused by the path policy on the path it targets. An agent under a policy
@@ -26,7 +26,13 @@ tasks:
   files:
   - src/tools/workspace.rs
   - src/lib.rs
-  evidence: []
+  evidence:
+  - 'src/tools/workspace.rs: read_bytes and write_bytes through the same enforce() gate as the text pair;
+    Wrote::classify now takes &[u8] so both pairs share one comparison'
+  - 7 unit tests including the negative control - denied read and denied write each paired with the same
+    operation succeeding under a permissive policy
+  - 'a missing file errors rather than reading empty: handing a parser zero bytes turns ''no such file''
+    into ''this file is corrupt'''
 - id: US-IO-HARNESS-0.14.0-T02
   summary: 'Built-in document tool dispatch: a single arm shape in `src/run.rs` that gates on `Act::Read`
     or `Act::Write` against the path the model named, so a refusal names the file rather than the tool,
@@ -34,7 +40,7 @@ tasks:
   why_required: This is what makes the tools built-ins rather than registered `Tool` impls, which is the
     design decision the release exists to get right. A registered tool is authorised once by name and
     never again.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   acceptance_criteria:
@@ -57,7 +63,12 @@ tasks:
     '
   files:
   - src/run.rs
-  evidence: []
+  evidence:
+  - 'src/tools/mod.rs: four feature-gated tool name constants; src/run.rs: dispatch arms gating on Act::Read/Act::Write
+    against the path the model named, through the same gate() the file built-ins use'
+  - the approval preview for a write is the change (set Sheet1!B7 to "42"), not the workbook's bytes,
+    because a human cannot decide on bytes
+  - a corrupt or non-xlsx file is an observation the model can route around, not a run failure
 - id: US-IO-HARNESS-0.14.0-T03
   summary: The opt-in Cargo feature and the dependency vetting behind it. An umbrella `documents` feature
     composed of per-format features, with every document crate optional, and each crate checked for maintenance
@@ -65,7 +76,7 @@ tasks:
   why_required: The crate has no `[features]` section today and a standing dependency-discipline constraint.
     Deciding the feature shape before any format lands is what keeps the default build unchanged rather
     than retrofitting it.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'N1 — the default build is unchanged. `cargo tree` for a default `cargo build` is asserted equal to
@@ -85,13 +96,19 @@ tasks:
     '
   files:
   - Cargo.toml
-  evidence: []
+  evidence:
+  - 'Cargo.toml: the crate''s first [features] section - per-format features under a documents umbrella,
+    every document crate optional'
+  - 'N1 asserted mechanically: cargo tree is 401 lines with and without the change, and no document crate
+    appears in the default tree'
+  - no crate in the set binds a C or C++ library, so no runner needs a system package - the constraint
+    that removed OCR
 - id: US-IO-HARNESS-0.14.0-T04
   summary: 'Excel: read a workbook, generate a new one, and edit an existing one preserving the sheets
     and formatting the agent did not touch. Fixtures are real files, not files the tests generated.'
   why_required: The release's anchor and the only capability where all three operations rest on healthy
     maintained crates. The fallback scope is this task plus T01-T03.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T02
@@ -106,13 +123,23 @@ tasks:
   files:
   - src/tools/
   - tests/
-  evidence: []
+  evidence:
+  - 'src/tools/documents/xlsx.rs: sheet_names, read_sheet, write_new, set_cell over calamine, rust_xlsxwriter
+    and umya-spreadsheet'
+  - 'the filesystem constraint verified rather than reported: no std::fs, no File::open, no path handed
+    to a library - 11 IO call sites, all read_bytes or write_bytes'
+  - 8 module tests including F3's preserving edit and the denied-path negative control; 426 tests default,
+    434 with the feature on
+  - umya-spreadsheet panics on an unparseable A1 reference, so set_cell validates before the value reaches
+    the library
+  - 'caught by the subagent: the dispatch arms referenced an unbound name, which only broke the FEATURED
+    build - the feature-off/on asymmetry the release fit named as the case that gets forgotten'
 - id: US-IO-HARNESS-0.14.0-T05
   summary: Word read and generate, and PowerPoint text extraction. No in-place `.docx` edit and no `.pptx`
     write path in the public surface.
   why_required: Both are read-or-generate only, for different reasons recorded in scope, and both are
     cheap once T01-T03 exist. Asserting the absence of the write paths is what keeps the limits honest.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T02
@@ -136,7 +163,7 @@ tasks:
     regeneration or `NeedAppearances`.'
   why_required: 'The widest of the capabilities and the one with a known trap: a filled field whose value
     no viewer renders is not a filled form.'
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T02
@@ -166,7 +193,7 @@ tasks:
     error that ends the run.
   why_required: Self-contained, healthy dependency, and the not-found path is the one a real run hits
     most.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T02
