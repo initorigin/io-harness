@@ -290,39 +290,6 @@ impl McpSession {
             .any(|s| s.tools.iter().any(|t| t.name == name))
     }
 
-    /// Call one namespaced tool, returning the text the model should see.
-    ///
-    /// Every failure mode — unknown tool, timeout, transport death, a tool that
-    /// reports its own error — comes back as `Ok(text)`, because they are all
-    /// things the *model* should react to rather than things that should end the
-    /// run. That is the same choice the built-in tools already make for a bad
-    /// regex or a refused path.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn call(
-        &self,
-        name: &str,
-        arguments: &serde_json::Value,
-        store: &Store,
-        run_id: i64,
-        step: u32,
-        cap: usize,
-        watch: &Watch<'_>,
-        depth: u32,
-    ) -> Result<String> {
-        self.call_media(
-            name,
-            arguments,
-            store,
-            run_id,
-            step,
-            cap,
-            watch,
-            depth,
-            &mut PendingMedia::default(),
-        )
-        .await
-    }
-
     /// [`McpSession::call`], additionally collecting any images the tool
     /// returned into `pending_media` for the next request to carry.
     ///

@@ -300,6 +300,9 @@ impl<'a> Git<'a> {
     /// The policy check targets this exact string; `Act::Exec` patterns match by
     /// full text or by basename, so a rule naming `git` still covers
     /// `/usr/bin/git`.
+    // Only the tests need this today: production always runs the `git` on PATH,
+    // and a caller-configurable git binary is a capability nobody has asked for.
+    #[cfg(test)]
     pub(crate) fn program(mut self, program: impl Into<String>) -> Self {
         self.program = program.into();
         self

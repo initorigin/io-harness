@@ -275,7 +275,8 @@ pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
 // 0.12.0. The observer is this release's headline, not a reason to break every
 // caller that does not want one.
 pub use run::{
-    resume, resume_observed, resume_tree, resume_tree_observed, resume_tree_with_decision,
+    resume, resume_from_stored_policy, resume_from_stored_policy_observed, resume_observed,
+    resume_tree, resume_tree_observed, resume_tree_with_decision,
     resume_tree_with_decision_observed, resume_with, resume_with_decision,
     resume_with_decision_observed, resume_with_observed, run, run_observed, run_tree,
     run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult, SPAWN_TOOL,

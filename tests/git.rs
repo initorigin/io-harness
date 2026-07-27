@@ -394,3 +394,66 @@ async fn a_commit_with_nothing_staged_is_reported_not_fatal() {
         "nothing was staged, so nothing should have been committed"
     );
 }
+
+// ------------------------------------------------------------------- F10
+
+#[tokio::test]
+async fn a_commit_interrupted_before_its_checkpoint_is_not_taken_twice() {
+    // A step budget of one is how this suite interrupts a run: it stops with
+    // work left, exactly as a crashed process leaves it, and the resume
+    // continues under the same run id.
+    //
+    // A commit is the first genuinely irreversible action this crate can take,
+    // and 0.7.0's promise is that one already taken is not taken again. The
+    // replayed script asks for the identical commit a second time.
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    let store = store(&dir);
+    let before = log(dir.path()).lines().count();
+
+    let script = || {
+        Script::new(vec![
+            vec![call(
+                "write_file",
+                json!({ "path": "NOTES.md", "content": "written once\n" }),
+            )],
+            vec![call("git_add", json!({ "paths": ["NOTES.md"] }))],
+            vec![call("git_commit", json!({ "message": "recorded" }))],
+            vec![call("git_add", json!({ "paths": ["NOTES.md"] }))],
+            vec![call("git_commit", json!({ "message": "recorded" }))],
+        ])
+    };
+
+    let first = run_with(
+        &contract(&dir, 3),
+        &script(),
+        &store,
+        &Policy::permissive(),
+        &io_harness::approve::ApproveAll,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        log(dir.path()).lines().count(),
+        before + 1,
+        "the first run commits once"
+    );
+
+    io_harness::resume(&contract(&dir, 6), &script(), &store, first.run_id)
+        .await
+        .unwrap();
+
+    let log = log(dir.path());
+    assert_eq!(
+        log.lines().count(),
+        before + 1,
+        "the resumed run must not commit again: {log}"
+    );
+    assert_eq!(
+        log.matches("recorded").count(),
+        1,
+        "exactly one commit carries the message: {log}"
+    );
+}

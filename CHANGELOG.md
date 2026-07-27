@@ -26,6 +26,127 @@ notes are produced from it.
 
 ### Security
 
+## [0.15.0] - 2026-07-27
+
+Images the model can see, and work the agent hands back as commits.
+
+### The image half
+
+A caller attaches images to the task with `TaskContract::with_images`, and they
+ride every request — the task is about them, so they are never quietly dropped
+partway through a run. The agent has its own route: `view_image`, a built-in
+that takes a workspace path, gated on `Act::Read` against the path the model
+named. That gate is the point. This is the model choosing which of the user's
+files gets sent to a third party, so it is authorised per call on the real path
+rather than once by tool name.
+
+`CompletionRequest` gains a `media` field and `Provider` gains
+`accepts_images`, which **defaults to `false`**. A provider implementation
+written before this release keeps compiling and inherits a refusal rather than a
+silent drop — a run that paid for a confident answer about an image the model
+never received is invisible from the outside, because the response looks exactly
+like success. The refusal happens before the request body is built, so nothing is
+spent.
+
+The wire shape is per vendor: an Anthropic base64 image content block, and an
+`image_url` data URL for the OpenAI-shaped body OpenAI and OpenRouter share. A
+request with no images still sends a bare content string, so every text-only body
+is byte-identical to 0.14.0's.
+
+MCP tool results carrying images are passed through, retiring a comment that had
+promised this since 0.8.0. The trace records a digest, a size and a media type —
+never the bytes.
+
+All of it is behind an opt-in `media` feature whose only new dependency is
+`base64`, already compiled in every build through `reqwest`. The default
+dependency tree is unchanged.
+
+### The git half
+
+Five built-ins — `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit` —
+so a run that edited four files ends as one reviewable commit instead of a
+working tree someone has to reconstruct.
+
+The shape of them is the release's real subject. `ExecGuard::check` enforces the
+program name and records argv without checking it, so `Act::Exec("git")` is not
+a boundary: it cannot tell `git log` from `git push --force`. Shipping git as an
+exec allow-list entry would hand the model the whole binary under a rule that
+reads like a restriction. Instead each built-in constructs its own complete argv,
+and the model supplies paths, a message and a count — never a subcommand, a flag
+or an argv. `push`, `fetch`, `clone`, `reset`, `checkout` and `rebase` are absent
+by construction, and two tests keep them absent: one fails if a command variant
+is added without being added to the covered set, and one asserts the subcommand
+is always one of the five.
+
+Two consequences are load-bearing rather than incidental. A model-named path can
+never become a flag — every path goes after `--` and a leading `-` is refused
+rather than escaped, because git parses its own argv and "escaped option" is not
+a state that exists. And repository hooks do not run: `.git/hooks/*` is arbitrary
+code carried by the repository the agent was pointed at, and nothing in this
+crate's permission model covers it.
+
+The path policy governs git on the paths git touches. Staging copies a file's
+bytes into the object store, so `git_add` needs `Act::Read` on every path it
+stages — which is what stops a policy-denied file from reaching a commit — and
+`git_commit` needs `Act::Write` on `.git`. **A run under a narrow write policy
+must allow `.git`, or commits are refused.**
+
+Commit identity is supplied by the harness, defaulting to an agent name at an
+RFC 2606 `.invalid` domain and overridable with
+`TaskContract::with_commit_identity`. `git commit` fails outright with no
+`user.email` configured, so this could not be left to the machine; inheriting the
+repository's identity would attribute the agent's commit to whichever human
+configured that checkout.
+
+Git is a **runtime** capability, never a build dependency: no `git` on the
+machine is an observation the model adapts to and the run carries on. The git
+half adds no crate at all.
+
+### Video is cut from the roadmap
+
+Not deferred — cut, and it appears in no planned release. The roadmap promised
+"image and video passthrough to any provider whose model accepts them". On the
+evidence that resolves to one provider out of three and an unanswerable question:
+the Anthropic Messages API and the OpenAI Chat Completions API accept images and
+no video at all, and OpenRouter, the only one of the three carrying a `video_url`
+content part, states that support varies by model and offers no way to ask which.
+If video returns it will be a new roadmap entry argued on its own merits. Audio
+is likewise absent, and OCR remains off the roadmap — named again here because
+this is the image release and that is exactly the argument for folding it in.
+
+### Added
+
+- `Media`, `IMAGE_MEDIA_TYPES`, `MAX_IMAGE_BYTES`, `MAX_REQUEST_IMAGE_BYTES`, and
+  `CompletionRequest::media`, behind the new `media` feature.
+- `Provider::accepts_images`, defaulting to `false`.
+- `TaskContract::with_images` and `TaskContract::with_commit_identity`; the
+  `images` and `commit_identity` fields.
+- The `view_image` built-in.
+- The `git_status`, `git_diff`, `git_log`, `git_add` and `git_commit` built-ins,
+  and `Identity`.
+- MCP image content passthrough.
+
+### Changed
+
+- **`CompletionRequest` now derives `Default` and has a new field.** A caller
+  constructing it with an exhaustive struct literal will not compile; add
+  `..Default::default()`, which is the one-line fix and the construction style
+  the type now documents. This is a source-breaking change in a minor release,
+  which is what 0.x permits and what this crate has done before.
+- Provider recordings taken against 0.14.x are refused rather than replayed
+  against the new request shape. That is the existing series gate behaving as
+  designed; re-record them.
+- `fill_form` now generates a real `/AP` normal appearance stream per filled text
+  field instead of setting `/NeedAppearances` and relying on the viewer to
+  redraw. An empty value removes the appearance rather than leaving a stale one.
+  Checkboxes and radios keep their existing state-selection behaviour; choice
+  fields are drawn as plain text, left-aligned and single-line.
+
+### Fixed
+
+- `Media::byte_len` saturates rather than underflowing on a malformed base64
+  payload, which is reachable from an MCP server — a trust boundary.
+
 ## [0.14.0] - 2026-07-27
 
 Documents, governed by the rules that already govern source. An agent reads a

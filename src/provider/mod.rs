@@ -213,7 +213,11 @@ impl Media {
     /// characters per three bytes, less the padding.
     pub fn byte_len(&self) -> usize {
         let pad = self.base64.bytes().rev().take_while(|b| *b == b'=').count();
-        self.base64.len() / 4 * 3 - pad
+        // Saturating because this is reachable from a trust boundary: an MCP
+        // server hands over its own base64, and a stub payload like `"="` would
+        // otherwise underflow and panic in a debug build. A wrong size on
+        // malformed input is a wrong size; a panic ends the run.
+        (self.base64.len() / 4 * 3).saturating_sub(pad)
     }
 
     /// A short digest of the encoded image, for the trace.

@@ -405,6 +405,57 @@ pub async fn resume_with<P: Provider>(
     resume_with_observed(contract, provider, store, run_id, policy, approver, &Ignore).await
 }
 
+/// Resume a run under the policy it was started with, read back from the store.
+///
+/// [`resume_with`] takes a policy because a resumed run must not silently lose
+/// its boundary — that was 0.13.0's subject. But the caller still had to
+/// reconstruct one, and a caller resuming after a crash in another process may
+/// have nothing to reconstruct it from. The policy has been durable since
+/// 0.13.0; this is the entry point that uses it.
+///
+/// It matters more from 0.15.0 on than it did when it was first noticed: this is
+/// the first release in which a crashed run may already have taken an
+/// irreversible action — a commit — under a policy the resuming caller cannot
+/// name.
+///
+/// Fails with [`Error::Resume`] when the store holds no policy for the run,
+/// rather than substituting a permissive one. A run whose boundary cannot be
+/// recovered is not resumed under no boundary; that substitution is exactly the
+/// defect 0.13.0 closed.
+pub async fn resume_from_stored_policy<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    approver: &dyn Approver,
+) -> Result<RunResult> {
+    resume_from_stored_policy_observed(contract, provider, store, run_id, approver, &Ignore).await
+}
+
+/// [`resume_from_stored_policy`], reporting to `observer` as it happens. See
+/// [`run_observed`].
+pub async fn resume_from_stored_policy_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    let Some(policy) = store.run_policy(run_id)? else {
+        return Err(Error::Resume {
+            reason: format!(
+                "run {run_id} has no recorded policy, so the boundary it ran under cannot be \
+                 recovered; pass one explicitly with `resume_with` if you know what it was"
+            ),
+        });
+    };
+    resume_with_observed(
+        contract, provider, store, run_id, &policy, approver, observer,
+    )
+    .await
+}
+
 /// [`resume_with`], reporting to `observer` as it happens. See [`run_observed`].
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_observed<P: Provider>(
@@ -2847,6 +2898,8 @@ pub(crate) type PendingMedia = ();
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
+// `pending_media` is `()` without the feature, and nothing reads it there.
+#[cfg_attr(not(feature = "media"), allow(unused_variables))]
 async fn dispatch(
     ws: &Workspace,
     call: &ToolCall,
@@ -3665,7 +3718,7 @@ async fn dispatch(
                 ));
             }
             let out = mcp
-                .call(
+                .call_media(
                     name,
                     &call.arguments,
                     store,
@@ -3674,6 +3727,7 @@ async fn dispatch(
                     cap,
                     watch,
                     depth,
+                    pending_media,
                 )
                 .await?;
             Dispatched::seen(
