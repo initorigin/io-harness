@@ -298,6 +298,13 @@ pub async fn run_with_observed<P: Provider>(
 /// ran under a deny-by-default policy and crashed came back with no boundary and
 /// nothing said so. Refusing is the only behaviour that cannot silently widen
 /// what an agent may do.
+///
+/// What it preserves: the run id, the step it reached, its token and wall-clock
+/// budgets, and — since 0.13.0 — the observation ledger it had assembled, so the
+/// resumed run asks the model what the interrupted one would have. What it does
+/// not: a permission policy, which it refuses to guess at rather than
+/// substituting one. A run with no recorded policy, which is every run
+/// checkpointed before 0.13.0, resumes exactly as it did then.
 pub async fn resume<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -461,6 +468,11 @@ pub async fn resume_with_observed<P: Provider>(
 /// its original `run_id`. The decision is re-checked against the policy first,
 /// so a deny that landed after the pause still holds. A denial closes the run
 /// without performing the action.
+///
+/// Preserves the policy — it is an argument — and, since 0.13.0, the run's
+/// observation ledger. It is for a run that *paused*, though: a run that crashed
+/// has no `request_id` and no pending decision to supply, and wants
+/// [`resume_with`].
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_decision<P: Provider>(
     contract: &TaskContract,
@@ -1828,7 +1840,11 @@ pub async fn run_tree_observed<P: Provider>(
 /// own checkpoint (see `spawn_child`), so every agent in the tree continues
 /// where it stopped rather than restarting.
 ///
-/// Additive to [`run_tree`], mirroring how [`resume`] complements [`run_with`].
+/// Additive to [`run_tree`], mirroring how [`resume_with`] complements
+/// [`run_with`]. Takes the policy and the approver, so a tree's boundary was
+/// never at risk of being dropped across a resume the way the flat workspace
+/// loop's was; since 0.13.0 every agent in the tree also restores its own
+/// observation ledger.
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree<P: Provider>(
     contract: &TaskContract,
