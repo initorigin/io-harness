@@ -287,6 +287,7 @@ mod tests {
     #[test]
     fn body_maps_tools_to_input_schema_and_system_top_level() {
         let a = Anthropic::new("k", "claude-x");
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let req = CompletionRequest {
             system: "sys".into(),
             user: "hi".into(),
@@ -347,6 +348,7 @@ mod media_wire {
     use super::*;
     use crate::provider::Media;
 
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
     fn req_with_image() -> CompletionRequest {
         CompletionRequest {
             system: "sys".into(),
@@ -376,6 +378,7 @@ mod media_wire {
         // The negative control, and the compatibility guarantee: a text-only
         // body is byte-identical to the one 0.14.0 sent, so upgrading alone
         // changes nothing on the wire and invalidates no recording.
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let b = Anthropic::new("k", "claude-x").body(&CompletionRequest {
             system: "sys".into(),
             user: "no picture".into(),

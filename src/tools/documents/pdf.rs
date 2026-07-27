@@ -510,6 +510,174 @@ fn form_fields(doc: &Document) -> Vec<(String, String, ObjectId)> {
     out
 }
 
+/// The widget annotations a field draws through.
+///
+/// A field and its widget are usually the same object — one dictionary carrying
+/// both `/FT` and `/Rect` — and that is the shape [`form_fields`] hands back. A
+/// field with several widgets (the same value shown on two pages) splits them
+/// into `/Kids`, and since `form_fields` only descends into kids that carry their
+/// own `/T`, every kid left here is a widget.
+fn widgets(doc: &Document, field: ObjectId) -> Vec<ObjectId> {
+    let kids: Vec<ObjectId> = doc
+        .get_dictionary(field)
+        .and_then(|d| d.get_deref(b"Kids", doc).and_then(Object::as_array))
+        .map(|a| a.iter().filter_map(|o| o.as_reference().ok()).collect())
+        .unwrap_or_default();
+    if kids.is_empty() {
+        vec![field]
+    } else {
+        kids
+    }
+}
+
+/// The font name and size a `/DA` (default appearance) string asks for.
+///
+/// `/DA` is a fragment of a content stream, and the only part of it an appearance
+/// stream has to reproduce is the `<name> <size> Tf` in it — the two tokens before
+/// the operator. A size of `0` is the PDF's way of writing "auto"; it comes back
+/// as `0.0` for the caller to resolve against the box the text has to fit, because
+/// only the caller knows the box.
+///
+/// A field with no `/DA` at all, or one this cannot read, gets `/Helv 0` — the
+/// same default a viewer assumes.
+// ponytail: whitespace tokens, no `#xx` name decoding and no PostScript comment
+// handling. Every /DA a form generator emits is `/Name size Tf` plus a colour
+// operator; decode names properly when a file in the wild proves otherwise.
+fn da_font(da: &[u8]) -> (Vec<u8>, f32) {
+    let text = String::from_utf8_lossy(da);
+    let toks: Vec<&str> = text.split_whitespace().collect();
+    for (i, tok) in toks.iter().enumerate() {
+        if *tok == "Tf" && i >= 2 {
+            if let (Some(name), Ok(size)) =
+                (toks[i - 2].strip_prefix('/'), toks[i - 1].parse::<f32>())
+            {
+                if !name.is_empty() {
+                    return (name.as_bytes().to_vec(), size.max(0.0));
+                }
+            }
+        }
+    }
+    (b"Helv".to_vec(), 0.0)
+}
+
+/// Draw `value` into `widget`'s normal appearance stream, replacing whatever was
+/// there.
+///
+/// The stream is a form XObject with the widget's `/Rect` as its `/BBox`, so it is
+/// drawn in the box's own coordinates whatever the page does around it, and it
+/// carries a `/Resources` naming exactly the one font its `Tf` names. The font
+/// comes from the AcroForm `/DR` when the field's `/DA` names one that is really
+/// there; otherwise a Helvetica is added to the document once and reused, because
+/// a `Tf` naming a font the resources do not have draws nothing.
+///
+/// The string operand is written by `lopdf`'s object writer, which escapes `\` and
+/// any unbalanced `(` or `)` — the case that matters, since a filled form is
+/// exactly where a `)` typed by a person arrives and an unescaped one ends the
+/// string early and corrupts the rest of the stream.
+///
+/// A widget with no usable `/Rect` gets no appearance: there is no box to fit the
+/// text to, and a stream drawn into a guessed one is worse than none.
+// ponytail: one line, left-aligned, no quadding (/Q), no multiline (/Ff bit 13),
+// no comb, and auto-size fits the box height only — a long value in a short box
+// still runs past the right edge. Each is a separate layout mode; add the one a
+// caller actually files a bug about.
+fn set_appearance(
+    doc: &mut Document,
+    widget: ObjectId,
+    value: &str,
+    da: &[u8],
+    dr_fonts: &Dictionary,
+    fallback: &mut Option<ObjectId>,
+    rel: &str,
+) -> Result<()> {
+    let rect: Vec<f32> = doc
+        .get_dictionary(widget)
+        .and_then(|d| d.get_deref(b"Rect", doc).and_then(Object::as_array))
+        .map(|a| a.iter().filter_map(|o| o.as_float().ok()).collect())
+        .unwrap_or_default();
+    // A /Rect is stored as two opposite corners in either order, so the width and
+    // height are the absolute differences, not `x1 - x0`.
+    let (w, h) = match rect[..] {
+        [x0, y0, x1, y1] => ((x1 - x0).abs(), (y1 - y0).abs()),
+        _ => return Ok(()),
+    };
+    if w <= 0.0 || h <= 0.0 {
+        return Ok(());
+    }
+
+    let (name, size) = da_font(da);
+    // 0 means auto: fill about two thirds of the box height, which is where a
+    // viewer's own auto-size lands, and never emit the 0 itself — a `0 Tf` draws
+    // nothing at all.
+    let size = if size > 0.0 {
+        size
+    } else {
+        (h * 0.66).clamp(4.0, 12.0)
+    };
+    let (name, font) = match dr_fonts.get(&name).ok().cloned() {
+        Some(font) => (name, font),
+        None => {
+            let id = *fallback.get_or_insert_with(|| {
+                doc.add_object(dictionary! {
+                    "Type" => "Font",
+                    "Subtype" => "Type1",
+                    "BaseFont" => "Helvetica",
+                    "Encoding" => "WinAnsiEncoding",
+                })
+            });
+            (b"Helv".to_vec(), Object::Reference(id))
+        }
+    };
+
+    let mut fonts = Dictionary::new();
+    fonts.set(name.clone(), font);
+    let mut resources = Dictionary::new();
+    resources.set("Font", fonts);
+
+    let content = Content {
+        operations: vec![
+            // The marked-content bracket a form field's appearance is expected to
+            // carry; a viewer that regenerates appearances looks for it.
+            Operation::new("BMC", vec![Object::Name(b"Tx".to_vec())]),
+            Operation::new("q", vec![]),
+            Operation::new("BT", vec![]),
+            Operation::new("Tf", vec![Object::Name(name), Object::Real(size)]),
+            // Two points of padding from the left edge, and a baseline that centres
+            // one line of `size` in the box.
+            Operation::new(
+                "Td",
+                vec![Object::Real(2.0), Object::Real(((h - size) / 2.0).max(2.0))],
+            ),
+            Operation::new("Tj", vec![Object::string_literal(encode(value))]),
+            Operation::new("ET", vec![]),
+            Operation::new("Q", vec![]),
+            Operation::new("EMC", vec![]),
+        ],
+    }
+    .encode()
+    .map_err(|e| unwritable(rel, e))?;
+
+    let form_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "FormType" => 1_i64,
+            "BBox" => vec![
+                Object::Real(0.0), Object::Real(0.0),
+                Object::Real(w), Object::Real(h),
+            ],
+            "Resources" => resources,
+        },
+        content,
+    ));
+    let mut ap = Dictionary::new();
+    ap.set("N", Object::Reference(form_id));
+    doc.get_dictionary_mut(widget)
+        .map_err(|e| unwritable(rel, e))?
+        .set("AP", ap);
+    Ok(())
+}
+
 /// The document's `/AcroForm` dictionary, whether the catalog holds it inline or
 /// by reference.
 fn acroform(doc: &Document) -> Result<&Dictionary> {
@@ -538,30 +706,33 @@ fn acroform(doc: &Document) -> Result<&Dictionary> {
 /// form is blank. A tool that stopped at `/V` would produce a file that passes
 /// every programmatic check and shows an empty form to every human.
 ///
-/// The two fixes are to regenerate `/AP` per field, or to set
-/// `/NeedAppearances true` on the AcroForm dictionary and let the viewer
-/// regenerate it. **This sets `/NeedAppearances`**, because generating a faithful
-/// appearance stream means re-implementing the viewer's text layout — font
-/// metrics from `/DA`, the field's quadding, multiline and comb behaviour,
-/// auto-sizing when the size is `0` — and an appearance stream that is *wrong* is
-/// worse than none, since it is what gets drawn and printed.
+/// The two fixes are to set `/NeedAppearances true` and let the viewer regenerate
+/// `/AP`, or to generate `/AP` here. **This generates it** (see `set_appearance`):
+/// every text field it fills gets a form XObject drawing the value, sized and
+/// fonted from the field's `/DA` and resourced from the AcroForm `/DR`. It also
+/// still sets `/NeedAppearances`, but only as a hint — nothing here depends on a
+/// viewer honouring it, which is the point, since a viewer that ignores it used to
+/// show the filled fields empty.
 ///
-/// It also **removes the stale `/AP`** from every field it fills. A viewer that
-/// honours `/NeedAppearances` was going to rebuild it anyway; a viewer that does
-/// not would otherwise draw the value the field had *before* the fill. Blank is a
-/// visible failure; the old value silently presented as the new one is not.
+/// A field filled with an **empty** value gets no appearance at all: the stale one
+/// is removed and nothing replaces it. A stream drawn for an empty value would
+/// draw the old text, which is the one failure worse than a blank box — the
+/// previous value silently presented as the new one.
 ///
-/// Checkbox and radio fields (`/FT /Btn`) are the exception on both counts: their
-/// value is a name selecting a state out of `/AP`, not a string drawn into one,
-/// so this sets `/V` and `/AS` as names and leaves `/AP` alone.
+/// Checkbox and radio fields (`/FT /Btn`) are the exception: their value is a name
+/// selecting a state out of an `/AP` the file already carries, not a string drawn
+/// into one, so this sets `/V` and `/AS` as names and leaves `/AP` alone.
 ///
 /// # What it cannot promise
 ///
-/// `/NeedAppearances` is honoured by Acrobat, by pdf.js and by the common desktop
-/// viewers, but it is a request to the viewer and not a rendered result. A viewer
-/// that ignores it will show the filled text fields empty. If the output has to
-/// render identically everywhere without cooperation, it has to be flattened by
-/// something that lays out glyphs, and that is not this function.
+/// The generated appearance is one line of text, left-aligned, in the base-14
+/// Helvetica metrics `encode` can spell. Fields whose layout is something else —
+/// centred or right-aligned (`/Q`), multiline, comb — are drawn as that one line
+/// rather than in their declared style; the value is right, its placement is
+/// approximate. Choice and listbox fields (`/FT /Ch`, `/FT /Lst`) are filled as
+/// text, which is right for a combo box a caller typed into and approximate for a
+/// list. Where the layout has to be exact, `/NeedAppearances` is still set and a
+/// cooperating viewer will redraw it properly.
 // ponytail: /AS is set on the field dictionary, which is correct for the common
 // merged field-and-widget node and for a radio group (whose /T and /FT sit on
 // the group, which is the node this treats as terminal). A group that puts /T on
@@ -603,21 +774,73 @@ pub fn fill_form(ws: &Workspace, rel: &str, fields: &[(String, String)]) -> Resu
         }
     }
 
+    // The defaults a field inherits when it names none of its own: the form's
+    // `/DA`, and the `/Font` of its `/DR` resource dictionary, which is where the
+    // font a `/DA` names actually lives.
+    let (form_da, dr_fonts) = {
+        let acro = acroform(&doc)?;
+        let da = acro
+            .get(b"DA")
+            .and_then(Object::as_str)
+            .unwrap_or_default()
+            .to_vec();
+        let fonts = acro
+            .get_deref(b"DR", &doc)
+            .and_then(Object::as_dict)
+            .and_then(|dr| dr.get_deref(b"Font", &doc).and_then(Object::as_dict))
+            .ok()
+            .cloned()
+            .unwrap_or_default();
+        (da, fonts)
+    };
+    let mut fallback_font = None;
+
     for (id, value) in targets {
         let is_button = doc
             .get_dictionary(id)
             .and_then(|d| d.get_deref(b"FT", &doc).and_then(Object::as_name))
             .is_ok_and(|ft| ft == b"Btn");
-        let field = doc
-            .get_object_mut(id)
-            .and_then(Object::as_dict_mut)
-            .map_err(|e| unwritable(rel, e))?;
         if is_button {
+            let field = doc
+                .get_object_mut(id)
+                .and_then(Object::as_dict_mut)
+                .map_err(|e| unwritable(rel, e))?;
             field.set("V", Object::Name(encode(value)));
             field.set("AS", Object::Name(encode(value)));
-        } else {
-            field.set("V", Object::string_literal(encode(value)));
-            field.remove(b"AP");
+            continue;
+        }
+
+        let da = doc
+            .get_dictionary(id)
+            .and_then(|d| d.get_deref(b"DA", &doc).and_then(Object::as_str))
+            .map(<[u8]>::to_vec)
+            .unwrap_or_else(|_| form_da.clone());
+        let widgets = widgets(&doc, id);
+
+        // Every stale appearance goes first, on the field and on each of its
+        // widgets, so that an empty value — or a widget with no drawable /Rect —
+        // leaves nothing behind to draw the old text.
+        for target in std::iter::once(id).chain(widgets.iter().copied()) {
+            if let Ok(dict) = doc.get_dictionary_mut(target) {
+                let _ = dict.remove(b"AP");
+            }
+        }
+        doc.get_object_mut(id)
+            .and_then(Object::as_dict_mut)
+            .map_err(|e| unwritable(rel, e))?
+            .set("V", Object::string_literal(encode(value)));
+        if !value.is_empty() {
+            for widget in widgets {
+                set_appearance(
+                    &mut doc,
+                    widget,
+                    value,
+                    &da,
+                    &dr_fonts,
+                    &mut fallback_font,
+                    rel,
+                )?;
+            }
         }
     }
 
@@ -922,6 +1145,36 @@ mod tests {
         );
     }
 
+    /// The decoded bytes of a widget's normal appearance stream, or [`None`] when
+    /// the widget carries no `/AP` at all.
+    ///
+    /// Decoded rather than raw: what a viewer draws is the stream after its
+    /// filters, so a test that read `stream.content` would pass on a compressed
+    /// stream that decodes to nothing.
+    fn appearance_of(doc: &Document, widget: ObjectId) -> Option<Vec<u8>> {
+        let ap = doc
+            .get_dictionary(widget)
+            .ok()?
+            .get_deref(b"AP", doc)
+            .ok()?
+            .as_dict()
+            .ok()?;
+        ap.get_deref(b"N", doc)
+            .ok()?
+            .as_stream()
+            .ok()?
+            .get_plain_content()
+            .ok()
+    }
+
+    /// The field ids of a document's form, by fully qualified name.
+    fn fields_by_name(doc: &Document) -> BTreeMap<String, ObjectId> {
+        form_fields(doc)
+            .into_iter()
+            .map(|(q, _, id)| (q, id))
+            .collect()
+    }
+
     #[test]
     fn filling_a_form_sets_the_value_and_asks_the_viewer_to_redraw_it() {
         let d = dir();
@@ -942,10 +1195,7 @@ mod tests {
         );
 
         let doc = Document::load_mem(&ws.read_bytes("form.pdf").unwrap()).unwrap();
-        let by_name: BTreeMap<String, ObjectId> = form_fields(&doc)
-            .into_iter()
-            .map(|(q, _, id)| (q, id))
-            .collect();
+        let by_name = fields_by_name(&doc);
 
         let text = doc.get_dictionary(by_name["full_name"]).unwrap();
         assert_eq!(
@@ -954,10 +1204,13 @@ mod tests {
             "the value landed"
         );
         // The half that a /V-only implementation fails: the value has to be
-        // drawable, not merely stored.
+        // drawable, not merely stored. The fixture's stale /AP drew nothing, so a
+        // stream that still contains the new value is one that replaced it.
+        let drawn = appearance_of(&doc, by_name["full_name"]).expect("the field has an /AP /N");
         assert!(
-            !text.has(b"AP"),
-            "the stale appearance stream is gone, so no viewer can draw the old value"
+            drawn.windows(12).any(|w| w == b"Ada Lovelace"),
+            "the appearance draws the new value: {:?}",
+            String::from_utf8_lossy(&drawn)
         );
         let acro = acroform(&doc).unwrap();
         assert!(
@@ -971,6 +1224,226 @@ mod tests {
         let check = doc.get_dictionary(by_name["subscribe"]).unwrap();
         assert_eq!(check.get(b"V").unwrap().as_name().unwrap(), b"Yes");
         assert_eq!(check.get(b"AS").unwrap().as_name().unwrap(), b"Yes");
+    }
+
+    /// The operands of the first `operator` in a decoded content stream.
+    fn operands<'a>(ops: &'a [Operation], operator: &str) -> Option<&'a [Object]> {
+        ops.iter()
+            .find(|op| op.operator == operator)
+            .map(|op| op.operands.as_slice())
+    }
+
+    /// The claim `/NeedAppearances` could only ask for: the value is *drawn*, in a
+    /// stream this module generated, resourced well enough for a viewer to render
+    /// without cooperating.
+    #[test]
+    fn a_filled_text_field_carries_an_appearance_stream_that_draws_the_value() {
+        let d = dir();
+        let ws = Workspace::new(d.path());
+        form_fixture(&ws, "form.pdf");
+        fill_form(
+            &ws,
+            "form.pdf",
+            &[("full_name".to_string(), "Ada Lovelace".to_string())],
+        )
+        .unwrap();
+
+        let doc = Document::load_mem(&ws.read_bytes("form.pdf").unwrap()).unwrap();
+        let id = fields_by_name(&doc)["full_name"];
+        let drawn = appearance_of(&doc, id).expect("the filled field has an /AP /N");
+        assert!(
+            drawn.windows(12).any(|w| w == b"Ada Lovelace"),
+            "the decoded stream draws the value: {:?}",
+            String::from_utf8_lossy(&drawn)
+        );
+
+        let ops = Content::decode(&drawn).unwrap().operations;
+        // The font the /DA named, at the size it named, and the marked-content
+        // bracket a text field's appearance is expected to carry.
+        assert_eq!(operands(&ops, "BMC").unwrap()[0].as_name().unwrap(), b"Tx");
+        let tf = operands(&ops, "Tf").unwrap();
+        assert_eq!(tf[0].as_name().unwrap(), b"Helv");
+        assert_eq!(tf[1].as_float().unwrap(), 12.0);
+
+        // The stream has to be a form XObject the size of the widget, and its
+        // resources have to resolve the font its `Tf` names — a `Tf` naming a font
+        // the resources lack draws nothing at all.
+        let ap = doc
+            .get_dictionary(id)
+            .unwrap()
+            .get_deref(b"AP", &doc)
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        let stream = ap.get_deref(b"N", &doc).unwrap().as_stream().unwrap();
+        assert_eq!(
+            stream.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Form"
+        );
+        let bbox: Vec<f32> = stream
+            .dict
+            .get(b"BBox")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o.as_float().unwrap())
+            .collect();
+        assert_eq!(bbox, vec![0.0, 0.0, 300.0, 20.0], "the widget's /Rect size");
+        let font = stream
+            .dict
+            .get_deref(b"Resources", &doc)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get_deref(b"Font", &doc)
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get_deref(b"Helv", &doc)
+            .unwrap()
+            .as_dict()
+            .unwrap();
+        assert_eq!(
+            font.get(b"BaseFont").unwrap().as_name().unwrap(),
+            b"Helvetica"
+        );
+    }
+
+    /// The negative control for the test above, and the one failure worse than a
+    /// blank box: an empty value must not leave the *previous* value on screen.
+    /// The fixture ships a stale `/AP`, so "absent" here can only mean "removed".
+    #[test]
+    fn filling_a_field_with_an_empty_value_leaves_no_appearance_behind() {
+        let d = dir();
+        let ws = Workspace::new(d.path());
+        form_fixture(&ws, "blank.pdf");
+        form_fixture(&ws, "filled.pdf");
+
+        fill_form(
+            &ws,
+            "blank.pdf",
+            &[("full_name".to_string(), String::new())],
+        )
+        .unwrap();
+        fill_form(
+            &ws,
+            "filled.pdf",
+            &[("full_name".to_string(), "Ada".to_string())],
+        )
+        .unwrap();
+
+        let blank = Document::load_mem(&ws.read_bytes("blank.pdf").unwrap()).unwrap();
+        let id = fields_by_name(&blank)["full_name"];
+        assert!(
+            !blank.get_dictionary(id).unwrap().has(b"AP"),
+            "the key itself is gone, not merely emptied"
+        );
+        assert!(appearance_of(&blank, id).is_none());
+
+        // Same fixture, same call, a value in it: so the absence above measures the
+        // empty value and not a fill that never generated anything.
+        let filled = Document::load_mem(&ws.read_bytes("filled.pdf").unwrap()).unwrap();
+        let id = fields_by_name(&filled)["full_name"];
+        assert!(appearance_of(&filled, id).is_some());
+    }
+
+    /// A filled form is exactly where text a person typed arrives, and an
+    /// unescaped `)` ends the string literal early and corrupts every operator
+    /// after it. Both halves matter: the value has to come back out of the stream
+    /// intact, and the file has to still parse.
+    #[test]
+    fn a_value_with_brackets_and_backslashes_round_trips_into_the_content_stream() {
+        let d = dir();
+        let ws = Workspace::new(d.path());
+        form_fixture(&ws, "form.pdf");
+        let value = r"Ada (Lovelace\Byron) )";
+
+        fill_form(
+            &ws,
+            "form.pdf",
+            &[("full_name".to_string(), value.to_string())],
+        )
+        .unwrap();
+
+        // The whole file still parses; a corrupted stream length or a stray `)`
+        // would surface here first.
+        let doc = Document::load_mem(&ws.read_bytes("form.pdf").unwrap()).unwrap();
+        let id = fields_by_name(&doc)["full_name"];
+        let drawn = appearance_of(&doc, id).unwrap();
+        let shown = String::from_utf8_lossy(&drawn).to_string();
+        assert!(
+            shown.contains(r"\\") && shown.contains(r"\)"),
+            "the backslash and the unbalanced bracket are escaped in the stream: {shown}"
+        );
+
+        let ops = Content::decode(&drawn).unwrap().operations;
+        assert_eq!(
+            operands(&ops, "Tj").unwrap()[0].as_str().unwrap(),
+            value.as_bytes(),
+            "and a parser reading the stream back gets the value the caller set"
+        );
+        assert_eq!(
+            doc.get_dictionary(id)
+                .unwrap()
+                .get(b"V")
+                .unwrap()
+                .as_str()
+                .unwrap(),
+            value.as_bytes(),
+            "the stored value is untouched by the escaping"
+        );
+    }
+
+    /// `0 Tf` means "auto-size" and draws nothing if it is emitted literally, so a
+    /// field whose `/DA` says `0` has to be resolved against the box it fits into.
+    #[test]
+    fn an_auto_sized_default_appearance_draws_at_a_size_that_fits_the_box() {
+        let d = dir();
+        let ws = Workspace::new(d.path());
+        form_fixture(&ws, "auto.pdf");
+        // Rewrite the fixture's /DA to the auto-size form. Done through `lopdf`
+        // rather than by parameterising the fixture, so every other test keeps the
+        // explicit size it asserts on.
+        {
+            let mut doc = Document::load_mem(&ws.read_bytes("auto.pdf").unwrap()).unwrap();
+            let id = fields_by_name(&doc)["full_name"];
+            doc.get_dictionary_mut(id)
+                .unwrap()
+                .set("DA", Object::string_literal("/Helv 0 Tf 0 g"));
+            let mut buf = Vec::new();
+            doc.save_to(&mut buf).unwrap();
+            ws.write_bytes("auto.pdf", &buf).unwrap();
+        }
+
+        fill_form(
+            &ws,
+            "auto.pdf",
+            &[("full_name".to_string(), "Ada".to_string())],
+        )
+        .unwrap();
+
+        let doc = Document::load_mem(&ws.read_bytes("auto.pdf").unwrap()).unwrap();
+        let id = fields_by_name(&doc)["full_name"];
+        let ops = Content::decode(&appearance_of(&doc, id).unwrap())
+            .unwrap()
+            .operations;
+        let size = operands(&ops, "Tf").unwrap()[1].as_float().unwrap();
+        assert!(
+            size > 0.0 && size <= 20.0,
+            "the 0 became a real size inside the field's 20pt height, got {size}"
+        );
+    }
+
+    #[test]
+    fn reading_a_default_appearance_finds_the_font_and_size_it_names() {
+        assert_eq!(da_font(b"/Helv 12 Tf 0 g"), (b"Helv".to_vec(), 12.0));
+        assert_eq!(da_font(b"0 g /TiRo 9.5 Tf"), (b"TiRo".to_vec(), 9.5));
+        // 0 is "auto", and stays 0 for the caller to resolve against its box.
+        assert_eq!(da_font(b"/Helv 0 Tf"), (b"Helv".to_vec(), 0.0));
+        // Nothing readable in it falls back to what a viewer assumes.
+        assert_eq!(da_font(b""), (b"Helv".to_vec(), 0.0));
+        assert_eq!(da_font(b"0 g"), (b"Helv".to_vec(), 0.0));
     }
 
     #[test]

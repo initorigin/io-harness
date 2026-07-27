@@ -46,6 +46,19 @@ pub struct TaskContract {
     /// extend.
     #[allow(clippy::doc_markdown)]
     pub mcp: Vec<crate::mcp::McpServer>,
+    /// Images handed to the agent alongside the goal, shown to the model on
+    /// every step of the run.
+    ///
+    /// This is the caller's half of the image capability: the task is *about*
+    /// these, so they persist for the whole run rather than being attached once.
+    /// The agent's own half — looking at an image already in the workspace — is
+    /// the `view_image` built-in, which is gated on the path the model names.
+    ///
+    /// Empty by default, so a 0.14.0-era contract behaves exactly as before. A
+    /// provider that does not accept images refuses a run carrying any, before
+    /// anything is sent; see [`crate::Provider::accepts_images`].
+    #[cfg(feature = "media")]
+    pub images: Vec<crate::provider::Media>,
     /// Tools the embedding program supplies itself, offered to the model beside
     /// the built-ins and governed by the same policy and trace.
     ///
@@ -97,6 +110,8 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            #[cfg(feature = "media")]
+            images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
             retry: RetryPolicy::default(),
@@ -127,6 +142,8 @@ impl TaskContract {
             max_tokens: None,
             max_retries: 2,
             mcp: Vec::new(),
+            #[cfg(feature = "media")]
+            images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
             retry: RetryPolicy::default(),
@@ -161,6 +178,26 @@ impl TaskContract {
     ///
     /// Workspace mode only, like [`TaskContract::with_mcp`]: single-file mode has
     /// one tool and no tool layer to extend.
+    /// Hand the agent images to look at, alongside the goal.
+    ///
+    /// A new named method rather than a parameter on any of the sixteen entry
+    /// points: every one of them takes a `TaskContract`, so attaching here works
+    /// with all of them and changes no existing signature.
+    ///
+    /// Construct each [`crate::Media`] with [`crate::Media::image`], which
+    /// refuses a media type no provider documents and refuses an image over the
+    /// per-image size bound. The total carried by one request is bounded too —
+    /// see [`crate::provider::MAX_REQUEST_IMAGE_BYTES`].
+    #[cfg(feature = "media")]
+    #[must_use]
+    pub fn with_images<I>(mut self, images: I) -> Self
+    where
+        I: IntoIterator<Item = crate::provider::Media>,
+    {
+        self.images.extend(images);
+        self
+    }
+
     pub fn with_tools(mut self, tools: crate::tools::Toolbox) -> Self {
         self.tools = tools;
         self

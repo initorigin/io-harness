@@ -1259,10 +1259,12 @@ async fn run_from<P: Provider>(
                     ObsKind::Read,
                 ),
             );
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
             system: system.clone(),
             user: user.clone(),
             tools: vec![tool.clone()],
+            ..Default::default()
         };
 
         let response =
@@ -1454,10 +1456,12 @@ async fn run_workspace_from<P: Provider>(
         )
         .await?;
         let user = workspace_user_prompt(contract, &assembled.text);
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
             system: system.clone(),
             user: user.clone(),
             tools: tools.clone(),
+            ..Default::default()
         };
 
         let response =
@@ -2046,10 +2050,12 @@ fn run_agent<'f, P: Provider>(
             )
             .await?;
             let user = workspace_user_prompt(contract, &assembled.text);
+            #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 system: system.clone(),
                 user: user.clone(),
                 tools: tools.clone(),
+                ..Default::default()
             };
             let response = complete_with_retry(
                 tree.provider,

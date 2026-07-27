@@ -143,6 +143,25 @@ pub struct Media {
 #[cfg(feature = "media")]
 pub const IMAGE_MEDIA_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
+/// The largest single image, in decoded bytes.
+///
+/// Anthropic documents 5MB per image; OpenAI allows a larger total payload. The
+/// smaller of the two is the honest bound for a provider-agnostic crate: an
+/// image that would be refused by one vendor and accepted by another is worse
+/// than one refused here, because the refusal there costs a step and arrives as
+/// an HTTP 400 that reads like a transport failure.
+#[cfg(feature = "media")]
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// The largest total of all images on one request, in decoded bytes.
+///
+/// Exists because the per-image bound does not compose: sixteen images each
+/// under the single-image limit is a request no budget anticipated. This is the
+/// bound the run loop enforces when it attaches the caller's images and whatever
+/// the agent has just looked at.
+#[cfg(feature = "media")]
+pub const MAX_REQUEST_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
 #[cfg(feature = "media")]
 impl Media {
     /// Encode image bytes for the provider boundary.
@@ -158,6 +177,13 @@ impl Media {
             return Err(Error::Config(format!(
                 "unsupported image media type {media_type:?}: expected one of {}",
                 IMAGE_MEDIA_TYPES.join(", ")
+            )));
+        }
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(Error::Config(format!(
+                "image is {} bytes, over the {MAX_IMAGE_BYTES}-byte per-image bound; \
+                 resize it before attaching rather than sending it truncated",
+                bytes.len()
             )));
         }
         Ok(Self {
@@ -434,6 +460,7 @@ mod failures {
         format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{events}")
     }
 
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
     fn request() -> CompletionRequest {
         CompletionRequest {
             system: "s".into(),
@@ -705,6 +732,7 @@ mod media_tests {
         }
     }
 
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
     fn with_image() -> CompletionRequest {
         CompletionRequest {
             user: "what is in this picture".into(),
@@ -756,6 +784,7 @@ mod media_tests {
 
     #[test]
     fn a_text_only_request_is_never_refused_even_by_a_blind_provider() {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let text_only = CompletionRequest {
             user: "no picture here".into(),
             ..Default::default()

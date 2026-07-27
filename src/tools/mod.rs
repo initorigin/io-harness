@@ -14,6 +14,7 @@
 pub mod custom;
 pub mod documents;
 pub mod fs;
+pub mod git;
 pub mod workspace;
 
 pub use custom::{Tool, ToolFuture, Toolbox};
@@ -28,6 +29,15 @@ pub const GREP_TOOL: &str = "grep";
 pub const FIND_TOOL: &str = "find";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
+/// The name the model uses to look at an image in the workspace (0.15.0,
+/// `media` feature).
+///
+/// A built-in rather than a registered [`Tool`], for the reason the document
+/// tools are: this one decides which of the user's files is sent to a third
+/// party, so it is gated per call on the real path the model names rather than
+/// authorised once by name.
+#[cfg(feature = "media")]
+pub const VIEW_IMAGE_TOOL: &str = "view_image";
 /// The names the model uses for spreadsheet work (0.14.0, `xlsx` feature).
 ///
 /// These are built-ins rather than registered [`Tool`]s on purpose. A registered

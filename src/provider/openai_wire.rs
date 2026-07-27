@@ -178,6 +178,7 @@ mod tests {
 
     #[test]
     fn body_maps_tools_to_function_schema() {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let req = CompletionRequest {
             system: "sys".into(),
             user: "hi".into(),
@@ -206,6 +207,7 @@ mod media_wire {
 
     #[test]
     fn an_image_becomes_a_data_url_part_after_the_text() {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let req = CompletionRequest {
             system: "sys".into(),
             user: "what is this".into(),
@@ -233,6 +235,7 @@ mod media_wire {
         // would change the body of every text-only run in the crate.
         let b = body(
             "some/model",
+            #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             &CompletionRequest {
                 user: "no picture".into(),
                 ..Default::default()
@@ -243,6 +246,7 @@ mod media_wire {
 
     #[test]
     fn several_images_all_reach_the_body_in_order() {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let req = CompletionRequest {
             user: "compare".into(),
             media: vec![

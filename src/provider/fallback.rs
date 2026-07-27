@@ -209,6 +209,7 @@ mod tests {
         panic!("the secondary must not be called");
     }
 
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
     fn req() -> CompletionRequest {
         CompletionRequest {
             system: String::new(),

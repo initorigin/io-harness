@@ -61,6 +61,7 @@ fn stall_every_connection() {
     }
 }
 
+#[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
 fn request() -> CompletionRequest {
     CompletionRequest {
         system: "s".into(),
