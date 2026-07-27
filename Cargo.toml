@@ -45,6 +45,18 @@ regex = "1"
 # files and explicitly cannot modify an existing one, and umya-spreadsheet is the
 # only one that round-trips an existing workbook. Nothing here binds a C or C++
 # library, so no runner needs a system package.
+docx-rs = { version = "0.4", optional = true }
+# PowerPoint is read-only here and deliberately has no dedicated crate: a .pptx is
+# a zip of XML, and pulling the text out of ppt/slides/*.xml is a short piece of
+# code over two dependencies this tree can already justify. The alternative was a
+# ten-day-old extraction crate, and the vetting rule that removed OCR applies to
+# convenience too.
+zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
+quick-xml = { version = "0.37", optional = true }
+lopdf = { version = "0.44", optional = true }
+pdf-extract = { version = "0.12", optional = true }
+rxing = { version = "0.9", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
 calamine = { version = "0.36", optional = true }
 rust_xlsxwriter = { version = "0.96", optional = true }
 umya-spreadsheet = { version = "3.0", optional = true }
@@ -73,5 +85,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", 
 # who wants spreadsheets does not compile a PDF stack, and an umbrella so the
 # common case is one word.
 default = []
-documents = ["xlsx"]
+documents = ["xlsx", "docx", "pptx", "pdf", "barcode"]
+docx = ["dep:docx-rs"]
+pptx = ["dep:zip", "dep:quick-xml"]
+pdf = ["dep:lopdf", "dep:pdf-extract"]
+barcode = ["dep:rxing", "dep:image"]
 xlsx = ["dep:calamine", "dep:rust_xlsxwriter", "dep:umya-spreadsheet"]
