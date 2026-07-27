@@ -261,6 +261,73 @@ mod tests {
         ws.write_bytes(rel, &buf).unwrap();
     }
 
+    /// The same fixture, written by a *different* crate.
+    ///
+    /// `two_sheet_fixture` builds with `umya-spreadsheet`, which is also the crate
+    /// [`set_cell`] edits with, so on its own it proves only that the library
+    /// round-trips its own output — and a library that drops what it does not
+    /// model never emits what it does not model. This one is written by
+    /// `rust_xlsxwriter`, so the bytes handed to the edit were produced by
+    /// something with its own idea of what an OOXML package looks like.
+    ///
+    /// It is still not a workbook Excel itself wrote — the tree carries no binary
+    /// fixtures — so the strongest available evidence for the preserving edit is
+    /// this plus the live run in `examples/documents_live.rs`, where a
+    /// `rust_xlsxwriter` workbook is edited by `umya-spreadsheet` and read back by
+    /// `calamine`, three crates deep.
+    fn foreign_fixture(ws: &Workspace, rel: &str) {
+        let mut book = rust_xlsxwriter::Workbook::new();
+        let bold = rust_xlsxwriter::Format::new().set_bold();
+        let data = book.add_worksheet();
+        data.set_name("Data").unwrap();
+        data.write_string_with_format(0, 0, "Region", &bold)
+            .unwrap();
+        data.write_string(0, 1, "Q1").unwrap();
+        data.write_string(1, 0, "EMEA").unwrap();
+        data.write_string(1, 1, "120").unwrap();
+        let notes = book.add_worksheet();
+        notes.set_name("Notes").unwrap();
+        notes.write_string(0, 0, "do not lose me").unwrap();
+
+        ws.write_bytes(rel, &book.save_to_buffer().unwrap())
+            .unwrap();
+    }
+
+    #[test]
+    fn an_edit_preserves_a_workbook_the_editing_crate_did_not_write() {
+        let d = dir();
+        let ws = Workspace::new(d.path());
+        foreign_fixture(&ws, "book.xlsx");
+
+        assert_eq!(
+            set_cell(&ws, "book.xlsx", "Data", "B2", "999").unwrap(),
+            Wrote::Changed
+        );
+
+        let after = umya_spreadsheet::reader::xlsx::read_reader(
+            Cursor::new(ws.read_bytes("book.xlsx").unwrap()),
+            true,
+        )
+        .unwrap();
+        let data = after.sheet_by_name("Data").unwrap();
+        assert_eq!(data.value("B2"), "999", "the new value landed");
+        assert_eq!(data.value("A1"), "Region", "its neighbours survived");
+        assert!(
+            data.style("A1").font().is_some_and(|f| f.bold()),
+            "the bold format another crate wrote survived an edit to B2"
+        );
+        assert_eq!(
+            after.sheet_by_name("Notes").unwrap().value("A1"),
+            "do not lose me",
+            "the untouched sheet survived"
+        );
+        assert_eq!(
+            sheet_names(&ws, "book.xlsx").unwrap(),
+            vec!["Data", "Notes"],
+            "and no sheet was added or dropped"
+        );
+    }
+
     /// F3, the criterion that matters: an edit is an edit, not a rewrite.
     #[test]
     fn setting_one_cell_leaves_the_other_sheet_and_the_formatting_intact() {

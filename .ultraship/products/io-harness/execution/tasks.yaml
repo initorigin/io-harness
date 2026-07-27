@@ -134,12 +134,18 @@ tasks:
     the library
   - 'caught by the subagent: the dispatch arms referenced an unbound name, which only broke the FEATURED
     build - the feature-off/on asymmetry the release fit named as the case that gets forgotten'
+  - 'F3''s fixture clause, closed in T09: an_edit_preserves_a_workbook_the_editing_crate_did_not_write
+    builds the two-sheet bold-formatted fixture with rust_xlsxwriter and edits it with umya-spreadsheet,
+    so the preserved formatting was written by a crate other than the one under test. The tree carries
+    no binary fixtures, so a workbook Excel itself wrote is not asserted; the strongest available evidence
+    is that test plus the live run, where a rust_xlsxwriter workbook is edited by umya-spreadsheet and
+    read back by calamine and all nine original rows survive'
 - id: US-IO-HARNESS-0.14.0-T05
   summary: Word read and generate, and PowerPoint text extraction. No in-place `.docx` edit and no `.pptx`
     write path in the public surface.
   why_required: Both are read-or-generate only, for different reasons recorded in scope, and both are
     cheap once T01-T03 exist. Asserting the absence of the write paths is what keeps the limits honest.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T02
@@ -157,13 +163,24 @@ tasks:
   files:
   - src/tools/
   - tests/
-  evidence: []
+  evidence:
+  - 'src/tools/documents/docx.rs: read_text and write_new over docx-rs, 4 tests. F4''s second half is
+    asserted by absence — there is no third function, and the module documents why: the reader drops
+    the OOXML it does not model, so read-then-write is a lossy rewrite and generate-and-replace is not
+    offered as a stand-in for an edit'
+  - 'src/tools/documents/pptx.rs: read_text only, 7 tests. No pptx crate — a deck is a zip of XML and
+    the slide text is the <a:t> content of ppt/slides/slideN.xml, a short walk over zip and quick-xml'
+  - 'F9''s "no write path exists in the public surface" is mechanically true: pptx.rs has exactly one
+    pub fn, and the public-surface diff in evidence/0.14.0/ lists no pptx writer'
+  - slides come back in numeric order, not archive or lexicographic order, which is what stops slide10
+    reading before slide2; layouts, masters and speaker notes are deliberately not read
+  - both modules carry the denied-path refusal test and its permissive negative control
 - id: US-IO-HARNESS-0.14.0-T06
   summary: 'PDF: generate, extract text, watermark every page, and fill AcroForm fields including appearance-stream
     regeneration or `NeedAppearances`.'
   why_required: 'The widest of the capabilities and the one with a known trap: a filled field whose value
     no viewer renders is not a filled form.'
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T02
@@ -187,13 +204,30 @@ tasks:
   files:
   - src/tools/
   - tests/
-  evidence: []
+  evidence:
+  - 'src/tools/documents/pdf.rs: write_new, read_text, watermark and fill_form over lopdf and pdf-extract,
+    17 tests — the widest module and the widest test set'
+  - 'F6 is asserted the way it has to be: watermarking APPENDS to the page rather than replacing its
+    content, watermarking twice leaves both stamps and the body, and a page with inherited resources
+    keeps its own font reachable. A watermark that flattened the original would pass a naive "the stamp
+    is there" check and fails these'
+  - 'F7 — fill_form sets /V and /NeedAppearances and deletes the stale /AP, so a viewer redraws the field
+    rather than showing the old appearance. Asserted on the flag and the deletion, not only on /V. LIMIT
+    RECORDED: it does not generate appearance streams itself and has not been opened in a real viewer,
+    so the claim is "asks the viewer to redraw it", which is what the test is named'
+  - a batch with one unknown field writes none of it, and naming a field that is not there lists the
+    ones that are — a failure the model can act on rather than a partial write it cannot see
+  - 'F5 — reading order is asserted loosely on purpose; read_text''s doc comment states the extraction
+    is best-effort, that a scanned page returns empty text, and that pdf-extract panics on input it does
+    not understand so the call catches the unwind. That guard is a no-op under panic = "abort", and the
+    doc says so'
+  - denied-path refusal for both reading and writing, each with its permissive negative control
 - id: US-IO-HARNESS-0.14.0-T07
   summary: Barcode and QR decoding from a workspace image, with a clean not-found result rather than an
     error that ends the run.
   why_required: Self-contained, healthy dependency, and the not-found path is the one a real run hits
     most.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T02
@@ -207,12 +241,23 @@ tasks:
   files:
   - src/tools/
   - tests/
-  evidence: []
+  evidence:
+  - 'src/tools/documents/barcode.rs: decode over rxing, 6 tests. Every 1D and 2D symbology the port supports,
+    without the caller naming one first — a model that had to name the symbology before reading the label
+    would need to already know the answer'
+  - 'F8 — a QR code and a 1D symbology each decode to the payload they were written with, and an image
+    with no code in it returns Ok(vec![]) rather than an error: "I looked and there was nothing there"
+    is an observation the model can act on, while an Err invites a retry of the identical call'
+  - an image that cannot be decoded as an image IS an error, which is the other thing entirely
+  - 'the path is read through Workspace::read_bytes and decoded in memory: rxing ships detect_in_file
+    helpers that take a path and call image::open themselves, and they are deliberately not used — a
+    path handed to a library is a read that never passes the policy gate'
+  - denied-path refusal before a pixel is decoded, with its permissive negative control
 - id: US-IO-HARNESS-0.14.0-T08
   summary: The document-aware verification criterion, gating on extracted text rather than file bytes.
   why_required: Without it a document task has no stop condition, and `FileContains` on a `.docx` matches
     zip bytes.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.14.0-T01
   - US-IO-HARNESS-0.14.0-T05
@@ -229,14 +274,24 @@ tasks:
   files:
   - src/verify.rs
   - tests/
-  evidence: []
+  evidence:
+  - 'src/verify.rs: Verification::DocumentContains, reader chosen by extension (.xlsx/.docx/.pptx/.pdf),
+    an unknown extension an error rather than a fallback to matching raw bytes'
+  - 'F10 — three tests: passes on text the document shows, fails on text it does not, and the decisive
+    one — the same document read both ways, where WorkspaceFileContains says no and DocumentContains
+    says yes. That test corrected the premise: read_to_string(..).unwrap_or_default() on a zip yields
+    the empty string, so the byte criterion is a silent permanent false FAIL on every document, not a
+    false pass'
+  - the variant exists in every build; without the feature it returns a typed Error::Config naming the
+    feature rather than vanishing from the enum and breaking a consumer's exhaustive match
+  - 473 featured / 428 default tests pass, clippy clean both ways
 - id: US-IO-HARNESS-0.14.0-T09
   summary: 'Documentation, the live run, and the release gates: per-capability limits in the doc comments,
     a CHANGELOG that says what was cut and why, the feature named in the README, and one real-provider
     run over a real spreadsheet under a policy.'
   why_required: The cuts are the part a reader will otherwise mistake for an oversight, and no fixture
     exercises what a live model does with a document.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.14.0-T04
   - US-IO-HARNESS-0.14.0-T05
@@ -273,4 +328,27 @@ tasks:
   - README.md
   - CHANGELOG.md
   - examples/
-  evidence: []
+  evidence:
+  - 'O1 — limits stated where a caller meets them: xlsx::set_cell now carries "What preserving is worth"
+    (not a guarantee on chart/drawing/pivot/macro-heavy workbooks); docx module and write_new state
+    generate-and-read and why no in-place edit; pptx states read-only with no write path; pdf::read_text
+    states best-effort reading order and the panic guard''s limit under panic = "abort"'
+  - 'O2 — CHANGELOG 0.14.0 carries a "What was cut, and why" block: OCR and PowerPoint authoring off
+    the roadmap by owner decision 2026-07-27 (not deferred), plus barcode generation, the in-place Word
+    edit, document delete and PDF rasterisation, each with what was promised and why it is absent'
+  - 'O3 — README: Status through 0.14.0, the capability line rewritten to what shipped and what was cut,
+    and a new "Documents (v0.14)" section carrying the one enabling line, the twelve built-ins, DocumentContains
+    and "The limits, stated plainly". src/lib.rs has the v0.14 paragraph; docs/CAPABILITIES.md and docs/CONTRACT.md
+    updated for the feature-gated surface'
+  - 'O4 — evidence/0.14.0/: live_run_0.14.0_documents.txt (OpenRouter, openai/gpt-5.6-luna, both arms),
+    public_surface_diff.md with added/removed lists, dependency_tree_default.txt and dependency_tree_documents.txt'
+  - 'the live run, both arms: permissive — Success in 3 steps, xlsx_set_cell wrote C12=218454, all nine
+    original rows still readable and the number in the cell it was asked for; denied — the same write
+    refused twice by rule ledger.xlsx, workbook bytes identical before and after (a589c65bc0171e87).
+    The negative control is the release''s actual claim, that a document tool is governed'
+  - 'N4 — CI is five legs (three OSes, msrv, lint) and each now covers the features: cargo test --features
+    documents on all three OSes, the MSRV leg builds featured so an optional dependency cannot raise
+    the 1.88 floor invisibly (verified locally with cargo +1.88), and lint runs clippy both ways'
+  - 'N5 — no public item renamed or removed. 389 items at v0.13.0, 420 now, empty removals list. The
+    grep cannot see enum variants, so DocumentContains is recorded in the diff prose rather than counted'
+  - default cargo tree still 401 lines; 837 with all five formats enabled
