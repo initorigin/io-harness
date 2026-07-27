@@ -2792,7 +2792,8 @@ async fn dispatch(
                 .to_string(),
         },
     ));
-    Ok(match call.name.as_str() {
+    let name = call.name.as_str();
+    Ok(match name {
         GREP_TOOL => {
             let pattern = s("pattern").unwrap_or_default();
             match ws.grep(pattern, s("path_glob")) {
