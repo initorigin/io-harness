@@ -114,6 +114,42 @@ pub enum Verification {
         /// Text that must be present in it.
         needle: String,
     },
+    /// (workspace/multi-file, 0.14.0) A document under the workspace root must
+    /// contain this text **once its text has been extracted** — not in its raw
+    /// bytes.
+    ///
+    /// The distinction is the whole variant. A `.docx`, `.xlsx` and `.pptx` are
+    /// zips and a `.pdf` is a compressed object graph, so none of them is UTF-8.
+    /// [`Verification::WorkspaceFileContains`] reads with
+    /// `read_to_string(..).unwrap_or_default()`, which on a document yields the
+    /// empty string — so it reports "does not contain" for every document,
+    /// including one whose visible text plainly does contain the needle. It does
+    /// not fail loudly; it silently always fails. A criterion that can never pass
+    /// is worse than no criterion, because a run that ends `StepCapReached` looks
+    /// like an agent that could not do the work rather than a gate that was never
+    /// able to say yes.
+    ///
+    /// The reader is chosen by the file's extension: `.xlsx`, `.docx`, `.pptx`,
+    /// `.pdf`. Anything else is an error rather than a fallback to reading the
+    /// bytes as text — a criterion that silently degrades into a weaker check is
+    /// the failure mode this exists to remove.
+    ///
+    /// The variant exists in every build; only its implementation is behind the
+    /// document features. A build without them returns a typed
+    /// [`Error::Config`](crate::Error::Config) saying so, rather than the variant
+    /// vanishing and every match arm growing a `cfg`. Loud beats absent, which is
+    /// the same call single-file mode makes when handed a policy it cannot
+    /// enforce.
+    ///
+    /// Like the other content criteria this is gameable and does not prove the
+    /// document is *correct* — see the
+    /// [type-level docs](Verification#what-a-passing-gate-proves).
+    DocumentContains {
+        /// Document to read, relative to the workspace root.
+        file: PathBuf,
+        /// Text that must be present in its extracted text.
+        needle: String,
+    },
     /// (workspace/multi-file) Every listed file — relative to the workspace root
     /// — must compile on its own as a Rust library. The run only succeeds when
     /// all of them do, so one wrong file fails the whole set.
@@ -378,6 +414,7 @@ impl Verification {
             }
             Verification::EachCompilesRust(_)
             | Verification::WorkspaceTestPasses { .. }
+            | Verification::DocumentContains { .. }
             | Verification::WorkspaceFileContains { .. } => Err(Error::Config(
                 "multi-file verification requires a workspace root".into(),
             )),
@@ -398,6 +435,9 @@ impl Verification {
                     .await
                     .unwrap_or_default();
                 Ok(src.contains(needle))
+            }
+            Verification::DocumentContains { file, needle } => {
+                Ok(extract_document_text(root, file)?.contains(needle))
             }
             Verification::EachCompilesRust(files) => {
                 for f in files {
@@ -447,6 +487,10 @@ impl Verification {
             Verification::WorkspaceFileContains { file, needle } => {
                 format!("the file {file:?} must contain exactly this text: {needle:?}")
             }
+            Verification::DocumentContains { file, needle } => format!(
+                "the document {file:?} must contain this text once its text is \
+                 extracted: {needle:?}"
+            ),
             Verification::EachCompilesRust(files) => {
                 format!("each of these files must compile as Rust: {files:?}")
             }
@@ -454,6 +498,65 @@ impl Verification {
                 "these files {files:?} must together compile and pass this test:\n{test_src}"
             ),
         }
+    }
+}
+
+/// The error for a document this build cannot read because its feature is off.
+/// Named rather than absent: a criterion that silently could not run is the
+/// failure mode this whole variant exists to remove.
+#[allow(dead_code)]
+fn missing_feature(ext: &str) -> Error {
+    Error::Config(format!(
+        "DocumentContains cannot read .{ext}: this build of io-harness does not \
+         have the \"{ext}\" feature enabled"
+    ))
+}
+
+/// A document's extracted text, chosen by extension.
+///
+/// Reads through a permissive [`Workspace`] rooted at `root`: verification is the
+/// *caller's* criterion, not the agent's action, so it is not subject to the
+/// policy the agent runs under — the same reason
+/// [`Verification::WorkspaceFileContains`] reads the file directly. The
+/// `Workspace` is here to reuse the readers, not to gate them.
+///
+/// An unknown extension is an error rather than a fallback to reading the bytes
+/// as text: a criterion that quietly becomes a weaker criterion is exactly what
+/// this variant exists to remove.
+fn extract_document_text(root: &Path, file: &Path) -> Result<String> {
+    #[allow(unused_variables)]
+    let rel = file.to_string_lossy().replace('\\', "/");
+    #[allow(unused_variables)]
+    let ws = crate::tools::Workspace::new(root);
+    let ext = file
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        #[cfg(feature = "xlsx")]
+        "xlsx" => crate::tools::documents::xlsx::read_sheet(&ws, &rel, None),
+        #[cfg(feature = "docx")]
+        "docx" => crate::tools::documents::docx::read_text(&ws, &rel),
+        #[cfg(feature = "pptx")]
+        "pptx" => crate::tools::documents::pptx::read_text(&ws, &rel),
+        #[cfg(feature = "pdf")]
+        "pdf" => crate::tools::documents::pdf::read_text(&ws, &rel),
+        // One arm per format, each present only when its feature is absent, so the
+        // "you did not build this in" answer is reachable in exactly the builds
+        // where it is true.
+        #[cfg(not(feature = "xlsx"))]
+        "xlsx" => Err(missing_feature("xlsx")),
+        #[cfg(not(feature = "docx"))]
+        "docx" => Err(missing_feature("docx")),
+        #[cfg(not(feature = "pptx"))]
+        "pptx" => Err(missing_feature("pptx")),
+        #[cfg(not(feature = "pdf"))]
+        "pdf" => Err(missing_feature("pdf")),
+        other => Err(Error::Config(format!(
+            "DocumentContains does not know how to read .{other}; it reads .xlsx, \
+             .docx, .pptx and .pdf, and deliberately does not fall back to \
+             matching raw bytes"
+        ))),
     }
 }
 
@@ -857,5 +960,136 @@ mod tests {
     async fn multi_file_variant_errors_in_single_file_mode() {
         let v = Verification::EachCompilesRust(vec!["a.rs".into()]);
         assert!(v.passes(&PathBuf::from("unused"), "").await.is_err());
+    }
+
+    // 0.14.0 — the document criterion. The decisive test is the third one: a
+    // criterion that cannot tell a document's text from its container bytes is
+    // `WorkspaceFileContains` with extra steps and a longer name.
+
+    #[cfg(feature = "docx")]
+    #[tokio::test]
+    async fn a_document_criterion_passes_on_text_the_document_actually_shows() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = crate::tools::Workspace::new(dir.path());
+        crate::tools::documents::docx::write_new(
+            &ws,
+            "report.docx",
+            &["Quarterly revenue rose".to_string()],
+        )
+        .unwrap();
+
+        let v = Verification::DocumentContains {
+            file: "report.docx".into(),
+            needle: "revenue rose".into(),
+        };
+        assert!(v.passes_in(dir.path()).await.unwrap());
+    }
+
+    #[cfg(feature = "docx")]
+    #[tokio::test]
+    async fn a_document_criterion_fails_on_text_the_document_does_not_show() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = crate::tools::Workspace::new(dir.path());
+        crate::tools::documents::docx::write_new(&ws, "report.docx", &["Nothing here".to_string()])
+            .unwrap();
+
+        let v = Verification::DocumentContains {
+            file: "report.docx".into(),
+            needle: "revenue rose".into(),
+        };
+        assert!(!v.passes_in(dir.path()).await.unwrap());
+    }
+
+    /// THE test for this variant, and it found something sharper than expected.
+    ///
+    /// The first draft assumed `WorkspaceFileContains` would match a needle that
+    /// appears in a `.docx`'s container bytes and wrongly pass. It does not — it
+    /// reads with `read_to_string(..).unwrap_or_default()`, a document is not
+    /// UTF-8, so it reads the empty string and reports "does not contain" for
+    /// EVERY document. The wrong answer it gives is not a false pass, it is a
+    /// permanent false fail, and silently.
+    ///
+    /// So both halves are asserted on a document whose text genuinely contains
+    /// the needle: the byte criterion says no, the document criterion says yes.
+    /// Plus the container-bytes case, so the reader is pinned as reading text
+    /// rather than bytes in either direction.
+    #[cfg(feature = "docx")]
+    #[tokio::test]
+    async fn the_byte_criterion_cannot_read_a_document_and_this_one_can() {
+        let dir = tempfile::tempdir().unwrap();
+        let ws = crate::tools::Workspace::new(dir.path());
+        crate::tools::documents::docx::write_new(
+            &ws,
+            "report.docx",
+            &["Quarterly revenue rose".to_string()],
+        )
+        .unwrap();
+
+        let needle = "revenue rose";
+        let byte_match = Verification::WorkspaceFileContains {
+            file: "report.docx".into(),
+            needle: needle.into(),
+        };
+        assert!(
+            !byte_match.passes_in(dir.path()).await.unwrap(),
+            "the byte criterion reads a document as empty and can never pass — \
+             this is the wrong answer the variant exists to fix"
+        );
+
+        let text_match = Verification::DocumentContains {
+            file: "report.docx".into(),
+            needle: needle.into(),
+        };
+        assert!(
+            text_match.passes_in(dir.path()).await.unwrap(),
+            "the document criterion reads what the document shows"
+        );
+
+        // And the other direction: an entry name lives in the container's bytes
+        // and never in the text, so it must not match either.
+        let container = "word/document.xml";
+        let raw = std::fs::read(dir.path().join("report.docx")).unwrap();
+        assert!(
+            String::from_utf8_lossy(&raw).contains(container),
+            "the fixture must carry the entry name in its bytes, or the next \
+             assertion proves nothing"
+        );
+        let container_match = Verification::DocumentContains {
+            file: "report.docx".into(),
+            needle: container.into(),
+        };
+        assert!(
+            !container_match.passes_in(dir.path()).await.unwrap(),
+            "a needle only in the container must not match the text"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_criterion_refuses_a_format_it_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "revenue rose").unwrap();
+
+        let v = Verification::DocumentContains {
+            file: "notes.txt".into(),
+            needle: "revenue rose".into(),
+        };
+        let err = v.passes_in(dir.path()).await.unwrap_err();
+        assert!(
+            err.to_string().contains("txt"),
+            "the error names the extension it will not guess at, got {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_criterion_needs_a_workspace_root() {
+        let v = Verification::DocumentContains {
+            file: "report.docx".into(),
+            needle: "x".into(),
+        };
+        let err = v
+            .passes(std::path::Path::new("f.rs"), "irrelevant")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("workspace root"), "got {err}");
     }
 }
