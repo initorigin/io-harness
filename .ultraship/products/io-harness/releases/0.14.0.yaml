@@ -10,7 +10,7 @@ outcome:
     The agent reads a real `.xlsx`, changes cells in it, and writes it back with the rest of the
     workbook intact. It reads a `.docx` and generates a new one. It generates a PDF, extracts the
     text from an existing one, stamps a watermark across its pages, and fills its AcroForm fields.
-    It decodes a barcode or QR code out of an image.
+    It decodes a barcode or QR code out of an image. It reads the text out of a `.pptx`.
 
     Every one of those actions passes the 0.4.0 path policy on the actual path it touches, runs
     under the 0.6.0 sandbox where a sandbox applies, and can be gated by a criterion that
@@ -114,6 +114,13 @@ scope:
     Barcode and QR decoding from an image in the workspace: the 1D and 2D symbologies a maintained
     pure-Rust ZXing port already covers.
   - >
+    PowerPoint text extraction, read only. Getting the text out of a deck is genuinely easy —
+    several maintained pure-Rust extractors exist and none of them writes — so reading is kept while
+    authoring stays cut. Conditional on the same vetting every other dependency gets (N3): the
+    leading extractor is recent, and if it fails the maintenance or licence check at development
+    time this drops rather than being accommodated. It is the one capability here whose removal
+    costs the release nothing structural.
+  - >
     A document-aware `Verification` variant, so a document task has a real stop condition. It must
     gate on extracted text rather than on file bytes.
   - >
@@ -128,8 +135,8 @@ scope:
     moves deliberately; both are answers, drifting into it is not.
   - >
     Documentation of what each capability does and does not do, in the doc comment where a caller
-    meets it — specifically that Word is generate-and-read and that
-    PDF text extraction is best-effort on reading order.
+    meets it — specifically that Word is generate-and-read, that PowerPoint is read-only, and
+    that PDF text extraction is best-effort on reading order.
   excluded:
   - >
     OCR, entirely — and off the roadmap, not deferred. The owner cut it on 2026-07-27, so no planned
@@ -141,12 +148,11 @@ scope:
     recognises Latin script only. Either would make the five-leg matrix that 0.9.1 exists to protect
     slower and more fragile.
   - >
-    PowerPoint, entirely — reading as well as writing, and off the roadmap rather than deferred.
-    The owner cut it on 2026-07-27. Authoring was already unshippable: no mature Rust crate exists,
-    the one credible option is a 46-star single-maintainer pre-0.3 project, and the alternative is
-    writing an OOXML slide layer by hand. Text extraction was cheap and safe and would have been
-    kept on technical grounds alone; it goes because the format is out, which is the owner's call to
-    make. No `.pptx` path, read or write, appears in this release.
+    Creating or editing PowerPoint — off the roadmap rather than deferred, per the owner on
+    2026-07-27, who then kept reading on the grounds that it is easy. Authoring is independently
+    unshippable: no mature Rust crate exists, the one credible option is a 46-star single-maintainer
+    pre-0.3 project, and the alternative is writing an OOXML slide layer by hand. So `.pptx` is
+    read-only here, and no write path for it appears in the public surface.
   - >
     Editing a Word document in place, preserving what was not touched. The mature crate's read is
     the weaker half of its round trip and drops OOXML it does not model on re-serialise, which for
@@ -217,11 +223,14 @@ acceptance:
     payloads from images in the workspace, and an image containing no code returns a clean "nothing
     found" rather than an error that ends the run.
   - >
-    F9 — the document verification criterion passes when the extracted text contains the needle,
+    F9 — PowerPoint text extraction returns the text of a real deck, and no write path for `.pptx`
+    exists in the public surface.
+  - >
+    F10 — the document verification criterion passes when the extracted text contains the needle,
     fails when it does not, and FAILS on a document whose raw bytes contain the needle while its
     extracted text does not. Without the third case it is `FileContains` wearing a costume.
   - >
-    F10 — a document tool failure is an observation, not a run failure. A corrupt or truncated file
+    F11 — a document tool failure is an observation, not a run failure. A corrupt or truncated file
     returns an error the model can read and adapt to, the same treatment a malformed regex gets from
     `grep`, and the run continues.
   non_functional:
@@ -249,7 +258,7 @@ acceptance:
   operational:
   - >
     O1 — each capability's doc comment states its limits where a caller meets them: Word is
-    generate-and-read, PDF extraction is best-effort on reading order,
+    generate-and-read, PowerPoint is read-only, PDF extraction is best-effort on reading order,
     spreadsheet preserving-edit is not guaranteed for chart and drawing heavy workbooks.
   - >
     O2 — the CHANGELOG says what was cut and why. A reader who remembers the roadmap promised OCR
@@ -315,7 +324,7 @@ resource_profile:
   uncertainty: medium
   likely_cost_drivers:
   - >
-    Four formats, each with its own crate, its own failure modes and its own fixtures. The breadth
+    Five formats, each with its own crate, its own failure modes and its own fixtures. The breadth
     is the cost; no single piece is hard.
   - >
     Fixtures are real work and are easy to get wrong. A fixture the test also generated proves the
