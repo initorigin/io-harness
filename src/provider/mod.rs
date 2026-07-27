@@ -252,7 +252,7 @@ pub struct CompletionRequest {
     ///
     /// A provider that does not accept images refuses a request carrying any,
     /// before the body is built and before anything is spent — see
-    /// [`ensure_media_accepted`]. Media is never silently dropped: a run that
+    /// `ensure_media_accepted`. Media is never silently dropped: a run that
     /// paid for an answer about an image the model never received is the failure
     /// this field exists to make impossible.
     #[cfg(feature = "media")]

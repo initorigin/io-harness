@@ -11,13 +11,13 @@
 //!
 //! There is no `&str`, no `Vec<String>`, and no `impl IntoIterator<Item = ...>`
 //! anywhere on the way in that reaches the argv as an *option*. A caller names a
-//! [`GitCmd`] variant, and every field of every variant is one of two things:
+//! `GitCmd` variant, and every field of every variant is one of two things:
 //!
 //! * a typed non-string value (`bool`, `u32`) that this module renders into a
 //!   flag itself — a `bool` cannot spell `--upload-pack=…`; or
 //! * a `paths` vector, which is model-supplied data and is therefore emitted
 //!   *only* after the `--` separator, and only after each element passes
-//!   [`check_path`].
+//!   `check_path`.
 //!
 //! Adding a git capability means adding a variant here and getting it reviewed.
 //! That is the whole security property: the set of argvs this module can emit is
@@ -272,7 +272,7 @@ impl GitOutcome {
     }
 }
 
-/// Spawns [`GitCmd`]s in one directory under one policy.
+/// Spawns `GitCmd`s in one directory under one policy.
 pub(crate) struct Git<'a> {
     policy: &'a Policy,
     workdir: PathBuf,

@@ -11,7 +11,7 @@ tasks:
     flat fields (src/provider/mod.rs:118). Every other task in the image half sends or gates a `Media`,
     so none of them can start until the type and the refusal exist. The default-refuses capability declaration
     is what makes F3 true for an out-of-tree provider rather than only for the three built-ins.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F3 — a provider that does not accept images refuses a request carrying one before the request is
@@ -34,7 +34,9 @@ tasks:
   files:
   - src/provider/mod.rs
   - Cargo.toml
-  evidence: []
+  evidence:
+  - cargo test --features media --lib provider::media_tests — 8 passed
+  - cargo tree default 401 lines, --features media 402 (base64 only)
 - id: US-IO-HARNESS-0.15.0-T02
   summary: 'Wire encoding per provider: the Anthropic base64 image content block (src/provider/anthropic.rs:100)
     and the `image_url` data URL in the shared body at src/provider/openai_wire.rs:38. The fallback, record
@@ -43,7 +45,7 @@ tasks:
   why_required: The media type is inert until it reaches a wire body. These are the only three places
     a request becomes JSON, and each vendor's shape is different, so an image that is not encoded per
     vendor is an image the model never receives.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T01
   acceptance_criteria:
@@ -63,14 +65,16 @@ tasks:
   - src/provider/fallback.rs
   - src/provider/record.rs
   - src/provider/replay.rs
-  evidence: []
+  evidence:
+  - cargo test --features media --lib media_wire — 5 passed, wire shape asserted against the serialised
+    body for both vendors
 - id: US-IO-HARNESS-0.15.0-T03
   summary: A caller-side entry point that attaches images to a run, as a new named function rather than
     a parameter added to an existing one (src/lib.rs:271).
   why_required: One of the two ways an image gets in, and the only one that does not involve the model
     choosing. Without it the caller cannot hand the agent the image the task is about, which is the release's
     headline sentence.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T01
   acceptance_criteria:
@@ -83,7 +87,8 @@ tasks:
   files:
   - src/run.rs
   - src/lib.rs
-  evidence: []
+  evidence:
+  - TaskContract::with_images; tests/media.rs a_provider_that_accepts_images_receives_the_contract_image_every_step
 - id: US-IO-HARNESS-0.15.0-T04
   summary: 'The agent attaches an image itself: a built-in that takes a workspace path, dispatched in
     the same `match` as `read_file` (src/run.rs:2804) and gated on `Act::Read` against that path through
@@ -91,7 +96,7 @@ tasks:
   why_required: 'This is the half that needs the boundary: the model choosing which of the user''s files
     to send to a third party. It is the direct analogue of 0.14.0''s document built-ins and carries F1
     and F2, the release''s first refusal-plus-control pair.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T01
   acceptance_criteria:
@@ -108,7 +113,9 @@ tasks:
   files:
   - src/run.rs
   - src/tools/mod.rs
-  evidence: []
+  evidence:
+  - tests/media.rs — an_image_the_policy_denies_is_refused_and_never_reaches_the_provider, with its permissive
+    control
 - id: US-IO-HARNESS-0.15.0-T05
   summary: 'Byte bounds on media at three boundaries: what may enter a request, what is written to the
     trace (a digest, a size and a media type rather than the bytes), and what the 0.10.0 context accounting
@@ -117,7 +124,7 @@ tasks:
     image becomes a rusqlite store growing by megabytes per screenshot and a prompt budget that silently
     ignores the largest thing in it. The failure does not appear in a short test run, so the bound has
     to be built rather than observed.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T01
   - US-IO-HARNESS-0.15.0-T04
@@ -132,7 +139,8 @@ tasks:
   - src/run.rs
   - src/context.rs
   - src/state.rs
-  evidence: []
+  evidence:
+  - tests/media.rs — a_viewed_image_rides_one_request_and_is_then_dropped; the_trace_records_the_digest_and_the_size_rather_than_the_bytes
 - id: US-IO-HARNESS-0.15.0-T06
   summary: A first-party gated spawner that runs a fixed argv under the policy, enforcing the whole argv
     rather than the program name, and recording the argv, the exit status and a bounded slice of output
@@ -142,7 +150,7 @@ tasks:
     enforces only the program name (src/verify.rs:248). Every git built-in runs through this, so the git
     half cannot start without it, and building it on the argv-blind path would reproduce the defect the
     release exists to avoid.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F6 — the reachable git surface is fixed, asserted over the argv every built-in constructs. No reachable
@@ -153,7 +161,8 @@ tasks:
     '
   files:
   - src/tools/git.rs
-  evidence: []
+  evidence:
+  - cargo test --lib tools::git — 11 passed; free-form argv impossible at the type level
 - id: US-IO-HARNESS-0.15.0-T07
   summary: 'Git reads: history, working-tree status, and diff, as named built-ins constructing their own
     complete argv, gated on the paths they touch, with machine-readable NUL-separated output and a fixed
@@ -162,7 +171,7 @@ tasks:
     is wired: the argv builders, the gate, the environment and the output parsing are the same ones the
     write half uses. A path with a space or a newline in it becoming two paths is a parsing bug that only
     NUL separation prevents.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T06
   acceptance_criteria:
@@ -180,7 +189,8 @@ tasks:
   - src/tools/git.rs
   - src/run.rs
   - src/tools/mod.rs
-  evidence: []
+  evidence:
+  - tests/git.rs — 9 passed; NUL-safe machine-readable output, fixed child environment
 - id: US-IO-HARNESS-0.15.0-T08
   summary: 'Git writes: stage named paths and commit. `git_add` requires `Act::Read` on each path it stages,
     because staging copies the file''s bytes into the object store; `git_commit` requires `Act::Write`
@@ -189,7 +199,7 @@ tasks:
   why_required: This is the outcome sentence — a run that ends as a commit. The read gate on staging is
     what stops a policy-denied file reaching a commit, and hook suppression is what stops the repository
     the agent was pointed at executing its own code under the agent.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T07
   acceptance_criteria:
@@ -211,7 +221,9 @@ tasks:
   files:
   - src/tools/git.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - tests/git.rs — an_agent_stages_its_edits_and_commits_them; staging_a_path_the_policy_denies_for_reading_is_refused
+    with its control
 - id: US-IO-HARNESS-0.15.0-T09
   summary: 'The reachable git surface, asserted rather than described: a test over the argv every built-in
     constructs, and the argument-injection defence — pathspecs after `--`, a leading `-` refused, and
@@ -220,7 +232,7 @@ tasks:
     failure mode: a model-named path that becomes a flag converts a path-scoped capability into arbitrary
     git, and it ships looking like a working feature. Asserting over the builders means a later arm that
     adds a subcommand fails the suite instead of passing unnoticed.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T08
   acceptance_criteria:
@@ -238,14 +250,15 @@ tasks:
     '
   files:
   - src/tools/git.rs
-  evidence: []
+  evidence:
+  - every_shape_covers_every_variant; the_subcommand_is_always_one_of_the_five_this_crate_ships; evidence/0.15.0/git_argv_audit.md
 - id: US-IO-HARNESS-0.15.0-T10
   summary: 'Commit idempotency across 0.7.0 durable resume: a run killed between the commit and its checkpoint
     resumes without taking the commit twice, following the ordering 0.7.0 established for exec replay.'
   why_required: A commit is the first genuinely irreversible action the crate can take, and 0.7.0's promise
     that an irreversible action already taken is not taken twice has never been tested against one. Being
     wrong here is invisible until a crash.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T08
   acceptance_criteria:
@@ -257,7 +270,8 @@ tasks:
   files:
   - src/run.rs
   - src/state.rs
-  evidence: []
+  evidence:
+  - tests/git.rs — a_commit_interrupted_before_its_checkpoint_is_not_taken_twice
 - id: US-IO-HARNESS-0.15.0-T11
   summary: 'Clean degradation when the `git` binary is absent: the capability reports itself unavailable
     as an observation the model can read and adapt to, and the run continues.'
@@ -265,7 +279,7 @@ tasks:
     get an error the agent can work around rather than a panic or a failed run. This is the same treatment
     a malformed regex gets from `grep`, and it is what keeps N3 true for consumers rather than only for
     the CI runners.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T07
   acceptance_criteria:
@@ -283,14 +297,15 @@ tasks:
   files:
   - src/tools/git.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - tests/git.rs — no_git_binary_is_an_observation_and_the_run_carries_on; src/tools/git.rs a_missing_git_binary_is_an_unavailable_outcome_not_a_run_failure
 - id: US-IO-HARNESS-0.15.0-T12
   summary: MCP image content passthrough, retiring the comment at src/mcp.rs:453 that discards non-text
     content because media is 0.11.
   why_required: An MCP tool that returns an image currently returns the string "(no text content)", which
     is a silent drop of exactly the kind this release exists to remove. The comment is a promise the crate
     has carried unfulfilled for four minors.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T01
   acceptance_criteria:
@@ -301,14 +316,15 @@ tasks:
     '
   files:
   - src/mcp.rs
-  evidence: []
+  evidence:
+  - 'cargo test --features media --lib mcp:: — 11 passed; default build no-regression control passes'
 - id: US-IO-HARNESS-0.15.0-T13
   summary: 'Resume from the stored policy: a new named entry point that recovers the policy a run was
     started under instead of requiring the caller to pass one.'
   why_required: 'Carried from 0.13.0 by the owner''s decision, and this release is why it now matters:
     a crashed run may already have committed under a policy the resuming caller cannot reconstruct, so
     resuming without it means an irreversible action was taken under a boundary that no longer applies.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F13 — resume from the stored policy. A run started under a restrictive policy and killed is resumed
@@ -320,14 +336,16 @@ tasks:
   files:
   - src/run.rs
   - src/lib.rs
-  evidence: []
+  evidence:
+  - tests/policy.rs — a_run_resumed_from_its_stored_policy_is_still_bounded_by_it, its permissive control,
+    and the no-recorded-policy refusal
 - id: US-IO-HARNESS-0.15.0-T14
   summary: '`fill_form` generates real appearance streams rather than setting `/NeedAppearances` and deleting
     the stale `/AP`.'
   why_required: 'Carried from 0.14.0 by the owner''s decision as that release''s weakest claim: a value
     a viewer shows blank is not a filled form. `lopdf` is already in the tree and no rasterisation is
     involved, so the fix stays inside the no-system-package constraint.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F14 — `fill_form` generates an appearance stream. A filled field carries an `/AP` normal appearance
@@ -338,7 +356,9 @@ tasks:
     '
   files:
   - src/tools/documents/pdf.rs
-  evidence: []
+  evidence:
+  - 'cargo test --features pdf --lib tools::documents::pdf:: — 22 passed; appearance stream asserted on
+    decoded bytes with an empty-value control'
 - id: US-IO-HARNESS-0.15.0-T15
   summary: 'Release surface: doc comments stating each capability''s limits where a caller meets them,
     the CHANGELOG entry including why video was cut from the roadmap, README and crate-docs discoverability
@@ -347,7 +367,7 @@ tasks:
   why_required: The dependency-tree assertion is the constraint the whole release is held to, and the
     video cut is the thing a reader who remembers the roadmap will look for and, not finding it, read
     as an oversight. Neither is documentation about the work; both are acceptance criteria.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.15.0-T05
   - US-IO-HARNESS-0.15.0-T09
@@ -394,4 +414,6 @@ tasks:
   - README.md
   - Cargo.toml
   - .github/workflows/ci.yml
-  evidence: []
+  evidence:
+  - CHANGELOG 0.15.0 section, README images-and-git section, CI legs for media plus a git --version assertion,
+    evidence/0.15.0/
