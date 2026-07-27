@@ -113,8 +113,134 @@ pub struct ToolSpec {
     pub parameters: serde_json::Value,
 }
 
+/// An image handed to the model alongside the task.
+///
+/// The bytes are held already base64-encoded, because that is the form every
+/// provider's wire format wants: Anthropic takes base64 in an image content
+/// block, and the OpenAI-shaped bodies take it inside a `data:` URL. Encoding
+/// once where the file is read, rather than once per provider, also keeps the
+/// replay key — which is the whole serialized request (`Replay::key`) — a
+/// string rather than a JSON array with one number per byte.
+///
+/// Images only. Video is not on the roadmap: the Anthropic Messages API and the
+/// OpenAI Chat Completions API accept no video at all, and OpenRouter, the only
+/// one of the three with a `video_url` part, states support varies by model and
+/// offers no way to ask which. Audio is likewise absent.
+#[cfg(feature = "media")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Media {
+    /// IANA media type. One of `image/jpeg`, `image/png`, `image/gif` or
+    /// `image/webp` — the intersection all three providers document.
+    pub media_type: String,
+    /// Standard base64 of the image bytes: no `data:` prefix and no line breaks.
+    /// Construct through [`Media::image`] rather than filling this in by hand.
+    pub base64: String,
+}
+
+/// The image media types all three providers document accepting. A type outside
+/// this set is refused at construction rather than sent for a vendor to reject
+/// with a 400 that costs a step and reads like a transport failure.
+#[cfg(feature = "media")]
+pub const IMAGE_MEDIA_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+
+/// The largest single image, in decoded bytes.
+///
+/// Anthropic documents 5MB per image; OpenAI allows a larger total payload. The
+/// smaller of the two is the honest bound for a provider-agnostic crate: an
+/// image that would be refused by one vendor and accepted by another is worse
+/// than one refused here, because the refusal there costs a step and arrives as
+/// an HTTP 400 that reads like a transport failure.
+#[cfg(feature = "media")]
+pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// The largest total of all images on one request, in decoded bytes.
+///
+/// Exists because the per-image bound does not compose: sixteen images each
+/// under the single-image limit is a request no budget anticipated. This is the
+/// bound the run loop enforces when it attaches the caller's images and whatever
+/// the agent has just looked at.
+#[cfg(feature = "media")]
+pub const MAX_REQUEST_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+
+#[cfg(feature = "media")]
+impl Media {
+    /// Encode image bytes for the provider boundary.
+    ///
+    /// Fails when `media_type` is not one of [`IMAGE_MEDIA_TYPES`]. The bytes
+    /// themselves are not parsed: whether they are a valid PNG is the vendor's
+    /// judgement, and guessing here would mean adding an image decoder to the
+    /// default path of a crate that has one only behind the barcode feature.
+    pub fn image(media_type: impl Into<String>, bytes: &[u8]) -> Result<Self> {
+        use base64::Engine as _;
+        let media_type = media_type.into();
+        if !IMAGE_MEDIA_TYPES.contains(&media_type.as_str()) {
+            return Err(Error::Config(format!(
+                "unsupported image media type {media_type:?}: expected one of {}",
+                IMAGE_MEDIA_TYPES.join(", ")
+            )));
+        }
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(Error::Config(format!(
+                "image is {} bytes, over the {MAX_IMAGE_BYTES}-byte per-image bound; \
+                 resize it before attaching rather than sending it truncated",
+                bytes.len()
+            )));
+        }
+        Ok(Self {
+            media_type,
+            base64: base64::engine::general_purpose::STANDARD.encode(bytes),
+        })
+    }
+
+    /// The media type inferred from a path's extension, for the built-in that
+    /// takes a path from the model. `None` when the extension is not an image
+    /// type every provider accepts — which the caller reports as a refusal the
+    /// model can act on, rather than sending bytes no vendor will read.
+    pub fn media_type_for(path: &str) -> Option<&'static str> {
+        let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+        Some(match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            _ => return None,
+        })
+    }
+
+    /// Decoded byte length, for the size bound and the trace.
+    ///
+    /// Derived from the encoded length rather than by decoding: base64 is four
+    /// characters per three bytes, less the padding.
+    pub fn byte_len(&self) -> usize {
+        let pad = self.base64.bytes().rev().take_while(|b| *b == b'=').count();
+        // Saturating because this is reachable from a trust boundary: an MCP
+        // server hands over its own base64, and a stub payload like `"="` would
+        // otherwise underflow and panic in a debug build. A wrong size on
+        // malformed input is a wrong size; a panic ends the run.
+        (self.base64.len() / 4 * 3).saturating_sub(pad)
+    }
+
+    /// A short digest of the encoded image, for the trace.
+    ///
+    /// Deliberately not cryptographic — it answers "is this the same image the
+    /// last step sent?" and nothing else, and it uses the standard library so
+    /// that recording what was sent costs no dependency. Do not treat a match as
+    /// proof of identity.
+    pub fn digest(&self) -> String {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.media_type.hash(&mut h);
+        self.base64.hash(&mut h);
+        format!("{:016x}", h.finish())
+    }
+}
+
 /// A request for one model completion.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+///
+/// Construct with `..Default::default()` for forward compatibility — fields are
+/// added in minor releases (`media` in 0.15.0). An exhaustive struct literal
+/// will not survive the next one.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionRequest {
     /// System instructions.
     pub system: String,
@@ -122,6 +248,41 @@ pub struct CompletionRequest {
     pub user: String,
     /// Tools the model may call.
     pub tools: Vec<ToolSpec>,
+    /// Images the model should see alongside `user`.
+    ///
+    /// A provider that does not accept images refuses a request carrying any,
+    /// before the body is built and before anything is spent — see
+    /// `ensure_media_accepted`. Media is never silently dropped: a run that
+    /// paid for an answer about an image the model never received is the failure
+    /// this field exists to make impossible.
+    #[cfg(feature = "media")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub media: Vec<Media>,
+}
+
+/// Refuse a request carrying media that `provider` does not accept.
+///
+/// Called by the run loop before every completion, so the boundary covers an
+/// out-of-tree [`Provider`] as well as the three built in — and called again
+/// inside each built-in provider, so reaching one directly cannot bypass it.
+///
+/// This is an [`Error::Config`] rather than a provider error because nothing
+/// went wrong on the wire: a text-only provider was paired with an image, which
+/// is a decision the caller made and can fix.
+#[cfg(feature = "media")]
+pub(crate) fn ensure_media_accepted(
+    name: &str,
+    accepts: bool,
+    request: &CompletionRequest,
+) -> Result<()> {
+    if request.media.is_empty() || accepts {
+        return Ok(());
+    }
+    Err(Error::Config(format!(
+        "provider {name:?} does not accept image input, and the request carries {} image(s); \
+         no request was sent",
+        request.media.len()
+    )))
 }
 
 /// A tool call the model decided to make.
@@ -177,6 +338,22 @@ pub trait Provider {
     /// compiling; the built-in providers override it.
     fn name(&self) -> &str {
         "provider"
+    }
+
+    /// Whether this provider's model accepts image input.
+    ///
+    /// Defaults to `false`, and the default is the point: an implementation
+    /// written before 0.15.0 keeps compiling *and* inherits a refusal rather
+    /// than a silent drop. A run that spent money on a confident answer about an
+    /// image the model never received is the failure this governs, and it is
+    /// invisible from the outside — the response looks exactly like success.
+    ///
+    /// The three built-in providers override it to `true`. Whether the specific
+    /// *model* configured behind them accepts images is the vendor's business
+    /// and not knowable here; this reports what the API accepts.
+    #[cfg(feature = "media")]
+    fn accepts_images(&self) -> bool {
+        false
     }
 
     /// The URL this provider dials, if it dials one.
@@ -287,11 +464,13 @@ mod failures {
         format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{events}")
     }
 
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
     fn request() -> CompletionRequest {
         CompletionRequest {
             system: "s".into(),
             user: "u".into(),
             tools: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -517,5 +696,132 @@ mod failures {
                 );
             }
         }
+    }
+}
+
+/// The media boundary: what may be constructed, and who may receive it.
+#[cfg(all(test, feature = "media"))]
+mod media_tests {
+    use super::*;
+
+    /// A one-pixel PNG. Small enough to inline, real enough that the encoding
+    /// under test is encoding an image rather than a string.
+    const PNG: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52,
+    ];
+
+    struct Blind;
+    impl Provider for Blind {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse> {
+            unreachable!("the refusal must happen before the request is sent")
+        }
+        fn name(&self) -> &str {
+            "blind"
+        }
+        // Note: no `accepts_images` override. Inheriting the default is the
+        // point — a provider written before 0.15.0 refuses rather than drops.
+    }
+
+    struct Seeing;
+    impl Provider for Seeing {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse> {
+            Ok(CompletionResponse::default())
+        }
+        fn name(&self) -> &str {
+            "seeing"
+        }
+        fn accepts_images(&self) -> bool {
+            true
+        }
+    }
+
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn with_image() -> CompletionRequest {
+        CompletionRequest {
+            user: "what is in this picture".into(),
+            media: vec![Media::image("image/png", PNG).unwrap()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_unsupported_media_type_is_refused_at_construction() {
+        let err = Media::image("image/tiff", PNG).unwrap_err();
+        assert!(
+            matches!(&err, Error::Config(m) if m.contains("image/tiff")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn every_documented_image_type_is_accepted() {
+        // The negative control for the test above: the refusal is about the type
+        // being outside the set, not about construction failing in general.
+        for t in IMAGE_MEDIA_TYPES {
+            assert!(Media::image(t, PNG).is_ok(), "{t} should be constructible");
+        }
+    }
+
+    #[test]
+    fn a_provider_that_does_not_accept_images_refuses_before_the_request_is_sent() {
+        // `Blind::complete` is `unreachable!`, so reaching the provider at all
+        // fails this test rather than passing it quietly.
+        let err =
+            ensure_media_accepted("blind", Blind.accepts_images(), &with_image()).unwrap_err();
+        let Error::Config(message) = &err else {
+            panic!("expected a configuration error, got {err:?}");
+        };
+        assert!(message.contains("does not accept image input"), "{message}");
+        assert!(
+            message.contains("no request was sent"),
+            "the caller must be told nothing was spent: {message}"
+        );
+    }
+
+    #[test]
+    fn a_provider_that_accepts_images_is_not_refused() {
+        // The negative control. Without it the test above would pass against an
+        // implementation that refused every request carrying media.
+        assert!(ensure_media_accepted("seeing", Seeing.accepts_images(), &with_image()).is_ok());
+    }
+
+    #[test]
+    fn a_text_only_request_is_never_refused_even_by_a_blind_provider() {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let text_only = CompletionRequest {
+            user: "no picture here".into(),
+            ..Default::default()
+        };
+        assert!(ensure_media_accepted("blind", Blind.accepts_images(), &text_only).is_ok());
+    }
+
+    #[test]
+    fn byte_len_reports_the_decoded_size_not_the_encoded_one() {
+        let m = Media::image("image/png", PNG).unwrap();
+        assert_eq!(m.byte_len(), PNG.len());
+        assert!(m.base64.len() > PNG.len(), "base64 grows the payload");
+    }
+
+    #[test]
+    fn the_digest_distinguishes_images_and_is_stable() {
+        let a = Media::image("image/png", PNG).unwrap();
+        let b = Media::image("image/png", PNG).unwrap();
+        let c = Media::image("image/png", &[0xff, 0x00]).unwrap();
+        assert_eq!(a.digest(), b.digest(), "same bytes, same digest");
+        assert_ne!(a.digest(), c.digest(), "different bytes, different digest");
+        assert_eq!(a.digest().len(), 16);
+    }
+
+    #[test]
+    fn a_path_maps_to_the_media_type_its_extension_names() {
+        assert_eq!(Media::media_type_for("shot.PNG"), Some("image/png"));
+        assert_eq!(Media::media_type_for("a/b/photo.jpeg"), Some("image/jpeg"));
+        assert_eq!(Media::media_type_for("scan.webp"), Some("image/webp"));
+        // Not an image, and not guessed at: a `.pdf` is a document and a
+        // `.mp4` is video, which this release does not carry at all.
+        assert_eq!(Media::media_type_for("report.pdf"), None);
+        assert_eq!(Media::media_type_for("clip.mp4"), None);
+        assert_eq!(Media::media_type_for("noextension"), None);
     }
 }

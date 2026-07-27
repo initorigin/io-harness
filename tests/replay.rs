@@ -131,14 +131,17 @@ impl Provider for Dialer {
     }
 }
 
+#[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
 fn req(user: &str) -> CompletionRequest {
     CompletionRequest {
         system: "you are an agent".into(),
         user: user.into(),
         tools: Vec::new(),
+        ..Default::default()
     }
 }
 
+#[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
 fn text(t: &str) -> CompletionResponse {
     CompletionResponse {
         text: Some(t.into()),
@@ -443,6 +446,7 @@ fn a_recording_from_another_series_is_refused() {
 /// own history, not just a hand-built one. The read is of a file the run never
 /// edits, which is what keeps the second run's prompts identical to the first's.
 #[tokio::test]
+#[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
 async fn a_real_run_replays_from_its_recording_without_a_provider() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();

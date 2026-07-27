@@ -1,0 +1,753 @@
+product: io-harness
+version: 0.15.0
+status: released
+release_type: minor
+outcome:
+  user_can: >
+    A developer hands the agent an image, and the agent hands its work back as commits.
+
+    The image half: a caller attaches an image to the task and the model sees it, and the agent
+    itself can look at an image already in the workspace by naming its path. The provider says
+    whether it accepts images; one that does not refuses before the request is built, in the trace,
+    with nothing spent — an image is never quietly dropped on the way to a model that cannot read
+    it. `CompletionRequest` today is `{ system: String, user: String, tools }`
+    (src/provider/mod.rs:118) — three flat fields, no content parts and no history — so this is the
+    first time anything but text reaches a provider, and `src/mcp.rs:453` still discards non-text
+    MCP content behind a comment that says media is 0.11. That comment is retired here.
+
+    The git half: the agent reads the repository's history, sees what has changed, stages the files
+    it names, and commits — so a run that edited four files ends as one reviewable commit on the
+    current branch instead of a working tree someone has to reconstruct.
+
+    The shape of the git half is the release's real subject, and it follows from shelling out to the
+    `git` binary rather than binding a library. `ExecGuard::check` (src/verify.rs:248) checks the
+    program name and nothing else: argv is recorded into the trace and never enforced. So
+    `Act::Exec("git")` is not a boundary — it cannot distinguish `git log` from `git push --force`
+    or `git reset --hard`, and shipping git as an exec allowlist entry would hand the model the
+    whole binary under a rule that reads like a restriction. Git therefore ships the way documents
+    shipped in 0.14.0: named built-ins, dispatched in the same `match` as `read_file` and
+    `write_file`, each constructing its own complete argv. The model names paths; it never supplies
+    arguments. `push`, `fetch`, `clone`, `reset`, `checkout` and `rebase` are absent from the
+    reachable surface by construction, not by an exclusion list that a later arm could forget.
+
+    Two consequences of that are load-bearing rather than incidental. A path the model names must
+    not be able to become a flag — `--upload-pack=…` is a path-shaped string — so every pathspec
+    goes after `--` and a leading `-` is rejected. And `git commit` runs `.git/hooks/pre-commit`,
+    which is arbitrary code carried by the repository the agent was pointed at; hooks are disabled
+    on every invocation, because a capability that executes the workspace's own scripts is not
+    covered by any policy this crate has.
+
+    The path policy governs git on the paths git touches, not on the word `git`. Staging a file
+    copies its bytes into the object store, so `git_add` requires `Act::Read` on each path it
+    stages and a path denied for reading cannot be committed; `git_commit` requires `Act::Write` on
+    the repository. That is the same gate `read_file` uses, reached the same way.
+
+    Riding along by the owner's decision: the 0.13.0 resume-from-stored-policy gap gets its entry
+    point, because this is the first release in which a crashed run may have already taken an
+    irreversible action under a policy it can no longer name; and 0.14.0's `fill_form` generates
+    real appearance streams instead of asking the viewer to.
+  business_value: >
+    0.14.0 opened the breadth half of the roadmap with documents. This release finishes the two
+    things an agent that does someone's work is assumed to have and this one does not: it can see,
+    and it leaves a trail someone can review.
+
+    The git half is worth more than the feature it names. Every run today ends as a modified working
+    tree — the operator's only record of what an unattended agent did is the trace and a diff they
+    have to take themselves. Ending a run as commits makes the output reviewable with the tool
+    every consumer already uses, and it is the missing half of the pitch that an unattended agent is
+    safe to leave running: safe to leave running is worth little if what it produced cannot be read
+    back.
+
+    Doing it as built-ins rather than as an exec allowlist entry is the same argument 0.14.0 made
+    for documents, and it is sharper here. A consumer can wire git up today: register a `Tool` that
+    shells out, or point an MCP server at the repository. Both routes authorise on a name, and
+    src/verify.rs:248 shows what that buys — argv traced, never checked. io-cli and io-studio are
+    both being built now, and the version of this capability they would each write is one where
+    `git` allowed once is `git push --force` allowed. Shipping it once, in the crate that owns the
+    permission model, with a fixed argv per operation, is the difference between git being a
+    governed capability and git being the hole every consumer independently opens.
+
+    The image half is smaller in code and larger in reach: it is the first non-text thing to cross
+    the provider boundary, and the type it adds — a media part on `CompletionRequest`, a capability
+    declaration on `Provider` — is the shape anything later needs.
+
+    Cutting video is the other half of the value, and it was decided on evidence rather than on
+    appetite. Anthropic's Messages API and OpenAI's Chat Completions API both accept images and no
+    video. OpenRouter has a `video_url` part and says support varies by model, with no way to ask
+    which. The roadmap's promise — "any provider whose model accepts them" — resolves to one
+    provider out of three and an unanswerable question, so it is cut from the roadmap outright
+    rather than shipped as a feature that works when it happens to.
+  evidence_of_value: >
+    For the image boundary, the same pair 0.14.0 established: an agent under a policy denying
+    `private/**`, asked to look at `private/badge.png`, is refused on the real path with the rule
+    that refused it in the trace — and its negative control, the identical run under a permissive
+    policy, which sees the image. Without the second the first proves only that something failed.
+
+    For the provider boundary: a provider that does not accept images refuses the request before it
+    is built, with nothing sent and nothing spent, and the control is the same image on a provider
+    that does. The failure mode this exists to prevent is the quiet one — a run that costs money,
+    returns a confident answer about an image the model never received, and looks like a success.
+
+    For the git boundary, which is the release's subject: the reachable surface is asserted, not
+    described. A test over the argv every built-in constructs shows that no reachable invocation
+    contains `push`, `fetch`, `clone`, `remote`, `reset`, `checkout`, `rebase` or `--force`, and
+    that a model-supplied path is passed after `--` and cannot be read as a flag. A path beginning
+    with `-` is refused rather than escaped. That test is the boundary; the prose above is only its
+    description.
+
+    For hooks: a repository carrying a `.git/hooks/pre-commit` that writes a sentinel file is
+    committed to, and the sentinel does not appear. The control is the same hook firing under a
+    plain `git commit`, so the test measures suppression rather than a hook that never ran.
+
+    For the path policy over git: staging a file the policy denies for reading is refused and the
+    file is absent from the index afterwards, with the permissive control staging it. A denied file
+    that reaches a commit is the git half's version of 0.14.0's worst case.
+
+    For the irreversible action, which is what 0.7.0 exists for: a run killed between the commit and
+    its checkpoint, resumed, produces exactly one commit. Two commits would be the crate breaking
+    its own oldest durability promise in the first release that can actually take an irreversible
+    action.
+
+    And one live run against a real provider: an agent given an image and a repository, asked for
+    something stated in business terms, that ends with a commit a human can read — the image reaching
+    the model proven by the model reporting something about the image it had no other way to know.
+scope:
+  included:
+  - >
+    A media part on the provider boundary. `CompletionRequest` gains a `media` field carrying image
+    bytes with their media type; `Provider` gains a capability declaration whose default is that
+    images are not accepted, so an out-of-tree provider implementation inherits a refusal rather
+    than a silent drop. Both are additive: src/provider/mod.rs:150 already states that
+    `CompletionRequest` is constructed with `..Default::default()` because fields are added in minor
+    releases, and this is the release that does it.
+  - >
+    Wire encoding per provider, against each one's documented shape: Anthropic's base64 image
+    content block (src/provider/anthropic.rs:100), and the `image_url` data-URL part in
+    src/provider/openai_wire.rs:38, which both the OpenAI and OpenRouter providers share. The
+    fallback, record and replay providers forward media without inspecting it; the request-shape
+    change invalidates 0.14.x recordings, which the existing `series()` gate (src/provider/record.rs:100)
+    already refuses across a minor bump rather than replaying from the wrong shape.
+  - >
+    Two ways an image gets in. The caller attaches one to the task through a new named entry point —
+    a separate function, not a parameter added to the existing seven, per the convention stated at
+    src/lib.rs:271. And the agent attaches one itself, by naming a workspace path, through a built-in
+    gated on `Act::Read` against that path. The second is the one that needs the gate: it is the
+    model choosing which of the user's files to send to a third party.
+  - >
+    MCP image content passthrough, retiring the stale comment at src/mcp.rs:453 that drops non-text
+    content because "media is 0.11". An MCP tool that returns an image now returns an image.
+  - >
+    Byte bounds on media, in three places: what may enter a request, what is written to the trace,
+    and what the 0.10.0 context assembler counts. The trace records a digest, a size and a media
+    type — not the bytes. A rusqlite store that grows by megabytes per screenshot is a failure mode
+    that only appears in the runs this crate is built for, the long unattended ones.
+  - >
+    Git as named built-ins, dispatched in the same `match` as `read_file` and `write_file`
+    (src/run.rs:2804), each gated on the path it touches: read history, show working-tree status,
+    show a diff, stage named paths, and commit. Each constructs its own complete argv. The model
+    supplies paths and a commit message; it never supplies arguments, subcommands or flags.
+  - >
+    A first-party gated spawner for a fixed argv. `ExecGuard::exec` is private and reachable only by
+    `compile_source` with an rustc argv (src/verify.rs:679), so there is no way for a built-in to run
+    a binary under policy today. This adds one, and it enforces the whole argv rather than the
+    program name — the weakness at src/verify.rs:248 is not extended to a new caller. The full argv,
+    exit status and a bounded slice of output go to the trace.
+  - >
+    Argument-injection defence as a scope item rather than a review note. Every model-named path is
+    passed after a `--` separator; a path beginning with `-` is refused rather than escaped or
+    quoted; the commit message goes through a mechanism that cannot become an argument. This is the
+    thing most likely to be got wrong quietly, so it is asserted by test rather than asserted by
+    prose.
+  - >
+    Hook suppression on every invocation. `.git/hooks/*` is arbitrary code carried by the repository
+    the agent was pointed at, and nothing in this crate's permission model covers it. Git also runs
+    under a fixed environment — no pager, a stable locale for parseable output, and no system or
+    global config injecting behaviour the harness did not choose.
+  - >
+    Machine-readable output rather than parsed human output: the porcelain and format flags git
+    guarantees across versions, NUL-separated where paths are involved, so a path with a space or a
+    newline in it does not become two paths.
+  - >
+    Commit idempotency across 0.7.0 durable resume. A commit is an irreversible action, and it is
+    the first one the crate can actually take; a run killed between the commit and its checkpoint
+    resumes without taking it twice.
+  - >
+    Clean degradation when `git` is not on the machine. The capability is absent and says so — one
+    error the model can read and adapt to, the same treatment a malformed regex gets from `grep` —
+    rather than a panic or a run failure.
+  - >
+    Resume from the stored policy: a new named entry point that recovers the policy a run was
+    started under instead of requiring the caller to pass one. Carried from 0.13.0 by the owner's
+    decision, and it belongs here rather than anywhere else — this is the first release in which a
+    crashed run may already have committed under a policy the resuming caller cannot reconstruct.
+  - >
+    `fill_form` generates real appearance streams. Carried from 0.14.0 by the owner's decision.
+    Today it sets `/V`, sets `/NeedAppearances` and deletes the stale `/AP`, which is a request that
+    the viewer redraw the field; a viewer that ignores it shows the field blank. Generating the
+    appearance stream needs no new dependency — `lopdf` is already in the tree — and no
+    rasterisation, so it stays inside N3.
+  - >
+    Feature gating that holds the default build exactly where it is. The image half sits behind a
+    feature because it needs `base64` as a direct dependency; the git half needs no new crate at all,
+    which is the one clear dividend of shelling out.
+  - >
+    Documentation at the call site of what each capability does not do: images only and no video or
+    audio, git is local-only with a fixed reachable surface, git needs the binary, and a commit is
+    made on the current branch.
+  excluded:
+  - >
+    Video, entirely — and off the roadmap, not deferred. The owner cut it on 2026-07-27 and no
+    planned release schedules it. The evidence independently supported cutting it: the Anthropic
+    Messages API and the OpenAI Chat Completions API both accept images and no video, and
+    OpenRouter, the only one of the three with a `video_url` content part, states that support
+    varies by model and offers no way to ask which. The roadmap's "any provider whose model accepts
+    them" would have resolved to one provider out of three and an unanswerable question. If it
+    returns it is a new entry argued on its own merits.
+  - >
+    Audio. Never on the roadmap, and named here only because it is the obvious next thing to assume
+    present once images work. Anthropic's Messages API does not accept it at all.
+  - >
+    OCR, still, and still off the roadmap. Naming it again because this is the image release and
+    that is exactly the argument for folding it in. It needs a system package on every runner or an
+    MSRV above this crate's floor plus a model download at runtime.
+  - >
+    Every networked git operation: `push`, `fetch`, `pull`, `clone`, and anything touching a remote.
+    Not merely unreachable — not built. A commit is reviewable locally, and the moment the agent can
+    push, a run's output is on someone else's server before a human has read it.
+  - >
+    Every destructive or history-rewriting git operation: `reset`, `checkout` that discards work,
+    `rebase`, `revert`, `filter-branch`, `stash` and any `--force`. The agent commits its own work;
+    it does not undo anyone else's.
+  - >
+    Branching, merging and tagging. Commits land on the branch that is checked out. Branch creation
+    is defensible and merge is not, and drawing the line at "no ref manipulation" is a line that can
+    be tested; "some ref manipulation" is not. A caller who wants the agent on its own branch checks
+    one out before starting the run.
+  - >
+    Raw git argument passthrough in any form — no built-in that takes a subcommand, an argv, a flag
+    string or an option map from the model. It would defeat the whole design in one arm, and it is
+    the shortcut that will look reasonable during development.
+  - >
+    Any change to how registered `Tool` implementations or MCP servers are authorised. The documented
+    bound stays as it is. This release does not weaken it, extend it, or rely on it.
+  - >
+    Extending `ExecGuard` to enforce argv. It is verification's exec path and rustc is its only
+    caller; fixing it there is a separate change to a separate surface, and doing it under cover of
+    a git release would put a change to the verification gate in a release nobody reads for that.
+    The new spawner enforces its own argv, so the weakness is not extended.
+  - >
+    The README structural rewrite and the `docs/` guide pages. That is 0.16.0.
+  - >
+    The Windows Job Object, still deferred, still needing `windows-sys` under
+    `[target.'cfg(windows)'.dependencies]` and its own release.
+  - >
+    Binary document fixtures, and the `catch_unwind` guard in `pdf::read_text` being a no-op under
+    `panic = "abort"`. Both carried forward again, both recorded as known limitations, neither
+    related to this release's subject.
+  fallback_scope:
+  - >
+    Images end to end, and git read-stage-commit. That is: the media part on the provider boundary
+    with the capability declaration and its refusal, both ways an image gets in, the wire encoding
+    for all three providers, the gated fixed-argv spawner, the five git built-ins with their path
+    gates, the argv and hook defences, and commit idempotency across resume.
+
+    What falls away is the three additions that are not the outcome: MCP image passthrough, the
+    resume-from-stored-policy entry point, and `fill_form`'s appearance streams. Each is severable
+    and none of them changes what a user can do at the end of the release.
+
+    Nothing in the first list is cuttable. The argv defence, the hook suppression and the path gates
+    are not hardening applied to the git capability — without them the capability is a model with a
+    shell, which is the one outcome worse than not shipping it.
+acceptance:
+  functional:
+  - >
+    F1 — an agent-chosen image read is refused by the path policy on the path it targets. Under a
+    policy denying `private/**`, asked to look at `private/badge.png`, the run is refused; no image
+    reaches any request; the refusal is in the trace with the act, the real path, and the rule.
+  - >
+    F2 — the negative control for F1. The identical run under a permissive policy attaches the image
+    and the request carries it, so F1 measures the boundary rather than a read that would have
+    failed anyway.
+  - >
+    F3 — a provider that does not accept images refuses a request carrying one before the request is
+    built: no HTTP call, no spend, an error the caller can act on, and the refusal in the trace. The
+    control is the same media on a provider that does accept images, which sends it. The default for
+    the capability declaration is "does not accept", so an out-of-tree provider inherits F3 rather
+    than a silent drop.
+  - >
+    F4 — the wire shape matches each provider's documented format: an Anthropic base64 image content
+    block, and an `image_url` data URL for the OpenAI and OpenRouter bodies. Asserted against the
+    serialised body, not against a helper's return value.
+  - >
+    F5 — media is bounded at three boundaries. An image over the cap is refused with a clear error
+    rather than truncated into an invalid one; the trace holds a digest, a size and a media type
+    rather than the bytes; and the 0.10.0 context accounting sees the attachment rather than
+    ignoring it because it is not text.
+  - >
+    F6 — the reachable git surface is fixed, asserted over the argv every built-in constructs. No
+    reachable invocation contains `push`, `fetch`, `clone`, `remote`, `reset`, `checkout`, `rebase`,
+    `stash`, `filter-branch` or `--force`. This is a test over the argv builders, so a later arm that
+    adds one fails the suite rather than shipping.
+  - >
+    F7 — a model-named path cannot become an argument. Pathspecs are passed after `--`; a path
+    beginning with `-` is refused rather than escaped; a path containing spaces, quotes, a newline or
+    a shell metacharacter is staged as that exact path and nothing is interpreted. Asserted for a
+    path literally named `--upload-pack=x`, which is a valid filename and a live flag.
+  - >
+    F8 — repository hooks do not run. A repository carrying a `.git/hooks/pre-commit` that writes a
+    sentinel file is committed to and the sentinel is absent afterwards. The control is that the same
+    hook does fire under a plain `git commit`, so the test measures suppression and not a hook that
+    was never executable.
+  - >
+    F9 — the path policy governs staging. `git_add` of a path the policy denies for reading is
+    refused, and the file is absent from the index afterwards — not merely unreported. The control is
+    the same stage under a permissive policy, which succeeds and appears in the index.
+  - >
+    F10 — a commit is not taken twice. A run killed between the commit and its checkpoint, then
+    resumed, leaves exactly one commit with one parent, and the aggregate budget is not
+    double-charged for the step.
+  - >
+    F11 — no git binary is a clean absence. On a machine without `git`, the capability reports itself
+    unavailable as an observation the model can read and adapt to, and the run continues; it does not
+    panic and does not fail the run. The control is the same run where git is present.
+  - >
+    F12 — the end-to-end outcome. An agent edits several files and commits them; afterwards the log
+    shows one commit with the message it was asked for and exactly the files it staged, the working
+    tree is clean of those changes, and a file the agent did not stage is still uncommitted.
+  - >
+    F13 — resume from the stored policy. A run started under a restrictive policy and killed is
+    resumed through the new entry point without the caller passing a policy, and the action the
+    original policy denied is still refused. The control is the same resume of a run started
+    permissive, which is allowed — so the test shows the policy was recovered rather than that
+    everything is denied on resume.
+  - >
+    F14 — `fill_form` generates an appearance stream. A filled field carries an `/AP` normal
+    appearance whose content stream contains the value, rather than only `/V` and a
+    `/NeedAppearances` request to the viewer. The control: filling a field with an empty value leaves
+    no stale appearance behind claiming the old one.
+  - >
+    F15 — an MCP tool returning image content passes it through to the model instead of returning
+    "(no text content)", and the comment at src/mcp.rs:453 that promises this for 0.11 is gone rather
+    than re-dated.
+  non_functional:
+  - >
+    N1 — the default build is unchanged. `cargo tree` for a default `cargo build` is asserted at 401
+    lines, identical to 0.13.0 and 0.14.0. The image half is behind a feature because it adds
+    `base64` as a direct dependency; the git half adds no crate at all.
+  - >
+    N2 — the msrv leg passes at the declared 1.88 floor with every feature enabled. If the floor
+    moves it moves deliberately, is stated in `Cargo.toml` and the CHANGELOG, and is not discovered
+    by a red CI run.
+  - >
+    N3 — no system package installed on any of the three runners. `git` is preinstalled on
+    ubuntu-latest, macos-latest and windows-latest, so this is satisfied by asserting its presence in
+    CI rather than by installing it. A consumer without git gets F11's clean absence, not a build
+    failure — git is a runtime capability, never a build dependency.
+  - >
+    N4 — five-leg CI green with the git tests running on all three OSes. This is load-bearing rather
+    than routine: `core.autocrlf` defaults differently on Windows, path separators differ, and a
+    file-mode change is a diff on one platform and not on another. A Linux-only pass would not be
+    evidence.
+  - >
+    N5 — additive only. No public item renamed or removed, captured as a public-surface diff by the
+    method recorded in 0.13.0's evidence. `CompletionRequest` gains a field, which is what
+    src/provider/mod.rs:150 says minor releases do, and the migration note for callers who construct
+    it without `..Default::default()` is written rather than left to a compile error.
+  - >
+    N6 — 0.14.x provider recordings are refused rather than replayed against the new request shape.
+    The `series()` gate at src/provider/record.rs:100 should already do this across a minor bump;
+    the release asserts it rather than assuming it.
+  - >
+    N7 — git output parsing is version-stable. The porcelain and format flags used are ones git
+    guarantees across versions, output is NUL-separated wherever paths appear, and the assertion runs
+    against whatever git version each runner ships rather than against a pinned one.
+  operational:
+  - >
+    O1 — each capability's doc comment states its limits where a caller meets them: images only, no
+    video and no audio; git is local-only with a reachable surface that is fixed and enumerated; git
+    requires the binary at runtime; commits land on the current branch; hooks do not run, and that
+    this is deliberate.
+  - >
+    O2 — the CHANGELOG says video was cut from the roadmap and why, with the provider evidence. A
+    reader who remembers the roadmap promised it should find the reason in the release notes rather
+    than infer an oversight.
+  - >
+    O3 — the media feature is discoverable: named in the README and the crate docs with the one line
+    a consumer needs to enable it.
+  - >
+    O4 — the live-run transcript, the public-surface diff, the default-dependency-tree comparison and
+    the git argv audit are stored under `evidence/0.15.0/`.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io, plus the three-OS GitHub Actions matrix (ubuntu-latest, macos-latest, windows-latest)
+    with the msrv and lint jobs.
+  deployment_method: >
+    The initorigin release flow with the owner's 2026-07-26 override in effect: all work including
+    the sealed completion record on `feat/0.15.0`, PR to `develop`, release PR `develop` to `main`, a
+    GitHub Release titled `io-harness 0.15.0` with notes taken verbatim from the CHANGELOG, then
+    `cargo publish` last.
+  migrations:
+  - >
+    No schema change is expected. If one proves necessary it is additive only: `CREATE TABLE IF NOT
+    EXISTS` in `Store::from_conn`, `CHECKPOINT_FORMAT` left at 7, no existing table reshaped.
+  - >
+    `CompletionRequest` gains a field. A caller constructing it with `..Default::default()`, which is
+    what src/provider/mod.rs:150 tells them to do, is unaffected; a caller using an exhaustive struct
+    literal gets a compile error and a one-line fix. This is called out in the CHANGELOG rather than
+    left to be discovered.
+  - >
+    Provider recordings taken against 0.14.x are refused by the existing series gate and must be
+    re-recorded. That is the designed behaviour, not a regression, and it is stated.
+  - >
+    A consumer upgrades by changing the version. The default build is unchanged; images are opt-in
+    behind the feature, and git is inert until a run enables the tools and the policy allows the
+    paths.
+  observability:
+  - >
+    Git actions appear in the existing trace and event surfaces as what they are: the full argv, the
+    exit status, a bounded slice of output, and the path gate decision on each path — so an operator
+    auditing a run sees which files were staged and which were refused, not an opaque tool call.
+  - >
+    Media appears in the trace as a digest, a size and a media type, and in the event surface as an
+    attachment rather than as bytes. A run that sent an image is auditable without the store holding
+    the image.
+  rollback: >
+    `cargo yank --vers 0.15.0`, leaving 0.14.0 as what a fresh `cargo add` resolves to. A consumer
+    rolling back loses image passthrough, the git built-ins, the stored-policy resume entry point and
+    the appearance-stream fill; nothing in their store or their existing runs is affected, since the
+    release adds no schema and changes no existing behaviour. Commits an agent already made are
+    ordinary git history and are unaffected by yanking the crate that made them.
+dependencies:
+  products:
+  - >
+    io-cli and io-studio follow this release rather than constrain it. Either could shell out to git
+    from a registered `Tool` today; the argument for shipping it here is that theirs would authorise
+    on the name `git` and this one does not.
+  - >
+    io-eval does not exist yet, so no consumer is broken by the additions.
+  services:
+  - >
+    A provider API key for the live-run evidence only. Every functional criterion runs against local
+    fixtures and temporary repositories.
+  - >
+    GitHub Actions for the three-OS matrix, which is load-bearing here: line endings, path separators
+    and file-mode handling all differ, and all three reach git.
+  - >
+    The `git` binary at runtime on the machine running the agent. Preinstalled on all three runners
+    and on any machine with a repository to work in; absent is handled by F11 rather than by a
+    requirement.
+  human_approvals:
+  - >
+    None. The owner's 2026-07-26 override authorizes the PRs, both merges, the GitHub Release and
+    `cargo publish` without a review stop.
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    The gated spawner is new infrastructure, not a wrapper. Nothing in the crate runs a binary for
+    the model today, and the one exec path that exists is private, argv-blind and owned by
+    verification. Getting the trace, the refusal shape and the sandbox question right is most of the
+    git half's cost, and none of it is visible in the feature list.
+  - >
+    Argument injection and path quoting. The defence is small; being sure of it is not. Paths named
+    `--upload-pack=x`, paths with newlines, paths with quotes, and Windows paths all have to be
+    proven rather than assumed, and this is the failure mode that ships silently.
+  - >
+    Git behaviour differences across the three OSes: `core.autocrlf`, path separators, file-mode
+    bits, and case-insensitive filesystems that make two staged paths one. The tests are cheap and
+    the discovery is not.
+  - >
+    Commit idempotency across resume needs a durable marker taken in the right order relative to the
+    commit itself, which is the same reasoning 0.7.0 did for exec replay. It is a small amount of
+    code in a place where being wrong is invisible until a crash.
+  - >
+    The first non-text thing on the provider boundary touches three wire bodies, six provider
+    implementations, the replay key, the context accounting and the trace, none of them individually
+    hard and all of them at once.
+  - >
+    Appearance-stream generation in `fill_form` is PDF work in a release about neither PDFs nor
+    documents. It is bounded — build a content stream, register the font resource, set the bounding
+    box — but it is a context switch, and the reason F14 has a control is that "an `/AP` exists" is
+    easy to satisfy without the value being in it.
+  preferred_tools:
+  - '`gate` (src/run.rs:3416) and the document dispatch arms (src/run.rs:3197, :3237) as the template:
+    a git built-in should be indistinguishable from `xlsx_read` in how it is authorised, including
+    the refusal, the pause and the trace.'
+  - '`Workspace::read_bytes` / `write_bytes` (src/tools/workspace.rs:279, :295) and `check_path`
+    (:117) for anything touching workspace files, and `resolve` (:163) for its rejection of absolute
+    paths and its symlink safety — which is exactly the property a pathspec needs.'
+  - 'src/verify.rs:246-270 as the counter-example the new spawner must not copy: read it for the
+    trace and refusal shape, and note that it enforces `program` while recording argv.'
+  - 'The provider wire sites — src/provider/anthropic.rs:82-105 and src/provider/openai_wire.rs:18-44
+    — plus the Anthropic and OpenAI vision documentation for the exact content-part shapes.'
+  - rustc/cargo, clippy, rustfmt, `cargo tree` for the default-build assertion, and the three-OS
+    matrix via `gh run view`.
+  constraints:
+  - >
+    Git built-ins construct their own argv. The model supplies paths and a commit message and nothing
+    else — no subcommand, no flags, no option map, no escape hatch "for advanced use".
+  - >
+    The reachable surface is closed by construction and asserted by a test over the argv builders,
+    not by an exclusion list in prose.
+  - >
+    Every model-named path passes the same path gate `read_file` uses, on the real path, and goes
+    after `--`. A path beginning with `-` is refused.
+  - >
+    Repository hooks never run. Git runs under a fixed environment: no pager, stable locale, no
+    system or global config.
+  - >
+    `ExecGuard` is not extended to serve the new capability. The new spawner enforces its whole argv.
+  - >
+    No new crate for git. `base64` for the image half only, behind a feature; the default dependency
+    tree is asserted unchanged at 401 lines.
+  - >
+    No system package on any runner. `git` is a runtime capability that degrades cleanly when absent,
+    never a build dependency.
+  - >
+    Additive only: no public item renamed or removed, no existing behaviour changed, no schema
+    reshaped, `CHECKPOINT_FORMAT` stays 7. Every new capability is a new named function, not a
+    parameter added to an existing one (src/lib.rs:271).
+  - >
+    Every refusal test carries its negative control. A governance test that cannot fail proves
+    nothing, and this release has five separate boundaries.
+  - >
+    Minor semantics on a 0.x crate. The crate stays pre-1.0 and no 1.0.0 is planned or implied.
+risks:
+- >
+  A model-named path becomes a git argument. This is the release's worst failure mode: it converts a
+  path-scoped capability into arbitrary git, and it would ship looking like a working feature.
+  Mitigation: `--` separators and a leading-`-` refusal are scope items rather than review notes, F7
+  asserts them against a path literally named `--upload-pack=x`, and no built-in accepts anything but
+  paths and a message.
+- >
+  The reachable surface grows quietly. One arm added later that takes a subcommand, or a "pass extra
+  args" escape hatch added for a plausible reason, undoes the whole design without touching anything
+  the tests describe. Mitigation: F6 asserts over the argv builders themselves, so a new arm fails
+  the suite rather than passing unnoticed.
+- >
+  A repository's own hooks execute under the agent. Nothing in the permission model covers
+  `.git/hooks`, and a cloned repository is attacker-controlled content. Mitigation: hooks are
+  suppressed on every invocation, F8 has a control proving the hook would otherwise have fired, and
+  the fixed environment removes system and global config as a second injection route.
+- >
+  An image is silently dropped by a provider that cannot take one, and the run returns a confident
+  answer about something the model never saw. Mitigation: the capability declaration defaults to
+  refusal, F3 asserts the refusal happens before the request is built, and no code path drops media.
+- >
+  The commit is taken twice on resume, or the marker is written before the commit and it is never
+  taken at all. Mitigation: F10, and the ordering follows 0.7.0's exec-replay reasoning rather than
+  inventing a second scheme.
+- >
+  The trace or the context budget swallows image bytes, and the failure appears only in the long
+  unattended runs this crate exists for. Mitigation: F5 bounds all three boundaries explicitly, and
+  the trace stores a digest rather than the bytes.
+- >
+  Scope creep back toward video or OCR on the grounds that this is the media release. Mitigation:
+  video is cut from the roadmap outright rather than deferred, both exclusions carry their evidence,
+  and O2 requires the CHANGELOG to say so.
+open_questions:
+- >
+  Does git run inside the 0.6.0 sandbox or on the host? The sandbox's portable floor is an ephemeral
+  tempdir with network denied, and git's whole subject is the real workspace and the real `.git`, so
+  the floor as it stands would defeat it. Denying network for a binary that has no networked
+  subcommand reachable is redundant but cheap. Decide before the spawner is written, not after.
+- >
+  What identity authors the commit? `git commit` fails outright with no `user.email` configured, so
+  this cannot be left undecided: the repository's own config, a harness default identifying the
+  agent, or a value on the task contract. A commit attributed to a human who did not make it is the
+  wrong default, and a commit that fails on a fresh machine is the wrong other one.
+- >
+  Does `.git` sit inside the path policy's reach, and must a git-enabled run allow it explicitly? If
+  `deny_write(".git/**")` is a sensible default then commits need an explicit grant, which is
+  defensible but has to be stated rather than discovered. Settle it against `check_path`'s existing
+  behaviour before the gates are written.
+- >
+  Does `git_add` honour `.gitignore`, and can the agent stage an ignored file? Honouring it is the
+  expected behaviour and forcing past it is what `-f` exists for — which is not reachable here — but
+  the answer decides whether a refused stage reports "ignored" or "no such path", and the model has
+  to be able to tell those apart.
+- >
+  How does an image observation render in the 0.10.0 ledger, and what does compaction do with it?
+  Superseded text observations are compacted; an image cannot be summarised into a shorter image. A
+  digest and a caption is the obvious answer and it is a real choice, the same kind 0.14.0 settled
+  per document format.
+- >
+  One media feature or a split? A single feature is simpler to explain and the image half is small
+  enough that a split may be over-engineering, but `base64` is the only new crate and the pattern
+  0.14.0 set is umbrella-plus-per-format. Decide against what the tree actually looks like.
+released_at: 2026-07-27T21:30:00Z
+mode: published
+delivered: >
+  A developer hands the agent an image, and the agent hands its work back as commits. The caller
+  attaches images to the task with `TaskContract::with_images` and they ride every request; the agent
+  looks at one itself with `view_image`, gated on `Act::Read` against the path the model named.
+  `Provider::accepts_images` defaults to false, so a provider written before this release inherits a
+  refusal rather than a silent drop, and the refusal happens before the body is built and before
+  anything is spent. Anthropic gets a base64 image content block, the OpenAI-shaped body an
+  `image_url` data URL, and a request with no images still sends a bare content string. MCP tool
+  results carrying images pass through, retiring a comment that promised it for 0.11.
+
+  Five git built-ins — `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit` — each
+  constructing its own complete argv, so `push`, `fetch`, `clone`, `reset`, `checkout` and `rebase`
+  are unreachable by construction rather than excluded by a rule. The model supplies paths, a message
+  and a count, never a subcommand or a flag; every path goes after `--` and a leading `-` is refused.
+  Repository hooks do not run. `git_add` needs `Act::Read` on each path it stages, so a policy-denied
+  file cannot reach a commit, and `git_commit` needs `Act::Write` on `.git`.
+
+  Video is cut from the roadmap entirely rather than deferred, on the evidence that Anthropic and
+  OpenAI Chat Completions accept no video at all and OpenRouter says support varies by model with no
+  way to ask which. Carried over and closed: `resume_from_stored_policy`, and `fill_form` generating
+  real appearance streams.
+evidence:
+  tests:
+  - cargo test — 452 passing, 0 failing (default build)
+  - cargo test --features media — 478 passing, 0 failing
+  - cargo test --features documents — 503 passing, 0 failing
+  - >
+    tests/media.rs — 7 tests, every refusal with its control: a denied image refused on the real path
+    with the rule in the trace and the same image allowed under a permissive policy; a text-only
+    provider refused before it is reached (its `complete` is `unreachable!`, so reaching it fails the
+    test rather than passing it) and a seeing one receiving the image every step
+  - >
+    tests/git.rs — 9 tests. The hook test carries the control that makes it mean something: the same
+    fixture hook does fire under a plain `git commit`, so the absent sentinel proves suppression and
+    not an unexecutable hook. The denied-stage test asserts the file is absent from the index
+    afterwards, not merely unreported
+  - >
+    src/tools/git.rs — 11 tests holding the surface closed. `every_shape_covers_every_variant` fails
+    if a command variant is added without being covered, so a new capability cannot fall outside the
+    surface tests while they keep passing; `the_subcommand_is_always_one_of_the_five_this_crate_ships`
+    asserts on the subcommand rather than by scanning the whole argv, because the whole argv contains
+    model data and a path named `push` is a path
+  - >
+    src/provider/mod.rs — 8 media tests; src/provider/{anthropic,openai_wire}.rs — 5 wire tests
+    asserting the serialised body against each vendor's documented shape, each with the control that
+    a text-only request still sends a bare string
+  - >
+    src/mcp.rs — 11 tests with the feature on and the no-regression control passing in the default
+    build, where `render` returns exactly the string it returned in 0.14.0
+  - >
+    tests/policy.rs — 3 tests for resume-from-stored-policy: the recovered boundary still refuses,
+    the permissive control performs the write, and a run with no recorded policy is refused rather
+    than resumed permissively
+  - src/tools/documents/pdf.rs — 22 tests, the appearance stream asserted on decoded stream bytes
+    with an empty-value control proving no stale appearance survives
+  builds:
+  - cargo fmt --check — exit 0
+  - cargo clippy --all-targets -- -D warnings — exit 0
+  - cargo clippy --all-targets --features media -- -D warnings — exit 0
+  - cargo +1.88 build --all-targets --features media — exit 0, so the declared MSRV holds featured
+  - cargo doc --no-deps --features media — exit 0, 11 warnings, all predating this release
+  - cargo package --features media — io-harness-0.15.0.crate produced
+  - >
+    cargo tree — 401 lines, identical to 0.13.0 and 0.14.0. cargo tree --features media — 402 lines,
+    the one line being base64, already compiled in every build through reqwest. The git half adds no
+    line at all, which is the dividend of shelling out rather than binding git2 or gix
+  reviews:
+  - >
+    The git backend was chosen against the alternatives rather than by default. `gix` is pure Rust
+    but its own crate-status carries `[ ] add and remove entries`, so staging does not exist and this
+    release would have had to write the index layer gitoxide has not finished. `git2` works today but
+    puts libgit2's C in a crate that has been pure Rust since 0.1.0. The owner chose shelling out,
+    and that choice is what produced the release's actual subject: because `ExecGuard::check`
+    (src/verify.rs:248) enforces the program name and records argv without checking it, git could not
+    ship as an allow-list entry
+  - >
+    The contract cited src/provider/mod.rs:150 as already telling callers to construct
+    `CompletionRequest` with `..Default::default()`. That note is on `CompletionResponse`;
+    `CompletionRequest` had no `Default` derive at all. The citation was wrong, the substance was
+    not — N5 permits additive change and delivery.migrations already stated the compile error and its
+    one-line fix. Corrected in evidence/0.15.0/development_decisions.md rather than silently
+  - >
+    The live example proved nothing on its first run and the transcript says so. It gated on the file
+    the agent writes *before* committing, so the run ended satisfied one step early with no commit,
+    and the store sat inside the workspace leaving untracked files the agent could see. Both were
+    fixture defects and both were fixed rather than argued away
+  - >
+    A defect found by the MCP work and fixed in the owning file: `Media::byte_len` computed
+    `len/4*3 - pad`, which underflows and panics in a debug build on a malformed base64 payload. An
+    MCP server supplies its own base64 and is a trust boundary, so the arithmetic now saturates
+  deployments:
+  - 'crates.io — cargo publish, see known_limitations: sealed before the upload, per the repo''s
+    release order'
+  health_checks:
+  - >
+    Live run against OpenRouter, examples/media_git_live.rs — Success in 10 steps. The agent looked
+    at a 64x64 magenta PNG and wrote "magenta" into COLOUR.md; the colour appears nowhere in the
+    prompt, the goal, the file names or the criterion, and magenta rather than red or blue precisely
+    so a guess would not land on it — so the bytes reached the model. It then staged and committed
+    COLOUR.md with its own message ("Record swatch colour as magenta"), attributed to the contract's
+    identity rather than the machine's. Transcript at
+    evidence/0.15.0/live_run_0.15.0_media_git.txt
+  - >
+    Public surface diff at evidence/0.15.0/public_surface_diff.md — 420 items at v0.14.0, 442 now,
+    22 additions, zero removals. The document records what the method cannot see, which matters more
+    this release than last: three struct fields are invisible to a grep for `pub` items, and one of
+    them makes `CompletionRequest` source-breaking for an exhaustive struct literal
+known_limitations:
+- >
+  Commit idempotency across a resume rests on git's own semantics rather than on a durable marker
+  taken around the commit. A replayed `git_add` finds the file unmodified and stages nothing, so the
+  replayed `git_commit` finds nothing staged and makes no commit. It is asserted by a test that
+  replays the identical add-and-commit after a resume, and it holds — but the mechanism belongs to
+  git, not to this crate's checkpointing, and a future git built-in that is not naturally idempotent
+  would not inherit it.
+- >
+  `git_status` uses `--porcelain=v1` without `-z`, so its output is newline-separated. A path
+  containing a literal newline would be rendered ambiguously to the model. This is a display concern
+  and not a boundary one — the path gate and the argv builder both handle such a path correctly, and
+  a test asserts a path with a newline survives as one argv element — but the report the model reads
+  would be wrong about it.
+- >
+  `resume_from_stored_policy` covers the single-file and workspace loops. `resume_tree` has no
+  stored-policy form, so a crashed agent tree still requires the caller to supply the policy.
+- >
+  A viewed image rides exactly one request and is then dropped. That is deliberate — it is a tool
+  result, not a permanent part of the conversation — but a model that needs to look again spends
+  another step, and nothing tells it that in advance beyond the tool description.
+- >
+  The crate never decodes an image. The media type comes from the file extension and the bytes are
+  forwarded unparsed, so a corrupt file named `.png` reaches the vendor and comes back as an HTTP
+  400. Parsing it here would mean an image decoder in the default path of a crate that has one only
+  behind the barcode feature.
+- >
+  A run under a narrow write policy must allow `.git` or its commits are refused. The refusal is
+  correct and traced, but the only signal is the refusal itself; there is no earlier or clearer
+  error, and the requirement is documented rather than checked at configuration time.
+- >
+  Git is local only, by design: no push, fetch, clone or remote, and no branch, merge or tag either.
+  Commits land on the branch that is checked out. A caller who wants the agent on its own branch
+  checks one out before starting the run.
+- >
+  The live run used one provider, one model, one image and one repository. It exercises both halves
+  end to end under a permissive policy; the refusals and their controls are covered by tests rather
+  than by a live model.
+- >
+  `fill_form` now generates real appearance streams for text fields, which closes 0.14.0's weakest
+  claim at the level it can be closed without rasterising: the stream draws the value and the test
+  asserts on the decoded bytes. It has still never been opened in a real PDF viewer, because proving
+  that means Pdfium, which is a per-OS binary this release's no-system-package constraint forbids.
+  Checkboxes and radios keep their existing state-selection behaviour; choice fields are drawn as
+  plain text, single-line and left-aligned, and quadding, multiline and comb fields are not honoured.
+- >
+  MCP images are attached only when the tool did not report an error, on the grounds that an image
+  arriving with a failure is not something anyone asked to see. That is a judgement, and a server
+  that reports an error alongside a diagnostic screenshot loses the screenshot.
+- >
+  `CompletionRequest` gaining a field is source-breaking for a caller using an exhaustive struct
+  literal. Under 0.x that is a minor bump, which is what this is, and the type now derives `Default`
+  and documents `..Default::default()`, so this is the last time a field addition breaks it.
+- >
+  Carried forward again, all three unrelated to this release's subject: the Windows Job Object is
+  still unimplemented and still needs `windows-sys` under `[target.'cfg(windows)'.dependencies]` and
+  its own release; `pdf::read_text`'s `catch_unwind` guard is still a no-op under a `panic = "abort"`
+  profile; and the tree still carries no binary document fixtures written by a real application.
+- >
+  The record is sealed before the crates.io upload, which follows the develop->main merge and the
+  GitHub Release per the repo's release order. `mode: published` states the authorized target; the
+  flow makes it true.
+supersedes: 0.14.0
+next_recommended_version: 0.16.0
+immutable: true

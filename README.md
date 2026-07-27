@@ -19,8 +19,8 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
   the build fails inside that dependency rather than here.
 - **Status:** Pre-release (0.x), published on crates.io. Released through
   0.13.0; 0.12.0 closed the twelfth of the twelve pillars and all twelve still
-  hold. 0.14.0 (documents) is the release in progress. Per-release detail is in
-  [CHANGELOG.md](CHANGELOG.md).
+  hold. 0.15.0 (images and git) is the release in progress. Per-release detail
+  is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Capabilities
 
@@ -42,7 +42,8 @@ The shared engine every initorigin app (io-cli, io-studio) and io-eval build on.
 - Ephemeral local code-exec sandboxes — write, run, capture, destroy ✅ **v0.6** (OS-native + OS-neutral: macOS `sandbox-exec`, Linux namespaces, portable floor everywhere — on Windows the floor only, where the Job Object is designed but not implemented and just the wall clock is enforced)
 - Built-in tools — `write_file`, `read_file`, `grep`, `find` ✅ **v0.1**, **v0.3**; `read_skill` ✅ **v0.9**; `remember` ✅ **v0.10**; `spawn_agent` (in `run_tree` only) ✅ **v0.5**
 - Office and document tools ✅ **v0.14**, behind an opt-in `documents` feature: Excel read/generate/preserving-edit, Word read and generate, PowerPoint text read-only, PDF generate/extract/watermark/AcroForm form-fill, barcode and QR decode. OCR, PowerPoint authoring, barcode/QR generation, in-place Word edit, and document delete are **cut from the roadmap**, not deferred
-- Media and git — image and video passthrough when the model supports it; real repository work — 🚧 **planned v0.15**
+- Image passthrough ✅ **v0.15**, behind an opt-in `media` feature: the caller attaches images to the task and the agent can look at one in the workspace with `view_image`, gated on the real path. A provider that does not accept images refuses before anything is sent — media is never silently dropped. **Video is cut from the roadmap**, not deferred: Anthropic and OpenAI Chat Completions accept no video at all, and OpenRouter says support varies by model with no way to ask which. Audio and OCR are likewise off the roadmap
+- Git ✅ **v0.15**: `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, so a run ends as a reviewable commit. Each builds its own fixed argv — the model supplies paths and a message, never a subcommand or a flag — so push, fetch, clone, reset, checkout and rebase are unreachable by construction, and repository hooks do not run. No new dependency; `git` is a runtime capability that degrades cleanly when absent
 - Extensibility — MCP (rmcp) ✅ **v0.8** (client; stdio + streamable HTTP), in-process `Tool` implementations and skills ✅ **v0.9**
 
 See [docs/CAPABILITIES.md](docs/CAPABILITIES.md) for detail and
@@ -906,6 +907,51 @@ the window is configurable and can be disabled.
 **A retry is not a queue.** Honouring `Retry-After` is not the same as modelling a
 provider's rate limit, and nothing here tracks a provider's health across runs: a
 provider that failed the last run starts the next one trusted.
+
+## Images and git (v0.15)
+
+```toml
+io-harness = { version = "0.15", features = ["media"] }
+```
+
+`media` is what images need — its only dependency is `base64`, already in every
+build through `reqwest`, so the default dependency tree is unchanged. Git needs
+no feature and no dependency at all: it shells out to the `git` already on the
+machine.
+
+### Images
+
+The caller attaches them to the task with `TaskContract::with_images`, and they
+ride every request. The agent looks at one itself with `view_image`, which is
+gated on `Act::Read` against the path the model named — this is the model
+choosing which of the user's files to send to a third party, so it is authorised
+per call on the real path rather than once by tool name. A viewed image rides one
+request and is then dropped.
+
+`Provider::accepts_images` defaults to `false`, so a provider written before
+v0.15 inherits a refusal rather than a silent drop. The refusal happens before
+the request body is built and before anything is spent.
+
+### Git
+
+Five tools: `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`.
+
+The reachable surface is closed by construction rather than by an allow-list.
+The exec policy enforces a program *name* and records argv without checking it,
+so `Act::Exec("git")` cannot tell `git log` from `git push --force`; each
+built-in therefore constructs its own complete argv, and every model-supplied
+path is passed after `--` with a leading `-` refused outright.
+
+The path policy governs git on the paths git touches. Staging copies a file's
+bytes into the object store, so `git_add` requires `Act::Read` on each path it
+stages — a file the policy denies cannot reach a commit — and `git_commit`
+requires `Act::Write` on `.git`. **A run under a narrow write policy must allow
+`.git` or its commits are refused.**
+
+Commits are local: there is no push, no fetch, no branch switching and no history
+rewriting. Repository hooks do not run — `.git/hooks/*` is arbitrary code carried
+by the repository the agent was pointed at, and nothing in the permission model
+covers it.
 
 ## Documents (v0.14)
 

@@ -57,6 +57,12 @@ jobs:
       # text a reader hands back is compared against needles a test wrote — so a
       # Linux-only pass would not be evidence for the other two.
       - run: cargo test --features documents
+      # 0.15.0: `media` is its own optional feature, and the git built-ins are in
+      # the default build but need the binary. Git is preinstalled on all three
+      # runners — asserted rather than installed, because "no system package on
+      # any runner" is the constraint that removed OCR and it applies here too.
+      - run: git --version
+      - run: cargo test --features media
 
   # The MSRV is read from Cargo.toml rather than hardcoded, so the declared
   # rust-version and the version actually proven to build cannot drift apart.
@@ -80,6 +86,7 @@ jobs:
       # not only for the default build: an optional dependency raising the floor
       # would otherwise be invisible here and land on them.
       - run: cargo build --all-targets --features documents
+      - run: cargo build --all-targets --features media
 
   # Lints are platform-independent, so they run once instead of per-OS.
   lint:
@@ -102,3 +109,4 @@ jobs:
       # import behind `#[cfg(feature = ..)]` is only a warning in the build that
       # compiles it.
       - run: cargo clippy --all-targets --features documents -- -D warnings
+      - run: cargo clippy --all-targets --features media -- -D warnings

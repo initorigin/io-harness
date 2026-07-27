@@ -121,6 +121,16 @@ impl Replay {
 }
 
 impl Provider for Replay {
+    /// Always. A replay answers from a recording, and if the recorded request
+    /// carried an image then refusing it here would make a case unreplayable for
+    /// a reason that has nothing to do with the model. The request's media is
+    /// part of the key either way, so a media request cannot match a text-only
+    /// recording.
+    #[cfg(feature = "media")]
+    fn accepts_images(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let key = key(&request);
         let Some(answers) = self.answers.get(&key) else {

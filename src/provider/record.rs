@@ -165,6 +165,13 @@ impl<P: Provider> Record<P> {
 // is held across the inner call's await, so `&Record<P>` has to be `Send`, which
 // needs its fields `Sync`.
 impl<P: Provider + Sync> Provider for Record<P> {
+    /// Whatever it wraps. Recording changes what is stored, not what the model
+    /// can read.
+    #[cfg(feature = "media")]
+    fn accepts_images(&self) -> bool {
+        self.inner.accepts_images()
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         let response = self.inner.complete(request.clone()).await;
         if let Ok(response) = &response {

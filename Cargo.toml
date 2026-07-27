@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.14.0"
+version = "0.15.0"
 edition = "2021"
 # rmcp 2.2.0 sets the real floor: it uses let-chains, stabilised in 1.88, and
 # publishes no rust-version of its own — so cargo cannot catch it at resolve time
@@ -80,11 +80,19 @@ hyper-util = { version = "0.1.20", features = ["tokio", "service", "server"] }
 rmcp = { version = "2.2.0", default-features = false, features = ["server", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "sync"] }
 
+[dependencies.base64]
+# The image half only. Already compiled in every build as a transitive
+# dependency of reqwest, so enabling the feature costs a `cargo tree` line and
+# no build time; declaring it optional is what holds the default tree at 401.
+version = "0.22"
+optional = true
+
 [features]
 # The crate's first feature section (0.14.0). Per-format features so a consumer
 # who wants spreadsheets does not compile a PDF stack, and an umbrella so the
 # common case is one word.
 default = []
+media = ["dep:base64"]
 documents = ["xlsx", "docx", "pptx", "pdf", "barcode"]
 docx = ["dep:docx-rs"]
 pptx = ["dep:zip", "dep:quick-xml"]
@@ -99,3 +107,10 @@ xlsx = ["dep:calamine", "dep:rust_xlsxwriter", "dep:umya-spreadsheet"]
 [[example]]
 name = "documents_live"
 required-features = ["documents"]
+
+# 0.15.0's live run. `barcode` is here only for the `image` crate, which the
+# example uses to write its PNG fixture — the image capability itself never
+# decodes an image, it encodes and forwards one.
+[[example]]
+name = "media_git_live"
+required-features = ["media", "barcode"]
