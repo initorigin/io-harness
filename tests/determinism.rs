@@ -286,25 +286,22 @@ fn trace_with_result(result: &str) -> String {
     store.canonical_trace(run).unwrap()
 }
 
-/// A resume does NOT reproduce the uninterrupted run's prompts, and a replay is
-/// right to say so.
+/// A workspace replay survives an interruption, which through 0.12.0 it did not.
 ///
 /// This started as the criterion "an interrupted replay reproduces the
-/// uninterrupted one" and the test disproved it. The cause is not replay: the
-/// observation ledger the context assembler builds is in-memory
-/// (`ContextLedger::new()`, src/run.rs:1183 and :1758) and 0.7.0's resume does not
-/// restore it. A resumed run therefore re-assembles its context from the workspace
-/// rather than from what the first process had accumulated, and sends a prompt the
-/// recording never saw.
+/// uninterrupted one" and the test disproved it: the observation ledger the
+/// context assembler builds was in memory only, so a resumed run re-assembled its
+/// context from the workspace and sent a prompt the recording had never seen.
+/// 0.12.0 shipped the honest boundary instead — the replay refused rather than
+/// answering from the wrong recording — and recorded the cause in
+/// iterations/US-IO-HARNESS-0.12.0-I01. 0.13.0 makes the ledger durable, so the
+/// refusal is no longer reached here and the criterion holds as originally
+/// written.
 ///
-/// That is a real limitation of resume, older than this release and outside its
-/// scope to fix — checkpointing the ledger is context-assembly work. What matters
-/// here is the behaviour on the boundary: the replay reports the divergence as a
-/// typed, non-retryable error instead of quietly serving some other answer. A
-/// replay that guessed would produce a plausible trace that reproduced nothing,
-/// which is the failure mode this whole file exists to prevent.
+/// The refusal itself is not gone and must not be: a request that genuinely was
+/// never recorded still fails loudly. That is the test below this one.
 #[tokio::test]
-async fn a_resumed_replay_reports_divergence_rather_than_inventing_an_answer() {
+async fn a_workspace_replay_survives_being_interrupted_and_resumed() {
     let cassette = tempfile::tempdir().unwrap();
     let path = cassette.path().join("run.json");
 
@@ -326,57 +323,105 @@ async fn a_resumed_replay_reports_divergence_rather_than_inventing_an_answer() {
         provider.save(&path).unwrap();
     }
 
-    let dir = workspace();
-    let store = Store::memory().unwrap();
-    let provider = Replay::load(&path).unwrap();
-
-    let cut_short = contract(dir.path()).with_max_steps(1);
-    let first = run_with(&cut_short, &provider, &store, &open_policy(), &ApproveAll)
+    let straight = {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let p = Replay::load(&path).unwrap();
+        let r = run_with(
+            &contract(dir.path()),
+            &p,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
         .await
         .unwrap();
-    assert!(
-        matches!(first.outcome, RunOutcome::StepCapReached { .. }),
-        "the cap must stop it mid-task, not finish it: {first:?}"
-    );
+        store.canonical_trace(r.run_id).unwrap()
+    };
 
-    let resumed_provider = Replay::load(&path).unwrap();
-    // Resumed under the policy it was started with. The bare `resume` refuses a
-    // policy-bearing run outright as of 0.13.0, and that refusal is a different
-    // subject from this test's — here the run resumes and the *replay* is what
-    // must refuse.
-    let err = io_harness::resume_with(
-        &contract(dir.path()),
-        &resumed_provider,
-        &store,
-        first.run_id,
-        &open_policy(),
-        &ApproveAll,
-    )
-    .await
-    .expect_err(
-        "a resumed run assembles a prompt the recording never saw, so the replay          must refuse rather than answer",
-    );
+    let interrupted = {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let p = Replay::load(&path).unwrap();
 
-    let rendered = err.to_string();
-    assert!(
-        rendered.contains("diverged"),
-        "the error must name the divergence so it is debuggable, got: {rendered}"
+        let cut_short = contract(dir.path()).with_max_steps(1);
+        let first = run_with(&cut_short, &p, &store, &open_policy(), &ApproveAll)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first.outcome, RunOutcome::StepCapReached { .. }),
+            "the cap must stop it mid-task, not finish it: {first:?}"
+        );
+
+        // A fresh Replay: a real resume is a new process, which is the harder case.
+        let p2 = Replay::load(&path).unwrap();
+        let done = io_harness::resume_with(
+            &contract(dir.path()),
+            &p2,
+            &store,
+            first.run_id,
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await
+        .unwrap();
+        store.canonical_trace(done.run_id).unwrap()
+    };
+
+    assert_eq!(
+        straight, interrupted,
+        "a workspace replay must survive an interruption, not merely report that it could not"
     );
 }
 
-/// F10, for the loop where it actually holds: a single-file run interrupted and
-/// resumed DOES reproduce the uninterrupted replay.
-///
-/// The sibling test above shows a workspace run diverging across a resume. The
-/// cause is specific, not general: the workspace and sub-agent loops assemble each
-/// turn from an accumulating `ContextLedger` that lives only in memory, so a
-/// resume starts with an empty one. The single-file loop has no such ledger — its
-/// prompt is built from the file's current contents (`bound(&current, ...)`), which
-/// is on disk and survives the process.
-///
-/// So the limitation is "a resumed run whose prompt depends on accumulated
-/// observations", not "resume breaks replay". Worth pinning, because the narrower
-/// statement is the true one and the broad one would understate what works.
+/// The refusal 0.12.0 shipped is still the behaviour where it is still correct:
+/// a request the recording never saw fails loudly rather than being answered from
+/// the nearest thing on the cassette. The release removed the cause of the false
+/// refusals, not the refusal.
+#[tokio::test]
+async fn a_replay_still_refuses_a_request_that_was_never_recorded() {
+    let cassette = tempfile::tempdir().unwrap();
+    let path = cassette.path().join("run.json");
+
+    {
+        let dir = workspace();
+        let store = Store::memory().unwrap();
+        let provider = Record::new(Script {
+            at: AtomicUsize::new(0),
+        });
+        run_with(
+            &contract(dir.path()),
+            &provider,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await
+        .unwrap();
+        provider.save(&path).unwrap();
+    }
+
+    // A different goal is a different prompt, so nothing on the cassette answers it.
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let p = Replay::load(&path).unwrap();
+    let other = TaskContract::workspace(
+        "a goal the recording never saw",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "unreachable.txt".into(),
+            needle: "never".into(),
+        },
+    );
+    let err = run_with(&other, &p, &store, &open_policy(), &ApproveAll)
+        .await
+        .expect_err("an unrecorded request must refuse, not improvise");
+    assert!(
+        err.to_string().contains("diverged"),
+        "the error must name the divergence so it is debuggable, got: {err}"
+    );
+}
+
 #[tokio::test]
 async fn a_single_file_replay_does_survive_being_interrupted_and_resumed() {
     let cassette = tempfile::tempdir().unwrap();

@@ -8,8 +8,34 @@
 
 use rusqlite::Connection;
 
+use crate::context::{ObsKind, Observation};
 use crate::error::{Error, Result};
 use crate::policy::Policy;
+
+/// An observation kind as it is stored: the serde rendering, not
+/// [`ObsKind::label`], which is English for a prompt reader and renders `Write`
+/// as "wrote". Going through serde rather than a hand-written match is what
+/// keeps the mapping total — a new variant cannot be added without a rendering,
+/// and the pair below cannot drift apart.
+fn kind_wire(kind: ObsKind) -> String {
+    match serde_json::to_value(kind) {
+        Ok(serde_json::Value::String(s)) => s,
+        // Unreachable for a unit-variant enum with `rename_all`; falling back to
+        // the debug form keeps the write infallible without inventing a kind that
+        // would read back as a different observation.
+        other => format!("{other:?}"),
+    }
+}
+
+/// The inverse of [`kind_wire`]. A kind that does not parse is an error and not
+/// a skipped row: a ledger that came back silently shorter than it was would
+/// assemble a context nobody can account for, which is worse than refusing to
+/// restore it at all.
+fn kind_from_wire(kind: &str, run_id: i64) -> Result<ObsKind> {
+    serde_json::from_value(serde_json::Value::String(kind.to_string())).map_err(|e| Error::Resume {
+        reason: format!("run {run_id} has a ledger observation of unknown kind {kind:?}: {e}"),
+    })
+}
 
 /// The checkpoint layout version stamped into `PRAGMA user_version`. Bump when
 /// the on-disk checkpoint format changes incompatibly. A store whose version is
@@ -1001,6 +1027,39 @@ impl Store {
              );",
         )?;
 
+        // 0.13.0: the observation ledger the context assembler builds, made
+        // durable so a resumed run restores the context it had instead of
+        // re-deriving one from the workspace.
+        //
+        // The text was already durable — `steps.result` holds one step's
+        // observations concatenated — but concatenated is the problem: a step with
+        // three observations stores one string, and the typed triple assembly
+        // actually reasons about (`step`, `kind`, `target`) is not recoverable
+        // from it at all. `ObsKind::target_is_the_subject` decides supersession
+        // from `kind`, so a ledger rebuilt from `steps.result` would assemble
+        // differently from the one it replaced, which is worse than the honest
+        // re-derivation it would be replacing.
+        //
+        // One row per observation, ordered by `id` like every other event table
+        // here, because the ledger is an ordered log and `step` alone does not
+        // order the observations within a step.
+        //
+        // New table only, so a 0.12.0 database gains it and a 0.12.0 binary, which
+        // never queries it, still opens and resumes a migrated database.
+        // Deliberately NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout
+        // changed, and bumping it would make [`Store::check_resumable`] refuse
+        // every 0.12.0 store for an additive table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS ledger_observations (
+                 id     INTEGER PRIMARY KEY,
+                 run_id INTEGER NOT NULL,
+                 step   INTEGER NOT NULL,
+                 kind   TEXT NOT NULL,
+                 target TEXT,
+                 text   TEXT NOT NULL
+             );",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -1313,6 +1372,61 @@ impl Store {
             })
         })
         .transpose()
+    }
+
+    /// Append observations to a run's durable ledger, in one transaction.
+    ///
+    /// Called once at a committed step boundary rather than once per
+    /// observation: the step is the unit the rest of the checkpoint works in, and
+    /// an observation belonging to a step that never committed must not survive a
+    /// crash the step itself did not survive.
+    pub fn record_observations(&self, run_id: i64, entries: &[Observation]) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO ledger_observations (run_id, step, kind, target, text)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for e in entries {
+                stmt.execute((run_id, e.step as i64, kind_wire(e.kind), &e.target, &e.text))?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A run's durable ledger, in the order it was observed.
+    ///
+    /// Empty for a run that recorded nothing and for a run written before 0.13.0
+    /// — the two are the same to a reader, and both mean "there is nothing to
+    /// restore", which is 0.12.0's behaviour and not a lie about it.
+    pub fn observations(&self, run_id: i64) -> Result<Vec<Observation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT step, kind, target, text
+             FROM ledger_observations WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok((
+                r.get::<_, i64>(0)? as u32,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (step, kind, target, text) = row?;
+            out.push(Observation::new(
+                step,
+                kind_from_wire(&kind, run_id)?,
+                target,
+                text,
+            ));
+        }
+        Ok(out)
     }
 
     /// Every sandbox event recorded for a run, in order.

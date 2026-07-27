@@ -917,6 +917,36 @@ fn record_resume_markers(store: &Store, run_id: i64) -> Result<u32> {
     Ok(start_step)
 }
 
+/// A run's ledger as the store has it, with the count already durable.
+///
+/// The count is the watermark [`persist_ledger`] appends from: everything below
+/// it is on disk, everything above it was observed since the last committed
+/// step.
+fn restore_ledger(store: &Store, run_id: i64) -> Result<(ContextLedger, usize)> {
+    let mut ledger = ContextLedger::new();
+    for obs in store.observations(run_id)? {
+        ledger.push(obs);
+    }
+    let written = ledger.len();
+    Ok((ledger, written))
+}
+
+/// Append everything observed since the last committed step, and return the new
+/// watermark.
+///
+/// Called at the step boundary that commits, so an observation belonging to a
+/// step that never committed does not outlive it — the ledger stays consistent
+/// with the trace rather than running ahead of it.
+fn persist_ledger(
+    store: &Store,
+    run_id: i64,
+    ledger: &ContextLedger,
+    written: usize,
+) -> Result<usize> {
+    store.record_observations(run_id, &ledger.entries()[written..])?;
+    Ok(ledger.len())
+}
+
 /// The outcome of a run that is already over, if it is over.
 ///
 /// Idempotence for every resume entry point: a run that already finished is
@@ -1349,7 +1379,13 @@ async fn run_workspace_from<P: Provider>(
     // History, append-only. What the model sees of it is decided per turn by
     // `assemble`, under the contract's context budget — the log itself is never
     // trimmed, so the trace keeps everything.
-    let mut ledger = ContextLedger::new();
+    //
+    // Restored from the store, so a resumed run continues with the context it had
+    // rather than re-deriving one from the workspace and asking the model a
+    // different question than the process before it would have. Empty for a fresh
+    // run, and empty for a run checkpointed before 0.13.0, which is the same
+    // re-derivation that binary did.
+    let (mut ledger, mut written) = restore_ledger(store, run_id)?;
     // Is the agent getting anywhere? Restored from nothing on resume by design: a
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
@@ -1516,6 +1552,10 @@ async fn run_workspace_from<P: Provider>(
             step_changed,
             true,
         )?;
+        // The step is committed, so the observations behind it are safe to make
+        // durable. After the commit rather than before: a ledger that ran ahead of
+        // the trace would restore observations for a step the run never took.
+        written = persist_ledger(store, run_id, &ledger, written)?;
 
         // Did that step get anywhere? A stall needs both halves — nothing changed
         // in the workspace AND a tool call this window already saw — because a
@@ -1931,8 +1971,10 @@ fn run_agent<'f, P: Provider>(
         let mut tokens_used: u64 = tree.store.spent_tokens(run_id)?;
         // Same ledger and same per-turn assembly as the workspace loop: a tree of
         // 100 children each re-sending its own unbounded log is the multiplied
-        // version of the problem 0.10.0 exists to fix.
-        let mut ledger = ContextLedger::new();
+        // version of the problem 0.10.0 exists to fix — and, since 0.13.0, the
+        // same restore, keyed on this agent's own run id. A child that is resumed
+        // is the same child, at whatever depth it sits.
+        let (mut ledger, mut written) = restore_ledger(tree.store, run_id)?;
         let mut progress = Progress::new();
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
@@ -2160,6 +2202,13 @@ fn run_agent<'f, P: Provider>(
                 step_changed,
                 committed,
             )?;
+            // Only when the step actually committed. A step paused by a child is
+            // deliberately left uncommitted so the resume replays it (0.7.0's
+            // fix for double execution); persisting its observations would mean
+            // the replay observed everything twice.
+            if committed {
+                written = persist_ledger(tree.store, run_id, &ledger, written)?;
+            }
 
             // 0.5.0 spawns up to a hundred of these, so an agent burning its whole
             // step budget going nowhere is the multiplied version of the problem.
