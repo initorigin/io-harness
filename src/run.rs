@@ -31,16 +31,26 @@ use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
+use crate::tools::git::{Git, GitCmd, GitOutcome};
 #[cfg(feature = "barcode")]
 use crate::tools::BARCODE_DECODE_TOOL;
 #[cfg(feature = "pptx")]
 use crate::tools::PPTX_READ_TOOL;
+
+/// The path a git built-in names when it asks the policy about the repository
+/// itself. Reading history reads it; committing writes it. A run under a narrow
+/// write policy must allow it explicitly, which is stated where the tools are
+/// documented rather than left to be discovered by a refusal.
+const GIT_DIR: &str = ".git";
+#[cfg(feature = "media")]
+use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
     REMEMBER_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
+use crate::tools::{GIT_ADD_TOOL, GIT_COMMIT_TOOL, GIT_DIFF_TOOL, GIT_LOG_TOOL, GIT_STATUS_TOOL};
 #[cfg(feature = "pdf")]
 use crate::tools::{PDF_FILL_FORM_TOOL, PDF_READ_TOOL, PDF_WATERMARK_TOOL, PDF_WRITE_TOOL};
 #[cfg(feature = "xlsx")]
@@ -393,6 +403,57 @@ pub async fn resume_with<P: Provider>(
     approver: &dyn Approver,
 ) -> Result<RunResult> {
     resume_with_observed(contract, provider, store, run_id, policy, approver, &Ignore).await
+}
+
+/// Resume a run under the policy it was started with, read back from the store.
+///
+/// [`resume_with`] takes a policy because a resumed run must not silently lose
+/// its boundary — that was 0.13.0's subject. But the caller still had to
+/// reconstruct one, and a caller resuming after a crash in another process may
+/// have nothing to reconstruct it from. The policy has been durable since
+/// 0.13.0; this is the entry point that uses it.
+///
+/// It matters more from 0.15.0 on than it did when it was first noticed: this is
+/// the first release in which a crashed run may already have taken an
+/// irreversible action — a commit — under a policy the resuming caller cannot
+/// name.
+///
+/// Fails with [`Error::Resume`] when the store holds no policy for the run,
+/// rather than substituting a permissive one. A run whose boundary cannot be
+/// recovered is not resumed under no boundary; that substitution is exactly the
+/// defect 0.13.0 closed.
+pub async fn resume_from_stored_policy<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    approver: &dyn Approver,
+) -> Result<RunResult> {
+    resume_from_stored_policy_observed(contract, provider, store, run_id, approver, &Ignore).await
+}
+
+/// [`resume_from_stored_policy`], reporting to `observer` as it happens. See
+/// [`run_observed`].
+pub async fn resume_from_stored_policy_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    let Some(policy) = store.run_policy(run_id)? else {
+        return Err(Error::Resume {
+            reason: format!(
+                "run {run_id} has no recorded policy, so the boundary it ran under cannot be \
+                 recovered; pass one explicitly with `resume_with` if you know what it was"
+            ),
+        });
+    };
+    resume_with_observed(
+        contract, provider, store, run_id, &policy, approver, observer,
+    )
+    .await
 }
 
 /// [`resume_with`], reporting to `observer` as it happens. See [`run_observed`].
@@ -1259,10 +1320,16 @@ async fn run_from<P: Provider>(
                     ObsKind::Read,
                 ),
             );
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
             system: system.clone(),
             user: user.clone(),
             tools: vec![tool.clone()],
+            // Single-file mode has no `view_image` tool, so only the caller's
+            // images are in play here.
+            #[cfg(feature = "media")]
+            media: attach_media(contract, &mut PendingMedia::default())?,
+            ..Default::default()
         };
 
         let response =
@@ -1413,6 +1480,11 @@ async fn run_workspace_from<P: Provider>(
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
     let mem_key = memory_key(root);
+    // Images the agent looked at last step, carried into this one's request and
+    // dropped once shown. A viewed image is a tool result, not a permanent part
+    // of the conversation: the model that wants it again asks again, and the
+    // request stays bounded by what one step actually needed.
+    let pending_media = &mut PendingMedia::default();
 
     for step in start_step..=contract.max_steps {
         // The step boundary, where a cancellation is honoured (see `cancelled`).
@@ -1454,10 +1526,14 @@ async fn run_workspace_from<P: Provider>(
         )
         .await?;
         let user = workspace_user_prompt(contract, &assembled.text);
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
             system: system.clone(),
             user: user.clone(),
             tools: tools.clone(),
+            #[cfg(feature = "media")]
+            media: attach_media(contract, pending_media)?,
+            ..Default::default()
         };
 
         let response =
@@ -1524,6 +1600,8 @@ async fn run_workspace_from<P: Provider>(
                 &mem_key,
                 watch,
                 0,
+                pending_media,
+                &contract.commit_identity,
             )
             .await?
             {
@@ -2005,6 +2083,8 @@ fn run_agent<'f, P: Provider>(
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);
+        // See the workspace loop: viewed images ride one step and are dropped.
+        let pending_media = &mut PendingMedia::default();
 
         for step in start_step..=contract.max_steps {
             // The step boundary, where a cancellation is honoured (see `cancelled`).
@@ -2046,10 +2126,14 @@ fn run_agent<'f, P: Provider>(
             )
             .await?;
             let user = workspace_user_prompt(contract, &assembled.text);
+            #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 system: system.clone(),
                 user: user.clone(),
                 tools: tools.clone(),
+                #[cfg(feature = "media")]
+                media: attach_media(contract, pending_media)?,
+                ..Default::default()
             };
             let response = complete_with_retry(
                 tree.provider,
@@ -2126,6 +2210,8 @@ fn run_agent<'f, P: Provider>(
                     &mem_key,
                     tree.watch,
                     depth,
+                    pending_media,
+                    &contract.commit_identity,
                 )
                 .await?
                 {
@@ -2763,9 +2849,57 @@ impl Dispatched {
 /// consulting `approver` for anything it marks [`Effect::Ask`].
 ///
 /// Tool-level failures (bad regex, path escape, a policy refusal) become
+/// The images one request carries: the caller's, which are the task's subject and
+/// ride every step, plus whatever the agent looked at last step, which rides one.
+///
+/// Bounded here rather than at either source, because neither can see the total.
+/// Over the bound the oldest viewed images are dropped first and the model is not
+/// told a lie about it — the drop is reported in the trace by the caller. The
+/// caller's own images are never dropped: a task about an image that silently
+/// stops carrying it is the failure this whole boundary exists to prevent, so an
+/// over-budget contract is an error at the first step instead.
+#[cfg(feature = "media")]
+fn attach_media(
+    contract: &TaskContract,
+    pending: &mut PendingMedia,
+) -> Result<Vec<crate::provider::Media>> {
+    use crate::provider::MAX_REQUEST_IMAGE_BYTES;
+    let fixed: usize = contract.images.iter().map(|m| m.byte_len()).sum();
+    if fixed > MAX_REQUEST_IMAGE_BYTES {
+        return Err(Error::Config(format!(
+            "the contract's images total {fixed} bytes, over the \
+             {MAX_REQUEST_IMAGE_BYTES}-byte per-request bound"
+        )));
+    }
+    let mut out = contract.images.clone();
+    let mut used = fixed;
+    for m in pending.drain(..) {
+        if used + m.byte_len() > MAX_REQUEST_IMAGE_BYTES {
+            continue;
+        }
+        used += m.byte_len();
+        out.push(m);
+    }
+    Ok(out)
+}
+
+/// Images the agent looked at this step, waiting to be attached to the next
+/// request.
+///
+/// An alias rather than a `cfg` on the parameter itself, so the two call sites
+/// and the signature read the same in both feature states. Without the feature
+/// it is `()`: there is nothing to carry and nothing to bound.
+#[cfg(feature = "media")]
+pub(crate) type PendingMedia = Vec<crate::provider::Media>;
+/// See the `media` form above.
+#[cfg(not(feature = "media"))]
+pub(crate) type PendingMedia = ();
+
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
+// `pending_media` is `()` without the feature, and nothing reads it there.
+#[cfg_attr(not(feature = "media"), allow(unused_variables))]
 async fn dispatch(
     ws: &Workspace,
     call: &ToolCall,
@@ -2780,6 +2914,8 @@ async fn dispatch(
     memory_key: &str,
     watch: &Watch<'_>,
     depth: u32,
+    pending_media: &mut PendingMedia,
+    identity: &crate::tools::git::Identity,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -2917,6 +3053,75 @@ async fn dispatch(
                         remember,
                     },
                     Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
+                },
+            }
+        }
+        #[cfg(feature = "media")]
+        VIEW_IMAGE_TOOL => {
+            let path = s("path").unwrap_or_default();
+            // The extension decides the media type, and an unknown one is
+            // reported rather than guessed. Checked before the gate only because
+            // it costs nothing: the gate still runs for every path that could
+            // actually be read, so this cannot be used to probe for a file's
+            // existence outside the policy.
+            let Some(media_type) = crate::provider::Media::media_type_for(path) else {
+                return Ok(Dispatched::go(
+                    "view_image unsupported type",
+                    format!(
+                        "\n[view_image error] {path} is not an image this crate can send. \
+                         Supported: {}\n",
+                        crate::provider::IMAGE_MEDIA_TYPES.join(", ")
+                    ),
+                ));
+            };
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => match ws
+                    .read_bytes(&target)
+                    .map_err(|e| e.to_string())
+                    .and_then(|bytes| {
+                        crate::provider::Media::image(media_type, &bytes).map_err(|e| e.to_string())
+                    }) {
+                    Ok(media) => {
+                        // The observation records what was sent, not the image:
+                        // a digest, a size and a type. A trace that held the
+                        // bytes would grow by megabytes a step in exactly the
+                        // long unattended runs this crate exists for.
+                        let obs = format!(
+                            "\n[view_image {target}] attached to the next request \
+                             ({media_type}, {} bytes, digest {})\n",
+                            media.byte_len(),
+                            media.digest()
+                        );
+                        pending_media.push(media);
+                        Dispatched::Continue {
+                            decision: format!("viewed {target}"),
+                            obs,
+                            kind: ObsKind::Read,
+                            target: Some(target.clone()),
+                            changed: false,
+                            remember,
+                        }
+                    }
+                    Err(e) => {
+                        Dispatched::go("view_image error", format!("\n[view_image error] {e}\n"))
+                    }
                 },
             }
         }
@@ -3294,6 +3499,153 @@ async fn dispatch(
         // built-ins, and `Toolbox::validate` has already guaranteed the three
         // sets are disjoint, so the order is documentation rather than a
         // tie-break.
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL | GIT_ADD_TOOL | GIT_COMMIT_TOOL => {
+            // Paths the model named, if any. Every one of them is data: `argv`
+            // puts them after `--` and refuses a leading `-`.
+            let paths: Vec<String> = a
+                .get("paths")
+                .and_then(|v| v.as_array())
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            // What the policy is asked, per tool. Reading history reads `.git`.
+            // Staging copies a file's bytes into the object store, so it needs
+            // `Act::Read` on that file — which is what stops a path the policy
+            // denies from reaching a commit. Committing writes `.git`.
+            let (repo_act, path_act) = match name {
+                GIT_ADD_TOOL => (Act::Write, Some(Act::Read)),
+                GIT_COMMIT_TOOL => (Act::Write, None),
+                _ => (Act::Read, Some(Act::Read)),
+            };
+
+            let mut remembered: Vec<Rule> = Vec::new();
+            let mut targets: Vec<(Act, String)> = vec![(repo_act, GIT_DIR.to_string())];
+            if let Some(act) = path_act {
+                targets.extend(paths.iter().map(|p| (act, p.clone())));
+            }
+            let mut refused: Option<Dispatched> = None;
+            for (act, target) in targets {
+                match gate(
+                    ws, approver, store, run_id, step, act, &target, None, watch, depth,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => {
+                        refused = Some(Dispatched::go(decision, obs));
+                        break;
+                    }
+                    Gated::Paused { request_id } => {
+                        refused = Some(Dispatched::Pause { request_id });
+                        break;
+                    }
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+            }
+            if let Some(d) = refused {
+                return Ok(d);
+            }
+
+            let cmd = match name {
+                GIT_STATUS_TOOL => GitCmd::Status { paths },
+                GIT_DIFF_TOOL => GitCmd::Diff {
+                    staged: a.get("staged").and_then(serde_json::Value::as_bool) == Some(true),
+                    paths,
+                },
+                GIT_LOG_TOOL => GitCmd::Log {
+                    // Clamped rather than trusted: a model asking for the whole
+                    // history of a large repository would blow the observation
+                    // cap and learn nothing the first twenty commits do not say.
+                    max_count: a
+                        .get("max_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(20)
+                        .clamp(1, 200) as u32,
+                    paths,
+                },
+                GIT_ADD_TOOL => {
+                    if paths.is_empty() {
+                        return Ok(Dispatched::go(
+                            "git_add missing paths",
+                            "\n[git error] git_add needs a non-empty \"paths\" array\n".to_string(),
+                        ));
+                    }
+                    GitCmd::Add { paths }
+                }
+                _ => {
+                    let Some(message) = s("message").filter(|m| !m.trim().is_empty()) else {
+                        return Ok(Dispatched::go(
+                            "git_commit missing message",
+                            "\n[git error] git_commit needs a non-empty \"message\"\n".to_string(),
+                        ));
+                    };
+                    GitCmd::Commit {
+                        message: message.to_string(),
+                        identity: identity.clone(),
+                    }
+                }
+            };
+
+            let git = Git::new(ws.policy(), ws.root(), cap);
+            match git.run(&cmd).await? {
+                GitOutcome::Unavailable { reason } => Dispatched::go(
+                    "git unavailable",
+                    format!(
+                        "\n[git unavailable] {reason}. This workspace cannot be worked as a git \
+                         repository; carry on without it.\n"
+                    ),
+                ),
+                out @ GitOutcome::Ran { .. } => {
+                    let GitOutcome::Ran {
+                        code,
+                        stdout,
+                        stderr,
+                    } = &out
+                    else {
+                        unreachable!()
+                    };
+                    let ok = out.ok();
+                    let body = if stdout.trim().is_empty() && !ok {
+                        stderr.clone()
+                    } else {
+                        stdout.clone()
+                    };
+                    // A git that ran and failed is an observation, not a run
+                    // failure — the same treatment a malformed regex gets from
+                    // `grep`. The model reads the message and adapts.
+                    Dispatched::Continue {
+                        decision: format!(
+                            "{name} {}",
+                            if ok {
+                                "ok".to_string()
+                            } else {
+                                format!("exit {}", code.map_or("signal".into(), |c| c.to_string()))
+                            }
+                        ),
+                        obs: format!(
+                            "\n[{name}{}]\n{}\n",
+                            if ok {
+                                String::new()
+                            } else {
+                                " failed".to_string()
+                            },
+                            if body.trim().is_empty() {
+                                "(no output)"
+                            } else {
+                                body.trim_end()
+                            }
+                        ),
+                        kind: ObsKind::Tool,
+                        target: None,
+                        changed: matches!(cmd, GitCmd::Add { .. } | GitCmd::Commit { .. }) && ok,
+                        remember: remembered,
+                    }
+                }
+            }
+        }
         name if custom.owns(name) => {
             match gate(
                 ws,
@@ -3366,7 +3718,7 @@ async fn dispatch(
                 ));
             }
             let out = mcp
-                .call(
+                .call_media(
                     name,
                     &call.arguments,
                     store,
@@ -3375,6 +3727,7 @@ async fn dispatch(
                     cap,
                     watch,
                     depth,
+                    pending_media,
                 )
                 .await?;
             Dispatched::seen(
@@ -3565,6 +3918,14 @@ async fn complete_with_retry<P: Provider>(
     watch: &Watch<'_>,
     depth: u32,
 ) -> Result<CompletionResponse> {
+    // The general media boundary. Every completion in every loop goes through
+    // here, so this covers an out-of-tree `Provider` as well as the three built
+    // in — and it runs before the first attempt, so a refused request costs no
+    // retry, no token and no wall clock. The built-in providers check again
+    // inside their own `complete`, which is what stops a caller reaching one
+    // directly from bypassing it.
+    #[cfg(feature = "media")]
+    crate::provider::ensure_media_accepted(provider.name(), provider.accepts_images(), request)?;
     let max_retries = contract.max_retries;
     let retry = contract.retry;
     let max_duration = contract.max_duration;
@@ -4046,6 +4407,82 @@ fn workspace_tools() -> Vec<ToolSpec> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "File path relative to the workspace root." }
+                },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_STATUS_TOOL.to_string(),
+            description: "Show what has changed in the git repository at the workspace root: \
+                          modified, staged and untracked files."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional paths to limit the report to." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: GIT_DIFF_TOOL.to_string(),
+            description: "Show the diff of the working tree, or of what is staged.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "staged": { "type": "boolean", "description": "Diff what is staged instead of the working tree." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional paths to limit the diff to." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: GIT_LOG_TOOL.to_string(),
+            description: "Read the repository's recent commit history, newest first.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "max_count": { "type": "integer", "description": "How many commits to show (1-200, default 20)." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Optional paths to limit the history to." }
+                }
+            }),
+        },
+        ToolSpec {
+            name: GIT_ADD_TOOL.to_string(),
+            description: "Stage the named files for the next commit. Honours .gitignore; an \
+                          ignored file is reported rather than staged."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Files to stage, relative to the workspace root." }
+                },
+                "required": ["paths"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_COMMIT_TOOL.to_string(),
+            description: "Commit what you have staged, on the branch that is checked out. There \
+                          is no push, no branch switching and no history rewriting: your work \
+                          stays local for a human to review."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "message": { "type": "string", "description": "The commit message." }
+                },
+                "required": ["message"]
+            }),
+        },
+        #[cfg(feature = "media")]
+        ToolSpec {
+            name: VIEW_IMAGE_TOOL.to_string(),
+            description: "Look at an image in the workspace. The image is attached to your next \
+                          message, so you see it on the following step rather than in this tool's \
+                          result. Costs a step; the file must be a jpeg, png, gif or webp."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Image path relative to the workspace root." }
                 },
                 "required": ["path"]
             }),

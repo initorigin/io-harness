@@ -14,6 +14,7 @@
 pub mod custom;
 pub mod documents;
 pub mod fs;
+pub mod git;
 pub mod workspace;
 
 pub use custom::{Tool, ToolFuture, Toolbox};
@@ -28,6 +29,34 @@ pub const GREP_TOOL: &str = "grep";
 pub const FIND_TOOL: &str = "find";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
+/// The names the model uses for git work (0.15.0).
+///
+/// Built-ins for the reason the document tools are, and one sharper: the exec
+/// policy enforces a program *name* and records argv without checking it
+/// (src/verify.rs:248), so `Act::Exec("git")` cannot tell `git log` from
+/// `git push --force`. Each of these constructs its own complete argv instead —
+/// the model supplies paths and a message and never an argument — so the
+/// networked and destructive surface is unreachable by construction rather than
+/// excluded by a rule someone has to maintain.
+pub const GIT_LOG_TOOL: &str = "git_log";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_STATUS_TOOL: &str = "git_status";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_DIFF_TOOL: &str = "git_diff";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_ADD_TOOL: &str = "git_add";
+/// See [`GIT_LOG_TOOL`].
+pub const GIT_COMMIT_TOOL: &str = "git_commit";
+
+/// The name the model uses to look at an image in the workspace (0.15.0,
+/// `media` feature).
+///
+/// A built-in rather than a registered [`Tool`], for the reason the document
+/// tools are: this one decides which of the user's files is sent to a third
+/// party, so it is gated per call on the real path the model names rather than
+/// authorised once by name.
+#[cfg(feature = "media")]
+pub const VIEW_IMAGE_TOOL: &str = "view_image";
 /// The names the model uses for spreadsheet work (0.14.0, `xlsx` feature).
 ///
 /// These are built-ins rather than registered [`Tool`]s on purpose. A registered

@@ -900,3 +900,119 @@ async fn a_bare_resume_still_works_for_a_run_that_never_had_a_boundary() {
     assert_eq!(resumed.run_id, first.run_id);
     assert_eq!(resumed.outcome, RunOutcome::Success { steps: 2 });
 }
+
+// ---------------------------------------------------------------------------
+// 0.15.0 — resuming from the policy the store already holds.
+//
+// The policy has been durable since 0.13.0, but a caller still had to
+// reconstruct one to resume with it. A caller resuming after a crash in another
+// process may have nothing to reconstruct it from — and from 0.15.0 a crashed
+// run may already have taken an irreversible action under it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_run_resumed_from_its_stored_policy_is_still_bounded_by_it() {
+    let dir = fixture();
+    let script = MockScript::new(vec![
+        vec![write("src/a.rs", GOOD_A)],
+        vec![write("secrets/key.txt", "exfiltrated")],
+        vec![write("src/b.rs", GOOD_B)],
+    ]);
+    let store = Store::memory().unwrap();
+    let approver = Counting::new(Decision::approve());
+
+    let first = run_with(
+        &capped(dir.path(), 1),
+        &script,
+        &store,
+        &guarded(),
+        &approver,
+    )
+    .await
+    .unwrap();
+
+    // No policy passed. The caller has the run id and nothing else, which is the
+    // situation this entry point exists for.
+    let resumed = io_harness::resume_from_stored_policy(
+        &capped(dir.path(), 5),
+        &script,
+        &store,
+        first.run_id,
+        &approver,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.run_id, first.run_id, "one run, not two");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("secrets/key.txt")).unwrap(),
+        "original-secret",
+        "the boundary was recovered from the store, not lost with the process"
+    );
+    let events = store.events(first.run_id).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "refusal" && e.target == "secrets/key.txt"),
+        "the refusal is in the trace: {events:?}"
+    );
+}
+
+/// The negative control. The same call on a run started permissively performs
+/// the write — so the test above is measuring a recovered boundary rather than a
+/// resume that denies everything.
+#[tokio::test]
+async fn the_same_call_on_a_permissive_run_performs_the_write() {
+    let dir = fixture();
+    let script = MockScript::new(vec![
+        vec![write("src/a.rs", GOOD_A)],
+        vec![write("secrets/key.txt", "exfiltrated")],
+        vec![write("src/b.rs", GOOD_B)],
+    ]);
+    let store = Store::memory().unwrap();
+    let approver = Counting::new(Decision::approve());
+
+    let first = run_with(
+        &capped(dir.path(), 1),
+        &script,
+        &store,
+        &Policy::permissive(),
+        &approver,
+    )
+    .await
+    .unwrap();
+
+    io_harness::resume_from_stored_policy(
+        &capped(dir.path(), 5),
+        &script,
+        &store,
+        first.run_id,
+        &approver,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("secrets/key.txt")).unwrap(),
+        "exfiltrated"
+    );
+}
+
+#[tokio::test]
+async fn a_run_with_no_recorded_policy_is_refused_rather_than_resumed_permissively() {
+    // Substituting a permissive policy for one that cannot be found is the exact
+    // defect 0.13.0 closed. An unknown run id has no recorded policy, which is
+    // the same state a pre-0.13.0 run row is in.
+    let dir = fixture();
+    let store = Store::memory().unwrap();
+    let err = io_harness::resume_from_stored_policy(
+        &capped(dir.path(), 5),
+        &MockScript::new(vec![]),
+        &store,
+        424_242,
+        &Counting::new(Decision::approve()),
+    )
+    .await
+    .expect_err("a run whose boundary cannot be recovered must not be resumed");
+    assert!(matches!(&err, io_harness::Error::Resume { .. }), "{err:?}");
+}

@@ -79,7 +79,14 @@ impl Provider for OpenAi {
         Some(&self.endpoint)
     }
 
+    #[cfg(feature = "media")]
+    fn accepts_images(&self) -> bool {
+        true
+    }
+
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        #[cfg(feature = "media")]
+        super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
         let resp = self
             .client
             .post(&self.endpoint)
