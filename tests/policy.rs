@@ -722,3 +722,181 @@ async fn a_policy_on_a_single_file_contract_is_refused_not_silently_ignored() {
     let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
     assert!(run(&contract, &script, &store).await.is_ok());
 }
+
+// ---------------------------------------------------------------------------
+// 0.13.0 — a resumed run is the run it was.
+//
+// `resume` took no policy and substituted `Policy::permissive()` with
+// `ApproveAll` for every workspace run, so a caller who ran under a boundary and
+// crashed resumed without one. Nothing warned; the trace showed no refusals
+// because nothing refused. These are the tests for the boundary half.
+// ---------------------------------------------------------------------------
+
+/// A step budget of one is how a test interrupts a run: the run stops with work
+/// left, exactly as a crashed process leaves it, and the resume continues under
+/// the original run id.
+fn capped(dir: &std::path::Path, steps: u32) -> TaskContract {
+    TaskContract::workspace("make a+b 42", dir, verify()).with_max_steps(steps)
+}
+
+#[tokio::test]
+async fn a_resumed_run_still_enforces_the_policy_it_was_started_under() {
+    let dir = fixture();
+    // Step 1 does real work and stops at the budget. Step 2 — the one the resume
+    // drives — goes for the secret.
+    let script = MockScript::new(vec![
+        vec![write("src/a.rs", GOOD_A)],
+        vec![write("secrets/key.txt", "exfiltrated")],
+        vec![write("src/b.rs", GOOD_B)],
+    ]);
+    let store = Store::memory().unwrap();
+    let approver = Counting::new(Decision::approve());
+
+    let first = run_with(
+        &capped(dir.path(), 1),
+        &script,
+        &store,
+        &guarded(),
+        &approver,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.outcome, RunOutcome::StepCapReached { steps: 1 });
+
+    let resumed = io_harness::resume_with(
+        &capped(dir.path(), 5),
+        &script,
+        &store,
+        first.run_id,
+        &guarded(),
+        &approver,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.run_id, first.run_id, "one run, not two");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("secrets/key.txt")).unwrap(),
+        "original-secret",
+        "the denied write was refused after the resume, not performed"
+    );
+    let events = store.events(first.run_id).unwrap();
+    let refusal = events
+        .iter()
+        .find(|e| e.kind == "refusal")
+        .expect("the refusal is in the trace under the original run id");
+    assert_eq!(refusal.act, "write");
+    assert_eq!(refusal.target, "secrets/key.txt");
+    assert_eq!(refusal.rule.as_deref(), Some("secrets/*"));
+}
+
+/// The negative control for the test above. Same fixture, same script, same
+/// resume — but resumed permissively on purpose. The secret IS overwritten,
+/// which proves the assertion above detects an enforced boundary rather than
+/// passing because the write would have failed anyway.
+#[tokio::test]
+async fn the_same_resume_performs_the_write_when_no_policy_is_supplied() {
+    let dir = fixture();
+    let script = MockScript::new(vec![
+        vec![write("src/a.rs", GOOD_A)],
+        vec![write("secrets/key.txt", "exfiltrated")],
+        vec![write("src/b.rs", GOOD_B)],
+    ]);
+    let store = Store::memory().unwrap();
+    let approver = Counting::new(Decision::approve());
+
+    let first = run_with(
+        &capped(dir.path(), 1),
+        &script,
+        &store,
+        &Policy::permissive(),
+        &approver,
+    )
+    .await
+    .unwrap();
+
+    io_harness::resume_with(
+        &capped(dir.path(), 5),
+        &script,
+        &store,
+        first.run_id,
+        &Policy::permissive(),
+        &approver,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("secrets/key.txt")).unwrap(),
+        "exfiltrated",
+        "with no boundary the write lands — so the test above is measuring the boundary"
+    );
+}
+
+#[tokio::test]
+async fn a_bare_resume_refuses_a_run_that_was_started_under_a_policy() {
+    let dir = fixture();
+    let script = MockScript::new(vec![
+        vec![write("src/a.rs", GOOD_A)],
+        vec![write("secrets/key.txt", "exfiltrated")],
+    ]);
+    let store = Store::memory().unwrap();
+
+    let first = run_with(
+        &capped(dir.path(), 1),
+        &script,
+        &store,
+        &guarded(),
+        &Counting::new(Decision::approve()),
+    )
+    .await
+    .unwrap();
+    let steps_before = store.steps(first.run_id).unwrap().len();
+
+    let err = io_harness::resume(&capped(dir.path(), 5), &script, &store, first.run_id)
+        .await
+        .unwrap_err();
+
+    let message = format!("{err}");
+    assert!(
+        message.contains(&first.run_id.to_string()) && message.contains("resume_with"),
+        "the error names the run and the alternative, got {message}"
+    );
+    assert_eq!(
+        store.steps(first.run_id).unwrap().len(),
+        steps_before,
+        "refused before driving the loop, so no step was taken"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("secrets/key.txt")).unwrap(),
+        "original-secret"
+    );
+}
+
+#[tokio::test]
+async fn a_bare_resume_still_works_for_a_run_that_never_had_a_boundary() {
+    let dir = fixture();
+    let script = MockScript::new(vec![
+        vec![write("src/a.rs", GOOD_A)],
+        vec![write("src/b.rs", GOOD_B)],
+    ]);
+    let store = Store::memory().unwrap();
+
+    let first = run_with(
+        &capped(dir.path(), 1),
+        &script,
+        &store,
+        &Policy::permissive(),
+        &Counting::new(Decision::approve()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first.outcome, RunOutcome::StepCapReached { steps: 1 });
+
+    let resumed = io_harness::resume(&capped(dir.path(), 5), &script, &store, first.run_id)
+        .await
+        .unwrap();
+
+    assert_eq!(resumed.run_id, first.run_id);
+    assert_eq!(resumed.outcome, RunOutcome::Success { steps: 2 });
+}

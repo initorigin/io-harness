@@ -340,11 +340,17 @@ async fn a_resumed_replay_reports_divergence_rather_than_inventing_an_answer() {
     );
 
     let resumed_provider = Replay::load(&path).unwrap();
-    let err = io_harness::resume(
+    // Resumed under the policy it was started with. The bare `resume` refuses a
+    // policy-bearing run outright as of 0.13.0, and that refusal is a different
+    // subject from this test's — here the run resumes and the *replay* is what
+    // must refuse.
+    let err = io_harness::resume_with(
         &contract(dir.path()),
         &resumed_provider,
         &store,
         first.run_id,
+        &open_policy(),
+        &ApproveAll,
     )
     .await
     .expect_err(

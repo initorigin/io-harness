@@ -227,6 +227,11 @@ pub async fn run_with_observed<P: Provider>(
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
     store.set_provider(run_id, provider.name())?;
+    // The caller's policy, before the provider layer below is merged into it —
+    // what the caller asked for, not what the harness added. Recorded so a later
+    // `resume` can tell a run that had a boundary from one that never did; see
+    // [`resume`], which refuses the first rather than resuming it permissively.
+    store.record_run_policy(run_id, policy)?;
     // The run row exists and the provider is set, which is what `Started` reports:
     // emitted before the network authorization below, so an observer watching a run
     // that is refused before its first step still saw it begin.
@@ -284,6 +289,15 @@ pub async fn run_with_observed<P: Provider>(
 /// Resume an interrupted run under its original `run_id`. Continues from the
 /// step after the last one recorded, reusing the file on disk as the current
 /// state — it does not restart from step one.
+///
+/// This is the resume for a run that had **no** permission boundary. It drives
+/// the loop permissively, and a run that *was* started under a policy is refused
+/// with [`Error::Resume`] rather than resumed without it — use [`resume_with`]
+/// and supply the policy. Through 0.12.0 this function substituted
+/// [`Policy::permissive`] for every workspace run it resumed, so a caller who
+/// ran under a deny-by-default policy and crashed came back with no boundary and
+/// nothing said so. Refusing is the only behaviour that cannot silently widen
+/// what an agent may do.
 pub async fn resume<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -304,24 +318,89 @@ pub async fn resume_observed<P: Provider>(
     run_id: i64,
     observer: &dyn Observer,
 ) -> Result<RunResult> {
-    contract.tools.validate()?;
-    let skills = contract.discover_skills()?;
     // Refuse a store from a newer checkpoint format or a missing run with a
-    // typed error, rather than misreading it or panicking.
+    // typed error, rather than misreading it or panicking. Before the policy
+    // gate below, so an unknown run still reports as an unknown run.
     store.check_resumable(run_id)?;
-
-    // Idempotent by construction: a run that already finished is returned as-is,
-    // so re-running resume twice does not re-drive the loop or re-charge the
-    // budget. A run still `Running` (its process died mid-loop) falls through and
-    // is resumed from its last committed step.
-    if store.run_status(run_id)? == Some(RunStatus::Completed) {
-        if let Some(o) = terminal_outcome(store, run_id)? {
-            return Ok(RunResult::new(o, run_id));
+    // Before the gate, because a finished run is a read and not a resume: it
+    // drives no loop, performs no action, and asks no provider, so there is no
+    // boundary to drop and refusing it would break the "report, don't re-drive"
+    // contract a refused or escalated run relies on.
+    if let Some(o) = finished_outcome(store, run_id)? {
+        return Ok(RunResult::new(o, run_id));
+    }
+    // The gate. `None` means nothing recorded a policy for this run — a run
+    // written by 0.12.0 or earlier — and is deliberately not read as "the caller
+    // chose permissive": it resumes as it always did, which is what 0.7.0's
+    // resume contract promised those runs. A recorded permissive policy is the
+    // same case, said explicitly. Anything else had a boundary, and this
+    // function cannot honour it.
+    if let Some(recorded) = store.run_policy(run_id)? {
+        if !recorded.is_permissive() {
+            return Err(crate::error::Error::Resume {
+                reason: format!(
+                    "run {run_id} was started under a permission policy; resume it with \
+                     resume_with (or resume_with_observed), supplying that policy — resuming \
+                     here would drop the boundary the run was executing under"
+                ),
+            });
         }
     }
+    resume_with_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        &Policy::permissive(),
+        &ApproveAll,
+        observer,
+    )
+    .await
+}
 
+/// Resume an interrupted run under `policy`, routing anything the policy marks
+/// [`Effect::Ask`] to `approver` — the resume twin of [`run_with`].
+///
+/// The policy given here is the one that governs the resumed run; it is recorded
+/// against the run, so the store answers what rules the run actually executed
+/// under rather than only what it started under. Supplying
+/// [`Policy::permissive`] deliberately downgrades a run that had a boundary,
+/// which is a caller's decision to make explicitly and is exactly what [`resume`]
+/// will not do on its behalf.
+pub async fn resume_with<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    policy: &Policy,
+    approver: &dyn Approver,
+) -> Result<RunResult> {
+    resume_with_observed(contract, provider, store, run_id, policy, approver, &Ignore).await
+}
+
+/// [`resume_with`], reporting to `observer` as it happens. See [`run_observed`].
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    policy: &Policy,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    contract.tools.validate()?;
+    let skills = contract.discover_skills()?;
+    store.check_resumable(run_id)?;
+
+    if let Some(o) = finished_outcome(store, run_id)? {
+        return Ok(RunResult::new(o, run_id));
+    }
+
+    let caller_enforces = !policy.is_permissive();
     let start_step = record_resume_markers(store, run_id)?;
     store.set_provider(run_id, provider.name())?;
+    store.record_run_policy(run_id, policy)?;
     let watch = &Watch::new(observer);
     watch.emit(RunEvent::new(
         run_id,
@@ -333,25 +412,43 @@ pub async fn resume_observed<P: Provider>(
     ));
     match contract.root.clone() {
         Some(root) => {
-            let policy = Policy::permissive();
-            let mcp = McpSession::connect(&contract.mcp, &policy, store, run_id, watch).await?;
+            // Re-authorized on resume rather than trusted from the interrupted
+            // run, for the reason [`resume_tree_observed`] gives: the policy
+            // handed to the resume is the one that governs it, and a host allowed
+            // before a crash may not be allowed after.
+            let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch)
+                .await?
+            {
+                ProviderAccess::Granted(p) => p,
+                ProviderAccess::Pending(request_id) => {
+                    return Ok(RunResult::new(
+                        RunOutcome::AwaitingApproval {
+                            request_id,
+                            steps: start_step.saturating_sub(1),
+                        },
+                        run_id,
+                    ))
+                }
+            };
+            let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let result = run_workspace_from(
-                contract,
-                provider,
-                store,
-                run_id,
-                &root,
-                start_step,
-                &policy,
-                &ApproveAll,
-                &mcp,
-                &skills,
-                watch,
+                contract, provider, store, run_id, &root, start_step, policy, approver, &mcp,
+                &skills, watch,
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
             result
         }
+        // The same refusal [`run_with_observed`] makes, for the same reason:
+        // single-file mode has no policy-aware tool layer, and silently ignoring
+        // a policy would leave the caller believing a boundary was enforced when
+        // nothing was checking.
+        None if caller_enforces => Err(crate::error::Error::Config(
+            "a permission policy requires workspace mode — build the contract \
+             with TaskContract::workspace(goal, root, verify). Single-file \
+             contracts are not policy-enforced."
+                .into(),
+        )),
         None => run_from(contract, provider, store, run_id, start_step, watch).await,
     }
 }
@@ -818,6 +915,19 @@ fn record_resume_markers(store: &Store, run_id: i64) -> Result<u32> {
         store.record_checkpoint_event(&crate::state::CheckpointEvent::skipped(run_id, s))?;
     }
     Ok(start_step)
+}
+
+/// The outcome of a run that is already over, if it is over.
+///
+/// Idempotence for every resume entry point: a run that already finished is
+/// returned as-is, so resuming twice does not re-drive the loop or re-charge the
+/// budget. A run still `Running` — its process died mid-loop — reads as `None`
+/// here and is resumed from its last committed step.
+fn finished_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
+    if store.run_status(run_id)? != Some(RunStatus::Completed) {
+        return Ok(None);
+    }
+    terminal_outcome(store, run_id)
 }
 
 fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
@@ -1621,6 +1731,10 @@ pub async fn run_tree_observed<P: Provider>(
     let ledger = Arc::new(Ledger::new(containment));
     let run_id = store.start_run(&contract.goal, &root.display().to_string())?;
     store.set_provider(run_id, provider.name())?;
+    // As in [`run_with_observed`]: the caller's policy, recorded before the
+    // provider layer is merged in. A tree's own resume already takes a policy,
+    // so this is for the audit rather than for a gate.
+    store.record_run_policy(run_id, policy)?;
     let watch = &Watch::new(observer);
     watch.emit(RunEvent::new(
         run_id,
