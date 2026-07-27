@@ -43,11 +43,25 @@ not when a release merely touched it.
 - **Long-running autonomous tasks** — 24h+ unattended, crash-resumable · 0.7.0
 - **Extensibility** — MCP client, stdio and streamable HTTP · 0.8.0; in-process `Tool` implementations and markdown skills · 0.9.0
 - **Built-in tools** — filesystem, grep, find over a policy-scoped workspace · 0.1.0, 0.3.0
-- **Office and document tools** — Word/Excel/PowerPoint/PDF create and edit, PDF watermark, PDF form fill, OCR, barcode/QR · planned 0.13.0
-- **Media and git** — image and video passthrough where the model accepts it; real repository work · planned 0.14.0
+- **Office and document tools** — Excel read and in-place single-cell edit, Word generate and read, PowerPoint read, PDF generate, read, watermark and form fill, barcode/QR decode · 0.14.0; each format behind its own cargo feature under the `documents` umbrella, all off by default
+- **Media and git** — image and video passthrough where the model accepts it; real repository work · planned 0.15.0
+
+OCR and PowerPoint authoring are off the roadmap by the owner's decision of
+2026-07-27 — cut, not deferred. OCR needs a system package on the runner, which
+the standing rule against binding system libraries forbids; generating a deck
+means hand-rolling layouts, masters, theme parts and the relationship graph that
+ties them together, and a file PowerPoint may or may not open is not a
+capability. Word editing is absent for the same kind of reason: the reader drops
+the OOXML it does not model, so read-then-write is a lossy rewrite of a
+document the user cares about. Spreadsheet edits round-trip a workbook the
+harness did not create, but preservation is not a guarantee — charts, drawings,
+pivots and macros are where it is likeliest to cost something.
 
 ## Status
 
-Released through 0.12.0, live on crates.io. **All twelve pillars now hold** —
-0.12.0 closed the last two, observability and evaluation. Ordering rationale is recorded in
+Released through 0.14.0, live on crates.io. **All twelve pillars hold** — 0.12.0
+closed the last two, observability and evaluation. Releases since then deepen the
+harness rather than add a pillar: 0.13.0 made a resumed run the run it was, and
+0.14.0 gave the agent documents under the same path policy and verification that
+govern source edits. Ordering rationale is recorded in
 `.ultraship/iterations/US-IO-HARNESS-0.9.0-I01.yaml`; the roadmap is canonical.

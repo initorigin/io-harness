@@ -50,6 +50,13 @@ jobs:
       # examples/mcp_fixture_server and examples/crash_fixture as child processes.
       - run: cargo build --all-targets
       - run: cargo test
+      # 0.14.0: the document formats are optional, so the default legs above do
+      # not compile a line of them. They run on all three OSes rather than on
+      # Linux alone because path separators and line endings both reach these
+      # formats — a zip entry name is `/`-separated on every platform, and the
+      # text a reader hands back is compared against needles a test wrote — so a
+      # Linux-only pass would not be evidence for the other two.
+      - run: cargo test --features documents
 
   # The MSRV is read from Cargo.toml rather than hardcoded, so the declared
   # rust-version and the version actually proven to build cannot drift apart.
@@ -69,6 +76,10 @@ jobs:
           toolchain: ${{ steps.rv.outputs.version }}
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo build --all-targets
+      # The declared MSRV has to hold for the crate a consumer actually enables,
+      # not only for the default build: an optional dependency raising the floor
+      # would otherwise be invisible here and land on them.
+      - run: cargo build --all-targets --features documents
 
   # Lints are platform-independent, so they run once instead of per-OS.
   lint:
@@ -87,3 +98,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # Both ways, because the feature gates change which code exists: an unused
+      # import behind `#[cfg(feature = ..)]` is only a warning in the build that
+      # compiles it.
+      - run: cargo clippy --all-targets --features documents -- -D warnings

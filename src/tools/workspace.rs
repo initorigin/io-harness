@@ -59,9 +59,9 @@ impl Wrote {
     /// write is [`Wrote::Changed`]. A file that exists but cannot be read
     /// (permissions) is not a reason to fail the write — the old content is
     /// unknown, so it reports `Changed`, the conservative answer.
-    pub(crate) fn classify(old: std::io::Result<Vec<u8>>, content: &str) -> Self {
+    pub(crate) fn classify(old: std::io::Result<Vec<u8>>, content: &[u8]) -> Self {
         match old {
-            Ok(old) if old == content.as_bytes() => Wrote::Unchanged,
+            Ok(old) if old == content => Wrote::Unchanged,
             Ok(_) => Wrote::Changed,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Wrote::Created,
             Err(_) => Wrote::Changed,
@@ -254,6 +254,45 @@ impl Workspace {
     /// reports, it does not skip work, so nothing about the file's state depends
     /// on the comparison.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<Wrote> {
+        let abs = self.resolve(rel)?;
+        self.enforce(Act::Write, rel)?;
+        let did = Wrote::classify(std::fs::read(&abs), content.as_bytes());
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(abs, content)?;
+        Ok(did)
+    }
+
+    /// Read a file under the root as bytes, for a format that is not text.
+    ///
+    /// A path the policy denies is refused before anything is read, exactly as
+    /// [`Workspace::read_file`] refuses it — this is the same gate, not a second
+    /// one, which is what lets a document capability be governed by the rules
+    /// that already govern source.
+    ///
+    /// Unlike [`Workspace::read_file`], a missing file is an error rather than an
+    /// empty buffer. The text case reads empty so an agent can create a file it
+    /// is about to write; a byte read is always "parse this document", and
+    /// handing a parser zero bytes turns "there is no such file" into "this file
+    /// is corrupt", which is the wrong thing to tell the model.
+    pub fn read_bytes(&self, rel: &str) -> Result<Vec<u8>> {
+        let abs = self.resolve(rel)?;
+        self.enforce(Act::Read, rel)?;
+        std::fs::read(abs).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => Error::Config(format!("no such file: {rel}")),
+            _ => Error::Io(e),
+        })
+    }
+
+    /// Write a file under the root as bytes, creating parent directories and
+    /// reporting whether it changed anything.
+    ///
+    /// The byte twin of [`Workspace::write_file`], through the same policy gate
+    /// and with the same semantics: the write happens in every case,
+    /// [`Wrote::Unchanged`] included, so nothing about the file's state depends
+    /// on the comparison.
+    pub fn write_bytes(&self, rel: &str, content: &[u8]) -> Result<Wrote> {
         let abs = self.resolve(rel)?;
         self.enforce(Act::Write, rel)?;
         let did = Wrote::classify(std::fs::read(&abs), content);
@@ -648,5 +687,111 @@ mod tests {
             ws.write_file("secrets/key.txt", "original"),
             Err(Error::Refused { .. })
         ));
+    }
+
+    // 0.14.0 — byte IO under the same gate as text IO. These are the foundation
+    // every document capability routes through, so the boundary tests come with
+    // their negative controls: an assertion that a denied path is refused proves
+    // nothing unless the same operation demonstrably succeeds when allowed.
+
+    #[test]
+    fn a_denied_byte_write_is_refused_and_the_file_is_untouched() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/blob.bin"), b"original").unwrap();
+        let ws = guarded(dir.path());
+
+        let refused = ws.write_bytes("secrets/blob.bin", b"\x00\x01\x02");
+
+        assert!(
+            matches!(&refused, Err(Error::Refused { act, target, .. })
+                if act == "write" && target == "secrets/blob.bin"),
+            "the refusal names the act and the real path, got {refused:?}"
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("secrets/blob.bin")).unwrap(),
+            b"original",
+            "refused before anything was written"
+        );
+    }
+
+    #[test]
+    fn a_denied_byte_read_is_refused_before_anything_is_read() {
+        let dir = fixture();
+        std::fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        std::fs::write(dir.path().join("secrets/blob.bin"), b"original").unwrap();
+        let ws = guarded(dir.path());
+
+        assert!(
+            matches!(ws.read_bytes("secrets/blob.bin"),
+                Err(Error::Refused { act, .. }) if act == "read"),
+            "a document read of a denied path is the same hole facing the other way"
+        );
+    }
+
+    /// The negative control for both tests above. The same bytes, the same
+    /// operations, a policy that allows them — so the refusals are measuring the
+    /// boundary rather than an operation that would have failed regardless.
+    #[test]
+    fn the_same_byte_io_succeeds_where_the_policy_allows_it() {
+        let dir = fixture();
+        let ws = guarded(dir.path());
+        let payload = b"\x50\x4b\x03\x04binary-not-utf8\xff\xfe";
+
+        assert_eq!(
+            ws.write_bytes("src/doc.bin", payload).unwrap(),
+            Wrote::Created
+        );
+        assert_eq!(ws.read_bytes("src/doc.bin").unwrap(), payload);
+    }
+
+    #[test]
+    fn byte_io_round_trips_content_that_is_not_valid_utf8() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+        // A lone 0xFF is not valid UTF-8: read_file would lose it, which is the
+        // whole reason this pair exists.
+        let payload = &[0x00u8, 0xFF, 0x10, 0x80, b'z'];
+
+        ws.write_bytes("blob.bin", payload).unwrap();
+        assert_eq!(ws.read_bytes("blob.bin").unwrap(), payload);
+        assert_ne!(
+            ws.read_file("blob.bin").unwrap().as_bytes(),
+            payload,
+            "the text reader cannot represent these bytes — that is what this pair is for"
+        );
+    }
+
+    #[test]
+    fn a_missing_byte_read_is_an_error_not_an_empty_document() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+
+        let err = ws.read_bytes("nope.xlsx").unwrap_err();
+        assert!(
+            err.to_string().contains("nope.xlsx"),
+            "the error names the missing file, got {err}"
+        );
+        // Contrast with the text reader, whose empty-on-missing behaviour is
+        // deliberate and unchanged.
+        assert_eq!(ws.read_file("nope.xlsx").unwrap(), "");
+    }
+
+    #[test]
+    fn a_byte_write_reports_whether_it_changed_anything() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+
+        assert_eq!(ws.write_bytes("b.bin", b"one").unwrap(), Wrote::Created);
+        assert_eq!(ws.write_bytes("b.bin", b"one").unwrap(), Wrote::Unchanged);
+        assert_eq!(ws.write_bytes("b.bin", b"two").unwrap(), Wrote::Changed);
+    }
+
+    #[test]
+    fn byte_io_cannot_escape_the_workspace_root() {
+        let dir = fixture();
+        let ws = Workspace::new(dir.path());
+        assert!(ws.read_bytes("../outside.bin").is_err());
+        assert!(ws.write_bytes("../outside.bin", b"x").is_err());
     }
 }
