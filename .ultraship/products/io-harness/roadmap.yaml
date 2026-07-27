@@ -227,15 +227,37 @@ versions:
     status: released
   - version: 0.15.0
     outcome: >
-      A developer hands the agent an image or video alongside the task and the harness passes it
-      through to any provider whose model accepts it, and the agent works a real git repository —
-      reading history, staging, and committing its own work — so a run ends as reviewable version
-      control rather than loose file edits.
+      A developer hands the agent an image alongside the task and the harness passes it through to
+      any provider whose model accepts one, and the agent works a real git repository — reading
+      history, staging, and committing its own work — so a run ends as reviewable version control
+      rather than loose file edits.
 
       Image work here means passthrough to a provider that accepts images. It does not mean OCR: OCR
       is off the roadmap by the owner's decision of 2026-07-27 and is not to be folded in here on
       the grounds that this is the image release.
-    detail: hypothesis
+
+      Video is cut from the roadmap entirely, not deferred — the owner's decision, 2026-07-27, and
+      it appears in no planned release. The evidence supported it: the Anthropic Messages API and
+      the OpenAI Chat Completions API both accept images and no video at all, and OpenRouter, the
+      only one of the three carrying a `video_url` content part, states that support varies by
+      model and gives no way to ask which. "Passthrough to any provider whose model accepts it"
+      would have meant one provider out of three and no way to know when. If video returns it will
+      be as a new roadmap entry argued on its own merits, when more than one provider takes it.
+
+      Git is shelled out to the `git` binary rather than bound through a library — the owner's
+      decision after weighing `git2` (libgit2's C, vendored) and `gix` (pure Rust, but its own
+      crate-status has `[ ] add and remove entries`, so staging does not exist). That choice is what
+      shapes the release. `ExecGuard::check` (src/verify.rs:248) enforces only the program name and
+      records argv without checking it, so `Act::Exec("git")` cannot tell `git log` from
+      `git push --force`. Git therefore ships as named built-ins that each construct their own fixed
+      argv, with the model naming paths and never arguments: the destructive and networked surface
+      is unreachable by construction rather than excluded by an allowlist.
+
+      Two carried-over defects ride along by the owner's decision: the 0.13.0 resume-from-stored-
+      policy gap, which matters more here because this release makes the agent take irreversible
+      commits under a policy, and 0.14.0's `fill_form`, which sets `/NeedAppearances` instead of
+      generating appearance streams.
+    detail: specified
     status: planned
   - version: 0.16.0
     outcome: >
