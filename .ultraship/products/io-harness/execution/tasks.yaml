@@ -14,7 +14,7 @@ tasks:
     in the crate persists a `Policy` today — the closest, `spawns.deny_write`, stores glob strings only.
     Without this table the resume path has nothing to consult and can only guess, which is the defect.
     Nothing else in the release can be built first.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F4 — the persisted policy round-trips. The policy a run was started under is recoverable from the
@@ -36,7 +36,12 @@ tasks:
   - src/state.rs
   - src/lib.rs
   - tests/policy.rs
-  evidence: []
+  evidence:
+  - 'src/state.rs: run_policies table, record_run_policy, run_policy; Layer/Defaults exported from src/lib.rs'
+  - 4 unit tests in src/state.rs cover a layered round-trip, a permissive round-trip, absence reading
+    as None and not as permissive, and idempotent re-recording
+  - 'run_policy errors on a failed read rather than reading as None, unlike its sibling getters: None
+    is what tells resume the run had no boundary'
 - id: US-IO-HARNESS-0.13.0-T02
   summary: 'A policy-bearing resume, and a bare `resume` that refuses rather than downgrades. `resume_with`
     and `resume_with_observed` take `policy: &Policy` and `approver: &dyn Approver` in the positions `run_with`/`run_with_observed`
@@ -49,7 +54,7 @@ tasks:
     a crash got an agent with no boundary and no warning. `resume_with` alone would not close it — every
     existing `resume` call site would stay silently permissive — so the refusal is half the fix, not a
     nicety.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.13.0-T01
   acceptance_criteria:
@@ -77,7 +82,13 @@ tasks:
   - src/lib.rs
   - tests/policy.rs
   - tests/checkpoint.rs
-  evidence: []
+  evidence:
+  - 'src/run.rs: resume_with and resume_with_observed; resume/resume_observed refuse a policy-bearing
+    run with Error::Resume'
+  - 4 tests in tests/policy.rs, including the negative control - the same resume with no policy supplied
+    DOES overwrite the secret
+  - the gate sits after the finished-run short-circuit; tests/net.rs caught the first placement and the
+    fix was in the gate, not the test
 - id: US-IO-HARNESS-0.13.0-T03
   summary: Serde on the context ledger types, with a total kind mapping. `Serialize`/`Deserialize` on
     `context::Ledger` (src/context.rs:119), `Observation` (:92) and `ObsKind` (:34) — none of the three
@@ -87,7 +98,7 @@ tasks:
   why_required: The ledger cannot be made durable until its types can cross the store boundary. Splitting
     this from T04 keeps the derive-and-mapping decision — which is where the silent-truncation risk lives
     — separate from the schema and the restore path.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F9 — every observation kind survives the round trip. All ten `ObsKind` variants (src/context.rs:34-54)
@@ -98,7 +109,10 @@ tasks:
     '
   files:
   - src/context.rs
-  evidence: []
+  evidence:
+  - 'src/context.rs: Serialize/Deserialize on Ledger, Observation, ObsKind with rename_all snake_case'
+  - 5 unit tests; all ten variants pinned by an explicit array, wire strings pinned by exact assertion,
+    an unknown kind asserted to error rather than default
 - id: US-IO-HARNESS-0.13.0-T04
   summary: A durable observation ledger, restored in both loops. A table in the `context_events` shape
     holding each `Observation`'s `step`, `kind` and `target` — the typed triple that supersession reads
@@ -110,7 +124,7 @@ tasks:
   why_required: A resumed run currently re-derives its context instead of restoring it, so it asks the
     model a different question than the process before it would have. Both construction sites are named
     because a fix that lands in one leaves the same defect at a depth where it is harder to see.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.13.0-T03
   acceptance_criteria:
@@ -132,7 +146,12 @@ tasks:
   - src/run.rs
   - src/context.rs
   - tests/context.rs
-  evidence: []
+  evidence:
+  - 'src/state.rs: ledger_observations table, record_observations, observations; src/run.rs: restore_ledger
+    and persist_ledger at both loops'
+  - 3 tests across tests/context.rs and tests/subagents.rs
+  - both restore tests verified to FAIL with the restore disabled; the first version of the test was vacuous
+    and was replaced
 - id: US-IO-HARNESS-0.13.0-T05
   summary: Replay survives an interruption in every loop. With the ledger restored, the workspace and
     sub-agent replay paths reproduce their own requests across a resume, so 0.12.0's divergence report
@@ -141,7 +160,7 @@ tasks:
   why_required: 0.12.0's F10 shipped with its second half unmet and iterations/US-IO-HARNESS-0.12.0-I01
     recorded it as unfixable without checkpointing the ledger. This task is the promise coming due; an
     evaluation harness that cannot survive an interruption cannot measure a 24-hour run.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.13.0-T04
   acceptance_criteria:
@@ -159,7 +178,12 @@ tasks:
   files:
   - tests/determinism.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - 'tests/determinism.rs: a_workspace_replay_survives_being_interrupted_and_resumed asserts canonical-trace
+    equality across an interruption'
+  - a_replay_still_refuses_a_request_that_was_never_recorded keeps 0.12.0's refusal for the case where
+    it is still correct
+  - closes the second half of 0.12.0's F10, recorded as unmet in iterations/US-IO-HARNESS-0.12.0-I01
 - id: US-IO-HARNESS-0.13.0-T06
   summary: A 0.12.0 store and a 0.12.0 checkpoint still work. `CHECKPOINT_FORMAT` stays 7 (src/state.rs:16)
     under a test that asserts it, every new table is `CREATE TABLE IF NOT EXISTS` and no existing table
@@ -169,7 +193,7 @@ tasks:
   why_required: Absence in the store and "permissive" are different facts, and conflating them would invent
     a permission decision nobody made. This is also the task that proves the release kept the additive-schema
     constraint rather than asserting it did.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.13.0-T02
   - US-IO-HARNESS-0.13.0-T04
@@ -202,7 +226,7 @@ tasks:
     that changes for an existing caller, with the reason the error is the safer default.
   why_required: The error message and the doc comment are what a developer meets at the moment their production
     resume stops working. O2 is an acceptance criterion rather than a courtesy for that reason.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.13.0-T02
   - US-IO-HARNESS-0.13.0-T04
@@ -220,7 +244,12 @@ tasks:
   files:
   - src/run.rs
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - Cargo.toml 0.13.0; CHANGELOG 0.13.0 section with the migration note folded into Changed per the repo's
+    six-heading convention
+  - doc comments on resume, resume_with, resume_with_decision and resume_tree state what each preserves
+    and what it does not
+  - README trace-and-resume section and the v0.7 bullet name resume_with; cargo doc adds no new warnings
 - id: US-IO-HARNESS-0.13.0-T08
   summary: The live run and the release gates. One workspace run against a real provider under a real
     policy, killed mid-run and resumed — the evidence 0.12.0 owed and never produced — with the transcript,

@@ -229,6 +229,18 @@ for step in store.steps(result.run_id)? {
 }
 ```
 
+A resumed run keeps the step it reached, what it spent, how long it has been
+alive, and the context it had assembled — it continues the same run rather than
+re-deriving one. If the run was started under a permission policy, resume it with
+`resume_with` and supply that policy; plain `resume` refuses a policy-bearing run
+rather than continuing it without a boundary.
+
+```rust
+let result = io_harness::resume_with(
+    &contract, &provider, &store, run_id, &policy, &approver,
+).await?;
+```
+
 Or run it live end to end: `cargo run --example edit_file`.
 
 ## Permissions and approval (v0.4)
@@ -457,7 +469,8 @@ no user input and pick up exactly where it stopped.
   row, its budget draw, and a checkpoint marker are committed in one rusqlite
   transaction. The committed checkpoint *is* the step's completion marker: a crash
   mid-commit leaves either a whole step or none of it, never a torn half.
-- **Resume the whole tree** — `resume` continues a single or workspace run;
+- **Resume the whole tree** — `resume` (or `resume_with`, for a run started under
+  a policy) continues a single or workspace run;
   `resume_tree` reconstructs a crashed v0.5 tree and continues **every** agent from
   its own last committed step. A parent *adopts* the children it had already
   spawned and resumes each from its checkpoint, rather than duplicating or

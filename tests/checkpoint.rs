@@ -13,8 +13,8 @@ use std::time::Duration;
 use io_harness::approve::{Approver, Decision, DecisionFuture, Request};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    resume, resume_tree, resume_tree_with_decision, run, run_tree, ApproveAll, Containment, Policy,
-    Provider, RunOutcome, Store, TaskContract, Verification,
+    resume, resume_tree, resume_tree_with_decision, run, run_tree, run_with, ApproveAll,
+    Containment, Policy, Provider, RunOutcome, Store, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -124,6 +124,29 @@ fn spawn(goal: &str, file: &str, needle: &str) -> ToolCall {
     )
 }
 
+/// A workspace provider that writes one fixed (path, content) on every turn.
+///
+/// Stateless, so a replayed or resumed step behaves identically. Pointed at a
+/// contract whose verification the content does NOT satisfy it produces a run
+/// that reaches its step cap with real committed state — the interrupted run the
+/// back-compatibility tests below resume from; pointed at content that does
+/// satisfy it, it finishes one.
+struct WriteOnce {
+    path: &'static str,
+    content: &'static str,
+}
+impl Provider for WriteOnce {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        Ok(CompletionResponse {
+            tool_calls: vec![call(
+                "write_file",
+                json!({ "path": self.path, "content": self.content }),
+            )],
+            ..Default::default()
+        })
+    }
+}
+
 /// Approver that always defers (for the pause-across-restart test).
 struct Defer;
 impl Approver for Defer {
@@ -147,6 +170,30 @@ fn tree_contract(root: &std::path::Path) -> TaskContract {
 }
 fn containment() -> Containment {
     Containment::new(10, 4, 3, 1_000_000)
+}
+
+/// A workspace contract over `root` satisfied by `needle` landing in `out.txt`.
+/// Workspace mode on purpose: the observation ledger and the policy gate only
+/// exist on that path, so a single-file contract would prove nothing about
+/// either.
+fn out_contract(root: &std::path::Path, needle: &str, max_steps: u32) -> TaskContract {
+    TaskContract::workspace(
+        "write out.txt",
+        root,
+        Verification::WorkspaceFileContains {
+            file: "out.txt".into(),
+            needle: needle.into(),
+        },
+    )
+    .with_max_steps(max_steps)
+}
+
+/// The store as a plain SQLite file, for reaching past the public API to make a
+/// 0.13.0 database look like a 0.12.0 one. `rusqlite` is the crate's own storage
+/// dependency and other tests in this suite (`store_open`, `outcome_record`)
+/// already open the file this way.
+fn sqlite(db: &std::path::Path) -> rusqlite::Connection {
+    rusqlite::Connection::open(db).expect("open the store as a plain SQLite file")
 }
 
 /// Locate the compiled `crash_fixture` example next to this test binary, for the
