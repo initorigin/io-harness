@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.14.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -423,3 +423,121 @@ open_questions:
   Where do fixture documents live and how big are they? They have to be real files rather than
   generated ones for F3 and F4 to mean anything, and they are binary blobs in a git repository.
   Decide the size ceiling before adding the first one.
+released_at: 2026-07-27T14:40:00Z
+mode: published
+delivered: >
+  A developer runs a task over real documents, and the documents are governed by the same rules as
+  source files. The agent reads an `.xlsx` and changes one cell of it with the rest of the workbook
+  intact, reads and generates a `.docx`, reads the text of a `.pptx`, generates a PDF and extracts
+  its text, stamps a watermark across its pages and fills its AcroForm fields, and decodes a barcode
+  or QR code out of an image. Every one of those is a built-in dispatched on `Act::Read` or
+  `Act::Write` against the path the model named, over new byte-level workspace IO that no document
+  module bypasses, and `Verification::DocumentContains` gates a run on a document's extracted text.
+  All of it is behind an opt-in `documents` feature; the default build is byte-for-byte the
+  dependency tree 0.13.0 had. Proven live: a real model read a real workbook and edited it in place
+  under a permissive policy, and was refused the identical write under a policy that denied it.
+evidence:
+  tests:
+  - cargo test — 428 passing, 0 failing (default build)
+  - cargo test --features documents — 474 passing, 0 failing
+  - 'src/tools/documents/xlsx.rs — 9 tests including
+    `an_edit_preserves_a_workbook_the_editing_crate_did_not_write`, which builds the two-sheet
+    bold-formatted fixture with rust_xlsxwriter and edits it with umya-spreadsheet, so the preserved
+    formatting was written by a crate other than the one under test'
+  - 'src/tools/documents/pdf.rs — 17 tests. F6 is asserted as append-not-replace: watermarking twice
+    leaves both stamps and the body, and a page with inherited resources keeps its own font
+    reachable. A watermark that flattened the original would pass a naive check and fails these'
+  - 'src/tools/documents/pptx.rs — 7 tests, including numeric slide ordering past nine and that only
+    slide parts are read, not layouts, masters or notes'
+  - src/tools/documents/docx.rs — 4 tests; src/tools/documents/barcode.rs — 6 tests, including an
+    image with no code returning an empty result rather than an error
+  - 'every module carries a denied-path refusal test AND its permissive negative control, so each
+    boundary test is measuring the boundary rather than an operation that would have failed anyway'
+  - 'src/verify.rs — 15 tests, three of them for DocumentContains. The decisive one reads one
+    document both ways: WorkspaceFileContains says "does not contain", DocumentContains says it
+    does'
+  builds:
+  - cargo fmt --check — exit 0
+  - cargo clippy --all-targets -- -D warnings — exit 0
+  - cargo clippy --all-targets --features documents -- -D warnings — exit 0
+  - 'cargo +1.88 build --all-targets --features documents — exit 0, so the declared MSRV holds for
+    the crate a consumer actually enables and not only for the default build'
+  - cargo doc --no-deps --features documents — exit 0, 6 warnings, all predating this release
+  - cargo package --features documents — io-harness-0.14.0.crate produced, 439,342 bytes
+  - 'GitHub Actions run 30273678142 on feat/0.14.0, all five legs success: test (ubuntu-latest),
+    test (macos-latest), test (windows-latest), msrv, lint. The document tests run on all three
+    OSes, the msrv leg builds featured, and lint runs clippy both ways'
+  - 'cargo tree — 401 lines, identical to 0.13.0. cargo tree --features documents — 837 lines. The
+    first number is the constraint the release was held to'
+  reviews:
+  - 'The F3 fixture clause was found unmet during completion and fixed rather than argued away: the
+    original two-sheet fixture was written by umya-spreadsheet, the same crate set_cell edits with,
+    so it proved only that the library round-trips its own output. A cross-crate fixture was added'
+  - 'The live run''s own gate was found to be weaker than it looks and the example says so: because
+    DocumentContains puts its needle in the criterion the model is shown, an agent could satisfy it
+    by replacing the workbook. The example checks preservation and cell placement in Rust afterwards,
+    which no prompt can talk past'
+  deployments:
+  - 'crates.io — cargo publish, see known_limitations: sealed before the upload, per the repo''s
+    release order'
+  health_checks:
+  - 'Live run against OpenRouter (openai/gpt-5.6-luna), examples/documents_live.rs, both arms.
+    Permissive: Success in 3 steps — find, xlsx_read, then xlsx_set_cell writing C12=218454; all
+    nine original rows still readable and the total in the cell it was asked for. Denied: the same
+    write refused twice by rule ledger.xlsx, StepCapReached, workbook bytes identical before and
+    after (a589c65bc0171e87). Transcript at evidence/0.14.0/live_run_0.14.0_documents.txt'
+  - 'Public surface diff at evidence/0.14.0/public_surface_diff.md: 389 items at v0.13.0, 420 now,
+    zero removals — no public item renamed or removed'
+known_limitations:
+- >
+  `fill_form` sets `/V`, sets `/NeedAppearances` and deletes the stale `/AP` rather than generating
+  appearance streams itself, and it has never been opened in a real PDF viewer. `/NeedAppearances`
+  is a request to the viewer to redraw the field; a viewer that ignores it will show the field
+  blank. The test is named for what it proves — the value is set and the viewer is asked to redraw
+  it — and F7's "renders it" is satisfied at that level rather than by rasterising a page.
+- >
+  `pdf::read_text` wraps `pdf-extract` in `catch_unwind` because that crate is written to panic on
+  input it does not understand. The guard depends on unwinding, so it does nothing under a
+  `panic = "abort"` profile, and the default panic hook still prints the message before the error is
+  returned. Sound, but unusual enough to name.
+- >
+  The tree carries no binary document fixtures. The open question about where fixture documents live
+  and how large they may be was answered by not having any: fixtures are generated in-test, and F3's
+  "a file the test did not itself generate" is met by generating it with a *different* crate than
+  the one under test. A workbook Microsoft Excel itself wrote is still not asserted against, and the
+  strongest evidence for the preserving edit is the cross-crate test plus the live run, where three
+  crates touch one workbook in sequence.
+- >
+  The spreadsheet preserving-edit is `umya-spreadsheet`'s round trip. What that library models it
+  keeps; what it does not model it can drop or normalise. Charts, drawings, pivot tables, slicers
+  and macros are where that bites, and nothing here can tell a caller which of those a given
+  workbook holds — so the limit is stated in the doc comment rather than enforced by a check that
+  would pass on the workbook it could not understand.
+- >
+  PDF text extraction is best-effort on reading order. A PDF stores placed glyphs, not a document:
+  columns can interleave, tables lose their shape, and a scanned page returns an empty string rather
+  than an error. Treat the output as evidence, not as the document.
+- >
+  Word is generate-and-read with no in-place edit, and PowerPoint is read-only with no writer. Both
+  are deliberate and both are documented at the call site; neither is a later release's task.
+- >
+  `Verification` is not `#[non_exhaustive]`, so adding `DocumentContains` breaks a downstream
+  `match` that has no wildcard arm. Under 0.x that is a minor bump, which is what this is, and the
+  public-surface method — a grep for `pub` items — cannot see enum variants at all, so the addition
+  is recorded in the diff's prose rather than in its counts.
+- >
+  Document reads are bounded by the same context caps as any other observation, but a large document
+  is rendered whole before the cap applies. The rendering choices per format are what keep that
+  affordable — a sheet is tab-separated with a row/column gutter rather than a padded grid — and no
+  streaming or paging reader exists.
+- >
+  The live run used one provider and one model (OpenRouter, openai/gpt-5.6-luna) and one format. It
+  exercises the spreadsheet path end to end under a policy and its negative control; the other four
+  formats are covered by tests rather than by a live model.
+- >
+  The record is sealed before the crates.io upload, which follows the develop->main merge and the
+  GitHub Release per the repo's release order. `mode: published` states the authorized target; the
+  flow makes it true.
+supersedes: 0.13.0
+next_recommended_version: 0.15.0
+immutable: true

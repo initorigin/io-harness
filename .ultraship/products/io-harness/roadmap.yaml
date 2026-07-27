@@ -224,7 +224,7 @@ versions:
       crate's round trip silently drops OOXML it does not model, which for an agent editing
       someone's real document is data loss, so "edit a Word file in place" is not claimed.
     detail: specified
-    status: planned
+    status: released
   - version: 0.15.0
     outcome: >
       A developer hands the agent an image or video alongside the task and the harness passes it
@@ -232,9 +232,9 @@ versions:
       reading history, staging, and committing its own work — so a run ends as reviewable version
       control rather than loose file edits.
 
-      Image work here means passthrough to a provider that accepts images. It does not mean OCR:
-      OCR is off the roadmap by the owner's decision of 2026-07-27 and is not to be folded in here
-      on the grounds that this is the image release.
+      Image work here means passthrough to a provider that accepts images. It does not mean OCR: OCR
+      is off the roadmap by the owner's decision of 2026-07-27 and is not to be folded in here on
+      the grounds that this is the image release.
     detail: hypothesis
     status: planned
   - version: 0.16.0
