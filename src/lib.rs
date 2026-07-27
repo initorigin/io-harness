@@ -241,7 +241,7 @@ pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // reaching into a provider's namespace to find it.
 pub use net::REQUEST_TIMEOUT;
 pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
-pub use policy::{Act, Effect, Policy, Rule, Verdict};
+pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
     ToolSpec, Usage,

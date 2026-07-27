@@ -9,6 +9,7 @@
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
+use crate::policy::Policy;
 
 /// The checkpoint layout version stamped into `PRAGMA user_version`. Bump when
 /// the on-disk checkpoint format changes incompatibly. A store whose version is
@@ -977,6 +978,29 @@ impl Store {
              );",
         )?;
 
+        // 0.13.0: the policy a run was started under, kept so a later resume can
+        // tell what boundary the caller enforced instead of guessing. Nothing in
+        // the schema recorded it: `policy_events` holds the decisions a policy
+        // produced, which is the opposite direction — a run that was never asked
+        // to do anything forbidden leaves no events at all, and a permissive run
+        // leaves none either, so the two are indistinguishable after the fact.
+        //
+        // Stored as JSON in one column rather than shredded into rule rows: the
+        // only reader wants the whole [`Policy`] back, and a serialised blob
+        // cannot drift from the type the way a hand-written flattening would.
+        //
+        // New table only, so a 0.12.0 database gains it and a 0.12.0 binary, which
+        // never queries it, still opens and resumes a migrated database.
+        // Deliberately NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout
+        // changed, and bumping it would make [`Store::check_resumable`] refuse
+        // every 0.12.0 store for an additive table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_policies (
+                 run_id INTEGER PRIMARY KEY,
+                 policy TEXT NOT NULL
+             );",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -1241,6 +1265,54 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record the policy a run was started under.
+    ///
+    /// `INSERT OR REPLACE`, like every other per-run row, so recording twice for
+    /// one run — a resume that re-states its boundary — replaces rather than
+    /// duplicates or fails.
+    pub fn record_run_policy(&self, run_id: i64, policy: &Policy) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO run_policies (run_id, policy) VALUES (?1, ?2)",
+            (
+                run_id,
+                serde_json::to_string(policy).expect("a Policy is always serialisable"),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// The policy a run was started under, or `None` if none was recorded.
+    ///
+    /// `None` is not [`Policy::permissive`] and must never be read as it: a run
+    /// written by 0.12.0 has no row at all, so the honest answer is "nobody
+    /// recorded what the boundary was", not "the caller chose to enforce
+    /// nothing". A caller that needs a policy either way has to decide which to
+    /// assume, and it should decide that knowingly.
+    /// Unlike the other getters in this file, a failed read is an error rather
+    /// than `None`. They can fold the two together because a missing memory
+    /// entry and an unreadable one lead to the same recovery; here they do not.
+    /// `None` is what tells [`crate::resume`] the run had no boundary and may be
+    /// resumed permissively, so a disk error that read as `None` would hand a
+    /// policy-bearing run an agent with no policy — silently, and by exactly the
+    /// route this table exists to close.
+    pub fn run_policy(&self, run_id: i64) -> Result<Option<Policy>> {
+        let json: Option<String> = match self.conn.query_row(
+            "SELECT policy FROM run_policies WHERE run_id = ?1",
+            [run_id],
+            |r| r.get(0),
+        ) {
+            Ok(json) => Some(json),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(e.into()),
+        };
+        json.map(|j| {
+            serde_json::from_str(&j).map_err(|e| Error::Resume {
+                reason: format!("run {run_id} has an unreadable recorded policy: {e}"),
+            })
+        })
+        .transpose()
     }
 
     /// Every sandbox event recorded for a run, in order.
@@ -2522,5 +2594,70 @@ mod tests {
         assert!(store.memory_list("ws").unwrap().is_empty());
         store.memory_put("ws", "k", "v", 1, 1).unwrap();
         assert_eq!(store.memory_get("ws", "k").unwrap().unwrap().value, "v");
+    }
+
+    #[test]
+    fn a_layered_policy_reads_back_exactly_as_it_was_recorded() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        let policy = Policy::default()
+            .layer("task")
+            .deny_write("vendor/**")
+            .rule(
+                crate::policy::Act::Exec,
+                crate::policy::Effect::Allow,
+                "cargo",
+            );
+
+        store.record_run_policy(run, &policy).unwrap();
+
+        // Equal, not merely similar: the layers, their order, and the defaults
+        // are the boundary, so a lossy round trip is a wrong boundary.
+        assert_eq!(store.run_policy(run).unwrap(), Some(policy));
+    }
+
+    #[test]
+    fn a_permissive_policy_reads_back_permissive() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store.record_run_policy(run, &Policy::permissive()).unwrap();
+
+        let back = store.run_policy(run).unwrap().expect("a row was recorded");
+        assert!(back.is_permissive());
+    }
+
+    #[test]
+    fn a_run_with_no_recorded_policy_reads_back_none_not_permissive() {
+        let store = Store::memory().unwrap();
+        let unrecorded = store.start_run("goal", "root").unwrap();
+        let permissive = store.start_run("goal", "root").unwrap();
+        store
+            .record_run_policy(permissive, &Policy::permissive())
+            .unwrap();
+
+        // The distinction the table exists for: a 0.12.0 run wrote no row, and
+        // "nobody recorded a policy" must never be read as "the caller chose to
+        // enforce nothing".
+        assert_eq!(store.run_policy(unrecorded).unwrap(), None);
+        assert!(store.run_policy(permissive).unwrap().is_some());
+    }
+
+    #[test]
+    fn re_recording_a_policy_for_the_same_run_replaces_it() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store.record_run_policy(run, &Policy::permissive()).unwrap();
+        store.record_run_policy(run, &Policy::default()).unwrap();
+
+        assert_eq!(store.run_policy(run).unwrap(), Some(Policy::default()));
+        let rows: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM run_policies WHERE run_id = ?1",
+                [run],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 }

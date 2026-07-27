@@ -24,13 +24,23 @@
 //! ([`Ledger::full_text`]); eliding is a decision about the *request*, not about
 //! the trace.
 
+use serde::{Deserialize, Serialize};
+
 use crate::error::Result;
 use crate::policy::{Act, Effect, Policy};
 use crate::state::{ContextEvent, MemoryEntry, Store};
 use crate::tools::Workspace;
 
 /// What an observation was, so assembly can reason about it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// The serde rendering (`read`, `grep`, `find`, `write`, `skill`, `tool`, `mcp`,
+/// `child`, `message`, `error` — snake_case, as [`Act`] and [`Effect`] already
+/// are) is a *wire format*: it is what a persisted ledger's `kind` column holds,
+/// so each of those ten strings is a stored value that a later release may not
+/// rename. It is deliberately not [`ObsKind::label`], which renders different
+/// words for a different reader — see the note there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ObsKind {
     /// A file read into context.
     Read,
@@ -71,6 +81,12 @@ impl ObsKind {
 
     /// The word a stub uses for this kind — the same word the observation's own
     /// header uses, so a stub reads as the thing it replaced.
+    ///
+    /// **Not the serialized form, and must not be unified with it.** These are
+    /// English for the model and the operator reading a prompt (`Write` is
+    /// "wrote", `Mcp` is "mcp tool"); the serde rendering on the type above is a
+    /// stored value. Making either one match the other changes the prompt text
+    /// or orphans every persisted ledger, and neither failure announces itself.
     pub fn label(self) -> &'static str {
         match self {
             ObsKind::Read => "read",
@@ -88,7 +104,7 @@ impl ObsKind {
 }
 
 /// One observation exactly as it happened.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Observation {
     /// The step it happened on.
     pub step: u32,
@@ -115,7 +131,10 @@ impl Observation {
 
 /// The observations of one run, in order. Assembly reads it; nothing mutates
 /// history.
-#[derive(Debug, Clone, Default)]
+///
+/// `entries` stays private through serde too — it serializes as the one field it
+/// is, so a restored ledger is still append-only through [`Ledger::push`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Ledger {
     entries: Vec<Observation>,
 }
@@ -746,6 +765,96 @@ mod tests {
                 "{kind:?} names the answerer, not the subject"
             );
         }
+    }
+
+    /// Every variant, written out. Deliberately not derived from anything: an
+    /// eleventh variant must be added here by hand, which is the point — a new
+    /// kind that nothing pins is a new wire string nothing pins.
+    const ALL_KINDS: [ObsKind; 10] = [
+        ObsKind::Read,
+        ObsKind::Grep,
+        ObsKind::Find,
+        ObsKind::Write,
+        ObsKind::Skill,
+        ObsKind::Tool,
+        ObsKind::Mcp,
+        ObsKind::Child,
+        ObsKind::Message,
+        ObsKind::Error,
+    ];
+
+    #[test]
+    fn every_obs_kind_round_trips_through_json() {
+        for kind in ALL_KINDS {
+            let json = serde_json::to_string(&kind).unwrap();
+            let back: ObsKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, kind, "{kind:?} did not survive {json}");
+        }
+    }
+
+    #[test]
+    fn obs_kind_wire_strings_are_pinned() {
+        // Stored values. Changing one silently orphans every ledger already on
+        // disk, so each is asserted literally rather than derived from the enum.
+        let expected = [
+            "\"read\"",
+            "\"grep\"",
+            "\"find\"",
+            "\"write\"",
+            "\"skill\"",
+            "\"tool\"",
+            "\"mcp\"",
+            "\"child\"",
+            "\"message\"",
+            "\"error\"",
+        ];
+        for (kind, want) in ALL_KINDS.into_iter().zip(expected) {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), want, "{kind:?}");
+        }
+        // The wire string is not the display word: `label` renders `Write` as
+        // "wrote" and `Mcp` as "mcp tool". Both are correct, for different
+        // readers — this pins that they are allowed to differ.
+        assert_eq!(ObsKind::Write.label(), "wrote");
+        assert_eq!(ObsKind::Mcp.label(), "mcp tool");
+    }
+
+    #[test]
+    fn an_unknown_kind_string_fails_rather_than_defaulting() {
+        // A silently-defaulted kind would restore a ledger that reads as valid
+        // and is not: a `write` decoded as a `read` un-invalidates the reads it
+        // should have made stale.
+        let bad: std::result::Result<ObsKind, _> = serde_json::from_str("\"wrote\"");
+        assert!(bad.is_err(), "got {bad:?}");
+        assert!(serde_json::from_str::<ObsKind>("\"Read\"").is_err());
+        assert!(serde_json::from_str::<ObsKind>("\"sing\"").is_err());
+    }
+
+    #[test]
+    fn an_observation_round_trips_with_and_without_a_target() {
+        for obs in [
+            Observation::new(3, ObsKind::Read, Some("src/lib.rs".into()), "\n[read]\nA\n"),
+            Observation::new(4, ObsKind::Message, None, "thinking"),
+        ] {
+            let json = serde_json::to_string(&obs).unwrap();
+            let back: Observation = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, obs, "round-trip changed {json}");
+        }
+    }
+
+    #[test]
+    fn a_ledger_round_trips_its_entries_in_order() {
+        let mut l = Ledger::new();
+        l.push(Observation::new(1, ObsKind::Read, Some("a".into()), "A"));
+        l.push(Observation::new(1, ObsKind::Grep, Some("x".into()), "X"));
+        l.push(Observation::new(2, ObsKind::Write, Some("a".into()), "W"));
+        l.push(Observation::new(2, ObsKind::Error, None, "boom"));
+
+        let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        // Order is load-bearing: supersession and invalidation both read "is
+        // there a *later* entry", so a reordered restore changes the answer.
+        assert_eq!(back.entries(), l.entries());
+        assert_eq!(back.full_text(), l.full_text());
+        assert_eq!(back.text_for_step(2), l.text_for_step(2));
     }
 
     #[test]
