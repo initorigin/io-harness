@@ -193,7 +193,7 @@ tasks:
   why_required: Absence in the store and "permissive" are different facts, and conflating them would invent
     a permission decision nobody made. This is also the task that proves the release kept the additive-schema
     constraint rather than asserting it did.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.13.0-T02
   - US-IO-HARNESS-0.13.0-T04
@@ -218,7 +218,16 @@ tasks:
   files:
   - tests/checkpoint.rs
   - src/state.rs
-  evidence: []
+  evidence:
+  - '5 tests in tests/checkpoint.rs: CHECKPOINT_FORMAT still 7; a store with both new tables dropped opens,
+    migrates and resumes to Success; a run with no recorded policy resumes through the bare resume, exercising
+    the None branch of the gate; a run with no durable observations resumes and re-derives; a finished
+    policy-bearing run still reports its outcome'
+  - 'evidence/0.13.0/public_surface_diff.md: no public item renamed or removed; the only break is behavioural
+    and a line diff cannot see it, which the file records'
+  - 'recorded limit: from_conn runs every CREATE TABLE IF NOT EXISTS before returning a Store, so a query
+    against a genuinely absent table is unreachable through the public API - what is proven is that a
+    0.12.0 store opens and resumes'
 - id: US-IO-HARNESS-0.13.0-T07
   summary: The boundary, documented where a developer meets it. Every resume entry point's doc comment
     says what it preserves and what it does not, and `resume`'s names `resume_with` — so the answer is
@@ -259,7 +268,7 @@ tasks:
   why_required: Every functional criterion in this release runs against fixtures and recordings. A live
     run is the only thing that exercises the observer, the recording and the restored resume together
     on a path no fixture covers, and 0.12.0 shipped without it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.13.0-T05
   - US-IO-HARNESS-0.13.0-T06
@@ -278,4 +287,12 @@ tasks:
     '
   files:
   - evidence/0.13.0/
-  evidence: []
+  evidence:
+  - 'examples/live_resume.rs run against OpenRouter (openai/gpt-5.6-luna): the model tried to read secrets/key.txt
+    on a resume-driven step and the policy refused it, file unchanged, refusal in the trace under the
+    original run id'
+  - ledger went from 3 durable observations to 6 under one run id; 4 steps, 2664 tokens, Success
+  - transcript at evidence/0.13.0/live_run_0.13.0_policy_resume.txt (gitignored, as every release's evidence
+    is)
+  - 419 tests across 26 targets, cargo clippy --all-targets -D warnings clean, cargo fmt --check clean,
+    cargo doc adds no new warnings

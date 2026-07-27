@@ -78,6 +78,7 @@ async fn main() -> io_harness::Result<()> {
             "[2] the store remembers the boundary: is_permissive = {:?}",
             recorded.as_ref().map(|p| p.is_permissive())
         );
+        let steps_before = store.last_step(run_id)?;
         match resume(&contract(8), &provider, &store, run_id).await {
             Err(e) => println!("[2] bare resume refused, as it must: {e}"),
             Ok(r) => panic!(
@@ -87,8 +88,8 @@ async fn main() -> io_harness::Result<()> {
         }
         assert_eq!(
             store.last_step(run_id)?,
-            store.last_step(run_id)?,
-            "the refusal took no step"
+            steps_before,
+            "the refusal took no step — it stopped before the loop, not inside it"
         );
     }
 
