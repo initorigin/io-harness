@@ -1,0 +1,49 @@
+product: io-harness
+version: 0.14.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: >
+    Continuing the session that shipped 0.13.0. The owner's standing direction is "commit
+    constantly, be token-efficient", and they have been actively steering scope — OCR and
+    PowerPoint authoring cut, PowerPoint reading kept — so scope decisions are theirs to refine and
+    mine to record, not to re-litigate.
+  budget: null
+  capacity: >
+    Subagents for parallel work on disjoint files, main thread token-efficient. This release
+    parallelises unusually well once the foundations land: T05, T06 and T07 touch different formats
+    and different files and depend only on T01-T03.
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+  - >
+    Recorded constraint: subagents for disjoint files, token-efficient main thread. After the three
+    foundation tasks, four capability tasks (Excel, Word+PowerPoint, PDF, barcode) touch different
+    crates, different tool modules and different fixtures, with no shared state between them. This
+    is the most parallelisable release on the roadmap so far.
+  - >
+    A full dependency assessment was taken before this contract was written, covering every
+    candidate crate with its version, release date, licence, MSRV and maintenance signal. Two
+    capabilities were cut on that evidence before any code was written, which is the expensive
+    discovery already made.
+  - >
+    The architecture question — the one that decides whether the release is safe — is settled and
+    written down: built-ins with per-path gates, over byte-level policy-checked workspace IO, not
+    registered `Tool` implementations. The remaining work is breadth against a settled shape.
+  - >
+    Not `high`, for three reasons. Five formats is genuinely wide, and the cost is in fixtures and
+    edge cases rather than in any single hard problem. PDF AcroForm appearance streams are a known
+    trap that eats a day and cannot be skipped without F7 failing. And the first `[features]`
+    section in the crate's history doubles the local build matrix — everything must pass with the
+    feature off as well as on, and the off case is the one that gets forgotten.
+  major_cost_drivers:
+  - Fixtures that are real documents rather than files the tests generated, without which F3 and F4
+    prove only that a library round-trips its own output.
+  - PDF form-field appearance streams — the difference between the value being in the file and a
+    viewer showing it.
+  - The feature-off build, which must stay byte-identical in its dependency tree to 0.13.0.
+  - Dependency vetting at adoption time, since the research found several crates with
+    marketing-grade descriptions and traction out of line with their download counts.
+  recommended_scope_change: null
