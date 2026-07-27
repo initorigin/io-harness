@@ -1,617 +1,252 @@
 product: io-harness
-version: 0.12.0
+version: 0.13.0
 tasks:
-- id: US-IO-HARNESS-0.12.0-T01
-  summary: 'Close three shipped-but-unreachable defects, each one site. `Store::open` sets `journal_mode=WAL`
-    and a `busy_timeout` so a store the crate hands out is safe for a second reader without that reader
-    configuring the file behind the API''s back. The request deadline becomes overridable by a caller:
-    `REQUEST_TIMEOUT` and `http_client_with_timeout` (`src/net.rs:40,62`) and the three `pub(crate) fn
-    at` provider constructors are unreachable, so 0.11.0''s O4 shipped as documentation of a capability
-    nobody has. `Containment.max_total_duration` (`src/containment.rs:40`) becomes enforced.'
-  why_required: Three defects that make the crate's own documentation false. 0.11.0's record claims the
-    deadline is overridable and every path to it is `pub(crate)`; a tree can be given a duration ceiling
-    that is silently ignored, which is a containment hole on a 24-hour run; and a store the crate opens
-    cannot safely be read by anything else, which is the coupling the observer exists to remove. None
-    depends on any feature in this release, so they land first.
-  status: done
+- id: US-IO-HARNESS-0.13.0-T01
+  summary: Persist the policy a run was started under. A `run_policies` table created with `CREATE TABLE
+    IF NOT EXISTS` in `Store::from_conn` (src/state.rs:757, alongside `context_events` at :934), holding
+    the run id, whether the caller enforced a boundary, and the serialised `Policy`. A `record_run_policy`
+    writer and a `run_policy(run_id)` reader in the `record_*`/`*_events(run_id)` shape the store already
+    uses (src/state.rs:1200, :1229). Written from `run_with_observed`, which already computes the fact
+    at src/run.rs:246 as `caller_enforces` and currently throws it away. `Layer` and `Defaults` are added
+    to the `pub use policy::{...}` at src/lib.rs:244 so a caller who reads the policy back can name the
+    types inside it.
+  why_required: F1 and F2 both need a durable answer to "was this run started under a boundary", and nothing
+    in the crate persists a `Policy` today — the closest, `spawns.deny_write`, stores glob strings only.
+    Without this table the resume path has nothing to consult and can only guess, which is the defect.
+    Nothing else in the release can be built first.
+  status: todo
   depends_on: []
   acceptance_criteria:
-  - 'F6 — a store the crate opens is safe for a second reader. `Store::open` sets WAL and a busy timeout;
-    asserted by a concurrent reader on the same file that neither blocks the writer nor aborts, using
-    no pragmas of its own.
+  - 'F4 — the persisted policy round-trips. The policy a run was started under is recoverable from the
+    store and equal to the one supplied, including its layers, for a layered policy and for a single-layer
+    one. A permissive policy is stored as such and is distinguishable from no record at all.
 
     '
-  - 'F17 — the request deadline is overridable by a caller. Asserted from an integration test, which is
-    the only place that proves the item is actually public — the 0.11.0 criterion that claimed this was
-    satisfied by a `pub(crate)` path reachable only from inside the crate.
+  - 'N1 — no schema break. `CHECKPOINT_FORMAT` stays 7, asserted by a test. Every new table is created
+    with `CREATE TABLE IF NOT EXISTS` in `Store::from_conn`; no existing table is renamed, reshaped or
+    has a column removed. A store written by 0.12.0 opens under 0.13.0 and every 0.12.0 test that reads
+    the schema still passes.
 
     '
-  - 'F16 — a tree halts on its duration ceiling. `Containment.max_total_duration` is enforced; asserted
-    by a tree that crosses it and stops. It is silently ignored today.
+  - 'O3 — the persisted policy is readable for an audit: a finished run can answer what rules it ran under,
+    from the crate''s own API rather than by opening the SQLite file.
 
     '
   files:
   - src/state.rs
-  - src/net.rs
-  - src/provider/openrouter.rs
-  - src/provider/anthropic.rs
-  - src/provider/openai.rs
-  - src/containment.rs
-  - tests/net.rs
-  evidence:
-  - Store::open sets WAL + public BUSY_TIMEOUT (5s); tests/store_open.rs 4 passed. WAL asserted from a
-    plain second connection with no pragmas of its own.
-  - with_timeout(Duration) added public on OpenRouter/Anthropic/OpenAi; REQUEST_TIMEOUT public at the
-    crate root and per provider module. tests/deadline.rs 2 passed, as an INTEGRATION test because that
-    is the only thing that proves the item is reachable from outside the crate -- the exact mistake 0.11.0's
-    O4 made.
-  - Containment::max_total_duration enforced against the ROOT run's started_at; max_total_cost documented
-    as inert with the reason (no price telemetry). tests/subagents.rs 12 passed, including a tree with
-    no ceiling still reaching its step cap unchanged.
-- id: US-IO-HARNESS-0.12.0-T02
-  summary: Make an outcome terminal and an audit table readable. `finish_run(run_id, "refused")` (`src/run.rs:1801`)
-    gains a `RunOutcome` variant and a `terminal_outcome` mapping (`src/run.rs:630-651`), so resuming
-    a network-refused run reports what happened instead of falling back into the loop. `AgentEvent` and
-    `SpawnRow` are re-exported from `src/lib.rs`, so `Store::agent_events` stops returning a `Vec` of
-    a type no external caller can name.
-  why_required: '`"refused"` is the same defect 0.11.0 fixed for `"escalated"` — an outcome string with
-    no variant and no mapping, so a resumed run silently re-runs. And `agent_events` is the only audit
-    of per-step budget draws; an observability release cannot ship leaving it unreadable through the public
-    API.'
-  status: done
-  depends_on: []
+  - src/lib.rs
+  - tests/policy.rs
+  evidence: []
+- id: US-IO-HARNESS-0.13.0-T02
+  summary: 'A policy-bearing resume, and a bare `resume` that refuses rather than downgrades. `resume_with`
+    and `resume_with_observed` take `policy: &Policy` and `approver: &dyn Approver` in the positions `run_with`/`run_with_observed`
+    use (src/run.rs:200-218), threading them into `run_workspace_from` (src/run.rs:1207) and `McpSession::connect`
+    where `resume_observed` currently substitutes `Policy::permissive()` and `&ApproveAll` (src/run.rs:336,
+    :346). `resume` and `resume_observed` keep their signatures and gain one behaviour: a run whose stored
+    record says the caller enforced a policy returns a typed error naming the run and `resume_with`, before
+    any provider call. Both new functions join the `pub use run::{...}` at src/lib.rs:254.'
+  why_required: This is the defect. A caller who ran under a deny-by-default policy and resumed after
+    a crash got an agent with no boundary and no warning. `resume_with` alone would not close it — every
+    existing `resume` call site would stay silently permissive — so the refusal is half the fix, not a
+    nicety.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.13.0-T01
   acceptance_criteria:
-  - 'F14 — a refused run is terminal on resume. `"refused"` (`src/run.rs:1801`) maps through `terminal_outcome`
-    to its own outcome, so resuming reports what happened instead of re-entering the loop. A regression
-    test that fails against 0.11.0, in the shape of 0.11.0''s own F10.
+  - 'F1 — a resumed run enforces the caller''s policy. A workspace run started under a deny-by-default
+    policy, interrupted, and resumed through `resume_with` refuses the denied action, records the refusal
+    in the trace under the original `run_id`, and does not perform it. The negative control is an acceptance
+    criterion, not an extra: the same scenario driven through today''s code path must show the action
+    performed, so the test is proven able to fail on exactly the defect it guards.
 
     '
-  - 'F15 — `agent_events` is readable through the public API. `AgentEvent` and `SpawnRow` are nameable,
-    so an external consumer can read the per-step budget-draw audit without opening the SQLite file. Asserted
-    from an integration test, which is where the public surface is visible.
+  - 'F2 — the bare `resume` refuses a policy-bearing run. A run started through `run_with` under a non-permissive
+    policy and resumed through `resume` returns a typed error that names the run and `resume_with`, performs
+    no provider call, and leaves the run resumable. Asserted by the absence of a new step row and by a
+    provider call counter at zero.
+
+    '
+  - 'F3 — the bare `resume` is unchanged for every run that had no boundary. A run started through `run`,
+    `run_observed` or `run_with` with a permissive policy resumes through `resume` with a canonicalised
+    trace byte-identical to 0.12.0''s. 0.7.0''s resume contract holds for everyone whose behaviour was
+    already correct.
 
     '
   files:
   - src/run.rs
   - src/lib.rs
-  - src/state.rs
+  - tests/policy.rs
   - tests/checkpoint.rs
-  evidence:
-  - 'RunOutcome::Refused added and mapped in terminal_outcome. Regression proven by deleting the arm:
-    the resumed run reported Success { steps: 1 } because resume() substitutes Policy::permissive() +
-    ApproveAll, so a human-refused run was resumed under a permissive policy and completed. tests/net.rs
-    10 passed; the test counts approver calls, since ''not asked twice'' is not observable from the outcome.'
-  - AgentEvent and SpawnRow re-exported from src/lib.rs, so the agent_events budget-draw audit is readable
-    through the public API.
-- id: US-IO-HARNESS-0.12.0-T03
-  summary: Remove the determinism leaks and the trace dishonesty the audit found. `run_id` comes out of
-    the rendered memory note (`src/context.rs:545-549`), which today sends different prompt bytes for
-    the same case because `run_id` is an `AUTOINCREMENT`. Sub-agent results compose in spawn order rather
-    than `buffer_unordered` completion order (`src/run.rs:1401-1408`). The single-file loop back-fills
-    `reported_tokens` as the other two loops do. `context_events` stops conflating a replan and a terminal
-    stall under one `stalled` kind. The documented-but-never-emitted `sandbox_events` `net_deny` kind
-    is emitted or removed from the docs.
-  why_required: A replay that returns the recorded responses but still varies the prompt bytes or the
-    child ordering would look like it worked and would silently invalidate every measurement built on
-    it. These fixes must precede the replay work, not follow it, or the replay tests will be written against
-    a moving target.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T02
+  evidence: []
+- id: US-IO-HARNESS-0.13.0-T03
+  summary: Serde on the context ledger types, with a total kind mapping. `Serialize`/`Deserialize` on
+    `context::Ledger` (src/context.rs:119), `Observation` (:92) and `ObsKind` (:34) — none of the three
+    has any today and the module does not import serde at all. `ObsKind` already carries a variant-to-string
+    `label` (:74) with no inverse; the mapping becomes total in both directions and is pinned variant
+    by variant, so an eleventh variant cannot be added without the mapping following it.
+  why_required: The ledger cannot be made durable until its types can cross the store boundary. Splitting
+    this from T04 keeps the derive-and-mapping decision — which is where the silent-truncation risk lives
+    — separate from the schema and the restore path.
+  status: todo
+  depends_on: []
   acceptance_criteria:
-  - 'NF6 — no regression. All 341 tests shipped at 0.11.0 pass unless one asserted a behaviour this release
-    deliberately changes, and each such test is named in the record with why its old assertion was wrong.
-    The likely casualties are tests asserting the memory note''s rendered text, which currently contains
-    `run_id`, and any test asserting child-result order.
+  - 'F9 — every observation kind survives the round trip. All ten `ObsKind` variants (src/context.rs:34-54)
+    persist and restore to an equal value, asserted variant by variant so adding an eleventh without extending
+    the mapping fails the build or the test rather than shortening a ledger at runtime. A row whose kind
+    does not parse is an error, not a skipped entry.
 
     '
   files:
   - src/context.rs
-  - src/run.rs
+  evidence: []
+- id: US-IO-HARNESS-0.13.0-T04
+  summary: A durable observation ledger, restored in both loops. A table in the `context_events` shape
+    holding each `Observation`'s `step`, `kind` and `target` — the typed triple that supersession reads
+    (`target_is_the_subject`, src/context.rs:65) and that is lost today; the text itself is already durable
+    in `steps.result` via `text_for_step` (src/run.rs:1401, :2041), so whether the text is stored again
+    or joined back is the one design call to settle here. Written on the path that already commits a step,
+    and restored at both construction sites — `run_workspace_from` (src/run.rs:1242) and `run_agent` (src/run.rs:1821)
+    — which build a fresh empty ledger after `start_step` is already known.
+  why_required: A resumed run currently re-derives its context instead of restoring it, so it asks the
+    model a different question than the process before it would have. Both construction sites are named
+    because a fix that lands in one leaves the same defect at a depth where it is harder to see.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.13.0-T03
+  acceptance_criteria:
+  - 'F5 — the ledger is restored, not re-derived. A resumed workspace run''s ledger equals the ledger
+    the uninterrupted run held at the same step: the same observations, in the same order. Asserted on
+    the ledger itself, not only on the resulting trace, so a coincidental match cannot pass.
+
+    '
+  - 'F6 — the same holds for the sub-agent loop, at depth. A sub-agent run interrupted and resumed restores
+    its own ledger, and the parent''s ledger is unaffected by the child''s restore.
+
+    '
+  - 'N3 — the ledger persistence costs at most one write per step boundary, on the path that already commits
+    a step. No new write on a step that does not commit, and no read of the ledger table outside resume.
+
+    '
+  files:
   - src/state.rs
+  - src/run.rs
+  - src/context.rs
   - tests/context.rs
-  - tests/memory.rs
-  - tests/subagents.rs
-  evidence:
-  - 'Children composed in spawn order: buffer_unordered -> buffered. Negative control in tests/subagents.rs
-    shows the old code returning child 5,4,3,2 for a spawn order of 0,1,2,3.'
-  - run_id removed from the rendered memory note (src/context.rs), so the same case sends the same prompt
-    bytes twice. step kept -- it is a stored column, stable across replays. New test asserts the rendered
-    block is byte-identical across run_ids 1, 2 and 9999.
-  - context_events splits replan from stalled; four stall assertions replaced with the stronger cross-kind
-    sequence assertion.
-  - 'sandbox_events ''net_deny'' removed from the docs: documented since 0.6.0, never constructed, never
-    emitted. A sandbox denies egress structurally, so there is no attempt to observe.'
-  - 'NOT A DEFECT after all: the contract''s claim that the single-file loop leaves assembled rows with
-    a NULL reported_tokens was wrong. assemble() is called only from the workspace loop (src/run.rs:864)
-    and the sub-agent loop (:1324); the single-file loop uses bound() and records no assembled row at
-    all, so there is nothing to back-fill. Reported rather than silently dropped.'
-- id: US-IO-HARNESS-0.12.0-T04
-  summary: 'Settle the event surface before threading it anywhere: a serde-serialisable `RunEvent` covering
-    every kind of thing the run records, and an `Observer` trait shaped on the crate''s existing inversion-of-control
-    precedent — `Send + Sync`, `&self` methods, passed as `&dyn Observer` the way `Approver` is at `src/run.rs:143`.
-    `&self` rather than `&mut self` is what makes it safe under `buffer_unordered`''s concurrent children.
-    Provider types gain serde derives, which is also the prerequisite for T08.'
-  why_required: The enum is public and covers fourteen kinds across roughly forty emission sites; getting
-    it wrong is expensive and permanent. 0.11.0 settled its error kind and 0.9.0 its `Tool` trait before
-    touching a call site, for the same reason. Nothing else in the release can be built until this shape
-    exists.
-  status: done
+  evidence: []
+- id: US-IO-HARNESS-0.13.0-T05
+  summary: Replay survives an interruption in every loop. With the ledger restored, the workspace and
+    sub-agent replay paths reproduce their own requests across a resume, so 0.12.0's divergence report
+    (tests/determinism.rs:307) becomes an equality assertion of the kind the single-file case already
+    passes (:375). The refusal 0.12.0 shipped stays reachable for a request that genuinely was never recorded.
+  why_required: 0.12.0's F10 shipped with its second half unmet and iterations/US-IO-HARNESS-0.12.0-I01
+    recorded it as unfixable without checkpointing the ledger. This task is the promise coming due; an
+    evaluation harness that cannot survive an interruption cannot measure a 24-hour run.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.12.0-T03
+  - US-IO-HARNESS-0.13.0-T04
   acceptance_criteria:
-  - 'F3 — every event serialises and round-trips. Each `RunEvent` variant survives `serde_json` to value
-    and back to an equal value, and one test pins the rendered shape of each variant so a consumer reading
-    the JSON is reading something a future release cannot change silently.
+  - 'F7 — a recorded case replays identically across an interruption, in the workspace loop and the sub-agent
+    loop. The canonicalised trace of the interrupted-then-resumed replay equals the uninterrupted replay''s,
+    which is 0.12.0''s F10 second half, recorded as unmet in iterations/US-IO-HARNESS-0.12.0-I01. The
+    single-file case that already passes must keep passing, asserted in the same test file.
 
     '
-  - 'NF1 — no new runtime dependency. `serde` is already a dependency and is already derived on `Containment`,
-    `Policy` and the sandbox types; the observer needs no channel and therefore no `tokio` `sync` feature.
-    `[dependencies]` is unchanged against 0.11.0 except for serde derive coverage.
+  - 'F8 — replay''s refusal path stays honest where it is still correct. A replay asked for a request
+    that genuinely was never recorded still fails loudly with 0.12.0''s non-retryable error. The release
+    removes the cause of the false refusals, not the refusal.
 
     '
   files:
-  - src/observe.rs
-  - src/lib.rs
-  - src/provider/mod.rs
-  - tests/observe.rs
-  evidence:
-  - 'src/observe.rs: Observer (Send + Sync, &self, &dyn -- the Approver precedent), RunEvent, 17-variant
-    EventKind, Flow, Ignore. One method returning Flow rather than Result: an observer is a spectator
-    and must not be able to fail a run.'
-  - Wire shape flat and internally tagged, pinned by test because it is a contract. every_kind() carries
-    a compiler-enforced exhaustiveness guard so a new variant cannot escape the round-trip and distinct-tag
-    tests. 5 lib tests passed.
-  - 'Provider types derive serde + PartialEq: the prerequisite for recording, since there was previously
-    no format to record into.'
-- id: US-IO-HARNESS-0.12.0-T05
-  summary: Unify the step boundary. The commit point is duplicated at `src/run.rs:743`, `:962` and `:1455`,
-    each with its own inline `StepRecord` construction and its own differently-named `info!` ("loop step"
-    / "workspace step" / "agent step"). One emission path for all three loops, with the sub-agent loop's
-    deliberately uncommitted step — a step paused by a child so that resume replays it (`src/run.rs:1442-1456`)
-    — handled explicitly rather than silently dropped.
-  why_required: Three copies of the boundary will drift the moment an event is emitted from them, and
-    the uncommitted-step case is exactly where a naive "one commit, one event" rule reintroduces the double-execution
-    bug 0.7.0 exists to prevent.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T04
-  acceptance_criteria:
-  - 'F4 — the step boundary is emitted once, from one place, for all three loops. Asserted by driving
-    the single-file, workspace and sub-agent loops and observing the same event shape from each; and the
-    sub-agent loop''s step that is deliberately left uncommitted when a child defers (`src/run.rs:1442-1456`)
-    is asserted to behave as the release specifies rather than to silently emit nothing.
-
-    '
-  files:
-  - src/run.rs
-  - tests/checkpoint.rs
-  - tests/subagents.rs
-  evidence:
-  - commit_step is the single boundary for all three loops, replacing three inline StepRecord constructions
-    and three differently-named info! lines.
-  - 'The paused-by-child case is passed IN as a `commit: bool` argument rather than branched around, so
-    the uncommitted step is an argument at the one commit point rather than a second quieter commit path.
-    No Step event is emitted for it. Pinned by a_step_left_uncommitted_for_replay_is_not_announced_as_a_step.'
-- id: US-IO-HARNESS-0.12.0-T06
-  summary: 'Thread the observer through every entry point and emit every event kind from the sites the
-    audit enumerated: committed steps, tool calls, policy refusals, approval requests and decisions, spend
-    draws, retries, fallbacks, stalls, replans, spawns, memory writes, sandbox lifecycle events, MCP calls,
-    and the terminal outcome. Registration is opt-in on all seven entry points, and a run without an observer
-    must behave exactly as it does under 0.11.0.'
-  why_required: 'This is the release''s headline: an embedding application is called as the run happens
-    instead of polling a file. The zero-cost-when-absent half is not optional — a visibility feature that
-    changes what an unobserved run does is a regression however well it reports.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T05
-  acceptance_criteria:
-  - 'F1 — a registered observer is called for every kind of thing the run records. One run exercising
-    steps, tool calls, refusals, an approval decision, a spend draw, a retry, a fallback, a stall, a replan,
-    a spawn, a memory write, a sandbox event, an MCP call and a terminal outcome delivers one event per
-    occurrence. Asserted against the trace the same run wrote: the two surfaces report the same facts
-    in the same order. An event stream that disagrees with the durable trace is worse than none.
-
-    '
-  - 'F2 — the observer costs nothing when absent. A run with no observer produces a byte-identical canonicalised
-    trace and the same provider call count as 0.11.0, asserted by a call counter on the existing mock
-    providers. No new allocation per step on the unobserved path.
-
-    '
-  - 'NF2 — the observer does not change the run''s concurrency model. `Store` stays `Send + !Sync`, the
-    tree stays `buffer_unordered` on one task, and `run_agent`''s future stays non-`Send`. An `Observer:
-    Send + Sync` with `&self` methods is compatible with all three; a `&mut self` observer would not be,
-    under concurrent children.
-
-    '
-  files:
-  - src/run.rs
-  - src/verify.rs
-  - src/net.rs
-  - src/mcp.rs
-  - src/context.rs
-  - src/observe.rs
-  - tests/observe.rs
-  evidence:
-  - Seven *_observed twins, originals become one-line wrappers passing &Ignore -- 0.11.0 code compiles
-    unchanged and there is one code path, not an Option branch per site.
-  - 'Ten of fifteen event kinds emitted. The headline test compares the event stream against the trace
-    the same run wrote and found a real asymmetry: the trace records prose, the event carries Replan {
-    window: 3 }. Corrected to assert the sequence agrees AND the number matches the prose, rather than
-    demanding the event repeat a sentence it deliberately does not carry.'
-  - an_unobserved_run_writes_the_same_trace_and_makes_the_same_provider_calls covers F2/NF2.
-  - 'OPEN: ToolCall, Refused, ApprovalRequested, ApprovalDecided, MemoryWrote, Sandbox and Mcp were declared
-    but never emitted -- the enum promised more than the run delivered. In progress; the sites are in
-    dispatch()/gate() in run.rs plus verify.rs and mcp.rs.'
-  - All seventeen EventKind variants now emitted. ToolCall, Refused, ApprovalRequested, ApprovalDecided
-    and MemoryWrote were declared and never fired from run.rs; Sandbox and Mcp never fired from verify.rs
-    and mcp.rs. A declared variant nothing emits is a lie in the public API. The plan wrongly assumed
-    these were leaf sites in other files -- dispatch() and gate() are in run.rs. 12 observe tests, each
-    asserting the event against the stored row rather than a literal.
-- id: US-IO-HARNESS-0.12.0-T07
-  summary: Cancellation the caller asks for. The observer's return value can stop the run, which ends
-    as a terminal outcome, records it, leaves `runs.status` not `running`, and stays resumable. Today
-    the only way to stop a run in flight is to drop its future, which leaves the run row `running` forever
-    — `Store::set_status` (`src/state.rs:1227`) exists and is never called from `src/run.rs`, so `RunStatus::Failed`
-    is a variant nothing writes.
-  why_required: A 24-hour unattended run with no way to ask it to stop is not operable, and the observer
-    is the only place the request can come from. Without this the release ships a surface that can watch
-    a run but not act on what it sees.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T06
-  acceptance_criteria:
-  - 'F5 — a run can be cancelled by its observer. The run stops within one step of the request, records
-    a terminal outcome, leaves `runs.status` not `running`, and is resumable. Contrasted with a dropped
-    future, which is asserted to be the thing that leaves a run wedged today.
-
-    '
-  files:
-  - src/run.rs
-  - src/state.rs
-  - src/observe.rs
-  - tests/observe.rs
-  evidence:
-  - 'RunOutcome::Cancelled, outcome string cancelled, mapped in terminal_outcome. Watch latches the request;
-    honoured at the top of each loop iteration, so a cancel costs at most one more step and never lands
-    mid-step. The run is finished rather than abandoned: status completed, summary written, resume a faithful
-    no-op.'
-  - 'Known edge, reported rather than hidden: a cancel requested on the last step of the budget has no
-    next boundary, so that run reports StepCapReached. It stopped anyway.'
-- id: US-IO-HARNESS-0.12.0-T08
-  summary: 'A recording provider and a replaying provider, both combinators that are themselves `Provider`,
-    following `Fallback`''s pattern (`src/provider/fallback.rs:87`) so every existing generic entry point
-    takes them unchanged. Recording is lossless where the trace is not: `CompletionResponse.text` survives
-    alongside tool calls (discarded today at `src/run.rs:892-905`), both `prompt_tokens` and `completion_tokens`
-    survive (dropped today at `src/run.rs:714`), and tool-call arguments containing a `|` survive (corrupted
-    today by the `" | "`-joined format at `src/run.rs:909`). Replay is keyed on the request, never on
-    a counter.'
-  why_required: Nothing in the crate records a provider response, so no case can be re-run against what
-    the model said. Request-keying rather than counter-keying is the whole difference between replay that
-    composes with 0.7.0's resume and replay that breaks it — `tests/checkpoint.rs:63-66` already documents
-    why.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T04
-  acceptance_criteria:
-  - 'F7 — a recording provider captures a call losslessly. Request and response round-trip through the
-    recording, including `CompletionResponse.text` when tool calls are also present (discarded today at
-    `src/run.rs:892-905`), both `Usage.prompt_tokens` and `completion_tokens` (dropped today at `src/run.rs:714`),
-    and tool-call arguments containing a `|` character, which the current `" | "`-joined trace format
-    corrupts.
-
-    '
-  - 'NF7 — replay is not a second engine. The replaying provider is a `Provider` and nothing else; no
-    entry point, no loop and no store method branches on whether a run is a replay. If the loops have
-    to know, the design is wrong and is reconsidered rather than special-cased.
-
-    '
-  files:
-  - src/provider/record.rs
-  - src/provider/replay.rs
-  - src/provider/mod.rs
-  - src/state.rs
-  - tests/replay.rs
-  evidence:
-  - Record<P> and Replay as Fallback-shaped combinators. Recordings go to a JSON file, not the store --
-    forced by the type system, since Provider::complete's future must be Send and rusqlite::Connection
-    is !Sync, so a &Store captured in a recorder's future does not compile. The contract's open question
-    is settled by the compiler.
-  - Replay keys on request content, never a counter. a_counter_keyed_mock_diverges_where_a_replay_does_not
-    is the negative control proving the difference is real.
-  - 'A missing recording is a typed non-retryable error, not a default: CompletionResponse::default()
-    reads exactly like ''the model chose not to call a tool'', so a silent default would make a diverged
-    replay look successful. Recordings carry the harness version and refuse a different major.minor series.
-    8 tests passed.'
-- id: US-IO-HARNESS-0.12.0-T09
-  summary: 'Define and prove "identical twice": a canonicalised projection of the trace naming which tables
-    and columns are compared and which fields are excluded as inherently variable, then the tests. One
-    case recorded once and run twice compares equal. The negative controls must fail: reintroducing `run_id`
-    into the memory note breaks it, and composing children in completion order breaks it. And a recorded
-    case killed mid-run and resumed produces the same trace as the uninterrupted replay.'
-  why_required: The determinism claim is what every future measurement rests on, and a comparison that
-    cannot fail proves nothing. The negative controls are the criterion, not a nicety — they are the only
-    thing standing between a real guarantee and a test that passes because it asserts nothing.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T08
-  - US-IO-HARNESS-0.12.0-T03
-  acceptance_criteria:
-  - 'F8 — a case replays identically. One case recorded once and run twice produces the same canonicalised
-    trace, compared byte for byte. The replaying provider makes no network call, asserted rather than
-    assumed.
-
-    '
-  - 'F9 — the determinism tests can fail. The F8 comparison FAILS when `run_id` is reintroduced into the
-    rendered memory note, and FAILS when child results are composed in `buffer_unordered` completion order
-    rather than spawn order. Both are asserted as explicit negative controls, because a determinism test
-    that cannot fail proves nothing and this release''s whole measurement claim rests on it.
-
-    '
-  - 'F10 — a replay survives a resume wherever the harness can reproduce the request, and refuses loudly
-    where it cannot. A recorded single-file case cut short and resumed reproduces the uninterrupted replay''s
-    canonical trace exactly, using a freshly loaded `Replay` so the resume is treated as a new process
-    — the case every scripted mock in `tests/` fails, since they key on an `AtomicUsize` and a re-run
-    step consumes the next recording. Where the harness CANNOT reproduce the request — the workspace and
-    sub-agent loops, whose in-memory `ContextLedger` a resume does not restore — the replay must fail
-    with a typed, non-retryable error naming the divergence, never serve a different recorded answer.
-    Both halves are asserted. The second is the one that protects a measurement: a replay that guessed
-    would produce a plausible trace reproducing nothing.
-
-
-    Narrowed from ''a resumed case reproduces the uninterrupted replay for all loops'' by iterations/US-IO-HARNESS-0.12.0-I01,
-    which found that claim false for two of the three loops and true for the third, for a reason upstream
-    of replay.
-
-    '
-  files:
-  - tests/replay.rs
   - tests/determinism.rs
-  - src/state.rs
-  evidence:
-  - '6 tests. Positive: one case replayed twice into fresh stores compares equal, and separately matches
-    the run it was recorded from -- two replays could agree while both differing from reality.'
-  - Two negative controls (run_id in the prompt, children in completion order) must break equality, plus
-    a control-on-controls asserting identically-built traces DO compare equal. Without these the positive
-    test would pass through a reintroduction of either bug.
-  - Store::canonical_trace defines the comparison, with every excluded field and its reason documented
-    -- equality could not be row identity, since a retry shares a step number with the commit that follows.
-  - 'BLOCKED, needs /ultraship:iterate: F10 as written is false. A resumed run does not reproduce the
-    uninterrupted one, because ContextLedger is in-memory (src/run.rs:1183, :1758) and 0.7.0''s resume
-    never restores it, so the resumed run re-assembles context from the workspace and sends a prompt the
-    recording never saw. Replay is not the cause. Fixing it means checkpointing the ledger, which this
-    contract excludes. The test now pins the true boundary behaviour -- the replay reports divergence
-    as a typed error rather than inventing an answer.'
-  - 'F10 RE-TESTED and it is PARTLY SATISFIED, which the first finding overstated. a_single_file_replay_does_survive_being_interrupted_and_resumed
-    passes: a recorded single-file case cut short and resumed reproduces the uninterrupted replay exactly,
-    with a freshly loaded Replay so the resume is treated as a new process. The single-file loop builds
-    its prompt from the file on disk (bound(&current, ...)), which survives the process. The divergence
-    is confined to the workspace and sub-agent loops, which assemble each turn from an in-memory ContextLedger
-    that a resume starts empty. So the true limitation is ''a resumed run whose prompt depends on accumulated
-    observations diverges'', NOT ''resume breaks replay''. Both halves are now pinned by a test.'
-  - F10 amended by iterations/US-IO-HARNESS-0.12.0-I01 and now MET in both halves. a_single_file_replay_does_survive_being_interrupted_and_resumed
-    proves the reproduce half; a_resumed_replay_reports_divergence_rather_than_inventing_an_answer proves
-    the refuse half. The context-ledger fix is deferred to roadmap 0.16.0, which the iteration created
-    as its destination.
-- id: US-IO-HARNESS-0.12.0-T10
-  summary: 'The per-run outcome record: an additive table written by `finish_run`, carrying whether the
-    run succeeded, its step count, its token spend and its duration — the last requiring an end stamp,
-    since no end timestamp exists anywhere in the schema and `elapsed_secs` (`src/state.rs:1249`) is live
-    and keeps growing after the run finishes. A public reader on `Store`, and the record reaching the
-    caller through `RunResult` (`src/run.rs:84`), whose private constructors mean the added field breaks
-    only an exhaustive struct pattern.'
-  why_required: A finished run currently reports an outcome discriminant and a `run_id`. Spend needs a
-    follow-up query and latency is not recorded at all, so the fourth field of the deliverable is the
-    one genuinely new write. Written by `finish_run` rather than assembled by the caller because an escalated
-    run returns `Err` and never reaches a `RunResult`.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T02
-  acceptance_criteria:
-  - 'F11 — a finished run has a record, and its numbers are right. For each outcome kind, the record''s
-    success flag, step count, token spend and duration are asserted against independently computed values
-    — duration as a bound, never an equality. `steps` is asserted to mean what the release documents it
-    to mean, given that retry rows share a step number so `COUNT(*)` over the table is not a step count.
-
-    '
-  - 'F12 — the record exists for a run that never returns a `RunResult`. An escalated run returns `Err`,
-    so its record must be written by `finish_run` rather than assembled by the caller. Asserted by reading
-    the record back for a run that escalated.
-
-    '
-  - 'F13 — the record reaches the caller. `RunResult` carries the summary, so spend and latency are available
-    without a follow-up store query. The added fields are asserted against the stored record so the two
-    cannot drift.
-
-    '
-  - 'NF8 — additive migration only. Any new table is `CREATE TABLE IF NOT EXISTS` in `Store::from_conn`,
-    `CHECKPOINT_FORMAT` stays 7, and no existing table is renamed or reshaped. A 0.11.0 store opens and
-    a 0.11.0 checkpoint resumes, matching the precedent set twice in 0.10.0 (`src/state.rs:807-809`, `:826-828`).
-
-    '
-  - 'NF5 — the public break is deliberate and documented. Adding fields to `RunResult` breaks an exhaustive
-    struct pattern; that is the only intended break. The CHANGELOG carries the migration note, the public-surface
-    diff against the 0.11.0 tag is recorded in the evidence, and no other public item is renamed or removed.
-
-    '
-  files:
-  - src/state.rs
   - src/run.rs
-  - src/lib.rs
-  - tests/outcome_record.rs
-  evidence:
-  - run_outcomes table, additive CREATE TABLE IF NOT EXISTS, CHECKPOINT_FORMAT still 7, no existing table
-    reshaped. Written by finish_run so a run that escalates or is refused -- returning Err and never reaching
-    a RunResult -- still gets one.
-  - 'finished_at is the genuinely new fact: nothing recorded when a run ENDED, and elapsed_secs measures
-    against now so it keeps growing afterwards. Both stamps from the database clock.'
-  - A paused run gets no summary until it really ends. A pre-0.12.0 run reports None rather than zeroes.
-    7 tests, every field asserted against an independently computed value, duration as a bound.
-  - 'OPEN: RunResult does not yet carry the summary (F13).'
-  - 'RunResult::summary(&store) delivers the record to the caller. A method rather than the field the
-    contract anticipated: a field would have to be filled at every return site including the Err paths
-    that never build a RunResult, so the two could drift. Consequence worth noting -- with no field added,
-    this release takes NO breaking change at all, and the CHANGELOG''s promised migration note was removed
-    because the break no longer exists.'
-- id: US-IO-HARNESS-0.12.0-T11
-  summary: Correct every false claim in `README.md` — its structure is 0.15.0's subject, its accuracy
-    is this release's. No `git` tool (built-ins are `write_file`, `grep`, `find`, `read_file`, `remember`,
-    `read_skill`, `spawn_agent`); Office/PDF/OCR/media no longer listed as capabilities without a status
-    marker beside shipped siblings; the current version in the dependency snippet rather than `0.3`; `Act::Net`
-    in the policy defaults table, where it defaults to Deny (`src/policy.rs:167-175`); `remember` in the
-    reserved tool names; all nine `RunOutcome` variants; no "everything else is roadmap" assertion when
-    ten listed items have shipped; no instruction to override a deadline before T01 makes that possible.
-    Plus the leaked rustdoc hidden lines that render as stray text and the top-of-file pseudo-field block
-    that collapses into one line. `docs/CAPABILITIES.md` marks all twelve pillars held.
-  why_required: The crate is published. A README claiming a tool that does not exist and pinning a version
-    eight minors stale is not a formatting preference — it is the page every prospective user reads first,
-    and it is currently wrong about what the crate can do.
-  status: done
+  evidence: []
+- id: US-IO-HARNESS-0.13.0-T06
+  summary: A 0.12.0 store and a 0.12.0 checkpoint still work. `CHECKPOINT_FORMAT` stays 7 (src/state.rs:16)
+    under a test that asserts it, every new table is `CREATE TABLE IF NOT EXISTS` and no existing table
+    is reshaped, and a run checkpointed by 0.12.0 — which has no policy record and no ledger rows — resumes
+    with 0.12.0 behaviour and a recorded reason rather than failing or inventing a boundary. The public-surface
+    diff is captured as evidence in the shape 0.10.0 used.
+  why_required: Absence in the store and "permissive" are different facts, and conflating them would invent
+    a permission decision nobody made. This is also the task that proves the release kept the additive-schema
+    constraint rather than asserting it did.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.12.0-T01
-  - US-IO-HARNESS-0.12.0-T02
+  - US-IO-HARNESS-0.13.0-T02
+  - US-IO-HARNESS-0.13.0-T04
   acceptance_criteria:
-  - 'O5 — the README''s corrected claims are accurate against the source, verified by re-running the audit
-    that found them rather than by inspection. Every claim about a tool, a capability, a default or a
-    public item is checked against the code it describes.
+  - 'N1 — no schema break. `CHECKPOINT_FORMAT` stays 7, asserted by a test. Every new table is created
+    with `CREATE TABLE IF NOT EXISTS` in `Store::from_conn`; no existing table is renamed, reshaped or
+    has a column removed. A store written by 0.12.0 opens under 0.13.0 and every 0.12.0 test that reads
+    the schema still passes.
 
     '
-  - 'O4 — `docs/CAPABILITIES.md` marks observability and evaluation shipped at 0.12.0 and marks nothing
-    else, and states that all twelve pillars now hold. If the fallback scope is taken, both stay partial
-    with the deferred release named. The file''s existing "completed 0.12.0" wording for observability
-    is made accurate rather than aspirational.
+  - 'N2 — a 0.12.0 checkpoint still resumes. A run checkpointed by 0.12.0 has no persisted policy and
+    no persisted ledger; resuming it under 0.13.0 behaves as 0.12.0 did — it does not refuse for a missing
+    policy record, and it re-derives its context — and the degradation is recorded rather than silent.
+    Absence must read as absence, never as "permissive" or "empty ledger asserted".
+
+    '
+  - 'N5 — the additive API does not break a single existing caller. Every 0.12.0 entry point keeps its
+    signature; the public-surface diff shows additions and no removals or changes, captured as evidence
+    the way 0.10.0''s was.
 
     '
   files:
-  - README.md
-  - docs/CAPABILITIES.md
-  evidence:
-  - 'README factual errors corrected: no git tool, Office/OCR/media marked planned 0.13/0.14, dep line
-    0.12, Act::Net row added to the defaults table, remember added to the reserved names, all ten RunOutcome
-    variants, the false ''everything else is roadmap'' sentence removed, and the deadline override now
-    shown with a working example because it is finally possible.'
-  - 'Rendering: leaked rustdoc hidden lines removed, intra-doc link syntax fixed, the 2834-char metadata
-    line replaced with a real list, the 546-char table cell reflowed with every fact preserved, yaml fence
-    tagged, comment padding normalised. Badges, docs.rs link and MSRV 1.88 added at the top.'
-  - Structure deliberately untouched -- git diff confirms the heading tree is byte-identical apart from
-    the three deleted rustdoc lines. The restructure is 0.15.0.
-  - 'OPEN: docs/CAPABILITIES.md and README now claim observability and evaluation shipped in 0.12.0. Those
-    are release-forward claims and are not yet true in the tree; they must be made true by T04-T10 or
-    walked back before the release is sealed.'
-- id: US-IO-HARNESS-0.12.0-T12
-  summary: Document the three contracts this release creates, and record the correction it makes. What
-    order events arrive in, that they are in-process and synchronous, that an event is not a transaction,
-    and that the durable trace stays authoritative. Exactly what determinism guarantees — what is compared,
-    what is excluded and why, under what conditions two runs are expected to match. What each field of
-    the outcome record means, including that spend is tokens and not currency, that duration is wall-clock
-    including time the process was down, and what "steps" counts given that retry rows share a step number.
-    Plus the CHANGELOG, carrying the `RunResult` migration note and attributing 0.11.0's O4 miss rather
-    than quietly fixing it.
-  why_required: A consumer branching on an event or relying on a determinism guarantee needs it specified
-    rather than observed, and an over-broad determinism claim is worse than a narrow one because it will
-    be relied on. The 0.11.0 record is immutable, so the correction has to be recorded somewhere a reader
-    will find it.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.12.0-T07
-  - US-IO-HARNESS-0.12.0-T09
-  - US-IO-HARNESS-0.12.0-T10
-  acceptance_criteria:
-  - 'O1 — the observer''s contract is documented: what order events arrive in, that they are emitted in-process
-    and synchronously with the run, that an event is not a transaction and a caller must not assume one
-    event equals one committed row, and that the durable trace remains the record of what happened. A
-    consumer needs to know which surface is authoritative.
-
-    '
-  - 'O2 — the determinism guarantee is documented precisely: what is compared, what is excluded and why,
-    and under what conditions two runs are expected to match — same recording, same workspace isolation,
-    memory state stated. An over-broad determinism claim is worse than a narrow one, because it will be
-    relied on.
-
-    '
-  - 'O3 — the outcome record''s fields are documented with what each means and where it comes from, including
-    that spend is tokens and not currency, that duration is wall-clock including time the process was
-    down, and exactly what "steps" counts given that retry rows share a step number.
-
-    '
-  - 'O6 — the 0.11.0 O4 miss is recorded honestly: the request deadline was documented as overridable
-    and was not, the record for 0.11.0 is immutable and stays as sealed, and the correction is attributed
-    in this release''s CHANGELOG entry rather than quietly fixed.
-
-    '
-  - 'NF3 — a trace failure does not become a run failure through a new path, and neither does an observer.
-    A panicking or erroring observer must not corrupt the trace or leave a run wedged, and the chosen
-    behaviour is documented rather than incidental.
-
-    '
-  files:
-  - src/observe.rs
-  - src/lib.rs
+  - tests/checkpoint.rs
   - src/state.rs
-  - CHANGELOG.md
-  - docs/CAPABILITIES.md
-  evidence:
-  - 'The three contracts are documented at their definitions: src/observe.rs carries module docs on event
-    ordering, that events are in-process and synchronous, that one event is not one committed row, that
-    the durable trace stays authoritative, and that an observer must not panic. Store::canonical_trace
-    documents exactly what is compared, what is excluded and the reason for each exclusion. RunSummary
-    documents every field including that spend is tokens and never money, that duration is wall-clock
-    including downtime, and that steps is MAX(step) rather than a row count.'
-  - 'src/provider/replay.rs carries an explicit ''what it does not guarantee'' section: a diverged prompt,
-    duplicate identical requests across a process restart, and ordering past a key''s recorded answers.
-    An overstated determinism claim is worse than a narrow one.'
-  - 'O6 discharged: the CHANGELOG annotates 0.11.0''s entry in place rather than rewriting it, since that
-    is what 0.11.0 claimed and its record is sealed. The Security section carries the resume-drops-policy
-    finding, including the correction that resume_with_decision is not a general policy-aware resume --
-    it needs a request_id and a pending Decision, so there is no policy-preserving general resume at all.'
-  - docs/CAPABILITIES.md marks observability and evaluation shipped and states all twelve pillars now
-    hold.
-- id: US-IO-HARNESS-0.12.0-T13
-  summary: 'Verify the whole release rather than assert it: the full suite from a cold cache, the three-OS
-    matrix plus the msrv and lint jobs green on one commit with no leg skipped or marked `continue-on-error`,
-    the public-surface diff against the 0.11.0 tag recorded, every 0.11.0 test still passing or named
-    with why its old assertion was wrong, and the live evidence — a real run observed through the observer
-    with its event sequence captured, and a recorded case replayed twice with the comparison output.'
-  why_required: Two of the last three releases had CI find a real Windows-specific behaviour nothing local
-    could see, and the determinism comparison is the leg most likely to differ across platforms since
-    path rendering and line endings both reach the trace. Nobody on this project has a Windows machine.
-  status: done
+  evidence: []
+- id: US-IO-HARNESS-0.13.0-T07
+  summary: The boundary, documented where a developer meets it. Every resume entry point's doc comment
+    says what it preserves and what it does not, and `resume`'s names `resume_with` — so the answer is
+    at the call site, not in a changelog. The CHANGELOG carries the migration note for the one behaviour
+    that changes for an existing caller, with the reason the error is the safer default.
+  why_required: The error message and the doc comment are what a developer meets at the moment their production
+    resume stops working. O2 is an acceptance criterion rather than a courtesy for that reason.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.12.0-T11
-  - US-IO-HARNESS-0.12.0-T12
+  - US-IO-HARNESS-0.13.0-T02
+  - US-IO-HARNESS-0.13.0-T04
   acceptance_criteria:
-  - 'NF4 — MSRV stays 1.88; `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` stay clean
-    on all three platforms; the ubuntu/macos/windows matrix plus the msrv and lint jobs are green on one
-    commit with no leg skipped, excluded or marked `continue-on-error`.
+  - 'O1 — every resume entry point documents what it preserves and what it does not, in the doc comment,
+    so the answer is at the call site rather than in the changelog. `resume`''s comment says it is for
+    runs that had no policy and names `resume_with`.
 
     '
-  - 'NF6 — no regression. All 341 tests shipped at 0.11.0 pass unless one asserted a behaviour this release
-    deliberately changes, and each such test is named in the record with why its old assertion was wrong.
-    The likely casualties are tests asserting the memory note''s rendered text, which currently contains
-    `run_id`, and any test asserting child-result order.
-
-    '
-  - 'O7 — the live-run evidence exists in the evidence directory: a run observed through the observer
-    with its event sequence captured, and a recorded case replayed twice with the comparison output.
+  - 'O2 — the CHANGELOG carries a migration note for the one behaviour that changes for an existing caller:
+    `resume` on a policy-bearing run now errors. It names the fix (`resume_with`) and states why the error
+    is the safer default.
 
     '
   files:
-  - .github/workflows/ci.yml
-  - evidence/0.12.0/
-  evidence:
-  - 'CI run 30209627766 on commit ''announce a denied network host'': test (ubuntu-latest), test (windows-latest),
-    test (macos-latest), lint and msrv ALL green on one commit. No leg skipped, excluded or marked continue-on-error.'
-  - 'cargo test locally: 396 passing across 26 targets, up from 341 at 0.11.0. cargo clippy --all-targets
-    -- -D warnings exit 0. cargo fmt --check clean. MSRV 1.88 holds.'
-  - 'Public surface diff recorded in evidence/0.12.0/. ZERO removals -- no public item renamed or removed,
-    so the release takes no breaking change at all, which is stronger than NF5 required. The diff''s own
-    blind spot is documented rather than hidden: it is line-based and deduplicated, so the three new provider
-    with_timeout methods collapse into McpServer::with_timeout, which already existed with a byte-identical
-    signature.'
-  - 'NF6: the 0.11.0 tests that changed are named with why each old assertion was wrong -- four stall
-    assertions replaced by the stronger cross-kind sequence assertion, and a memory test that asserted
-    the run_id leak as a REQUIREMENT (''a note must name the run that wrote it''), which was the defect
-    stated as a spec.'
-  - 'NOT DONE: the live-run evidence O7 asks for (a real provider run observed end to end, and a recorded
-    case replayed twice). The observer and replay paths are covered by fixtures including real local sockets,
-    a real sandboxed rustc and a real stdio MCP server, but no live provider run was made this session.'
+  - src/run.rs
+  - CHANGELOG.md
+  evidence: []
+- id: US-IO-HARNESS-0.13.0-T08
+  summary: The live run and the release gates. One workspace run against a real provider under a real
+    policy, killed mid-run and resumed — the evidence 0.12.0 owed and never produced — with the transcript,
+    the public-surface diff and the determinism comparison stored under evidence/0.13.0/. Full suite,
+    clippy, rustfmt, and the five-leg CI matrix green, with no new runtime dependency and no new feature
+    flag.
+  why_required: Every functional criterion in this release runs against fixtures and recordings. A live
+    run is the only thing that exercises the observer, the recording and the restored resume together
+    on a path no fixture covers, and 0.12.0 shipped without it.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.13.0-T05
+  - US-IO-HARNESS-0.13.0-T06
+  - US-IO-HARNESS-0.13.0-T07
+  acceptance_criteria:
+  - 'O4 — the live-run transcript, the public-surface diff and the determinism comparison are stored under
+    evidence/0.13.0/ in the shape previous releases used.
+
+    '
+  - 'N4 — no new runtime dependency, and no new feature flag on an existing one.
+
+    '
+  - 'N6 — five-leg CI green on the three-OS matrix plus msrv and lint, with the determinism leg included,
+    since a trace comparison is the leg most sensitive to platform differences.
+
+    '
+  files:
+  - evidence/0.13.0/
+  evidence: []

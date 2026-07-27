@@ -1,0 +1,62 @@
+product: io-harness
+version: 0.13.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: >
+    One working session, continuous, following on from the session that planned, built and shipped
+    0.12.0. The owner's standing direction this session is "commit constantly, be token-efficient".
+  budget: null
+  capacity: >
+    The owner directed that parallel work on disjoint files go to subagents and that the main thread
+    stay token-efficient — a constraint on the main context rather than on the work. This release
+    also follows five consecutive releases taken in one stretch, so there is no later release
+    waiting to absorb sprawl from this one: anything discovered beyond the policy and the ledger is
+    recorded as an iteration rather than accommodated.
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+  - >
+    Recorded constraint: one continuous session, subagents for disjoint files, a token-efficient
+    main thread. The release splits cleanly along that line. The boundary half touches
+    `src/state.rs`, `src/run.rs` and `src/lib.rs`; the ledger half touches `src/context.rs`,
+    `src/state.rs` and `src/run.rs`; the two halves share only `src/run.rs`, and within it they
+    touch different functions — `resume_observed` for one, `run_workspace_from` and `run_agent` for
+    the other. Serde on the context types (T03) and the policy table (T01) are genuinely disjoint
+    and can run in parallel.
+  - >
+    Both halves are additions in shapes the crate has already settled, not new architecture.
+    `resume_with` mirrors `run_with` (src/run.rs:200-218) and `resume_tree` (:1679) already proves a
+    policy-bearing resume signature reads naturally here. Both new tables copy `context_events` end
+    to end — schema at src/state.rs:934, writer at :1200, reader at :1229 — which is the pattern the
+    contract's constraints require anyway.
+  - >
+    The design work is choosing shapes, not discovering the codebase. A full audit against the
+    shipped source was taken for this contract: every ledger construction, mutation and read site,
+    the complete table list and the `context_events` schema, all fourteen public entry points with
+    their policy parameters, the `Policy` type's existing serde and its round-trip test, and the
+    nine test files that exercise resume. The stale `src/run.rs:1183`/`:1758` citations from the
+    0.12.0 iteration were corrected to `:1242`/`:1821` in the process.
+  - >
+    `Policy` already derives `Serialize`/`Deserialize` (src/policy.rs:118) with a round-trip already
+    proven to enforce identically (:539), so the boundary half's persistence is a table and two
+    methods rather than a serialisation project.
+  - >
+    Not `high`, for three reasons. The durable ledger's shape is a real design call — the text is
+    already durable in `steps.result` but the typed `(step, kind, target)` triple is not, so storing
+    the assembled result and storing the inputs are both defensible and only one is right. The
+    resume test matrix is wide: two loops, times interrupted and uninterrupted, times policy-bearing
+    and permissive, times replay and live, plus the 0.12.0-checkpoint compatibility case, and
+    `tests/context.rs` and `tests/memory.rs` have no resume coverage at all to build on. And two
+    acceptance criteria are negative controls, which means keeping the defective path reachable long
+    enough to prove a test can fail on it.
+  major_cost_drivers:
+  - The durable ledger's representation — assembled observations versus the inputs the assembler
+    consumed. Settled first, against the 0.10.0 assembler, before the table is written.
+  - The resume test matrix, which is most of the release's diff and correctly so.
+  - The negative controls in F1 and F7, which require proving a test can fail on the defect.
+  - '`resume`''s new error on a policy-bearing run: the only public break, and the message a
+    developer meets when their production resume stops working.'
+  recommended_scope_change: null
