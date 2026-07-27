@@ -12,3 +12,8 @@
 //! 0.14.0 ships spreadsheets ([`xlsx`]).
 
 pub mod xlsx;
+
+pub mod barcode;
+
+pub mod docx;
+pub mod pptx;

@@ -31,10 +31,18 @@ use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
+#[cfg(feature = "barcode")]
+use crate::tools::BARCODE_DECODE_TOOL;
+#[cfg(feature = "pptx")]
+use crate::tools::PPTX_READ_TOOL;
 use crate::tools::{
     FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
     REMEMBER_TOOL, WRITE_FILE_TOOL,
 };
+#[cfg(feature = "docx")]
+use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
+#[cfg(feature = "pdf")]
+use crate::tools::{PDF_FILL_FORM_TOOL, PDF_READ_TOOL, PDF_WATERMARK_TOOL, PDF_WRITE_TOOL};
 #[cfg(feature = "xlsx")]
 use crate::tools::{XLSX_READ_TOOL, XLSX_SET_CELL_TOOL, XLSX_SHEETS_TOOL, XLSX_WRITE_TOOL};
 use crate::verify::{ExecGuard, Verification};
@@ -3178,6 +3186,104 @@ async fn dispatch(
                 }
             }
         }
+        // The remaining document readers. Same gate, same reason as the
+        // spreadsheet arms above: `Act::Read` on the path the model named.
+        #[cfg(any(
+            feature = "docx",
+            feature = "pptx",
+            feature = "pdf",
+            feature = "barcode"
+        ))]
+        n if is_document_read(n) => {
+            let path = s("path").unwrap_or_default();
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => match read_document(ws, name, &target) {
+                    Ok(text) => Dispatched::Continue {
+                        decision: format!("read {target}"),
+                        obs: format!(
+                            "\n[{name} {target}]\n{}\n",
+                            bound(&text, cap, ObsKind::Read)
+                        ),
+                        kind: ObsKind::Read,
+                        target: Some(target.clone()),
+                        changed: false,
+                        remember,
+                    },
+                    Err(e) => {
+                        Dispatched::go("document read error", format!("\n[{name} error] {e}\n"))
+                    }
+                },
+            }
+        }
+        // The remaining document writers.
+        #[cfg(any(feature = "docx", feature = "pdf"))]
+        n if is_document_write(n) => {
+            let path = s("path").unwrap_or_default();
+            if path.is_empty() {
+                return Ok(Dispatched::go(
+                    "document missing path",
+                    format!("\n[{name} error] needs a \"path\" relative to the workspace root\n"),
+                ));
+            }
+            let preview = describe_document_write(name, &call.arguments);
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Write,
+                path,
+                Some(&preview),
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => match write_document(ws, name, &target, &call.arguments) {
+                    Ok(w) => Dispatched::Continue {
+                        decision: format!("wrote {target}"),
+                        obs: format!(
+                            "\n[{name} {target}] {preview}{}\n",
+                            if w.moved_the_workspace() {
+                                ""
+                            } else {
+                                " — identical to what was already there, the workspace \
+                                 did not change"
+                            }
+                        ),
+                        kind: ObsKind::Write,
+                        target: Some(target.clone()),
+                        changed: w.moved_the_workspace(),
+                        remember,
+                    },
+                    Err(e) => {
+                        Dispatched::go("document write error", format!("\n[{name} error] {e}\n"))
+                    }
+                },
+            }
+        }
         // A tool the embedding program registered. Registration made it
         // available; this check is what authorizes the call, on exactly the terms
         // an MCP tool gets — an exec check on the name the model used. Deciding
@@ -3746,6 +3852,167 @@ fn tree_tools() -> Vec<ToolSpec> {
     tools
 }
 
+/// Whether `name` is a document tool that only reads.
+///
+/// A free function rather than a match arm per format: the arms differ only in
+/// which module they call, and four near-identical arms would drift.
+#[cfg(any(
+    feature = "docx",
+    feature = "pptx",
+    feature = "pdf",
+    feature = "barcode"
+))]
+fn is_document_read(name: &str) -> bool {
+    #[cfg(feature = "docx")]
+    if name == DOCX_READ_TOOL {
+        return true;
+    }
+    #[cfg(feature = "pptx")]
+    if name == PPTX_READ_TOOL {
+        return true;
+    }
+    #[cfg(feature = "pdf")]
+    if name == PDF_READ_TOOL {
+        return true;
+    }
+    #[cfg(feature = "barcode")]
+    if name == BARCODE_DECODE_TOOL {
+        return true;
+    }
+    false
+}
+
+/// Whether `name` is a document tool that writes.
+#[cfg(any(feature = "docx", feature = "pdf"))]
+fn is_document_write(name: &str) -> bool {
+    #[cfg(feature = "docx")]
+    if name == DOCX_WRITE_TOOL {
+        return true;
+    }
+    #[cfg(feature = "pdf")]
+    if name == PDF_WRITE_TOOL || name == PDF_WATERMARK_TOOL || name == PDF_FILL_FORM_TOOL {
+        return true;
+    }
+    false
+}
+
+/// Read one document, choosing the reader by the tool the model called rather
+/// than by the file's extension: the model named the format it believes it is
+/// dealing with, and letting the extension decide would silently read something
+/// else than what was asked for.
+#[cfg(any(
+    feature = "docx",
+    feature = "pptx",
+    feature = "pdf",
+    feature = "barcode"
+))]
+fn read_document(ws: &Workspace, name: &str, target: &str) -> Result<String> {
+    use crate::tools::documents;
+    match name {
+        #[cfg(feature = "docx")]
+        n if n == DOCX_READ_TOOL => documents::docx::read_text(ws, target),
+        #[cfg(feature = "pptx")]
+        n if n == PPTX_READ_TOOL => documents::pptx::read_text(ws, target),
+        #[cfg(feature = "pdf")]
+        n if n == PDF_READ_TOOL => documents::pdf::read_text(ws, target),
+        #[cfg(feature = "barcode")]
+        n if n == BARCODE_DECODE_TOOL => documents::barcode::decode(ws, target).map(|found| {
+            if found.is_empty() {
+                // Not an error: "I looked and there was nothing there" is a fact
+                // the model can act on, and the run continues.
+                "no barcode or QR code found in this image".to_string()
+            } else {
+                found
+                    .iter()
+                    .map(|d| format!("{}: {}", d.format, d.text))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }),
+        other => Err(crate::error::Error::Config(format!(
+            "not a document read tool: {other}"
+        ))),
+    }
+}
+
+/// What a document write is about to do, for the approval preview and the trace.
+/// The change, never the bytes — a human deciding on a document write cannot
+/// decide on a blob.
+#[cfg(any(feature = "docx", feature = "pdf"))]
+fn describe_document_write(name: &str, args: &serde_json::Value) -> String {
+    let count = |key: &str| {
+        args.get(key)
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    };
+    match name {
+        #[cfg(feature = "docx")]
+        n if n == DOCX_WRITE_TOOL => {
+            format!("create a document of {} paragraph(s)", count("paragraphs"))
+        }
+        #[cfg(feature = "pdf")]
+        n if n == PDF_WRITE_TOOL => format!("create a PDF of {} page(s)", count("pages")),
+        #[cfg(feature = "pdf")]
+        n if n == PDF_WATERMARK_TOOL => format!(
+            "watermark every page with {:?}",
+            args.get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+        ),
+        #[cfg(feature = "pdf")]
+        n if n == PDF_FILL_FORM_TOOL => format!("fill {} form field(s)", count("fields")),
+        other => format!("write via {other}"),
+    }
+}
+
+/// Perform one document write, chosen by the tool the model called.
+#[cfg(any(feature = "docx", feature = "pdf"))]
+fn write_document(
+    ws: &Workspace,
+    name: &str,
+    target: &str,
+    args: &serde_json::Value,
+) -> Result<crate::tools::workspace::Wrote> {
+    use crate::tools::documents;
+    #[allow(unused_variables)]
+    let strings = |key: &str| -> Vec<String> {
+        args.get(key)
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    };
+    match name {
+        #[cfg(feature = "docx")]
+        n if n == DOCX_WRITE_TOOL => documents::docx::write_new(ws, target, &strings("paragraphs")),
+        #[cfg(feature = "pdf")]
+        n if n == PDF_WRITE_TOOL => documents::pdf::write_new(ws, target, &strings("pages")),
+        #[cfg(feature = "pdf")]
+        n if n == PDF_WATERMARK_TOOL => documents::pdf::watermark(
+            ws,
+            target,
+            args.get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default(),
+        ),
+        #[cfg(feature = "pdf")]
+        n if n == PDF_FILL_FORM_TOOL => {
+            let fields: Vec<(String, String)> = args
+                .get("fields")
+                .and_then(|v| v.as_object().cloned())
+                .map(|m| {
+                    m.into_iter()
+                        .map(|(k, v)| (k, v.as_str().unwrap_or_default().to_string()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            documents::pdf::fill_form(ws, target, &fields)
+        }
+        other => Err(crate::error::Error::Config(format!(
+            "not a document write tool: {other}"
+        ))),
+    }
+}
+
 fn workspace_tools() -> Vec<ToolSpec> {
     #[allow(unused_mut)]
     let mut v = vec![
@@ -3871,5 +4138,97 @@ fn workspace_tools() -> Vec<ToolSpec> {
             }),
         },
     ]);
+    #[cfg(feature = "docx")]
+    v.extend([
+        ToolSpec {
+            name: DOCX_READ_TOOL.to_string(),
+            description: "Read the text of a .docx Word document in the workspace.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "Document path relative to the workspace root." } },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: DOCX_WRITE_TOOL.to_string(),
+            description: "Create a NEW .docx Word document from paragraphs. There is no in-place edit for Word: to change an existing document, read it and write a new one, accepting that formatting this crate does not model is not carried over.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Document path relative to the workspace root." },
+                    "paragraphs": { "type": "array", "description": "Paragraphs, in order.", "items": { "type": "string" } }
+                },
+                "required": ["path", "paragraphs"]
+            }),
+        },
+    ]);
+    #[cfg(feature = "pptx")]
+    v.push(ToolSpec {
+        name: PPTX_READ_TOOL.to_string(),
+        description: "Read the text of a .pptx slide deck, slide by slide. Reading only — this crate cannot write PowerPoint.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "description": "Deck path relative to the workspace root." } },
+            "required": ["path"]
+        }),
+    });
+    #[cfg(feature = "pdf")]
+    v.extend([
+        ToolSpec {
+            name: PDF_READ_TOOL.to_string(),
+            description: "Extract the text of a PDF. Best effort: reading order across columns and tables is not guaranteed.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": { "path": { "type": "string", "description": "PDF path relative to the workspace root." } },
+                "required": ["path"]
+            }),
+        },
+        ToolSpec {
+            name: PDF_WRITE_TOOL.to_string(),
+            description: "Create a NEW PDF, one page per string.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "PDF path relative to the workspace root." },
+                    "pages": { "type": "array", "description": "Page text, one entry per page.", "items": { "type": "string" } }
+                },
+                "required": ["path", "pages"]
+            }),
+        },
+        ToolSpec {
+            name: PDF_WATERMARK_TOOL.to_string(),
+            description: "Stamp text across every page of an existing PDF, keeping its content.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "PDF path relative to the workspace root." },
+                    "text": { "type": "string", "description": "Watermark text." }
+                },
+                "required": ["path", "text"]
+            }),
+        },
+        ToolSpec {
+            name: PDF_FILL_FORM_TOOL.to_string(),
+            description: "Fill the form fields of an existing PDF, by field name.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "PDF path relative to the workspace root." },
+                    "fields": { "type": "object", "description": "Field name to value.", "additionalProperties": { "type": "string" } }
+                },
+                "required": ["path", "fields"]
+            }),
+        },
+    ]);
+    #[cfg(feature = "barcode")]
+    v.push(ToolSpec {
+        name: BARCODE_DECODE_TOOL.to_string(),
+        description: "Decode barcodes and QR codes from a PNG or JPEG in the workspace. Reports plainly when the image contains none.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "description": "Image path relative to the workspace root." } },
+            "required": ["path"]
+        }),
+    });
     v
 }
