@@ -334,7 +334,7 @@ pub fn read_text(ws: &Workspace, rel: &str) -> Result<String> {
 ///   it. The bracket puts the stamp back in the page's default space wherever
 ///   the original left off.
 /// - The page is given a `/Resources` of its own before the stamp is registered
-///   in it (see [`own_resources`]), because creating an empty one on a page that
+///   in it (see `own_resources`), because creating an empty one on a page that
 ///   inherits its resources detaches every font the page already used.
 ///
 /// The stamp is drawn last, so it sits over the page rather than under it, and it
