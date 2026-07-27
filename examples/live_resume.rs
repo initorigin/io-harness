@@ -95,14 +95,25 @@ async fn main() -> io_harness::Result<()> {
     // ---- process 3: resume with the policy ---------------------------------
     let store = Store::open(&db)?;
     let before = store.observations(run_id)?.len();
-    let r = resume_with(&contract(8), &provider, &store, run_id, &guarded(), &ApproveAll).await?;
+    let r = resume_with(
+        &contract(8),
+        &provider,
+        &store,
+        run_id,
+        &guarded(),
+        &ApproveAll,
+    )
+    .await?;
     println!("[3] resumed to: {:?}", r.outcome);
 
     assert_eq!(r.run_id, run_id, "one run, not two");
 
     let secret = std::fs::read_to_string(dir.path().join("secrets/key.txt"))?;
     println!("[3] secrets/key.txt is still {secret:?}");
-    assert_eq!(secret, "original-secret", "the boundary held across the resume");
+    assert_eq!(
+        secret, "original-secret",
+        "the boundary held across the resume"
+    );
 
     let after = store.observations(run_id)?.len();
     println!("[3] ledger grew from {before} to {after} observations, one run id");
