@@ -949,3 +949,66 @@ async fn children_are_composed_in_spawn_order_not_completion_order() {
         "child run ids must be allocated in spawn order"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.13.0 — the durable ledger reaches depth.
+//
+// The workspace loop and the sub-agent loop each build their own ledger. A fix
+// that landed in one and not the other would leave the same defect at a depth
+// where it is harder to see, so the sub-agent loop gets its own assertion.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn each_agent_keeps_its_own_durable_ledger_under_its_own_run_id() {
+    let dir = ws();
+    std::fs::write(dir.path().join("seed.txt"), "SEED-CONTENT").unwrap();
+    let contract = TaskContract::workspace(
+        "delegate a read and a write",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "out.txt".into(),
+            needle: "OK".into(),
+        },
+    )
+    .with_max_steps(3);
+
+    let script = MockScript::new(vec![
+        vec![call(
+            "spawn_agent",
+            json!({ "goal": "read the seed then write out", "verify_file": "out.txt", "verify_contains": "OK" }),
+        )],
+        // The child's turns: observe something, then satisfy its verification.
+        vec![call("read_file", json!({ "path": "seed.txt" }))],
+        vec![write("out.txt", "OK")],
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &script,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    let ids = store.tree_run_ids(result.run_id).unwrap();
+    let children: Vec<i64> = ids.into_iter().filter(|id| *id != result.run_id).collect();
+    assert!(!children.is_empty(), "the tree spawned at least one child");
+
+    let child_rows = store.observations(children[0]).unwrap();
+    assert!(
+        child_rows.iter().any(|o| o.text.contains("SEED-CONTENT")),
+        "the child's own observations are durable under the child's run id, got {child_rows:?}"
+    );
+    assert!(
+        !store
+            .observations(result.run_id)
+            .unwrap()
+            .iter()
+            .any(|o| o.text.contains("SEED-CONTENT")),
+        "a child's observations belong to the child, not to its parent's ledger"
+    );
+}

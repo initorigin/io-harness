@@ -1054,3 +1054,145 @@ async fn a_long_runs_stubs_collapse_so_the_ceiling_still_holds() {
         "the assembled row must record the collapse, got {rows:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.13.0 — the ledger survives an interruption.
+//
+// Through 0.12.0 the ledger lived only in memory, built fresh at the top of the
+// workspace and sub-agent loops after the resume step was already known, so a
+// resumed run re-derived its context from the workspace and asked the model a
+// different question than the process before it would have. Recorded as a
+// limitation in iterations/US-IO-HARNESS-0.12.0-I01.
+// ---------------------------------------------------------------------------
+
+/// The assertion the whole ledger half turns on: the same work, interrupted or
+/// not, sends the model the same thing. Compared on the observation section of
+/// the prompt — the only place the in-memory ledger is observable from outside —
+/// because the durable rows alone cannot tell a restored ledger from a re-derived
+/// one. This test fails if the restore is removed; the durable-row test below
+/// does not, which is why both exist.
+#[tokio::test]
+async fn a_resumed_run_asks_the_model_what_an_uninterrupted_run_would_have() {
+    let script = || {
+        MockScript::new(vec![
+            vec![call("read_file", json!({ "path": "a.txt" }))],
+            vec![call(
+                "write_file",
+                json!({ "path": "b.txt", "content": "b" }),
+            )],
+            vec![call("read_file", json!({ "path": "b.txt" }))],
+        ])
+    };
+
+    // Uninterrupted: three steps in one process.
+    let whole_dir = ws();
+    std::fs::write(whole_dir.path().join("a.txt"), "hello").unwrap();
+    let whole_store = Store::memory().unwrap();
+    let whole_provider = script();
+    let whole = (
+        run_with(
+            &never_passes(whole_dir.path(), 3),
+            &whole_provider,
+            &whole_store,
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await
+        .unwrap(),
+        whole_provider,
+    );
+
+    // Interrupted after one step, then resumed for the other two.
+    let cut_dir = ws();
+    std::fs::write(cut_dir.path().join("a.txt"), "hello").unwrap();
+    let cut_store = Store::memory().unwrap();
+    let provider = script();
+    let first = run_with(
+        &never_passes(cut_dir.path(), 1),
+        &provider,
+        &cut_store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    io_harness::resume_with(
+        &never_passes(cut_dir.path(), 3),
+        &provider,
+        &cut_store,
+        first.run_id,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    // Turn 3 of the whole run is turn 2 of the resumed provider: both are the
+    // step that has two steps of history behind it.
+    let uninterrupted = whole.1.observations(2);
+    let resumed = provider.observations(2);
+    assert!(
+        uninterrupted.contains("hello"),
+        "the fixture must carry step one's read into the later prompt, or this \
+         proves nothing: {uninterrupted}"
+    );
+    assert_eq!(
+        resumed, uninterrupted,
+        "a resumed run assembles from the ledger it had, not from the workspace"
+    );
+
+    // And the durable rows are written once, not once per resume: the watermark
+    // must not replay what the restore just read back.
+    let rows = cut_store.observations(first.run_id).unwrap();
+    assert_eq!(
+        rows,
+        whole_store.observations(whole.0.run_id).unwrap(),
+        "the interruption leaves the same durable ledger, with nothing duplicated"
+    );
+}
+
+/// The restore is a restore, not a re-derivation: what step one observed is in
+/// the prompt step two is sent, across the process boundary. Asserted on the
+/// provider's own received requests, which is the only place it is observable.
+#[tokio::test]
+async fn what_the_run_observed_before_the_interruption_is_in_the_prompt_after_it() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.txt"), "the-observation-from-step-one").unwrap();
+    let store = Store::memory().unwrap();
+
+    let before = MockScript::new(vec![vec![call("read_file", json!({ "path": "a.txt" }))]]);
+    let first = run_with(
+        &never_passes(dir.path(), 1),
+        &before,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let after = MockScript::new(vec![vec![call("read_file", json!({ "path": "a.txt" }))]]);
+    io_harness::resume_with(
+        &never_passes(dir.path(), 2),
+        &after,
+        &store,
+        first.run_id,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        after.turns(),
+        1,
+        "the resume drove exactly the remaining step"
+    );
+    assert!(
+        after
+            .observations(0)
+            .contains("the-observation-from-step-one"),
+        "the resumed run carried its earlier observation into the prompt, got: {}",
+        after.observations(0)
+    );
+}
