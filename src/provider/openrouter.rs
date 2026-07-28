@@ -1,8 +1,9 @@
 //! OpenRouter provider over an own HTTP + SSE client.
 //!
 //! OpenRouter speaks the OpenAI chat/completions format, so the request body,
-//! SSE parsing, and tool-call accumulation live in [`super::openai_wire`]; this
-//! module only adds the endpoint, bearer auth, and model configuration.
+//! SSE parsing, and tool-call accumulation live in a shared crate-private
+//! `openai_wire` module; this one only adds the endpoint, bearer auth, and model
+//! configuration.
 
 use std::time::Duration;
 
@@ -16,6 +17,28 @@ pub use crate::net::REQUEST_TIMEOUT;
 const ENDPOINT: &str = "https://openrouter.ai/api/v1/chat/completions";
 
 /// An OpenRouter-backed [`Provider`].
+///
+/// ```no_run
+/// use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// // `OPENROUTER_API_KEY` and `OPENROUTER_MODEL`. Neither is defaulted: a guessed
+/// // model slug is a wrong model that ships quietly.
+/// let provider = OpenRouter::from_env()?;
+///
+/// let contract = TaskContract::new(
+///     "add a hello function returning 42",
+///     "src/hello.rs",
+///     Verification::FileContains("fn hello".into()),
+/// );
+/// let result = run(&contract, &provider, &Store::memory()?).await?;
+/// println!("{:?}", result.outcome);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Swapping vendors is this line and nothing else — the contract, the policy, the
+/// store, and the tools are unchanged, because no vendor type reaches them.
 pub struct OpenRouter {
     client: reqwest::Client,
     api_key: String,

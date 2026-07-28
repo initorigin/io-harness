@@ -1,9 +1,9 @@
 //! OpenAI provider over an own HTTP + SSE client.
 //!
 //! OpenAI's chat/completions format is the same one OpenRouter uses, so the
-//! request body, SSE parsing, and tool-call accumulation are shared via
-//! [`super::openai_wire`]; this module only adds the endpoint, bearer auth, and
-//! model configuration.
+//! request body, SSE parsing, and tool-call accumulation are shared through a
+//! crate-private `openai_wire` module; this one only adds the endpoint, bearer
+//! auth, and model configuration.
 
 use std::time::Duration;
 
@@ -17,6 +17,31 @@ pub use crate::net::REQUEST_TIMEOUT;
 const ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";
 
 /// An OpenAI-backed [`Provider`].
+///
+/// ```no_run
+/// use std::time::Duration;
+///
+/// use io_harness::{run, OpenAi, Store, TaskContract, Verification, REQUEST_TIMEOUT};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// // `OPENAI_API_KEY` and `OPENAI_MODEL`, or `OpenAi::new(key, model)` when they
+/// // come from your own configuration.
+/// let provider = OpenAi::from_env()?
+///     // The one deadline worth overriding: a reasoning model that thinks for a
+///     // quarter of an hour outlives the ten-minute default and would otherwise
+///     // be abandoned mid-answer.
+///     .with_timeout(REQUEST_TIMEOUT + Duration::from_secs(600));
+///
+/// let contract = TaskContract::new(
+///     "add a hello function returning 42",
+///     "src/hello.rs",
+///     Verification::FileContains("fn hello".into()),
+/// );
+/// let result = run(&contract, &provider, &Store::memory()?).await?;
+/// println!("{:?}", result.outcome);
+/// # Ok(())
+/// # }
+/// ```
 pub struct OpenAi {
     client: reqwest::Client,
     api_key: String,

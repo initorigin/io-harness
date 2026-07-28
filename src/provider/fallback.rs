@@ -2,8 +2,8 @@
 //!
 //! Three providers are implemented and, before 0.11, only ever one was reachable
 //! in a run: every entry point is generic over a single `P: Provider`, and
-//! [`Provider::complete`](crate::provider::Provider::complete) returns
-//! `impl Future`, so there is no `dyn Provider` to hold a list behind.
+//! [`Provider::complete`] returns `impl Future`, so there is no `dyn Provider` to
+//! hold a list behind.
 //!
 //! [`Fallback`] is how fallback happens without changing that. It is itself a
 //! `Provider`, so `run(&contract, &Fallback::new(a, b), &store)` needs no new
