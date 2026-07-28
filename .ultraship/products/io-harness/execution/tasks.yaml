@@ -1,494 +1,160 @@
 product: io-harness
-version: 0.16.0
+version: 0.16.1
 tasks:
-- id: US-IO-HARNESS-0.16.0-T01
-  summary: The public-surface enumerator and its snapshot test. One module that resolves every item
-    re-exported from `lib.rs` to its kind, name, and defining file, a checked-in snapshot of that
-    surface, and a test comparing the two. Negative controls prove the comparison catches a removal
-    and a rename, not only an addition.
-  why_required: The deprecation cycle is the half of this release that is a promise rather than a
-    page, and a promise with no mechanism is what the release exists to stop shipping. This is the
-    mechanism. It is also the foundation for T02, which needs the same enumeration to ask a
-    different question of each item, so building it twice is the alternative to building it first.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - >
-    F8 — the public surface matches its checked-in snapshot. The negative control is the checker run
-    against a snapshot with one item removed and one renamed, which reports both — a removal and a
-    rename are the two things the deprecation cycle exists to catch, and a checker that catches only
-    additions would pass every release that broke something.
-  files:
-  - tests/public_api.rs
-  - tests/support/surface.rs
-  - docs/public-api.txt
-  evidence:
-  - >
-    tests/public_api.rs and docs/public-api.txt; 106 items enumerated, all resolved;
-    public_surface_matches_snapshot passes; controls cover a removal, a rename, an addition and an
-    unresolvable export (784258b)
-- id: US-IO-HARNESS-0.16.0-T02
-  summary: The worked-example checker. Over T01's enumeration, assert every public item's
-    documentation carries a fenced code block, failing with the list of items that do not. Its
-    negative control is a fixture item that is documented and exampleless, which the checker must
-    report.
-  why_required: '"Every public item carries a worked example" is the release''s most checkable claim
-    and the one that decays fastest — the next added function is the one nobody notices. The checker
-    is what converts it from a sentence into a build failure. It lands before the sweep so the sweep
-    has a failing test to drive it, which is the ordering test-driven development asks for and also
-    the only way to know the sweep is finished.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T01
-  acceptance_criteria:
-  - >
-    F5 — every public item re-exported from `lib.rs` carries a fenced example. A test enumerates the
-    public surface and fails naming each item whose documentation has no fenced code block.
-  - >
-    F6 — the negative control for F5. The checker run over a fixture with a documented-but-
-    exampleless item reports that item, so F5 measures presence rather than the checker returning an
-    empty list on every input.
-  files:
-  - tests/public_api.rs
-  - tests/support/surface.rs
-  evidence:
-  - >
-    every_public_item_has_a_worked_example fails listing 105 of the 106 items, which is the work-
-    list T11 and T12 are driven by; the control reports a documented-but-exampleless fixture item
-    (784258b)
-- id: US-IO-HARNESS-0.16.0-T03
-  summary: The drift checkers. The MSRV stated in the README, the crate root, and `CONTRACT.md` is
-    asserted equal to `Cargo.toml`'s `rust-version`; the documented feature list is asserted equal to
-    the `[features]` keys in both directions; every relative link in the README and under `docs/`
-    resolves to a file that exists. Each carries a negative-control fixture.
-  why_required: The three facts most likely to be retyped and left stale are the MSRV, the feature
-    list, and the links — and the link half becomes a live hazard the moment T05 splits one file into
-    a dozen. Writing the checkers before the split means the split is verified as it happens rather
-    than audited afterwards, when a dangling link reads like a deliberate omission.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - >
-    F4 — every relative link in the README and in every `docs/` page resolves to a file that exists.
-    The negative control is a link to a deliberately absent path inside the checker's own fixture,
-    which the checker reports.
-  - >
-    F9 — the documented MSRV equals `Cargo.toml`'s `rust-version`, asserted for the README, the
-    crate root, and `CONTRACT.md`. The negative control is the same assertion against a fixture
-    stating a different version, which fails.
-  - >
-    F10 — the documented feature list equals the `[features]` table's keys. A feature added to
-    `Cargo.toml` and not documented fails the test, and so does a documented feature that does not
-    exist. The negative control covers both directions, because a one-directional check passes
-    forever after the first stale entry.
-  files:
-  - tests/docs_drift.rs
-  - tests/support/docs.rs
-  evidence:
-  - >
-    tests/docs_drift.rs, 10 tests; MSRV, feature-list in both directions, and relative-link
-    checkers, each with a negative-control fixture (2d44290)
-- id: US-IO-HARNESS-0.16.0-T04
-  summary: The changelog break audit and its checker. Read 0.2.0 through 0.15.0 for changes that
-    broke the public contract, mark each with an explicit token, write the migration note saying what
-    to write instead, and add the test that fails on a marked-breaking entry with no note. Update
-    `docs/CHANGELOG_STRUCTURE.md` so the next release inherits the format.
-  why_required: A migration note is the only part of the pre-1.0 promise a consumer actually consumes
-    — the deprecation cycle helps whoever upgrades next, but the notes help everyone upgrading across
-    the fifteen releases already shipped. The audit is also the task most likely to discover a break
-    the contract did not anticipate, so it runs early enough that the discovery is still cheap.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - >
-    F11 — every 0.x minor that broke the public contract carries a migration note in the changelog
-    saying what to write instead. Asserted by a test over `CHANGELOG.md` that finds every entry
-    marked as breaking and fails on any without a migration note. The negative control is a fixture
-    entry marked breaking with no note, which the checker reports.
-  files:
-  - CHANGELOG.md
-  - docs/CHANGELOG_STRUCTURE.md
-  - tests/changelog.rs
-  evidence:
-  - >
-    CHANGELOG.md: 49 breaking entries marked across 16 versions, each carrying a Migration note. The
-    audit ran against the git tags rather than the prose, because three releases claim in prose to
-    break nothing and do (0.5.0, 0.9.0, 0.14.0)
-  - >
-    tests/changelog.rs, 5 tests, fence-aware; the control reports a marked-and-unmigrated fixture
-    entry (92ca065)
-  - >
-    docs/CHANGELOG_STRUCTURE.md states the marker and the migration-note requirement so the next
-    release inherits the format
-- id: US-IO-HARNESS-0.16.0-T05
-  summary: The README as a landing page. What the crate is, badges, the MSRV, a quickstart inside the
-    first screen, and a capability list describing what the harness does today, ending in links to
-    the guide pages and the standing license and attribution blocks. No heading named after a
-    release. The tests for the shape of the first 60 lines and for the absence of version-scoped
-    headings land with it, the second with the 0.15.0 file as its negative control.
-  why_required: This is the release's headline and the page a new reader lands on from crates.io. It
-    is sequenced before the guide pages because the split is decided by what the landing page keeps —
-    writing the guides first would mean guessing at the boundary and moving prose twice.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T03
-  acceptance_criteria:
-  - >
-    F1 — the README opens as a landing page. Within its first 60 lines it states what the crate is,
-    shows a runnable quickstart code fence, and names the MSRV. Asserted by a test over the file, so
-    a later edit that pushes the quickstart below a new section of prose fails the suite.
-  - >
-    F2 — no heading in the README or the crate root is named after a release. A test asserts no
-    heading matches `\(v?\d+\.\d+`, and that the crate-root documentation contains no `v0.N adds`
-    line. The negative control is the current file: the same test run against the 0.15.0 README and
-    crate root fails, which is what makes F2 a measurement rather than a tautology.
-  files:
-  - README.md
-  - tests/readme.rs
-  evidence:
-  - >
-    README.md rewritten as a landing page: quickstart inside the first screen, MSRV stated, no
-    version-named heading (503d676)
-  - >
-    tests/readme.rs, 8 tests; the controls use the real 0.15.0 headings, checked in as a fixture so
-    they survive a shallow clone
-- id: US-IO-HARNESS-0.16.0-T06
-  summary: Guide pages, first group — the permission model and the approval flow, agent composition
-    and containment, the execution sandbox, and durable unattended runs. Each is one page under
-    `docs/guide/`, carrying the depth the README shed, with its "the limits, stated plainly" block
-    intact.
-  why_required: 'These four are the capabilities a reader most often needs in full and least often
-    gets from a summary: they are the ones with real boundaries, and a boundary described loosely is
-    worse than one not described at all. Without the pages the README rewrite is a deletion.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T05
-  acceptance_criteria:
-  - >
-    F3 — nothing was lost in the split. Every capability section removed from the README exists as a
-    `docs/guide/` page, and every "the limits, stated plainly" block present at 0.15.0 is present in
-    the guide page for its capability. Asserted by a test carrying the explicit list of capabilities
-    and limit-blocks, so a page silently dropped fails rather than passing unnoticed.
-  - >
-    F4 — every relative link in the README and in every `docs/` page resolves to a file that exists.
-    The negative control is a link to a deliberately absent path inside the checker's own fixture,
-    which the checker reports.
-  files:
-  - docs/guide/permissions.md
-  - docs/guide/composition.md
-  - docs/guide/sandbox.md
-  - docs/guide/durable-runs.md
-  evidence:
-  - >
-    docs/guide/permissions.md, composition.md, sandbox.md and durable-runs.md, 507 lines; the
-    Windows limits block carried across byte-for-byte (f00a100)
-- id: US-IO-HARNESS-0.16.0-T07
-  summary: Guide pages, second group — MCP and network egress, in-process tools and skills, context
-    assembly and durable memory, and resilience with provider fallback. Same shape and same treatment
-    of the limits blocks as T06.
-  why_required: These four are the extensibility and long-run surface, and they are where the crate's
-    honest boundaries live — what the policy governs once a stdio server or a registered tool is
-    running, and what a context budget does not promise. They are disjoint files from T06 and run
-    beside it.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T05
-  acceptance_criteria:
-  - >
-    F3 — nothing was lost in the split. Every capability section removed from the README exists as a
-    `docs/guide/` page, and every "the limits, stated plainly" block present at 0.15.0 is present in
-    the guide page for its capability. Asserted by a test carrying the explicit list of capabilities
-    and limit-blocks, so a page silently dropped fails rather than passing unnoticed.
-  - >
-    F4 — every relative link in the README and in every `docs/` page resolves to a file that exists.
-    The negative control is a link to a deliberately absent path inside the checker's own fixture,
-    which the checker reports.
-  files:
-  - docs/guide/mcp-and-network.md
-  - docs/guide/tools-and-skills.md
-  - docs/guide/context-and-memory.md
-  - docs/guide/resilience.md
-  evidence:
-  - >
-    docs/guide/mcp-and-network.md, tools-and-skills.md, context-and-memory.md and resilience.md, 527
-    lines; four limits blocks survived, not the three expected (f00a100)
-- id: US-IO-HARNESS-0.16.0-T08
-  summary: Guide pages, third group — verification and what a passing gate proves, observability and
-    replay, documents, and images and git. The verification page is the one that has to state the
-    0.8.1 result plainly, and the documents page states the OCR, PowerPoint-authoring and video
-    decisions as decisions with their reasoning rather than as gaps.
-  why_required: 0.12.0 and 0.13.0 are absent from the README entirely, so observability and replay
-    have never been documented for a reader at all — this group is the one that adds rather than
-    moves. And the verification page carries the narrowest, most misread guarantee in the crate,
-    which io-cli and io-studio have both inherited.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T05
-  acceptance_criteria:
-  - >
-    F3 — nothing was lost in the split. Every capability section removed from the README exists as a
-    `docs/guide/` page, and every "the limits, stated plainly" block present at 0.15.0 is present in
-    the guide page for its capability. Asserted by a test carrying the explicit list of capabilities
-    and limit-blocks, so a page silently dropped fails rather than passing unnoticed.
-  - >
-    F4 — every relative link in the README and in every `docs/` page resolves to a file that exists.
-    The negative control is a link to a deliberately absent path inside the checker's own fixture,
-    which the checker reports.
-  files:
-  - docs/guide/verification.md
-  - docs/guide/observability.md
-  - docs/guide/documents.md
-  - docs/guide/images-and-git.md
-  evidence:
-  - >
-    docs/guide/verification.md, observability.md, documents.md and images-and-git.md, 971 lines;
-    observability.md was written from source because 0.12.0 and 0.13.0 were never documented for a
-    reader at all (50f17bc)
-- id: US-IO-HARNESS-0.16.0-T09
-  summary: The "nothing was lost" checker and the guide index. A test carrying the explicit list of
-    capabilities and of the limits blocks present at 0.15.0, asserting each has a page and each block
-    survived; and `docs/CAPABILITIES.md` reworked into the index that links the guide pages, for a
-    reader who arrives at `docs/` from docs.rs rather than from the README.
-  why_required: A split that quietly drops a section is the failure mode of this release, and it is
-    invisible — the result still reads well. The list has to be written down against the 0.15.0 file
-    while that file is still the reference, and the check has to name the capabilities explicitly,
-    because a checker that counts pages passes when the right number of wrong pages exists.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T06
-  - US-IO-HARNESS-0.16.0-T07
-  - US-IO-HARNESS-0.16.0-T08
-  acceptance_criteria:
-  - >
-    F3 — nothing was lost in the split. Every capability section removed from the README exists as a
-    `docs/guide/` page, and every "the limits, stated plainly" block present at 0.15.0 is present in
-    the guide page for its capability. Asserted by a test carrying the explicit list of capabilities
-    and limit-blocks, so a page silently dropped fails rather than passing unnoticed.
-  files:
-  - docs/CAPABILITIES.md
-  - tests/docs_drift.rs
-  evidence:
-  - >
-    tests/guide_pages.rs, 7 tests, all passing; it catches a missing page, a dropped limits block, a
-    stub, and a page the test does not know about, with four controls
-  - >
-    docs/CAPABILITIES.md reworked as the guide index, and its stale claim that video passthrough is
-    a capability removed
-- id: US-IO-HARNESS-0.16.0-T10
-  summary: The crate root restructured. What the harness is, one worked example, the capability
-    surface as capabilities, the feature flags, the MSRV, and the platform support matrix, written
-    from the same source of truth as the README and linking the guide pages. The version-by-version
-    narrative is retired from `src/lib.rs`.
-  why_required: docs.rs opens on the crate root, not the README, so this is the page an external Rust
-    developer actually lands on — and it is the worse of the two, with v0.3 filed after v0.14 and
-    v0.10 through v0.13 never mentioned. Fixing the README alone would leave the primary front door
-    unchanged.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T05
-  acceptance_criteria:
-  - >
-    F2 — no heading in the README or the crate root is named after a release. A test asserts no
-    heading matches `\(v?\d+\.\d+`, and that the crate-root documentation contains no `v0.N adds`
-    line. The negative control is the current file: the same test run against the 0.15.0 README and
-    crate root fails, which is what makes F2 a measurement rather than a tautology.
-  - >
-    F14 — `cargo doc` builds clean with no warnings on the default build and with `--all-features`,
-    including no broken intra-doc links. An intra-doc link to a renamed item is the most common way
-    documentation of this shape rots, and rustdoc already detects it.
-  files:
-  - src/lib.rs
-  evidence:
-  - >
-    src/lib.rs crate root rewritten, 233 lines down to 209; crate_root_does_not_narrate_releases and
-    crate_root_has_no_version_named_heading both pass; cargo doc emits no warning from lib.rs
-    (d81ba88)
-- id: US-IO-HARNESS-0.16.0-T11
-  summary: Worked examples, first partition — the core loop surface. `TaskContract`, the run and
-    resume entry points, `RunResult` and `RunOutcome`, `Error` and `ProviderErrorKind`,
-    `Verification`, `ExecGuard`, the policy types, and the approver types. Each gets an example
-    showing the item used for its purpose, in a form a reader could copy.
-  why_required: This partition is what a reader reaches for first and the items the guide pages link
-    into, so an exampleless `Verification` variant is a dead end at the exact moment a reader is
-    trying to start. It is the half of the sweep where the examples carry the most weight.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T02
-  acceptance_criteria:
-  - >
-    F5 — every public item re-exported from `lib.rs` carries a fenced example. A test enumerates the
-    public surface and fails naming each item whose documentation has no fenced code block.
-  - >
-    F7 — every example compiles. `cargo test --doc` passes on the default build and with
-    `--all-features`, so an example that names a feature-gated item is compiled under the feature
-    that provides it rather than silently skipped.
-  files:
-  - src/contract.rs
-  - src/run.rs
-  - src/error.rs
-  - src/verify.rs
-  - src/policy.rs
-  - src/approve.rs
-  evidence:
-  - >
-    43 items documented across contract.rs, run.rs, error.rs, verify.rs, policy.rs and approve.rs;
-    each shows the item doing its job rather than restating its signature (1988802)
-  - >
-    Two wrong doc comments fixed: Verification claimed the subject compiles as its own crate with
-    the criterion against it, which overstates the 0.8.1 boundary; and TaskContract::with_tools had
-    lost its doc block into with_images, so its authorization paragraphs rendered nowhere on a
-    default build
-- id: US-IO-HARNESS-0.16.0-T12
-  summary: Worked examples, second partition — the surrounding surface. The provider types, the store
-    and its row types, the tool trait and toolbox, sandbox, MCP, skills, observation, context,
-    containment, resilience, and the exported constants. Feature-gated items get examples compiled
-    under the feature that provides them.
-  why_required: These are the items an embedding application reaches for once it is past the first
-    run — `Store`'s row types are the audit surface 0.12.0 exported precisely so they could be named,
-    and an exported type with no example is an export that only half happened. Disjoint files from
-    T11, so the two partitions run beside each other.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T02
-  acceptance_criteria:
-  - >
-    F5 — every public item re-exported from `lib.rs` carries a fenced example. A test enumerates the
-    public surface and fails naming each item whose documentation has no fenced code block.
-  - >
-    F7 — every example compiles. `cargo test --doc` passes on the default build and with
-    `--all-features`, so an example that names a feature-gated item is compiled under the feature
-    that provides it rather than silently skipped.
-  files:
-  - src/provider/mod.rs
-  - src/state.rs
-  - src/tools/mod.rs
-  - src/sandbox.rs
-  - src/mcp.rs
-  - src/skills.rs
-  - src/observe.rs
-  - src/context.rs
-  - src/containment.rs
-  - src/resilience.rs
-  evidence:
-  - >
-    62 further items across provider, state, containment, resilience, net, sandbox, mcp, observe,
-    skills, context, custom and git; most run for real rather than no_run (c6809e4, 16be32f)
-  - >
-    All 106 items now carry an example: every_public_item_has_a_worked_example passes, cargo test
-    --doc 116 passed and 118 with --all-features
-  - >
-    Four more wrong doc comments fixed: seccomp claimed in three places and installed nowhere,
-    setrlimit claimed to cap processes, max_processes documented as enforced when no platform
-    enforces it, and a comment denying that a README.md in a skills directory is discovered as a
-    skill
-  - >
-    cargo doc --no-deps warning-free on both the default and --all-features builds, the eleven pre-
-    existing rustdoc warnings included
-- id: US-IO-HARNESS-0.16.0-T13
-  summary: '`docs/CONTRACT.md` rewritten as the actual public contract: what is public and what is
-    not, what pre-1.0 means here, the deprecation cycle and the snapshot that enforces it, the MSRV
-    policy, the feature flags and what each costs, the platform support matrix, and the limits that
-    hold today — including the carried ones this release documents rather than fixes.'
-  why_required: 'This is the half of the release aimed at a developer who already depends on the
-    crate, and nothing else in the repository answers "what may change under me". It also gives the
-    six carried limitations their in-scope destination: stated plainly in one place a consumer reads,
-    rather than fixed in a release that has no business fixing them.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T01
-  - US-IO-HARNESS-0.16.0-T04
-  acceptance_criteria:
-  - >
-    F9 — the documented MSRV equals `Cargo.toml`'s `rust-version`, asserted for the README, the
-    crate root, and `CONTRACT.md`. The negative control is the same assertion against a fixture
-    stating a different version, which fails.
-  - >
-    F10 — the documented feature list equals the `[features]` table's keys. A feature added to
-    `Cargo.toml` and not documented fails the test, and so does a documented feature that does not
-    exist. The negative control covers both directions, because a one-directional check passes
-    forever after the first stale entry.
-  files:
-  - docs/CONTRACT.md
-  evidence:
-  - >
-    docs/CONTRACT.md rewritten: what is public and what is not, what pre-1.0 means here, the
-    deprecation cycle, the MSRV policy, the feature table, the platform matrix, and eleven limits
-    that hold today (e7de93e, 50f17bc)
-- id: US-IO-HARNESS-0.16.0-T14
-  summary: '`resume_tree_from_stored_policy` and `resume_tree_from_stored_policy_observed` — the tree
-    loop''s stored-policy resume, built on the template `resume_from_stored_policy` already provides
-    for the single-file and workspace loops. A tree with no stored policy is a typed error, never a
-    silent fall back to `Policy::permissive`.'
-  why_required: 'The release documents the public contract, and the resume surface currently
-    contradicts itself: two loops can be resumed under the policy they were started with and the
-    third cannot, which would have to be written down as a caveat in the guide page for durable runs.
-    Fixing it is smaller than documenting it, and 0.15.0 made it sharper by letting the agent take
-    irreversible commits under a policy.'
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - >
-    F12 — `resume_tree_from_stored_policy` resumes a tree under the policy it was started with. A
-    tree run started under a policy denying a path, killed mid-run, and resumed through the new
-    entry point without the caller passing a policy, still refuses that path — and the refusal is in
-    the trace attributed to the original rule and layer.
-  - >
-    F13 — the negative control for F12. The same tree started under a permissive policy and resumed
-    the same way performs the action, so F12 measures a restored boundary rather than a resume that
-    fails everything. And a tree resumed through the new function that has no stored policy is a
-    typed error, never a silent fall back to `Policy::permissive` — which is the exact defect 0.13.0
-    was written to close in the other two loops.
-  files:
-  - src/run.rs
-  - src/lib.rs
-  - tests/checkpoint.rs
-  evidence:
-  - >
-    resume_tree_from_stored_policy and its observed twin added; no existing signature changed; a
-    tree with no stored policy is Error::Resume and never a permissive fallback (d8dfad5)
-  - >
-    tests/checkpoint.rs, 18 passed: F12 asserts the refusal and its rule and layer attribution, F13
-    covers both the permissive control and the no-stored-policy error
-- id: US-IO-HARNESS-0.16.0-T15
-  summary: Publication surface and the gate. `[package.metadata.docs.rs]` with all features enabled
-    and feature labels on the items they gate, the `Cargo.toml` description shortened to one sentence
-    a human reads, the packaged crate carrying the README and the guide pages, and the full gate —
-    `cargo doc` clean on both builds, `cargo test --doc` on both, the suite on three OSes, and the
-    default tree still 401 lines.
-  why_required: 'The rendered docs.rs page is the artifact this release is largely written for and it
-    is unobservable until after publication, which is irreversible. Verifying it locally is the only
-    chance to see it. The description is separately load-bearing: it is a comma-separated inventory
-    of fifteen releases that already refused a publish at 1041 characters against the 1000-character
-    cap.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.16.0-T09
-  - US-IO-HARNESS-0.16.0-T10
-  - US-IO-HARNESS-0.16.0-T11
-  - US-IO-HARNESS-0.16.0-T12
-  - US-IO-HARNESS-0.16.0-T13
-  - US-IO-HARNESS-0.16.0-T14
-  acceptance_criteria:
-  - >
-    F7 — every example compiles. `cargo test --doc` passes on the default build and with
-    `--all-features`, so an example that names a feature-gated item is compiled under the feature
-    that provides it rather than silently skipped.
-  - >
-    F14 — `cargo doc` builds clean with no warnings on the default build and with `--all-features`,
-    including no broken intra-doc links. An intra-doc link to a renamed item is the most common way
-    documentation of this shape rots, and rustdoc already detects it.
-  files:
-  - Cargo.toml
-  - README.md
-  evidence:
-  - >
-    Cargo.toml: description cut from a 944-character inventory to one sentence,
-    [package.metadata.docs.rs] with all-features and doc_auto_cfg, docsrs declared in [lints.rust]
-    check-cfg, version 0.16.0; 17 files under docs/ present in cargo package --list
-  - >
-    Gate green: cargo test 203 lib plus every integration suite, cargo test --all-features 32
-    suites, cargo test --doc 116 and 118 with --all-features, cargo doc --no-deps 0 warnings on both
-    builds, clippy --all-targets clean, cargo fmt clean, cargo tree 401 lines
-  - >
-    CHANGELOG.md carries the 0.16.0 entry, written under the format T04 introduced and opening with
-    the fact that the release breaks nothing
+  - id: US-IO-HARNESS-0.16.1-T01
+    summary: >
+      Rewrite the README's "Part of initorigin" table. Three rows with a status column — io-harness
+      Released and linked, io-cli and io-studio in development and named without a link — and a
+      sentence under it stating that io-harness is the only public repository today and that the
+      other two open when they release.
+    why_required: >
+      This table is the release. It is the last section of the crates.io landing page for a published
+      crate, it links four repositories that return 404 to every reader who is not the owner, and two
+      of the five products it names have not been built. Without this task there is no 0.16.1.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F1 — the README's product table has exactly three rows (io-harness, io-cli, io-studio),
+        carries a status column, and contains no occurrence of `io-eval` or `website`.
+      - >
+        F2 — the only link in that table is io-harness's. Neither io-cli nor io-studio is a markdown
+        link to any URL, and the table is followed by a sentence stating that io-harness is the only
+        public repository today.
+    files:
+      - README.md
+    evidence:
+      - >
+        README.md "Part of initorigin" now has three rows and a Status column: io-harness Released
+        and linked, io-cli and io-studio "In development" with bare names. `io-eval` and `website`
+        are gone from the file entirely. The table is followed by "io-harness is the only public
+        repository today, which is why it is the only one linked."
+  - id: US-IO-HARNESS-0.16.1-T02
+    summary: >
+      Sweep the repository for anything else that presents an unbuilt or private initorigin product
+      as available — `io-eval`, `initorigin/website`, `initorigin/io-cli`, `initorigin/io-studio` —
+      across README.md, src/lib.rs, docs/, CONTRIBUTING.md and Cargo.toml, and correct what is
+      found. Sealed release records, product.yaml, roadmap.yaml and past CHANGELOG entries are
+      historical and are left alone.
+    why_required: >
+      The crate has two landing pages, not one: crates.io renders the README and docs.rs opens on
+      src/lib.rs. Fixing one and not the other reproduces the exact defect 0.16.0 shipped its
+      `readme` checker to prevent, and there is no mechanised check for this table, so the sweep is
+      the only thing standing in for one.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.16.1-T01
+    acceptance_criteria:
+      - >
+        F3 — a repository-wide grep for `io-eval`, `initorigin/website`, `initorigin/io-cli` and
+        `initorigin/io-studio` returns hits only in files that are historical by design:
+        CHANGELOG.md's past entries, the sealed `.ultraship/products/io-harness/releases/*.yaml`
+        records, and `product.yaml`/`roadmap.yaml`. No hit in README.md, `src/lib.rs`, `docs/`,
+        CONTRIBUTING.md, or Cargo.toml.
+    files:
+      - README.md
+      - src/lib.rs
+    evidence:
+      - >
+        Repository-wide grep for `io-eval`, `initorigin/website`, `initorigin/io-cli`,
+        `initorigin/io-studio` over README.md, src/, docs/, CONTRIBUTING.md, Cargo.toml, SECURITY.md,
+        CODE_OF_CONDUCT.md, NOTICE, examples/, tests/ and .github/ returns exactly one hit:
+        src/state.rs:1507, a `//` implementation comment explaining why `runs.finished_at` exists
+        ("io-eval would have been coupled to internals from its first line"). It is not a doc
+        comment, renders nowhere, and states a design rationale rather than an availability claim, so
+        it was left alone. Every other hit is in a historical file — the sealed
+        `.ultraship/.../releases/*.yaml` records, product.yaml, roadmap.yaml, the iterations, the
+        generated views, and past CHANGELOG entries.
+  - id: US-IO-HARNESS-0.16.1-T03
+    summary: >
+      Remove `CARGO_REGISTRY_TOKEN` and its comment from `.env.example`, leaving only the provider
+      variables a contributor running the suite actually sets. No CHANGELOG entry.
+    why_required: >
+      The template tells every contributor to obtain a crates.io publish token. It is the
+      maintainer's credential, it is not needed to build or test the crate, and asking for it in a
+      public template misstates what the project requires of a contributor.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F4 — `.env.example` contains no `CARGO_REGISTRY_TOKEN` line and no comment referring to a
+        publish token, and every remaining variable in it is one a contributor running the suite
+        actually sets.
+    files:
+      - .env.example
+    evidence:
+      - >
+        `.env.example` no longer contains CARGO_REGISTRY_TOKEN or its comment. The six remaining
+        variables are the three provider key/model pairs the suite and the examples read via
+        `OpenRouter::from_env` / `Anthropic::from_env` / `OpenAi::from_env`. No CHANGELOG entry was
+        written for this, per the contract.
+  - id: US-IO-HARNESS-0.16.1-T04
+    summary: >
+      Bump the version to 0.16.1 in Cargo.toml and Cargo.lock, and write the CHANGELOG `[0.16.1]`
+      section covering the README correction only — stating that there is no breaking change and no
+      code change, and saying nothing about `.env.example`.
+    why_required: >
+      An unbumped manifest cannot be published, and the CHANGELOG is this project's stated single
+      source of truth for release notes: the GitHub Release body is taken from it verbatim, so a
+      missing section means a Release with no notes.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.16.1-T01
+    acceptance_criteria:
+      - >
+        F5 — CHANGELOG.md has a `[0.16.1]` section that describes the README correction, states there
+        are no breaking changes, and does NOT mention the `.env.example` change.
+    files:
+      - Cargo.toml
+      - Cargo.lock
+      - CHANGELOG.md
+    evidence:
+      - >
+        Cargo.toml version = "0.16.1"; Cargo.lock updated via `cargo update -p io-harness --precise
+        0.16.1`. CHANGELOG.md gained a `[0.16.1] - 2026-07-28` section under Changed describing the
+        table correction, opening with "There are no breaking changes and no code change in this
+        release", and making no mention of .env.example.
+  - id: US-IO-HARNESS-0.16.1-T05
+    summary: >
+      Run the gates: the full test suite including the five 0.16.0 checkers, clippy, fmt, the
+      public-surface diff, and `cargo package` with an inspection of the resulting `.crate`.
+    why_required: >
+      CI is not being waited on for this release, which makes the local run the only verification
+      there is. `tests/readme.rs` asserts properties of the file T01 edits, so this is also the one
+      place the release could fail unexpectedly rather than a formality.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.16.1-T01
+      - US-IO-HARNESS-0.16.1-T02
+      - US-IO-HARNESS-0.16.1-T03
+      - US-IO-HARNESS-0.16.1-T04
+    acceptance_criteria:
+      - >
+        NF1 — no public API change. `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` is empty
+        for the whole branch, and `tests/public_api.rs` passes against the unchanged snapshot.
+      - >
+        NF2 — the five 0.16.0 checkers stay green with no test edited to accommodate the change:
+        `readme`, `public_api`, `docs_drift`, `changelog`, and `guide_pages`. `readme` is the one this
+        release could plausibly break, since it asserts properties of the file being edited; it must
+        pass unmodified.
+      - >
+        NF3 — `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` all
+        exit 0, MSRV stays 1.88, and the default `cargo tree` stays at 401 lines.
+      - >
+        NF4 — `cargo package` succeeds and the crate description stays under the crates.io
+        1000-character cap. The packaged `.crate` is inspected for a `.env`, a secret-shaped path, or
+        any file the `exclude` list should have caught.
+    files: []
+    evidence:
+      - >
+        cargo test — 203 lib tests + every integration target + 116 doctests, all passed, 0 failed.
+        The five 0.16.0 checkers pass unmodified: changelog 5/5, docs_drift 10/10, guide_pages 7/7,
+        public_api 9/9, readme 8/8.
+      - >
+        `cargo clippy --all-targets -- -D warnings` exit 0. `cargo fmt --check` exit 0. `cargo tree`
+        401 lines, unchanged. `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` empty for the
+        whole branch. Cargo.toml description is 290 characters, well under the crates.io 1000 cap.
+      - >
+        `cargo package` produced io-harness-0.16.1.crate, 577 KB. Inspected: no `.env`, no
+        `.ultraship/`, no `.github/`, no secret-shaped path. `.env.example` ships as intended and now
+        carries no publishing credential.

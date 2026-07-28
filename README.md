@@ -179,13 +179,14 @@ goes through a deprecation cycle rather than vanishing between two releases.
 
 `IO Harness` is one of the [initorigin](https://github.com/initorigin) products:
 
-| Repo | What it is |
-| --- | --- |
-| [io-harness](https://github.com/initorigin/io-harness) | The Rust agent harness (the center product) |
-| [io-eval](https://github.com/initorigin/io-eval) | Benchmark harness for io-harness |
-| [io-cli](https://github.com/initorigin/io-cli) | Terminal app on io-harness |
-| [io-studio](https://github.com/initorigin/io-studio) | Desktop coding studio on io-harness |
-| [website](https://github.com/initorigin/website) | Marketing site, docs, and blog |
+| Product | What it is | Status |
+| --- | --- | --- |
+| [io-harness](https://github.com/initorigin/io-harness) | The Rust agent harness (the center product) | Released |
+| io-cli | Terminal app on io-harness | In development |
+| io-studio | Desktop coding studio on io-harness | In development |
+
+io-harness is the only public repository today, which is why it is the only one
+linked. io-cli and io-studio open when they release.
 
 ## Contributing
 
