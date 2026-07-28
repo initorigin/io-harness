@@ -44,6 +44,37 @@ use crate::state::{McpEvent, PolicyEvent, Store};
 /// Namespacing is not cosmetic: without it a server advertising `write_file`
 /// would shadow the built-in that edits the workspace, and the model would have
 /// no way to tell which one it was calling.
+///
+/// The full shape is `mcp__<server-id>__<tool>`, where the server id is the one
+/// [`McpServer::id`] was configured with. That name is what the model calls,
+/// what the trace records, and — the reason to build it in your own code —
+/// what the policy decides on, so a single server's tools can be allowed and
+/// denied individually.
+///
+/// ```
+/// use io_harness::{Policy, MCP_TOOL_PREFIX};
+///
+/// // The server configured as `github` offers `create_issue`. Denying it by
+/// // its namespaced name leaves that server's read-only tools usable.
+/// let tool = format!("{MCP_TOOL_PREFIX}github__create_issue");
+/// assert_eq!(tool, "mcp__github__create_issue");
+///
+/// let policy = Policy::default()
+///     .layer("app")
+///     .allow_exec("github-mcp-server")
+///     .deny_exec(tool.clone());
+/// # let _ = policy;
+///
+/// // And the prefix is how an application routing tool events tells a server
+/// // tool apart from a built-in or a registered in-process `Tool`.
+/// assert!(tool.starts_with(MCP_TOOL_PREFIX));
+/// assert!(!"write_file".starts_with(MCP_TOOL_PREFIX));
+/// ```
+///
+/// It is reserved in the other direction too: an in-process
+/// [`Tool`](crate::tools::Tool) whose name starts with it is refused by
+/// [`Toolbox::validate`](crate::tools::Toolbox::validate), so nothing can
+/// impersonate a tool an operator believes came from a configured server.
 pub const MCP_TOOL_PREFIX: &str = "mcp__";
 
 /// Default per-call timeout. A third-party tool that never returns must not
@@ -55,6 +86,57 @@ fn default_timeout_secs() -> u64 {
 }
 
 /// How to reach one MCP server.
+///
+/// The two variants are not interchangeable configuration: they are checked by
+/// different halves of the policy. A stdio server is a process the harness
+/// spawns, so it needs an [`Act::Exec`] rule on its binary; an HTTP server is a
+/// host the harness dials, so it needs an [`Act::Net`] rule on that host.
+/// Configuring the wrong one is a run that fails at start with
+/// [`Error::Refused`], which is the intended outcome — naming a server in a
+/// contract is not authorising it.
+///
+/// ```
+/// use std::collections::BTreeMap;
+///
+/// use io_harness::{McpServer, McpTransport, Policy};
+///
+/// // Spawned locally. `env` is how a server gets the credential it needs
+/// // without that credential going anywhere near the model.
+/// let local = McpServer {
+///     id: "github".into(),
+///     transport: McpTransport::Stdio {
+///         command: "github-mcp-server".into(),
+///         args: vec!["stdio".into()],
+///         env: BTreeMap::from([("GITHUB_TOKEN".into(), std::env::var("GH_PAT").unwrap_or_default())]),
+///     },
+///     timeout_secs: 30,
+/// };
+///
+/// // Dialled remotely. Static headers go on every request.
+/// let remote = McpServer {
+///     id: "search".into(),
+///     transport: McpTransport::Http {
+///         url: "https://mcp.example.com/v1".into(),
+///         headers: BTreeMap::from([("Authorization".into(), "Bearer …".into())]),
+///     },
+///     timeout_secs: 30,
+/// };
+///
+/// // One rule each, and of different kinds. Egress is deny-by-default, so
+/// // without `allow_net` the HTTP server is unreachable however well-formed
+/// // its URL is.
+/// let policy = Policy::default()
+///     .layer("app")
+///     .allow_exec("github-mcp-server")
+///     .allow_net("mcp.example.com");
+/// # let _ = (local, remote, policy);
+/// ```
+///
+/// It is `#[serde(tag = "transport")]`, so a config file writes
+/// `{"transport": "stdio", "command": …}` flat beside [`McpServer`]'s own
+/// fields rather than nesting.
+///
+/// [`Act::Net`]: crate::Act::Net
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 pub enum McpTransport {
@@ -80,6 +162,60 @@ pub enum McpTransport {
 }
 
 /// One configured MCP server.
+///
+/// This is how the harness gains a capability it does not ship: point it at a
+/// server, and that server's tools are offered to the model beside the
+/// built-ins. No fork, no patch.
+///
+/// The policy line in the example is not decoration. Attaching a server to a
+/// contract makes it *configured*; starting it is an [`Act::Exec`] check on its
+/// binary, so without `allow_exec` naming that binary the run ends in
+/// [`Error::Mcp`] before the server process exists.
+///
+/// ```no_run
+/// use io_harness::{run_with, ApproveAll, McpServer, OpenRouter, Policy, Store,
+///                  TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let contract = TaskContract::workspace(
+///     "read the open issues and summarise them into NOTES.md",
+///     "/path/to/repo",
+///     Verification::WorkspaceFileContains {
+///         file: "NOTES.md".into(),
+///         needle: "#".into(),
+///     },
+/// )
+/// .with_mcp([McpServer::stdio("github", "github-mcp-server")
+///     .with_args(["stdio"])
+///     // A third-party tool that never returns must not become a run that
+///     // never ends. The default is 60s.
+///     .with_timeout(std::time::Duration::from_secs(30))]);
+///
+/// let policy = Policy::default()
+///     .layer("app")
+///     .allow_read("*")
+///     .allow_write("*")
+///     // Without this line the server never starts.
+///     .allow_exec("github-mcp-server")
+///     // Each of its tools is checked again by namespaced name, so one write
+///     // tool can be refused while the read-only ones stay usable.
+///     .deny_exec("mcp__github__create_issue");
+///
+/// let result = run_with(
+///     &contract,
+///     &OpenRouter::from_env()?,
+///     &Store::memory()?,
+///     &policy,
+///     &ApproveAll,
+/// )
+/// .await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// One session serves a whole 0.5.0 tree, so a child agent is offered the same
+/// servers without each spawning its own.
 ///
 /// `Serialize`/`Deserialize` because io-cli and io-studio will express these in
 /// their own config files, the same way they already express a [`Policy`].

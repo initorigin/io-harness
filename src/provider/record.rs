@@ -16,20 +16,19 @@
 //! - it flattens the calls into `"name:{json}"` joined with `" | "`, which any
 //!   `|` inside an argument silently corrupts.
 //!
-//! It could not be fixed by writing more columns either.
-//! [`Provider::complete`](crate::provider::Provider::complete) is RPITIT and its
-//! future must be `Send`; `rusqlite::Connection` is `Send + !Sync`, so a `&Store`
-//! captured across the inner provider's `.await` makes the future non-`Send` and
-//! the trait bound fails. A recorder therefore cannot hold a store, and the
-//! recording goes to a plain file.
+//! It could not be fixed by writing more columns either. [`Provider::complete`]
+//! is RPITIT and its future must be `Send`; `rusqlite::Connection` is
+//! `Send + !Sync`, so a `&Store` captured across the inner provider's `.await`
+//! makes the future non-`Send` and the trait bound fails. A recorder therefore
+//! cannot hold a store, and the recording goes to a plain file.
 //!
 //! ## What it does not capture
 //!
-//! Failures. [`Error`](crate::Error) is not serialisable and a recorded failure
-//! would be a recorded *decision* about retry and fall-over rather than an
-//! answer. Only successful completions are recorded, so replaying a run whose
-//! provider failed reports a missing recording for that request rather than
-//! reproducing the failure.
+//! Failures. [`Error`] is not serialisable and a recorded failure would be a
+//! recorded *decision* about retry and fall-over rather than an answer. Only
+//! successful completions are recorded, so replaying a run whose provider failed
+//! reports a missing recording for that request rather than reproducing the
+//! failure.
 
 use std::path::Path;
 use std::sync::Mutex;

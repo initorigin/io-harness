@@ -26,6 +26,138 @@ notes are produced from it.
 
 ### Security
 
+## [0.16.0] - 2026-07-28
+
+The documented public contract. A developer arriving cold can tell what the
+crate does and start using it; a developer already depending on it knows what
+may change.
+
+**There are no breaking changes in this release.** Upgrading from 0.15.0 is a
+version bump and a rebuild — nothing you wrote stops compiling. That is worth
+stating plainly in the release that introduces migration notes, because it is
+the first entry the new format applies to.
+
+### The two front doors
+
+The README was 1072 lines organised as a release history: sections named after
+the version that introduced each capability, ordered by nothing in particular,
+with 0.15 filed before 0.14 and 0.12 and 0.13 absent from the file entirely. Its
+first code fence was on line 107, and its status paragraph described a release
+two versions stale. The crate root — the page docs.rs actually opens on — was
+worse: 230 lines of "v0.2 adds", "v0.4 adds", with v0.3 arriving after v0.14 and
+v0.10 through v0.13 never mentioned at all.
+
+Both answered "what did each version add", which is a question only a maintainer
+asks. Both are now landing pages: what the crate is, a quickstart above the fold,
+badges, the MSRV, and what the harness does today, described as capabilities.
+
+### Guides
+
+The depth that made those 1072 lines worth reading is not deleted. It moved into
+twelve pages under `docs/guide/` — permissions, verification, composition,
+sandbox, durable runs, MCP and network egress, tools and skills, context and
+memory, resilience, observability, documents, images and git — and every "the
+limits, stated plainly" block travelled with its capability, because those are
+the paragraphs that make the rest credible.
+
+Two of the twelve are new writing rather than moved prose: observability and
+replay had never been documented for a reader at all.
+
+### Added
+
+- A worked example on **every** one of the 106 public items re-exported from the
+  crate root. Previously one item had one.
+- `resume_tree_from_stored_policy` and `resume_tree_from_stored_policy_observed`.
+  The tree loop was the only one of the three that could not be resumed under the
+  policy it was started with, so the three resume paths disagreed about whether
+  the permission boundary survives a restart. A tree with no stored policy is a
+  typed `Error::Resume`, never a silent fall back to `Policy::permissive`.
+- `docs/CONTRACT.md` as an actual contract: what is public and what is not, what
+  pre-1.0 means here, the deprecation cycle, the MSRV policy, the feature table
+  with what each feature costs, the platform matrix, and eleven limits that hold
+  today.
+- `docs/public-api.txt`, the enumerated public surface, compared against the live
+  crate by a test.
+- `[package.metadata.docs.rs]` with all features enabled and `doc_auto_cfg`, so
+  the rendered page shows the documents and media surface with the feature each
+  item needs labelled on it.
+
+### The promises, and the checks that keep them
+
+Three claims in this release decay into fiction unless something checks them, so
+the checks ship rather than the promises. Each carries a negative control,
+because a checker that silently matches nothing passes every input and reports a
+green light wired to nothing.
+
+- **Every public item has an example** — `tests/public_api.rs` enumerates the
+  surface and fails naming any item without a fenced block. `cargo test --doc`
+  compiles all of them, so an example cannot rot into a lie.
+- **A rename or removal is announced** — the same file compares the surface
+  against `docs/public-api.txt`. Removing or renaming an item fails the build
+  until that file is edited by hand, which is the moment the `#[deprecated]`
+  attribute and the migration note get written. There is deliberately no flag
+  that regenerates it.
+- **Every break has a migration note** — `tests/changelog.rs` finds every entry
+  marked breaking and fails on any without one.
+- **The prose matches the build** — `tests/docs_drift.rs` asserts the documented
+  MSRV equals `rust-version` and the documented feature list equals the
+  `[features]` keys in both directions, and that every relative link in the
+  README and under `docs/` resolves.
+- **The split lost nothing** — `tests/guide_pages.rs` names each capability and
+  the limits block that had to travel with it.
+
+### Fixed
+
+Auditing the old README against the source, for the first time in fifteen
+releases, found documentation that was not merely stale but wrong. All of these
+are corrections to doc comments; none changes behaviour.
+
+- `Verification`'s type documentation claimed the subject is compiled as its own
+  crate with the criterion compiled against it. It is not: subject and criterion
+  are one crate, the criterion in a child module. The separate-crate approach was
+  tried during 0.8.1 and abandoned, because privacy is a wall between crates and
+  a passing implementation is allowed to be private. The claim was wrong in the
+  direction that made the 0.8.1 boundary sound stronger than it is.
+- `TaskContract::with_tools` had no documentation. Its doc block had lost its
+  closing line and merged into `with_images`, so the paragraphs explaining that
+  registration grants availability and not authorization rendered under a
+  `media`-gated method — that is, nowhere, on a default build.
+- The sandbox module claimed a seccomp filter in three places. None is
+  installed; the Linux backend is namespaces and rlimits, and any syscall
+  restriction is the kernel's own default under an unprivileged user namespace.
+- The sandbox module claimed `setrlimit` caps "CPU/procs/fds". It sets
+  `RLIMIT_CPU` and `RLIMIT_NOFILE` only, and `SandboxLimits::max_processes` is
+  enforced by nothing on any platform.
+- A comment in `skills.rs` claimed a `README` is not discovered as a skill. The
+  test is the `.md` extension and nothing else, so it is.
+- Five unresolved intra-doc links in the documents module, which resolved under
+  `--all-features` and dangled in the default build, plus six more across the
+  provider modules and the context module. `cargo doc` is now warning-free on
+  both builds.
+
+### Changed
+
+- The crate description was a 944-character comma-separated inventory of fifteen
+  releases — the same field that reached 1041 characters at 0.11.0 and was
+  refused by the registry's 1000-character cap. It is one sentence now.
+- `docs/CAPABILITIES.md` is the guide index. It had also gone stale: it described
+  0.15.0 as planned and listed image **and video** passthrough as a capability,
+  though video was cut from the roadmap on 2026-07-27 and appears in no release.
+- Historical entries in this file: 49 breaking changes across 16 versions are now
+  marked and carry a migration note. The audit ran against the git tags rather
+  than the prose, which is how it found that three releases claim in prose to
+  break nothing and do.
+
+### Known limitations
+
+Documented in `docs/CONTRACT.md` rather than fixed here, because each is a
+behaviour change and this release makes none. The two most likely to bite: a
+registered tool named after one of the git, image or document built-ins passes
+validation and is then permanently unreachable, since the reserved-name set
+still lists only the original seven; and `resume_tree` does not record the policy
+it executes under, so a tree resumed under a widened policy leaves an audit that
+understates what was permitted.
+
 ## [0.15.0] - 2026-07-27
 
 Images the model can see, and work the agent hands back as commits.
@@ -113,6 +245,43 @@ content part, states that support varies by model and offers no way to ask which
 If video returns it will be a new roadmap entry argued on its own merits. Audio
 is likewise absent, and OCR remains off the roadmap — named again here because
 this is the image release and that is exactly the argument for folding it in.
+
+### Breaking changes
+
+- **BREAKING** — `CompletionRequest` gained a `media` field, so an exhaustive
+  struct literal no longer compiles **when the `media` feature is on** (the field
+  is `#[cfg(feature = "media")]`, so a default build is unaffected). The type now
+  derives `Default`. *Migration:* construct it with the fields you set plus
+  `..Default::default()`, which is the style the type documents and which survives
+  the next field too:
+
+  ```rust
+  // 0.14.0
+  let req = CompletionRequest { system, user, tools };
+  // 0.15.0
+  let req = CompletionRequest { system, user, tools, ..Default::default() };
+  ```
+
+- **BREAKING** — `TaskContract` gained the `images` and `commit_identity` public
+  fields, so a struct literal over it no longer compiles. *Migration:* build the
+  contract through `TaskContract::new` / `TaskContract::workspace` and the
+  `with_*` builders — `.with_images(..)`, `.with_commit_identity(..)` — which is
+  the documented path and does not change when a field is added.
+
+- **BREAKING (behaviour)** — an out-of-tree `Provider` inherits
+  `accepts_images() == false`, so a request carrying images is refused with
+  `Error::Config` before the body is built. The method is defaulted, so the impl
+  still compiles; a provider that genuinely accepts images will silently start
+  refusing them. *Migration:* override it —
+  `fn accepts_images(&self) -> bool { true }` — on any `Provider` impl whose
+  vendor takes image content.
+
+- **BREAKING (behaviour)** — `fill_form` writes a real `/AP` normal appearance
+  stream per filled text field instead of setting `/NeedAppearances`. The output
+  bytes of a filled PDF differ from 0.14.0's for the same input, and an empty
+  value now removes the appearance rather than leaving a stale one. *Migration:*
+  nothing to write; re-generate any checked-in expected PDF or byte-for-byte
+  fixture rather than comparing against a 0.14.0 one.
 
 ### Added
 
@@ -211,6 +380,23 @@ than this should find the reason here.
   binding Pdfium, a per-OS binary the crate would have to tell users to install,
   which is the same constraint that removed OCR plus a redistribution question.
 
+### Breaking changes
+
+- **BREAKING** — `Verification` gained the `DocumentContains { file, needle }`
+  variant, so an exhaustive `match` over `Verification` no longer compiles. This
+  release's closing note says everything in it is additive; that is true of
+  behaviour and of every existing item's name and shape, and it is not true of an
+  exhaustive match. *Migration:* add an arm, or a `_ =>` arm:
+
+  ```rust
+  match verification {
+      Verification::FileContains(s) => { /* ... */ }
+      // ...
+      Verification::DocumentContains { file, needle } => { /* ... */ }
+      _ => { /* forward-compatible catch-all */ }
+  }
+  ```
+
 ### Added
 
 - **The crate's first `[features]` section, with `default = []`.** The default
@@ -291,6 +477,26 @@ A resumed run is the run it was. Resume restored the durable half of a run —
 the step it reached, what it spent, how long it had been alive — and silently
 substituted the rest: the permission policy it was executing under, and the
 context it had assembled.
+
+### Breaking changes
+
+- **BREAKING (behaviour)** — `resume` and `resume_observed` refuse a run that was
+  started under a non-permissive policy, returning `Error::Resume` where 0.12.0
+  ran the agent permissively. *Migration:* call `resume_with` and hand it the
+  policy the run was executing under —
+  `resume(&contract, &provider, &store, run_id)` becomes
+  `resume_with(&contract, &provider, &store, run_id, &policy, &approver)`. If a
+  permissive resume is genuinely what you want, pass `Policy::permissive()` to
+  `resume_with`. The worked before/after is under **Migrating from 0.12.0** below.
+  A run started permissively, and any run recorded before 0.13.0, resumes exactly
+  as it did.
+
+- **BREAKING (behaviour)** — a resumed run restores its stored observation ledger
+  instead of re-deriving context from the workspace, so the prompt a resumed step
+  sends is the one the interrupted process would have sent rather than a freshly
+  assembled one. *Migration:* nothing to write. If you compare a resumed run's
+  `steps.prompt` against a 0.12.0 capture, re-capture it — the old bytes were the
+  defect this release fixes.
 
 ### Added
 
@@ -395,6 +601,45 @@ a boundary invented for it.
 
 The twelfth and last of the twelve pillars: observability and evaluation. The
 harness is now what it was defined to be.
+
+### Breaking changes
+
+- **BREAKING** — `RunOutcome` gained the `Refused` and `Cancelled` variants, so an
+  exhaustive `match` over it no longer compiles. *Migration:* add
+  `RunOutcome::Refused` and `RunOutcome::Cancelled` arms, or a `_ =>` arm. Both
+  are terminal: treat them as "the run is over and did not succeed".
+
+- **BREAKING (behaviour)** — `Store::open` sets `journal_mode = WAL`, which is a
+  persistent property of the database file rather than of the connection that set
+  it. A store opened once by 0.12.0 stays in WAL, and rolling back to 0.11.0 does
+  not undo it. *Migration:* nothing to write — 0.11.0 reads a WAL database
+  happily. If a tool of yours copies the database file, copy the `-wal` and `-shm`
+  sidecars with it, or run `PRAGMA wal_checkpoint(TRUNCATE)` first.
+
+- **BREAKING (behaviour)** — `Containment::max_total_duration` is enforced.
+  Declared in 0.5.0 and never read, so a tree that ran past it previously carried
+  on; it now halts, measured from the root run's `started_at` and therefore
+  counting time the process was down. *Migration:* raise the value to the tree's
+  real wall-clock horizon, or set `max_total_duration: None` to keep 0.11.0's
+  behaviour of no limit.
+
+- **BREAKING (trace)** — `context_events` records a `replan` kind distinctly from
+  `stalled`. A consumer matching `kind == "stalled"` to mean "was nudged and
+  carried on" now misses every replan. *Migration:* match both —
+  `kind == "stalled" || kind == "replan"` for the old union, and `kind ==
+  "replan"` alone for "was nudged", `kind == "stalled"` alone for "gave up".
+
+- **BREAKING (trace)** — the `"net_deny"` `sandbox_events` kind is removed. It was
+  documented from 0.6.0 and never constructed, so no store has ever contained a
+  row with it. *Migration:* delete the arm; network decisions are in
+  `policy_events` with `act = "net"`.
+
+- **BREAKING (trace)** — a durable memory note no longer renders the writing run's
+  id into the prompt, and a tree composes its children's results in spawn order
+  rather than completion order. Both change `steps.prompt` and `steps.result` for
+  the same task run twice, which is the point: they were the two sources of
+  run-to-run drift. *Migration:* nothing to write; re-capture any expected trace
+  text taken from a 0.11.0 run.
 
 ### Added
 
@@ -527,6 +772,64 @@ three of those were worse than assumed rather than merely unhandled.
 Recovery and retry is the eleventh of the twelve pillars to close. Only
 observability and evaluation (0.12.0) remains.
 
+### Breaking changes
+
+- **BREAKING** — `Error::Provider(String)` is now a struct variant,
+  `Error::Provider { kind, status, retry_after, message }`. Every `match` on it
+  breaks, and so does every construction. *Migration:*
+
+  ```rust
+  // 0.10.0
+  Err(Error::Provider(format!("openrouter: {e}")))
+  // 0.11.0 — pick the constructor that names what happened
+  Err(Error::provider_transport(format!("openrouter: {e}")))
+  // also: Error::provider_status(status, retry_after, msg),
+  //       Error::provider_malformed(msg), Error::provider(kind, msg)
+
+  // 0.10.0
+  Err(Error::Provider(msg)) => eprintln!("{msg}"),
+  // 0.11.0
+  Err(Error::Provider { kind, message, .. }) => eprintln!("{kind:?}: {message}"),
+  ```
+
+- **BREAKING** — `Workspace::write_file` and `FsTool::write` return
+  `Result<tools::workspace::Wrote>` instead of `Result<()>`. `write_file(..)?;`,
+  `let _ = ..`, `.is_ok()` and `.unwrap()` are unaffected. *Migration:* only an
+  explicit unit pattern or annotation changes — `let () = ws.write_file(p, c)?;`
+  becomes `let _wrote = ws.write_file(p, c)?;`, and a `-> Result<()>` wrapper
+  becomes `-> Result<Wrote>` or ends in `Ok(())` after discarding the value.
+
+- **BREAKING** — `RunOutcome` gained the `Escalated { steps, retryable }` and
+  `Stalled` variants, so an exhaustive `match` over it no longer compiles.
+  *Migration:* add both arms, or a `_ =>` arm; `Escalated.retryable` tells you
+  whether re-running is worth it.
+
+- **BREAKING** — `TaskContract` gained the `retry: RetryPolicy` and
+  `stall: StallPolicy` public fields, so a struct literal over it no longer
+  compiles. *Migration:* build through `TaskContract::new` / `workspace` plus
+  `.with_retry_policy(..)` and `.with_stall_policy(..)`.
+
+- **BREAKING (behaviour)** — stall detection is on by default
+  (`StallPolicy { window: 3, max_replans: 1 }`). A run that repeats a tool call
+  without changing the workspace is nudged once and then ends as
+  `RunOutcome::Stalled` instead of spending its way to the step cap.
+  *Migration:* to keep 0.10.0's behaviour exactly, disable it —
+  `contract.with_stall_policy(StallPolicy { window: 0, ..Default::default() })`.
+
+- **BREAKING (behaviour)** — a provider response that parses to no text, no tool
+  call and no usage is `Error::Provider { kind: ProviderErrorKind::Malformed, .. }`
+  where it used to return `Ok` with an empty response that the loops read as "the
+  model chose not to call a tool". A response that parses and legitimately
+  contains no tool call is unchanged. *Migration:* handle the error; if your code
+  relied on the empty-`Ok` shrug to end a run, match `Malformed` and decide there.
+
+- **BREAKING (behaviour)** — an `Auth` failure escalates on its first occurrence
+  rather than consuming `max_retries` first, and a retry that does happen now
+  *waits* (doubling per attempt, honouring `Retry-After`) where 0.10.0 retried
+  immediately. A run's wall clock therefore changes. *Migration:* nothing to
+  write; bound the waiting with `with_retry_policy(RetryPolicy { max, .. })` — no
+  retry is allowed to sleep past the run's time budget.
+
 ### Added
 
 - **Provider failures carry a kind.** `ProviderErrorKind` — `Transport`,
@@ -640,6 +943,32 @@ Two of the twelve pillars close here: **context construction** and **state and
 memory**. Recovery and retry (0.11.0) and observability and evaluation (0.12.0)
 are the two that remain.
 
+### Breaking changes
+
+- **BREAKING** — `TaskContract` gained the `context: ContextBudget` public field,
+  so a struct literal over it no longer compiles. Code that builds the contract
+  through `TaskContract::new` or `TaskContract::workspace` — every documented path
+  — is unaffected. *Migration:*
+
+  ```rust
+  // 0.9.1
+  let contract = TaskContract { goal, target, verify, /* ... */ };
+  // 0.10.0 — either add the field
+  let contract = TaskContract { goal, target, verify, context: ContextBudget::default(), /* ... */ };
+  // or move to the constructor, which does not change when a field is added
+  let contract = TaskContract::new(goal, target, verify).with_context_budget(ContextBudget::default());
+  ```
+
+- **BREAKING (behaviour)** — the workspace loop assembles the request per turn
+  under a context budget instead of appending every tool result to one string and
+  re-sending it. The model no longer sees the full verbatim history: superseded
+  reads and greps become one-line stubs, a read a later write invalidated is
+  re-read, and every observation kind is capped. A prompt captured from a 0.9.1
+  run will not reproduce. *Migration:* nothing to write — `steps.result` still
+  holds the full unelided text, so an audit is unaffected. Raise the ceiling with
+  `with_context_budget(ContextBudget { max_tokens, share })` if a task genuinely
+  needs more history in the request.
+
 ### Added
 
 - **A context budget, and per-turn assembly under it.** The new `context` module
@@ -721,6 +1050,37 @@ This release makes the three-OS matrix green.
 
 Nothing here changes the public API. Every fix is behaviour that was already
 promised and not delivered on a platform other than macOS.
+
+### Breaking changes
+
+This release states that nothing here changes the public API, and that is true of
+every signature. Three of its fixes change behaviour a caller could have been
+depending on, and are marked here for a reader upgrading across it.
+
+- **BREAKING (behaviour, Windows)** — a path deny rule that silently failed open
+  now fires. Any `deny_read` / `deny_write` whose pattern or target used `\`, or
+  was derived from a `std::fs::canonicalize` result (`\\?\C:\...`), never
+  matched and the access was **allowed**. A Windows run that succeeded under such
+  a policy may now be refused — correctly. *Migration:* nothing to write; the
+  refusals you now see are the ones the policy always described. Read
+  `Policy::explain` for the rule and layer that decided.
+
+- **BREAKING (behaviour, unix)** — path matching on unix is literal on both sides.
+  Through 0.9.0 the *target* was folded (`\` to `/`) while the pattern was not,
+  so a pattern like `logs/*` could match a unix file literally named `logs\a.txt`.
+  It no longer does — on unix `\` is a legal filename character and folding it
+  merges two distinct paths. *Migration:* if you have a rule that relied on the
+  fold, write the pattern with the separator the path actually uses:
+  `deny_read("logs\\*")` for a literal backslash, `deny_read("logs/*")` for a
+  directory.
+
+- **BREAKING (behaviour)** — a sandbox wrapper that fails to start is
+  `Error::Sandbox` instead of an indistinguishable "verification failed", and a
+  resource cap that cannot be applied fails the spawn instead of running the
+  payload uncapped. *Migration:* handle `Error::Sandbox` on the paths that call
+  verification — code that treated every non-pass as "the model's code is wrong"
+  now receives an `Err` for "the sandbox never ran it", which is the distinction
+  the change exists to make.
 
 ### Added
 
@@ -822,6 +1182,32 @@ Upgrading from 0.8.1 is a version bump and nothing else. Every existing public
 item keeps its name and shape, a contract that registers no tools and no skills
 behaves exactly as it did, the release adds no runtime dependency, MSRV stays
 1.87, and there is no schema change — a 0.8.1 store opens and resumes unchanged.
+
+### Breaking changes
+
+This release states that upgrading from 0.8.1 is a version bump and nothing else.
+That holds for every existing item's name and shape; these three are the
+exceptions a reader upgrading across it needs.
+
+- **BREAKING (MSRV)** — the declared minimum supported Rust version moves 1.87 →
+  1.88. The code and the dependencies are unchanged: 1.88 is what the crate has
+  actually required since 0.8.0 through rmcp's use of let-chains, and 0.8.x
+  declared 1.87 while failing to build on it. *Migration:* build with Rust 1.88 or
+  newer. A 1.87 toolchain now refuses at resolve time with a clear message instead
+  of failing inside a dependency.
+
+- **BREAKING** — `TaskContract` gained the `tools: Toolbox` and
+  `skills: Option<PathBuf>` public fields, so a struct literal over it no longer
+  compiles. *Migration:* build through `TaskContract::new` / `workspace` plus
+  `.with_tools(..)` and `.with_skills(..)`.
+
+- **BREAKING (behaviour)** — a Windows run reports `Backend::PortableFloor` where
+  0.8.1 reported `Backend::WindowsJobObject`. No job object was ever created, so
+  the old label named containment that did not exist; the variant is kept as
+  public and reserved but is never reported. *Migration:* a trace reader or test
+  matching `Backend::WindowsJobObject` on Windows must match
+  `Backend::PortableFloor` instead — and should read it as the weaker guarantee it
+  is: wall clock only, no CPU, memory, process or network boundary.
 
 ### Added
 
@@ -1027,6 +1413,21 @@ No API change and no migration. `test_src` keeps the exact shape it had on 0.8.0
 private items — and a macro the subject legitimately exports still reaches it.
 MSRV stays 1.87 and no dependency moved.
 
+### Breaking changes
+
+- **BREAKING (behaviour, in a patch release)** — an execution gate that passed on
+  0.8.0 by defeating its own criterion fails on 0.8.1. A subject file that
+  shadowed a prelude macro (`#[macro_export] macro_rules! assert`) or stripped the
+  crate (`#![cfg(any())]`) reported a pass; it now fails to compile, or is caught
+  by the probe item. *Migration:* **there is nothing to write on the caller's
+  side, and no opt-out.** If a run stopped passing after this upgrade, the gate
+  was being defeated and the earlier pass was false — treat the newly failing run
+  as the correct verdict and fix the subject. `test_src` keeps the exact shape it
+  had on 0.8.0: it still calls the subject's items unqualified, still reaches the
+  subject's private items, and a macro the subject legitimately exports still
+  reaches it. Recorded here as breaking because it is a behaviour change shipped
+  in a patch version, which SemVer does not lead a consumer to expect.
+
 ### Fixed
 
 - `Verification::RustTestPasses` and `Verification::WorkspaceTestPasses` can no
@@ -1072,6 +1473,45 @@ those servers are the first thing in the crate that can dial an arbitrary host, 
 by the same layered, deny-by-default policy that already governs reads, writes, and
 executions.
 
+### Breaking changes
+
+- **BREAKING** — `Act` has a fourth variant, `Act::Net(String)`, and `Defaults` a
+  fourth field, `net: Effect`. An exhaustive `match` on `Act` and a `Defaults`
+  struct literal both stop compiling. *Migration:* add an `Act::Net(target)` arm
+  (or a `_` arm) and a `net: Effect::Deny` field:
+
+  ```rust
+  // 0.7.0
+  let d = Defaults { read: Effect::Allow, write: Effect::Ask, exec: Effect::Deny };
+  // 0.8.0
+  let d = Defaults { read: Effect::Allow, write: Effect::Ask, exec: Effect::Deny, net: Effect::Deny };
+  ```
+
+- **BREAKING** — `Error` gained the `Mcp` variant and `TaskContract` gained the
+  `mcp` public field. *Migration:* add an `Error::Mcp` arm (or a `_` arm) to an
+  exhaustive match, and build the contract through `TaskContract::new` /
+  `workspace` plus `.with_mcp(..)` rather than a struct literal.
+
+- **BREAKING (behaviour)** — a policy serialized before 0.8.0 deserializes with
+  `net: Deny`, because `Defaults.net` is `#[serde(default)]`. An old config parses
+  rather than failing, and then makes no outbound calls. *Migration:* add the
+  hosts the run uses — `policy.layer("app").allow_net("api.example.com")` — or
+  `net: Allow` in the serialized defaults. Your provider's own host needs nothing:
+  it is covered by the named `provider` layer.
+
+- **BREAKING (MSRV)** — the minimum supported Rust version moves 1.75 → 1.87, and
+  `reqwest` 0.12 → 0.13. rmcp 2.2.0 requires reqwest 0.13 and its child-process
+  transport requires Rust 1.87. *Migration:* build with Rust 1.87 or newer; if
+  your own tree pins reqwest 0.12, move it to 0.13 rather than carrying two TLS
+  stacks.
+
+- **BREAKING (behaviour)** — redirects are off on every built-in provider's HTTP
+  client. A 3xx used to be followed and now surfaces as a non-success status,
+  because a host change after the policy has decided would be a hole in the
+  egress boundary. *Migration:* point the provider at the URL that answers
+  directly rather than at one that redirects; there is deliberately no
+  follow-redirects switch.
+
 ### Added
 
 - **MCP client over [rmcp](https://crates.io/crates/rmcp), two transports.**
@@ -1116,7 +1556,9 @@ executions.
   run makes outbound calls needs an `allow_net` for the hosts it uses; the
   provider's own host is covered by the `provider` layer and needs nothing. The
   alternative — defaulting to allow — would have left egress ungoverned for exactly
-  the callers who upgraded to govern it.
+  the callers who upgraded to govern it. *Migration:*
+  `policy.layer("app").allow_net("api.example.com")` for each host the run dials,
+  or `net: Allow` in the serialized defaults to restore 0.7.0's behaviour.
 - **The system prompt now names the tools it does not enumerate.** The workspace
   and tree prompts described a world of exactly four (or five) built-in tools while
   the request carried more, so a model trusting the prose over the schema could
@@ -1158,6 +1600,23 @@ that step and a checkpoint marker in one rusqlite transaction, and on restart it
 resumes every agent — a single run or a whole 0.5.0 tree — from its own last
 committed step, without re-running finished work, double-charging the budget, or
 re-applying an edit already made.
+
+### Breaking changes
+
+- **BREAKING** — `Error` gained the `Resume` variant, so an exhaustive `match` on
+  `Error` no longer compiles. *Migration:* add an `Error::Resume(_)` arm, or a
+  `_ =>` arm. It is returned for a resume against a missing or newer-format
+  checkpoint — handle it rather than expecting a panic or a silent half-resume.
+
+- **BREAKING (behaviour)** — checkpointing is on by default, so `resume` continues
+  from the last committed step instead of re-running the work the interrupted
+  process had already done. A completed step is skipped and recorded as a
+  `skipped` event, an irreversible edit is re-observed rather than repeated, and
+  the budget is not double-charged. *Migration:* **there is no opt-out.** If you
+  want a run to start from step 0, start a new run rather than resuming an old id.
+  The store also gains a `PRAGMA user_version` format stamp: a 0.6.0 database
+  migrates in place on open, and a store written by 0.7.0 carries a stamp that
+  0.6.0 does not read.
 
 ### Added
 
@@ -1212,6 +1671,23 @@ compile and the test binary it has run since 0.2.0 — now executes inside an
 ephemeral, per-run sandbox, so model-produced code no longer runs on the host
 directly. The sandbox is OS-native and OS-neutral: one trait, a native backend
 per platform over a portable floor that runs everywhere.
+
+### Breaking changes
+
+- **BREAKING** — `Error` gained the `Sandbox` variant, so an exhaustive `match` on
+  `Error` no longer compiles. *Migration:* add an `Error::Sandbox(_)` arm, or a
+  `_ =>` arm. It is returned when a sandbox fails to start — one failed child
+  never takes down its siblings.
+
+- **BREAKING (behaviour)** — sandboxed execution is the default for the
+  verification gate. Every `rustc` compile and test-binary run the gate performs
+  now happens in an ephemeral per-run sandbox with outbound network denied,
+  resource caps applied, and a workdir removed on every exit path. The same code
+  passes or fails as before, but a gate that reached the network, wrote outside
+  the workdir, or ran longer than the caps allow now stops.
+  *Migration:* to get 0.5.0's exact direct-host execution back, opt out on the
+  guard — `ExecGuard::default().no_sandbox()` — which is why the change is
+  additive and reversible.
 
 ### Added
 
@@ -1272,6 +1748,19 @@ Sub-agent composition: a parent decomposes a task at run time and spawns
 sub-agents on demand, bounded by an operator-held containment ceiling. This is
 the release that turns io-harness from a single-agent harness into an
 agent-composition engine.
+
+### Breaking changes
+
+This release's security note says a 0.4.0 caller that constructs no `Containment`
+gets the exact 0.4.0 surface and behaviour. That holds at run time; two enums grew
+a variant, so an exhaustive `match` still has to change.
+
+- **BREAKING** — `RunOutcome` gained the `BudgetCeilingReached` variant and
+  `Verification` gained `WorkspaceFileContains`. An exhaustive `match` over either
+  no longer compiles. *Migration:* add the arms, or a `_ =>` arm.
+  `BudgetCeilingReached` means the tree-wide aggregate budget was exhausted, which
+  is a different stop from the per-contract `CostBudgetExceeded`; treat both as
+  terminal and non-successful.
 
 ### Added
 
@@ -1353,6 +1842,21 @@ agent-composition engine.
 
 ## [0.4.0] - 2026-07-24
 
+### Breaking changes
+
+- **BREAKING** — `RunOutcome` gained the `AwaitingApproval { request_id, steps }`
+  and `Denied` variants, and `Error` gained `Refused`. An exhaustive `match` over
+  either no longer compiles. *Migration:* add the arms, or a `_ =>` arm.
+  `AwaitingApproval` is not a failure — it is a pause; carry the `request_id` to
+  `resume_with_decision` when the human answers.
+
+- **BREAKING** — `RunResult` gained the `remembered` public field, so a struct
+  literal or an exhaustive struct pattern over it no longer compiles.
+  *Migration:* add `remembered` — `let RunResult { outcome, steps, remembered, .. }
+  = result;` — or add `..` to the pattern so the next field does not break it
+  again. `remembered` carries the rules an approve-and-remember decision produced,
+  for the caller to persist.
+
 ### Added
 
 - **Permission policy.** `Policy` is a stack of named layers plus a per-action
@@ -1429,6 +1933,21 @@ Repository-wide work and provider choice: the agent can search a whole workspace
 and edit several files in one run, and you pick OpenRouter, Anthropic, or OpenAI
 at run construction — behind the same provider-agnostic surface.
 
+### Breaking changes
+
+- **BREAKING** — `Verification` gained the `EachCompilesRust(files)` and
+  `WorkspaceTestPasses { files, test_src }` variants, so an exhaustive `match`
+  over it no longer compiles. *Migration:* add the arms, or a `_ =>` arm.
+
+- **BREAKING** — `TaskContract` gained the `root` public field, so a struct
+  literal over it no longer compiles. *Migration:* build through
+  `TaskContract::new(goal, target, verify)` for a single-file task — which leaves
+  `root` unset — or `TaskContract::workspace(goal, root, verify)` for a repository
+  task.
+
+`Provider::name()` is *not* a breaking addition: it is defaulted, so an existing
+implementer keeps compiling and inherits the default label.
+
 ### Added
 
 - Workspace tasks: `TaskContract::workspace(goal, root, verify)` runs a
@@ -1464,6 +1983,46 @@ at run construction — behind the same provider-agnostic surface.
 Trust a longer run: budgets, retry, a full trace, resumable runs, and
 execution-based verification that compiles the produced file so a substring stub
 cannot pass.
+
+### Breaking changes
+
+- **BREAKING** — `Store::record_step` is removed and replaced by `Store::record`,
+  which takes a `StepRecord` so the new prompt / tool-call / token columns have
+  somewhere to come from. *Migration:*
+
+  ```rust
+  // 0.1.0
+  store.record_step(run_id, step, "wrote src/hello.rs", "ok")?;
+  // 0.2.0 — StepRecord::new leaves the audit fields empty
+  store.record(run_id, &StepRecord::new(step, "wrote src/hello.rs", "ok"))?;
+  ```
+
+- **BREAKING** — `Verification::check` is removed and replaced by
+  `Verification::passes`, which is async, takes the path as well as the contents,
+  and returns `Result<bool>` rather than `bool` — an execution-based gate runs a
+  compiler, which can fail for reasons that are not "the criterion was not met".
+  *Migration:*
+
+  ```rust
+  // 0.1.0
+  if verification.check(&contents) { /* ... */ }
+  // 0.2.0
+  if verification.passes(&path, &contents).await? { /* ... */ }
+  ```
+
+- **BREAKING** — `Verification` gained the `CompilesRust` and
+  `RustTestPasses { test_src }` variants, and `RunOutcome` gained
+  `TimeBudgetExceeded` and `CostBudgetExceeded`. An exhaustive `match` over either
+  no longer compiles. *Migration:* add the arms, or a `_ =>` arm.
+
+- **BREAKING** — `CompletionResponse` gained the `usage` field, `StepRecord`
+  gained `prompt`, `tool_call` and `tokens`, and `TaskContract` gained
+  `max_duration`, `max_retries` and `max_tokens`. A struct literal over any of the
+  three no longer compiles. *Migration:* `CompletionResponse` derives `Default`, so
+  add `..Default::default()` to its literal — the construction style it documents.
+  For `StepRecord` use `StepRecord::new(step, decision, result)`; for
+  `TaskContract` use `TaskContract::new(..)` plus `.with_time_budget(..)`,
+  `.with_token_budget(..)` and `.with_max_retries(..)`.
 
 ### Added
 

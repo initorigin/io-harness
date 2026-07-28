@@ -21,6 +21,26 @@ use serde::{Deserialize, Serialize};
 /// The caps a whole agent tree runs under. Tokens are the hard spend ceiling
 /// (no price telemetry exists, so spend is counted in tokens); an optional cost
 /// and duration are carried for callers that supply them.
+///
+/// ```
+/// use io_harness::Containment;
+///
+/// // Twelve agents in the tree, four running at once, two levels of nesting, and
+/// // 200k tokens for all of them together. A spawned contract can tighten any of
+/// // these and can raise none of them.
+/// let containment = Containment::new(12, 4, 2, 200_000);
+///
+/// // The ceiling actually enforced is the token one: a provider reports tokens
+/// // and never money, so `max_total_cost` is inert and stays `None`.
+/// assert_eq!(containment.max_total_tokens, 200_000);
+/// assert_eq!(containment.max_total_cost, None);
+///
+/// // Serde, so an operator's config file is the source of the caps rather than a
+/// // recompile.
+/// let stored = serde_json::to_string(&containment).unwrap();
+/// let loaded: Containment = serde_json::from_str(&stored).unwrap();
+/// assert_eq!(loaded, containment);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Containment {
     /// Maximum number of agents that may exist in the tree, root included.
@@ -80,6 +100,25 @@ impl Containment {
 
 /// Why a spawn was refused by the containment boundary. Returned to the
 /// requesting agent as a typed tool result it can adapt to, never a panic.
+///
+/// ```
+/// use io_harness::{Containment, Ledger, SpawnRefusal};
+///
+/// // Room for two agents in the whole tree, and the root is already one of them.
+/// let ledger = Ledger::new(&Containment::new(2, 2, 1, 1_000));
+/// ledger.register_agent(1).expect("the first child fits");
+///
+/// // The second child does not. The parent agent is told, in a form it can act
+/// // on — do the work itself, or narrow what it was going to delegate.
+/// let refusal = ledger.register_agent(1).unwrap_err();
+/// assert_eq!(refusal, SpawnRefusal::AgentCap { max: 2 });
+/// assert_eq!(refusal.to_string(), "agent cap reached (2 agents)");
+///
+/// // `cap` is the short label the trace records, so an audit can count refusals
+/// // by which boundary produced them without parsing the English above.
+/// assert_eq!(refusal.cap(), "agents");
+/// assert_eq!(SpawnRefusal::DepthCap { max: 1, requested: 2 }.cap(), "depth");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnRefusal {
     /// The tree already holds `max_total_agents`.
@@ -117,6 +156,27 @@ impl std::fmt::Display for SpawnRefusal {
 }
 
 /// The outcome of drawing token spend against the ledger.
+///
+/// ```
+/// use io_harness::{Containment, Draw, Ledger, Usage};
+///
+/// let ledger = Ledger::new(&Containment::new(4, 2, 1, 5_000));
+/// let usage = Usage { prompt_tokens: 4_000, completion_tokens: 800, total_tokens: 4_800 };
+///
+/// // What the run loop does with a completion's usage: draw it, then branch. This
+/// // is the only place the tree's ceiling is checked, so ignoring the return is
+/// // how a tree overspends.
+/// match ledger.draw_tokens(usage.total_tokens) {
+///     Draw::Ok => { /* take another step */ }
+///     Draw::Halted => unreachable!("4,800 fits under 5,000"),
+/// }
+///
+/// // The next step does not fit. `Halted` stops the whole tree, not just this
+/// // agent — and the rejected draw is not recorded, so the total never drifts
+/// // above the ceiling even though the provider did charge for that step.
+/// assert_eq!(ledger.draw_tokens(usage.total_tokens), Draw::Halted);
+/// assert_eq!(ledger.spent_tokens(), 4_800);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Draw {
     /// The draw was within the ceiling; the tree may continue.
@@ -132,6 +192,28 @@ pub enum Draw {
 ///
 /// Wrap in an [`std::sync::Arc`] and hand a clone of the arc to every agent in
 /// the tree; they all draw on the one ledger.
+///
+/// ```
+/// use std::sync::Arc;
+///
+/// use io_harness::{Containment, Draw, Ledger};
+///
+/// // One ledger for the tree; every agent holds a clone of the same arc.
+/// let ledger = Arc::new(Ledger::new(&Containment::new(10, 4, 3, 100)));
+/// let child = Arc::clone(&ledger);
+///
+/// // A child's contract can ask for 500 tokens and still only get what the tree
+/// // has left. This is the containment property: budgets narrow, never widen.
+/// assert_eq!(child.effective_token_budget(Some(500)), 100);
+/// assert_eq!(child.effective_token_budget(Some(20)), 20);
+///
+/// // Two agents, each well inside its own budget, still halt the tree between
+/// // them — the ceiling is aggregate, and the second draw is rejected rather
+/// // than letting the recorded total pass 100.
+/// assert_eq!(child.draw_tokens(60), Draw::Ok);
+/// assert_eq!(ledger.draw_tokens(60), Draw::Halted);
+/// assert_eq!(ledger.spent_tokens(), 60);
+/// ```
 #[derive(Debug)]
 pub struct Ledger {
     max_total_tokens: u64,

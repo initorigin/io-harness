@@ -69,6 +69,25 @@ const DESCRIPTION_CAP: usize = 240;
 /// One discovered skill. The body is not held here — it is read when the agent
 /// asks for it, so the read passes the permission policy at the moment it
 /// happens rather than at discovery.
+///
+/// The split matters for what a run costs. `name` and `description` are what go
+/// into the system prompt, on every turn, for every skill; the file at `path` is
+/// loaded only if the model asks for that one. Twenty skills therefore cost
+/// twenty lines a turn, not twenty bodies.
+///
+/// ```no_run
+/// use io_harness::Skills;
+///
+/// # fn demo() -> io_harness::Result<()> {
+/// for skill in Skills::discover("./skills")?.iter() {
+///     // `path` is absolute, and it is the path the policy decides on when
+///     // the agent asks to read it — so `deny_read` over a subdirectory of
+///     // skills is a skill the model can see listed and cannot open.
+///     println!("{} — {}\n  {}", skill.name, skill.description, skill.path.display());
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
     /// How the agent refers to it: the frontmatter `name`, else the file stem,
@@ -83,6 +102,64 @@ pub struct Skill {
 }
 
 /// The skills discovered for one run.
+///
+/// Both layout conventions in common use are discovered, so a directory
+/// written for another agent tool usually works unchanged. Given:
+///
+/// ```text
+/// skills/
+///   migrations.md          -> skill "migrations"
+///   api-style/
+///     SKILL.md             -> skill "api-style"
+///   assets/                -> ignored: a directory with no SKILL.md in it
+///   notes.txt              -> ignored: not markdown
+/// ```
+///
+/// every top-level `*.md` file is a skill, and every subdirectory holding a
+/// `SKILL.md` is one too. A subdirectory without a `SKILL.md` is skipped, as is
+/// any file that is not markdown — but note that a top-level `README.md` *is*
+/// discovered as a skill, because the rule is the extension and nothing else.
+/// Keep prose that is not a skill out of the directory or one directory down.
+///
+/// The name comes from the frontmatter, else the file stem, else the containing
+/// directory for a `SKILL.md`:
+///
+/// ```no_run
+/// use io_harness::Skills;
+///
+/// # fn demo() -> io_harness::Result<()> {
+/// let skills = Skills::discover("./skills")?;
+/// assert_eq!(skills.names(), vec!["api-style", "migrations"]); // sorted by name
+///
+/// // The catalogue is the whole prompt cost: one line per skill, no bodies.
+/// // Byte-identical across runs on the same directory, because discovery
+/// // sorts and `read_dir` order does not.
+/// println!("{}", skills.catalog());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// In a run you point the contract at the directory rather than discovering it
+/// yourself. Discovery then happens at run start, so a path that does not
+/// exist, is not a directory, holds more than [`MAX_SKILLS`], or holds two
+/// skills of the same name fails the run with
+/// [`Error::Config`] naming it — a rejected set, never a silently truncated
+/// one.
+///
+/// ```
+/// use io_harness::{TaskContract, Verification};
+///
+/// let contract = TaskContract::workspace(
+///     "add a migration for the new column",
+///     "/path/to/repo",
+///     Verification::WorkspaceFileContains {
+///         file: "migrations/latest.sql".into(),
+///         needle: "DROP".into(),
+///     },
+/// )
+/// .with_skills("./skills");
+/// # let _ = contract;
+/// ```
 ///
 /// Cheap to clone and shared by a whole 0.5.0 tree, so a child is offered the
 /// same catalogue its parent was.
@@ -143,7 +220,11 @@ impl Skills {
             {
                 path.clone()
             } else {
-                // Not a skill: a README, a .gitkeep, an editor's leftovers.
+                // Not a skill: a .gitkeep, a .txt, an editor's leftovers. The
+                // test is the extension and nothing else, so a `README.md`
+                // sitting here *is* discovered as one — documented on `Skills`
+                // rather than special-cased, because a name-based exception
+                // would be the start of a list nobody can predict.
                 continue;
             };
 

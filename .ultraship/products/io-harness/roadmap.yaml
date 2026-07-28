@@ -273,5 +273,29 @@ versions:
       happen. The documentation rewrite lands here rather than earlier because it should describe a
       finished twelve-pillar harness once, not be redrafted after each pillar; 0.12.0 corrects only
       the README's factual errors, which are a different problem from its structure.
-    detail: hypothesis
-    status: planned
+
+      Three things follow from taking that seriously rather than treating it as a writing task.
+
+      The crate root is documentation too, and it is the one an external developer actually lands on
+      — docs.rs opens on `src/lib.rs`, not the README. It carries the same defect in a worse place:
+      230 lines of "v0.2 adds", "v0.4 adds", "v0.8 adds", with v0.3 arriving after v0.14 and v0.10
+      through v0.13 absent entirely. It gets the same treatment as the README, from the same source
+      of truth, so the two cannot drift apart.
+
+      "Every public item carries a worked example" is a claim that decays the moment it is made
+      unless something checks it. The release ships the check: a test that enumerates the public
+      surface re-exported from `lib.rs` and fails on any item whose docs carry no fenced example.
+      `cargo test --doc` already compiles every example that exists, so an example cannot rot into a
+      lie; what is missing is the part that notices when one was never written.
+
+      A deprecation cycle needs a mechanism, not a promise. The public surface is snapshotted to a
+      checked-in file and compared by a test, so removing or renaming an item fails the build until
+      someone updates the snapshot deliberately — which is the moment the `#[deprecated]` attribute
+      and the changelog migration note get written, rather than a moment nobody notices.
+
+      One code change rides along, because documenting an incoherent surface is worse than fixing
+      it: `resume_tree` still has no stored-policy form, so the three resume loops disagree about
+      whether a run can be resumed under the policy it was started with. It ships as a new named
+      function, never an added parameter.
+    detail: specified
+    status: released
