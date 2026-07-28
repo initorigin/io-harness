@@ -1,0 +1,576 @@
+product: io-harness
+version: 0.16.0
+status: released
+release_type: minor
+outcome:
+  user_can: >
+    An external Rust developer who has never seen this crate can tell what it does, run it, and
+    know what may change under them — from the two pages they actually land on, not from
+    archaeology across fifteen changelog entries.
+
+    Today they land on one of two things and both are release histories. The README (1072 lines)
+    is organised as "Usage (v0.4)", "Agent composition and containment (v0.5)", "MCP and network
+    egress (v0.8)", "Images and git (v0.15)", "Documents (v0.14)" — capability sections named
+    after the release that introduced them, ordered by nothing, with 0.15 filed before 0.14 and
+    0.12 and 0.13 absent from the file entirely. The crate root is worse, and it is the page
+    docs.rs opens: 230 lines of `//! v0.2 adds`, `//! v0.4 adds`, `//! v0.8 adds`, with v0.3
+    arriving after v0.14 and v0.10 through v0.13 never mentioned. Both documents answer "what did
+    each version add", which is a question only a maintainer asks. Neither answers "what is this
+    and how do I start", which is the only question a new reader has.
+
+    After this release the README is a landing page: one description of what the harness is, a
+    quickstart above the fold, badges, the MSRV, and what the crate does today as a capability
+    list rather than a version log. The depth that made those 1072 lines valuable is not deleted
+    — it moves into guide pages under `docs/`, one per capability, linked from the landing page,
+    so a reader who wants the whole permission model still gets the whole permission model. The
+    crate root gets the same structure so that the two front doors say the same thing.
+
+    And a developer depending on the crate learns what they may rely on. Every public item carries
+    a worked example. Every breaking change between 0.x minors is called out in the changelog with
+    a migration note saying what to write instead. A renamed or removed item goes through a
+    deprecation cycle rather than vanishing between two releases. The crate stays pre-1.0 and
+    says so plainly: a minor may still break. What is promised is not that it will not happen —
+    it is that when it happens it is announced, explained, and survivable.
+
+    Three of those four claims decay into fiction unless something checks them, so the release
+    ships the checks rather than the promises. A test enumerates the public surface re-exported
+    from `lib.rs` and fails on any item whose documentation carries no fenced example — and
+    `cargo test --doc` already compiles every example that exists, so an example cannot rot into
+    a lie; what was missing is the part that notices one was never written. The public surface is
+    snapshotted to a checked-in file and compared by a test, so removing or renaming an item
+    fails the build until someone edits the snapshot deliberately, which is exactly the moment
+    the `#[deprecated]` attribute and the changelog migration note get written rather than a
+    moment nobody notices. And the facts the prose states about the build — the MSRV, the feature
+    flags — are asserted against `Cargo.toml` instead of being retyped and left to drift.
+
+    One code change rides along, because documenting an incoherent surface is worse than fixing
+    the incoherence. `resume_from_stored_policy` (0.13.0) lets a run be resumed under the policy
+    it was started with, without the caller having to reconstruct it — but it covers the
+    single-file and workspace loops only. `resume_tree`, the 0.5.0 agent-tree loop, still has no
+    stored-policy form, so a release whose subject is the documented public contract would have
+    to document three resume paths that disagree about whether the boundary survives a restart.
+    It ships as a new named function with its observed twin, never as an added parameter.
+  business_value: >
+    io-harness is public on crates.io and is the engine io-cli, io-studio, and io-eval embed. Its
+    documentation is the whole of its adoption surface — there is no landing site, no tutorial,
+    and no support channel. A reader who cannot answer "what is this" in thirty seconds does not
+    file an issue, they close the tab, and nothing in the trace records that they were there.
+
+    Fifteen releases of genuine engineering are currently reachable only by someone willing to
+    read a 1072-line release log. That is the entire gap between what the crate is and what it
+    appears to be. Closing it costs one release and no new capability.
+
+    The contract half compounds differently. Three sibling products pin this crate, and every
+    undocumented rename becomes a debugging session in each of them. A stated deprecation cycle
+    plus a snapshot test converts that from a recurring cost into a one-time cost per change,
+    paid by the person making the change, who is the person who knows what it means.
+  evidence_of_value: >
+    A reader who has never seen the crate reaches a running example from the README's first
+    screen, without scrolling past a version history and without opening a second file.
+
+    The checks are the durable evidence, because they outlive the release that wrote them: the
+    public-item example test, the surface snapshot test, and the MSRV and feature-flag drift
+    assertions all fail the build when the claim stops being true. A documentation release that
+    ships no check has produced a snapshot of accuracy with a half-life of one release. This one
+    ships four, each with a negative control proving it can fail.
+scope:
+  included:
+  - >
+    README rewritten as a landing page. One description of what the harness is, badges (crates.io,
+    docs.rs, CI, license, MSRV), the MSRV stated explicitly, a quickstart that appears above the
+    fold — inside the first screen, before any prose about design — and a capability list saying
+    what the crate does today. No heading is named after the release that introduced it, and no
+    section is ordered by version. It ends with links to the guide pages, the sibling products,
+    contributing, security, and the license block the attribution convention requires.
+  - >
+    Per-capability guide pages under `docs/guide/`, one per capability, carrying the depth the
+    README sheds: the permission model and approval flow, agent composition and containment, the
+    execution sandbox, durable and unattended runs, MCP and network egress, in-process tools and
+    skills, context assembly and memory, resilience and provider fallback, observability and
+    replay, documents, images, and git. Nothing that is true today is deleted in the move — every
+    "the limits, stated plainly" block travels with its capability, because those blocks are the
+    most honest paragraphs in the repository and the reason to trust the rest.
+  - >
+    The crate root (`src/lib.rs`) restructured the same way and from the same source of truth: what
+    the harness is, one worked example, the capability surface as capabilities rather than as a
+    changelog, the feature flags, the MSRV, and the platform support matrix. The version-by-version
+    narrative is retired from the crate root — the changelog is where release history belongs, and
+    it is already better at it.
+  - >
+    A worked example on every public item re-exported from `lib.rs` — every struct, enum, trait,
+    function, and constant — plus the test that enforces it. Examples compile: `cargo test --doc`
+    runs them, so `no_run` is used where a call would need a network or an API key, and never to
+    hide something that does not compile.
+  - >
+    `docs/CONTRACT.md` becomes the actual public contract: what is public and what is not, what
+    pre-1.0 means here (a minor may break), the deprecation cycle and its guarantee, the MSRV
+    policy, the feature flags and what each one costs, the platform support matrix, and the limits
+    that hold today — what a passing verification gate does and does not prove, what the policy
+    governs and what it does not, and the platforms where containment is the portable floor rather
+    than a native backend.
+  - >
+    Changelog migration notes. Every 0.x minor that broke the public contract gets a migration note
+    saying what changed and what to write instead, and `docs/CHANGELOG_STRUCTURE.md` is updated so
+    the next release inherits the format rather than reinventing it.
+  - >
+    The public-surface snapshot: a checked-in file listing every publicly reachable item, and a
+    test comparing the live surface against it. Removing or renaming an item fails the test until
+    the snapshot is edited, which is where the deprecation cycle acquires teeth instead of being a
+    paragraph of intent.
+  - >
+    Drift assertions binding prose to build facts: the MSRV stated in the README, the crate root,
+    and `CONTRACT.md` is asserted equal to `Cargo.toml`'s `rust-version`, and the documented feature
+    list is asserted equal to the `[features]` table's keys. A relative-link check over the README
+    and every `docs/` page fails on a link to a file that does not exist, which is the failure mode
+    a documentation split creates on the day it lands.
+  - >
+    `docs.rs` metadata so the rendered documentation shows the whole crate rather than the default
+    build's subset: `[package.metadata.docs.rs]` with all features enabled and the feature gates
+    labelled on the items they gate.
+  - >
+    `resume_tree_from_stored_policy` and `resume_tree_from_stored_policy_observed` — the 0.5.0 tree
+    loop's stored-policy resume, closing the asymmetry with `resume_from_stored_policy`. New named
+    functions; no existing signature changes.
+  excluded:
+  - >
+    Any new capability. This release adds one function that closes a gap in an existing surface and
+    nothing else. A documentation release is the worst possible moment to add behaviour, because
+    every new sentence would then be describing something that has never been run in anger.
+  - >
+    A documentation website, a book, a tutorial series, or rendered guide hosting. The guide pages
+    are markdown in the repository, readable on GitHub and shipped in the package. The `website`
+    product exists and is where a docs site belongs when there is one.
+  - >
+    `git_status`'s `--porcelain=v1` without `-z`, carried from 0.15.0. A path containing a newline
+    renders ambiguously to the model. It is a display defect, not a boundary one, and folding a
+    behaviour change into the release that documents behaviour makes both harder to review. Stays
+    in `known_limitations`.
+  - >
+    The Windows Job Object backend, `pdf::read_text`'s no-op `catch_unwind` under `panic = "abort"`,
+    binary document fixtures written by a real application, and opening a `fill_form` output in a
+    real PDF viewer. All four are carried limitations that need code, infrastructure, or a system
+    package this repository does not permit. They are documented honestly in `CONTRACT.md` as
+    limits that hold today — which is this release's job — and not fixed in it, which is not.
+  - >
+    OCR, PowerPoint authoring, and video. Off the roadmap entirely by the owner's decisions of
+    2026-07-27, not deferred. A documentation release is not an occasion to reopen them, and the
+    guide pages state their absence as a decision with its reasoning rather than as a gap.
+  - >
+    Any change to the store schema, `CHECKPOINT_FORMAT`, or an existing table's shape.
+  fallback_scope:
+  - >
+    README rewritten as a landing page, with the per-capability depth moved to `docs/guide/` pages
+    and a link check proving nothing dangles.
+  - >
+    The crate root restructured to match, so docs.rs and GitHub tell the same story.
+  - >
+    `docs/CONTRACT.md` as the real public contract, including the pre-1.0 statement, the deprecation
+    cycle, the MSRV policy, and the limits that hold today.
+  - >
+    Changelog migration notes for every 0.x minor that broke the contract.
+
+    This is coherent on its own: a reader arriving cold is served, and a dependent knows what may
+    change and how it will be announced. What it drops is the enforcement — the per-item example
+    test, the surface snapshot, the drift assertions — and the `resume_tree` stored-policy
+    function. The claims would then be true on the day they ship and unguarded afterwards, which is
+    a worse release but not a broken one.
+acceptance:
+  functional:
+  - >
+    F1 — the README opens as a landing page. Within its first 60 lines it states what the crate is,
+    shows a runnable quickstart code fence, and names the MSRV. Asserted by a test over the file, so
+    a later edit that pushes the quickstart below a new section of prose fails the suite.
+  - >
+    F2 — no heading in the README or the crate root is named after a release. A test asserts no
+    heading matches `\(v?\d+\.\d+`, and that the crate-root documentation contains no `v0.N adds`
+    line. The negative control is the current file: the same test run against the 0.15.0 README and
+    crate root fails, which is what makes F2 a measurement rather than a tautology.
+  - >
+    F3 — nothing was lost in the split. Every capability section removed from the README exists as a
+    `docs/guide/` page, and every "the limits, stated plainly" block present at 0.15.0 is present in
+    the guide page for its capability. Asserted by a test carrying the explicit list of capabilities
+    and limit-blocks, so a page silently dropped fails rather than passing unnoticed.
+  - >
+    F4 — every relative link in the README and in every `docs/` page resolves to a file that exists.
+    The negative control is a link to a deliberately absent path inside the checker's own fixture,
+    which the checker reports.
+  - >
+    F5 — every public item re-exported from `lib.rs` carries a fenced example. A test enumerates the
+    public surface and fails naming each item whose documentation has no fenced code block.
+  - >
+    F6 — the negative control for F5. The checker run over a fixture with a documented-but-
+    exampleless item reports that item, so F5 measures presence rather than the checker returning an
+    empty list on every input.
+  - >
+    F7 — every example compiles. `cargo test --doc` passes on the default build and with
+    `--all-features`, so an example that names a feature-gated item is compiled under the feature
+    that provides it rather than silently skipped.
+  - >
+    F8 — the public surface matches its checked-in snapshot. The negative control is the checker run
+    against a snapshot with one item removed and one renamed, which reports both — a removal and a
+    rename are the two things the deprecation cycle exists to catch, and a checker that catches only
+    additions would pass every release that broke something.
+  - >
+    F9 — the documented MSRV equals `Cargo.toml`'s `rust-version`, asserted for the README, the
+    crate root, and `CONTRACT.md`. The negative control is the same assertion against a fixture
+    stating a different version, which fails.
+  - >
+    F10 — the documented feature list equals the `[features]` table's keys. A feature added to
+    `Cargo.toml` and not documented fails the test, and so does a documented feature that does not
+    exist. The negative control covers both directions, because a one-directional check passes
+    forever after the first stale entry.
+  - >
+    F11 — every 0.x minor that broke the public contract carries a migration note in the changelog
+    saying what to write instead. Asserted by a test over `CHANGELOG.md` that finds every entry
+    marked as breaking and fails on any without a migration note. The negative control is a fixture
+    entry marked breaking with no note, which the checker reports.
+  - >
+    F12 — `resume_tree_from_stored_policy` resumes a tree under the policy it was started with. A
+    tree run started under a policy denying a path, killed mid-run, and resumed through the new
+    entry point without the caller passing a policy, still refuses that path — and the refusal is in
+    the trace attributed to the original rule and layer.
+  - >
+    F13 — the negative control for F12. The same tree started under a permissive policy and resumed
+    the same way performs the action, so F12 measures a restored boundary rather than a resume that
+    fails everything. And a tree resumed through the new function that has no stored policy is a
+    typed error, never a silent fall back to `Policy::permissive` — which is the exact defect 0.13.0
+    was written to close in the other two loops.
+  - >
+    F14 — `cargo doc` builds clean with no warnings on the default build and with `--all-features`,
+    including no broken intra-doc links. An intra-doc link to a renamed item is the most common way
+    documentation of this shape rots, and rustdoc already detects it.
+  non_functional:
+  - >
+    The default dependency tree is unchanged: `cargo tree` on the default build stays at 401 lines.
+    This release adds no dependency in any build, default or featured.
+  - >
+    The MSRV stays at 1.88 and the CI matrix stays green on macOS, Linux, and Windows. A
+    documentation release that breaks a build has failed at the only thing it could not afford to.
+  - >
+    `CHECKPOINT_FORMAT` stays 7. No table is renamed, reshaped, or dropped; any table addition, if
+    one proves necessary, is an additive `CREATE TABLE IF NOT EXISTS` in `Store::from_conn`. This
+    release is not expected to touch the schema at all.
+  - >
+    No existing public signature changes. `resume_tree_from_stored_policy` and its observed twin are
+    additions, so code written against 0.15.0 compiles unchanged against 0.16.0. Nothing is renamed
+    or removed in the release that introduces the deprecation cycle — that would be the worst
+    possible first exercise of it.
+  - >
+    The crate's `description` in `Cargo.toml` stays under the crates.io 1000-character cap, which
+    refused the 0.11.0 publish at 1041. The landing-page rewrite is the natural moment to shorten it
+    to one sentence a human reads rather than a comma-separated inventory of fifteen releases.
+  - >
+    The packaged crate carries the README and the `docs/` guide pages, so `cargo package` output
+    contains them and a reader on docs.rs is not linked into files that only exist on GitHub.
+  operational:
+  - >
+    `ultraship validate` exits 0 and the release record is sealed on the feature branch before the
+    first PR is opened, per the standing release flow.
+  - >
+    The rendered docs.rs page is verifiable before publication: `cargo doc --all-features` locally
+    produces the page a reader will see, including the feature labels on gated items.
+  - >
+    Disk: the volume runs hot and a full gate run leaves under 5 GB free. `target/` is deleted after
+    each long build phase and free space is checked between phases.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.16.0, GitHub at initorigin/io-harness with the tag `v0.16.0` and a
+    Release titled `io-harness 0.16.0`, and docs.rs, which builds from the published crate and is
+    the page this release is largely written for.
+  deployment_method: >
+    The standing flow, unchanged. All work on `feat/0.16.0` off `develop`, including the sealed
+    UltraShip release record. PR into `develop`, merged. Release PR `develop` into `main`, merged.
+    GitHub Release cut from the tag with notes from the changelog. `cargo publish` last, after both
+    merges and the Release exist. `develop` synced to `main` fast-forward only at the end. No branch
+    is deleted. `git fetch --tags` after the Release, since `gh release create` makes the tag on the
+    remote only.
+  migrations:
+  - >
+    None. No schema change, no format bump, no signature change. A consumer upgrades from 0.15.0 by
+    changing the version in their `Cargo.toml` and rebuilding; nothing they wrote stops compiling.
+    The changelog entry says exactly that, which for the release that introduces migration notes is
+    the correct first migration note to write.
+  - >
+    Retroactive only: the migration notes added to `CHANGELOG.md` describe breaks that already
+    happened in 0.2.0 through 0.15.0. They change no code and require no action from anyone already
+    on 0.15.0 — they exist for a reader upgrading across several minors at once, who today has to
+    reconstruct each break from a prose entry that never labelled it as one.
+  observability:
+  - >
+    Nothing new at runtime. The release adds no event kind, no table, and no trace record beyond
+    what `resume_tree_from_stored_policy` inherits from the loop it wraps — a stored-policy resume
+    emits the same policy-attribution records the 0.13.0 single-file and workspace forms emit.
+  - >
+    The release's own observability is its test suite. The four checkers — public-item examples,
+    surface snapshot, MSRV and feature-flag drift, changelog migration notes — fail the build when a
+    documented claim stops being true. That is the only telemetry a documentation release can have,
+    and it is why they are in scope rather than deferred.
+  - >
+    `cargo doc --all-features` warning-free (F14) is the pre-publication signal for the docs.rs
+    build, which is otherwise unobservable until after the crate is public and irreversible.
+  rollback: >
+    A published version cannot be recalled. The forward fix is 0.16.1 with the correction; `cargo
+    yank --version 0.16.0` is the escape hatch and leaves 0.15.0 as what `cargo install` resolves
+    to, and it is on the owner-approval list rather than something to reach for. Before the publish
+    step, rollback is ordinary git: the branch is not merged and nothing is public. The risk profile
+    is unusually low here — the failure mode of a documentation release is an inaccurate sentence,
+    which a patch fixes without anyone's build breaking.
+dependencies:
+  products:
+  - >
+    None blocking. io-cli, io-studio, and io-eval consume this crate and benefit from the contract
+    document, but none of them gates this release and none needs a change to accommodate it.
+  services:
+  - >
+    crates.io for publication, with the registry token in the repository's gitignored `.env`.
+  - >
+    GitHub Actions for the three-OS CI matrix. The repository is public, so standard runners cost
+    nothing.
+  - >
+    docs.rs builds the published crate. It is a consumer of this release rather than a dependency of
+    it — nothing is gated on it, but a `cargo doc --all-features` failure locally predicts a failed
+    docs.rs build, which is why F14 is an acceptance criterion rather than a nicety.
+  human_approvals:
+  - >
+    PRs, merges, the GitHub Release, and `cargo publish` are pre-authorised by the owner's standing
+    override. `cargo yank` and anything that rewrites history or changes repository visibility are
+    not, and are raised before being attempted.
+resource_profile:
+  complexity: medium
+  uncertainty: low
+  likely_cost_drivers:
+  - >
+    Volume. 1072 lines of README and 230 lines of crate documentation are rewritten and
+    redistributed across a dozen guide pages. There is no hard problem in it, but there is a great
+    deal of prose, and the prose has to stay accurate against a codebase of eighteen thousand lines
+    that no one is re-reading while they write.
+  - >
+    The worked-example sweep. The public surface re-exported from `lib.rs` is roughly seventy items
+    across fifteen modules. Each needs an example that compiles, and the ones that need a provider,
+    a store, or a filesystem need an example that compiles as `no_run` without becoming a fiction.
+    This is the single largest line-count in the release and the most mechanical.
+  - >
+    Four checkers, each with a negative control. The parsing is not hard — doc comments and public
+    items are regular enough to scan without a syntax tree — but a checker that silently matches
+    nothing passes every input, which is precisely why each one carries a control that must fail.
+  - >
+    Build time on a hot disk. `cargo test --doc --all-features` compiles the document and media
+    stacks, and the gate run is where the volume fills. Phases are separated by `rm -rf target` and
+    a `df` check.
+  preferred_tools:
+  - >
+    Subagents over disjoint files. The guide pages are the natural fan-out: each is one file, sourced
+    from one contiguous README section, with no shared state. The crate-root rewrite, the example
+    sweep, and the checkers are separate lanes that do not collide.
+  - >
+    `cargo test --doc`, `cargo doc --all-features`, and the existing three-OS CI matrix as the gate.
+  - >
+    Plain Rust integration tests for the four checkers. No new dependency, no build script, no
+    nightly rustdoc JSON — a checker that requires a nightly toolchain is a checker that stops
+    running the first time CI's nightly breaks.
+  constraints:
+  - Additive `CREATE TABLE IF NOT EXISTS` in `Store::from_conn` only; never bump `CHECKPOINT_FORMAT`
+    (7); never rename or reshape an existing table.
+  - No system package on any runner.
+  - The default `cargo tree` stays at 401 lines.
+  - A new capability ships as a new named function, never an added parameter (`src/lib.rs:271`
+    states the convention).
+  - Every refusal test carries a negative control.
+  - The crate stays 0.x. No 1.0.0.
+  - No AI attribution in any commit message, PR body, or release note.
+risks:
+- >
+  The documentation drifts from the code while it is being written. Rewriting 1300 lines of prose
+  about a codebase nobody is re-reading is how a confident, wrong sentence gets published — and this
+  release's entire value is that its sentences are true. Mitigation: every factual claim that can be
+  asserted is asserted (MSRV, feature list, links, examples compiling), and every claim that cannot
+  be is written from the source file it describes rather than from the README it replaces, since the
+  old README is itself the suspect document.
+- >
+  The example sweep degenerates into seventy examples that compile and teach nothing — `let x =
+  Foo::new();` repeated until the checker goes quiet. The checker cannot tell a worked example from
+  a token one, which makes this the release's most likely quiet failure. Mitigation: an example
+  shows the item used for its purpose in a context a reader could copy, and the guide page for a
+  capability is where the longer worked flow lives, so the per-item example does not have to carry
+  it alone.
+- >
+  Splitting one file into thirteen creates thirteen files that rot independently. Mitigation: the
+  link checker catches the structural half immediately; the deeper half is answered by keeping each
+  guide page owned by its capability's source module, so the page and the code it describes are
+  edited in the same change.
+- >
+  The surface snapshot becomes a rubber stamp — a failing test that everyone fixes by regenerating
+  the snapshot without reading the diff. Mitigation: the snapshot is regenerated by hand rather than
+  by a `--bless` flag, and `CONTRACT.md` states that a diff in it is the trigger for writing the
+  deprecation attribute and the migration note. A one-command regenerate would make the mechanism
+  self-defeating on the day someone is in a hurry.
+- >
+  Scope creep dressed as tidying. A release that touches every file is an inviting moment to fix the
+  seven carried limitations, and six of them are explicitly out. Mitigation: they are named in
+  `excluded` with the reason, and they appear in `CONTRACT.md` as documented limits, which is the
+  in-scope way to address them.
+open_questions:
+- >
+  Whether the guide pages live at `docs/guide/<capability>.md` or flat in `docs/`. Leaning toward
+  the subdirectory, since `docs/` already holds four process documents (`CAPABILITIES.md`,
+  `CHANGELOG_STRUCTURE.md`, `CONTRACT.md`, `RELEASE_PROCESS.md`) that are a different audience from
+  a user guide, and mixing them makes both harder to scan. Decided in the first development task,
+  not routed to the owner.
+- >
+  What becomes of `docs/CAPABILITIES.md` (67 lines) once the guide pages exist. It is either the
+  index that links them or it is redundant with the README's capability list. Leaning toward making
+  it the index, since a `docs/` reader who arrived from docs.rs rather than from the README needs a
+  way in.
+- >
+  Whether the changelog's breaking changes are marked with an explicit token the checker can find,
+  or inferred from prose. An explicit marker is the only version a checker can be honest about, so
+  the retrofit adds one to each historical entry that broke the contract — which means auditing
+  fifteen releases for breaks that were never labelled as such. That audit is a development task,
+  and its result is the first thing `CONTRACT.md` will be measured against.
+- >
+  Whether any item warrants an actual `#[deprecated]` in this release. Nothing currently needs
+  renaming, and manufacturing a deprecation to exercise the cycle would be dishonest. The mechanism
+  and the policy ship; the first real use is whenever the first real rename happens.
+released_at: 2026-07-28T06:40:00Z
+mode: published
+delivered: >
+  An external Rust developer arriving cold reaches a running example from the README's first
+  screen, and a developer already depending on the crate can read what is public, what pre-1.0
+  means here, and what does not work today, in one place.
+
+  Both front doors were release histories and are now landing pages. The README went from 1072
+  lines organised as "Usage (v0.4)" / "MCP and network egress (v0.8)", with its first code fence
+  on line 107 and a status paragraph two releases stale, to a landing page with the quickstart
+  inside the first screen. The crate root — the page docs.rs opens — went from 230 lines of
+  "v0.2 adds" with v0.3 filed after v0.14 and v0.10 through v0.13 absent, to 209 lines describing
+  what the crate does. Twelve guide pages under docs/ carry the depth, and every "the limits,
+  stated plainly" block travelled with its capability. Two of the twelve are new writing rather
+  than moved prose: observability and replay had never been documented for a reader at all.
+
+  All 106 public items re-exported from the crate root carry a worked example; before this release
+  one did. 49 breaking changes across 16 versions are marked in the changelog with a migration
+  note saying what to write instead. docs/CONTRACT.md states what is public, the deprecation
+  cycle, the MSRV policy, the feature table, the platform matrix, and eleven limits that hold.
+
+  Four checkers ship so the claims cannot quietly stop being true, each with a negative control
+  proving it can fail: the worked-example check, the public-surface snapshot that fails a rename
+  or a removal until the snapshot is edited by hand, the MSRV and feature-list drift assertions
+  against Cargo.toml, and the changelog migration-note check. A fifth asserts the README split
+  lost nothing.
+
+  One code change: resume_tree_from_stored_policy and its observed twin, closing the last
+  asymmetry between the three resume loops. No existing signature changed.
+evidence:
+  tests:
+  - >
+    cargo test — 32 suites ok, 0 failed (203 lib tests plus every integration suite). Full output
+    in evidence/0.16.0/tests-default.txt
+  - >
+    cargo test --all-features — 32 suites ok, 0 failed. Run before the record was written; the
+    document and media stacks compile and their suites pass
+  - >
+    cargo test --doc — 116 passed, 0 failed on the default build
+  - >
+    cargo test --doc --all-features — 118 passed, 0 failed. Every worked example on every public
+    item compiles and runs, including the two media-gated ones. Output in
+    evidence/0.16.0/doctests-all-features.txt
+  - >
+    cargo test --test public_api — 9 passed. every_public_item_has_a_worked_example green across
+    all 106 items; public_surface_matches_snapshot green; controls report a removal and a rename
+  - >
+    cargo test --test docs_drift — 10 passed. MSRV equals Cargo.toml's rust-version in README,
+    crate root and CONTRACT.md; the documented feature list equals the [features] keys in both
+    directions; no dangling relative link in README.md or any docs/ page
+  - >
+    cargo test --test changelog — 5 passed. Every entry marked breaking carries a migration note
+  - >
+    cargo test --test guide_pages — 7 passed. All twelve capabilities have a page, every limits
+    block survived, no page is orphaned from the index, and no page sits outside the check
+  - >
+    cargo test --test readme — 8 passed. The README states what the crate is, shows a runnable
+    fence and names the MSRV inside its first 60 lines; no heading in the README or the crate root
+    is named after a release; the crate root narrates no release history
+  - >
+    cargo test --test checkpoint — 18 passed, covering F12 and F13: a tree resumed through
+    resume_tree_from_stored_policy is still bounded by the policy it started under, with the
+    refusal attributed to the original rule and layer; the permissive control performs the write;
+    a tree with no stored policy is Error::Resume
+  builds:
+  - >
+    cargo build — exit 0
+  - >
+    cargo clippy --all-targets — exit 0, zero warnings. Output in evidence/0.16.0/clippy.txt
+  - >
+    cargo fmt --check — clean, exit 0. Output in evidence/0.16.0/fmt.txt
+  - >
+    cargo doc --no-deps — exit 0, zero warnings. Eleven pre-existing rustdoc warnings, including
+    five unresolved intra-doc links that resolved under --all-features and dangled in the default
+    build, were fixed in this release. Output in evidence/0.16.0/doc-default.txt
+  - >
+    cargo doc --no-deps --all-features — exit 0, zero warnings. Output in
+    evidence/0.16.0/doc-all-features.txt
+  - >
+    cargo tree — 401 lines, unchanged from 0.15.0. No dependency was added in any build, default
+    or featured. Full output in evidence/0.16.0/tree-full.txt
+  - >
+    cargo package --list — exit 0. 17 files under docs/ are in the package, so the guide pages the
+    crate root and README link are shipped rather than left on GitHub; README.md, CHANGELOG.md,
+    LICENSE and NOTICE present; zero .ultraship/ files, so the exclude holds
+  reviews:
+  - >
+    Scope audit against the contract: everything in scope.included is present, and everything in
+    scope.excluded is still absent. CHECKPOINT_FORMAT is still 7 and src/state.rs took insertions
+    only. git_status still uses --porcelain=v1 without -z. No Windows Job Object, no Pdfium, no
+    real-application document fixtures. The only occurrence of "video_url" in src/ is the doc
+    comment in src/provider/mod.rs explaining why video was cut
+  - >
+    Security gate: no secret is tracked. `.env` matches `*.env` in .gitignore, and `git ls-files`
+    matching env, secret or credential returns nothing
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  This record was sealed on feat/0.16.0 before the crates.io upload, which follows the
+  develop→main merge and the GitHub Release. `mode: published` states the authorised target; the
+  release flow makes it true.
+- >
+  A registered tool named after one of the git, image or document built-ins passes Toolbox
+  validation and is then permanently unreachable. RESERVED_TOOL_NAMES still lists only the
+  original seven, and dispatch tests every built-in arm before reaching the toolbox. Found while
+  auditing the README against the source. Documented in CONTRACT.md rather than fixed, because
+  extending the reserved set turns a currently-accepted registration into an Error::Config, which
+  belongs in a release that can carry a break.
+- >
+  `resume_tree` does not call record_run_policy, unlike run_tree and both flat loops, so a tree
+  resumed under a widened policy leaves an audit that understates what was permitted. The new
+  resume_tree_from_stored_policy is unaffected, since it reads that row back.
+- >
+  `SandboxLimits::max_processes` is enforced by nothing on any platform. The doc comments claiming
+  otherwise were corrected here; the field's behaviour was not changed.
+- >
+  No seccomp filter is installed on Linux. Three doc comments claimed one and were corrected. The
+  backend is namespaces and rlimits, and any syscall restriction is the kernel's own default under
+  an unprivileged user namespace.
+- >
+  The public-surface snapshot covers the 106 items re-exported from the crate root. Items reachable
+  only through a public module path — io_harness::context::assemble, io_harness::tools::Workspace,
+  the whole documents API — are public and are not individually snapshotted, so the deprecation
+  cycle's mechanism does not yet cover them. Stated in CONTRACT.md.
+- >
+  The worked-example check counts fenced blocks. It cannot distinguish a worked example from a
+  token one, so the quality of the 106 examples rests on review rather than on the checker.
+- >
+  Carried from earlier releases and documented rather than fixed: git_status uses --porcelain=v1
+  without -z, so a path containing a newline renders ambiguously to the model; commit idempotency
+  across a resume rests on git's own semantics rather than a durable marker; fill_form's output has
+  never been opened in a real PDF viewer, which needs Pdfium and therefore a system package; the
+  Windows Job Object is still unimplemented, so containment there is the portable floor and the CPU
+  and memory caps do not fire; pdf::read_text's catch_unwind is a no-op under a panic = "abort"
+  profile; and no binary document fixture was written by a real application.
+- >
+  The three-OS CI matrix had not run on this branch when the record was sealed. Every gate above
+  was run on macOS. Linux and Windows are proven by the matrix on the feat→develop pull request.
+supersedes: 0.15.0
+next_recommended_version: 0.17.0
+immutable: true

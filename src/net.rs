@@ -44,6 +44,23 @@ use crate::state::{PolicyEvent, Store};
 /// module is private, so the value reaches callers re-exported from each of those
 /// provider modules — a default you are told to reason about has to be one you
 /// can read.
+///
+/// ```no_run
+/// use io_harness::{OpenRouter, REQUEST_TIMEOUT};
+///
+/// # fn demo() -> io_harness::Result<()> {
+/// // A model that streams at a crawl needs longer than the default; naming the
+/// // constant is how the override says what it is relative to, rather than
+/// // hard-coding a number nobody can compare against.
+/// let patient = OpenRouter::from_env()?.with_timeout(REQUEST_TIMEOUT * 3);
+///
+/// // The other direction: a batch job that would rather fail fast and retry than
+/// // hold a worker on one hung socket for ten minutes.
+/// let impatient = OpenRouter::from_env()?.with_timeout(REQUEST_TIMEOUT / 10);
+/// # let _ = (patient, impatient);
+/// # Ok(())
+/// # }
+/// ```
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// The one `reqwest::Client` constructor in the crate.

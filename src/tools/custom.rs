@@ -45,6 +45,46 @@ use crate::provider::ToolSpec;
 /// stay generic over `impl Future` precisely because a run has exactly one of
 /// them; a run has many tools.
 ///
+/// The `'a` is the borrow of `&self`, which is the useful part: the future may
+/// hold the tool's own state — a connection pool, an HTTP client, a handle to
+/// the application it lives in — rather than cloning it on every call. Building
+/// one is `Box::pin(async move { … })` and nothing else.
+///
+/// ```
+/// use std::collections::HashMap;
+/// use std::sync::Mutex;
+///
+/// use io_harness::tools::{Tool, ToolFuture};
+/// use io_harness::ToolSpec;
+/// # use serde_json::{json, Value};
+///
+/// /// Whatever the embedding program already holds — a connection pool, an
+/// /// HTTP client, a cache. Here, a map behind a lock.
+/// struct Customers {
+///     rows: Mutex<HashMap<String, String>>,
+/// }
+///
+/// impl Tool for Customers {
+///     # fn spec(&self) -> ToolSpec {
+///     #     ToolSpec { name: "customer".into(), description: "Look a customer up by id.".into(),
+///     #                parameters: json!({"type": "object"}) }
+///     # }
+///     fn invoke<'a>(&'a self, arguments: &'a Value) -> ToolFuture<'a> {
+///         Box::pin(async move {
+///             // `self` is borrowed for the life of the future, so the tool
+///             // reads the program's own state instead of being handed a
+///             // clone of it on every call.
+///             let id = arguments.get("id").and_then(Value::as_str).unwrap_or_default();
+///             let found = self.rows.lock().unwrap().get(id).cloned();
+///             // `Err` is not a run failure: the text becomes an observation
+///             // the model can act on, and only it can decide whether a miss
+///             // means "try another id" or "give up".
+///             found.ok_or_else(|| io_harness::Error::Config(format!("no customer {id}")))
+///         })
+///     }
+/// }
+/// ```
+///
 /// [`Provider`]: crate::Provider
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
@@ -108,6 +148,81 @@ pub trait Tool: Send + Sync {
 }
 
 /// The set of [`Tool`]s registered for a run.
+///
+/// Collect them, hand the box to
+/// [`TaskContract::with_tools`](crate::TaskContract::with_tools), and the model
+/// is offered them beside `grep`, `find`, `read_file`, and `write_file`.
+///
+/// ```
+/// use io_harness::tools::{Tool, ToolFuture, Toolbox};
+/// use io_harness::{TaskContract, ToolSpec, Verification};
+/// # use serde_json::{json, Value};
+/// # struct Now;
+/// # impl Tool for Now {
+/// #     fn spec(&self) -> ToolSpec {
+/// #         ToolSpec { name: "now".into(), description: "The current time, ISO 8601.".into(),
+/// #                    parameters: json!({"type": "object"}) }
+/// #     }
+/// #     fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+/// #         Box::pin(async { Ok("2026-07-28T09:00:00Z".to_string()) })
+/// #     }
+/// # }
+/// # struct OpenTicket;
+/// # impl Tool for OpenTicket {
+/// #     fn spec(&self) -> ToolSpec {
+/// #         ToolSpec { name: "open_ticket".into(), description: "File a ticket.".into(),
+/// #                    parameters: json!({"type": "object"}) }
+/// #     }
+/// #     fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+/// #         Box::pin(async { Ok("PROJ-1".to_string()) })
+/// #     }
+/// # }
+/// let tools = Toolbox::new().with(Now).with(OpenTicket);
+/// assert_eq!(tools.names(), vec!["now", "open_ticket"]);
+///
+/// let contract = TaskContract::workspace(
+///     "triage the failing build",
+///     "/path/to/repo",
+///     Verification::WorkspaceFileContains { file: "TRIAGE.md".into(), needle: "#".into() },
+/// )
+/// .with_tools(tools);
+/// # let _ = contract;
+/// ```
+///
+/// Registration makes a tool *available*; it does not authorize it. Each call
+/// is an [`Act::Exec`](crate::Act::Exec) check on the tool's name, so an
+/// operator can be handed this box and still refuse one tool in it:
+/// `deny_exec("open_ticket")` leaves `now` working.
+///
+/// [`Toolbox::validate`] runs before the first completion, which is what turns
+/// a naming mistake into "your config is wrong" rather than an agent that has
+/// silently stopped being able to write files:
+///
+/// ```
+/// use io_harness::tools::{Tool, ToolFuture, Toolbox};
+/// use io_harness::ToolSpec;
+/// # use serde_json::{json, Value};
+///
+/// struct Impostor;
+///
+/// impl Tool for Impostor {
+///     fn spec(&self) -> ToolSpec {
+///         // The name of a built-in. Dispatch matches the built-in first, so
+///         // this tool would be registered, offered, and never reached.
+///         ToolSpec { name: "write_file".into(), description: "…".into(),
+///                    parameters: json!({"type": "object"}) }
+///     }
+///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+///     #     Box::pin(async { Ok(String::new()) })
+///     # }
+/// }
+///
+/// let err = Toolbox::new().with(Impostor).validate().unwrap_err();
+/// assert!(err.to_string().contains("write_file"));
+/// ```
+///
+/// The same rejection covers an empty name, a name using the `mcp__` prefix
+/// reserved for server tools, and two tools sharing one name.
 ///
 /// Cheap to clone (each tool is behind an `Arc`), so a whole 0.5.0 tree shares
 /// one toolbox and every child is offered what its parent was — inheritance

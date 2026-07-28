@@ -20,6 +20,38 @@ use crate::error::{Error, Result};
 
 /// What an action wants to do. Search tools (`grep`, `find`) filter their
 /// results with [`Act::Read`], so a denied path cannot reach the model.
+///
+/// Four acts, and every checked thing in the crate maps onto exactly one of
+/// them. Knowing which is how you write a rule for something whose name never
+/// appears in the policy — a registered [`Tool`](crate::Tool) and an MCP tool are
+/// both [`Act::Exec`] on their *name*, and a spreadsheet tool is
+/// [`Act::Read`]/[`Act::Write`] on the path the model gave it:
+///
+/// ```
+/// use io_harness::{Act, Effect, Policy};
+///
+/// let policy = Policy::permissive()
+///     .layer("app")
+///     // Files: the path, relative to the workspace root.
+///     .deny_read("secrets/*")
+///     .allow_write("src/*")
+///     // Binaries the verification gate spawns, by name — and the same act
+///     // decides whether a registered or MCP tool may be *called*.
+///     .allow_exec("rustc")
+///     .deny_exec("charge_credit_card")
+///     // Outbound connections, by host or `host:port`. Naming the host alone
+///     // covers whichever port a URL resolved to.
+///     .allow_net("api.example.com");
+///
+/// assert_eq!(policy.check(Act::Read, "secrets/prod.env").effect, Effect::Deny);
+/// assert_eq!(policy.check(Act::Exec, "charge_credit_card").effect, Effect::Deny);
+/// assert_eq!(policy.check(Act::Net, "api.example.com:443").effect, Effect::Allow);
+/// ```
+///
+/// What the exec act does *not* govern is what a thing does once it is running:
+/// a registered tool runs in the harness's process with the embedding program's
+/// privileges, and a stdio MCP server is a separate process that then dials what
+/// it likes. The policy decides what starts, not what a started thing does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Act {
@@ -35,6 +67,26 @@ pub enum Act {
 }
 
 /// What a rule does. Ordered by strictness: `Allow` < `Ask` < `Deny`.
+///
+/// The ordering is not decoration — it is how stacking two policies is defined.
+/// [`Policy::merge`] and [`Policy::contain`] take the `max` of the two defaults
+/// per act, so combining policies can only ever tighten them:
+///
+/// ```
+/// use io_harness::{Act, Effect, Policy};
+///
+/// assert!(Effect::Allow < Effect::Ask && Effect::Ask < Effect::Deny);
+///
+/// // A permissive overlay cannot loosen a base's asking default.
+/// let combined = Policy::default().merge(Policy::permissive());
+/// assert_eq!(combined.check(Act::Write, "anything-unmatched").effect, Effect::Ask);
+/// ```
+///
+/// The three effects also mean three different things at run time, and the
+/// middle one is the only one a human ever sees: `Allow` proceeds silently,
+/// `Ask` routes to the [`Approver`](crate::Approver), and `Deny` refuses without
+/// consulting anyone — a denied action never reaches an approver, so an
+/// [`ApproveAll`](crate::ApproveAll) cannot wave it through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Effect {
@@ -51,6 +103,35 @@ pub enum Effect {
 /// `pattern` is a glob (`*` any run including `/`, `?` one character) matched
 /// against the target's full relative path *or* its basename, the same way the
 /// `find` tool matches. That is what lets `.env` deny `config/.env`.
+///
+/// The basename half is why a bare filename is a *recursive* deny, and it is the
+/// reason to construct a `Rule` deliberately rather than reaching for the
+/// nearest-looking builder:
+///
+/// ```
+/// use io_harness::{Act, Effect, Policy, Rule};
+///
+/// // `*` spans `/`, so this is not "one directory down".
+/// let deny_anywhere = Rule { act: Act::Read, effect: Effect::Deny, pattern: ".env".into() };
+/// let deny_one_tree = Rule { act: Act::Read, effect: Effect::Deny, pattern: "vendor/*".into() };
+///
+/// let policy = Policy::permissive()
+///     .layer("secrets")
+///     .rule(deny_anywhere.act, deny_anywhere.effect, deny_anywhere.pattern.clone())
+///     .rule(deny_one_tree.act, deny_one_tree.effect, deny_one_tree.pattern.clone());
+///
+/// // Matched on the basename: every `.env` at every depth.
+/// assert_eq!(policy.check(Act::Read, "deploy/staging/.env").effect, Effect::Deny);
+/// // Matched on the full relative path, and `*` crosses directories.
+/// assert_eq!(policy.check(Act::Read, "vendor/lib/src/main.rs").effect, Effect::Deny);
+/// // Neither form matches, so the tier default decides.
+/// assert_eq!(policy.check(Act::Read, "src/main.rs").effect, Effect::Allow);
+/// ```
+///
+/// A `Rule` is also what an approver hands back in
+/// [`Decision::Approve`](crate::Decision::Approve)`::remember`, and what a
+/// deserialized operator config is made of — it is `Serialize`/`Deserialize` for
+/// exactly that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
     /// Which kind of action this rule governs.
@@ -63,6 +144,34 @@ pub struct Rule {
 
 /// A named group of rules. The name is what [`Policy::explain`] and the trace
 /// report, so a refusal from a shared base is attributable to that base.
+///
+/// Name layers after *who wrote them*, not after what they do. When a run is
+/// refused six weeks later, the trace names the layer, and "ops-baseline" sends
+/// the reader to the right file while "denies" sends them nowhere:
+///
+/// ```
+/// use io_harness::{Act, Effect, Layer, Policy, Rule};
+///
+/// // A layer built directly — what deserializing an operator's config file
+/// // produces, as opposed to the builder methods a program writes inline.
+/// let baseline = Layer {
+///     name: "ops-baseline".into(),
+///     rules: vec![
+///         Rule { act: Act::Read, effect: Effect::Deny, pattern: "infra/*".into() },
+///         Rule { act: Act::Write, effect: Effect::Deny, pattern: "infra/*".into() },
+///     ],
+/// };
+///
+/// let mut policy = Policy::permissive();
+/// policy.layers.push(baseline);
+/// let policy = policy.layer("app").allow_read("*").allow_write("*");
+///
+/// // The app's blanket allows do not lift the baseline's denies, and the verdict
+/// // says whose rule stopped it.
+/// let verdict = policy.explain(Act::Write, "infra/main.tf");
+/// assert_eq!(verdict.effect, Effect::Deny);
+/// assert_eq!(verdict.layer.as_deref(), Some("ops-baseline"));
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Layer {
     /// Human-readable name, surfaced in explanations and the trace.
@@ -72,6 +181,35 @@ pub struct Layer {
 }
 
 /// The default effect for an action no rule mentions.
+///
+/// This is the part of a policy that decides what happens to everything you did
+/// *not* think of, so it is the part worth setting on purpose. Deny-by-default
+/// makes the rule list exhaustive — anything unnamed is refused — which is the
+/// shape an unattended run wants:
+///
+/// ```
+/// use io_harness::{Act, Defaults, Effect, Policy};
+///
+/// let mut policy = Policy::permissive().layer("job").allow_read("src/*").allow_write("out/*");
+/// policy.defaults = Defaults {
+///     read: Effect::Deny,
+///     write: Effect::Deny,
+///     exec: Effect::Deny,
+///     net: Effect::Deny,
+/// };
+///
+/// // Named: allowed. Unnamed: refused, without ever asking a human.
+/// assert_eq!(policy.check(Act::Read, "src/lib.rs").effect, Effect::Allow);
+/// assert_eq!(policy.check(Act::Read, "/etc/passwd").effect, Effect::Deny);
+/// ```
+///
+/// Two defaults it is easy to be surprised by. `Policy::default()` sets `write`
+/// and `exec` to [`Effect::Ask`], so a run with no approver behind it stalls on
+/// its first write unless a rule allows it outright. And `net` defaults to
+/// [`Effect::Deny`] everywhere, including for a policy deserialized from a 0.7.0
+/// config that has no `net` field — the harness contributes the configured
+/// provider's host as its own layer, so the model is still reachable and nothing
+/// else is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Defaults {
     /// Default for reads. Reads inside the allow list are the permissive tier.
@@ -98,6 +236,40 @@ fn deny() -> Effect {
 }
 
 /// The outcome of evaluating a policy, with the rule and layer that produced it.
+///
+/// The two `Option`s are the useful part: they distinguish "a rule someone wrote
+/// stopped this" from "nothing matched, so the tier default did". Those need
+/// different fixes — one edits a line of config, the other adds one — and a
+/// refusal message that cannot tell them apart sends the reader to the wrong
+/// file:
+///
+/// ```
+/// use io_harness::{Act, Effect, Policy, Verdict};
+///
+/// fn explain_refusal(v: &Verdict, target: &str) -> String {
+///     match (&v.rule, &v.layer) {
+///         (Some(rule), Some(layer)) => format!("{target}: refused by `{rule}` in layer {layer}"),
+///         // No rule mentioned it at all — the answer is in `Defaults`.
+///         _ => format!("{target}: no rule matched; the tier default is {:?}", v.effect),
+///     }
+/// }
+///
+/// let policy = Policy::default().layer("app").deny_read("vendor/*");
+///
+/// assert_eq!(
+///     explain_refusal(&policy.explain(Act::Read, "vendor/x.rs"), "vendor/x.rs"),
+///     "vendor/x.rs: refused by `vendor/*` in layer app",
+/// );
+/// assert_eq!(
+///     explain_refusal(&policy.explain(Act::Write, "src/x.rs"), "src/x.rs"),
+///     "src/x.rs: no rule matched; the tier default is Ask",
+/// );
+/// ```
+///
+/// The same `Verdict` is what enforcement acts on — [`Policy::check`] *is*
+/// [`Policy::explain`] — so an explanation can never describe a boundary
+/// different from the one enforced. These fields are also what the trace records
+/// on a refusal, so an audit six weeks later reads the same attribution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
     /// What to do.
@@ -115,6 +287,52 @@ pub struct Verdict {
 const SECRET_PATTERNS: &[&str] = &[".env", "*.pem", "id_rsa", "id_ed25519", "*.key"];
 
 /// A permission policy: a stack of layers plus per-action defaults.
+///
+/// The reason it is a *stack* rather than one rule list is that the rules
+/// normally come from two people. An operator writes a base, an application
+/// stacks its own needs on top, and the base has to keep holding — which it
+/// does, because evaluation is deny-first across the whole stack and specificity
+/// does not enter into it:
+///
+/// ```
+/// use io_harness::{Act, Effect, Policy};
+///
+/// // Whoever runs the fleet. Shipped once, reused by every job.
+/// let ops = Policy::permissive()
+///     .layer("ops")
+///     .deny_read("infra/*")
+///     .deny_write("infra/*")
+///     .deny_exec("kubectl");
+///
+/// // Whoever wrote this job. It asks for everything, as applications do.
+/// let app = Policy::permissive()
+///     .layer("app")
+///     .allow_read("*")
+///     .allow_write("*")
+///     .allow_exec("rustc");
+///
+/// let policy = ops.merge(app);
+///
+/// // The app's `allow_read("*")` is broader and later, and still loses. A deny
+/// // in any layer beats an allow in any other, so handing out `ops` is safe:
+/// // nothing stacked on top can take it back.
+/// assert_eq!(policy.check(Act::Read, "infra/prod.tf").effect, Effect::Deny);
+/// assert_eq!(policy.check(Act::Exec, "kubectl").effect, Effect::Deny);
+/// assert_eq!(policy.check(Act::Write, "src/lib.rs").effect, Effect::Allow);
+/// ```
+///
+/// Which constructor to start from is a real decision, not a default:
+///
+/// * [`Policy::default`] — reads allowed, writes and execs [`Effect::Ask`], the
+///   secret paths (`.env`, `*.pem`, `id_rsa`, `id_ed25519`, `*.key`) denied
+///   outright, egress denied. The tiered starting point for an interactive run.
+/// * [`Policy::permissive`] — enforces nothing, and is what
+///   [`run`](crate::run) applies when the caller passes no policy at all. Start
+///   here when you intend to write the whole boundary yourself.
+///
+/// For a [`run_tree`](crate::run_tree), [`Policy::contain`] is the one that
+/// matters: a child inherits the parent's rules and may only narrow them, so no
+/// descendant at any depth holds an allow the root did not.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     /// Layers in stacking order. Later layers may add capability, never

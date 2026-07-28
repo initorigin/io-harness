@@ -9,9 +9,13 @@
 //! `deny_write("secrets/*")` that stops `write_file` but not `set_cell` is not a
 //! policy, it is a suggestion.
 //!
-//! 0.14.0 ships spreadsheets ([`xlsx`]), Word ([`docx`]), PowerPoint text
-//! ([`pptx`], read-only), PDF ([`pdf`]) and barcode decoding ([`barcode`]).
-//! Each is behind its own feature; the `documents` umbrella turns on all five.
+//! The formats are spreadsheets (`xlsx`), Word (`docx`), PowerPoint text
+//! (`pptx`, read-only), PDF (`pdf`) and barcode decoding (`barcode`). Each is
+//! behind its own feature; the `documents` umbrella turns on all five.
+//!
+//! The names are written plainly rather than as intra-doc links: each is both a
+//! feature and a module, and the module only exists when the feature is on, so
+//! a link resolves in an `--all-features` build and dangles in the default one.
 
 pub mod barcode;
 pub mod docx;

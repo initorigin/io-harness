@@ -925,3 +925,185 @@ async fn a_sandboxed_verification_is_recreated_on_resume() {
         r.outcome
     );
 }
+
+// ---------- 0.16.0 F12/F13: the tree resumes under the policy it started with ----------
+//
+// 0.13.0 gave the single-file and workspace loops `resume_from_stored_policy` so
+// a crashed run could come back under its own boundary without the caller
+// reconstructing it. The tree loop never got one, so the three resume paths
+// disagreed about whether a restart preserves the boundary. These cover the pair
+// that closes that gap.
+
+/// Every policy refusal in the whole tree, as `(target, rule, layer)`.
+///
+/// Read straight out of `policy_events` rather than through `Store::events`,
+/// because a tree's refusals land on the *child* agent's run id and the caller
+/// only holds the root's — the one thing a per-run reader cannot answer.
+fn tree_refusals(db: &std::path::Path) -> Vec<(String, Option<String>, Option<String>)> {
+    let c = sqlite(db);
+    let mut stmt = c
+        .prepare("SELECT target, rule, layer FROM policy_events WHERE kind = 'refusal' ORDER BY id")
+        .unwrap();
+    let rows: Vec<_> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    rows
+}
+
+/// Start a tree under `policy` and cut it off mid-fan-out — F4's crash, with the
+/// policy as a parameter. Leaves the store closed, as a killed process would.
+async fn crash_a_tree_mid_fan_out(dir: &std::path::Path, db: &std::path::Path, policy: &Policy) {
+    let store = Store::open(db).unwrap();
+    let slow = TreeProvider {
+        child_delay: Duration::from_millis(500),
+    };
+    let crashed = tokio::time::timeout(
+        Duration::from_millis(150),
+        run_tree(
+            &tree_contract(dir),
+            &slow,
+            &store,
+            policy,
+            &ApproveAll,
+            &containment(),
+        ),
+    )
+    .await;
+    assert!(
+        crashed.is_err(),
+        "the run should have been cut off mid-fan-out"
+    );
+    assert!(
+        store.agent_count_tree(1).unwrap() >= 2,
+        "children were spawned before the crash, so the resume has a tree to restore"
+    );
+    assert!(
+        store.run_policy(1).unwrap().is_some(),
+        "the policy the tree started under is durable — that is what the resume reads"
+    );
+}
+
+/// F12 — a tree started under a policy denying a path, crashed, and resumed
+/// through the new entry point *without a policy argument* still refuses that
+/// path, and the refusal is attributable to the original rule and layer.
+#[tokio::test]
+async fn a_tree_resumed_from_its_stored_policy_is_still_bounded_by_it() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    // The coordinator fans out to a.txt and b.txt; the boundary allows one and
+    // denies the other, by an explicit rule so the trace has something to name.
+    let policy = Policy::default()
+        .layer("base")
+        .allow_read("*")
+        .allow_write("*")
+        .deny_write("a.txt");
+    crash_a_tree_mid_fan_out(dir.path(), &db, &policy).await;
+
+    // A different process: the run id and nothing else. No policy passed.
+    let store = Store::open(&db).unwrap();
+    let r = io_harness::resume_tree_from_stored_policy(
+        &tree_contract(dir.path()),
+        &TreeProvider {
+            child_delay: Duration::ZERO,
+        },
+        &store,
+        1,
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { .. }),
+        "the tree was driven, not stopped — the refusal below is a boundary, not a dead run: {:?}",
+        r.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt"))
+            .unwrap()
+            .trim(),
+        "BETA",
+        "the allowed half of the fan-out completed"
+    );
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "the denied path stayed denied across the restart"
+    );
+    let refusals = tree_refusals(&db);
+    assert!(
+        refusals
+            .iter()
+            .any(|(target, rule, layer)| target == "a.txt"
+                && rule.as_deref() == Some("a.txt")
+                && layer.as_deref() == Some("base")),
+        "the refusal is in the trace, attributed to the rule and layer of the policy the tree \
+         was STARTED under: {refusals:?}"
+    );
+}
+
+/// F13(a) — the negative control. The same tree, the same call, started
+/// permissively: the write happens. Without this, F12 would pass just as well if
+/// the resumed tree refused everything.
+#[tokio::test]
+async fn the_same_tree_resume_on_a_permissive_run_performs_the_write() {
+    let dir = ws();
+    let db = dir.path().join("runs.db");
+    crash_a_tree_mid_fan_out(dir.path(), &db, &Policy::permissive()).await;
+
+    let store = Store::open(&db).unwrap();
+    let r = io_harness::resume_tree_from_stored_policy(
+        &tree_contract(dir.path()),
+        &TreeProvider {
+            child_delay: Duration::ZERO,
+        },
+        &store,
+        1,
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(r.outcome, RunOutcome::Success { .. }),
+        "tree completed on resume: {:?}",
+        r.outcome
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt"))
+            .unwrap()
+            .trim(),
+        "ALPHA",
+        "the path F12 sees refused is written here, so F12 measures a restored boundary"
+    );
+    assert!(
+        tree_refusals(&db).is_empty(),
+        "a permissive tree refuses nothing: {:?}",
+        tree_refusals(&db)
+    );
+}
+
+/// F13(b) — a tree with no recorded policy is a typed error, never a silent
+/// [`Policy::permissive`]. An unknown run id has no recorded policy, which is the
+/// same state every pre-0.13.0 run row is in.
+#[tokio::test]
+async fn a_tree_with_no_recorded_policy_is_refused_rather_than_resumed_permissively() {
+    let dir = ws();
+    let store = Store::memory().unwrap();
+    let err = io_harness::resume_tree_from_stored_policy(
+        &tree_contract(dir.path()),
+        &TreeProvider {
+            child_delay: Duration::ZERO,
+        },
+        &store,
+        424_242,
+        &ApproveAll,
+        &containment(),
+    )
+    .await
+    .expect_err("a tree whose boundary cannot be recovered must not be resumed");
+    assert!(matches!(&err, io_harness::Error::Resume { .. }), "{err:?}");
+}

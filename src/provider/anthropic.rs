@@ -26,6 +26,31 @@ const API_VERSION: &str = "2023-06-01";
 const MAX_TOKENS: u64 = 8192;
 
 /// An Anthropic-backed [`Provider`].
+///
+/// ```no_run
+/// use io_harness::{run_with, Anthropic, ApproveAll, Policy, Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// // `ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL`; the key is read here and never
+/// // logged. `Anthropic::new` takes both explicitly when they come from your own
+/// // configuration rather than the environment.
+/// let provider = Anthropic::from_env()?;
+///
+/// let contract = TaskContract::workspace(
+///     "summarise the repo's README into NOTES.md",
+///     "/path/to/repo",
+///     Verification::WorkspaceFileContains { file: "NOTES.md".into(), needle: "#".into() },
+/// );
+/// let policy = Policy::default().layer("app").allow_read("*").allow_write("NOTES.md");
+/// let result = run_with(&contract, &provider, &Store::memory()?, &policy, &ApproveAll).await?;
+/// println!("{:?}", result.outcome);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The harness contributes `api.anthropic.com` as the `provider` policy layer, so
+/// a deny-by-default network policy still reaches this model and the trace records
+/// why it was allowed.
 pub struct Anthropic {
     client: reqwest::Client,
     api_key: String,

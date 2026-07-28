@@ -40,6 +40,37 @@ fn kind_from_wire(kind: &str, run_id: i64) -> Result<ObsKind> {
 /// The checkpoint layout version stamped into `PRAGMA user_version`. Bump when
 /// the on-disk checkpoint format changes incompatibly. A store whose version is
 /// higher than this is from a newer binary and is refused on resume.
+///
+/// The reason a caller ever reads it: a resume against a store a *newer*
+/// io-harness wrote fails, typed, before anything is replayed — and this constant
+/// is the version to name when reporting that.
+///
+/// ```
+/// use io_harness::{Error, Store, CHECKPOINT_FORMAT};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let path = std::env::temp_dir().join("io-harness-doc-newer-checkpoint.sqlite3");
+/// let _ = std::fs::remove_file(&path);
+/// {
+///     // Stand in for a store written by a future release.
+///     let conn = rusqlite::Connection::open(&path).unwrap();
+///     conn.pragma_update(None, "user_version", CHECKPOINT_FORMAT + 1).unwrap();
+/// }
+///
+/// let store = Store::open(&path)?;
+/// match store.check_resumable(1) {
+///     Err(Error::Resume { reason }) => {
+///         // Not a panic, and not a half-resume that reads a layout this binary
+///         // does not understand. Tell the operator what to do about it.
+///         assert!(reason.contains("newer"), "{reason}");
+///         eprintln!("this binary understands checkpoint format {CHECKPOINT_FORMAT}: {reason}");
+///     }
+///     other => panic!("a newer store must refuse to resume, got {other:?}"),
+/// }
+/// # let _ = std::fs::remove_file(&path);
+/// # Ok(())
+/// # }
+/// ```
 pub const CHECKPOINT_FORMAT: i64 = 7;
 
 /// The one outcome string that means the run did what it was asked.
@@ -47,11 +78,63 @@ pub const CHECKPOINT_FORMAT: i64 = 7;
 /// Named rather than inlined so that [`RunSummary::success`] and any future
 /// reader agree by construction. Eleven outcome strings exist; exactly one of
 /// them is the task being done.
+///
+/// ```
+/// use io_harness::{Store, SUCCESS_OUTCOME};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let worked = store.start_run("add a hello function", "src/hello.rs")?;
+/// let gave_up = store.start_run("add a goodbye function", "src/bye.rs")?;
+/// store.finish_run(worked, SUCCESS_OUTCOME)?;
+/// store.finish_run(gave_up, "step_cap_reached")?;
+///
+/// // Scoring a batch of runs: compare against this rather than against the
+/// // literal `"success"`, so a reader and the crate cannot drift apart about
+/// // which of the eleven endings counts.
+/// let succeeded = |id| -> io_harness::Result<bool> {
+///     Ok(store.outcome(id)?.as_deref() == Some(SUCCESS_OUTCOME))
+/// };
+/// assert!(succeeded(worked)?);
+/// assert!(!succeeded(gave_up)?);
+///
+/// // Which is exactly what `RunSummary::success` already carries, computed the
+/// // same way at the moment the run ended.
+/// assert_eq!(store.run_summary(worked)?.map(|s| s.success), Some(true));
+/// # Ok(())
+/// # }
+/// ```
 pub const SUCCESS_OUTCOME: &str = "success";
 
 /// The durable lifecycle status of a run, so a caller can tell a crashed run
 /// (still `Running`) from one paused for a human (`Paused`) or finished
 /// (`Completed`). OS- and rusqlite-free, so it is safe in the public API.
+///
+/// ```
+/// use io_harness::{RunStatus, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let crashed = store.start_run("summarise the README", "NOTES.md")?;
+/// let waiting = store.start_run("rewrite the changelog", "CHANGELOG.md")?;
+/// let done = store.start_run("add a hello function", "src/hello.rs")?;
+/// store.finish_run(waiting, "awaiting_approval")?;
+/// store.finish_run(done, "success")?;
+///
+/// // The triage a supervisor does on startup. A run left `Running` by a store
+/// // nobody is driving is one whose process died mid-loop: resume it. `Paused` is
+/// // waiting on a human and resumes with their decision, not without it.
+/// let resumable: Vec<i64> = store
+///     .runs()?
+///     .into_iter()
+///     .filter(|id| store.run_status(*id).ok().flatten() == Some(RunStatus::Running))
+///     .collect();
+/// assert_eq!(resumable, [crashed]);
+/// assert_eq!(store.run_status(waiting)?, Some(RunStatus::Paused));
+/// assert_eq!(store.run_status(done)?, Some(RunStatus::Completed));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunStatus {
     /// The run is in progress — or was, until the process died mid-loop. A
@@ -78,6 +161,33 @@ impl RunStatus {
 
 /// A persisted spawned-child contract, enough to rebuild and resume that exact
 /// child on a tree resume rather than spawning a duplicate.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let parent = store.start_run("summarise the repo", "NOTES.md")?;
+/// let child = store.start_child_run("summarise src/", "NOTES.md", parent, 1)?;
+/// store.record_spawn(parent, 4, child, "summarise src/", "NOTES.md", "#", Some(8), "[]")?;
+///
+/// // What a tree resume does with it: the parent replays step 4, looks the spawn
+/// // up by (parent, step, goal), and adopts the child it already made. Without
+/// // this row the replay would spawn a second child and spend the tree's ledger
+/// // twice for one piece of work.
+/// let row = store.find_spawn(parent, 4, "summarise src/")?.expect("recorded above");
+/// assert_eq!(row.child_run_id, child);
+/// assert_eq!(row.max_steps, Some(8));
+/// // The narrowing the parent applied is stored too, so the adopted child resumes
+/// // under the policy it was contained by rather than the parent's wider one.
+/// assert_eq!(row.deny_write, "[]");
+///
+/// // A step that never spawned has no row, which is how a replay tells "already
+/// // done" from "not done yet".
+/// assert!(store.find_spawn(parent, 5, "summarise src/")?.is_none());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnRow {
     /// The child run id already allocated for this spawn.
@@ -104,6 +214,34 @@ pub struct SpawnRow {
 ///
 /// Serialisable, so a scoring tool can store or ship it without restating the
 /// shape.
+///
+/// ```
+/// use io_harness::{Store, StepRecord};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("add a hello function", "src/hello.rs")?;
+/// store.record(run_id, &StepRecord::new(1, "wrote src/hello.rs", "ok").with_trace("", "", 1_280))?;
+/// store.finish_run(run_id, "step_cap_reached")?;
+///
+/// // One row instead of three queries plus knowledge of which of eleven outcome
+/// // strings mean success. This is what a scoring tool reads per run.
+/// let summary = store.run_summary(run_id)?.expect("the run has finished");
+/// assert!(!summary.success);
+/// // `outcome` and `success` are both kept on purpose: the flag says whether it
+/// // worked, the string says *how* it ended, and a step cap, a stall and a
+/// // human's refusal are three different things to act on.
+/// assert_eq!(summary.outcome, "step_cap_reached");
+/// assert_eq!((summary.steps, summary.tokens), (1, 1_280));
+///
+/// // `None` while a run is unfinished or paused for a human — absent rather than
+/// // a row of zeroes, which would read like a run that did nothing.
+/// let paused = store.start_run("rewrite the changelog", "CHANGELOG.md")?;
+/// store.finish_run(paused, "awaiting_approval")?;
+/// assert!(store.run_summary(paused)?.is_none());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RunSummary {
     /// The run this describes.
@@ -147,6 +285,40 @@ pub struct RunSummary {
 
 /// A persisted run store. Use [`Store::open`] for a file, or [`Store::memory`]
 /// for an ephemeral in-memory database.
+///
+/// The store is not a log. It is what makes a run resumable after a crash and
+/// auditable afterwards, so which constructor you choose is a decision about
+/// whether either matters for this run.
+///
+/// ```no_run
+/// use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// // A file store outlives the process: a run that dies mid-loop is resumable
+/// // from its last committed step, and a second process may read the trace while
+/// // this one is still writing it (WAL, plus `BUSY_TIMEOUT`).
+/// let store = Store::open("runs.sqlite3")?;
+///
+/// let contract = TaskContract::new(
+///     "add a hello function returning 42",
+///     "src/hello.rs",
+///     Verification::FileContains("fn hello".into()),
+/// );
+/// let result = run(&contract, &OpenRouter::from_env()?, &store).await?;
+///
+/// // Everything the run did, read back by id: the trace, the budget draws, the
+/// // policy refusals, and what it cost.
+/// for step in store.steps(result.run_id)? {
+///     println!("{}: {} ({} tokens)", step.step, step.decision, step.tokens);
+/// }
+/// println!("{:?}", store.run_summary(result.run_id)?);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// [`Store::memory`] is the same API with no file: a throwaway run, or a test.
+/// Nothing survives the process, so nothing is resumable — which is the right
+/// trade only when a failed run is cheaper to restart than to continue.
 pub struct Store {
     conn: Connection,
 }
@@ -154,6 +326,32 @@ pub struct Store {
 /// One durable checkpoint-lifecycle event: a step was checkpointed, a run was
 /// resumed, or an already-committed step was skipped on resume. Together they
 /// make a crashed-and-resumed run's history reconstructable from the store.
+///
+/// ```
+/// use io_harness::{CheckpointEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("summarise the repo", "NOTES.md")?;
+/// # store.record_checkpoint_event(&CheckpointEvent::checkpoint(run_id, 1))?;
+/// # store.record_checkpoint_event(&CheckpointEvent::checkpoint(run_id, 2))?;
+/// # store.record_checkpoint_event(&CheckpointEvent::resume(run_id, 3, "restarted after a crash"))?;
+/// # store.record_checkpoint_event(&CheckpointEvent::skipped(run_id, 1))?;
+/// # store.record_checkpoint_event(&CheckpointEvent::skipped(run_id, 2))?;
+/// // Answers the question a crashed run leaves behind: did it restart, and did
+/// // the restart re-do work that was already committed?
+/// let events = store.checkpoint_events(run_id)?;
+/// let resumes = events.iter().filter(|e| e.kind == "resume").count();
+/// let replayed: Vec<u32> = events.iter().filter(|e| e.kind == "skipped").map(|e| e.step).collect();
+///
+/// assert_eq!(resumes, 1, "this run died once and came back");
+/// // Two steps were replayed and recognised as already done, so they cost
+/// // nothing the second time — that is what makes a resume idempotent rather
+/// // than a second charge for the same steps.
+/// assert_eq!(replayed, [1, 2]);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct CheckpointEvent {
     /// The run this event belongs to.
@@ -197,6 +395,40 @@ impl CheckpointEvent {
 }
 
 /// One recorded loop step — the full trace entry, as written and read back.
+///
+/// ```
+/// use io_harness::{StepRecord, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("add a hello function", "src/hello.rs")?;
+///
+/// // A transient provider failure, and then the step that worked. Both are step
+/// // 1: a retry writes its own row under the step number it retried.
+/// store.record(run_id, &StepRecord::new(1, "retry 1 after a 503", ""))?;
+///
+/// // `new` alone records a decision and its result; `with_trace` adds the audit
+/// // half — the exact prompt sent, the call the model made, and what it cost.
+/// // Without it the trace says what happened and not why.
+/// store.record(
+///     run_id,
+///     &StepRecord::new(1, "wrote src/hello.rs", "ok").with_trace(
+///         "<the assembled prompt>",
+///         r#"{"name":"write_file","arguments":{"path":"src/hello.rs"}}"#,
+///         1_280,
+///     ),
+/// )?;
+///
+/// // Read back for audit — and the reason `RunSummary::steps` is `MAX(step)`
+/// // rather than a row count: two rows here, one agent step.
+/// let steps = store.steps(run_id)?;
+/// assert_eq!(steps.len(), 2);
+/// assert_eq!(store.last_step(run_id)?, 1);
+/// assert!(steps[1].tool_call.contains("write_file"));
+/// assert_eq!(steps.iter().map(|s| s.tokens).sum::<u64>(), 1_280);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct StepRecord {
     /// 1-based step number within the run.
@@ -247,6 +479,34 @@ impl StepRecord {
 /// or credentials. (The write payload of a *deferred* action is held separately
 /// in the pending-approval row, because resuming it requires replaying exactly
 /// what was approved.)
+///
+/// ```
+/// use io_harness::{PolicyEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("tidy the repo", "src/lib.rs")?;
+/// # store.record_event(run_id, &PolicyEvent::refusal(3, "write", "secrets/id_rsa")
+/// #     .with_rule("secrets/*", "app"))?;
+/// # store.record_event(run_id, &PolicyEvent::decision(4, "exec", "git push", "approve", "stdin")
+/// #     .with_performed("git push --dry-run"))?;
+/// // The audit an operator actually asks for: what did the agent try that it was
+/// // not allowed to do, and which rule stopped it?
+/// let events = store.events(run_id)?;
+/// let refused = events.iter().find(|e| e.kind == "refusal").expect("one refusal");
+/// assert_eq!(refused.target, "secrets/id_rsa");
+/// // Attributed to the rule and the layer, so "why was this denied" is answered
+/// // from the store rather than by re-deriving the policy stack by hand.
+/// assert_eq!((refused.rule.as_deref(), refused.layer.as_deref()), (Some("secrets/*"), Some("app")));
+///
+/// // And the case that is easy to miss: an approval that changed the action. The
+/// // agent asked for one command and a human let a different one through.
+/// let approved = events.iter().find(|e| e.kind == "decision").expect("one decision");
+/// assert_eq!(approved.decision.as_deref(), Some("approve"));
+/// assert_eq!(approved.performed.as_deref(), Some("git push --dry-run"));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyEvent {
     /// 1-based step the event occurred on.
@@ -317,6 +577,32 @@ impl PolicyEvent {
 
 /// An action paused awaiting a human decision, persisted so it outlives the
 /// process that requested it.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("update the deploy config", "deploy/prod.yaml")?;
+///
+/// // The agent asked to write a production file, the policy said `Ask`, and the
+/// // approver deferred. The payload is stored with it, because resuming has to
+/// // replay exactly what was approved and not whatever the model would say now.
+/// let request_id = store.put_pending(run_id, 2, "write", "deploy/prod.yaml", Some("replicas: 4"))?;
+///
+/// // This process may now exit. A reviewer — a web UI, a CLI, a person the next
+/// // morning — reads the request back and decides.
+/// let pending = store.pending(request_id)?.expect("just written");
+/// assert_eq!((pending.act.as_str(), pending.target.as_str()), ("write", "deploy/prod.yaml"));
+/// assert_eq!(pending.content.as_deref(), Some("replicas: 4"));
+/// assert!(pending.resolved.is_none(), "nobody has decided yet");
+///
+/// store.resolve_pending(request_id, "approve")?;
+/// assert_eq!(store.pending(request_id)?.unwrap().resolved.as_deref(), Some("approve"));
+/// // `resume_with_decision` then continues the run from here.
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pending {
     /// The request id, as returned by [`Store::put_pending`].
@@ -341,6 +627,44 @@ pub struct Pending {
 /// Together with each run's `parent_run_id` these make the tree a reconstructable
 /// graph — who spawned whom, what was refused, and what the tree spent — long
 /// after the process that ran it has exited.
+///
+/// ```
+/// use io_harness::{AgentEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("summarise the repo", "NOTES.md")?;
+/// # store.record_agent_event(&AgentEvent::budget_draw(run_id, 1, 1_280, 8_720))?;
+/// # store.record_agent_event(&AgentEvent::spawn(run_id, 2, 2, "summarise src/"))?;
+/// # store.record_agent_event(&AgentEvent::budget_draw(run_id, 2, 4_100, 4_620))?;
+/// # store.record_agent_event(&AgentEvent::spawn_refused(run_id, 3, "agents"))?;
+/// # store.record_agent_event(&AgentEvent::budget_draw(run_id, 3, 3_900, 720))?;
+/// // The only audit of what each step drew against the tree's *shared* ceiling.
+/// // A run's own token total does not show this: the ceiling is tree-wide, so
+/// // what matters is how fast `remaining` is falling for everyone.
+/// let events = store.agent_events(run_id)?;
+///
+/// let drawn: u64 = events.iter().filter_map(|e| e.tokens).sum();
+/// let left = events.iter().filter_map(|e| e.remaining).last();
+/// assert_eq!(drawn, 9_280);
+/// // 720 left after three steps that averaged over 3,000: this tree ends in
+/// // `BudgetCeilingReached` next step, and the row says so before it happens.
+/// assert_eq!(left, Some(720));
+///
+/// // The same table carries the shape of the tree and what it was denied.
+/// let children: Vec<i64> = events.iter().filter_map(|e| e.child_run_id).collect();
+/// let refusals: Vec<&str> = events
+///     .iter()
+///     .filter(|e| e.kind == "spawn_refused")
+///     .filter_map(|e| e.detail.as_deref())
+///     .collect();
+/// assert_eq!(children, [2]);
+/// // A parent that wanted a second child and hit the agent cap — a run doing
+/// // less work than it planned to, which is invisible in its outcome.
+/// assert_eq!(refusals, ["agents"]);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentEvent {
     /// The agent this event belongs to (the parent, for a spawn; the drawing
@@ -408,6 +732,37 @@ impl AgentEvent {
 ///
 /// Together these let an operator audit not just *what* code ran but *where* and
 /// *how* it was isolated, reconstructable from the store alone after the run.
+///
+/// ```
+/// use io_harness::{SandboxEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("make the tests pass", "src/lib.rs")?;
+/// # store.record_sandbox_event(&SandboxEvent::create(run_id, 4, "macos-sandbox-exec"))?;
+/// # store.record_sandbox_event(&SandboxEvent::exec(run_id, 4, "macos-sandbox-exec", "rustc --test subject.rs"))?;
+/// # store.record_sandbox_event(&SandboxEvent::gate_phase_failed(run_id, 4, "criterion-compile"))?;
+/// # store.record_sandbox_event(&SandboxEvent::destroy(run_id, 4))?;
+/// let events = store.sandbox_events(run_id)?;
+///
+/// // Which backend actually isolated the run. The crate picks a native one per
+/// // platform and falls back to a portable floor, so "was this really contained"
+/// // is a question about this field and not about the configuration.
+/// let backend = events.iter().find_map(|e| e.backend.as_deref());
+/// assert_eq!(backend, Some("macos-sandbox-exec"));
+///
+/// // And the phase to look for when a run that used to pass stops passing:
+/// // `criterion-compile` means the criterion no longer compiles *against* the
+/// // subject, which before 0.8.1 could be reported as a pass.
+/// let phases: Vec<&str> = events
+///     .iter()
+///     .filter(|e| e.kind == "gate_phase_failed")
+///     .filter_map(|e| e.detail.as_deref())
+///     .collect();
+/// assert_eq!(phases, ["criterion-compile"]);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxEvent {
     /// The run this execution belongs to.
@@ -511,6 +866,39 @@ impl SandboxEvent {
 /// The `net` half of a run's egress history lives in [`PolicyEvent`] — an MCP
 /// server's host is checked by the same policy as any other outbound call — so
 /// this table is about the MCP conversation itself, not about permission.
+///
+/// ```
+/// use io_harness::{McpEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("summarise the repo", "NOTES.md")?;
+/// # store.record_mcp(run_id, &McpEvent::connected("files", "stdio").with_millis(42))?;
+/// # store.record_mcp(run_id, &McpEvent::discovered("files", "mcp__files__read"))?;
+/// # store.record_mcp(run_id, &McpEvent::discovered("files", "mcp__files__list"))?;
+/// # store.record_mcp(run_id, &McpEvent::called("files", "mcp__files__read", true).at_step(2).with_millis(31))?;
+/// # store.record_mcp(run_id, &McpEvent::called("files", "mcp__files__read", false).at_step(3).with_millis(30_000).with_detail("timeout"))?;
+/// let events = store.mcp_events(run_id)?;
+///
+/// // What a server actually offered this run — the answer to "why did the model
+/// // not use the tool I configured", which is usually that it was never
+/// // discovered. Namespaced, so a server can never shadow `write_file`.
+/// let offered: Vec<&str> = events
+///     .iter()
+///     .filter(|e| e.kind == "discovered")
+///     .filter_map(|e| e.tool.as_deref())
+///     .collect();
+/// assert_eq!(offered, ["mcp__files__read", "mcp__files__list"]);
+///
+/// // And the call that went wrong, with how long it took before it did. Detail
+/// // carries a short note only — never arguments or results, which can carry
+/// // secrets.
+/// let failed = events.iter().find(|e| e.ok == Some(false)).expect("one failure");
+/// assert_eq!((failed.step, failed.millis), (3, Some(30_000)));
+/// assert_eq!(failed.detail.as_deref(), Some("timeout"));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpEvent {
     /// The step it occurred on. `0` for connect/discover, which happen before
@@ -593,6 +981,30 @@ impl McpEvent {
 
 /// One durable memory entry: a fact or decision an agent wrote deliberately,
 /// keyed to a workspace rather than to a run.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let first = store.start_run("make the tests pass", "src/lib.rs")?;
+///
+/// // What an agent learned the expensive way, written once so the next run over
+/// // this workspace does not spend three steps rediscovering it.
+/// store.memory_put("/repo", "test-command", "cargo test --features documents", first, 6)?;
+///
+/// // A later run — a different process, days afterwards — recalls it by key.
+/// let entry = store.memory_get("/repo", "test-command")?.expect("written above");
+/// assert_eq!(entry.value, "cargo test --features documents");
+/// // Attributed, which is what makes a stale fact traceable: this came from run
+/// // 1, step 6, and you can go and read what that step actually did.
+/// assert_eq!((entry.run_id, entry.step), (first, 6));
+///
+/// // Keyed to the workspace, never to the run: another workspace sees nothing.
+/// assert!(store.memory_get("/other-repo", "test-command")?.is_none());
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub struct MemoryEntry {
     /// The name it is recalled by, unique within its workspace.
@@ -608,12 +1020,79 @@ pub struct MemoryEntry {
 }
 
 /// Most entries one workspace may hold.
+///
+/// A write past the cap is not refused — the oldest entry is evicted to make
+/// room, and the evicted keys come back so the caller can record the loss in the
+/// trace rather than discovering it later as a fact that quietly stopped existing.
+///
+/// ```
+/// use io_harness::{Store, MEMORY_MAX_ENTRIES};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// for i in 0..MEMORY_MAX_ENTRIES {
+///     let evicted = store.memory_put("/repo", &format!("fact-{i}"), "small", 1, 1)?;
+///     assert!(evicted.is_empty(), "everything fits until the cap");
+/// }
+///
+/// // One more. The oldest goes, oldest first, and is named.
+/// let evicted = store.memory_put("/repo", "fact-new", "small", 1, 2)?;
+/// assert_eq!(evicted, ["fact-0"]);
+/// assert_eq!(store.memory_list("/repo")?.len(), MEMORY_MAX_ENTRIES);
+/// assert!(store.memory_get("/repo", "fact-0")?.is_none());
+/// # Ok(())
+/// # }
+/// ```
 pub const MEMORY_MAX_ENTRIES: usize = 64;
+
 /// Most characters one workspace's entries may total.
+///
+/// The second of the two caps, and the one that actually binds: sixty-four
+/// entries of a paragraph each is a context section nobody budgeted for, so the
+/// character total evicts even when the entry count is nowhere near its limit.
+///
+/// ```
+/// use io_harness::{Store, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let long_note = "x".repeat(MEMORY_MAX_ENTRY_CHARS);
+///
+/// // Eight full-size notes fill the workspace exactly — well inside the entry
+/// // count, and exactly on the character ceiling.
+/// for i in 0..8 {
+///     assert!(store.memory_put("/repo", &format!("note-{i}"), &long_note, 1, 1)?.is_empty());
+/// }
+/// assert!(8 < MEMORY_MAX_ENTRIES);
+/// assert_eq!(long_note.chars().count() * 8, MEMORY_MAX_CHARS);
+///
+/// // The ninth evicts, on characters rather than on count.
+/// assert_eq!(store.memory_put("/repo", "note-8", &long_note, 1, 2)?, ["note-0"]);
+/// # Ok(())
+/// # }
+/// ```
 pub const MEMORY_MAX_CHARS: usize = 16_000;
 
 /// Most characters one entry may hold. A longer value is cut down to this and
 /// marked, never refused — a too-long fact is still worth remembering.
+///
+/// ```
+/// use io_harness::{Store, MEMORY_MAX_ENTRY_CHARS};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let rambling = "y".repeat(MEMORY_MAX_ENTRY_CHARS * 3);
+/// store.memory_put("/repo", "build-notes", &rambling, 1, 4)?;
+///
+/// // Cut to the ceiling and *marked*, so a later reader can see the value is a
+/// // fragment. A silent truncation reads like a complete fact that happens to
+/// // end mid-sentence.
+/// let stored = store.memory_get("/repo", "build-notes")?.expect("written above");
+/// assert_eq!(stored.value.chars().count(), MEMORY_MAX_ENTRY_CHARS);
+/// assert!(stored.value.ends_with("[truncated]"));
+/// # Ok(())
+/// # }
+/// ```
 pub const MEMORY_MAX_ENTRY_CHARS: usize = MEMORY_MAX_CHARS / 8;
 
 /// The visible marker appended to a value that was cut to the per-entry ceiling.
@@ -641,6 +1120,36 @@ fn truncate_memory_value(value: &str) -> String {
 /// they answer "why did the model not see the thing it read at step 3", and
 /// `est_tokens` beside `reported_tokens` is what records the estimator's drift
 /// from the provider's own count (see [`crate::context::estimate_tokens`]).
+///
+/// ```
+/// use io_harness::{ContextEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("summarise the repo", "NOTES.md")?;
+/// # store.record_context_event(run_id, &ContextEvent::assembled(3, "carried=3 stubbed=5 reread=1", 4_100))?;
+/// # store.record_context_reported(run_id, 3, 4_690)?;
+/// # store.record_context_event(run_id, &ContextEvent::reread_refused(3, "secrets/id_rsa: denied by policy"))?;
+/// let events = store.context_events(run_id)?;
+///
+/// // Why the model did not see something it read earlier: five observations were
+/// // stubbed to fit the budget, and one stale read could not be refreshed at all
+/// // because the policy now refuses that path.
+/// let refused: Vec<&str> = events
+///     .iter()
+///     .filter(|e| e.kind == "reread_refused")
+///     .filter_map(|e| e.detail.as_deref())
+///     .collect();
+/// assert_eq!(refused, ["secrets/id_rsa: denied by policy"]);
+///
+/// // And the pair that makes the budget trustworthy: what the assembler
+/// // estimated, beside what the provider actually charged for the same turn.
+/// // Drift here is the estimator being wrong, not the budget being generous.
+/// let assembled = events.iter().find(|e| e.kind == "assembled").expect("one per turn");
+/// assert_eq!((assembled.est_tokens, assembled.reported_tokens), (Some(4_100), Some(4_690)));
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextEvent {
     /// The step it belongs to.
@@ -749,6 +1258,25 @@ impl ContextEvent {
 /// every store opened from a file. Without it rusqlite's default is to fail
 /// immediately with `SQLITE_BUSY`, which turns a moment of contention into an
 /// error rather than a short wait.
+///
+/// ```no_run
+/// use io_harness::{Store, BUSY_TIMEOUT};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// // A dashboard tailing a run another process is still writing. `Store::open`
+/// // sets WAL and this timeout, so this read waits for the writer instead of
+/// // failing — which is why watching a live run needs no coordination with it.
+/// let store = Store::open("runs.sqlite3")?;
+/// let run_id = store.last_run()?.expect("at least one run in the store");
+/// println!("step {} so far", store.last_step(run_id)?);
+///
+/// // The value is public because it is the bound on how long such a read can
+/// // block: a poller on a shorter interval than this can queue up behind a busy
+/// // writer, and it should size its own deadline knowing that.
+/// assert!(BUSY_TIMEOUT >= std::time::Duration::from_secs(1));
+/// # Ok(())
+/// # }
+/// ```
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl Store {

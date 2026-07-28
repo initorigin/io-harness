@@ -196,6 +196,52 @@ pub fn estimate_tokens(text: &str) -> u64 {
 }
 
 /// How much of a request the observation log may occupy.
+///
+/// The half of budgeting that [`TaskContract::with_token_budget`] is not:
+/// that bounds what a whole run may spend, this bounds what any *one* request
+/// carries of what the run has already observed. Without it a long workspace
+/// run re-sends its entire history every turn and the cost of turn *n* grows
+/// with *n*.
+///
+/// ```
+/// use io_harness::ContextBudget;
+///
+/// let budget = ContextBudget::default();
+/// assert_eq!(budget.max_tokens, 24_000);
+/// assert_eq!(budget.share, 0.5);
+///
+/// // With no run token budget, the ceiling is `max_tokens` flat.
+/// assert_eq!(budget.effective_tokens(None), 24_000);
+///
+/// // With one, the prompt takes `share` of what is *left* — so a run running
+/// // low stops spending what remains on re-sending history and leaves it for
+/// // doing the work.
+/// assert_eq!(budget.effective_tokens(Some(100_000)), 24_000); // capped by max_tokens
+/// assert_eq!(budget.effective_tokens(Some(20_000)), 10_000);  // half of the remainder
+/// assert_eq!(budget.effective_tokens(Some(1_000)), 2_000);    // floored, never zero
+/// ```
+///
+/// That last line is the floor: a prompt too small to carry one observation is
+/// a turn the agent cannot act on, so the final turns still get a usable
+/// request even when it exceeds what is nominally left.
+///
+/// Tighten it for a model with a small window, or for a run whose observations
+/// are large:
+///
+/// ```
+/// use io_harness::{ContextBudget, TaskContract, Verification};
+///
+/// let contract = TaskContract::workspace(
+///     "make the failing test pass",
+///     "/path/to/repo",
+///     Verification::WorkspaceFileContains { file: "OK".into(), needle: "ok".into() },
+/// )
+/// .with_token_budget(200_000)
+/// .with_context_budget(ContextBudget { max_tokens: 8_000, share: 0.25 });
+/// # let _ = contract;
+/// ```
+///
+/// [`TaskContract::with_token_budget`]: crate::TaskContract::with_token_budget
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ContextBudget {
     /// Absolute per-request ceiling for the assembled prompt.
@@ -223,7 +269,7 @@ impl ContextBudget {
     /// With no run token budget it is [`max_tokens`](ContextBudget::max_tokens)
     /// flat. With one, it is the configured `share` of what is *left*, so a run
     /// running out of budget spends less of it on re-sent history — floored at
-    /// [`BUDGET_FLOOR`] so the last turns still send a usable prompt, and never
+    /// `2000` tokens so the last turns still send a usable prompt, and never
     /// above `max_tokens`.
     pub fn effective_tokens(&self, remaining_budget: Option<u64>) -> u64 {
         match remaining_budget {

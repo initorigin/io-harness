@@ -9,6 +9,32 @@ use std::time::Duration;
 /// a DNS failure differed only in prose, so nothing above the provider could
 /// branch on them. This enum is that branch, and [`ProviderErrorKind::is_retryable`]
 /// is the decision the rest of the crate reads.
+///
+/// A caller branches on the kind rather than on the message, because the message
+/// wording is explicitly *not* part of the public contract and the kind is:
+///
+/// ```
+/// use io_harness::{Error, ProviderErrorKind};
+/// use std::time::Duration;
+///
+/// # fn next_move(failure: &Error) -> (&'static str, Option<Duration>) {
+/// // What a run that exhausted its retries hands back. The three answers a
+/// // caller actually has are "wait this long", "try again now", and "stop".
+/// match failure {
+///     // The only kind that carries *when*. Honour the server's own number
+///     // rather than backing off blind, then resume under the original run id.
+///     Error::Provider { kind: ProviderErrorKind::RateLimited, retry_after, .. } => {
+///         ("wait, then resume", Some(retry_after.unwrap_or(Duration::from_secs(30))))
+///     }
+///     // Auth and Request are terminal: the key will not become valid, and the
+///     // server has already read this exact request and refused it. Retrying
+///     // burns the budget to reach the same failure and hides it behind a later one.
+///     Error::Provider { kind, .. } if !kind.is_retryable() => ("stop and page a human", None),
+///     Error::Provider { .. } => ("resume; another attempt can succeed", None),
+///     _ => ("not a provider failure", None),
+/// }
+/// # }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderErrorKind {
     /// The request never completed: connection refused, DNS failure, TLS failure,
@@ -81,6 +107,44 @@ impl ProviderErrorKind {
 }
 
 /// Errors io-harness can return from a run.
+///
+/// The variants are separate because the *response* to each is separate — a
+/// refusal is not a malfunction, a bad checkpoint is not a bad key, and only one
+/// arm here is ever worth retrying. This is the match a caller writes around an
+/// entry point:
+///
+/// ```
+/// use io_harness::Error;
+///
+/// # fn handle(failure: Error) -> String {
+/// match failure {
+///     // The policy said no. Nothing happened and nothing is broken: either
+///     // widen the rule that refused it, or accept the refusal. The rule and
+///     // layer are carried so the operator knows which line of config to edit.
+///     Error::Refused { act, target, rule, layer } => format!(
+///         "{act} {target} refused by {} in layer {}",
+///         rule.unwrap_or_else(|| "the tier default".into()),
+///         layer.unwrap_or_else(|| "-".into()),
+///     ),
+///     // The checkpoint could not be honoured — newer format, missing run, or a
+///     // run started under a policy this resume would have silently dropped.
+///     // Never retried in a loop: re-resume the way the message names.
+///     Error::Resume { reason } => format!("resume refused: {reason}"),
+///     // Operator error, raised before the provider is called once. Fail the
+///     // job; a second attempt reaches the same missing key or duplicate tool.
+///     Error::Config(message) => format!("fix the configuration: {message}"),
+///     // The tool server never came up. The run fails rather than quietly
+///     // proceeding without a capability it was told it had.
+///     Error::Mcp { server, reason } => format!("server {server} did not start: {reason}"),
+///     // The gate never ran the code, as opposed to running it and failing it.
+///     Error::Sandbox { reason } => format!("verification never executed: {reason}"),
+///     // The one arm where another attempt is a real option — and only for some
+///     // kinds; see `ProviderErrorKind::is_retryable`.
+///     Error::Provider { kind, message, .. } if kind.is_retryable() => format!("retry: {message}"),
+///     other => other.to_string(),
+/// }
+/// # }
+/// ```
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     /// A filesystem tool operation failed.
@@ -224,6 +288,30 @@ impl From<reqwest::Error> for Error {
 }
 
 /// Crate result alias.
+///
+/// Every fallible call in the crate returns this, so an embedding function that
+/// adopts it gets `?` across all of them with no error mapping in between —
+/// opening the store, building a provider from the environment, and driving the
+/// run are three different failure sources and one type:
+///
+/// ```no_run
+/// use io_harness::{run_with, ApproveAll, OpenRouter, Policy, Result, Store,
+///                  TaskContract, Verification};
+///
+/// // `Result<RunOutcome>` is `std::result::Result<RunOutcome, io_harness::Error>`.
+/// # async fn build_notes(repo: &str) -> Result<io_harness::RunOutcome> {
+/// let store = Store::open("runs.db")?;          // rusqlite failure -> Error::State
+/// let provider = OpenRouter::from_env()?;       // missing key   -> Error::Config
+/// let contract = TaskContract::workspace(
+///     "summarise the README into NOTES.md",
+///     repo,
+///     Verification::WorkspaceFileContains { file: "NOTES.md".into(), needle: "#".into() },
+/// );
+/// let policy = Policy::default().layer("app").allow_write("NOTES.md");
+/// let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+/// Ok(result.outcome)
+/// # }
+/// ```
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]

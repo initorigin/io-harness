@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2021"
 # rmcp 2.2.0 sets the real floor: it uses let-chains, stabilised in 1.88, and
 # publishes no rust-version of its own — so cargo cannot catch it at resolve time
@@ -10,13 +10,35 @@ edition = "2021"
 rust-version = "1.88"
 authors = ["Aakash Pawar"]
 license = "Apache-2.0"
-description = "A Rust agent harness: run an AI agent from a typed task contract to a verified result. Provider-agnostic (OpenRouter, Anthropic, OpenAI) with fallback between them, multi-file edits with grep/find over a workspace, budgets, classified provider failures with kind-aware retry and backoff, stall detection with a bounded replan, full trace, resumable runs, execution-based verification, a layered permission policy with a human-approval gate, contained sub-agent composition, an OS-native/OS-neutral sandbox (macOS sandbox-exec, Linux namespaces, portable floor; Windows wall-clock only) isolating model-produced code per run, durable checkpoint/resume for unattended runs, an MCP client (stdio and streamable HTTP), a deny-by-default network egress policy, budget-aware context assembly that compacts superseded observations and re-reads what a later write invalidated, and durable cross-run memory keyed to the workspace. Embeddable in-process."
+# One sentence a human reads. This field was a comma-separated inventory of
+# every release, which reached 1041 characters at 0.11.0 and was refused by
+# crates.io against its 1000-character cap. The inventory belongs in the README
+# and the guide pages, which is where 0.16.0 put it.
+description = "Run an AI agent from a typed task contract to a verified result: provider-agnostic and embeddable in-process, with a layered permission boundary, execution-based verification inside a sandbox, durable resume for unattended runs, contained sub-agents, an MCP client, and a full SQLite trace."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
 keywords = ["agent", "ai", "llm", "mcp", "harness"]
 categories = ["asynchronous", "api-bindings"]
 # Ship only crate consumers' files; keep internal planning/CI out of the package.
+# docs/ is deliberately NOT excluded: the crate root and the README link the
+# guide pages, and a package that ships the links without the pages is worse
+# than one that ships neither.
 exclude = [".ultraship/", ".github/"]
+
+# docs.rs is the page this crate is mostly read on, and the default build hides
+# the documents and media surface entirely. Build it with everything on, and set
+# the `docsrs` cfg so the crate root can turn on feature labelling — without it a
+# reader sees an item and no indication that it needs a feature to exist.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+# `docsrs` is set by docs.rs and by nothing else, so declare it rather than let
+# rustc warn about an unexpected cfg on every build. This release requires a
+# warning-free `cargo doc`, and a warning introduced to remove a warning would
+# be a poor trade.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }

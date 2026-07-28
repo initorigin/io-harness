@@ -13,6 +13,51 @@ use crate::verify::Verification;
 /// adds the time and cost (token) budgets and the retry limit; a 0.1.0 caller
 /// that only set `goal`, `file`, `verify`, and `max_steps` still compiles —
 /// the new bounds default to unbounded / two retries.
+///
+/// Every entry point in the crate takes one of these, so it is where a run's
+/// definition of done and its ceilings are decided — before the model is asked
+/// anything, and independently of which provider will serve it:
+///
+/// ```
+/// use io_harness::{TaskContract, Verification};
+/// use std::time::Duration;
+///
+/// let contract = TaskContract::workspace(
+///     "make `parse` return an error on empty input instead of panicking",
+///     "/path/to/repo",
+///     // The criterion is checked by compiling and running, so a plausible-looking
+///     // stub cannot satisfy it. This is the half of the contract that decides
+///     // whether the run *succeeded*, as opposed to merely stopping.
+///     Verification::WorkspaceTestPasses {
+///         files: vec!["src/parse.rs".into()],
+///         test_src: "#[test] fn empty_is_err() { assert!(parse(\"\").is_err()); }".into(),
+///     },
+/// )
+/// // And this is the half that decides when it stops regardless. All three are
+/// // independent stops with their own `RunOutcome`, so a run that ran out of
+/// // money is distinguishable afterwards from one that ran out of ideas.
+/// .with_max_steps(20)
+/// .with_time_budget(Duration::from_secs(900))
+/// .with_token_budget(200_000)
+/// // Surfaced to the model verbatim. A constraint is guidance, not a boundary —
+/// // what the agent may actually touch is the `Policy`'s job, because the model
+/// // can ignore a sentence and cannot ignore a refusal.
+/// .with_constraint("do not change the public signature of `parse`");
+///
+/// assert_eq!(contract.max_steps, 20);
+/// assert!(contract.root.is_some()); // workspace mode: grep, find, read, write
+/// ```
+///
+/// [`TaskContract::new`] is the other constructor: one file, one tool, and no
+/// policy enforcement — a policy passed to a single-file run is refused with
+/// [`Error::Config`](crate::Error::Config) rather than silently ignored. Reach
+/// for [`TaskContract::workspace`] for anything with a boundary.
+///
+/// The `with_*` builders that add *capability* rather than bounds —
+/// [`with_mcp`](TaskContract::with_mcp), [`with_tools`](TaskContract::with_tools),
+/// [`with_skills`](TaskContract::with_skills) — are workspace-mode only and are
+/// validated at run start, so a duplicate tool name or an unreadable skills
+/// directory fails the run before the first completion is billed.
 #[derive(Debug, Clone)]
 pub struct TaskContract {
     /// Plain-language goal, e.g. "add a `hello` function that returns 42".
@@ -175,19 +220,6 @@ impl TaskContract {
         self
     }
 
-    /// Register in-process tools for the run and offer them to the model.
-    ///
-    /// Registration makes a tool available; it does not authorize it. Each call
-    /// is an [`Act::Exec`](crate::Act::Exec) check on the tool's name, and a
-    /// registered tool runs with the embedding program's own privileges — see
-    /// [`crate::tools::Tool`] for the full bound.
-    ///
-    /// A name that shadows a built-in, uses the `mcp__` prefix, or duplicates
-    /// another registered tool fails the run with [`Error::Config`](crate::Error::Config)
-    /// before the first completion.
-    ///
-    /// Workspace mode only, like [`TaskContract::with_mcp`]: single-file mode has
-    /// one tool and no tool layer to extend.
     /// Hand the agent images to look at, alongside the goal.
     ///
     /// A new named method rather than a parameter on any of the sixteen entry
@@ -225,6 +257,19 @@ impl TaskContract {
         self
     }
 
+    /// Register in-process tools for the run and offer them to the model.
+    ///
+    /// Registration makes a tool available; it does not authorize it. Each call
+    /// is an [`Act::Exec`](crate::Act::Exec) check on the tool's name, and a
+    /// registered tool runs with the embedding program's own privileges — see
+    /// [`crate::tools::Tool`] for the full bound.
+    ///
+    /// A name that shadows a built-in, uses the `mcp__` prefix, or duplicates
+    /// another registered tool fails the run with [`Error::Config`](crate::Error::Config)
+    /// before the first completion.
+    ///
+    /// Workspace mode only, like [`TaskContract::with_mcp`]: single-file mode has
+    /// one tool and no tool layer to extend.
     pub fn with_tools(mut self, tools: crate::tools::Toolbox) -> Self {
         self.tools = tools;
         self

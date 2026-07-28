@@ -103,6 +103,29 @@ where
 }
 
 /// A tool the model may call, described in a vendor-neutral shape.
+///
+/// ```
+/// use io_harness::ToolSpec;
+///
+/// // One description, whichever provider runs: the crate translates this into
+/// // Anthropic's `input_schema` or OpenAI's `function.parameters` at the wire
+/// // boundary, so a tool is not re-described per vendor.
+/// let spec = ToolSpec {
+///     name: "lookup_order".into(),
+///     // The model reads this to decide whether to call it, so it is a sentence
+///     // about when to use the tool, not a restatement of the name.
+///     description: "Look up an order by its id. Use when the user names an order.".into(),
+///     parameters: serde_json::json!({
+///         "type": "object",
+///         "properties": { "order_id": { "type": "string" } },
+///         "required": ["order_id"]
+///     }),
+/// };
+///
+/// // The arguments a model then sends arrive shaped by this schema — see
+/// // `Tool::invoke`, which receives them as a `serde_json::Value`.
+/// assert_eq!(spec.parameters["required"][0], "order_id");
+/// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolSpec {
     /// Tool name the model calls.
@@ -126,6 +149,31 @@ pub struct ToolSpec {
 /// OpenAI Chat Completions API accept no video at all, and OpenRouter, the only
 /// one of the three with a `video_url` part, states support varies by model and
 /// offers no way to ask which. Audio is likewise absent.
+///
+/// ```
+/// use io_harness::Media;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// // In a real caller these bytes come from `std::fs::read`; the type is inferred
+/// // from the path rather than trusted from a client, so an `.exe` renamed to
+/// // `.png` is still refused by the vendor and never by a guess made here.
+/// let bytes = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+/// let media_type = Media::media_type_for("screenshot.png").expect("an image extension");
+/// let image = Media::image(media_type, &bytes)?;
+///
+/// // Attach it to a request, or record what was sent: `byte_len` is the decoded
+/// // size the request-wide bound is counted in, and `digest` answers "is this the
+/// // same image as last step" in the trace.
+/// assert_eq!(image.byte_len(), bytes.len());
+/// assert_eq!(image.digest().len(), 16);
+///
+/// // A type outside the set every provider documents is refused here, rather than
+/// // costing a step and coming back as an HTTP 400 that reads like a transport
+/// // failure.
+/// assert!(Media::image("image/tiff", &bytes).is_err());
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(feature = "media")]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Media {
@@ -140,6 +188,28 @@ pub struct Media {
 /// The image media types all three providers document accepting. A type outside
 /// this set is refused at construction rather than sent for a vendor to reject
 /// with a 400 that costs a step and reads like a transport failure.
+///
+/// ```
+/// use io_harness::{Media, IMAGE_MEDIA_TYPES};
+///
+/// // Screen an upload before it reaches a run, so the user is told at the point
+/// // they can fix it rather than one step and one billed request later.
+/// fn accept(upload_type: &str) -> Result<(), String> {
+///     if IMAGE_MEDIA_TYPES.contains(&upload_type) {
+///         return Ok(());
+///     }
+///     Err(format!("{upload_type} is not one of {}", IMAGE_MEDIA_TYPES.join(", ")))
+/// }
+///
+/// assert!(accept("image/png").is_ok());
+/// assert!(accept("image/tiff").is_err());
+///
+/// // The set is the same one `Media::image` enforces — reading it is how a caller
+/// // agrees with the constructor instead of maintaining a second list.
+/// for media_type in IMAGE_MEDIA_TYPES {
+///     assert!(Media::image(media_type, b"not really an image").is_ok());
+/// }
+/// ```
 #[cfg(feature = "media")]
 pub const IMAGE_MEDIA_TYPES: [&str; 4] = ["image/jpeg", "image/png", "image/gif", "image/webp"];
 
@@ -240,6 +310,35 @@ impl Media {
 /// Construct with `..Default::default()` for forward compatibility — fields are
 /// added in minor releases (`media` in 0.15.0). An exhaustive struct literal
 /// will not survive the next one.
+///
+/// ```no_run
+/// use io_harness::{CompletionRequest, OpenRouter, Provider, ToolSpec};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let request = CompletionRequest {
+///     system: "You answer with one sentence.".into(),
+///     user: "Which crate builds the workspace?".into(),
+///     // Offering a tool here is what allows the model to reply with a
+///     // `ToolCall` instead of text; an empty `tools` guarantees prose.
+///     tools: vec![ToolSpec {
+///         name: "grep".into(),
+///         description: "Search the workspace for a pattern.".into(),
+///         parameters: serde_json::json!({
+///             "type": "object",
+///             "properties": { "pattern": { "type": "string" } },
+///             "required": ["pattern"]
+///         }),
+///     }],
+///     // Never an exhaustive literal: `media` appeared in 0.15.0 and the next
+///     // field will appear the same way, in a minor.
+///     ..Default::default()
+/// };
+///
+/// let response = OpenRouter::from_env()?.complete(request).await?;
+/// # let _ = response;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionRequest {
     /// System instructions.
@@ -286,6 +385,25 @@ pub(crate) fn ensure_media_accepted(
 }
 
 /// A tool call the model decided to make.
+///
+/// ```
+/// use io_harness::ToolCall;
+///
+/// // What a `Tool` implementation is handed, and what the run loop dispatches on.
+/// let call = ToolCall {
+///     name: "write_file".into(),
+///     arguments: serde_json::json!({ "path": "NOTES.md", "content": "# Notes" }),
+/// };
+///
+/// // `arguments` is whatever the model produced, not something the crate
+/// // validated: read it defensively. A missing field is a tool result the model
+/// // can correct, where an unwrap would be a panic that ends the run.
+/// let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) else {
+///     panic!("reply with an error string here, do not unwrap in a real tool");
+/// };
+/// assert_eq!(path, "NOTES.md");
+/// assert_eq!(call.arguments.get("mode").and_then(|v| v.as_str()), None);
+/// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     /// Tool name.
@@ -296,6 +414,23 @@ pub struct ToolCall {
 
 /// Token usage for one completion, in a vendor-neutral shape. Used to enforce
 /// the cost budget and to record spend in the trace.
+///
+/// ```
+/// use io_harness::{Containment, Draw, Ledger, Usage};
+///
+/// let ledger = Ledger::new(&Containment::new(4, 2, 1, 10_000));
+/// let usage = Usage { prompt_tokens: 4_000, completion_tokens: 500, total_tokens: 4_500 };
+///
+/// // `total_tokens` is the figure the budget is enforced in: the provider's own
+/// // total, taken as reported rather than re-derived from the other two.
+/// assert_eq!(ledger.draw_tokens(usage.total_tokens), Draw::Ok);
+/// assert_eq!(ledger.remaining_tokens(), 5_500);
+///
+/// // A provider that reports nothing gives `None`, not a zero: an unknown cost
+/// // and a free step are different facts, and the loop treats them differently.
+/// let unknown: Option<Usage> = None;
+/// assert_eq!(unknown.map(|u| u.total_tokens), None);
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Usage {
     /// Tokens in the prompt.
@@ -310,6 +445,32 @@ pub struct Usage {
 ///
 /// Construct with `..Default::default()` for forward compatibility — fields are
 /// added in minor releases (e.g. `usage` in 0.2.0).
+///
+/// ```
+/// use io_harness::{CompletionResponse, ToolCall, Usage};
+///
+/// let response = CompletionResponse {
+///     tool_calls: vec![ToolCall {
+///         name: "write_file".into(),
+///         arguments: serde_json::json!({ "path": "NOTES.md" }),
+///     }],
+///     usage: Some(Usage { prompt_tokens: 1_200, completion_tokens: 80, total_tokens: 1_280 }),
+///     ..Default::default()
+/// };
+///
+/// // The branch a run loop takes: tool calls first, in the order the model made
+/// // them, and free text only when there are none. A model may return both, and
+/// // reading `text` first would drop the work it asked for.
+/// if let Some(call) = response.tool_calls.first() {
+///     assert_eq!(call.name, "write_file");
+/// } else {
+///     println!("the model answered instead of acting: {:?}", response.text);
+/// }
+///
+/// // Usage is what the step's budget draw is made from; `None` means the provider
+/// // said nothing, which is why the field is an `Option` rather than a zero.
+/// assert_eq!(response.usage.map(|u| u.total_tokens), Some(1_280));
+/// ```
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionResponse {
     /// Any free text the model returned.
@@ -326,6 +487,42 @@ pub struct CompletionResponse {
 /// their own to run the loop offline. Selecting a provider is just constructing
 /// a different implementer and handing it to [`crate::run`] — no vendor type
 /// appears in the task contract.
+///
+/// ```
+/// use io_harness::{CompletionRequest, CompletionResponse, Provider, Result, Usage};
+///
+/// // A provider that answers from a script: the whole run loop — tools, policy,
+/// // checkpoints, verification — driven with no key, no socket, and no spend.
+/// struct Scripted {
+///     replies: std::sync::Mutex<std::vec::IntoIter<CompletionResponse>>,
+/// }
+///
+/// impl Provider for Scripted {
+///     async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+///         Ok(self.replies.lock().unwrap().next().unwrap_or_default())
+///     }
+///
+///     // Recorded per step in the trace, so an audit says who answered.
+///     fn name(&self) -> &str {
+///         "scripted"
+///     }
+///
+///     // `endpoint` is left at its `None` default: this one opens no connection,
+///     // so the egress policy has nothing to authorize. A provider that does dial
+///     // must report its URL here, or it is reaching the network unchecked.
+/// }
+///
+/// let provider = Scripted {
+///     replies: std::sync::Mutex::new(vec![CompletionResponse {
+///         text: Some("done".into()),
+///         usage: Some(Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }),
+///         ..Default::default()
+///     }]
+///     .into_iter()),
+/// };
+/// assert_eq!(provider.name(), "scripted");
+/// assert_eq!(provider.endpoint(), None);
+/// ```
 pub trait Provider {
     /// Perform one completion.
     fn complete(

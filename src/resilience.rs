@@ -27,6 +27,35 @@ use std::time::Duration;
 /// an authentication failure or an unacceptable request is escalated on its first
 /// occurrence rather than re-sent, because sending the same bad request again is two
 /// failures instead of one.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use io_harness::{ProviderErrorKind, RetryPolicy};
+///
+/// let policy = RetryPolicy::default();
+///
+/// // The failure this exists for: a provider mid-deploy answering 503. Wait half
+/// // a second, then a second, then two — deterministic, so a run's behaviour is
+/// // reproducible rather than jittered.
+/// assert!(ProviderErrorKind::Server.is_retryable());
+/// assert_eq!(policy.wait(1, None), Duration::from_millis(500));
+/// assert_eq!(policy.wait(2, None), Duration::from_secs(1));
+/// // Growth stops at the ceiling, so a long unattended run is never parked.
+/// assert_eq!(policy.wait(30, None), policy.max);
+///
+/// // A rate limit that names its own wait wins outright, the ceiling included:
+/// // arguing with a server about its limit is how a client earns a longer ban.
+/// assert_eq!(policy.wait(1, Some(Duration::from_secs(90))), Duration::from_secs(90));
+///
+/// // And what is never waited on at all: a rejected key stays rejected, so it is
+/// // escalated on the first failure instead of being asked twice.
+/// assert!(!ProviderErrorKind::Auth.is_retryable());
+///
+/// // A slower schedule for a provider that rate-limits aggressively.
+/// let gentle = RetryPolicy { base: Duration::from_secs(2), max: Duration::from_secs(60) };
+/// assert_eq!(gentle.wait(3, None), Duration::from_secs(8));
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RetryPolicy {
     /// Wait before the first retry.
@@ -70,6 +99,26 @@ impl RetryPolicy {
 /// The 0.10.0 live evidence recorded the failure this exists for twice: the model
 /// re-read the same four files for sixteen consecutive turns and ended in
 /// `StepCapReached`, having spent its whole step budget proving it was stuck.
+///
+/// ```
+/// use io_harness::{Progress, Progressing, StallPolicy};
+///
+/// // Patient: five unproductive repeats before the nudge, and up to two nudges
+/// // before the run is ended. A longer window costs budget when an agent really
+/// // is stuck; a shorter one risks calling a slow exploration phase a stall.
+/// let patient = StallPolicy { window: 5, max_replans: 2 };
+///
+/// // The escape hatch, and the reason `window` is not a `NonZeroU32`: zero turns
+/// // stall detection off entirely and restores pre-0.11.0 behaviour exactly, for
+/// // a caller whose workload legitimately repeats itself.
+/// let off = StallPolicy { window: 0, max_replans: 0 };
+/// let mut progress = Progress::new();
+/// for _ in 0..50 {
+///     assert_eq!(progress.step(off, false, "read src/lib.rs"), Progressing::Fine);
+/// }
+/// assert_eq!(progress.replans(), 0);
+/// # let _ = patient;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StallPolicy {
     /// Consecutive steps that change nothing before the agent is told so.
@@ -95,6 +144,28 @@ impl Default for StallPolicy {
 }
 
 /// What to do about the step just taken.
+///
+/// ```
+/// use io_harness::{Progress, Progressing, StallPolicy};
+///
+/// let policy = StallPolicy::default();
+/// let mut progress = Progress::new();
+/// let mut ended = false;
+///
+/// // What a run loop does with the verdict: `Fine` carries on, `Replan` adds one
+/// // directive to the context and carries on, `Stalled` is terminal. Treating
+/// // `Replan` as terminal would end runs that were one nudge from working.
+/// for _ in 0..6 {
+///     match progress.step(policy, false, "read src/lib.rs") {
+///         Progressing::Fine => {}
+///         Progressing::Replan => {
+///             let _directive = progress.replan_directive(policy.window, &["read src/lib.rs".into()]);
+///         }
+///         Progressing::Stalled => ended = true,
+///     }
+/// }
+/// assert!(ended, "told once, still going in circles, so the run ends");
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Progressing {
     /// Nothing to do.
@@ -112,6 +183,30 @@ pub enum Progressing {
 /// phase changes nothing either, and a run that greps four different patterns is
 /// working, not stuck. What distinguished the recorded failure is that it was doing
 /// the same thing over and over while nothing moved.
+///
+/// ```
+/// use io_harness::{Progress, Progressing, StallPolicy};
+///
+/// let policy = StallPolicy::default(); // three steps, one nudge
+/// let mut progress = Progress::new();
+///
+/// // Opening a repository: four different reads that change nothing. This is what
+/// // working looks like at the start of a run, and flagging it would degrade
+/// // healthy runs in the name of resilience.
+/// for call in ["read src/lib.rs", "grep TODO", "find *.toml", "read Cargo.toml"] {
+///     assert_eq!(progress.step(policy, false, call), Progressing::Fine);
+/// }
+///
+/// // The recorded 0.10.0 failure instead: a call already made this window, made
+/// // again, with nothing written in between. Both halves now hold, so the agent
+/// // is told — thirteen steps before it would have hit its step cap.
+/// assert_eq!(progress.step(policy, false, "read src/lib.rs"), Progressing::Replan);
+///
+/// // A write that actually moved the workspace clears the window — an agent that
+/// // got somewhere may repeat itself on the way to getting somewhere else.
+/// assert_eq!(progress.step(policy, true, "write NOTES.md"), Progressing::Fine);
+/// assert_eq!(progress.replans(), 1);
+/// ```
 #[derive(Debug, Default, Clone)]
 pub struct Progress {
     /// Tool-call signatures seen since the last productive step.
