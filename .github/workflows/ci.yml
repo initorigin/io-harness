@@ -32,9 +32,18 @@ jobs:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     # A cap that never fires means a process that is never killed, so a hung
-    # test must not burn a six-hour default. 20 minutes is well above a cold
-    # Windows build plus the suite.
-    timeout-minutes: 20
+    # test must not burn a six-hour default.
+    #
+    # 20 minutes was NOT "well above" a cold Windows build plus the suite, as
+    # this comment used to claim. The 0.15.0 run on develop took 19m14s against
+    # it — a 46-second margin nobody had measured. 0.16.0 gave all 106 public
+    # items a worked example, and a doctest is its own rustc invocation and its
+    # own link, which on Windows is the slow part. That spent the margin, and
+    # the job was cancelled mid-suite with every test to that point passing.
+    #
+    # 40 minutes, with the measurement that justifies it written down so the
+    # next person to trim it knows what it was sized against.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
@@ -56,7 +65,14 @@ jobs:
       # formats — a zip entry name is `/`-separated on every platform, and the
       # text a reader hands back is compared against needles a test wrote — so a
       # Linux-only pass would not be evidence for the other two.
-      - run: cargo test --features documents
+      # `--lib --tests` rather than a bare `cargo test`: this leg exists to
+      # compile and exercise the document formats, and the documents API is not
+      # re-exported from the crate root, so it carries no doctests of its own.
+      # A bare `cargo test` here would re-run all 116 default-build doctests for
+      # the third time in one job and prove nothing the first leg did not. The
+      # media leg below keeps its doctests, because two public items are gated
+      # on that feature and their examples only compile with it on.
+      - run: cargo test --features documents --lib --tests
       # 0.15.0: `media` is its own optional feature, and the git built-ins are in
       # the default build but need the binary. Git is preinstalled on all three
       # runners — asserted rather than installed, because "no system package on
