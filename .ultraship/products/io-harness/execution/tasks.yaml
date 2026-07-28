@@ -10,7 +10,7 @@ tasks:
     page, and a promise with no mechanism is what the release exists to stop shipping. This is the
     mechanism. It is also the foundation for T02, which needs the same enumeration to ask a
     different question of each item, so building it twice is the alternative to building it first.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -22,7 +22,11 @@ tasks:
   - tests/public_api.rs
   - tests/support/surface.rs
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - >
+    tests/public_api.rs and docs/public-api.txt; 106 items enumerated, all resolved;
+    public_surface_matches_snapshot passes; controls cover a removal, a rename, an addition and an
+    unresolvable export (784258b)
 - id: US-IO-HARNESS-0.16.0-T02
   summary: The worked-example checker. Over T01's enumeration, assert every public item's
     documentation carries a fenced code block, failing with the list of items that do not. Its
@@ -33,7 +37,7 @@ tasks:
     is what converts it from a sentence into a build failure. It lands before the sweep so the sweep
     has a failing test to drive it, which is the ordering test-driven development asks for and also
     the only way to know the sweep is finished.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T01
   acceptance_criteria:
@@ -47,7 +51,11 @@ tasks:
   files:
   - tests/public_api.rs
   - tests/support/surface.rs
-  evidence: []
+  evidence:
+  - >
+    every_public_item_has_a_worked_example fails listing 105 of the 106 items, which is the work-
+    list T11 and T12 are driven by; the control reports a documented-but-exampleless fixture item
+    (784258b)
 - id: US-IO-HARNESS-0.16.0-T03
   summary: The drift checkers. The MSRV stated in the README, the crate root, and `CONTRACT.md` is
     asserted equal to `Cargo.toml`'s `rust-version`; the documented feature list is asserted equal to
@@ -57,7 +65,7 @@ tasks:
     list, and the links — and the link half becomes a live hazard the moment T05 splits one file into
     a dozen. Writing the checkers before the split means the split is verified as it happens rather
     than audited afterwards, when a dangling link reads like a deliberate omission.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -76,7 +84,10 @@ tasks:
   files:
   - tests/docs_drift.rs
   - tests/support/docs.rs
-  evidence: []
+  evidence:
+  - >
+    tests/docs_drift.rs, 10 tests; MSRV, feature-list in both directions, and relative-link
+    checkers, each with a negative-control fixture (2d44290)
 - id: US-IO-HARNESS-0.16.0-T04
   summary: The changelog break audit and its checker. Read 0.2.0 through 0.15.0 for changes that
     broke the public contract, mark each with an explicit token, write the migration note saying what
@@ -86,7 +97,7 @@ tasks:
     — the deprecation cycle helps whoever upgrades next, but the notes help everyone upgrading across
     the fifteen releases already shipped. The audit is also the task most likely to discover a break
     the contract did not anticipate, so it runs early enough that the discovery is still cheap.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -98,7 +109,17 @@ tasks:
   - CHANGELOG.md
   - docs/CHANGELOG_STRUCTURE.md
   - tests/changelog.rs
-  evidence: []
+  evidence:
+  - >
+    CHANGELOG.md: 49 breaking entries marked across 16 versions, each carrying a Migration note. The
+    audit ran against the git tags rather than the prose, because three releases claim in prose to
+    break nothing and do (0.5.0, 0.9.0, 0.14.0)
+  - >
+    tests/changelog.rs, 5 tests, fence-aware; the control reports a marked-and-unmigrated fixture
+    entry (92ca065)
+  - >
+    docs/CHANGELOG_STRUCTURE.md states the marker and the migration-note requirement so the next
+    release inherits the format
 - id: US-IO-HARNESS-0.16.0-T05
   summary: The README as a landing page. What the crate is, badges, the MSRV, a quickstart inside the
     first screen, and a capability list describing what the harness does today, ending in links to
@@ -108,7 +129,7 @@ tasks:
   why_required: This is the release's headline and the page a new reader lands on from crates.io. It
     is sequenced before the guide pages because the split is decided by what the landing page keeps —
     writing the guides first would mean guessing at the boundary and moving prose twice.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T03
   acceptance_criteria:
@@ -124,7 +145,13 @@ tasks:
   files:
   - README.md
   - tests/readme.rs
-  evidence: []
+  evidence:
+  - >
+    README.md rewritten as a landing page: quickstart inside the first screen, MSRV stated, no
+    version-named heading (503d676)
+  - >
+    tests/readme.rs, 8 tests; the controls use the real 0.15.0 headings, checked in as a fixture so
+    they survive a shallow clone
 - id: US-IO-HARNESS-0.16.0-T06
   summary: Guide pages, first group — the permission model and the approval flow, agent composition
     and containment, the execution sandbox, and durable unattended runs. Each is one page under
@@ -133,7 +160,7 @@ tasks:
   why_required: 'These four are the capabilities a reader most often needs in full and least often
     gets from a summary: they are the ones with real boundaries, and a boundary described loosely is
     worse than one not described at all. Without the pages the README rewrite is a deletion.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T05
   acceptance_criteria:
@@ -151,7 +178,10 @@ tasks:
   - docs/guide/composition.md
   - docs/guide/sandbox.md
   - docs/guide/durable-runs.md
-  evidence: []
+  evidence:
+  - >
+    docs/guide/permissions.md, composition.md, sandbox.md and durable-runs.md, 507 lines; the
+    Windows limits block carried across byte-for-byte (f00a100)
 - id: US-IO-HARNESS-0.16.0-T07
   summary: Guide pages, second group — MCP and network egress, in-process tools and skills, context
     assembly and durable memory, and resilience with provider fallback. Same shape and same treatment
@@ -160,7 +190,7 @@ tasks:
     honest boundaries live — what the policy governs once a stdio server or a registered tool is
     running, and what a context budget does not promise. They are disjoint files from T06 and run
     beside it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T05
   acceptance_criteria:
@@ -178,7 +208,10 @@ tasks:
   - docs/guide/tools-and-skills.md
   - docs/guide/context-and-memory.md
   - docs/guide/resilience.md
-  evidence: []
+  evidence:
+  - >
+    docs/guide/mcp-and-network.md, tools-and-skills.md, context-and-memory.md and resilience.md, 527
+    lines; four limits blocks survived, not the three expected (f00a100)
 - id: US-IO-HARNESS-0.16.0-T08
   summary: Guide pages, third group — verification and what a passing gate proves, observability and
     replay, documents, and images and git. The verification page is the one that has to state the
@@ -188,7 +221,7 @@ tasks:
     have never been documented for a reader at all — this group is the one that adds rather than
     moves. And the verification page carries the narrowest, most misread guarantee in the crate,
     which io-cli and io-studio have both inherited.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T05
   acceptance_criteria:
@@ -206,7 +239,11 @@ tasks:
   - docs/guide/observability.md
   - docs/guide/documents.md
   - docs/guide/images-and-git.md
-  evidence: []
+  evidence:
+  - >
+    docs/guide/verification.md, observability.md, documents.md and images-and-git.md, 971 lines;
+    observability.md was written from source because 0.12.0 and 0.13.0 were never documented for a
+    reader at all (50f17bc)
 - id: US-IO-HARNESS-0.16.0-T09
   summary: The "nothing was lost" checker and the guide index. A test carrying the explicit list of
     capabilities and of the limits blocks present at 0.15.0, asserting each has a page and each block
@@ -216,7 +253,7 @@ tasks:
     invisible — the result still reads well. The list has to be written down against the 0.15.0 file
     while that file is still the reference, and the check has to name the capabilities explicitly,
     because a checker that counts pages passes when the right number of wrong pages exists.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T06
   - US-IO-HARNESS-0.16.0-T07
@@ -230,7 +267,13 @@ tasks:
   files:
   - docs/CAPABILITIES.md
   - tests/docs_drift.rs
-  evidence: []
+  evidence:
+  - >
+    tests/guide_pages.rs, 7 tests, all passing; it catches a missing page, a dropped limits block, a
+    stub, and a page the test does not know about, with four controls
+  - >
+    docs/CAPABILITIES.md reworked as the guide index, and its stale claim that video passthrough is
+    a capability removed
 - id: US-IO-HARNESS-0.16.0-T10
   summary: The crate root restructured. What the harness is, one worked example, the capability
     surface as capabilities, the feature flags, the MSRV, and the platform support matrix, written
@@ -240,7 +283,7 @@ tasks:
     developer actually lands on — and it is the worse of the two, with v0.3 filed after v0.14 and
     v0.10 through v0.13 never mentioned. Fixing the README alone would leave the primary front door
     unchanged.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T05
   acceptance_criteria:
@@ -255,7 +298,11 @@ tasks:
     documentation of this shape rots, and rustdoc already detects it.
   files:
   - src/lib.rs
-  evidence: []
+  evidence:
+  - >
+    src/lib.rs crate root rewritten, 233 lines down to 209; crate_root_does_not_narrate_releases and
+    crate_root_has_no_version_named_heading both pass; cargo doc emits no warning from lib.rs
+    (d81ba88)
 - id: US-IO-HARNESS-0.16.0-T11
   summary: Worked examples, first partition — the core loop surface. `TaskContract`, the run and
     resume entry points, `RunResult` and `RunOutcome`, `Error` and `ProviderErrorKind`,
@@ -324,7 +371,7 @@ tasks:
     crate, and nothing else in the repository answers "what may change under me". It also gives the
     six carried limitations their in-scope destination: stated plainly in one place a consumer reads,
     rather than fixed in a release that has no business fixing them.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T01
   - US-IO-HARNESS-0.16.0-T04
@@ -340,7 +387,11 @@ tasks:
     forever after the first stale entry.
   files:
   - docs/CONTRACT.md
-  evidence: []
+  evidence:
+  - >
+    docs/CONTRACT.md rewritten: what is public and what is not, what pre-1.0 means here, the
+    deprecation cycle, the MSRV policy, the feature table, the platform matrix, and eleven limits
+    that hold today (e7de93e, 50f17bc)
 - id: US-IO-HARNESS-0.16.0-T14
   summary: '`resume_tree_from_stored_policy` and `resume_tree_from_stored_policy_observed` — the tree
     loop''s stored-policy resume, built on the template `resume_from_stored_policy` already provides
@@ -351,7 +402,7 @@ tasks:
     third cannot, which would have to be written down as a caveat in the guide page for durable runs.
     Fixing it is smaller than documenting it, and 0.15.0 made it sharper by letting the agent take
     irreversible commits under a policy.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -369,7 +420,13 @@ tasks:
   - src/run.rs
   - src/lib.rs
   - tests/checkpoint.rs
-  evidence: []
+  evidence:
+  - >
+    resume_tree_from_stored_policy and its observed twin added; no existing signature changed; a
+    tree with no stored policy is Error::Resume and never a permissive fallback (d8dfad5)
+  - >
+    tests/checkpoint.rs, 18 passed: F12 asserts the refusal and its rule and layer attribution, F13
+    covers both the permissive control and the no-stored-policy error
 - id: US-IO-HARNESS-0.16.0-T15
   summary: Publication surface and the gate. `[package.metadata.docs.rs]` with all features enabled
     and feature labels on the items they gate, the `Cargo.toml` description shortened to one sentence
