@@ -311,7 +311,7 @@ tasks:
   why_required: This partition is what a reader reaches for first and the items the guide pages link
     into, so an exampleless `Verification` variant is a dead end at the exact moment a reader is
     trying to start. It is the half of the sweep where the examples carry the most weight.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T02
   acceptance_criteria:
@@ -329,7 +329,15 @@ tasks:
   - src/verify.rs
   - src/policy.rs
   - src/approve.rs
-  evidence: []
+  evidence:
+  - >
+    43 items documented across contract.rs, run.rs, error.rs, verify.rs, policy.rs and approve.rs;
+    each shows the item doing its job rather than restating its signature (1988802)
+  - >
+    Two wrong doc comments fixed: Verification claimed the subject compiles as its own crate with
+    the criterion against it, which overstates the 0.8.1 boundary; and TaskContract::with_tools had
+    lost its doc block into with_images, so its authorization paragraphs rendered nowhere on a
+    default build
 - id: US-IO-HARNESS-0.16.0-T12
   summary: Worked examples, second partition — the surrounding surface. The provider types, the store
     and its row types, the tool trait and toolbox, sandbox, MCP, skills, observation, context,
@@ -339,7 +347,7 @@ tasks:
     run — `Store`'s row types are the audit surface 0.12.0 exported precisely so they could be named,
     and an exported type with no example is an export that only half happened. Disjoint files from
     T11, so the two partitions run beside each other.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T02
   acceptance_criteria:
@@ -361,7 +369,21 @@ tasks:
   - src/context.rs
   - src/containment.rs
   - src/resilience.rs
-  evidence: []
+  evidence:
+  - >
+    62 further items across provider, state, containment, resilience, net, sandbox, mcp, observe,
+    skills, context, custom and git; most run for real rather than no_run (c6809e4, 16be32f)
+  - >
+    All 106 items now carry an example: every_public_item_has_a_worked_example passes, cargo test
+    --doc 116 passed and 118 with --all-features
+  - >
+    Four more wrong doc comments fixed: seccomp claimed in three places and installed nowhere,
+    setrlimit claimed to cap processes, max_processes documented as enforced when no platform
+    enforces it, and a comment denying that a README.md in a skills directory is discovered as a
+    skill
+  - >
+    cargo doc --no-deps warning-free on both the default and --all-features builds, the eleven pre-
+    existing rustdoc warnings included
 - id: US-IO-HARNESS-0.16.0-T13
   summary: '`docs/CONTRACT.md` rewritten as the actual public contract: what is public and what is
     not, what pre-1.0 means here, the deprecation cycle and the snapshot that enforces it, the MSRV
@@ -438,7 +460,7 @@ tasks:
     chance to see it. The description is separately load-bearing: it is a comma-separated inventory
     of fifteen releases that already refused a publish at 1041 characters against the 1000-character
     cap.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.16.0-T09
   - US-IO-HARNESS-0.16.0-T10
@@ -458,4 +480,15 @@ tasks:
   files:
   - Cargo.toml
   - README.md
-  evidence: []
+  evidence:
+  - >
+    Cargo.toml: description cut from a 944-character inventory to one sentence,
+    [package.metadata.docs.rs] with all-features and doc_auto_cfg, docsrs declared in [lints.rust]
+    check-cfg, version 0.16.0; 17 files under docs/ present in cargo package --list
+  - >
+    Gate green: cargo test 203 lib plus every integration suite, cargo test --all-features 32
+    suites, cargo test --doc 116 and 118 with --all-features, cargo doc --no-deps 0 warnings on both
+    builds, clippy --all-targets clean, cargo fmt clean, cargo tree 401 lines
+  - >
+    CHANGELOG.md carries the 0.16.0 entry, written under the format T04 introduced and opening with
+    the fact that the release breaks nothing
