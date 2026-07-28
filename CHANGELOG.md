@@ -26,6 +26,32 @@ notes are produced from it.
 
 ### Security
 
+## [0.16.1] - 2026-07-28
+
+A documentation correction. **There are no breaking changes and no code
+change in this release** — no public item is added, renamed, or removed, no
+behaviour differs, and a 0.16.0 contract compiles and behaves identically.
+
+### Changed
+
+- **The "Part of initorigin" table now says which products exist and which you
+  can go and look at.** It listed five repositories as if a reader could open
+  any of them. Four are private, and two of those — `io-eval` and `website` —
+  have not been built at all, so the table was describing an intention in the
+  voice of a fact, on the last screen of a published crate's landing page.
+
+  It now lists the three products this crate is for — io-harness, io-cli,
+  io-studio — with a status column, and it links only io-harness, because that
+  is the only repository a reader can open. io-cli and io-studio are named
+  without links and marked as in development, which is both true and the reason
+  there is no link: a link to a private repository is a 404 dressed as a
+  promise. `io-eval` and `website` are removed rather than listed as unbuilt;
+  they remain on the product's own roadmap, which is where an intention belongs.
+
+  This is the one section 0.16.0 carried forward unchanged from the release-
+  history README it replaced, and the one claim on the page that none of that
+  release's five checkers looks at.
+
 ## [0.16.0] - 2026-07-28
 
 The documented public contract. A developer arriving cold can tell what the
