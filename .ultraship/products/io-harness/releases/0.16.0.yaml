@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.16.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -432,3 +432,145 @@ open_questions:
   Whether any item warrants an actual `#[deprecated]` in this release. Nothing currently needs
   renaming, and manufacturing a deprecation to exercise the cycle would be dishonest. The mechanism
   and the policy ship; the first real use is whenever the first real rename happens.
+released_at: 2026-07-28T06:40:00Z
+mode: published
+delivered: >
+  An external Rust developer arriving cold reaches a running example from the README's first
+  screen, and a developer already depending on the crate can read what is public, what pre-1.0
+  means here, and what does not work today, in one place.
+
+  Both front doors were release histories and are now landing pages. The README went from 1072
+  lines organised as "Usage (v0.4)" / "MCP and network egress (v0.8)", with its first code fence
+  on line 107 and a status paragraph two releases stale, to a landing page with the quickstart
+  inside the first screen. The crate root — the page docs.rs opens — went from 230 lines of
+  "v0.2 adds" with v0.3 filed after v0.14 and v0.10 through v0.13 absent, to 209 lines describing
+  what the crate does. Twelve guide pages under docs/ carry the depth, and every "the limits,
+  stated plainly" block travelled with its capability. Two of the twelve are new writing rather
+  than moved prose: observability and replay had never been documented for a reader at all.
+
+  All 106 public items re-exported from the crate root carry a worked example; before this release
+  one did. 49 breaking changes across 16 versions are marked in the changelog with a migration
+  note saying what to write instead. docs/CONTRACT.md states what is public, the deprecation
+  cycle, the MSRV policy, the feature table, the platform matrix, and eleven limits that hold.
+
+  Four checkers ship so the claims cannot quietly stop being true, each with a negative control
+  proving it can fail: the worked-example check, the public-surface snapshot that fails a rename
+  or a removal until the snapshot is edited by hand, the MSRV and feature-list drift assertions
+  against Cargo.toml, and the changelog migration-note check. A fifth asserts the README split
+  lost nothing.
+
+  One code change: resume_tree_from_stored_policy and its observed twin, closing the last
+  asymmetry between the three resume loops. No existing signature changed.
+evidence:
+  tests:
+  - >
+    cargo test — 32 suites ok, 0 failed (203 lib tests plus every integration suite). Full output
+    in evidence/0.16.0/tests-default.txt
+  - >
+    cargo test --all-features — 32 suites ok, 0 failed. Run before the record was written; the
+    document and media stacks compile and their suites pass
+  - >
+    cargo test --doc — 116 passed, 0 failed on the default build
+  - >
+    cargo test --doc --all-features — 118 passed, 0 failed. Every worked example on every public
+    item compiles and runs, including the two media-gated ones. Output in
+    evidence/0.16.0/doctests-all-features.txt
+  - >
+    cargo test --test public_api — 9 passed. every_public_item_has_a_worked_example green across
+    all 106 items; public_surface_matches_snapshot green; controls report a removal and a rename
+  - >
+    cargo test --test docs_drift — 10 passed. MSRV equals Cargo.toml's rust-version in README,
+    crate root and CONTRACT.md; the documented feature list equals the [features] keys in both
+    directions; no dangling relative link in README.md or any docs/ page
+  - >
+    cargo test --test changelog — 5 passed. Every entry marked breaking carries a migration note
+  - >
+    cargo test --test guide_pages — 7 passed. All twelve capabilities have a page, every limits
+    block survived, no page is orphaned from the index, and no page sits outside the check
+  - >
+    cargo test --test readme — 8 passed. The README states what the crate is, shows a runnable
+    fence and names the MSRV inside its first 60 lines; no heading in the README or the crate root
+    is named after a release; the crate root narrates no release history
+  - >
+    cargo test --test checkpoint — 18 passed, covering F12 and F13: a tree resumed through
+    resume_tree_from_stored_policy is still bounded by the policy it started under, with the
+    refusal attributed to the original rule and layer; the permissive control performs the write;
+    a tree with no stored policy is Error::Resume
+  builds:
+  - >
+    cargo build — exit 0
+  - >
+    cargo clippy --all-targets — exit 0, zero warnings. Output in evidence/0.16.0/clippy.txt
+  - >
+    cargo fmt --check — clean, exit 0. Output in evidence/0.16.0/fmt.txt
+  - >
+    cargo doc --no-deps — exit 0, zero warnings. Eleven pre-existing rustdoc warnings, including
+    five unresolved intra-doc links that resolved under --all-features and dangled in the default
+    build, were fixed in this release. Output in evidence/0.16.0/doc-default.txt
+  - >
+    cargo doc --no-deps --all-features — exit 0, zero warnings. Output in
+    evidence/0.16.0/doc-all-features.txt
+  - >
+    cargo tree — 401 lines, unchanged from 0.15.0. No dependency was added in any build, default
+    or featured. Full output in evidence/0.16.0/tree-full.txt
+  - >
+    cargo package --list — exit 0. 17 files under docs/ are in the package, so the guide pages the
+    crate root and README link are shipped rather than left on GitHub; README.md, CHANGELOG.md,
+    LICENSE and NOTICE present; zero .ultraship/ files, so the exclude holds
+  reviews:
+  - >
+    Scope audit against the contract: everything in scope.included is present, and everything in
+    scope.excluded is still absent. CHECKPOINT_FORMAT is still 7 and src/state.rs took insertions
+    only. git_status still uses --porcelain=v1 without -z. No Windows Job Object, no Pdfium, no
+    real-application document fixtures. The only occurrence of "video_url" in src/ is the doc
+    comment in src/provider/mod.rs explaining why video was cut
+  - >
+    Security gate: no secret is tracked. `.env` matches `*.env` in .gitignore, and `git ls-files`
+    matching env, secret or credential returns nothing
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  This record was sealed on feat/0.16.0 before the crates.io upload, which follows the
+  develop→main merge and the GitHub Release. `mode: published` states the authorised target; the
+  release flow makes it true.
+- >
+  A registered tool named after one of the git, image or document built-ins passes Toolbox
+  validation and is then permanently unreachable. RESERVED_TOOL_NAMES still lists only the
+  original seven, and dispatch tests every built-in arm before reaching the toolbox. Found while
+  auditing the README against the source. Documented in CONTRACT.md rather than fixed, because
+  extending the reserved set turns a currently-accepted registration into an Error::Config, which
+  belongs in a release that can carry a break.
+- >
+  `resume_tree` does not call record_run_policy, unlike run_tree and both flat loops, so a tree
+  resumed under a widened policy leaves an audit that understates what was permitted. The new
+  resume_tree_from_stored_policy is unaffected, since it reads that row back.
+- >
+  `SandboxLimits::max_processes` is enforced by nothing on any platform. The doc comments claiming
+  otherwise were corrected here; the field's behaviour was not changed.
+- >
+  No seccomp filter is installed on Linux. Three doc comments claimed one and were corrected. The
+  backend is namespaces and rlimits, and any syscall restriction is the kernel's own default under
+  an unprivileged user namespace.
+- >
+  The public-surface snapshot covers the 106 items re-exported from the crate root. Items reachable
+  only through a public module path — io_harness::context::assemble, io_harness::tools::Workspace,
+  the whole documents API — are public and are not individually snapshotted, so the deprecation
+  cycle's mechanism does not yet cover them. Stated in CONTRACT.md.
+- >
+  The worked-example check counts fenced blocks. It cannot distinguish a worked example from a
+  token one, so the quality of the 106 examples rests on review rather than on the checker.
+- >
+  Carried from earlier releases and documented rather than fixed: git_status uses --porcelain=v1
+  without -z, so a path containing a newline renders ambiguously to the model; commit idempotency
+  across a resume rests on git's own semantics rather than a durable marker; fill_form's output has
+  never been opened in a real PDF viewer, which needs Pdfium and therefore a system package; the
+  Windows Job Object is still unimplemented, so containment there is the portable floor and the CPU
+  and memory caps do not fire; pdf::read_text's catch_unwind is a no-op under a panic = "abort"
+  profile; and no binary document fixture was written by a real application.
+- >
+  The three-OS CI matrix had not run on this branch when the record was sealed. Every gate above
+  was run on macOS. Linux and Windows are proven by the matrix on the feat→develop pull request.
+supersedes: 0.15.0
+next_recommended_version: 0.17.0
+immutable: true

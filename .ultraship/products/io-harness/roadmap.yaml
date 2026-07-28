@@ -276,11 +276,11 @@ versions:
 
       Three things follow from taking that seriously rather than treating it as a writing task.
 
-      The crate root is documentation too, and it is the one an external developer actually lands
-      on — docs.rs opens on `src/lib.rs`, not the README. It carries the same defect in a worse
-      place: 230 lines of "v0.2 adds", "v0.4 adds", "v0.8 adds", with v0.3 arriving after v0.14 and
-      v0.10 through v0.13 absent entirely. It gets the same treatment as the README, from the same
-      source of truth, so the two cannot drift apart.
+      The crate root is documentation too, and it is the one an external developer actually lands on
+      — docs.rs opens on `src/lib.rs`, not the README. It carries the same defect in a worse place:
+      230 lines of "v0.2 adds", "v0.4 adds", "v0.8 adds", with v0.3 arriving after v0.14 and v0.10
+      through v0.13 absent entirely. It gets the same treatment as the README, from the same source
+      of truth, so the two cannot drift apart.
 
       "Every public item carries a worked example" is a claim that decays the moment it is made
       unless something checks it. The release ships the check: a test that enumerates the public
@@ -298,4 +298,4 @@ versions:
       whether a run can be resumed under the policy it was started with. It ships as a new named
       function, never an added parameter.
     detail: specified
-    status: planned
+    status: released
