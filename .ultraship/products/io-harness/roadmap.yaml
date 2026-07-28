@@ -299,3 +299,25 @@ versions:
       function, never an added parameter.
     detail: specified
     status: released
+  - version: 0.16.1
+    outcome: >
+      A reader who reaches the end of the README learns which initorigin products actually exist and
+      which they can go and look at, instead of being handed five repository links of which four are
+      private and two name products that have not been built. 0.16.0 made the README a landing page
+      and this is the one table it left as an aspiration rather than a fact: `io-eval` and `website`
+      are listed as if they were shipped things, and `io-cli` and `io-studio` are linked to
+      repositories that return 404 to everyone but their owner. The table now lists the three
+      products the crate is actually for, states each one's status, and carries a link only for the
+      one a reader can open.
+
+      A contributor copying `.env.example` also stops being told to obtain a crates.io publish
+      token. Publishing is the maintainer's step, not a prerequisite for running the suite, and a
+      template that asks for a credential nobody needs teaches the wrong thing about what the
+      project requires.
+
+      Nothing a caller wrote against 0.16.0 changes. No public item is added, renamed, or removed
+      and no behaviour differs; this is documentation correctness, which for a crate whose whole
+      0.16.0 thesis was "the documented public contract" is the same kind of defect as a wrong
+      return value.
+    detail: specified
+    status: released
