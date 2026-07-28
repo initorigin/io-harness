@@ -1,0 +1,331 @@
+product: io-harness
+version: 0.16.2
+status: released
+release_type: patch
+outcome:
+  user_can: >
+    A developer who follows the crates.io link to the API reference reaches a rendered page. Today
+    they do not: docs.rs has no documentation for 0.16.0 or for 0.16.1, because both fail to build
+    there. The crate root carries `#![cfg_attr(docsrs, feature(doc_auto_cfg))]`, and `doc_auto_cfg`
+    was removed in Rust 1.92.0 and merged into `doc_cfg` (rust-lang/rust#138907). docs.rs builds on
+    nightly, so the crate root fails to compile there with "feature has been removed", and the build
+    is a hard failure rather than a degraded page.
+
+    The failure is invisible everywhere else. The attribute is inside `cfg_attr(docsrs, ...)`, and
+    `docsrs` is set by docs.rs and by nothing else, so every stable `cargo doc` — in CI, on a
+    contributor's machine, in the release gates — compiles the crate without ever reaching the line.
+    That is why two consecutive releases shipped it.
+
+    After this release the gate is `#![cfg_attr(docsrs, feature(doc_cfg))]`, docs.rs renders the full
+    surface, and every item behind `documents`, `media`, or a per-format feature is labelled with the
+    feature it needs — which is exactly what the gate was added in 0.16.0 to do. `doc_cfg` performs
+    the automatic labelling itself since the merge, so nothing about the rendered output is lost.
+
+    Nothing a caller wrote against 0.16.1 changes. No public item is added, renamed, or removed, no
+    behaviour differs, and a 0.16.1 contract compiles and behaves identically.
+  business_value: >
+    docs.rs is where a Rust crate's API is read. The crates.io page links to it, `cargo doc --open`
+    is the local substitute rather than the norm, and a crate whose documentation link leads to a
+    build-failure notice reads as unmaintained regardless of what is in it. 0.16.0 was a release
+    whose entire subject was the documented public contract — twelve guide pages, a worked example on
+    all 106 public items, five checkers enforcing the prose. All of that is currently unreachable on
+    the page most readers use to reach it.
+
+    It is a patch and it goes out on its own rather than waiting for the next minor. Two published
+    versions have no page and neither can be repaired, since a published version's sources are
+    immutable; the only way to give the 0.16 line documentation is a forward release. The longer that
+    waits, the longer the current answer to "where are the docs" is "there are none".
+
+    It also closes a gap the release gates did not see. The failing configuration is one no local or
+    CI command builds, so nothing in the repository could have caught it — a fact worth recording in
+    the release rather than treating the two failures as bad luck.
+  evidence_of_value: >
+    The docs.rs build for 0.16.2 reported as successful and the rendered page at
+    `docs.rs/io-harness/0.16.2` showing the crate root, the twelve guide links, and feature labels on
+    the gated items — checked from the published page after the build completes, not from a local
+    render.
+
+    Before that, locally: `cargo +nightly doc --all-features --no-deps` with `RUSTDOCFLAGS="--cfg
+    docsrs"` exiting 0 with no warning, which is the closest reproduction of the docs.rs invocation
+    available off the builder and the check that would have caught the original defect.
+scope:
+  included:
+    - >
+      Replace `#![cfg_attr(docsrs, feature(doc_auto_cfg))]` with
+      `#![cfg_attr(docsrs, feature(doc_cfg))]` in `src/lib.rs`, and extend the comment above it to
+      state why — the feature was removed in 1.92.0 and merged into `doc_cfg`, and 0.16.1's docs.rs
+      build failed on the old name. The comment is the only durable record at the site of the change.
+    - >
+      Reproduce the docs.rs build locally on nightly with the `docsrs` cfg set, before and after, so
+      the fix is verified against the configuration that failed rather than against the one that
+      always passed.
+    - >
+      The version bump to 0.16.2 in Cargo.toml and Cargo.lock, and a CHANGELOG `[0.16.2]` section
+      under `Fixed` naming the removed feature, linking the upstream PR, stating that there is no
+      behaviour change, and stating plainly that 0.16.0 and 0.16.1 remain unbuildable on docs.rs.
+    - >
+      The full release flow through to crates.io: the sealed completion record on `feat/0.16.2`, PR
+      to `develop`, release PR to `main`, a GitHub Release titled `io-harness 0.16.2`, then
+      `cargo publish`.
+  excluded:
+    - >
+      Any behaviour change, any public API change, and any `src/` edit beyond the one attribute line
+      and its comment. This is a build fix for a single configuration.
+    - >
+      A CI job that builds the docs on nightly with `--cfg docsrs`. It is the obvious follow-up and
+      it is deliberately not in this release: it is a workflow change with its own failure modes and
+      its own matrix cost, and bundling it would put an untested job in the release that exists to
+      unbreak a page. Recorded as a known limitation and left for a release that can carry it.
+    - >
+      The four defects the 0.16.0 audit documented in `docs/CONTRACT.md` — the reserved tool-name
+      gap, `resume_tree` not recording its policy, `SandboxLimits::max_processes` enforced by
+      nothing, and the absent Linux seccomp filter. Each is a behaviour change and none belongs in a
+      patch.
+    - >
+      Yanking 0.16.0 or 0.16.1. Neither is broken as a crate — both build, both pass their suites,
+      and both are what a consumer is running. Only their docs.rs pages are missing, and yanking is
+      an owner-approved action that would be a disproportionate response to that.
+  fallback_scope:
+    - >
+      The one-line attribute change, the version bump, and the CHANGELOG entry, verified by the local
+      nightly `docsrs` build and shipped as 0.16.2. That is already the whole release; there is no
+      smaller coherent version of it, and nothing in it can be deferred without the release ceasing
+      to have a reason to exist.
+acceptance:
+  functional:
+    - >
+      F1 — `src/lib.rs` contains `#![cfg_attr(docsrs, feature(doc_cfg))]` and no occurrence of
+      `doc_auto_cfg` anywhere in the repository outside CHANGELOG.md and the sealed release records.
+    - >
+      F2 — `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps` exits 0 on a
+      nightly at or after 1.92.0, emitting no warning and no `unexpected_cfg` diagnostic.
+    - >
+      F3 — the same command on the pre-fix tree fails with "feature has been removed", establishing
+      that the check discriminates rather than passing on everything. This is the negative control
+      the crate requires of every gate it ships.
+    - >
+      F4 — CHANGELOG.md has a `[0.16.2]` section under `Fixed` that names `doc_auto_cfg`, links
+      rust-lang/rust#138907, states there is no behaviour change, and states that 0.16.0 and 0.16.1
+      remain unbuildable on docs.rs.
+  non_functional:
+    - >
+      NF1 — no public API change. `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` is empty
+      for the whole branch, and `tests/public_api.rs` passes against the unchanged snapshot.
+    - >
+      NF2 — the five 0.16.0 checkers stay green with no test edited to accommodate the change:
+      `readme`, `public_api`, `docs_drift`, `changelog`, `guide_pages`. `changelog` is the one this
+      release could plausibly break, since it inspects the file being edited.
+    - >
+      NF3 — `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` all
+      exit 0 on stable, MSRV stays 1.88, and the default `cargo tree` stays at 401 lines.
+    - >
+      NF4 — `cargo package` succeeds and the packaged `.crate` is inspected for a `.env`, a
+      secret-shaped path, or any file the `exclude` list should have caught.
+  operational:
+    - >
+      O1 — the docs.rs build for 0.16.2 succeeds and `docs.rs/io-harness/0.16.2` renders, confirmed
+      from the published page after `cargo publish`. This is the whole point of the release and the
+      only place its effect is visible.
+    - >
+      O2 — the release trail is the standard one and readable without this session: feat branch with
+      the sealed record, two merged PRs, a GitHub Release titled `io-harness 0.16.2` with notes taken
+      from the CHANGELOG, then the crates.io upload.
+delivery:
+  target_mode: published
+  environment: crates.io and docs.rs, plus the three-OS GitHub Actions matrix.
+  deployment_method: >
+    The initorigin release flow with the 2026-07-26 owner override in effect: all work including the
+    sealed completion record on `feat/0.16.2`, PR to `develop`, release PR `develop` to `main`, a
+    GitHub Release titled `io-harness 0.16.2` with notes from the CHANGELOG, then `cargo publish`
+    last. The owner has authorized not waiting on the CI matrix for this release, on the stated
+    grounds that it is a one-line change with no code effect; the full local suite still runs before
+    the first merge, so the release is verified but unqueued.
+  migrations:
+    - >
+      None. No schema change, no public API change, no configuration change. A consumer upgrades by
+      changing the version number, and a consumer who does not upgrade loses nothing but a docs.rs
+      page they never had.
+  observability:
+    - >
+      The docs.rs build queue and build log for 0.16.2, which is the artifact this release exists to
+      fix and the only place its effect is visible. Nothing in the crate's runtime behaviour changes,
+      so the trace and the `tracing` spans have nothing to say about it.
+  rollback: >
+    None is needed and none is planned. The change is inert outside the `docsrs` cfg, so a consumer
+    on 0.16.2 runs the same code as one on 0.16.1; if the docs.rs build were still to fail, the
+    correction is a forward 0.16.3 with a different gate, not a yank. `cargo yank --vers 0.16.2`
+    exists as the mechanism and is an owner-approved action.
+dependencies:
+  products: []
+  services:
+    - >
+      crates.io for the upload, docs.rs for the build that verifies the release worked, and GitHub
+      for the Release. The three-OS matrix runs on the merge but is not gated on, per the owner's
+      instruction.
+    - >
+      A nightly toolchain at or after 1.92.0 on the development machine, for F2 and F3. Local only —
+      the crate's MSRV is unchanged at 1.88 and no consumer needs nightly.
+  human_approvals:
+    - >
+      The crates.io publish itself is irreversible and stays the owner-approved gate it has been
+      since 0.6.0. Authorized here: the owner asked for the docs.rs failure to be fixed and set the
+      flow to run through to publication without a stop.
+resource_profile:
+  complexity: small
+  uncertainty: low
+  likely_cost_drivers:
+    - >
+      Verifying against the right configuration. The defect exists precisely because every ordinary
+      command passes; a fix confirmed by `cargo doc` on stable would be confirmed by the same command
+      that missed the bug twice. The nightly `docsrs` reproduction is the release, and the rest is a
+      version bump.
+    - >
+      Judging what `doc_cfg` now does on its own. The merge folded automatic labelling into
+      `doc_cfg`, so no per-item `#[doc(cfg(...))]` attributes are needed — but that is a claim about
+      upstream behaviour, and it is checked by reading the rendered output for feature labels rather
+      than by assuming the rename is sufficient.
+  preferred_tools:
+    - cargo +nightly doc with RUSTDOCFLAGS="--cfg docsrs", the reproduction and the gate.
+    - cargo test, clippy, fmt, and `cargo package` as the standing release gates.
+    - gh for the PRs and the Release; cargo publish for the upload.
+  constraints:
+    - >
+      Patch semantics: no public API change and no behaviour change. The edit is one attribute inside
+      a cfg no consumer build sets.
+    - >
+      No new CI job in this release. The nightly docs check is the right follow-up and is recorded as
+      a limitation rather than smuggled in.
+    - >
+      Stay 0.x. This is a patch on a pre-1.0 crate and makes no compatibility promise beyond the one
+      0.16.0 already made.
+risks:
+  - >
+    `doc_cfg` is itself an unstable feature and could be renamed or removed the same way
+    `doc_auto_cfg` was, breaking the docs.rs build again with no local signal. Mitigation within this
+    release: none available — the feature is the mechanism docs.rs itself documents. Mitigation
+    recorded for the next release: a nightly `--cfg docsrs` doc job in CI, which turns the next such
+    removal into a failing build rather than a failed publication.
+  - >
+    The rename is applied and the automatic labelling silently stops, leaving a page that builds but
+    no longer tells a reader which feature an item needs. Mitigation: F2 is not "exits 0" alone — the
+    rendered output is read for feature labels on the gated items before the release is called done.
+  - >
+    A stale local nightly older than 1.92.0 would pass both the pre-fix and post-fix builds, making
+    F3's negative control vacuous. Mitigation: the toolchain version is recorded in the evidence
+    alongside the command output, so the control is verifiable rather than asserted.
+  - >
+    Skipping the CI wait hides an unrelated failure. Mitigation: the full local suite plus clippy,
+    fmt and `cargo package` run before the first merge, and the change is inert in every
+    configuration CI builds — the matrix cannot exercise the line that changed.
+open_questions:
+  - >
+    None material. The upstream change is documented and the replacement feature name is the one
+    rust-lang/rust#138907 names; the only judgement left is whether a CI job to catch the next
+    occurrence belongs in this release, which is answered no above and recorded as a limitation.
+
+released_at: '2026-07-28T03:35:23Z'
+mode: published
+delivered: >
+  The crate root's nightly documentation gate is now `#![cfg_attr(docsrs, feature(doc_cfg))]`. It
+  was `doc_auto_cfg`, and that feature was removed in Rust 1.92.0 and merged into `doc_cfg`
+  (rust-lang/rust#138907), so the crate root failed to compile on docs.rs — which builds on nightly
+  — for both 0.16.0 and 0.16.1. Neither published version has a rendered page, and neither can be
+  given one: a published version's sources are immutable. 0.16.2 is the first version of the 0.16
+  line with documentation on docs.rs.
+
+  The defect was invisible to everything this repository runs. The attribute sits inside
+  `cfg_attr(docsrs, ...)`, and `docsrs` is set by docs.rs and by nothing else, so every stable
+  `cargo doc` — in CI, in the release gates, on a contributor's machine — compiles the crate without
+  reaching the line, and did so without a warning. That is why two consecutive releases shipped it,
+  and it is why this release's verification is a nightly build with `--cfg docsrs` rather than any
+  command that had already passed.
+
+  The labelling the gate exists for still happens. `doc_cfg` performs the automatic per-item
+  labelling itself since the merge, so the rendered output carries "Available on crate feature `x`
+  only" for every item behind `barcode`, `docx`, `media`, `pdf`, `pptx` and `xlsx` — checked by
+  reading the generated HTML, not inferred from the build exiting 0.
+
+  Nothing else changed. No public item was added, renamed, or removed, no behaviour differs, and a
+  0.16.1 caller upgrades by changing the version number.
+evidence:
+  tests:
+    - >
+      cargo test — 603 passed, 0 failed across every target including the doctests, exit 0. Full
+      output at evidence/0.16.2/tests-default.txt. Identical total to 0.16.1, as expected of a
+      release that adds no test and changes no behaviour.
+    - >
+      NF2 — the five checkers 0.16.0 shipped all pass with no test file edited to accommodate this
+      change: changelog 5/5, docs_drift 10/10, guide_pages 7/7, public_api 9/9, readme 8/8.
+      `changelog` is the one that inspects a file this release edits, and it passes on the new
+      `[0.16.2]` section unmodified.
+    - >
+      F4 — CHANGELOG.md has a `[0.16.2]` section whose only entry is under `Fixed`. It names
+      `doc_auto_cfg`, links rust-lang/rust#138907, states there is no breaking and no behaviour
+      change, and states that 0.16.0 and 0.16.1 remain unbuildable on docs.rs.
+  builds:
+    - >
+      F3, the negative control — on the pre-fix line, `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc
+      --all-features --no-deps` fails with `error[E0557]: feature has been removed` at
+      src/lib.rs:220:29, noting "removed in 1.92.0" and "merged into `doc_cfg`". That is the docs.rs
+      build log's error reproduced verbatim off the builder, which is what makes the passing build
+      below evidence rather than coincidence. Output at
+      evidence/0.16.2/doc-nightly-negative-control.txt; toolchain rustc 1.99.0-nightly (09ee43b2d
+      2026-07-27) recorded at evidence/0.16.2/toolchain.txt, after 1.92.0 so the control is not
+      vacuous.
+    - >
+      F1/F2 — with the fix, the same command exits 0 with no warning and no `unexpected_cfg`
+      diagnostic (evidence/0.16.2/doc-nightly.txt). `src/lib.rs:220` reads
+      `#![cfg_attr(docsrs, feature(doc_cfg))]`, and no occurrence of `doc_auto_cfg` remains outside
+      CHANGELOG.md and this record. The rendered HTML under target/doc/io_harness carries "Available
+      on crate feature `x` only" for barcode, docx, media, pdf, pptx and xlsx, so the automatic
+      labelling survived the rename.
+    - >
+      cargo clippy --all-targets -- -D warnings — exit 0 (evidence/0.16.2/clippy.txt).
+      cargo fmt --check — exit 0 (evidence/0.16.2/fmt.txt).
+    - >
+      NF1 — `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` returns nothing for the whole
+      branch, and the public-surface snapshot is untouched. NF3 — default `cargo tree` is 401 lines,
+      the standing constraint, unchanged (evidence/0.16.2/tree-lines.txt).
+    - >
+      NF4 — cargo package: io-harness-0.16.2.crate, 118 files, 564 KiB compressed, verification build
+      exit 0 (evidence/0.16.2/package.txt, package-list.txt). Inspected: no `.env`, no
+      `.ultraship/`, no `.github/`, no secret-shaped path.
+    - >
+      Secrets gate — `.env` is matched by `.gitignore:10` and is untracked, and the branch diff
+      contains no secret-shaped assignment.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+  - >
+    The record is sealed on `feat/0.16.2` before the crates.io upload, which follows the two merges
+    and the GitHub Release. `mode: published` states the authorized target; the flow makes it true.
+    O1 — the docs.rs build succeeding and the page rendering — can only be checked after the upload,
+    since docs.rs builds from the published crate.
+  - >
+    Nothing in this repository can catch the next occurrence. The failing configuration is one no
+    local or CI command builds, which is the whole reason two releases shipped the defect, and this
+    release deliberately adds no nightly `--cfg docsrs` job to fix that: a workflow change has its
+    own failure modes and its own matrix cost, and it does not belong in the release that exists to
+    unbreak the page. It is the first thing the next release should carry.
+  - >
+    `doc_cfg` is itself an unstable feature and can be renamed or removed exactly as `doc_auto_cfg`
+    was. Nothing about this fix makes the crate durable against that; it makes it correct against
+    today's nightly.
+  - >
+    The CI matrix was not waited on, at the owner's instruction and on the stated grounds that this
+    is a one-line change. The trade is narrower here than it was for 0.16.1: the edited line is
+    inside a cfg that no configuration CI builds ever sets, so the matrix could not exercise it even
+    if it ran. Every claim above rests on a local macOS run on stable, plus the nightly docs build.
+  - >
+    0.16.0 and 0.16.1 stay without documentation on docs.rs permanently. Neither was yanked — both
+    build, both pass their suites, and both are what a consumer is running; only their doc pages are
+    missing, and yanking would be a disproportionate response the owner has not authorized.
+  - >
+    Everything 0.16.0 and 0.16.1 carried is carried still. The four defects documented in
+    `docs/CONTRACT.md` — the reserved tool-name gap, `resume_tree` not recording its policy,
+    `SandboxLimits::max_processes` enforced by nothing, and no Linux seccomp filter — are untouched,
+    because each is a behaviour change and none belongs in a patch.
+supersedes: 0.16.1
+next_recommended_version: null
+immutable: true

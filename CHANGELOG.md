@@ -26,6 +26,34 @@ notes are produced from it.
 
 ### Security
 
+## [0.16.2] - 2026-07-28
+
+A build fix for docs.rs. **There are no breaking changes and no behaviour
+change in this release** — no public item is added, renamed, or removed, and a
+0.16.1 contract compiles and behaves identically. The one changed line is a
+nightly feature gate that is only ever reached under the `docsrs` cfg, which
+docs.rs sets and nothing else does.
+
+### Fixed
+
+- **The docs.rs documentation build now succeeds.** It failed for both 0.16.0
+  and 0.16.1, so neither version has a rendered page: the crate root enabled
+  the nightly `doc_auto_cfg` feature, and that feature was removed in Rust
+  1.92.0 and merged into `doc_cfg`
+  ([rust-lang/rust#138907](https://github.com/rust-lang/rust/pull/138907)).
+  docs.rs builds on nightly, so the crate root failed to compile there with
+  `` feature has been removed ``, while every stable `cargo doc` was unaffected
+  and gave no warning.
+
+  The gate is now `#![cfg_attr(docsrs, feature(doc_cfg))]`. `doc_cfg` does the
+  automatic feature labelling itself since the merge, so the rendered docs say
+  the same thing they were always meant to: every item behind `documents`,
+  `media`, or a per-format feature is labelled with the feature it needs.
+
+  0.16.0 and 0.16.1 remain unbuildable on docs.rs — a published version's
+  sources cannot be changed — so 0.16.2 is the first version of the 0.16 line
+  with a page on docs.rs.
+
 ## [0.16.1] - 2026-07-28
 
 A documentation correction. **There are no breaking changes and no code

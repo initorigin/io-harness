@@ -321,3 +321,22 @@ versions:
       return value.
     detail: specified
     status: released
+  - version: 0.16.2
+    outcome: >
+      A developer who follows the crates.io link to the API reference reaches a rendered page
+      instead of a build-failure notice. docs.rs has no documentation for either 0.16.0 or 0.16.1:
+      both fail to compile there because the crate root enables the nightly `doc_auto_cfg` feature,
+      which Rust removed in 1.92.0 and merged into `doc_cfg`. docs.rs builds on nightly, so the
+      failure appears only there — every stable `cargo doc` in CI and on a contributor's machine
+      compiled it without a warning, which is why two releases shipped with it.
+
+      After this release, `docs.rs/io-harness` renders the whole surface, with every item behind
+      `documents`, `media`, or a per-format feature labelled with the feature it needs, which is
+      what the gate was there to do in the first place. 0.16.0 and 0.16.1 stay unbuildable — a
+      published version's sources cannot be changed — so this is the first version of the 0.16 line
+      with a page.
+
+      Nothing a caller wrote against 0.16.1 changes. The one edited line is inside `cfg_attr(docsrs,
+      ...)`, reached only under a cfg that docs.rs sets and nothing else does.
+    detail: specified
+    status: released
