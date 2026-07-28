@@ -260,10 +260,10 @@ pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
 pub use run::{
     resume, resume_from_stored_policy, resume_from_stored_policy_observed, resume_observed,
     resume_tree, resume_tree_from_stored_policy, resume_tree_from_stored_policy_observed,
-    resume_tree_observed, resume_tree_with_decision,
-    resume_tree_with_decision_observed, resume_with, resume_with_decision,
-    resume_with_decision_observed, resume_with_observed, run, run_observed, run_tree,
-    run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult, SPAWN_TOOL,
+    resume_tree_observed, resume_tree_with_decision, resume_tree_with_decision_observed,
+    resume_with, resume_with_decision, resume_with_decision_observed, resume_with_observed, run,
+    run_observed, run_tree, run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult,
+    SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,

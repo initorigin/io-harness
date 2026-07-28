@@ -62,10 +62,19 @@ impl Item {
         let kind = parts.next()?.to_string();
         let name = parts.next()?.to_string();
         let file = parts.next()?.to_string();
-        let gate = parts
-            .next()
-            .map(|g| g.trim().trim_start_matches('(').trim_end_matches(')').to_string());
-        Some(Item { kind, name, file, gate, docs: String::new() })
+        let gate = parts.next().map(|g| {
+            g.trim()
+                .trim_start_matches('(')
+                .trim_end_matches(')')
+                .to_string()
+        });
+        Some(Item {
+            kind,
+            name,
+            file,
+            gate,
+            docs: String::new(),
+        })
     }
 }
 
@@ -175,7 +184,11 @@ fn defs(src: &str) -> Vec<Def> {
         }
         if let Some(rest) = line.strip_prefix("pub ") {
             if let Some((kind, name)) = kind_and_name(rest) {
-                out.push(Def { kind, name, docs: docs.join("\n") });
+                out.push(Def {
+                    kind,
+                    name,
+                    docs: docs.join("\n"),
+                });
                 docs.clear();
                 continue;
             }
@@ -209,7 +222,11 @@ fn candidates(module: &str) -> Vec<(bool, String)> {
 fn resolve(index: &[(String, Vec<Def>)], module: &str, name: &str) -> Option<(String, Def)> {
     for (is_dir, path) in candidates(module) {
         for (file, defs) in index {
-            let hit = if is_dir { file.starts_with(&path) } else { *file == path };
+            let hit = if is_dir {
+                file.starts_with(&path)
+            } else {
+                *file == path
+            };
             if !hit {
                 continue;
             }
@@ -270,7 +287,11 @@ fn exports(lib: &str) -> Vec<(String, String, Option<String>)> {
             }
             None => {
                 if let Some(i) = stmt.rfind("::") {
-                    out.push((stmt[..i].to_string(), stmt[i + 2..].trim().to_string(), gate.clone()));
+                    out.push((
+                        stmt[..i].to_string(),
+                        stmt[i + 2..].trim().to_string(),
+                        gate.clone(),
+                    ));
                 }
             }
         }
@@ -288,8 +309,7 @@ fn exports(lib: &str) -> Vec<(String, String, Option<String>)> {
 /// mechanism worthless.
 fn enumerate() -> Result<Vec<Item>, String> {
     let files = source_index();
-    let index: Vec<(String, Vec<Def>)> =
-        files.iter().map(|(p, s)| (p.clone(), defs(s))).collect();
+    let index: Vec<(String, Vec<Def>)> = files.iter().map(|(p, s)| (p.clone(), defs(s))).collect();
     let lib = files
         .iter()
         .find(|(p, _)| p == "src/lib.rs")
@@ -351,8 +371,16 @@ fn drift(current: &[Item], snapshot: &[Item]) -> Drift {
     let cur: BTreeSet<String> = current.iter().map(Item::line).collect();
     let snap: BTreeSet<String> = snapshot.iter().map(Item::line).collect();
 
-    let mut added: Vec<Item> = current.iter().filter(|i| !snap.contains(&i.line())).cloned().collect();
-    let mut removed: Vec<Item> = snapshot.iter().filter(|i| !cur.contains(&i.line())).cloned().collect();
+    let mut added: Vec<Item> = current
+        .iter()
+        .filter(|i| !snap.contains(&i.line()))
+        .cloned()
+        .collect();
+    let mut removed: Vec<Item> = snapshot
+        .iter()
+        .filter(|i| !cur.contains(&i.line()))
+        .cloned()
+        .collect();
 
     let mut renamed = Vec::new();
     let mut kept_removed = Vec::new();
@@ -365,7 +393,11 @@ fn drift(current: &[Item], snapshot: &[Item]) -> Drift {
             None => kept_removed.push(r),
         }
     }
-    Drift { added, removed: kept_removed, renamed }
+    Drift {
+        added,
+        removed: kept_removed,
+        renamed,
+    }
 }
 
 /// The failure message. `None` when the surface matches.
@@ -484,7 +516,11 @@ fn drift_reports_a_removal() {
     let current = vec![fixture("struct", "Kept", "src/a.rs", "")];
 
     let d = drift(&current, &snapshot);
-    assert_eq!(d.removed.len(), 1, "expected exactly one removal, got {d:?}");
+    assert_eq!(
+        d.removed.len(),
+        1,
+        "expected exactly one removal, got {d:?}"
+    );
     assert_eq!(d.removed[0].name, "gone");
     assert!(d.added.is_empty() && d.renamed.is_empty(), "{d:?}");
 
@@ -511,7 +547,10 @@ fn drift_reports_a_rename() {
 
     let report = drift_report(&d).expect("a rename must produce a report");
     assert!(report.contains("RENAMED (1):"), "{report}");
-    assert!(report.contains("struct OldName (src/a.rs) -> NewName"), "{report}");
+    assert!(
+        report.contains("struct OldName (src/a.rs) -> NewName"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -543,7 +582,10 @@ fn a_feature_gate_is_part_of_the_compared_surface() {
 
     let report = drift_report(&drift(&[gated], &snapshot))
         .expect("moving an item behind a feature gate must be reported");
-    assert!(report.contains("feature") || report.contains("Media"), "{report}");
+    assert!(
+        report.contains("feature") || report.contains("Media"),
+        "{report}"
+    );
 }
 
 #[test]
@@ -616,7 +658,10 @@ impl Gated {
     let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, vec!["Gated", "go"], "got {found:?}");
     assert_eq!(found[0].kind, "struct");
-    assert!(found[0].docs.contains("```"), "attributes must not detach the doc block");
+    assert!(
+        found[0].docs.contains("```"),
+        "attributes must not detach the doc block"
+    );
     assert_eq!(found[1].kind, "async_fn");
     assert!(!found[1].docs.contains("```"));
 
@@ -628,8 +673,16 @@ impl Gated {
     assert_eq!(
         uses,
         vec![
-            ("provider".into(), "Media".into(), Some("feature = \"media\"".into())),
-            ("provider".into(), "IMAGE_MEDIA_TYPES".into(), Some("feature = \"media\"".into())),
+            (
+                "provider".into(),
+                "Media".into(),
+                Some("feature = \"media\"".into())
+            ),
+            (
+                "provider".into(),
+                "IMAGE_MEDIA_TYPES".into(),
+                Some("feature = \"media\"".into())
+            ),
             ("net".into(), "REQUEST_TIMEOUT".into(), None),
             ("run".into(), "run".into(), None),
             ("run".into(), "run_observed".into(), None),

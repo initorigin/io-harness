@@ -96,10 +96,9 @@ fn every_capability_has_a_guide_page() {
 
 #[test]
 fn no_guide_page_is_orphaned_from_the_index() {
-    let index = fs::read_to_string(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/CAPABILITIES.md"),
-    )
-    .expect("docs/CAPABILITIES.md");
+    let index =
+        fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/CAPABILITIES.md"))
+            .expect("docs/CAPABILITIES.md");
 
     let missing: Vec<&str> = GUIDES
         .iter()

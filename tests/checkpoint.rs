@@ -1034,9 +1034,11 @@ async fn a_tree_resumed_from_its_stored_policy_is_still_bounded_by_it() {
     );
     let refusals = tree_refusals(&db);
     assert!(
-        refusals.iter().any(|(target, rule, layer)| target == "a.txt"
-            && rule.as_deref() == Some("a.txt")
-            && layer.as_deref() == Some("base")),
+        refusals
+            .iter()
+            .any(|(target, rule, layer)| target == "a.txt"
+                && rule.as_deref() == Some("a.txt")
+                && layer.as_deref() == Some("base")),
         "the refusal is in the trace, attributed to the rule and layer of the policy the tree \
          was STARTED under: {refusals:?}"
     );

@@ -140,13 +140,20 @@ fn msrv_is_stated_and_matches_cargo_toml() {
     let declared = declared_msrv(&read("Cargo.toml"));
     let sources: [(&str, String); 3] = [
         ("README.md", read("README.md")),
-        ("src/lib.rs (crate-root docs)", crate_root_docs(&read("src/lib.rs"))),
+        (
+            "src/lib.rs (crate-root docs)",
+            crate_root_docs(&read("src/lib.rs")),
+        ),
         ("docs/CONTRACT.md", read("docs/CONTRACT.md")),
     ];
 
     let failures: Vec<String> = sources
         .iter()
-        .filter_map(|(name, text)| msrv_matches(&declared, text).err().map(|e| format!("{name} {e}")))
+        .filter_map(|(name, text)| {
+            msrv_matches(&declared, text)
+                .err()
+                .map(|e| format!("{name} {e}"))
+        })
         .collect();
 
     assert!(
@@ -160,8 +167,14 @@ fn msrv_is_stated_and_matches_cargo_toml() {
 fn msrv_checker_rejects_a_different_version() {
     let fixture = "# Fixture\n\n- **MSRV:** Rust **1.75**, which is not what Cargo.toml says.\n";
     let err = msrv_matches("1.88", fixture).expect_err("a stale MSRV must be reported");
-    assert!(err.contains("1.88"), "message should name the declared version: {err}");
-    assert!(err.contains("1.75"), "message should quote the offending line: {err}");
+    assert!(
+        err.contains("1.88"),
+        "message should name the declared version: {err}"
+    );
+    assert!(
+        err.contains("1.75"),
+        "message should quote the offending line: {err}"
+    );
 }
 
 #[test]
@@ -253,8 +266,14 @@ fn documented_feature_list_matches_cargo_toml() {
 
 #[test]
 fn feature_checker_rejects_an_undocumented_feature() {
-    let declared: BTreeSet<String> = ["default", "media", "documents"].iter().map(|s| s.to_string()).collect();
-    let documented: BTreeSet<String> = ["default", "documents"].iter().map(|s| s.to_string()).collect();
+    let declared: BTreeSet<String> = ["default", "media", "documents"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let documented: BTreeSet<String> = ["default", "documents"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
     let err = feature_list_matches(&declared, &documented).expect_err("must report the gap");
     assert!(err.contains("not documented"), "{err}");
     assert!(err.contains("media"), "{err}");
@@ -263,8 +282,12 @@ fn feature_checker_rejects_an_undocumented_feature() {
 #[test]
 fn feature_checker_rejects_a_documented_feature_that_does_not_exist() {
     let declared: BTreeSet<String> = ["default", "media"].iter().map(|s| s.to_string()).collect();
-    let documented: BTreeSet<String> = ["default", "media", "audio"].iter().map(|s| s.to_string()).collect();
-    let err = feature_list_matches(&declared, &documented).expect_err("must report the stale entry");
+    let documented: BTreeSet<String> = ["default", "media", "audio"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let err =
+        feature_list_matches(&declared, &documented).expect_err("must report the stale entry");
     assert!(err.contains("absent from Cargo.toml"), "{err}");
     assert!(err.contains("audio"), "{err}");
 }
@@ -281,7 +304,10 @@ fn feature_extractor_reads_lists_and_tables() {
     let found = documented_features(fixture);
     assert_eq!(
         found,
-        ["default", "media", "docx"].iter().map(|s| s.to_string()).collect::<BTreeSet<_>>()
+        ["default", "media", "docx"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<BTreeSet<_>>()
     );
 }
 
@@ -345,7 +371,9 @@ fn dangling_links(dir: &Path, text: &str) -> Vec<(usize, String)> {
 }
 
 fn markdown_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {

@@ -26,6 +26,138 @@ notes are produced from it.
 
 ### Security
 
+## [0.16.0] - 2026-07-28
+
+The documented public contract. A developer arriving cold can tell what the
+crate does and start using it; a developer already depending on it knows what
+may change.
+
+**There are no breaking changes in this release.** Upgrading from 0.15.0 is a
+version bump and a rebuild — nothing you wrote stops compiling. That is worth
+stating plainly in the release that introduces migration notes, because it is
+the first entry the new format applies to.
+
+### The two front doors
+
+The README was 1072 lines organised as a release history: sections named after
+the version that introduced each capability, ordered by nothing in particular,
+with 0.15 filed before 0.14 and 0.12 and 0.13 absent from the file entirely. Its
+first code fence was on line 107, and its status paragraph described a release
+two versions stale. The crate root — the page docs.rs actually opens on — was
+worse: 230 lines of "v0.2 adds", "v0.4 adds", with v0.3 arriving after v0.14 and
+v0.10 through v0.13 never mentioned at all.
+
+Both answered "what did each version add", which is a question only a maintainer
+asks. Both are now landing pages: what the crate is, a quickstart above the fold,
+badges, the MSRV, and what the harness does today, described as capabilities.
+
+### Guides
+
+The depth that made those 1072 lines worth reading is not deleted. It moved into
+twelve pages under `docs/guide/` — permissions, verification, composition,
+sandbox, durable runs, MCP and network egress, tools and skills, context and
+memory, resilience, observability, documents, images and git — and every "the
+limits, stated plainly" block travelled with its capability, because those are
+the paragraphs that make the rest credible.
+
+Two of the twelve are new writing rather than moved prose: observability and
+replay had never been documented for a reader at all.
+
+### Added
+
+- A worked example on **every** one of the 106 public items re-exported from the
+  crate root. Previously one item had one.
+- `resume_tree_from_stored_policy` and `resume_tree_from_stored_policy_observed`.
+  The tree loop was the only one of the three that could not be resumed under the
+  policy it was started with, so the three resume paths disagreed about whether
+  the permission boundary survives a restart. A tree with no stored policy is a
+  typed `Error::Resume`, never a silent fall back to `Policy::permissive`.
+- `docs/CONTRACT.md` as an actual contract: what is public and what is not, what
+  pre-1.0 means here, the deprecation cycle, the MSRV policy, the feature table
+  with what each feature costs, the platform matrix, and eleven limits that hold
+  today.
+- `docs/public-api.txt`, the enumerated public surface, compared against the live
+  crate by a test.
+- `[package.metadata.docs.rs]` with all features enabled and `doc_auto_cfg`, so
+  the rendered page shows the documents and media surface with the feature each
+  item needs labelled on it.
+
+### The promises, and the checks that keep them
+
+Three claims in this release decay into fiction unless something checks them, so
+the checks ship rather than the promises. Each carries a negative control,
+because a checker that silently matches nothing passes every input and reports a
+green light wired to nothing.
+
+- **Every public item has an example** — `tests/public_api.rs` enumerates the
+  surface and fails naming any item without a fenced block. `cargo test --doc`
+  compiles all of them, so an example cannot rot into a lie.
+- **A rename or removal is announced** — the same file compares the surface
+  against `docs/public-api.txt`. Removing or renaming an item fails the build
+  until that file is edited by hand, which is the moment the `#[deprecated]`
+  attribute and the migration note get written. There is deliberately no flag
+  that regenerates it.
+- **Every break has a migration note** — `tests/changelog.rs` finds every entry
+  marked breaking and fails on any without one.
+- **The prose matches the build** — `tests/docs_drift.rs` asserts the documented
+  MSRV equals `rust-version` and the documented feature list equals the
+  `[features]` keys in both directions, and that every relative link in the
+  README and under `docs/` resolves.
+- **The split lost nothing** — `tests/guide_pages.rs` names each capability and
+  the limits block that had to travel with it.
+
+### Fixed
+
+Auditing the old README against the source, for the first time in fifteen
+releases, found documentation that was not merely stale but wrong. All of these
+are corrections to doc comments; none changes behaviour.
+
+- `Verification`'s type documentation claimed the subject is compiled as its own
+  crate with the criterion compiled against it. It is not: subject and criterion
+  are one crate, the criterion in a child module. The separate-crate approach was
+  tried during 0.8.1 and abandoned, because privacy is a wall between crates and
+  a passing implementation is allowed to be private. The claim was wrong in the
+  direction that made the 0.8.1 boundary sound stronger than it is.
+- `TaskContract::with_tools` had no documentation. Its doc block had lost its
+  closing line and merged into `with_images`, so the paragraphs explaining that
+  registration grants availability and not authorization rendered under a
+  `media`-gated method — that is, nowhere, on a default build.
+- The sandbox module claimed a seccomp filter in three places. None is
+  installed; the Linux backend is namespaces and rlimits, and any syscall
+  restriction is the kernel's own default under an unprivileged user namespace.
+- The sandbox module claimed `setrlimit` caps "CPU/procs/fds". It sets
+  `RLIMIT_CPU` and `RLIMIT_NOFILE` only, and `SandboxLimits::max_processes` is
+  enforced by nothing on any platform.
+- A comment in `skills.rs` claimed a `README` is not discovered as a skill. The
+  test is the `.md` extension and nothing else, so it is.
+- Five unresolved intra-doc links in the documents module, which resolved under
+  `--all-features` and dangled in the default build, plus six more across the
+  provider modules and the context module. `cargo doc` is now warning-free on
+  both builds.
+
+### Changed
+
+- The crate description was a 944-character comma-separated inventory of fifteen
+  releases — the same field that reached 1041 characters at 0.11.0 and was
+  refused by the registry's 1000-character cap. It is one sentence now.
+- `docs/CAPABILITIES.md` is the guide index. It had also gone stale: it described
+  0.15.0 as planned and listed image **and video** passthrough as a capability,
+  though video was cut from the roadmap on 2026-07-27 and appears in no release.
+- Historical entries in this file: 49 breaking changes across 16 versions are now
+  marked and carry a migration note. The audit ran against the git tags rather
+  than the prose, which is how it found that three releases claim in prose to
+  break nothing and do.
+
+### Known limitations
+
+Documented in `docs/CONTRACT.md` rather than fixed here, because each is a
+behaviour change and this release makes none. The two most likely to bite: a
+registered tool named after one of the git, image or document built-ins passes
+validation and is then permanently unreachable, since the reserved-name set
+still lists only the original seven; and `resume_tree` does not record the policy
+it executes under, so a tree resumed under a widened policy leaves an audit that
+understates what was permitted.
+
 ## [0.15.0] - 2026-07-27
 
 Images the model can see, and work the agent hands back as commits.

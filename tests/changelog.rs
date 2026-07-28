@@ -112,7 +112,11 @@ fn every_breaking_entry_carries_a_migration_note() {
          A break without a migration note is a promise this crate does not keep — \
          say what to write instead, old call on one side and new call on the other:\n  {}",
         offenders.len(),
-        if offenders.len() == 1 { "y is" } else { "ies are" },
+        if offenders.len() == 1 {
+            "y is"
+        } else {
+            "ies are"
+        },
         offenders.join("\n  ")
     );
 }
