@@ -58,6 +58,44 @@ use crate::tools::{XLSX_READ_TOOL, XLSX_SET_CELL_TOOL, XLSX_SHEETS_TOOL, XLSX_WR
 use crate::verify::{ExecGuard, Verification};
 
 /// The tool a parent agent calls to spawn a contained sub-agent.
+///
+/// It is the name the model sees, and the name that appears in the trace and in
+/// [`EventKind::ToolCall`](crate::EventKind::ToolCall) when an agent fans out —
+/// which is the reason to know it. A consumer watching a tree matches on it to
+/// tell composition apart from ordinary work:
+///
+/// ```
+/// use io_harness::{EventKind, Flow, Observer, RunEvent, SPAWN_TOOL};
+///
+/// struct TreeShape;
+///
+/// impl Observer for TreeShape {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         match &event.kind {
+///             // A parent asking for a child, before the child exists.
+///             EventKind::ToolCall { name, target } if name == SPAWN_TOOL => {
+///                 println!("{:indent$}spawning: {target}", "", indent = event.depth as usize * 2);
+///             }
+///             // The child that resulted, with its own run id to route on.
+///             EventKind::Spawned { child_run_id, goal } => {
+///                 println!("{:indent$}run {child_run_id}: {goal}", "",
+///                          indent = (event.depth as usize + 1) * 2);
+///             }
+///             _ => {}
+///         }
+///         Flow::Continue
+///     }
+/// }
+/// ```
+///
+/// Only [`run_tree`] offers it. [`run`] and [`run_with`] never put it in the
+/// tool list, so a contract cannot opt into sub-agents by accident.
+///
+/// It is deliberately *not* governed by the exec policy the way a registered
+/// tool's name is — a spawn is intercepted by the tree loop before dispatch, and
+/// its ceilings are [`Containment`]'s: total agents, concurrency, depth, and the
+/// shared token ledger. To forbid composition, use [`run_with`]; to bound it,
+/// lower those caps.
 pub const SPAWN_TOOL: &str = "spawn_agent";
 
 /// How many grep hits are folded into one observation. A relevance ceiling, not a
@@ -65,6 +103,53 @@ pub const SPAWN_TOOL: &str = "spawn_agent";
 const OBS_GREP_CAP: usize = 50;
 
 /// Why a run stopped.
+///
+/// A run stopping is not a run failing — only one of these variants is success,
+/// and lumping the rest together as "it didn't work" loses the difference
+/// between a run that needs more budget, one that needs a human, and one that
+/// needs a different task. The match is what a caller writes around every entry
+/// point:
+///
+/// ```
+/// use io_harness::RunOutcome;
+///
+/// # fn next_step(outcome: RunOutcome) -> &'static str {
+/// match outcome {
+///     RunOutcome::Success { .. } => "verification passed; ship it",
+///
+///     // Paused, not finished. The pending action is persisted under
+///     // `request_id` and this process may exit; whoever decides later calls
+///     // `resume_with_decision` with that id. Never retry the run from scratch.
+///     RunOutcome::AwaitingApproval { request_id: _, .. } => "ask a human, then resume",
+///
+///     // Ceilings, and they mean different things. More steps or more time is a
+///     // knob; a token ceiling that keeps being hit is usually a task too big
+///     // for one contract.
+///     RunOutcome::StepCapReached { .. } | RunOutcome::TimeBudgetExceeded { .. } => "raise the bound and resume",
+///     RunOutcome::CostBudgetExceeded { .. } | RunOutcome::BudgetCeilingReached { .. } => "split the task",
+///
+///     // The agent is going in circles and was already told once. Resuming
+///     // spends the rest of the budget proving it again — change the goal.
+///     RunOutcome::Stalled { .. } => "rewrite the contract",
+///
+///     // Both are reported *after the fact*: the run that escalated or was
+///     // refused returned the `Err` itself, and a later `resume` reports this
+///     // instead of re-driving the loop.
+///     RunOutcome::Escalated { retryable: true, .. } => "transient provider failure; resume",
+///     RunOutcome::Escalated { .. } => "wrong key or bad request; fix it first",
+///     RunOutcome::Refused { .. } => "the provider's host was denied; widen the net policy",
+///
+///     RunOutcome::Denied { .. } => "a human said no; the action never happened",
+///     // An observer returned `Flow::Cancel`. Finished cleanly, and still resumable.
+///     RunOutcome::Cancelled { .. } => "resume when you want it to continue",
+/// }
+/// # }
+/// ```
+///
+/// Every variant carries `steps`, which is how many steps *completed* — so a
+/// `StepCapReached { steps: 12 }` and a `Success { steps: 12 }` cost the same
+/// and only one of them produced anything. For what the run actually spent, use
+/// [`RunResult::summary`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunOutcome {
     /// Verification passed. `steps` is the step it passed on.
@@ -123,6 +208,39 @@ pub enum RunOutcome {
 }
 
 /// The result of a run, including the persisted run id for audit.
+///
+/// Three things, and the `run_id` is the one that outlives the process. Every
+/// step, refusal, spawn and budget draw is in the store under it, so a run is
+/// still readable long after the program that drove it exited — and it is the
+/// handle every `resume*` entry point takes:
+///
+/// ```no_run
+/// use io_harness::{run_with, ApproveAll, OpenRouter, Policy, RunOutcome, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy) -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let result = run_with(contract, &OpenRouter::from_env()?, &store, policy, &ApproveAll).await?;
+///
+/// // What it cost and how long it took, read back from the same row an auditor
+/// // would read — so the caller and the audit cannot disagree. `None` while a
+/// // run is paused awaiting a human: there is no ending to summarise yet.
+/// if let Some(summary) = result.summary(&store)? {
+///     println!("{} tokens", summary.tokens);
+/// }
+///
+/// // Rules an approver asked to remember. The crate applied them for the rest of
+/// // this run and hands them back here; persisting them across runs is the
+/// // caller's decision, because config files are the application's to own.
+/// for rule in &result.remembered {
+///     println!("remember: {:?} {} {:?}", rule.act, rule.pattern, rule.effect);
+/// }
+///
+/// // Keep the id if the run is not finished — it is all a later process needs.
+/// if !matches!(result.outcome, RunOutcome::Success { .. }) {
+///     println!("resume run {}", result.run_id);
+/// }
+/// # Ok(()) }
+/// ```
 #[derive(Debug, Clone)]
 pub struct RunResult {
     /// Why the run stopped.
@@ -177,6 +295,42 @@ impl RunResult {
 /// `write_file` tool, retrying transient failures), apply any write, record the
 /// trace, then verify. Stops on the first passing verify, or when any budget —
 /// steps, time, or tokens — is reached.
+///
+/// The smallest thing that works, and the right entry point when the boundary is
+/// the *task* rather than a policy: one file, one tool, and a criterion the model
+/// cannot talk its way past.
+///
+/// ```no_run
+/// use io_harness::{run, OpenRouter, RunOutcome, Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let contract = TaskContract::new(
+///     "add a `hello` function returning 42",
+///     "src/hello.rs",
+///     // Execution-based: the file is compiled and this test is run against it,
+///     // so `fn hello` written as a literal string fails — which is exactly what
+///     // a model did to the cheaper `FileContains` in the 0.1.0 live run.
+///     Verification::RustTestPasses {
+///         test_src: "#[test] fn answers() { assert_eq!(hello(), 42); }".into(),
+///     },
+/// )
+/// .with_max_steps(6);
+///
+/// let result = run(&contract, &OpenRouter::from_env()?, &Store::open("runs.db")?).await?;
+/// match result.outcome {
+///     RunOutcome::Success { steps } => println!("verified in {steps} steps"),
+///     // Keep the id: the file on disk is the run's state, so a resume continues
+///     // from it rather than starting over.
+///     other => println!("{other:?} — resume run {}", result.run_id),
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// It applies [`Policy::permissive`] and approves everything, because there is no
+/// policy-aware tool layer in single-file mode — passing a real policy to
+/// [`run_with`] with a single-file contract is refused with
+/// [`Error::Config`](crate::Error::Config) rather than silently ignored. Use
+/// [`TaskContract::workspace`] and [`run_with`] as soon as a boundary matters.
 pub async fn run<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -193,6 +347,35 @@ pub async fn run<P: Provider>(
 /// signatures would have broken every caller of a 0.11.0 API to add something
 /// opt-in; a builder would have added a second way to start a run for the same
 /// reason.
+///
+/// Reach for it when a run is long enough that silence is a problem. Without an
+/// observer the only thing between "started" and "finished" is the SQLite trace,
+/// which nobody is watching while it happens:
+///
+/// ```no_run
+/// use io_harness::{run_observed, EventKind, Flow, Observer, OpenRouter, RunEvent,
+///                  Store, TaskContract};
+///
+/// /// A progress line per committed step — the boundary at which work is durable.
+/// struct Progress;
+///
+/// impl Observer for Progress {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if let EventKind::Step { decision, tokens, changed, .. } = &event.kind {
+///             let mark = if *changed { "*" } else { " " };
+///             println!("{mark} step {} ({tokens} tokens): {decision}", event.step);
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract) -> io_harness::Result<()> {
+/// run_observed(contract, &OpenRouter::from_env()?, &Store::memory()?, &Progress).await?;
+/// # Ok(()) }
+/// ```
+///
+/// Events are delivered in order, on the run's own task, so an observer that
+/// blocks holds the run up. Anything slow belongs on a channel.
 pub async fn run_observed<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -217,6 +400,46 @@ pub async fn run_observed<P: Provider>(
 /// reported to the model as a tool result it can adapt to; the refusal consumes
 /// the step, so a model that keeps retrying a denied action reaches the step cap
 /// rather than looping forever.
+///
+/// This is the entry point most callers want: a workspace, a boundary, and a
+/// human only for the grey tier.
+///
+/// ```no_run
+/// use io_harness::{run_with, OpenRouter, Policy, StdinApprover, Store, TaskContract,
+///                  Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let contract = TaskContract::workspace(
+///     "make the failing test in tests/parse.rs pass",
+///     "/path/to/repo",
+///     Verification::WorkspaceTestPasses {
+///         files: vec!["src/parse.rs".into()],
+///         test_src: "#[test] fn empty_is_err() { assert!(parse(\"\").is_err()); }".into(),
+///     },
+/// );
+///
+/// // Three tiers, and the middle one is the only one anybody is asked about.
+/// // `Policy::default()` already denies `.env`, `*.pem` and the other secret
+/// // paths outright, so those never become a question at 3am.
+/// let policy = Policy::default()
+///     .layer("app")
+///     .allow_read("*")
+///     .allow_write("src/*")     // routine, proceeds silently
+///     .deny_write("src/main.rs"); // never, and the approver is not consulted
+///
+/// // Everything else the policy marks `Ask` — a write outside src/, say —
+/// // stops here and waits, for as long as it takes.
+/// let result = run_with(
+///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, &policy, &StdinApprover,
+/// )
+/// .await?;
+/// println!("{:?}", result.outcome);
+/// # Ok(()) }
+/// ```
+///
+/// The policy is recorded against the run, so a later [`resume_from_stored_policy`]
+/// can recover the boundary this run executed under without the caller having to
+/// reconstruct it.
 pub async fn run_with<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -228,6 +451,48 @@ pub async fn run_with<P: Provider>(
 }
 
 /// [`run_with`], reporting to `observer` as it happens. See [`run_observed`].
+///
+/// The events a *policed* run adds are the ones worth watching: a refusal names
+/// the rule and layer that made it, which turns "the agent kept failing" into
+/// "one line of the ops baseline is too tight".
+///
+/// ```no_run
+/// use io_harness::{run_with_observed, ApproveAll, EventKind, Flow, Observer, OpenRouter,
+///                  Policy, RunEvent, Store, TaskContract};
+/// use std::sync::Mutex;
+///
+/// /// Collects every refusal so the operator sees which rules the task ran into,
+/// /// rather than only that it ran out of steps.
+/// #[derive(Default)]
+/// struct Friction(Mutex<Vec<String>>);
+///
+/// impl Observer for Friction {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if let EventKind::Refused { act, target, rule, layer } = &event.kind {
+///             self.0.lock().unwrap().push(format!(
+///                 "{act} {target} <- {} in {}",
+///                 rule.as_deref().unwrap_or("tier default"),
+///                 layer.as_deref().unwrap_or("-"),
+///             ));
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy) -> io_harness::Result<()> {
+/// let friction = Friction::default();
+/// run_with_observed(
+///     contract, &OpenRouter::from_env()?, &Store::memory()?, policy, &ApproveAll, &friction,
+/// )
+/// .await?;
+/// for line in friction.0.lock().unwrap().iter() {
+///     println!("refused: {line}");
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// `&self`, not `&mut self`: one observer serves a whole tree, so state goes
+/// behind a `Mutex` as above.
 pub async fn run_with_observed<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -325,6 +590,37 @@ pub async fn run_with_observed<P: Provider>(
 /// not: a permission policy, which it refuses to guess at rather than
 /// substituting one. A run with no recorded policy, which is every run
 /// checkpointed before 0.13.0, resumes exactly as it did then.
+///
+/// The shape a supervisor process wants: the run id is the only thing that has
+/// to survive the crash, and resuming twice is a no-op rather than a second run.
+///
+/// ```no_run
+/// use io_harness::{run, resume, OpenRouter, RunOutcome, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract) -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let provider = OpenRouter::from_env()?;
+///
+/// let first = run(contract, &provider, &store).await?;
+/// // ... the process is killed here, mid-step ...
+///
+/// // A crash leaves either a whole step or none of it — the trace, the budget
+/// // draw and the checkpoint commit in one transaction — so this continues from
+/// // the last committed step rather than restarting. Completed steps are
+/// // skipped, spend is restored from durable totals rather than reset, and the
+/// // time budget counts the downtime as elapsed.
+/// let again = resume(contract, &provider, &store, first.run_id).await?;
+///
+/// // Idempotent: a finished run reports its outcome instead of re-driving.
+/// if let RunOutcome::Success { steps } = again.outcome {
+///     println!("done at step {steps}");
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// It refuses a run that had a boundary — that is the point of it. Use
+/// [`resume_with`] when you hold the policy, and [`resume_from_stored_policy`]
+/// when you do not and want the one the run actually executed under.
 pub async fn resume<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -338,6 +634,37 @@ pub async fn resume<P: Provider>(
 ///
 /// A resume of an already-finished run is a no-op and reports no events: it drives
 /// nothing, so there is nothing to watch.
+///
+/// That silence is the useful signal, and it is the reason to observe a resume at
+/// all: an observer that hears nothing but `Started` and `Finished` is looking at
+/// a run that had already completed before the crash, not one that did work.
+///
+/// ```no_run
+/// use io_harness::{resume_observed, EventKind, Flow, Observer, OpenRouter, RunEvent,
+///                  Store, TaskContract};
+/// use std::sync::atomic::{AtomicU32, Ordering};
+///
+/// /// Counts only what *this* process drove. Steps committed before the crash
+/// /// are replayed from the store, not re-run, so they emit nothing.
+/// #[derive(Default)]
+/// struct DrivenHere(AtomicU32);
+///
+/// impl Observer for DrivenHere {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if matches!(event.kind, EventKind::Step { .. }) {
+///             self.0.fetch_add(1, Ordering::Relaxed);
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, run_id: i64) -> io_harness::Result<()> {
+/// let driven = DrivenHere::default();
+/// resume_observed(contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, run_id, &driven)
+///     .await?;
+/// println!("{} new steps after the restart", driven.0.load(Ordering::Relaxed));
+/// # Ok(()) }
+/// ```
 pub async fn resume_observed<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -394,6 +721,37 @@ pub async fn resume_observed<P: Provider>(
 /// [`Policy::permissive`] deliberately downgrades a run that had a boundary,
 /// which is a caller's decision to make explicitly and is exactly what [`resume`]
 /// will not do on its behalf.
+///
+/// Use it when the policy is something your program *builds* — from config it
+/// still holds, or from config that has since changed and should now apply:
+///
+/// ```no_run
+/// use io_harness::{resume_with, OpenRouter, Policy, StdinApprover, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract, run_id: i64) -> io_harness::Result<()> {
+/// // The same policy the run started under, rebuilt from the same config — plus
+/// // one deny added since, which now applies to the rest of the run. A resume is
+/// // the natural place to tighten: nothing forces the resumed run to inherit a
+/// // boundary the operator has since decided was too wide.
+/// let policy = Policy::default()
+///     .layer("app")
+///     .allow_read("*")
+///     .allow_write("src/*")
+///     .layer("incident-2026-07")
+///     .deny_write("src/billing/*");
+///
+/// resume_with(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, run_id, &policy,
+///     &StdinApprover,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+///
+/// The policy given here is recorded against the run, so the store keeps
+/// answering what the run actually executed under. If you cannot reconstruct one,
+/// do not pass [`Policy::permissive`] to get moving — use
+/// [`resume_from_stored_policy`], which reads back the real one.
 pub async fn resume_with<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -422,6 +780,39 @@ pub async fn resume_with<P: Provider>(
 /// rather than substituting a permissive one. A run whose boundary cannot be
 /// recovered is not resumed under no boundary; that substitution is exactly the
 /// defect 0.13.0 closed.
+///
+/// The entry point for a restart supervisor, which knows a run id and nothing
+/// else — it did not build the policy and has no config to rebuild it from:
+///
+/// ```no_run
+/// use io_harness::{resume_from_stored_policy, DenyAll, Error, OpenRouter, RunStatus,
+///                  Store, TaskContract};
+///
+/// # async fn sweep(contract: &TaskContract) -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let provider = OpenRouter::from_env()?;
+///
+/// for run_id in [17_i64, 18, 19] {
+///     if store.run_status(run_id)? != Some(RunStatus::Running) {
+///         continue; // already finished, or paused on a human
+///     }
+///     // No policy argument, and that is the point: the boundary comes back from
+///     // the store, so a supervisor cannot silently widen what an agent may do by
+///     // being the process that happened to restart it.
+///     match resume_from_stored_policy(contract, &provider, &store, run_id, &DenyAll).await {
+///         Ok(result) => println!("run {run_id}: {:?}", result.outcome),
+///         // Refused rather than resumed unbounded. A run whose boundary cannot
+///         // be recovered stays stopped until a human names one.
+///         Err(Error::Resume { reason }) => eprintln!("run {run_id} needs a human: {reason}"),
+///         Err(e) => return Err(e),
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// Prefer it to [`resume_with`] whenever the resuming process is not the one that
+/// wrote the policy — from 0.15.0 a crashed run may already have committed, so
+/// the boundary it was working under is not a detail that can be approximated.
 pub async fn resume_from_stored_policy<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -434,6 +825,37 @@ pub async fn resume_from_stored_policy<P: Provider>(
 
 /// [`resume_from_stored_policy`], reporting to `observer` as it happens. See
 /// [`run_observed`].
+///
+/// The one thing this combination shows that no other does: the recovered
+/// boundary in action. The caller never names the policy, so the refusals the
+/// observer reports — each attributed to its rule and layer — are the only
+/// visible evidence of which boundary came back from the store.
+///
+/// ```no_run
+/// use io_harness::{resume_from_stored_policy_observed, DenyAll, EventKind, Flow, Observer,
+///                  OpenRouter, RunEvent, Store, TaskContract};
+///
+/// /// Logs the layers the recovered policy is actually enforcing.
+/// struct RecoveredBoundary;
+///
+/// impl Observer for RecoveredBoundary {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if let EventKind::Refused { act, target, layer, .. } = &event.kind {
+///             println!("still enforcing {}: refused {act} {target}",
+///                      layer.as_deref().unwrap_or("tier default"));
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, run_id: i64) -> io_harness::Result<()> {
+/// resume_from_stored_policy_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, run_id, &DenyAll,
+///     &RecoveredBoundary,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
 pub async fn resume_from_stored_policy_observed<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -457,6 +879,48 @@ pub async fn resume_from_stored_policy_observed<P: Provider>(
 }
 
 /// [`resume_with`], reporting to `observer` as it happens. See [`run_observed`].
+///
+/// An observer can also *stop* a run, which is worth pairing with a resume
+/// because the two are the same mechanism seen from both ends: cancelling
+/// finishes a run cleanly at the next step boundary and leaves it resumable, so
+/// "stop it for now" and "carry on later" are one loop.
+///
+/// ```no_run
+/// use io_harness::{resume_with_observed, ApproveAll, EventKind, Flow, Observer, OpenRouter,
+///                  Policy, RunEvent, Store, TaskContract};
+/// use std::sync::atomic::{AtomicU64, Ordering};
+///
+/// /// Stops the run once it has spent more than the operator is willing to.
+/// struct SpendCeiling { limit: u64, spent: AtomicU64 }
+///
+/// impl Observer for SpendCeiling {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if let EventKind::Step { tokens, .. } = &event.kind {
+///             if self.spent.fetch_add(*tokens, Ordering::Relaxed) + tokens > self.limit {
+///                 // Honoured at the next step boundary, never mid-step: no tool
+///                 // call is abandoned in flight and no file is left half-written.
+///                 // The run records `cancelled` and stays resumable.
+///                 return Flow::Cancel;
+///             }
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy, run_id: i64)
+/// #     -> io_harness::Result<()> {
+/// let ceiling = SpendCeiling { limit: 50_000, spent: AtomicU64::new(0) };
+/// let result = resume_with_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, run_id, policy,
+///     &ApproveAll, &ceiling,
+/// )
+/// .await?;
+/// // `RunOutcome::Cancelled` — finished, not abandoned. Dropping the future
+/// // instead would leave `runs.status` as `running` forever, indistinguishable
+/// // from a crashed process.
+/// println!("{:?}", result.outcome);
+/// # Ok(()) }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_observed<P: Provider>(
     contract: &TaskContract,
@@ -544,6 +1008,52 @@ pub async fn resume_with_observed<P: Provider>(
 /// observation ledger. It is for a run that *paused*, though: a run that crashed
 /// has no `request_id` and no pending decision to supply, and wants
 /// [`resume_with`].
+///
+/// This is the other half of [`Decision::Defer`], and it is what makes an
+/// approval able to outlive the process that asked for it — a web app can show
+/// the pending action, close the request, and continue the run when someone
+/// clicks approve tomorrow:
+///
+/// ```no_run
+/// use io_harness::{resume_with_decision, ApproveAll, Act, Decision, OpenRouter, Policy,
+///                  Request, RunOutcome, Store, TaskContract};
+///
+/// # async fn on_click(contract: &TaskContract, policy: &Policy, request_id: i64, approved: bool)
+/// #     -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let pending = store.pending(request_id)?.expect("a pending request");
+///
+/// let decision = if approved {
+///     // Approving performs exactly what was persisted — the same target, the
+///     // same bytes the human was shown. Hand back a `modified` request to
+///     // perform something else instead; it is re-checked against the policy
+///     // first, so an approver cannot rewrite an action across a deny.
+///     Decision::Approve {
+///         modified: Some(Request::new(Act::Write, "docs/NOTES.md")
+///             .with_content(pending.content.clone().unwrap_or_default())),
+///         remember: Vec::new(),
+///     }
+/// } else {
+///     // The action never happens and the run closes as `RunOutcome::Denied`.
+///     Decision::deny("rejected in review")
+/// };
+///
+/// let result = resume_with_decision(
+///     contract, &OpenRouter::from_env()?, &store, pending.run_id, request_id, decision,
+///     policy, &ApproveAll,
+/// )
+/// .await?;
+///
+/// // Deferring again is legal and leaves it pending — the run stays paused.
+/// if let RunOutcome::AwaitingApproval { .. } = result.outcome {
+///     println!("still waiting");
+/// }
+/// # Ok(()) }
+/// ```
+///
+/// For a paused *tree*, use [`resume_tree_with_decision`]: the pending action
+/// often belongs to a child rather than the root, and only that function
+/// validates the request against the whole tree.
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_decision<P: Provider>(
     contract: &TaskContract,
@@ -563,6 +1073,41 @@ pub async fn resume_with_decision<P: Provider>(
 
 /// [`resume_with_decision`], reporting to `observer` as it happens. See
 /// [`run_observed`].
+///
+/// The event worth listening for here is
+/// [`EventKind::ApprovalDecided`](crate::EventKind::ApprovalDecided): it is the
+/// audit record that the decision a human made was the decision the run
+/// performed, which is the one claim an approval flow has to be able to prove.
+///
+/// ```no_run
+/// use io_harness::{resume_with_decision_observed, ApproveAll, Decision, EventKind, Flow,
+///                  Observer, OpenRouter, Policy, RunEvent, Store, TaskContract};
+///
+/// struct AuditTrail;
+///
+/// impl Observer for AuditTrail {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if let EventKind::ApprovalDecided { act, target, decision } = &event.kind {
+///             println!("run {} step {}: {decision} {act} {target}", event.run_id, event.step);
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy, run_id: i64, request_id: i64)
+/// #     -> io_harness::Result<()> {
+/// resume_with_decision_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, run_id, request_id,
+///     Decision::approve(), policy, &ApproveAll, &AuditTrail,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+///
+/// A re-check against the policy happens before the action, so a deny added
+/// while the run was paused still wins — in which case the observer sees a
+/// refusal rather than an approval, and the run closes as
+/// [`RunOutcome::Denied`].
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_decision_observed<P: Provider>(
     contract: &TaskContract,
@@ -755,6 +1300,35 @@ pub async fn resume_with_decision_observed<P: Provider>(
 /// [`resume_tree`] does: the root replays its (deliberately uncommitted) pause
 /// step, re-adopts the paused child, and the child continues past the
 /// now-applied action. A denial stops the tree.
+///
+/// The trap this exists to avoid: the `run_id` you pass is the tree's **root**,
+/// while `pending.run_id` is whichever agent actually asked — often three levels
+/// down. Passing the child's id to [`resume_with_decision`] resumes that child
+/// alone and orphans the tree around it.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_decision, ApproveAll, Containment, Decision, OpenRouter,
+///                  Policy, RunOutcome, Store, TaskContract};
+///
+/// # async fn decide(contract: &TaskContract, policy: &Policy, paused: RunOutcome, root_run_id: i64)
+/// #     -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let RunOutcome::AwaitingApproval { request_id, .. } = paused else { return Ok(()) };
+///
+/// // Show the human which agent in the tree is asking, not just what for.
+/// let pending = store.pending(request_id)?.expect("a pending request");
+/// println!("agent {} wants to {} {}", pending.run_id, pending.act, pending.target);
+///
+/// // The ROOT id, and the request id from anywhere in the tree. Containment is
+/// // supplied again because the resumed tree draws against one continuous
+/// // ceiling — it is restored from durable totals, never reset.
+/// resume_tree_with_decision(
+///     contract, &OpenRouter::from_env()?, &store, root_run_id, request_id,
+///     Decision::approve(), policy, &ApproveAll, &Containment::new(8, 3, 2, 400_000),
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree_with_decision<P: Provider>(
     contract: &TaskContract,
@@ -788,6 +1362,51 @@ pub async fn resume_tree_with_decision<P: Provider>(
 /// One observer watches the whole tree: every agent's events carry that agent's
 /// own `run_id` and `depth`, so a consumer routes on those rather than being
 /// handed one observer per child.
+///
+/// Which is what makes it usable here: after a tree-wide pause you want to see
+/// the deferred action land and then watch the *right* agent carry on, out of
+/// the several that resume at once.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_decision_observed, ApproveAll, Containment, Decision,
+///                  EventKind, Flow, Observer, OpenRouter, Policy, RunEvent, Store, TaskContract};
+///
+/// /// Follows one agent out of a whole tree resuming around it.
+/// struct FollowAgent { run_id: i64 }
+///
+/// impl Observer for FollowAgent {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if event.run_id != self.run_id {
+///             return Flow::Continue; // some other agent in the tree
+///         }
+///         match &event.kind {
+///             EventKind::ApprovalDecided { decision, target, .. } => {
+///                 println!("resumed on: {decision} {target}");
+///             }
+///             EventKind::Step { decision, .. } => println!("  step {}: {decision}", event.step),
+///             _ => {}
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy, root_run_id: i64, request_id: i64)
+/// #     -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// let pending = store.pending(request_id)?.expect("a pending request");
+/// let follow = FollowAgent { run_id: pending.run_id };
+///
+/// resume_tree_with_decision_observed(
+///     contract, &OpenRouter::from_env()?, &store, root_run_id, request_id,
+///     Decision::approve(), policy, &ApproveAll, &Containment::new(8, 3, 2, 400_000), &follow,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+///
+/// A [`Flow::Cancel`](crate::Flow::Cancel) from any agent's event stops the whole
+/// tree at the next boundary, not only the agent that emitted it — there is one
+/// cancellation flag per tree, as there is one approver and one ledger.
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree_with_decision_observed<P: Provider>(
     contract: &TaskContract,
@@ -1827,6 +2446,54 @@ struct Tree<'a, P: Provider> {
 ///
 /// Sub-agents are opt-in: this is the only entry point that offers the spawn
 /// tool. [`run_with`] and [`run`] are unchanged and never expose it.
+///
+/// Reach for it when a task decomposes into parts that do not have to share one
+/// agent's context — and note that the [`Containment`], not the contract, is
+/// what actually bounds the result:
+///
+/// ```no_run
+/// use io_harness::{run_tree, Containment, OpenRouter, Policy, StdinApprover, Store,
+///                  TaskContract, Verification};
+/// use std::time::Duration;
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let contract = TaskContract::workspace(
+///     "document every public module under docs/, one file per module",
+///     "/path/to/repo",
+///     Verification::WorkspaceFileContains { file: "docs/index.md".into(), needle: "##".into() },
+/// );
+///
+/// // The root's boundary, and therefore the ceiling for the entire tree: a child
+/// // inherits it through `Policy::contain` and may only narrow it, so no
+/// // descendant at any depth can write outside docs/ however its goal is worded.
+/// let policy = Policy::default()
+///     .layer("app")
+///     .allow_read("*")
+///     .allow_write("docs/*");
+///
+/// // The spend ceiling belongs here rather than on the contract, because a
+/// // spawned child's contract is written by the *model* — anything it could set
+/// // is something it could raise.
+/// let containment = Containment {
+///     max_total_agents: 12,
+///     max_concurrent: 4,   // the fan-out bound
+///     max_depth: 2,
+///     max_total_tokens: 500_000, // drawn down by the whole tree together
+///     max_total_cost: None,      // reserved and inert; bound money in tokens
+///     max_total_duration: Some(Duration::from_secs(3600)),
+/// };
+///
+/// let result = run_tree(
+///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, &policy,
+///     &StdinApprover, &containment,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+///
+/// Every spawn, refusal and budget draw is recorded against the tree, so
+/// `Store::agent_events` reconstructs who spawned whom and what each drew long
+/// after the process exited.
 pub async fn run_tree<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -1851,6 +2518,50 @@ pub async fn run_tree<P: Provider>(
 ///
 /// One observer watches the whole tree: a child's events carry that child's own
 /// `run_id` and its non-zero `depth`.
+///
+/// A tree is where an observer stops being a nicety. Children run concurrently
+/// and their output interleaves, so `depth` and `run_id` are what turn a stream
+/// of events back into a shape a person can read:
+///
+/// ```no_run
+/// use io_harness::{run_tree_observed, Containment, EventKind, Flow, Observer, OpenRouter,
+///                  Policy, RunEvent, StdinApprover, Store, TaskContract};
+///
+/// /// Indents by depth, so concurrent children are legible rather than interleaved.
+/// struct TreeLog;
+///
+/// impl Observer for TreeLog {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         let pad = "  ".repeat(event.depth as usize);
+///         match &event.kind {
+///             EventKind::Spawned { child_run_id, goal } => {
+///                 println!("{pad}+ run {child_run_id}: {goal}");
+///             }
+///             // Containment refused the spawn — the tree hit `max_total_agents`,
+///             // `max_depth` or `max_concurrent`. The parent adapts; nothing fails.
+///             EventKind::SpawnRefused { cap } => println!("{pad}! spawn refused: {cap} cap"),
+///             // What the tree has left of its ONE shared ceiling, after this draw.
+///             EventKind::SpendDraw { remaining, .. } => {
+///                 println!("{pad}  budget left: {remaining:?}");
+///             }
+///             EventKind::Step { decision, .. } => println!("{pad}  {decision}"),
+///             _ => {}
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy) -> io_harness::Result<()> {
+/// run_tree_observed(
+///     contract, &OpenRouter::from_env()?, &Store::memory()?, policy, &StdinApprover,
+///     &Containment::new(12, 4, 2, 500_000), &TreeLog,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
+///
+/// Events arrive on the run's own task and children share it, so a slow observer
+/// slows every agent in the tree, not just one.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tree_observed<P: Provider>(
     contract: &TaskContract,
@@ -1933,6 +2644,38 @@ pub async fn run_tree_observed<P: Provider>(
 /// never at risk of being dropped across a resume the way the flat workspace
 /// loop's was; since 0.13.0 every agent in the tree also restores its own
 /// observation ledger.
+///
+/// One call, whole tree — you never resume a child yourself, and the containment
+/// you pass is what the restored ledger is measured against:
+///
+/// ```no_run
+/// use io_harness::{resume_tree, Containment, OpenRouter, Policy, StdinApprover, Store,
+///                  TaskContract};
+///
+/// # async fn after_crash(contract: &TaskContract, policy: &Policy, root_run_id: i64)
+/// #     -> io_harness::Result<()> {
+/// // The SAME ceiling the tree started under. The ledger is rebuilt from the
+/// // tree's durable total spend, so a tree that had already used 400k of 500k
+/// // resumes with 100k left — pass a fresh, larger number and you have raised the
+/// // ceiling, not restored it.
+/// let containment = Containment::new(12, 4, 2, 500_000);
+///
+/// // The root's run id. Children are re-adopted from the store as the root
+/// // replays its crashed step, each continuing from its own checkpoint.
+/// let result = resume_tree(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, root_run_id, policy,
+///     &StdinApprover, &containment,
+/// )
+/// .await?;
+/// println!("{:?}", result.outcome);
+/// # Ok(()) }
+/// ```
+///
+/// One caveat worth knowing before you choose this over
+/// [`resume_tree_from_stored_policy`]: `run_tree` and the two flat loops record
+/// the caller's policy against the run, and this function does not — so a tree
+/// resumed here under a widened policy leaves an audit that understates what was
+/// permitted.
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree<P: Provider>(
     contract: &TaskContract,
@@ -1957,6 +2700,42 @@ pub async fn resume_tree<P: Provider>(
 }
 
 /// [`resume_tree`], reporting to `observer` as it happens. See [`run_observed`].
+///
+/// What this shows that a fresh [`run_tree_observed`] cannot: how much of the
+/// tree was already done. Adopted children emit nothing for the steps they
+/// committed before the crash, so the events that do arrive are exactly the work
+/// this process is driving.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_observed, ApproveAll, Containment, EventKind, Flow, Observer,
+///                  OpenRouter, Policy, RunEvent, Store, TaskContract};
+/// use std::collections::BTreeSet;
+/// use std::sync::Mutex;
+///
+/// /// Which agents in the tree still had work left after the restart.
+/// #[derive(Default)]
+/// struct StillWorking(Mutex<BTreeSet<i64>>);
+///
+/// impl Observer for StillWorking {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if matches!(event.kind, EventKind::Step { .. }) {
+///             self.0.lock().unwrap().insert(event.run_id);
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, policy: &Policy, root_run_id: i64)
+/// #     -> io_harness::Result<()> {
+/// let working = StillWorking::default();
+/// resume_tree_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, root_run_id, policy,
+///     &ApproveAll, &Containment::new(12, 4, 2, 500_000), &working,
+/// )
+/// .await?;
+/// println!("{:?} had steps left", working.0.lock().unwrap());
+/// # Ok(()) }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree_observed<P: Provider>(
     contract: &TaskContract,
@@ -2057,6 +2836,37 @@ pub async fn resume_tree_observed<P: Provider>(
 /// every child inherits the root's policy through [`Policy::contain`], so a
 /// guessed-at root boundary is guessed at for the whole tree, which may already
 /// have taken an irreversible action under the real one.
+///
+/// Prefer it to [`resume_tree`] whenever the boundary matters, and not only
+/// because you might get the policy wrong: it is also the only tree resume that
+/// leaves an accurate audit. `resume_tree` does not call `record_run_policy`, so
+/// a tree resumed there under a different policy keeps reporting the one it
+/// started with; this one reads that row back rather than writing over it.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_from_stored_policy, Containment, DenyAll, Error, OpenRouter,
+///                  Store, TaskContract};
+///
+/// # async fn supervisor(contract: &TaskContract, root_run_id: i64) -> io_harness::Result<()> {
+/// // No policy argument. A process that comes up after a crash in another
+/// // process has nothing to reconstruct one from, and guessing here would guess
+/// // for every agent in the tree at once.
+/// let resumed = resume_tree_from_stored_policy(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, root_run_id, &DenyAll,
+///     &Containment::new(12, 4, 2, 500_000),
+/// )
+/// .await;
+///
+/// match resumed {
+///     Ok(result) => println!("{:?}", result.outcome),
+///     // No recorded policy — a tree checkpointed by 0.12.0 or earlier. It stays
+///     // stopped rather than resuming unbounded; a human names the boundary and
+///     // uses `resume_tree`.
+///     Err(Error::Resume { reason }) => eprintln!("cannot recover the boundary: {reason}"),
+///     Err(e) => return Err(e),
+/// }
+/// # Ok(()) }
+/// ```
 pub async fn resume_tree_from_stored_policy<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -2079,6 +2889,40 @@ pub async fn resume_tree_from_stored_policy<P: Provider>(
 
 /// [`resume_tree_from_stored_policy`], reporting to `observer` as it happens. See
 /// [`run_observed`].
+///
+/// The combination an unattended supervisor actually wants: recover the boundary
+/// from the store, resume the whole tree, and keep a live handle on it — because
+/// a tree resumed by a process nobody is watching should still be stoppable.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_from_stored_policy_observed, Containment, DenyAll, EventKind,
+///                  Flow, Observer, OpenRouter, RunEvent, Store, TaskContract};
+/// use std::sync::atomic::{AtomicBool, Ordering};
+///
+/// /// Logs the recovered boundary doing its job, and stops the tree on request.
+/// struct Supervised { stop: AtomicBool }
+///
+/// impl Observer for Supervised {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if let EventKind::Refused { act, target, layer, .. } = &event.kind {
+///             println!("agent {} refused {act} {target} ({})",
+///                      event.run_id, layer.as_deref().unwrap_or("tier default"));
+///         }
+///         // One flag for the whole tree: cancelling from any agent's event stops
+///         // every agent at its next step boundary, and the tree stays resumable.
+///         if self.stop.load(Ordering::Relaxed) { Flow::Cancel } else { Flow::Continue }
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, root_run_id: i64) -> io_harness::Result<()> {
+/// let supervised = Supervised { stop: AtomicBool::new(false) };
+/// resume_tree_from_stored_policy_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, root_run_id, &DenyAll,
+///     &Containment::new(12, 4, 2, 500_000), &supervised,
+/// )
+/// .await?;
+/// # Ok(()) }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree_from_stored_policy_observed<P: Provider>(
     contract: &TaskContract,

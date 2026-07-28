@@ -62,16 +62,88 @@ use crate::state::{PolicyEvent, SandboxEvent, Store};
 /// exited 0. An agent found the first of these unprompted during io-cli 0.1.0's
 /// live runs (see `iterations/US-IO-HARNESS-0.8.0-I01`).
 ///
-/// The subject is now compiled as its own crate and the criterion compiles
-/// *against* it, with the prelude macros a criterion is likely to invoke
-/// explicitly re-imported so an exported macro cannot capture them. A subject can
-/// no longer redefine or delete what the criterion names. `test_src` is unchanged
-/// — it still calls the subject's items unqualified, and a macro the subject
-/// legitimately exports still reaches it.
+/// The subject and the criterion are still compiled as **one crate** — that is
+/// deliberate and is not the fix. Making the subject a separate crate was tried
+/// during 0.8.1 development and abandoned: privacy is a wall between crates, so
+/// an ordinary non-`pub` implementation began failing a gate it had always
+/// passed, and a passing implementation is allowed to be private. What changed
+/// is where the criterion sits inside that crate. It is appended in a child
+/// module that opens with `use super::*` — so `test_src` still calls the
+/// subject's items unqualified, private ones included — and that re-imports the
+/// prelude macros a criterion is likely to invoke *explicitly*. A subject
+/// defining `macro_rules! assert` now makes the name ambiguous (rustc E0659) and
+/// the gate fails to compile, rather than capturing it and passing an impossible
+/// criterion. A macro the subject exports under any other name still reaches the
+/// criterion through the glob.
+///
+/// The deletion attack is caught elsewhere, because one crate cannot catch it:
+/// the subject is separately compiled to an rlib with a probe item appended, and
+/// a second tiny crate is type-checked against that rlib. A subject that strips
+/// its own contents strips the probe too, and the reference fails to resolve.
+/// That separate subject compile is *not* what the criterion compiles against —
+/// its purposes are classifying an ordinary "this file does not compile" failure
+/// and hosting the probe.
 ///
 /// This is a boundary against the file under verification, not against a hostile
 /// author with other tools. Verification runs the produced code, so it remains
 /// governed by the exec [`Policy`] and the 0.6.0 sandbox.
+///
+/// # Choosing one
+///
+/// A criterion is a field of the [`TaskContract`](crate::TaskContract), so the
+/// run has a definition of done before the model is asked anything:
+///
+/// ```
+/// use io_harness::{TaskContract, Verification};
+/// use std::time::Duration;
+///
+/// // Execution-based, and the pair a repository task normally wants: the listed
+/// // files are concatenated and compiled together, then `test_src` is compiled
+/// // beside them and run. "Together" is the point — each file compiling on its
+/// // own (`EachCompilesRust`) would not catch a caller updated out of step with
+/// // the function it calls.
+/// let contract = TaskContract::workspace(
+///     "make `parse` reject an empty input instead of panicking",
+///     "/path/to/repo",
+///     Verification::WorkspaceTestPasses {
+///         files: vec!["src/parse.rs".into(), "src/lib.rs".into()],
+///         test_src: r#"
+///             #[test]
+///             fn empty_input_is_an_error() {
+///                 assert!(parse("").is_err());
+///             }
+///         "#
+///         .into(),
+///     },
+/// )
+/// .with_time_budget(Duration::from_secs(600));
+///
+/// // A pass proves this criterion was satisfied under the harness's compile and
+/// // run — nothing wider. `parse` is silent about everything else in the repo,
+/// // and a criterion is the only thing the gate can check.
+/// // https://github.com/initorigin/io-harness/blob/main/docs/guide/verification.md
+/// # let _ = contract;
+/// ```
+///
+/// The content variants are the weak tier and exist for outcomes that genuinely
+/// *are* about text. They cannot lie about what a file says and cannot confirm
+/// it works — a model satisfied `FileContains("fn hello")` in the 0.1.0 live run
+/// by writing that literal string, which does not compile:
+///
+/// ```
+/// use io_harness::Verification;
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let cheap = Verification::FileContains("fn hello".into());
+/// // Both of these pass. Only one of them is a program.
+/// assert!(cheap.passes("src/hello.rs".as_ref(), "pub fn hello() -> u32 { 42 }").await?);
+/// assert!(cheap.passes("src/hello.rs".as_ref(), "fn hello").await?);
+///
+/// // `CompilesRust` fails the second: a substring stub does not type-check, and
+/// // since 0.8.1 a file that deletes its own items with `#![cfg(any())]` fails
+/// // too rather than compiling clean on nothing.
+/// # Ok(()) }
+/// ```
 #[derive(Debug, Clone)]
 pub enum Verification {
     /// The file's contents must contain this text. Cheap, but gameable — a
@@ -177,6 +249,43 @@ pub enum Verification {
 /// Verification cannot prompt — there is no approver on this path — so a
 /// command is spawned only when the policy explicitly *allows* it. Anything
 /// else, including [`Effect::Ask`], is refused.
+///
+/// A run builds one of these for you. Build it yourself to check a criterion
+/// outside a run — a CI step re-verifying what an agent produced, say — under
+/// the boundary the agent itself worked under:
+///
+/// ```
+/// use io_harness::{ExecGuard, Policy, Verification, TEST_BINARY};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// // Compile-only: `rustc` may run, the produced test binary may not. The gate
+/// // type-checks the criterion against the code and never executes it, which is
+/// // what you want when the code came from a model and this host is not a sandbox
+/// // you are willing to lose.
+/// let policy = Policy::permissive()
+///     .layer("verify")
+///     .allow_exec("rustc")
+///     .deny_exec(TEST_BINARY);
+///
+/// let criterion = Verification::RustTestPasses {
+///     test_src: "#[test] fn it_answers() { assert_eq!(hello(), 42); }".into(),
+/// };
+/// // An allow the policy does not give is `Error::Refused`, not a silent skip —
+/// // a verification that was refused is not one that ran and failed.
+/// let outcome = criterion
+///     .passes_guarded(
+///         "src/hello.rs".as_ref(),
+///         "pub fn hello() -> u32 { 42 }",
+///         &ExecGuard::new(&policy),
+///     )
+///     .await;
+/// assert!(matches!(outcome, Err(io_harness::Error::Refused { .. })));
+/// # Ok(()) }
+/// ```
+///
+/// [`ExecGuard::tracing`] additionally writes every spawn's full argv against a
+/// run id, and [`ExecGuard::no_sandbox`] opts back to direct host execution —
+/// the sandbox is the default.
 pub struct ExecGuard<'a> {
     policy: &'a Policy,
     trace: Option<(&'a Store, i64, u32)>,
@@ -385,6 +494,30 @@ impl<'a> ExecGuard<'a> {
 /// The logical name of the test binary verification builds and runs. Denying it
 /// while allowing `rustc` gives compile-only verification: the produced code is
 /// type-checked but never executed.
+///
+/// It is a placeholder, not a path — the real binary lives in a temp dir with a
+/// name the caller never sees, so there is nothing else to write a rule against.
+/// The one thing to do with it is decide whether model-produced code may run on
+/// this host at all:
+///
+/// ```
+/// use io_harness::{Act, Effect, Policy, TEST_BINARY};
+///
+/// // The tier `Policy::default()` ships: both spawns allowed by name, so the
+/// // execution gate works out of the box.
+/// assert_eq!(Policy::default().check(Act::Exec, TEST_BINARY).effect, Effect::Allow);
+///
+/// // Type-check but never execute. A deny beats an allow in any layer, so this
+/// // holds however permissive the layers beneath it are — which is what makes it
+/// // usable as an operator-level base under an app's own policy.
+/// let compile_only = Policy::default().layer("no-execution").deny_exec(TEST_BINARY);
+/// assert_eq!(compile_only.check(Act::Exec, "rustc").effect, Effect::Allow);
+/// assert_eq!(compile_only.check(Act::Exec, TEST_BINARY).effect, Effect::Deny);
+/// ```
+///
+/// The refusal is [`Error::Refused`], reported to the caller rather than folded
+/// into "the gate did not pass" — a criterion that was refused is not one that
+/// ran and failed.
 pub const TEST_BINARY: &str = "<test-binary>";
 
 impl Verification {
