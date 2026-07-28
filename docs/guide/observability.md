@@ -1,0 +1,424 @@
+# Observability and replay
+
+Observability is the live and after-the-fact view of a run: an observer that is
+called as things happen, a one-row summary of what a finished run cost, and a
+recorded provider that lets the same case run again and get the same answers.
+
+Three surfaces, in the order you reach for them:
+
+| Surface | When | What it answers |
+| --- | --- | --- |
+| [`Observer`](#watching-a-run-while-it-happens) | during the run | What is it doing *right now* |
+| [`RunSummary`](#what-a-finished-run-cost) | after the run | Did it work, how many steps, what did it spend, how long |
+| [`Record`/`Replay`](#recording-and-replaying-a-run) | across runs | Run this exact case again and get the same answers |
+
+## Watching a run while it happens
+
+Everything a run does is durable in the trace and readable *afterwards*. That is
+not enough for a run designed to last hours: an application that wanted to show
+progress had to open the SQLite file with a second connection and poll it,
+against a schema the crate never promised. Register an `Observer` instead and the
+run calls it as things happen.
+
+```rust
+use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
+
+struct Printer;
+
+impl Observer for Printer {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if let EventKind::Step { decision, tokens, .. } = &event.kind {
+            println!("step {} — {decision} ({tokens} tokens)", event.step);
+        }
+        Flow::Continue
+    }
+}
+```
+
+Every entry point has an **observed twin** that takes the observer last —
+`run_observed`, `run_with_observed`, `resume_observed`, `resume_with_observed`,
+`resume_from_stored_policy_observed`, `resume_with_decision_observed`,
+`run_tree_observed`, `resume_tree_observed`,
+`resume_tree_from_stored_policy_observed`, `resume_tree_with_decision_observed`.
+They are separate functions rather than an extra parameter, so nothing a caller
+already wrote had to change: the unobserved originals *are* the observed twins,
+called with an observer that watches nothing.
+
+```rust
+use io_harness::{run_with_observed, ApproveAll, Policy, Store};
+
+let result = run_with_observed(
+    &contract, &provider, &store, &policy, &ApproveAll, &Printer,
+).await?;
+```
+
+An observer does not change the run. A watched run and an unwatched one make the
+same number of provider calls, commit the same steps with the same decisions and
+token counts, and reach the same outcome — that is asserted in `tests/observe.rs`
+by running the same case twice and comparing the two traces, not assumed.
+
+### The event shape
+
+```rust
+pub struct RunEvent {
+    pub run_id: i64,   // the *agent's* own run id; a child has its own
+    pub step: u32,     // 0 for anything before the first step
+    pub depth: u32,    // 0 for a single run or a tree's root
+    pub kind: EventKind,
+}
+```
+
+The common fields sit on `RunEvent` rather than on every variant, so a consumer
+can route on `run_id`/`depth` without matching the payload first. In a
+[composed tree](composition.md) that is what lets one observer over the whole
+tree tell who is doing what: a child's events carry the child's own run id and a
+non-zero depth.
+
+### The event kinds
+
+`EventKind` is one enum with one `Observer` method rather than a method per kind,
+so adding a kind is a new variant a consumer ignores with a `_` arm instead of a
+new trait method every implementer inherits.
+
+| Variant | Emitted when |
+| --- | --- |
+| `Started { goal, provider }` | Once, before the first step |
+| `Step { decision, tool_call, tokens, changed }` | A step completed and was committed |
+| `ToolCall { name, target }` | A tool was invoked, before its result is known |
+| `Refused { act, target, rule, layer }` | The policy refused an action — it did not happen |
+| `ApprovalRequested { act, target }` | A sensitive action stopped to ask a human; the run is waiting |
+| `ApprovalDecided { act, target, decision }` | A human answered: `approve`, `deny` or `defer` |
+| `SpendDraw { tokens, remaining }` | A step's tokens were drawn against a tree's shared ceiling |
+| `Retry { kind, attempt, delay_ms }` | A provider call failed retryably and will be retried |
+| `FellBackTo { provider }` | A `Fallback` provider fell over, and this is who answered |
+| `Replan { window }` | The agent changed nothing for a while and was told once to try something else |
+| `Stalled` | It had already been told and is still going in circles. Terminal |
+| `Spawned { child_run_id, goal }` | A sub-agent was started |
+| `SpawnRefused { cap }` | A spawn was refused by containment — `agents`, `depth` or `concurrency` |
+| `MemoryWrote { key }` | The agent wrote to durable cross-run memory |
+| `Sandbox { kind, backend }` | `create`, `exec`, `cap_hit`, `destroy` or `gate_phase_failed` |
+| `Mcp { server, tool, ok, millis }` | An MCP server was reached, or one of its tools called |
+| `Finished { outcome, steps, tokens }` | Once, last |
+
+Every variant reports something the trace already records. The event stream added
+no new facts about a run — it added a way to see them while the run is still
+going.
+
+`Sandbox { kind: "gate_phase_failed", .. }` is how a verification gate's failing
+phase reaches a watcher live; see [Verification](verification.md#if-a-run-stopped-passing-at-081).
+
+### Which surface is authoritative
+
+**The trace is.** An event is a notification that something happened, not the
+record of it: the durable row is what a resume, an audit and an evaluation all
+read. If an event and the trace ever disagree, the trace is right and the event
+is a bug.
+
+One event does not mean one committed row. A step is committed inside a
+transaction and its `Step` event is emitted after that transaction succeeds — but
+a retry emits a `Retry` having written a row of its own under the *same* step
+number, and a sub-agent step that pauses because one of its children deferred is
+deliberately left uncommitted so a resume replays it. Count events if you want to
+show activity; read the store if you need to know what is durable.
+
+### Ordering, timing and failure
+
+Events arrive in the order the run produces them, **synchronously, on the task
+driving the run**. `Observer::event` is therefore on the run's critical path: a
+slow observer slows the run down. Do the minimum — push to a queue, send on a
+channel — and do the work elsewhere.
+
+`Observer::event` returns no `Result` on purpose. An observer is a spectator, and
+a run must not fail because something watching it did. If your observer can fail,
+absorb the failure and report it out of band.
+
+A *panic* is different. `event` is called on the run's own task, so a panicking
+observer takes the run's future with it and leaves the run row `running`. Do not
+panic in an observer.
+
+The trait is `Send + Sync` with `&self` methods, held as `&dyn Observer` — shaped
+after `Approver`, the crate's other inversion-of-control point. `&self` rather
+than `&mut self` is not a style choice: a tree runs up to `max_concurrent`
+children as concurrent futures on one task, and a `&mut self` observer could not
+be shared between them. Keep whatever state you need behind a `Mutex`, an atomic,
+or a channel.
+
+### Forwarding events to another process
+
+Every event serialises, because the process driving a run is often not the
+process showing it to a person. A host can forward an event as JSON to a user
+interface written in another language without hand-writing a mapping. The wire
+shape is flat and tagged:
+
+```json
+{"run_id": 1, "step": 3, "depth": 0, "event": "step",
+ "decision": "wrote src/a.rs", "tool_call": "write_file:{…}",
+ "tokens": 412, "changed": true}
+```
+
+Flat, so a consumer reads one object rather than a nested one; tagged on `event`,
+with a distinct tag per variant, so a consumer can dispatch without guessing.
+Both properties are pinned by tests in `src/observe.rs` — including one that
+fails to compile if a variant is added without being covered — because this is a
+wire contract, not an internal detail.
+
+### Stopping a run from outside it
+
+`Observer::event` returns `Flow`. Returning `Flow::Cancel` is the only supported
+way to stop a run from outside: before it existed, a caller's only option was to
+drop the run's future, which abandoned it mid-step and left `runs.status` as
+`running` forever, indistinguishable from a crashed process.
+
+```rust
+use io_harness::observe::{Flow, Observer, RunEvent};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+struct StopWhenAsked(AtomicBool);
+
+impl Observer for StopWhenAsked {
+    fn event(&self, _event: &RunEvent) -> Flow {
+        if self.0.load(Ordering::SeqCst) { Flow::Cancel } else { Flow::Continue }
+    }
+}
+```
+
+Cancellation is honoured **at the next step boundary**, not immediately: the
+points in between are not safe to stop at — a tool call is mid-flight, a file may
+be half-written, a child may be running. The run finishes the step it is on,
+records `cancelled`, and returns `RunOutcome::Cancelled { steps }`. The step
+after the cancellation is never started, so the provider is not called again.
+
+A cancelled run is **finished, not abandoned**: `runs.status` is `completed`, the
+ending is announced as a `Finished` event like any other, and the run stays
+resumable. Resuming it reports `RunOutcome::Cancelled` again and drives nothing —
+no provider call, and no events, because a resume that drives nothing has nothing
+to report.
+
+`Ignore` is the observer that watches nothing, and the default when a caller
+registers none. It exists so the run has one code path rather than an
+`Option<&dyn Observer>` threaded through every call site.
+
+## What a finished run cost
+
+`Store::run_summary` returns one row per finished run: did it work, how many
+steps, what did it spend, how long did it take.
+
+```rust
+let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+
+if let Some(s) = result.summary(&store)? {
+    println!(
+        "{}: success={} steps={} tokens={} in {:?}ms",
+        s.outcome, s.success, s.steps, s.tokens, s.duration_ms,
+    );
+}
+```
+
+`RunResult::summary` is a method that reads the store rather than a field filled
+at each return site — so the caller and an auditor see the same row by
+construction, and the endings that return `Err` and never build a `RunResult` at
+all still get a summary.
+
+| Field | What it is |
+| --- | --- |
+| `run_id` | The run this describes |
+| `outcome` | The raw outcome string, as written to `runs.outcome` |
+| `success` | True for exactly one outcome — `success` |
+| `steps` | Steps completed, as `MAX(step)` |
+| `tokens` | Tokens spent, summed from committed steps |
+| `duration_ms` | Wall-clock milliseconds from start to end; `None` for a run started before 0.7.0 |
+| `finished_at` | When the run ended, from the database clock |
+
+Each field is there because assembling it by hand was either hard or impossible:
+
+- **`success`** meant knowing which of eleven free-text outcome strings is the
+  good one. Exactly one is. Every other ending — including the ones that are
+  nobody's fault, like a rate-limited provider — is the task not being done.
+  `outcome` is kept alongside `success` rather than replaced by it: the string
+  says *which* ending, the flag says whether it was the good one, and collapsing
+  them would throw away the difference between a step cap, a stall and a human's
+  refusal.
+- **`steps`** meant knowing that `MAX(step)` is the step count and `COUNT(*)` is
+  not, because a retry writes a row under the same step number. For a
+  [tree](composition.md) this is the *root* agent's step count; each agent has
+  its own summary.
+- **`tokens`** is tokens, not money. A provider reports usage and never a price,
+  so the crate has nothing to convert with.
+- **`duration_ms`** was simply unavailable: nothing recorded when a run ended,
+  and `Store::elapsed_secs` measures against `now`, so it keeps growing after the
+  run is over. It includes time the process was not running — a run that crashed
+  at midnight and resumed at nine counts the nine hours, because that is how long
+  the run took.
+
+`RunSummary` serialises, so a scoring tool can store or ship it without restating
+the shape.
+
+**A missing summary is reported as absent, never as a row of zeroes**, which
+would be indistinguishable from a run that did nothing. Three cases return
+`None`: a run that has not finished; a run **paused awaiting a human**, which has
+not ended and will be resumed; and a run finished by a pre-0.12.0 binary. When a
+paused run resumes and really ends, it gets its summary then, describing the
+whole run. `finish_run` is reachable more than once for one run, and the last
+ending is the true one — the summary is replaced, not duplicated.
+
+## Recording and replaying a run
+
+`Record` wraps a real provider, forwards every call to it, and keeps the request
+paired with the response it produced. `Replay` is a `Provider` with no provider
+behind it: it loads a recording and answers from it.
+
+```rust
+use io_harness::provider::{Record, Replay};
+use io_harness::{run, OpenRouter, Store};
+
+// Record.
+let provider = Record::new(OpenRouter::from_env()?);
+let live = run(&contract, &provider, &Store::memory()?).await?;
+provider.save("recording.json")?;
+
+// Replay — no network, no key, no socket.
+let replay = Replay::load("recording.json")?;
+let again = run(&contract, &replay, &Store::memory()?).await?;
+assert_eq!(again.outcome, live.outcome);
+```
+
+`Record::save` is callable mid-run and repeatedly: it snapshots rather than
+drains, so a long run can checkpoint its recording and still record more. It
+forwards `name`, `endpoint`, `endpoints`, `last_served` and `accepts_images` to
+the provider it wraps — a recorder is not a provider anyone chose, and a wrapper
+that reported fewer hosts than it can reach would be a way past an egress
+[policy](mcp-and-network.md) that never saw them.
+
+`Replay::endpoint` is `None`, so a run driven by a replay opens no socket and
+needs no egress grant to do so.
+
+### Why a file rather than the store
+
+The step trace already records something per step, and it is not enough:
+
+- the step row keeps `CompletionResponse::text` only when there were no tool
+  calls, so the commentary a model emits alongside a call is dropped;
+- it keeps `Usage::total_tokens` and discards the prompt/completion split;
+- it flattens the calls into `"name:{json}"` joined with `" | "`, which any `|`
+  inside an argument silently corrupts.
+
+Nor could it be fixed by writing more columns. `Provider::complete` is RPITIT and
+its future must be `Send`; `rusqlite::Connection` is `Send + !Sync`, so a
+`&Store` captured across the inner provider's `.await` makes the future
+non-`Send` and the trait bound fails. A recorder therefore cannot hold a store,
+and the recording goes to a plain file — pretty-printed JSON, because a recording
+is a fixture a human reads and diffs.
+
+### How a request finds its answer
+
+By its **content** — `system`, `user` and `tools`, which is the whole of a
+`CompletionRequest` — and never by a call counter.
+
+Every scripted mock keyed on an `AtomicUsize` is resume-unsafe for the same
+reason: resume re-runs the step that was in flight when the process died, that
+step calls `complete` again, and a counter-keyed script hands it the response
+meant for the *next* step. The run then continues from a script one place ahead
+of itself, silently. Content-keying makes the re-ask return what the first ask
+returned, because it is the same question.
+
+The lookup key is the JSON of the whole request rather than a hash, so a mismatch
+can be read by a human debugging a divergence, and rather than a hand-rolled
+concatenation, so no separator can be forged by a prompt containing it.
+
+### What a replay guarantees
+
+- **Same request, same answer.** The same request asked any number of times gets
+  the same response, unless a *different* request is asked in between and the
+  recording holds more than one answer for it. A re-run step is therefore
+  reproducible.
+- **A missing recording is loud.** A request the recording never saw is
+  `Error::Provider` of kind `ProviderErrorKind::Request` — non-retryable — rather
+  than a default response. Non-retryable on purpose: the same request will be
+  missing next time too, so a retry burns the budget to reach the same place.
+  `CompletionResponse::default()` reads exactly like "the model chose not to call
+  a tool", so a silent default would make a diverged replay look like a
+  successful one.
+- **A recording is refused across a release series.** The recording carries the
+  io-harness version that wrote it. A recording from another `major.minor` is a
+  typed `Error::Config`, because a build whose request or response shape changed
+  would replay something other than what was recorded. Patch releases are
+  accepted.
+
+### What a replay does not guarantee
+
+- **Anything about a diverged prompt.** The key is the exact request text, so a
+  replay must be driven against the same contract and the same workspace state as
+  the recording. A goal reworded, a fixture file edited, or a step that reads a
+  file the previous replay left different produces a request that was never
+  recorded — reported as a missing recording, not silently absorbed.
+- **Duplicate requests across a process restart.** A recording that answered one
+  identical request differently twice is served in recorded order, tracked in
+  memory. A resume in a *new* process starts that tracking over, so a re-run step
+  whose request duplicates an earlier step's gets the earlier answer. Only
+  identical requests are affected: a run's prompt carries its observations, so
+  consecutive steps normally differ.
+- **Ordering beyond what was recorded.** Once a key's recorded answers are
+  exhausted, the last one is served again for every further ask. The stated
+  guarantee is same-request-same-answer, and a request recorded once must still
+  be answerable twice.
+- **Failures.** `Error` is not serialisable, and a recorded failure would be a
+  recorded *decision* about retry and fall-over rather than an answer. Only
+  successful completions are recorded, so replaying a run whose provider failed
+  reports a missing recording for that request rather than reproducing the
+  failure. See [Resilience](resilience.md) for how failures are classified live.
+
+## Two runs of one case, compared
+
+`Store::canonical_trace` reduces a run's trace to the part that two identical runs
+must match, as diffable text. It is the crate's definition of "the same run
+twice", and it exists because equality could not be row identity: `steps` has no
+`UNIQUE(run_id, step)` and a retry inserts its own row under the step number the
+eventual commit will reuse, so comparing rows compares trace entries rather than
+agent behaviour.
+
+```rust
+use io_harness::provider::Replay;
+
+let mut traces = Vec::new();
+for _ in 0..2 {
+    let store = Store::memory()?;              // a FRESH store each time
+    let provider = Replay::load("recording.json")?;
+    let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+    traces.push(store.canonical_trace(result.run_id)?);
+}
+assert_eq!(traces[0], traces[1]);
+```
+
+**What is compared:** every `steps` row — step number, decision, result, prompt,
+tool call and tokens — and every `context_events` row's step, kind and detail.
+Between them these are what the agent was shown, what it decided, what it did,
+and what that cost.
+
+**What is excluded, and why:** everything whose value is a fact about *this*
+execution rather than about the run — wall-clock stamps (`runs.started_at`,
+`memory.created_at`, `run_outcomes.finished_at` and `duration_ms`),
+`mcp_events.millis`, `sandbox_events.detail` (it carries an argv containing an
+ephemeral tempdir path), and run and child ids (`AUTOINCREMENT` values, meaningful
+only within one store). Excluding a field is a decision that the crate cannot
+promise it, not a convenience; a comparison that quietly excludes what it cannot
+match is a comparison that asserts nothing.
+
+**What it assumes:** that each run being compared has its **own fresh store**.
+Run ids are excluded from the text, but a child agent's run id is embedded in the
+parent's composed observation (`[child 5 "goal" -> …]`), which is real content the
+model was shown. In a fresh store those ids start at 1 and are allocated in spawn
+order, so they match; in a shared store the second run's ids are higher and the
+traces differ for a reason that has nothing to do with the agent.
+
+Deterministic replay also requires the provider to answer identically — that is
+what `Replay` is for — and the same workspace state to start from.
+
+## See also
+
+- [Durable runs](durable-runs.md) — the trace, checkpoints and resume the events report on
+- [Agent composition](composition.md) — `depth`, child run ids, and the shared spend ledger
+- [Resilience](resilience.md) — what `Retry`, `FellBackTo`, `Replan` and `Stalled` mean
+- [Verification](verification.md) — the gate phases that arrive as `Sandbox` events
+- [Permissions and approval](permissions.md) — what `Refused`, `ApprovalRequested` and `ApprovalDecided` report
+- [The contract](../CONTRACT.md) — the crate's stability and API promises
+- [README](../../README.md)

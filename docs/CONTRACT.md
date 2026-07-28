@@ -134,7 +134,34 @@ program's privileges; a stdio MCP server is a separate process that, once
 started, dials what it likes. The harness decides what starts, not what a started
 thing then does.
 
+**A registered tool can be silently shadowed.** `Toolbox` rejects a tool that
+takes the name of a built-in, but the reserved set names only the original
+seven — `write_file`, `read_file`, `grep`, `find`, `read_skill`, `remember`,
+`spawn_agent`. The built-ins added since — the git, image and document tools —
+are not in it, while dispatch tests every built-in arm *before* it reaches the
+toolbox. So registering a tool called `git_status` or `xlsx_read` passes
+validation and is then permanently unreachable: the built-in answers every call.
+This is the exact silent shadowing the reserved set exists to prevent. Until it
+is closed, do not name a registered tool after any built-in.
+
 **Windows resource caps.** See the platform table above.
+
+**`SandboxLimits::max_processes` is enforced by nothing**, on any platform. It is
+deliberately not mapped to `RLIMIT_NPROC`, which is per-real-uid and would
+throttle the operator's own login session rather than the sandbox; the two
+backends that could scope it properly — the Linux pid-namespace active-process
+limit and the Windows Job Object — are not wired up. Setting it changes nothing.
+
+**No seccomp filter is installed.** The Linux backend is namespaces and rlimits.
+Whatever syscall restriction applies is the kernel's own default under an
+unprivileged user namespace, not a filter this crate installed.
+
+**A native backend can silently become the floor.** `select` chooses its
+candidate at compile time, and a backend whose primitive is unavailable at
+runtime degrades to the portable floor — this is live on Ubuntu 24.04, where
+`apparmor_restrict_unprivileged_userns=1` makes every `unshare` fail. It reports
+the floor honestly in the returned `Selected`, so read that value rather than
+assuming the platform's native backend is what ran.
 
 **What the trace says a tree ran under.** `run_tree` and the single-file and
 workspace loops record the policy they execute under, so the store answers "what
