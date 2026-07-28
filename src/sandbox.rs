@@ -9,7 +9,7 @@
 //!
 //! The sandbox is both **OS-native** and **OS-neutral**. One trait,
 //! [`Sandbox`], has a native backend per platform — macOS `sandbox-exec` and
-//! Linux namespaces + seccomp; Windows is still the floor (its Job Object is
+//! Linux namespaces; Windows is still the floor (its Job Object is
 //! unimplemented) — over a [portable floor](FloorSandbox) (fresh subprocess,
 //! ephemeral tempdir, resource caps, network env stripped) that compiles and runs
 //! on all three, so isolation is never *absent* on any OS the crate builds for.
@@ -20,13 +20,17 @@
 //! ## Backend isolation strength (documented, not hidden)
 //!
 //! - **macOS `sandbox-exec`** — a generated profile confines filesystem writes
-//!   to the workdir and denies network; `setrlimit` caps CPU/procs/fds; memory is
-//!   capped by an RSS monitor (macOS does not enforce `RLIMIT_AS`/`RLIMIT_DATA`).
+//!   to the workdir and denies network; `setrlimit` caps CPU time and open file
+//!   descriptors; memory is capped by an RSS monitor (macOS does not enforce
+//!   `RLIMIT_AS`/`RLIMIT_DATA`). It does **not** cap the process count — see
+//!   [`SandboxLimits::max_processes`], which no backend enforces today.
 //! - **Linux namespaces** — user + mount + pid + net namespaces give a hard
-//!   network boundary and a private tmpfs; seccomp + rlimits on top. Probed at
-//!   runtime: a kernel that restricts unprivileged user namespaces gets the
-//!   portable floor, reported as such. *(cfg-gated, not live-run on the macOS
-//!   build host.)*
+//!   network boundary and a private tmpfs; rlimits on top. The crate installs
+//!   **no seccomp filter of its own**; what syscall filtering there is comes
+//!   from whatever the kernel applies by default inside an unprivileged user
+//!   namespace. Probed at runtime: a kernel that restricts unprivileged user
+//!   namespaces gets the portable floor, reported as such. *(cfg-gated, not
+//!   live-run on the macOS build host.)*
 //! - **Windows** — *no native backend yet.* The Job Object was designed but
 //!   never implemented (no Win32 call is made), so a Windows run gets the
 //!   portable floor and reports it as such. On Windows that floor enforces the
@@ -53,11 +57,31 @@ use crate::error::Result;
 
 /// Which backend actually ran a sandboxed command. Recorded in the trace so an
 /// operator can audit not just *what* ran but *how* it was isolated.
+///
+/// The value is a *report*, never a promise: a native backend whose primitive
+/// turns out to be unavailable degrades to the floor and says `PortableFloor`
+/// here rather than naming an isolation it did not apply. So an application
+/// deciding how much to trust a run reads this, instead of inferring isolation
+/// from the OS it happens to be running on.
+///
+/// ```
+/// use io_harness::sandbox::{select, Backend, Sandbox, SandboxConfig};
+///
+/// let backend = select(&SandboxConfig::new()).backend();
+/// if backend == Backend::PortableFloor {
+///     // Filesystem-scoped and resource-capped, but not a syscall jail, and
+///     // network deny is only a proxy-env strip. Refuse genuinely untrusted
+///     // work here rather than running it believing it is confined.
+///     eprintln!("no kernel isolation on this host: {}", backend.as_str());
+/// }
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
     /// macOS `sandbox-exec` profile + rlimits + RSS monitor.
     MacosSandboxExec,
-    /// Linux user/mount/pid/net namespaces + seccomp + rlimits.
+    /// Linux user/mount/pid/net namespaces + rlimits. The crate installs no
+    /// seccomp filter; only the kernel's own defaults for an unprivileged user
+    /// namespace apply on top.
     LinuxNamespaces,
     /// Windows Job Object + restricted token. **Reserved, never reported** —
     /// the Job Object is not implemented, so Windows runs report
@@ -81,6 +105,29 @@ impl Backend {
 
 /// A resource cap that was breached, killing the sandboxed process. Returned in
 /// [`SandboxOutcome::cap_hit`] so a cap hit is a *typed* result, never a hang.
+///
+/// Worth matching on rather than folding into "it failed": a process killed by
+/// a cap has no exit code at all, so a caller reading only
+/// [`exit_code`](SandboxOutcome::exit_code) sees `None` and loses the one fact
+/// that says whether to raise a limit or fix the code.
+///
+/// ```
+/// use io_harness::sandbox::{Cap, SandboxOutcome};
+///
+/// fn why(outcome: &SandboxOutcome) -> String {
+///     match outcome.cap_hit {
+///         Some(Cap::Wall) => "hung: outlived max_wall_secs".into(),
+///         Some(Cap::Cpu) => "spun: burned max_cpu_secs of CPU and took SIGXCPU".into(),
+///         Some(Cap::Memory) => "grew past max_memory_bytes and the RSS monitor killed it".into(),
+///         // No cap fired, so the exit code is the whole story.
+///         None => format!("exited {:?}", outcome.exit_code),
+///     }
+/// }
+///
+/// // A cap is also what goes in the trace, by this stable label.
+/// assert_eq!(Cap::Wall.as_str(), "wall");
+/// # let _ = why;
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cap {
     /// CPU time (`RLIMIT_CPU` on unix; the process took SIGXCPU).
@@ -109,6 +156,36 @@ impl Cap {
 /// Defaults are sized so an ordinary `rustc`/`cargo` verification passes out of
 /// the box — a default that failed real compiles would push callers to disable
 /// the sandbox entirely. Tighten via the fields for untrusted work.
+///
+/// These caps **kill**; they do not throttle. A breach terminates the process
+/// and comes back as [`SandboxOutcome::cap_hit`], so a runaway is a typed
+/// result the gate can report rather than a verification that never returns.
+///
+/// ```
+/// use io_harness::sandbox::{SandboxConfig, SandboxLimits};
+///
+/// // Tighter than the defaults, for code you did not write. Thirty wall-
+/// // seconds is enough for a small `rustc` invocation and not enough for an
+/// // infinite loop to be interesting; the CPU cap catches a spin that the
+/// // wall clock would let idle-wait past.
+/// let config = SandboxConfig {
+///     limits: SandboxLimits {
+///         max_cpu_secs: Some(5),
+///         max_wall_secs: Some(30),
+///         max_memory_bytes: Some(256 * 1024 * 1024),
+///         max_open_files: Some(64),
+///         // Left as-is: no backend enforces it yet, so setting it would
+///         // buy a false sense of a process-count bound.
+///         ..SandboxLimits::default()
+///     },
+///     ..SandboxConfig::new()
+/// };
+///
+/// // Only the wall cap is enforced on every platform. On Windows it is the
+/// // *only* one, so leaving it `None` there means the run is bounded by
+/// // nothing at all.
+/// assert!(config.limits.max_wall_secs.is_some());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLimits {
     /// Max CPU seconds before SIGXCPU. `None` = no CPU cap. **Unix only** —
@@ -124,12 +201,21 @@ pub struct SandboxLimits {
     /// not exist on Windows, so this is not applied there and [`Cap::Memory`] is
     /// never reported.
     pub max_memory_bytes: Option<u64>,
-    /// Max concurrent processes in the sandbox. Enforced only by the native
-    /// backends that can scope it to the sandbox (Linux pid namespace, Windows
-    /// Job Object active-process limit); the portable floor does **not** enforce
-    /// it, because unix `RLIMIT_NPROC` is per-real-uid, not per-sandbox — capping
-    /// it there would throttle the operator's whole login session. `None` = no
-    /// cap.
+    /// Max concurrent processes in the sandbox. **Enforced by no backend
+    /// today, on any platform** — setting it changes nothing.
+    ///
+    /// The portable floor and the unix native backends deliberately do not map
+    /// it to `RLIMIT_NPROC`: that limit is per-real-uid, not per-sandbox, so
+    /// capping it there would throttle the operator's whole login session
+    /// rather than the sandboxed run. The two mechanisms that *can* scope it —
+    /// the Linux pid namespace's process limit and the Windows Job Object's
+    /// active-process limit — are not wired up (the Job Object is not
+    /// implemented at all; see [`windows`]).
+    ///
+    /// The field is kept because it is the shape the native implementations
+    /// will use, and because removing it would break every serialized config
+    /// carrying it. Treat it as reserved, not as a bound you have. `None` = no
+    /// cap, which is also what any other value means right now.
     pub max_processes: Option<u64>,
     /// Max open file descriptors (`RLIMIT_NOFILE`, unix). `None` = no cap.
     pub max_open_files: Option<u64>,
@@ -154,6 +240,36 @@ impl Default for SandboxLimits {
 /// The *absence* of a `SandboxConfig` on the exec path means opt out: the
 /// verification gate runs on the host exactly as it did in 0.5.0. Its presence
 /// turns isolation on. This is what makes 0.6.0 additive and reversible.
+///
+/// ```
+/// use io_harness::sandbox::{select, Backend, Sandbox, SandboxConfig};
+///
+/// // The recommended default: caps that kill, egress denied, and the
+/// // strongest backend this host can actually deliver.
+/// let config = SandboxConfig::new();
+/// assert!(!config.allow_network, "network is denied by default, not allowed");
+///
+/// // `floor_only` pins every platform to the same weakest backend. Useful for
+/// // reproducing a report from a host whose native primitive was unavailable,
+/// // and for exercising the floor on a machine that would otherwise never
+/// // take it.
+/// let floor = SandboxConfig::new().floor_only();
+/// assert_eq!(select(&floor).backend(), Backend::PortableFloor);
+/// ```
+///
+/// It derives `Serialize`/`Deserialize` for the same reason [`crate::Policy`]
+/// does: io-cli and io-studio load one from a config file rather than
+/// hand-building it. Each of its own three fields is `#[serde(default)]`, so a
+/// config file may name only what it changes — note that `limits`, if given at
+/// all, is a whole [`SandboxLimits`] and every cap in it must be spelled out.
+///
+/// ```
+/// use io_harness::sandbox::{SandboxConfig, SandboxLimits};
+///
+/// let config: SandboxConfig = serde_json::from_str(r#"{"allow_network": true}"#).unwrap();
+/// assert!(config.allow_network);
+/// assert_eq!(config.limits, SandboxLimits::default(), "the caps fall back whole");
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SandboxConfig {
     /// Resource caps for the run.
@@ -196,6 +312,31 @@ pub struct RunSpec<'a> {
 
 /// The result of a sandboxed run — enough to make a verification pass/fail
 /// decision identical to the un-sandboxed path, plus the isolation metadata.
+///
+/// ```
+/// use io_harness::sandbox::SandboxOutcome;
+///
+/// /// Turn one sandboxed command into something a person can act on.
+/// fn report(outcome: &SandboxOutcome) -> String {
+///     // `success()` is the gate's whole question: a zero exit *and* no cap.
+///     // Testing `exit_code == Some(0)` alone reads a capped run — which has
+///     // no exit code — as merely "not zero", losing the reason.
+///     if outcome.success() {
+///         return format!("passed, isolated by {}", outcome.backend.as_str());
+///     }
+///     match outcome.cap_hit {
+///         Some(cap) => format!("killed by the {} cap", cap.as_str()),
+///         // Compiler and test failures land in stderr; it is what the model
+///         // is shown so it can fix the code on the next step.
+///         None => format!("exited {:?}:\n{}", outcome.exit_code, outcome.stderr),
+///     }
+/// }
+/// # let _ = report;
+/// ```
+///
+/// `argv` and `backend` are recorded in the trace, so an audit answers both
+/// what ran and how it was confined — including when the backend that answered
+/// was weaker than the one this platform advertises.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SandboxOutcome {
     /// Which backend ran the command.
@@ -228,6 +369,45 @@ impl SandboxOutcome {
 /// is the public surface on mac, linux, and windows. Implemented by
 /// [`FloorSandbox`] and each native backend. Mirrors [`crate::Provider`]'s
 /// async style (RPITIT, no `async-trait` dependency).
+///
+/// Reach for it directly when the embedding program wants to run something
+/// under the same isolation the verification gate gets — a build, a linter, a
+/// script the agent produced — rather than shelling out beside the harness.
+///
+/// ```
+/// use io_harness::sandbox::{select, workdir, RunSpec, Sandbox, SandboxConfig};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let config = SandboxConfig::new();
+/// let sandbox = select(&config);
+///
+/// // An ephemeral workdir whose teardown is its drop: the directory and
+/// // everything the command wrote in it are gone when `dir` goes out of
+/// // scope, on every exit path including a panic or an early `?`.
+/// let dir = workdir()?;
+/// std::fs::write(dir.path().join("main.rs"), "fn main() {}")?;
+///
+/// let argv = vec!["rustc".to_string(), "main.rs".to_string()];
+/// let outcome = sandbox
+///     .run(RunSpec {
+///         argv: &argv,
+///         workdir: dir.path(),
+///         limits: &config.limits,
+///         allow_network: config.allow_network,
+///     })
+///     .await?;
+///
+/// // Anything worth keeping is copied out deliberately, through
+/// // `copy_back`, so the write policy still decides. Nothing leaks by
+/// // default.
+/// println!("{} under {}", outcome.success(), outcome.backend.as_str());
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The trait is RPITIT and therefore not object-safe — there is no
+/// `Box<dyn Sandbox>`. [`select`] returns the concrete [`Selected`] enum
+/// instead, which implements this trait.
 pub trait Sandbox {
     /// Run one command under isolation, returning its captured outcome.
     fn run(
@@ -242,6 +422,20 @@ pub trait Sandbox {
 /// The selected backend for a run. An internal enum so the crate can dispatch to
 /// one concrete backend without `dyn` (the trait is RPITIT and not
 /// object-safe). Callers see the [`Sandbox`] trait; [`select`] returns this.
+///
+/// Its variants are cfg-gated to the OS whose primitives they use, so a `match`
+/// over them does not port. Use it through [`Sandbox`] and ask
+/// [`backend`](Sandbox::backend) what it turned out to be — a native variant
+/// whose primitive failed its probe still reports [`Backend::PortableFloor`],
+/// so the variant you hold and the isolation you got are not the same question.
+///
+/// ```
+/// use io_harness::sandbox::{select, Backend, Sandbox, SandboxConfig};
+///
+/// let selected = select(&SandboxConfig::new());
+/// let confined = selected.backend() != Backend::PortableFloor;
+/// println!("kernel-level isolation: {confined}");
+/// ```
 pub enum Selected {
     /// The portable floor, always available.
     Floor(FloorSandbox),
@@ -294,6 +488,30 @@ impl Sandbox for Selected {
 /// [`windows`] has no native backend to offer at all. Since the backend is
 /// recorded in the trace, a degraded run is auditable, not silent. Use
 /// [`Sandbox::backend`] on the result to see what will really run.
+///
+/// Which is the point of the example: ask, never assume. Compiling for Linux
+/// does not mean you got namespaces. Ubuntu 24.04 ships
+/// `kernel.apparmor_restrict_unprivileged_userns=1`, every `unshare`-wrapped
+/// spawn fails there, and before 0.9.1 that surfaced to the caller as its code
+/// having failed verification. Now the wrapper is probed once per process and
+/// this returns a backend that reports the floor.
+///
+/// ```
+/// use io_harness::sandbox::{select, Backend, Sandbox, SandboxConfig};
+///
+/// let sandbox = select(&SandboxConfig::new());
+/// match sandbox.backend() {
+///     Backend::PortableFloor => {
+///         // Ephemeral workdir and caps that kill, but no syscall jail and no
+///         // kernel network boundary — egress denial here is only a proxy-env
+///         // strip, which a payload not reading those variables ignores. This
+///         // is the branch where an application handling genuinely untrusted
+///         // code decides to refuse rather than proceed.
+///         eprintln!("degraded to the portable floor on this host");
+///     }
+///     native => eprintln!("native isolation: {}", native.as_str()),
+/// }
+/// ```
 pub fn select(config: &SandboxConfig) -> Selected {
     if !config.force_floor {
         #[cfg(target_os = "macos")]
@@ -680,6 +898,47 @@ pub fn workdir() -> Result<tempfile::TempDir> {
 /// those `allowed` accepts (the 0.4.0 write policy). Returns the relative paths
 /// copied. So sandbox capture composes with the permission layer rather than
 /// bypassing it: a file the policy would deny writing is not copied back.
+///
+/// The `allowed` predicate is the whole reason this is not a directory copy.
+/// Everything a sandboxed command produces is otherwise dropped with the
+/// workdir, so capture is the one path back out — and if it did not consult
+/// the policy, it would be the hole in it: a file the agent may not write
+/// directly would arrive in the workspace merely by having been produced
+/// somewhere the write check does not run.
+///
+/// ```
+/// use std::path::PathBuf;
+///
+/// use io_harness::sandbox::copy_back;
+/// use io_harness::{Act, Effect, Policy};
+///
+/// # async fn demo(sandbox_dir: &std::path::Path, repo: &std::path::Path)
+/// #     -> io_harness::Result<()> {
+/// let policy = Policy::default()
+///     .layer("app")
+///     .allow_write("*")
+///     .deny_write("secrets/*");
+///
+/// let produced = vec![
+///     PathBuf::from("src/lib.rs"),
+///     PathBuf::from("secrets/leaked.pem"),
+/// ];
+/// let copied = copy_back(sandbox_dir, repo, &produced, |rel| {
+///     policy.check(Act::Write, &rel.to_string_lossy()).effect == Effect::Allow
+/// })
+/// .await?;
+///
+/// // The denied path is simply not there. It stays in the workdir and dies
+/// // with it; the return value is what actually landed, so a caller can
+/// // report the difference rather than guess at it.
+/// assert!(!copied.contains(&PathBuf::from("secrets/leaked.pem")));
+/// # Ok(())
+/// # }
+/// ```
+///
+/// A listed file that the sandbox never produced is skipped rather than an
+/// error: a command that failed part way leaves a partial set, and the caller
+/// already has the failure from [`SandboxOutcome`].
 pub async fn copy_back(
     workdir: &Path,
     dest_root: &Path,

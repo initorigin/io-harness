@@ -138,6 +138,35 @@ pub(crate) enum GitCmd {
 /// wrong default; requiring configuration would fail on a fresh machine, which
 /// is the wrong other one. So the harness supplies one and the caller may
 /// replace it.
+///
+/// This is what `git log` shows for every commit a run makes, and it is passed
+/// as `-c user.name=… -c user.email=…` on the commit itself rather than written
+/// into the repository's config, so a run leaves the checkout's own identity
+/// untouched.
+///
+/// ```
+/// use io_harness::{Identity, TaskContract, Verification};
+///
+/// // The default: a name at a domain that can never exist. RFC 2606 reserves
+/// // `.invalid` precisely so a synthetic address cannot accidentally be
+/// // someone's real one.
+/// assert_eq!(Identity::default().email, "agent@io-harness.invalid");
+///
+/// // Replace it when the commits should be attributable to your service, so
+/// // a human reading `git log` a month later can tell which system made
+/// // them and where to ask about it.
+/// let contract = TaskContract::workspace(
+///     "fix the failing test and commit the fix",
+///     "/path/to/repo",
+///     Verification::WorkspaceFileContains { file: "src/lib.rs".into(), needle: "fn".into() },
+/// )
+/// .with_commit_identity("nightly-agent", "nightly-agent@example.com");
+/// # let _ = contract;
+/// ```
+///
+/// Neither field may be empty or hold a control character: both reach the
+/// commit object and the reflog, and a newline in a name has nowhere useful to
+/// go. A bad one is an [`Error::Config`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Identity {
     /// The committer name.

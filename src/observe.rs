@@ -81,6 +81,43 @@ use serde::{Deserialize, Serialize};
 /// run from outside it: before 0.12.0 a caller's only option was to drop the
 /// run's future, which abandoned it mid-step and left `runs.status` as
 /// `running` forever, so nothing could tell it from a process that had crashed.
+///
+/// Which makes an observer that returns anything other than
+/// [`Flow::Continue`] a control, not a spectator — the place to enforce a
+/// ceiling the [`TaskContract`](crate::TaskContract) budgets cannot express:
+///
+/// ```
+/// use std::sync::atomic::{AtomicU64, Ordering};
+///
+/// use io_harness::{EventKind, Flow, Observer, RunEvent};
+///
+/// /// Stops a run once it has spent more than it was meant to, wherever in a
+/// /// tree that spend happened.
+/// struct SpendCap {
+///     limit: u64,
+///     spent: AtomicU64,
+/// }
+///
+/// impl Observer for SpendCap {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         if let EventKind::Step { tokens, .. } = event.kind {
+///             if self.spent.fetch_add(tokens, Ordering::Relaxed) + tokens > self.limit {
+///                 // Honoured at the next step boundary, not here: the points
+///                 // in between are not safe to stop at — a tool call is
+///                 // mid-flight, a file may be half-written. The run finishes
+///                 // the step, records `cancelled`, and stays resumable.
+///                 return Flow::Cancel;
+///             }
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// // `Continue` is the default, so a watcher that only ever looks can
+/// // `Flow::default()` and never think about this type again.
+/// assert_eq!(Flow::default(), Flow::Continue);
+/// assert!(Flow::Cancel.is_cancel());
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Flow {
@@ -109,6 +146,53 @@ impl Flow {
 ///
 /// The common fields are here rather than repeated on every variant, so a
 /// consumer can route on `run_id`/`depth` without matching the payload first.
+/// That is what makes a tree legible while it is running: `depth` is how deep
+/// the agent is, and `run_id` is that agent's *own* run id, never the root's.
+///
+/// ```
+/// use io_harness::{EventKind, Flow, Observer, RunEvent};
+///
+/// /// Prints a tree as it happens, indented by depth.
+/// struct Trace;
+///
+/// impl Observer for Trace {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         let indent = "  ".repeat(event.depth as usize);
+///         match &event.kind {
+///             EventKind::Spawned { child_run_id, goal } => {
+///                 println!("{indent}run {} spawned {child_run_id}: {goal}", event.run_id);
+///             }
+///             EventKind::Step { decision, tokens, .. } => {
+///                 println!("{indent}step {} — {decision} ({tokens} tokens)", event.step);
+///             }
+///             _ => {}
+///         }
+///         Flow::Continue
+///     }
+/// }
+/// ```
+///
+/// Every event serialises flat and tagged, because the process driving a run is
+/// often not the process showing it to a person — so a host can forward one to
+/// a user interface written in another language without hand-writing a mapping:
+///
+/// ```
+/// use io_harness::{EventKind, RunEvent};
+///
+/// let event = RunEvent::new(7, 3, EventKind::Stalled);
+/// let json = serde_json::to_value(&event).unwrap();
+///
+/// // One flat object: the payload is not nested under a `kind` key, and the
+/// // variant is a string tag a `switch` in any language can read.
+/// assert_eq!(json["run_id"], 7);
+/// assert_eq!(json["step"], 3);
+/// assert_eq!(json["event"], "stalled");
+/// assert!(json.get("kind").is_none());
+/// ```
+///
+/// `step` is `0` for anything that happens before the first step — authorizing
+/// network access to the provider, for instance — so a consumer numbering
+/// steps from an event stream should not assume the first one it sees is 1.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunEvent {
     /// The run this belongs to. In a tree, the *agent's* own run id, not the
@@ -156,6 +240,50 @@ impl RunEvent {
 /// Every variant reports something the rusqlite trace already records. This
 /// release added no new facts about a run — it added a way to see them while the
 /// run is still going.
+///
+/// The example matches the handful an operator watching an unattended run
+/// actually needs — the ones that mean the run is blocked on a person, is
+/// going in circles, or is slow for a reason — and lets the rest fall through:
+///
+/// ```
+/// use io_harness::{EventKind, Flow, Observer, RunEvent};
+///
+/// struct Alerts;
+///
+/// impl Observer for Alerts {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         match &event.kind {
+///             // The run has stopped and will not restart on its own.
+///             EventKind::ApprovalRequested { act, target } => {
+///                 eprintln!("waiting on a human: {act} {target}");
+///             }
+///             // Told once already, still repeating itself. Terminal.
+///             EventKind::Stalled => eprintln!("stalled — this run is over"),
+///             // Not a failure: the run continues, and this says why it looks
+///             // stuck and for how much longer.
+///             EventKind::Retry { kind, attempt, delay_ms } => {
+///                 eprintln!("{kind} on attempt {attempt}, waiting {delay_ms}ms");
+///             }
+///             // The policy stopped something. The action did not happen, and
+///             // the model was told so it can adapt.
+///             EventKind::Refused { act, target, rule, .. } => {
+///                 eprintln!("refused {act} {target} by rule {rule:?}");
+///             }
+///             // One enum and one `Observer` method, so a variant added in a
+///             // later release is a `_` arm here rather than a trait method
+///             // every implementer suddenly has to write.
+///             _ => {}
+///         }
+///         Flow::Continue
+///     }
+/// }
+/// ```
+///
+/// One event is not one committed row. A [`Retry`](EventKind::Retry) writes a
+/// row under the *same* step number as the [`Step`](EventKind::Step) that
+/// follows it, and a sub-agent step that pauses on a deferred child is left
+/// uncommitted on purpose so a resume replays it. Count events to show
+/// activity; read the store to know what is durable.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventKind {
@@ -300,6 +428,71 @@ pub enum EventKind {
 /// tree runs up to `max_concurrent` children as concurrent futures on one task,
 /// and a `&mut self` observer could not be shared between them. Keep whatever
 /// state you need behind a `Mutex`, an atomic, or a channel.
+///
+/// This is what an embedding application registers instead of opening the
+/// SQLite file with a second connection and polling it — against a schema the
+/// crate does not promise, having first configured the file itself. On a run
+/// designed to last 24 hours that is the difference between an agent an
+/// operator can watch and one they cannot.
+///
+/// ```no_run
+/// use std::sync::mpsc::{channel, Sender};
+///
+/// use io_harness::{run_observed, EventKind, Flow, Observer, OpenRouter, RunEvent,
+///                  Store, TaskContract, Verification};
+///
+/// /// Hands the run to whatever is showing it to a person.
+/// struct Forward(Sender<RunEvent>);
+///
+/// impl Observer for Forward {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         // `event` is called synchronously on the run's own task, so this
+///         // is the run's critical path: send and return. Anything slower
+///         // slows the run down, and a panic here takes the run's future
+///         // with it and leaves the run row `running`.
+///         let _ = self.0.send(event.clone());
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let (tx, rx) = channel::<RunEvent>();
+///
+/// // Drained elsewhere, while the run is still going — the whole point of
+/// // the surface. A `for` over `rx` on this task would deadlock instead.
+/// std::thread::spawn(move || {
+///     for event in rx {
+///         match &event.kind {
+///             EventKind::Step { decision, .. } => println!("step {}: {decision}", event.step),
+///             EventKind::Finished { outcome, steps, tokens } => {
+///                 println!("{outcome} after {steps} steps, {tokens} tokens");
+///             }
+///             _ => {}
+///         }
+///     }
+/// });
+///
+/// let contract = TaskContract::new(
+///     "add a hello function returning 42",
+///     "src/hello.rs",
+///     Verification::FileContains("fn hello".into()),
+/// );
+/// let result = run_observed(
+///     &contract,
+///     &OpenRouter::from_env()?,
+///     &Store::memory()?,
+///     &Forward(tx),
+/// )
+/// .await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The events report the same facts the trace records — asserted, not assumed
+/// — but the trace is the authoritative one. An event is a notification that
+/// something happened, not the record of it; if the two ever disagree, the
+/// trace is right and the event is a bug.
 pub trait Observer: Send + Sync {
     /// Called once per event, in order, on the run's own task.
     ///
@@ -315,6 +508,29 @@ pub trait Observer: Send + Sync {
 /// Exists so the run has one code path rather than `Option<&dyn Observer>`
 /// threaded through every call site, and so "no observer" costs a call to an
 /// empty function that optimises away rather than a branch per event.
+///
+/// Which means these two runs are the same run:
+///
+/// ```no_run
+/// use io_harness::{run, run_observed, Ignore, OpenRouter, Store, TaskContract,
+///                  Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::new(
+/// #     "add a hello function", "src/hello.rs",
+/// #     Verification::FileContains("fn hello".into()));
+/// # let provider = OpenRouter::from_env()?;
+/// # let store = Store::memory()?;
+/// let a = run(&contract, &provider, &store).await?;
+/// let b = run_observed(&contract, &provider, &store, &Ignore).await?;
+/// # let _ = (a, b);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// So reach for it when a function of yours takes a `&dyn Observer` and one
+/// caller has nothing to watch with — pass `&Ignore` rather than making the
+/// parameter an `Option`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Ignore;
 
