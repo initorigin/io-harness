@@ -1,0 +1,124 @@
+id: US-IO-HARNESS-0.17.0-I02
+timestamp: '2026-07-29T09:00:00Z'
+category:
+  - release-level
+  - architecture-level
+trigger: >
+  The 0.17.0 contract written by I01 carried four open questions and one required human approval,
+  all of them decisions the owner had to make rather than inferences the plan could safely take. The
+  owner asked for every one to be put to them with options and closed before the plan was committed,
+  so that development starts against a contract with no unresolved decisions in it.
+evidence:
+  - >
+    `releases/0.17.0.yaml` as written by I01 listed four entries under `open_questions` — the `exec`
+    timeout default, the output truncation shape, the completion signal for `Verification::None`,
+    and which non-Rust ecosystem CI asserts F8 against — and one entry under
+    `dependencies.human_approvals` covering the execution context for `exec`.
+  - >
+    The execution-context question is not a preference. The sandbox denies network egress by default
+    and discards its working directory; `npm install`, `pip install`, and `cargo fetch` all need
+    both. Sandboxing `exec` by default would have made the release's own stated outcome
+    unreachable, and the alternative grants the widest capability the crate has ever had. Only the
+    owner can make that trade.
+  - >
+    The deprecation-removal question was not in the contract and surfaced while presenting the
+    others: I01 wrote "at least one minor release" without naming the release that removes the three
+    Rust-specific `Verification` variants. Left unnamed it becomes work with no destination, which
+    the iterate contract explicitly forbids.
+before:
+  scope:
+    - >
+      0.17.0 contract with four `open_questions` and one ungranted `human_approvals` entry.
+    - >
+      0.18.0 roadmap outcome describing accounting only, with one break — the widened `Usage` struct.
+  assumptions:
+    - >
+      That `exec` runs in the workspace with the embedding program's privileges. Recorded by I01 as
+      an assumption pending owner approval, not as a decision.
+    - >
+      That a generous overridable timeout, a head-and-tail truncation, and an implicit completion
+      signal were the right defaults. Recorded as current assumptions, explicitly undecided.
+  implementation: >
+    Not started. The contract is planned and no code exists for any of it.
+change:
+  summary: >
+    Close all five decisions and fold them into the contract as scope, acceptance criteria, and
+    granted approval rather than leaving them as questions for the developing session to answer
+    under pressure. Name 0.18.0 as the release that removes the deprecated Rust verification
+    variants, which gives that deferred work a destination and makes 0.18.0 a two-break release.
+  added:
+    - >
+      Decision — `exec` runs in the workspace root with the embedding program's privileges, every
+      call checked by `Act::Exec` against the full argv. Not sandboxed. The sandbox stays what it
+      is: the container for verification gates. Recorded as granted approval, and stated in
+      `CONTRACT.md` with the same wording already used for registered tools and stdio MCP servers.
+    - >
+      Decision — `exec` carries a generous wall-clock timeout by default, overridable per contract.
+      A wedged command dies naming itself instead of consuming the whole run's time budget and
+      reporting a budget stop.
+    - >
+      Decision — oversized command output keeps its head and its tail and elides the middle, with
+      the elision stated in the result the model reads. A build log's useful content is at both
+      ends: what ran, at the top; what failed, at the bottom.
+    - >
+      Decision — under `Verification::None`, an assistant turn carrying no tool call ends the run
+      with its own terminal outcome, distinguishable from a step cap, a stall, and a budget stop. No
+      `done` tool is added, so an unverified run gains no tool surface over a verified one.
+    - >
+      Decision — F8 asserts `Verification::Command` against Node. `node` and `npm` are preinstalled
+      on all three runner images, `npm test` needs no compile step and no network, and it exercises
+      the lockfile-to-package-manager resolution the toolchain table needs anyway. No system package
+      is installed, so the standing constraint holds.
+    - >
+      Decision — the three deprecated Rust verification variants are removed in 0.18.0, the minimum
+      cycle the crate's published contract allows. 0.18.0 therefore carries two breaks: the widened
+      `Usage` struct and the removal. Both get migration notes.
+  removed:
+    - >
+      All four `open_questions` entries written by I01. Two are replaced by narrower ones that are
+      genuinely unresolved — the numeric timeout and byte-ceiling values, which are tuning against
+      real builds rather than design decisions, and whether killing a process tree on Windows
+      without a Job Object leaves orphans, which must be measured rather than assumed.
+    - >
+      The ungranted state of the `exec` execution-context approval.
+  deferred:
+    - >
+      Removal of `Verification::CompilesRust`, `RustTestPasses`, and `WorkspaceTestPasses`.
+      Destination: roadmap 0.18.0, whose outcome is amended by this iteration to name it.
+  replaced:
+    - >
+      The 0.18.0 roadmap outcome, which described a single-break accounting release and now
+      describes a two-break one.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.17.0
+    - 0.18.0
+  tasks: []
+  dependencies:
+    - >
+      A consumer who skips 0.17.0 entirely and upgrades 0.16.2 to 0.18.0 meets the removal with no
+      intervening deprecation warning. This is the known cost of the minimum cycle and the changelog
+      note for 0.18.0 must say so plainly rather than assume a reader upgraded one minor at a time.
+  resource_effect: >
+    None on 0.17.0 — the decisions were already priced into its scope as assumptions and the work
+    is identical. Adds a small amount to 0.18.0: three variant removals, their migration notes, and
+    the deletion of the tests that covered the old paths.
+versioning:
+  previous_target: 0.17.0
+  new_target: 0.17.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Session 2026-07-29. The owner asked for every open decision to be presented with options and
+    closed before the plan was committed. All five were put to them as multiple choice with the
+    trade-offs stated. Four were answered at the recommended option — workspace-and-policy-gated
+    exec, generous overridable timeout, head-and-tail truncation, implicit completion signal — plus
+    Node for F8 and keeping the 0.21.0/0.22.0 order as planned. One deviated from the
+    recommendation: the deprecated verification variants are removed in 0.18.0, the minimum cycle,
+    rather than at an unscheduled later release.
+canonical_updates:
+  - products/io-harness/releases/0.17.0.yaml
+  - products/io-harness/roadmap.yaml
