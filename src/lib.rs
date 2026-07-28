@@ -213,7 +213,11 @@
 // reader browsing the rendered docs is never shown an item that would not exist
 // in their build without being told why. Nightly-only, and reached only under
 // that cfg — a stable `cargo doc` is unaffected.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+//
+// `doc_cfg`, not `doc_auto_cfg`: the latter was removed in 1.92.0 (rust-lang
+// PR 138907) and merged into `doc_cfg`, which now does the automatic labelling
+// itself. 0.16.1's docs.rs build failed on the removed feature name.
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod approve;
 pub mod containment;

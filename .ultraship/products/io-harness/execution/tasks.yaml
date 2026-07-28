@@ -1,160 +1,136 @@
 product: io-harness
-version: 0.16.1
+version: 0.16.2
 tasks:
-  - id: US-IO-HARNESS-0.16.1-T01
+  - id: US-IO-HARNESS-0.16.2-T01
     summary: >
-      Rewrite the README's "Part of initorigin" table. Three rows with a status column — io-harness
-      Released and linked, io-cli and io-studio in development and named without a link — and a
-      sentence under it stating that io-harness is the only public repository today and that the
-      other two open when they release.
+      Reproduce the docs.rs failure locally on nightly with the `docsrs` cfg set, before changing
+      anything, and record the toolchain version alongside the output.
     why_required: >
-      This table is the release. It is the last section of the crates.io landing page for a published
-      crate, it links four repositories that return 404 to every reader who is not the owner, and two
-      of the five products it names have not been built. Without this task there is no 0.16.1.
+      The defect exists because no command this repository runs can see it. Fixing it without first
+      reproducing it would mean the fix is verified by the same stable `cargo doc` that passed on
+      the broken tree for two releases. This task is also the release's negative control: without
+      the pre-fix failure on this exact toolchain, a passing post-fix build proves nothing.
     status: done
     depends_on: []
     acceptance_criteria:
       - >
-        F1 — the README's product table has exactly three rows (io-harness, io-cli, io-studio),
-        carries a status column, and contains no occurrence of `io-eval` or `website`.
-      - >
-        F2 — the only link in that table is io-harness's. Neither io-cli nor io-studio is a markdown
-        link to any URL, and the table is followed by a sentence stating that io-harness is the only
-        public repository today.
+        F3 — the same command on the pre-fix tree fails with "feature has been removed", establishing
+        that the check discriminates rather than passing on everything. This is the negative control
+        the crate requires of every gate it ships.
     files:
-      - README.md
-    evidence:
-      - >
-        README.md "Part of initorigin" now has three rows and a Status column: io-harness Released
-        and linked, io-cli and io-studio "In development" with bare names. `io-eval` and `website`
-        are gone from the file entirely. The table is followed by "io-harness is the only public
-        repository today, which is why it is the only one linked."
-  - id: US-IO-HARNESS-0.16.1-T02
-    summary: >
-      Sweep the repository for anything else that presents an unbuilt or private initorigin product
-      as available — `io-eval`, `initorigin/website`, `initorigin/io-cli`, `initorigin/io-studio` —
-      across README.md, src/lib.rs, docs/, CONTRIBUTING.md and Cargo.toml, and correct what is
-      found. Sealed release records, product.yaml, roadmap.yaml and past CHANGELOG entries are
-      historical and are left alone.
-    why_required: >
-      The crate has two landing pages, not one: crates.io renders the README and docs.rs opens on
-      src/lib.rs. Fixing one and not the other reproduces the exact defect 0.16.0 shipped its
-      `readme` checker to prevent, and there is no mechanised check for this table, so the sweep is
-      the only thing standing in for one.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.16.1-T01
-    acceptance_criteria:
-      - >
-        F3 — a repository-wide grep for `io-eval`, `initorigin/website`, `initorigin/io-cli` and
-        `initorigin/io-studio` returns hits only in files that are historical by design:
-        CHANGELOG.md's past entries, the sealed `.ultraship/products/io-harness/releases/*.yaml`
-        records, and `product.yaml`/`roadmap.yaml`. No hit in README.md, `src/lib.rs`, `docs/`,
-        CONTRIBUTING.md, or Cargo.toml.
-    files:
-      - README.md
       - src/lib.rs
     evidence:
       - >
-        Repository-wide grep for `io-eval`, `initorigin/website`, `initorigin/io-cli`,
-        `initorigin/io-studio` over README.md, src/, docs/, CONTRIBUTING.md, Cargo.toml, SECURITY.md,
-        CODE_OF_CONDUCT.md, NOTICE, examples/, tests/ and .github/ returns exactly one hit:
-        src/state.rs:1507, a `//` implementation comment explaining why `runs.finished_at` exists
-        ("io-eval would have been coupled to internals from its first line"). It is not a doc
-        comment, renders nowhere, and states a design rationale rather than an availability claim, so
-        it was left alone. Every other hit is in a historical file — the sealed
-        `.ultraship/.../releases/*.yaml` records, product.yaml, roadmap.yaml, the iterations, the
-        generated views, and past CHANGELOG entries.
-  - id: US-IO-HARNESS-0.16.1-T03
-    summary: >
-      Remove `CARGO_REGISTRY_TOKEN` and its comment from `.env.example`, leaving only the provider
-      variables a contributor running the suite actually sets. No CHANGELOG entry.
-    why_required: >
-      The template tells every contributor to obtain a crates.io publish token. It is the
-      maintainer's credential, it is not needed to build or test the crate, and asking for it in a
-      public template misstates what the project requires of a contributor.
-    status: done
-    depends_on: []
-    acceptance_criteria:
+        rustc 1.99.0-nightly (09ee43b2d 2026-07-27), recorded in evidence/0.16.2/toolchain.txt —
+        after 1.92.0, so the removal is in effect and the control is not vacuous.
       - >
-        F4 — `.env.example` contains no `CARGO_REGISTRY_TOKEN` line and no comment referring to a
-        publish token, and every remaining variable in it is one a contributor running the suite
-        actually sets.
-    files:
-      - .env.example
-    evidence:
-      - >
-        `.env.example` no longer contains CARGO_REGISTRY_TOKEN or its comment. The six remaining
-        variables are the three provider key/model pairs the suite and the examples read via
-        `OpenRouter::from_env` / `Anthropic::from_env` / `OpenAi::from_env`. No CHANGELOG entry was
-        written for this, per the contract.
-  - id: US-IO-HARNESS-0.16.1-T04
+        `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps` on the pre-fix line
+        fails with `error[E0557]: feature has been removed` at src/lib.rs:220:29, noting "removed in
+        1.92.0" and "merged into `doc_cfg`" — the docs.rs build log's error, reproduced verbatim off
+        the builder. Output at evidence/0.16.2/doc-nightly-negative-control.txt.
+  - id: US-IO-HARNESS-0.16.2-T02
     summary: >
-      Bump the version to 0.16.1 in Cargo.toml and Cargo.lock, and write the CHANGELOG `[0.16.1]`
-      section covering the README correction only — stating that there is no breaking change and no
-      code change, and saying nothing about `.env.example`.
+      Replace `feature(doc_auto_cfg)` with `feature(doc_cfg)` in the crate root's `cfg_attr(docsrs,
+      ...)` gate, and extend the comment above it to record why the name changed.
     why_required: >
-      An unbumped manifest cannot be published, and the CHANGELOG is this project's stated single
-      source of truth for release notes: the GitHub Release body is taken from it verbatim, so a
-      missing section means a Release with no notes.
+      This line is the release. It is the only reason docs.rs has no page for 0.16.0 or 0.16.1, and
+      without the change 0.16.2 would fail its build for the third consecutive time.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.16.1-T01
+      - US-IO-HARNESS-0.16.2-T01
     acceptance_criteria:
       - >
-        F5 — CHANGELOG.md has a `[0.16.1]` section that describes the README correction, states there
-        are no breaking changes, and does NOT mention the `.env.example` change.
+        F1 — `src/lib.rs` contains `#![cfg_attr(docsrs, feature(doc_cfg))]` and no occurrence of
+        `doc_auto_cfg` anywhere in the repository outside CHANGELOG.md and the sealed release records.
+      - >
+        F2 — `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps` exits 0 on a
+        nightly at or after 1.92.0, emitting no warning and no `unexpected_cfg` diagnostic.
+    files:
+      - src/lib.rs
+    evidence:
+      - >
+        src/lib.rs:220 is `#![cfg_attr(docsrs, feature(doc_cfg))]`, with three comment lines above it
+        naming the removal, the upstream PR, and the 0.16.1 build that failed on the old name.
+      - >
+        The same nightly command now exits 0 with no warning (evidence/0.16.2/doc-nightly.txt) — the
+        only difference from T01 being the feature name.
+      - >
+        The labelling still happens, which is what the gate is for: the rendered HTML under
+        target/doc/io_harness carries "Available on crate feature `x` only" for barcode, docx, media,
+        pdf, pptx and xlsx. `doc_cfg` performs the automatic labelling itself since the merge, so no
+        per-item `#[doc(cfg(...))]` attribute was needed.
+  - id: US-IO-HARNESS-0.16.2-T03
+    summary: >
+      Bump the version to 0.16.2 in Cargo.toml and Cargo.lock, and write the CHANGELOG `[0.16.2]`
+      section under Fixed.
+    why_required: >
+      A published version's sources are immutable, so the only way this fix reaches docs.rs is a new
+      version. The CHANGELOG entry is where a reader learns that the missing 0.16.0 and 0.16.1 pages
+      are not coming back, which is the one thing about this release they cannot infer.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.16.2-T02
+    acceptance_criteria:
+      - >
+        F4 — CHANGELOG.md has a `[0.16.2]` section under `Fixed` that names `doc_auto_cfg`, links
+        rust-lang/rust#138907, states there is no behaviour change, and states that 0.16.0 and 0.16.1
+        remain unbuildable on docs.rs.
     files:
       - Cargo.toml
       - Cargo.lock
       - CHANGELOG.md
     evidence:
       - >
-        Cargo.toml version = "0.16.1"; Cargo.lock updated via `cargo update -p io-harness --precise
-        0.16.1`. CHANGELOG.md gained a `[0.16.1] - 2026-07-28` section under Changed describing the
-        table correction, opening with "There are no breaking changes and no code change in this
-        release", and making no mention of .env.example.
-  - id: US-IO-HARNESS-0.16.1-T05
+        Cargo.toml and Cargo.lock both read 0.16.2. The CHANGELOG `[0.16.2]` section opens by stating
+        there is no breaking and no behaviour change, explains under Fixed that the build failed for
+        both 0.16.0 and 0.16.1, names the removed feature and links the upstream PR, and closes by
+        saying the two published versions stay unbuildable and 0.16.2 is the first 0.16 with a page.
+  - id: US-IO-HARNESS-0.16.2-T04
     summary: >
-      Run the gates: the full test suite including the five 0.16.0 checkers, clippy, fmt, the
-      public-surface diff, and `cargo package` with an inspection of the resulting `.crate`.
+      Run the standing release gates on stable — the full suite including the five checkers, clippy,
+      fmt, `cargo package`, the public-surface diff and the dependency-tree line count.
     why_required: >
-      CI is not being waited on for this release, which makes the local run the only verification
-      there is. `tests/readme.rs` asserts properties of the file T01 edits, so this is also the one
-      place the release could fail unexpectedly rather than a formality.
+      The CI wait is waived for this release, so the local run is the only evidence that the change
+      broke nothing. A one-line change is the easiest kind to ship untested and the cheapest kind to
+      verify.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.16.1-T01
-      - US-IO-HARNESS-0.16.1-T02
-      - US-IO-HARNESS-0.16.1-T03
-      - US-IO-HARNESS-0.16.1-T04
+      - US-IO-HARNESS-0.16.2-T03
     acceptance_criteria:
       - >
         NF1 — no public API change. `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` is empty
         for the whole branch, and `tests/public_api.rs` passes against the unchanged snapshot.
       - >
         NF2 — the five 0.16.0 checkers stay green with no test edited to accommodate the change:
-        `readme`, `public_api`, `docs_drift`, `changelog`, and `guide_pages`. `readme` is the one this
-        release could plausibly break, since it asserts properties of the file being edited; it must
-        pass unmodified.
+        `readme`, `public_api`, `docs_drift`, `changelog`, `guide_pages`. `changelog` is the one this
+        release could plausibly break, since it inspects the file being edited.
       - >
         NF3 — `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` all
-        exit 0, MSRV stays 1.88, and the default `cargo tree` stays at 401 lines.
+        exit 0 on stable, MSRV stays 1.88, and the default `cargo tree` stays at 401 lines.
       - >
-        NF4 — `cargo package` succeeds and the crate description stays under the crates.io
-        1000-character cap. The packaged `.crate` is inspected for a `.env`, a secret-shaped path, or
-        any file the `exclude` list should have caught.
+        NF4 — `cargo package` succeeds and the packaged `.crate` is inspected for a `.env`, a
+        secret-shaped path, or any file the `exclude` list should have caught.
     files: []
     evidence:
       - >
-        cargo test — 203 lib tests + every integration target + 116 doctests, all passed, 0 failed.
-        The five 0.16.0 checkers pass unmodified: changelog 5/5, docs_drift 10/10, guide_pages 7/7,
-        public_api 9/9, readme 8/8.
+        cargo test — 603 passed, 0 failed across every target including the doctests, exit 0
+        (evidence/0.16.2/tests-default.txt). Same total as 0.16.1, as expected of a release that adds
+        no test and changes no behaviour.
       - >
-        `cargo clippy --all-targets -- -D warnings` exit 0. `cargo fmt --check` exit 0. `cargo tree`
-        401 lines, unchanged. `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` empty for the
-        whole branch. Cargo.toml description is 290 characters, well under the crates.io 1000 cap.
+        NF2 — the five checkers pass with no test file edited: changelog 5/5, docs_drift 10/10,
+        guide_pages 7/7, public_api 9/9, readme 8/8. `changelog` inspects the file this release
+        edits and passes on the new `[0.16.2]` section unmodified.
       - >
-        `cargo package` produced io-harness-0.16.1.crate, 577 KB. Inspected: no `.env`, no
-        `.ultraship/`, no `.github/`, no secret-shaped path. `.env.example` ships as intended and now
-        carries no publishing credential.
+        cargo clippy --all-targets -- -D warnings — exit 0 (evidence/0.16.2/clippy.txt).
+        cargo fmt --check — exit 0 (evidence/0.16.2/fmt.txt).
+      - >
+        NF1 — `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` returns nothing for the whole
+        branch, and the public-surface snapshot is untouched. NF3 — default `cargo tree` is 401
+        lines, the standing constraint, unchanged.
+      - >
+        cargo package — io-harness-0.16.2.crate, 118 files, 564 KiB compressed, verification build
+        exit 0 (evidence/0.16.2/package.txt, package-list.txt). Inspected: no `.env`, no
+        `.ultraship/`, no `.github/`, no secret-shaped path.
+      - >
+        Secrets gate — `.env` is matched by `.gitignore:10` and untracked, and the branch diff
+        contains no secret-shaped assignment.
