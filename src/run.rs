@@ -2038,6 +2038,78 @@ pub async fn resume_tree_observed<P: Provider>(
     Ok(RunResult::new(outcome?, run_id))
 }
 
+/// Resume a crashed agent tree under the policy it was started with, read back
+/// from the store — [`resume_from_stored_policy`] for the 0.5.0 tree loop.
+///
+/// [`resume_tree`] takes a policy, so a tree's boundary was never at risk of
+/// being silently dropped the way the flat workspace loop's was. But the caller
+/// still had to have one to hand, and a process that comes up after a crash in
+/// another process may have nothing to reconstruct it from. The policy has been
+/// durable since 0.13.0 and the single-file and workspace loops have resumed from
+/// it since then; the tree loop had no such entry point until 0.16.0, so the
+/// three resume paths disagreed about whether a restart preserves the boundary —
+/// a contradiction a release documenting the public contract would otherwise have
+/// had to write down as a caveat.
+///
+/// Fails with [`Error::Resume`] when the store holds no policy for the run,
+/// rather than substituting a permissive one. That substitution is the exact
+/// defect 0.13.0 closed in the other two loops, and it is sharper for a tree:
+/// every child inherits the root's policy through [`Policy::contain`], so a
+/// guessed-at root boundary is guessed at for the whole tree, which may already
+/// have taken an irreversible action under the real one.
+pub async fn resume_tree_from_stored_policy<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    approver: &dyn Approver,
+    containment: &Containment,
+) -> Result<RunResult> {
+    resume_tree_from_stored_policy_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        approver,
+        containment,
+        &Ignore,
+    )
+    .await
+}
+
+/// [`resume_tree_from_stored_policy`], reporting to `observer` as it happens. See
+/// [`run_observed`].
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_from_stored_policy_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    approver: &dyn Approver,
+    containment: &Containment,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    let Some(policy) = store.run_policy(run_id)? else {
+        return Err(Error::Resume {
+            reason: format!(
+                "tree {run_id} has no recorded policy, so the boundary it ran under cannot be \
+                 recovered; pass one explicitly with `resume_tree` if you know what it was"
+            ),
+        });
+    };
+    resume_tree_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        &policy,
+        approver,
+        containment,
+        observer,
+    )
+    .await
+}
+
 /// One agent's loop, reused for the root and every child. Identical to the
 /// workspace loop, plus: it may spawn children (recursively, via [`SPAWN_TOOL`]),
 /// and its token spend is drawn from the tree's shared ledger rather than only
