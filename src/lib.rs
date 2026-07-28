@@ -208,6 +208,13 @@
 //! with a migration note. That file is where the release history lives.
 //!
 
+// docs.rs builds with every feature on and sets the `docsrs` cfg (see
+// Cargo.toml). This labels each gated item with the feature it needs, so a
+// reader browsing the rendered docs is never shown an item that would not exist
+// in their build without being told why. Nightly-only, and reached only under
+// that cfg — a stable `cargo doc` is unaffected.
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
 pub mod approve;
 pub mod containment;
 pub mod context;
