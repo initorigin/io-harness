@@ -19,11 +19,18 @@ repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
 keywords = ["agent", "ai", "llm", "mcp", "harness"]
 categories = ["asynchronous", "api-bindings"]
-# Ship only crate consumers' files; keep internal planning/CI out of the package.
+# Workspace/planning state and local credentials are not part of the crate.
+#
+# `.env` is here for the reason the other two are not: a publish is
+# irreversible, and the belt-and-braces case is worth the line. `cargo package`
+# lists files through git in a git checkout, so an ignored `.env` would not be
+# packaged anyway — but "would not be" rests on this staying a git checkout with
+# that ignore rule, and a leaked registry token cannot be unleaked.
+#
 # docs/ is deliberately NOT excluded: the crate root and the README link the
 # guide pages, and a package that ships the links without the pages is worse
 # than one that ships neither.
-exclude = [".ultraship/", ".github/"]
+exclude = [".ultraship", ".env", ".github"]
 
 # docs.rs is the page this crate is mostly read on, and the default build hides
 # the documents and media surface entirely. Build it with everything on, and set
