@@ -769,8 +769,9 @@ pub struct SandboxEvent {
     pub run_id: i64,
     /// The step it occurred on.
     pub step: u32,
-    /// `"create"`, `"exec"`, `"cap_hit"`, `"destroy"`, or `"gate_phase_failed"`
-    /// (whose `detail` names the phase).
+    /// `"create"`, `"exec"`, `"cap_hit"`, `"destroy"`, `"gate_phase_failed"`
+    /// (whose `detail` names the phase), or `"gate_output"` (whose `detail` is
+    /// what a failing gate command printed).
     ///
     /// A `"net_deny"` kind was documented here from 0.6.0 to 0.11.0 and never
     /// existed: nothing constructed it and nothing emitted it. It was removed in
@@ -781,8 +782,10 @@ pub struct SandboxEvent {
     pub kind: String,
     /// The backend that isolated the run (e.g. `"macos-sandbox-exec"`).
     pub backend: Option<String>,
-    /// The argv for an `"exec"`, or the breached cap for a `"cap_hit"`. Never
-    /// file contents or credentials — the command line only.
+    /// The argv for an `"exec"`, the breached cap for a `"cap_hit"`, or the
+    /// bounded output of a failing gate command for a `"gate_output"`. Never the
+    /// agent's file contents and never credentials — the command line, or what
+    /// the caller's own criterion printed.
     pub detail: Option<String>,
 }
 
@@ -855,6 +858,49 @@ impl SandboxEvent {
             kind: "gate_phase_failed".into(),
             backend: None,
             detail: Some(phase.into()),
+        }
+    }
+
+    /// What a failing gate command printed, already bounded by the caller
+    /// (0.17.0).
+    ///
+    /// [`Verification::Command`](crate::Verification::Command) can run any
+    /// command in any language, so "the criterion did not pass" stops being a
+    /// self-explaining outcome: `cargo test` failing because the agent's change
+    /// is wrong and `npm test` failing because the machine has no `node_modules`
+    /// are the same discriminant and need opposite responses. The command's own
+    /// output is the only thing that tells them apart.
+    ///
+    /// This is the one `detail` that is not a command line. It is a *gate*
+    /// command's output — a caller-supplied criterion, never the agent's file
+    /// contents — and it is what makes a language-agnostic gate diagnosable at
+    /// all. Bounded by the caller before it arrives here.
+    ///
+    /// ```
+    /// use io_harness::{SandboxEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("make the suite pass", "/repo")?;
+    /// store.record_sandbox_event(&SandboxEvent::gate_output(
+    ///     run_id, 3, "FAIL test/parse.test.js\n  expected 2 received 1",
+    /// ))?;
+    ///
+    /// let why = store.sandbox_events(run_id)?;
+    /// assert!(why.iter().any(|e| e.kind == "gate_output"
+    ///     && e.detail.as_deref().is_some_and(|d| d.contains("expected 2"))));
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A new `kind` value, not a new table or column: a 0.6.0 store takes it with
+    /// no migration.
+    pub fn gate_output(run_id: i64, step: u32, output: &str) -> Self {
+        Self {
+            run_id,
+            step,
+            kind: "gate_output".into(),
+            backend: None,
+            detail: Some(output.into()),
         }
     }
 }

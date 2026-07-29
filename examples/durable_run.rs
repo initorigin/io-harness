@@ -12,6 +12,13 @@
 //! Nothing about the interrupted run is lost: the trace, the token spend, and the
 //! resume point all live in the on-disk rusqlite store, not in the process.
 
+// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
+// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
+// still work, and the fixtures are loose `.rs` files rather than cargo projects,
+// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
+// has no project to run in. See docs/guide/verification.md for the migration.
+#![allow(deprecated)]
+
 use io_harness::{resume, run, RunStatus, Store, TaskContract, Verification};
 
 #[tokio::main]

@@ -6,19 +6,20 @@
 [![License: Apache-2.0](https://img.shields.io/crates/l/io-harness.svg)](LICENSE)
 [![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 
-**Run an AI agent from a typed task contract to a verified result — in your own
-process, under a permission boundary you control.**
+**An embeddable agent runtime for Rust. Any task, any provider, in your process —
+with a permission boundary, a sandbox, and a durable trace you own.**
 
-You hand it a contract: the task, the file or workspace it may touch, and the
-criterion that decides whether the work is done. It runs the loop — observe,
-reason, act, verify, stop — and hands back a result that a check actually
-passed, with every step in a SQLite trace you can read afterwards.
+You hand it a contract: the task, the workspace it may touch, and what it may
+read, write, run and dial. It runs the loop — observe, reason, act, check, stop —
+and hands back an outcome, with every step, refusal and budget draw in a SQLite
+trace you can read afterwards. The agent can run the project's own toolchain, so
+the language the project is written in is not the harness's business.
 
 ## Quickstart
 
 ```toml
 [dependencies]
-io-harness = "0.16"
+io-harness = "0.17"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -30,19 +31,23 @@ async fn main() -> io_harness::Result<()> {
     let provider = OpenRouter::from_env()?; // OPENROUTER_API_KEY + OPENROUTER_MODEL
     let store = Store::memory()?;
 
-    let contract = TaskContract::new(
-        "add a hello function returning 42",
-        "src/hello.rs",
-        // Not a substring check: this compiles the file the agent produced.
-        Verification::CompilesRust,
+    let contract = TaskContract::workspace(
+        "the test suite is failing; find out why and fix it",
+        "/path/to/repo",
+        // The project's own command decides whether the work is done. Nothing
+        // here is Rust-specific — `go test ./...` or `pytest` reads the same.
+        Verification::Command { argv: vec!["npm".into(), "test".into()], expect_exit: 0 },
     );
 
-    // src/ is writable; secrets/ is refused outright and never reaches a human.
+    // src/ is writable, secrets/ is refused outright and never reaches a human,
+    // and the agent may run the test runner and nothing that publishes.
     let policy = Policy::default()
         .layer("app")
         .allow_read("*")
         .allow_write("src/*")
-        .deny_read("secrets/*");
+        .deny_read("secrets/*")
+        .allow_exec("npm*")
+        .deny_exec("npm publish*");
 
     let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
     println!("{:?}", result.outcome);
@@ -56,14 +61,28 @@ build fails inside that dependency rather than here.
 
 ## What it does
 
-**The loop.** A [`TaskContract`] names the goal, the subject, and the
-verification criterion. Single-file mode edits one file. Workspace mode gives the
-agent `grep`, `find`, `read_file` and `write_file` across a repository root.
+**The loop.** A [`TaskContract`] names the goal, the subject, and — optionally —
+the criterion. Workspace mode gives the agent `grep`, `find`, `read_file`,
+`write_file` and `edit_file` across a repository root. Single-file mode edits one
+file.
 
-**Verification that executes.** A criterion can compile the produced file or run
-a test against it, in a sandbox, so a substring stub cannot pass. What a passing
-gate does and does not prove is stated exactly in the
-[verification guide](docs/guide/verification.md) — it is narrower than it reads.
+**Commands, under the same boundary as everything else.** The agent runs the
+project's own build, tests, linter or package manager through an `exec` tool
+taking a fixed argv and never a shell string. Every call is checked against the
+policy on the program *and* on the whole argv, so `allow_exec("cargo test*")`
+beside `deny_exec("cargo publish*")` means what it reads. A command runs with
+your process's privileges and is **not** sandboxed — that bound is stated in full
+in the [command execution guide](docs/guide/command-execution.md), because it is
+the widest thing the crate grants.
+
+**Verification in any language, or none.** A criterion can be the project's own
+test command in whatever language it is written, or nothing at all when the task
+has no checkable criterion — "work out why the deploy fails" is a run, not a
+gate. What a passing gate does and does not prove is stated exactly in the
+[verification guide](docs/guide/verification.md); it is narrower than it reads.
+The harness also ships a table of what each ecosystem's commands conventionally
+are, so the agent does not spend turns discovering that this is a pnpm workspace
+— see [language support](docs/guide/language-support.md).
 
 **A permission boundary.** Layered, deny-first rules decide what the agent may
 read, write, execute, and connect to. Anything marked *ask* goes to an approver
@@ -123,6 +142,8 @@ flag, so push, fetch, reset and rebase are unreachable by construction.
 | Guide | What it covers |
 | --- | --- |
 | [Permissions and approval](docs/guide/permissions.md) | Layered rules, what asks and what is refused, deferring past process exit |
+| [Command execution](docs/guide/command-execution.md) | Running a project's own toolchain, checked on the whole argv — and the bound that is not there |
+| [Language support](docs/guide/language-support.md) | Toolchain detection, a criterion in any language, migrating off the Rust-specific gates |
 | [Verification](docs/guide/verification.md) | The criteria, execution-based gates, and exactly what a pass proves |
 | [Agent composition](docs/guide/composition.md) | Sub-agents, inherit-and-narrow containment, the shared ledger |
 | [Execution sandbox](docs/guide/sandbox.md) | Backends per platform, resource caps, the portable floor |

@@ -1,0 +1,223 @@
+id: US-IO-HARNESS-0.17.0-I01
+timestamp: '2026-07-28T12:00:00Z'
+category:
+  - product-level
+  - release-level
+  - architecture-level
+trigger: >
+  The owner rejected the product's own baseline sentence — "run an AI agent from a typed task
+  contract to a verified result" — and asked for a pure harness whose value does not depend on what
+  the task is: debugging a production issue, fixing a deployment, or building a whole application
+  should all be in scope. A source audit run against that ask found the crate cannot execute any of
+  them, and the reason is structural rather than a missing feature: the type system requires every
+  run to name a `Verification`, and four of the five variants compile or run Rust. The definition
+  and the code agree with each other and both disagree with what the product is for.
+
+  Four more gaps surfaced in the same audit, each of which blocks a consumer that does not exist
+  yet: no command execution, no partial-file edit, no accounting beyond a single token integer, and
+  no configuration file for io-cli and io-studio to share.
+evidence:
+  - >
+    No command execution tool exists. `grep -rn 'bash|"shell"|run_command|exec_tool|BASH'
+    src/tools/ src/run.rs` returns zero hits. The registered tool set is `write_file`, `read_file`,
+    `grep`, `find`, `read_skill`, `remember`, `spawn_agent`, the five fixed-argv git built-ins,
+    `view_image`, and the document tools. An agent asked to run `cargo test`, `npm install`,
+    `pytest`, or `kubectl` has no way to do it.
+  - >
+    No partial-file edit exists. `grep -rn 'str_replace|apply_patch|edit_file' src/` returns zero
+    hits. `write_file` replaces a whole file, so every edit costs tokens proportional to file size
+    and rewrites content the agent did not intend to touch.
+  - >
+    `Verification` at `src/verify.rs:148` has five variants: `CompilesRust`, `RustTestPasses`,
+    `WorkspaceFileContains`, `DocumentContains`, `WorkspaceTestPasses`. Three invoke `rustc`; the
+    other two are substring checks. There is no variant that runs a caller-supplied command and no
+    variant that permits a run with no gate at all. `TaskContract::new` and `TaskContract::workspace`
+    both take `verify` by value, so a contract without a criterion cannot be constructed.
+  - >
+    `Usage` at `src/provider/mod.rs:435` has exactly three fields — `prompt_tokens`,
+    `completion_tokens`, `total_tokens`. `grep -rn 'cache_creation|cache_read|cached_tokens|
+    cache_control' src/` returns zero hits, so cache reads and writes are neither parsed nor stored,
+    and the caching that dominates real agent cost is invisible.
+  - >
+    The model identifier is recorded nowhere. `runs.provider` holds the provider's name; `grep -rn
+    model src/state.rs` returns only doc-comment prose. `steps.tokens` is one INTEGER per step, and
+    a step that retried and then fell back collapses into it. No per-model breakdown can be derived
+    from the store at any cost.
+  - >
+    `Containment::max_total_cost` is documented inert in its own doc comment at
+    `src/containment.rs:34` — "a provider reports tokens and never money, so `max_total_cost` is
+    inert and stays `None`". The only enforced spend ceiling is counted in tokens.
+  - >
+    No provider call is timed. `grep -rn 'Instant::now|elapsed()' src/provider/mod.rs src/run.rs`
+    hits only a test at `src/provider/mod.rs:736`. `run_outcomes.duration_ms` is wall-clock for the
+    whole run, so API latency cannot be separated from time spent in tools or waiting for a human.
+  - >
+    No configuration file of any kind exists in the crate. Every knob — policy, sandbox limits,
+    budgets, MCP servers, skills, provider selection — is a Rust builder call. io-cli and io-studio
+    would each have to invent their own format, and the two would diverge on their first release.
+  - >
+    Web search and web fetch are provider-executed on all three configured providers, not
+    client-side tools. Anthropic ships `web_search_20260318` / `web_fetch_20260318`, OpenAI ships a
+    `web_search` tool whose actions include `open_page` and `find_in_page`, and OpenRouter ships an
+    `:online` suffix and a `web` plugin. The harness's `Act::Net` check never sees the URLs, because
+    the provider dials them.
+  - >
+    Anthropic's web search returns `encrypted_content` on every result and requires the assistant's
+    content blocks to be echoed back byte-identical: "if `encrypted_content` is missing or modified,
+    the request fails with a 400 validation error". `ContextBudget` compacts superseded observations
+    and re-assembles the ledger each turn (`src/context.rs`, `ledger_observations` in
+    `src/state.rs`), which is exactly the modification that is rejected.
+  - >
+    Anthropic bills web search at $10 per 1,000 searches and reports the count as
+    `usage.server_tool_use.web_search_requests`; OpenRouter's Exa engine bills $0.005 per request.
+    Neither is a token cost, so a token-only accounting schema under-reports money for any run that
+    searches.
+before:
+  scope:
+    - >
+      Product vision: "A production-grade Rust agent harness that runs AI agents reliably from a
+      typed task contract to a verified result."
+    - >
+      Requirements list built around a fixed twelve-pillar capability set, complete as of 0.16.0,
+      with no entry for command execution, partial-file edit, language-agnostic verification,
+      configuration, multi-turn session, or cost accounting.
+    - >
+      Roadmap ends at 0.16.2. No unshipped version exists.
+  assumptions:
+    - >
+      That a task contract with a mandatory verification criterion is the right entry point for
+      every run. It is the right entry point for a bounded, checkable task and it is the wrong one
+      for open-ended work, which is most of what the owner wants the harness to do.
+    - >
+      That verification proves enough to be worth requiring. It proves what the caller's check
+      tested; requiring it does not make a run more correct, it only makes an unbounded run
+      impossible to express.
+    - >
+      That "provider-agnostic plus agent composition plus skills" is the differentiator. The audit
+      of opencode, pi, Claude Code, and Codex shows the actual differentiators are the traced
+      permission boundary, the durable per-step resume, the execution sandbox, and the shared
+      budget ledger across an agent tree — pi ships no permission system at all and defers to
+      containers.
+  implementation: >
+    `TaskContract` is the sole entry point to all twenty run/resume functions and holds `verify:
+    Verification` by value. Tools are a fixed set with no execution primitive. `Usage` is three
+    integers. Configuration is Rust builders.
+change:
+  summary: >
+    Reposition the product from a task-contract runner to an embeddable agent runtime whose value is
+    independent of the task, and extend the roadmap with six versions that make the code match. The
+    verification layer is kept and demoted: it stops being an entry requirement and becomes an
+    optional, language-agnostic gate, which is what turns "any task" from a sentence into a
+    capability. Nothing shipped is rewritten; every change lands in a new version.
+  added:
+    - >
+      Requirement — command execution as a fixed-argv `exec` tool, checked by `Act::Exec` against
+      the policy. Fixed argv rather than a shell string, matching the discipline the git built-ins
+      already use: the model supplies arguments, never a subcommand or a flag, so shell
+      metacharacter injection has no surface.
+    - >
+      Requirement — partial-file edit (`edit_file`), exact-match string replacement that fails on
+      zero or multiple matches.
+    - >
+      Requirement — language-agnostic verification. `Verification::Command { argv, expect_exit }`
+      and `Verification::None`, so a gate can be a Go test, a pytest run, an npm script, or nothing
+      at all.
+    - >
+      Requirement — project and toolchain detection as shipped data, mapping a marker file
+      (`Cargo.toml`, `package.json` + lockfile, `go.mod`, `pyproject.toml`, `pom.xml`, and the
+      rest) to default build, test, lint, and format argv, overridable in configuration.
+    - >
+      Requirement — full run accounting. Cache-read, cache-write, and reasoning tokens; the model
+      identifier; per-call API latency and time-to-first-token; provider server-tool request
+      counters; lines added and removed per edit; and a pricing table that is data rather than code.
+      Raw counts are stored; money is derived on read so a price correction repairs all history.
+    - >
+      Requirement — one configuration file, owned by this crate and consumed by io-cli and io-studio
+      rather than reimplemented in each.
+    - >
+      Requirement — a session layer above the run loop: a durable conversation tree, multi-turn
+      input, mid-turn steering, and token-level streaming to an `Observer`.
+    - >
+      Requirement — agency primitives: a todo tool, a tool that asks the operator a question
+      (distinct from the approval path, which asks about permissions rather than intent), named
+      agent definitions, and slash-command prompt templates.
+    - >
+      Requirement — provider-executed web search and fetch, declared and configured by the harness
+      across all three providers, with the policy's `net` allow-rules projected onto each provider's
+      domain-filter parameter.
+    - >
+      Non-goal — Google Gemini and local/OpenAI-compatible providers.
+    - >
+      Non-goal — OAuth and subscription authentication. API keys from the environment remain the
+      only credential path.
+    - >
+      Non-goal — client-side web search and fetch implementations. All three configured providers
+      execute them server-side, so building one would duplicate the provider and lose citations.
+  removed:
+    - >
+      The claim that a typed task contract is what the product is. It stays as the mechanism for a
+      bounded run and stops being the identity.
+    - >
+      The requirement that every run name a verification criterion.
+    - >
+      The assumption that provider-agnosticism plus composition plus skills is the differentiator.
+      Replaced by the traced permission boundary, durable resume, sandbox, and shared tree ledger,
+      which the competitive audit shows are the properties no comparable harness has together.
+  deferred:
+    - >
+      Everything in this iteration is new work with a destination. The six roadmap entries
+      0.17.0–0.22.0 added by this iteration are those destinations; nothing is deferred without one.
+  replaced:
+    - >
+      The public baseline sentence, in `product.yaml` and — when 0.17.0 ships — in `Cargo.toml`,
+      `README.md`, and the crate root. New wording: an embeddable agent runtime for Rust, any task,
+      any provider, in your process, with a permission boundary, a sandbox, and a durable trace you
+      own.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.17.0
+    - 0.18.0
+    - 0.19.0
+    - 0.20.0
+    - 0.21.0
+    - 0.22.0
+  tasks: []
+  dependencies:
+    - >
+      io-cli and io-studio both become consumers of the configuration file added in 0.19.0 rather
+      than authors of their own. Neither should be planned until that version's shape is known,
+      because the alternative is two formats that have to be reconciled later.
+    - >
+      io-eval gains per-model and per-call cost data in 0.18.0. Until then it can score token spend
+      and cannot score money, and cannot attribute either to a model.
+    - >
+      Four defects recorded in `docs/CONTRACT.md` are behaviour changes and need a release that can
+      carry a break. `RESERVED_TOOL_NAMES` is fixed in 0.17.0, which is already editing tool
+      dispatch. The `resume_tree` policy-recording gap, the unenforced
+      `SandboxLimits::max_processes`, and the absent Linux seccomp filter ride whichever later
+      release touches their module.
+  resource_effect: >
+    Adds roughly six releases of work to a roadmap that had none. Two of the six carry a deliberate
+    break: 0.17.0 changes the `Verification` enum, and 0.18.0 widens the `Usage` struct, which
+    breaks struct-literal construction. Both are permitted below 1.0 and both require a
+    `#[deprecated]` cycle and a changelog migration note under the crate's own published contract.
+versioning:
+  previous_target: 0.16.2
+  new_target: 0.17.0
+  consequence: minor-bump
+approval:
+  source: user
+  reference: >
+    Session 2026-07-28. The owner rejected the existing baseline sentence in their own words, asked
+    for a pure harness independent of task type, set the provider scope to Anthropic, OpenAI, and
+    OpenRouter only, ruled out Gemini, local providers, and OAuth/subscription authentication,
+    required web search and fetch to be configured through those three providers, required support
+    for the major languages and frameworks, and required full raw accounting output covering input,
+    output, cache, and cost. The research, the repositioning, and the six-version roadmap were
+    presented in full and the owner replied "go with proper ultraship process for all this from
+    brainstorm to plan", which is the approval for this amendment.
+canonical_updates:
+  - products/io-harness/product.yaml
+  - products/io-harness/roadmap.yaml

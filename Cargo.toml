@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.16.2"
+version = "0.17.0"
 edition = "2021"
 # rmcp 2.2.0 sets the real floor: it uses let-chains, stabilised in 1.88, and
 # publishes no rust-version of its own — so cargo cannot catch it at resolve time
@@ -14,16 +14,23 @@ license = "Apache-2.0"
 # every release, which reached 1041 characters at 0.11.0 and was refused by
 # crates.io against its 1000-character cap. The inventory belongs in the README
 # and the guide pages, which is where 0.16.0 put it.
-description = "Run an AI agent from a typed task contract to a verified result: provider-agnostic and embeddable in-process, with a layered permission boundary, execution-based verification inside a sandbox, durable resume for unattended runs, contained sub-agents, an MCP client, and a full SQLite trace."
+description = "An embeddable agent runtime for Rust: any task, any provider, in your own process. Run commands, edit files and search a repository under a layered permission boundary on files, commands and network; gate the result on the project's own test command in any language, or on nothing at all; and keep a full SQLite trace of every step, refusal and budget draw. With an execution sandbox, contained sub-agents, an MCP client, and durable resume for unattended runs."
 repository = "https://github.com/initorigin/io-harness"
 readme = "README.md"
 keywords = ["agent", "ai", "llm", "mcp", "harness"]
 categories = ["asynchronous", "api-bindings"]
-# Ship only crate consumers' files; keep internal planning/CI out of the package.
+# Workspace/planning state and local credentials are not part of the crate.
+#
+# `.env` is here for the reason the other two are not: a publish is
+# irreversible, and the belt-and-braces case is worth the line. `cargo package`
+# lists files through git in a git checkout, so an ignored `.env` would not be
+# packaged anyway — but "would not be" rests on this staying a git checkout with
+# that ignore rule, and a leaked registry token cannot be unleaked.
+#
 # docs/ is deliberately NOT excluded: the crate root and the README link the
 # guide pages, and a package that ships the links without the pages is worse
 # than one that ships neither.
-exclude = [".ultraship/", ".github/"]
+exclude = [".ultraship", ".env", ".github"]
 
 # docs.rs is the page this crate is mostly read on, and the default build hides
 # the documents and media surface entirely. Build it with everything on, and set

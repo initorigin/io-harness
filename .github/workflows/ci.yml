@@ -126,3 +126,56 @@ jobs:
       # compiles it.
       - run: cargo clippy --all-targets --features documents -- -D warnings
       - run: cargo clippy --all-targets --features media -- -D warnings
+
+  # OP1 — the docs.rs build, reproduced. This job exists because of a defect no
+  # other job in this file could see.
+  #
+  # 0.16.0 added `#![cfg_attr(docsrs, feature(doc_auto_cfg))]`. Rust removed
+  # `doc_auto_cfg` in 1.92.0 and merged it into `doc_cfg`, so docs.rs — which
+  # builds on nightly, with `--cfg docsrs`, which nothing else sets — failed with
+  # `error[E0557]: feature has been removed`. **0.16.0 and 0.16.1 have no docs.rs
+  # page, permanently**: published sources are immutable, so only a forward
+  # release can fix it, and 0.16.2 was that release. Every command above passed
+  # on the broken tree for two releases, because `docsrs` is set by docs.rs and
+  # by nothing else.
+  #
+  # `doc_cfg` is itself unstable and can go the same way. This is what will catch
+  # it before publication rather than after.
+  docs:
+    name: docs.rs (nightly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@v1
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@v2.9.1
+      # The exact build docs.rs performs: nightly, every feature, `--cfg docsrs`
+      # set, dependencies skipped. `-D warnings` because a broken intra-doc link
+      # is a page that ships with a dead link on it.
+      - name: build the docs the way docs.rs does
+        env:
+          RUSTDOCFLAGS: --cfg docsrs -D warnings
+        run: cargo +nightly doc --all-features --no-deps
+      # Exit zero is NOT the check. `doc_auto_cfg` was silently doing nothing for
+      # a while before it was removed outright, and a rustdoc that ignores an
+      # unknown feature gate exits 0 having produced pages with no feature labels
+      # on them — which is the failure this job is really about, since a reader
+      # then sees an item with no indication that it needs a feature to exist.
+      #
+      # So the rendered HTML is grepped for the string rustdoc emits when it
+      # labels a gated item. `Media` is gated on `media` and is re-exported from
+      # the crate root, so its page must carry one.
+      - name: the rendered pages must actually carry the feature labels
+        run: |
+          set -euo pipefail
+          if ! grep -rql "Available on crate feature" target/doc/io_harness/; then
+            echo "::error::cargo doc exited 0 but rendered no feature labels."
+            echo "The doc_cfg gate in src/lib.rs is not taking effect — see the"
+            echo "comment above it. Reproduce locally with:"
+            echo "  RUSTDOCFLAGS=\"--cfg docsrs\" cargo +nightly doc --all-features --no-deps"
+            exit 1
+          fi
+          echo "feature labels present in $(grep -rlc "Available on crate feature" \
+            target/doc/io_harness/ | wc -l) page(s)"

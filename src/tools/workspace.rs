@@ -264,6 +264,78 @@ impl Workspace {
         Ok(did)
     }
 
+    /// Replace one exact occurrence of `search` with `replace` in a file under
+    /// the root, leaving everything else byte-identical (0.17.0).
+    ///
+    /// The same [`Act::Write`] gate as [`Workspace::write_file`], on the same
+    /// path, because it is the same act — a partial edit is not a lesser one, and
+    /// a policy that refuses a write to `secrets/*` refuses this too.
+    ///
+    /// **Exactly one match, or nothing happens.** A `search` that appears zero
+    /// times or more than once is an [`Error::Config`] naming the file and the
+    /// count, and the file is not touched. That is the whole capability: an edit
+    /// that silently picks one of three occurrences is not a cheaper write, it is
+    /// a corrupting one, and the agent cannot correct for a mistake it is not
+    /// told about. The model's move when it sees the count is to lengthen
+    /// `search` until it is unique.
+    ///
+    /// ```
+    /// use io_harness::tools::Workspace;
+    /// use io_harness::tools::workspace::Wrote;
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// std::fs::write(dir.path().join("a.rs"), "fn one() {}\nfn two() {}\n")?;
+    /// let ws = Workspace::new(dir.path());
+    ///
+    /// // Unique: replaced, and the rest of the file is untouched.
+    /// assert_eq!(ws.edit_file("a.rs", "fn two", "fn three")?, Wrote::Changed);
+    /// assert_eq!(ws.read_file("a.rs")?, "fn one() {}\nfn three() {}\n");
+    ///
+    /// // Absent, and ambiguous, both refuse rather than guess.
+    /// assert!(ws.edit_file("a.rs", "fn four", "x").is_err());
+    /// assert!(ws.edit_file("a.rs", "fn ", "x").is_err());
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    ///
+    /// [`Error::Config`]: crate::Error::Config
+    pub fn edit_file(&self, rel: &str, search: &str, replace: &str) -> Result<Wrote> {
+        let abs = self.resolve(rel)?;
+        self.enforce(Act::Write, rel)?;
+        if search.is_empty() {
+            return Err(Error::Config(format!(
+                "edit_file needs a non-empty search string; {rel} was not changed"
+            )));
+        }
+        // Read through the same reader `read_file` uses, so a missing file is the
+        // empty string and therefore a zero-match refusal — an edit cannot create
+        // a file, and reporting "no such text" for a file that does not exist is
+        // the same answer by a shorter route.
+        let current = std::fs::read_to_string(&abs).unwrap_or_default();
+        match current.matches(search).count() {
+            1 => {}
+            0 => {
+                return Err(Error::Config(format!(
+                    "edit_file found no occurrence of that text in {rel}; nothing was changed. \
+                     Read the file and copy the text to replace from it exactly, whitespace \
+                     included"
+                )))
+            }
+            n => {
+                return Err(Error::Config(format!(
+                    "edit_file found {n} occurrences of that text in {rel}, and will not guess \
+                     which one you meant; nothing was changed. Extend the search text with \
+                     surrounding lines until it appears exactly once"
+                )))
+            }
+        }
+        let updated = current.replacen(search, replace, 1);
+        let did = Wrote::classify(std::fs::read(&abs), updated.as_bytes());
+        std::fs::write(abs, updated)?;
+        Ok(did)
+    }
+
     /// Read a file under the root as bytes, for a format that is not text.
     ///
     /// A path the policy denies is refused before anything is read, exactly as

@@ -13,16 +13,36 @@
 
 pub mod custom;
 pub mod documents;
+pub mod exec;
 pub mod fs;
 pub mod git;
 pub mod workspace;
 
 pub use custom::{Tool, ToolFuture, Toolbox};
+pub use exec::DEFAULT_EXEC_TIMEOUT;
 pub use fs::FsTool;
-pub use workspace::{Match, Workspace};
+pub use workspace::{Match, Workspace, Wrote};
 
 /// The name the model uses to write a file (single-file 0.1/0.2 form: content only).
 pub const WRITE_FILE_TOOL: &str = "write_file";
+/// The name the model uses to change part of a file, leaving the rest alone
+/// (0.17.0).
+///
+/// Sits beside [`WRITE_FILE_TOOL`] rather than replacing it: a new file, or one
+/// being rewritten wholesale, is still a write. This is for the common case a
+/// whole-file write handles badly — an edit costs tokens proportional to the file
+/// rather than to the change, and rewrites content the agent never intended to
+/// touch. Gated by the same [`Act::Write`](crate::Act::Write) check on the same
+/// path, because it is the same act.
+pub const EDIT_FILE_TOOL: &str = "edit_file";
+/// The name the model uses to run a command (0.17.0).
+///
+/// The widest capability the crate grants, and the one that made a task in any
+/// language expressible. Every call is an [`Act::Exec`](crate::Act::Exec) check
+/// on the program *and* on the joined argv, so an operator can allow `cargo *`
+/// and deny `rm *` with the rule syntax the policy already has. See
+/// [`exec`] for what it does and does not bound.
+pub const EXEC_TOOL: &str = "exec";
 /// The name the model uses to search file contents by regex/substring.
 pub const GREP_TOOL: &str = "grep";
 /// The name the model uses to list files by name/path glob.
@@ -55,7 +75,14 @@ pub const GIT_COMMIT_TOOL: &str = "git_commit";
 /// tools are: this one decides which of the user's files is sent to a third
 /// party, so it is gated per call on the real path the model names rather than
 /// authorised once by name.
-#[cfg(feature = "media")]
+///
+/// This name and the document names below exist in **every** build, though the
+/// tools behind them do not. Until 0.17.0 they were `#[cfg]`-gated, which made
+/// the reserved-name set [`Toolbox::validate`] enforces depend on the feature
+/// set: a caller could register a `Tool` called `xlsx_read` in a default build,
+/// pass validation, and then have that tool silently stop being reachable the
+/// day they turned the `xlsx` feature on. A name the harness owns is owned in
+/// all builds, so enabling a feature can never take a working tool away.
 pub const VIEW_IMAGE_TOOL: &str = "view_image";
 /// The names the model uses for spreadsheet work (0.14.0, `xlsx` feature).
 ///
@@ -67,44 +94,32 @@ pub const VIEW_IMAGE_TOOL: &str = "view_image";
 /// the real path it names — `deny_write("secrets/*")` refuses
 /// `xlsx_set_cell("secrets/book.xlsx", ...)` for exactly the reason it refuses
 /// `write_file` to the same path.
-#[cfg(feature = "xlsx")]
 pub const XLSX_READ_TOOL: &str = "xlsx_read";
 /// The name the model uses to list a workbook's sheets. See [`XLSX_READ_TOOL`].
-#[cfg(feature = "xlsx")]
 pub const XLSX_SHEETS_TOOL: &str = "xlsx_sheets";
 /// The name the model uses to create a new workbook. See [`XLSX_READ_TOOL`].
-#[cfg(feature = "xlsx")]
 pub const XLSX_WRITE_TOOL: &str = "xlsx_write";
 /// The name the model uses to change one cell of an existing workbook, keeping
 /// the rest of it. See [`XLSX_READ_TOOL`].
-#[cfg(feature = "xlsx")]
 pub const XLSX_SET_CELL_TOOL: &str = "xlsx_set_cell";
 
 /// The names the model uses for the other document formats (0.14.0). Built-ins
 /// for the same reason the spreadsheet tools are — see [`XLSX_READ_TOOL`].
-#[cfg(feature = "docx")]
 pub const DOCX_READ_TOOL: &str = "docx_read";
 /// The name the model uses to create a Word document. See [`DOCX_READ_TOOL`].
-#[cfg(feature = "docx")]
 pub const DOCX_WRITE_TOOL: &str = "docx_write";
 /// The name the model uses to read a slide deck's text. Read-only: there is no
 /// `pptx_write`, because writing one is not a capability this crate has.
-#[cfg(feature = "pptx")]
 pub const PPTX_READ_TOOL: &str = "pptx_read";
 /// The name the model uses to read a PDF's text. See [`XLSX_READ_TOOL`].
-#[cfg(feature = "pdf")]
 pub const PDF_READ_TOOL: &str = "pdf_read";
 /// The name the model uses to create a PDF. See [`XLSX_READ_TOOL`].
-#[cfg(feature = "pdf")]
 pub const PDF_WRITE_TOOL: &str = "pdf_write";
 /// The name the model uses to stamp a watermark across every page of a PDF.
-#[cfg(feature = "pdf")]
 pub const PDF_WATERMARK_TOOL: &str = "pdf_watermark";
 /// The name the model uses to fill a PDF's form fields.
-#[cfg(feature = "pdf")]
 pub const PDF_FILL_FORM_TOOL: &str = "pdf_fill_form";
 /// The name the model uses to decode barcodes and QR codes out of an image.
-#[cfg(feature = "barcode")]
 pub const BARCODE_DECODE_TOOL: &str = "barcode_decode";
 
 /// The name the model uses to record a fact for later runs over this workspace.

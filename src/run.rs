@@ -11,6 +11,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::json;
 use tracing::info;
@@ -31,6 +32,8 @@ use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
+use crate::toolchain::Toolchain;
+use crate::tools::exec::{Exec, ExecOutcome};
 use crate::tools::git::{Git, GitCmd, GitOutcome};
 #[cfg(feature = "barcode")]
 use crate::tools::BARCODE_DECODE_TOOL;
@@ -45,8 +48,8 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    FsTool, Toolbox, Workspace, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
-    REMEMBER_TOOL, WRITE_FILE_TOOL,
+    FsTool, Toolbox, Workspace, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL,
+    READ_SKILL_TOOL, REMEMBER_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -142,6 +145,11 @@ const OBS_GREP_CAP: usize = 50;
 ///     RunOutcome::Denied { .. } => "a human said no; the action never happened",
 ///     // An observer returned `Flow::Cancel`. Finished cleanly, and still resumable.
 ///     RunOutcome::Cancelled { .. } => "resume when you want it to continue",
+///
+///     // Only a `Verification::None` run reaches this: it stopped because the
+///     // agent stopped, not because a ceiling did. Nothing checked the work —
+///     // read it, rather than shipping it the way a `Success` may be shipped.
+///     RunOutcome::Finished { .. } => "the agent is done; nothing verified it",
 /// }
 /// # }
 /// ```
@@ -205,6 +213,25 @@ pub enum RunOutcome {
     /// finished rather than abandoned, and stays resumable — a resume reports this
     /// outcome instead of re-driving the loop.
     Cancelled { steps: u32 },
+    /// The agent finished. Only a [`Verification::None`] run reaches this: with
+    /// no criterion to pass, an assistant turn that calls no tool is the run
+    /// saying it is done, and the loop stops there.
+    ///
+    /// Distinct from every ceiling on purpose. An unattended run that completed
+    /// its work and one that ran out of steps both stop, and treating them alike
+    /// is how a fleet operator ends up re-driving finished work — or worse,
+    /// shipping the output of a run that never got there. `steps` is the step it
+    /// finished on.
+    ///
+    /// It is **not** a claim the work is correct. Nothing checked it; that is
+    /// what choosing [`Verification::None`] means. A run with a criterion reports
+    /// [`RunOutcome::Success`], and that one *is* a claim — bounded by what the
+    /// criterion checked and no wider.
+    ///
+    /// Added in 0.17.0 with [`Verification::None`].
+    ///
+    /// [`Verification::None`]: crate::Verification::None
+    Finished { steps: u32 },
 }
 
 /// The result of a run, including the persisted run id for audit.
@@ -1605,6 +1632,20 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
 /// Record the resume marker and one skipped marker per already-committed step,
 /// so a multi-crash run's full history is reconstructable from the store alone.
 /// Returns the step to resume from (last committed + 1).
+/// Did this step end the run, because there is no gate and the agent stopped
+/// acting?
+///
+/// Both halves are required. Without [`Verification::None`] an assistant turn
+/// with no tool call is an ordinary unproductive step — the agent thinking aloud,
+/// or asking a question the loop cannot answer — and ending the run there would
+/// silently cap every existing contract at its first quiet turn. Without the
+/// empty tool-call list there is no signal at all: no `done` tool is added, so an
+/// unverified run has exactly the tool surface a verified one has, and a model
+/// that has finished says so by saying something.
+fn finished(contract: &TaskContract, response: &CompletionResponse) -> bool {
+    matches!(contract.verify, Verification::None) && response.tool_calls.is_empty()
+}
+
 fn record_resume_markers(store: &Store, run_id: i64) -> Result<u32> {
     let last = store.last_step(run_id)?;
     let start_step = last + 1;
@@ -1691,6 +1732,10 @@ fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
         // human's `denied` is — the caller asked for it — so a resume reports it
         // rather than quietly starting the run up again.
         "cancelled" => Some(RunOutcome::Cancelled { steps: last }),
+        // 0.17.0: a `Verification::None` run that ended on its own terms. Final —
+        // there is no criterion left to re-check, so a resume reports it rather
+        // than driving the loop again to watch the agent say nothing twice.
+        "finished" => Some(RunOutcome::Finished { steps: last }),
         _ => None,
     }))
 }
@@ -2016,6 +2061,14 @@ async fn run_from<P: Provider>(
             }
         }
 
+        // A run with no criterion ends when the agent stops calling tools. After
+        // the budget checks, because a step that also crossed a ceiling crossed
+        // it — and before the gate, which for this variant can never pass.
+        if finished(contract, &response) {
+            finish(store, watch, run_id, 0, step, "finished")?;
+            return Ok(RunResult::new(RunOutcome::Finished { steps: step }, run_id));
+        }
+
         let contents = fs.read().await?;
         let guard = ExecGuard::new(&permissive)
             .tracing(store, run_id, step)
@@ -2098,6 +2151,11 @@ async fn run_workspace_from<P: Provider>(
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
+    // Detected once, before the first turn. The marker files do not change under
+    // a run often enough to be worth a filesystem walk every step, and a run that
+    // creates its own `package.json` is creating a project rather than working in
+    // one.
+    let toolchain = crate::toolchain::detect(root);
     let mem_key = memory_key(root);
     // Images the agent looked at last step, carried into this one's request and
     // dropped once shown. A viewed image is a tool result, not a permanent part
@@ -2144,7 +2202,7 @@ async fn run_workspace_from<P: Provider>(
             },
         )
         .await?;
-        let user = workspace_user_prompt(contract, &assembled.text);
+        let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
         #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
             system: system.clone(),
@@ -2221,6 +2279,7 @@ async fn run_workspace_from<P: Provider>(
                 0,
                 pending_media,
                 &contract.commit_identity,
+                contract.exec_timeout,
             )
             .await?
             {
@@ -2364,6 +2423,15 @@ async fn run_workspace_from<P: Provider>(
                         .with_remembered(remembered),
                 );
             }
+        }
+
+        // A run with no criterion ends when the agent stops calling tools. Checked
+        // after the budgets, so a step that also crossed a ceiling reports the
+        // ceiling, and before the gate, which for this variant can never pass.
+        if finished(contract, &response) {
+            finish(store, watch, run_id, 0, step, "finished")?;
+            return Ok(RunResult::new(RunOutcome::Finished { steps: step }, run_id)
+                .with_remembered(remembered));
         }
 
         if contract
@@ -2996,6 +3064,8 @@ fn run_agent<'f, P: Provider>(
         // is the same child, at whatever depth it sits.
         let (mut ledger, mut written) = restore_ledger(tree.store, run_id)?;
         let mut progress = Progress::new();
+        // Children share their parent's workspace, so they share its detection too.
+        let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);
@@ -3041,7 +3111,7 @@ fn run_agent<'f, P: Provider>(
                 },
             )
             .await?;
-            let user = workspace_user_prompt(contract, &assembled.text);
+            let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 system: system.clone(),
@@ -3128,6 +3198,7 @@ fn run_agent<'f, P: Provider>(
                     depth,
                     pending_media,
                     &contract.commit_identity,
+                    contract.exec_timeout,
                 )
                 .await?
                 {
@@ -3371,6 +3442,15 @@ fn run_agent<'f, P: Provider>(
                     "cost_budget_exceeded",
                 )?;
                 return Ok(RunOutcome::CostBudgetExceeded { steps: step });
+            }
+
+            // As in the workspace loop: no criterion means the agent's own quiet
+            // turn ends it. A child composes back into its parent carrying this
+            // outcome, so a parent can tell a child that finished from one that
+            // ran out of steps.
+            if finished(contract, &response) {
+                finish(tree.store, tree.watch, run_id, depth, step, "finished")?;
+                return Ok(RunOutcome::Finished { steps: step });
             }
 
             if contract
@@ -3832,6 +3912,7 @@ async fn dispatch(
     depth: u32,
     pending_media: &mut PendingMedia,
     identity: &crate::tools::git::Identity,
+    exec_timeout: Duration,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -4101,6 +4182,190 @@ async fn dispatch(
                         Err(e) => Dispatched::go("write error", format!("\n[write error] {e}\n")),
                     }
                 }
+            }
+        }
+        EDIT_FILE_TOOL => {
+            let path = s("path").unwrap_or_default();
+            let search = s("search").unwrap_or_default();
+            let replacement = s("replace").unwrap_or_default();
+            if path.is_empty() || search.is_empty() {
+                return Ok(Dispatched::go(
+                    "edit missing arguments",
+                    "\n[edit error] edit_file needs a \"path\" and a non-empty \"search\"\n",
+                ));
+            }
+            // The same act as `write_file`, so the same gate on the same path — a
+            // partial edit is not a lesser write, and a policy that refuses one
+            // refuses the other. The replacement text is offered as the content so
+            // a human deciding an `Ask` sees what is going in rather than only
+            // where.
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Write,
+                path,
+                Some(replacement),
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target,
+                    content,
+                    remember,
+                } => {
+                    let replacement = content.unwrap_or_default();
+                    match ws.edit_file(&target, search, &replacement) {
+                        Ok(wrote) => Dispatched::Continue {
+                            decision: format!("edited {target}"),
+                            obs: bound(
+                                &format!(
+                                    "\n[edited {target}] replaced {} chars with {}{}\n",
+                                    search.chars().count(),
+                                    replacement.chars().count(),
+                                    if wrote.moved_the_workspace() {
+                                        ""
+                                    } else {
+                                        " — the replacement is identical to what was there, so \
+                                         the workspace did not change"
+                                    }
+                                ),
+                                cap,
+                                ObsKind::Write,
+                            ),
+                            kind: ObsKind::Write,
+                            target: Some(target.clone()),
+                            changed: wrote.moved_the_workspace(),
+                            remember,
+                        },
+                        // A miss or an ambiguity is the model's to fix and says how:
+                        // an edit that guessed which of three occurrences was meant
+                        // is the failure this tool exists to make impossible.
+                        Err(e) => Dispatched::go("edit error", format!("\n[edit error] {e}\n")),
+                    }
+                }
+            }
+        }
+        EXEC_TOOL => {
+            let argv: Vec<String> = a
+                .get("argv")
+                .and_then(|v| v.as_array())
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let Some(program) = argv.first().filter(|p| !p.trim().is_empty()).cloned() else {
+                return Ok(Dispatched::go(
+                    "exec missing argv",
+                    "\n[exec error] exec needs a non-empty \"argv\" array whose first element is \
+                     the program\n",
+                ));
+            };
+            // Two checks, and the second is the one that makes a useful rule
+            // writable. The program alone is what `deny_exec(\"rm\")` names, and it
+            // holds whatever the arguments are. The whole argv is what
+            // `allow_exec(\"git log*\")` and `deny_exec(\"git push*\")` name — a
+            // check on the program could not tell those two apart, which is the
+            // weakness the git built-ins were built to route around and the reason
+            // they still exist.
+            let joined = argv.join(" ");
+            let mut remembered: Vec<Rule> = Vec::new();
+            let mut targets = vec![program.clone()];
+            if joined != program {
+                targets.push(joined.clone());
+            }
+            for target in targets {
+                match gate(
+                    ws,
+                    approver,
+                    store,
+                    run_id,
+                    step,
+                    Act::Exec,
+                    &target,
+                    None,
+                    watch,
+                    depth,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => return Ok(Dispatched::go(decision, obs)),
+                    Gated::Paused { request_id } => return Ok(Dispatched::Pause { request_id }),
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+            }
+
+            let outcome = Exec::new(ws.root(), exec_timeout, cap).run(&argv).await?;
+            let (decision, obs) = match &outcome {
+                ExecOutcome::Unavailable { reason } => (
+                    format!("{program} unavailable"),
+                    format!(
+                        "\n[exec unavailable] {reason}. This machine cannot run that command; \
+                         try another, or carry on without it.\n"
+                    ),
+                ),
+                ExecOutcome::TimedOut { after } => (
+                    format!("{program} timed out"),
+                    format!(
+                        "\n[exec timed out] `{joined}` was killed after {}s without finishing. \
+                         Nothing it printed was captured. Run something narrower, or expect this \
+                         command to need longer than this run allows.\n",
+                        after.as_secs()
+                    ),
+                ),
+                ExecOutcome::Ran {
+                    code,
+                    stdout,
+                    stderr,
+                    elided,
+                } => {
+                    let body = crate::verify::joined_streams(stdout, stderr);
+                    (
+                        format!(
+                            "exec {program} {}",
+                            code.map_or("(signal)".to_string(), |c| format!("exit {c}"))
+                        ),
+                        format!(
+                            "\n[exec `{joined}` {}]{}\n{}\n",
+                            code.map_or("killed by a signal".to_string(), |c| format!("exit {c}")),
+                            if *elided > 0 {
+                                format!(
+                                    " ({elided} characters of output elided from the middle; the \
+                                     start and the end are both here)"
+                                )
+                            } else {
+                                String::new()
+                            },
+                            if body.trim().is_empty() {
+                                "(no output)"
+                            } else {
+                                body.trim_end()
+                            }
+                        ),
+                    )
+                }
+            };
+            Dispatched::Continue {
+                decision,
+                obs,
+                kind: ObsKind::Tool,
+                target: None,
+                // Deliberately not `changed`, even for a command that plainly
+                // wrote files. The stall signal asks whether the agent is getting
+                // anywhere, and running the same build a fourth time without
+                // editing anything in between is the shape of an agent that is
+                // not — the argv is part of the call signature, so a *different*
+                // command is never mistaken for a repeat.
+                changed: false,
+                remember: remembered,
             }
         }
         // Loading one skill's body. Offered only when skills are configured, so
@@ -5072,7 +5337,11 @@ fn with_skill_catalog(base: String, skills: &Skills) -> String {
     )
 }
 
-fn workspace_user_prompt(contract: &TaskContract, observations: &str) -> String {
+fn workspace_user_prompt(
+    contract: &TaskContract,
+    observations: &str,
+    toolchain: Option<&Toolchain>,
+) -> String {
     let constraints = if contract.constraints.is_empty() {
         "(none)".to_string()
     } else {
@@ -5083,8 +5352,17 @@ fn workspace_user_prompt(contract: &TaskContract, observations: &str) -> String 
     } else {
         observations.to_string()
     };
+    // Every turn, not only the first. An agent forty steps into a run has had the
+    // first turn compacted out from under it by `ContextBudget`, and the project's
+    // build command is exactly the fact it would then have to rediscover — which
+    // is what this exists to stop it paying for twice.
+    let project = match toolchain {
+        Some(t) => format!("Project: {}\n", t.describe()),
+        None => String::new(),
+    };
     format!(
-        "Goal: {goal}\nConstraints: {constraints}\nSuccess criterion: {criterion}\n\n\
+        "Goal: {goal}\nConstraints: {constraints}\nSuccess criterion: {criterion}\n\
+         {project}\n\
          Observations so far (results of your tool calls):\n{obs}\n\n\
          Call a tool to make progress toward the success criterion.",
         goal = contract.goal,
@@ -5429,6 +5707,47 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "content": { "type": "string", "description": "Full new file contents." }
                 },
                 "required": ["path", "content"]
+            }),
+        },
+        ToolSpec {
+            name: EDIT_FILE_TOOL.to_string(),
+            description: "Change part of an existing file, leaving the rest of it exactly as it \
+                          was. Prefer this to write_file for anything but a new file. The search \
+                          text must appear EXACTLY ONCE: if it appears zero times or more than \
+                          once the edit is refused and nothing changes, so include enough \
+                          surrounding lines to make it unique."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "File path relative to the workspace root." },
+                    "search": { "type": "string", "description": "The exact text to replace, copied from the file including its whitespace. Must occur exactly once." },
+                    "replace": { "type": "string", "description": "What to put in its place. An empty string deletes the searched text." }
+                },
+                "required": ["path", "search", "replace"]
+            }),
+        },
+        ToolSpec {
+            name: EXEC_TOOL.to_string(),
+            description: "Run a command in the workspace root and read back its exit status and \
+                          its output — the project's own build, tests, linter, formatter or \
+                          package manager. There is NO shell: give the command as an array of \
+                          strings, one element per argument. Pipes, redirection, `&&`, `;` and \
+                          `$(...)` are not interpreted; they are ordinary characters inside \
+                          whichever argument contains them. Run one command per call. A command \
+                          that runs too long is killed and reported as a timeout, and very long \
+                          output keeps its start and its end with the middle elided."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "description": "The command, one array element per argument, program first — e.g. [\"npm\", \"test\"] or [\"cargo\", \"test\", \"--all-features\"].",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["argv"]
             }),
         },
     ];
