@@ -66,9 +66,14 @@ A deny in any layer beats an allow in any other, so an operator base is safe to
 hand out: nothing an application stacks on top can take it back. An `Effect::Ask`
 routes to the `Approver` exactly as a write does; a `Deny` never reaches one.
 
-Both checks are recorded in `policy_events` with the rule and layer that decided,
-so "what was this run allowed to run" is one query against the same table that
-answers it for files and hosts.
+A refusal, and an approver's decision, are recorded in `policy_events` with the
+rule and layer that produced them — the same table, and the same shape, as a
+refused read or a denied host. A *silent allow* is not: `exec` behaves here
+exactly as `read_file` and `write_file` do, and none of the three writes a row
+when the policy simply permits the action. What every call does leave, allowed or
+not, is the step's own trace row, whose `tool_call` column holds the argv the
+model asked for. So "what was refused" is one query against `policy_events`, and
+"what actually ran" is one query against `steps`.
 
 ```rust
 use io_harness::{Act, Effect, Policy};
@@ -143,7 +148,8 @@ Sandboxed execution as an opt-in is later work.
 
 | Question | Where |
 | --- | --- |
-| what was this run allowed to run, and what was refused | `policy_events`, `act = "exec"`, with the rule and layer |
+| what commands did this run ask to run | `steps.tool_call`, and the `ToolCall` observer event |
+| which were refused, or went to a human | `policy_events`, `act = "exec"`, with the rule and layer |
 | what a gate command printed when it failed | `sandbox_events`, `kind = "gate_output"` |
 | which phase of a gate failed | `sandbox_events`, `kind = "gate_phase_failed"` |
 | what the agent saw | the step's observation, and the next step's prompt |

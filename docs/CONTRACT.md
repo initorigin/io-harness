@@ -137,9 +137,10 @@ thing then does.
 **What a command the agent runs is bounded by.** As of 0.17.0 the agent can run
 a command with the `exec` tool. Every call is an `Act::Exec` check on the program
 *and* on the whole argv, so `allow_exec("cargo test*")` beside
-`deny_exec("cargo publish*")` means what it reads, and both decisions land in
-`policy_events` attributed to the rule and layer. What the policy does **not**
-decide is what the command then does.
+`deny_exec("cargo publish*")` means what it reads. A refusal, and an approver's
+decision, land in `policy_events` attributed to the rule and layer; a silent
+allow does not write a row, exactly as it does not for a read or a write. What
+the policy does **not** decide is what the command then does.
 
 A command runs **in the workspace root with the embedding program's privileges,
 outside the sandbox**. That is the same bound already stated above for a

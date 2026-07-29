@@ -262,15 +262,22 @@ pub fn detect(root: &Path) -> Option<Toolchain> {
         // running `npm install` in a pnpm workspace does not merely waste a turn,
         // it writes a second lockfile the project did not ask for.
         "package.json" => {
-            let (manager, install) = if has("bun.lockb") || has("bun.lock") {
-                ("bun", "install")
+            // `install` and not `ci` for npm. `npm ci` is the right command in a
+            // CI job and the wrong one here: it requires a lockfile and fails
+            // outright without one, which is exactly what the 0.17.0 live run hit
+            // on its first turn — the agent was handed a default that could not
+            // work on the project in front of it. `npm install` works with a
+            // lockfile and without.
+            let manager = if has("bun.lockb") || has("bun.lock") {
+                "bun"
             } else if has("pnpm-lock.yaml") {
-                ("pnpm", "install")
+                "pnpm"
             } else if has("yarn.lock") {
-                ("yarn", "install")
+                "yarn"
             } else {
-                ("npm", "ci")
+                "npm"
             };
+            let install = "install";
             tc(
                 "node",
                 marker,
@@ -500,7 +507,7 @@ mod tests {
             ("bun.lock", "bun", "install"),
             ("pnpm-lock.yaml", "pnpm", "install"),
             ("yarn.lock", "yarn", "install"),
-            ("package-lock.json", "npm", "ci"),
+            ("package-lock.json", "npm", "install"),
         ] {
             let dir = project(&["package.json", lockfile]);
             let found = detect(dir.path()).unwrap();
