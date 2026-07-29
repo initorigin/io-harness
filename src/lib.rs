@@ -217,7 +217,7 @@
 // `doc_cfg`, not `doc_auto_cfg`: the latter was removed in 1.92.0 (rust-lang
 // PR 138907) and merged into `doc_cfg`, which now does the automatic labelling
 // itself. 0.16.1's docs.rs build failed on the removed feature name.
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 pub mod approve;
 pub mod containment;
