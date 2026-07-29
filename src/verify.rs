@@ -151,6 +151,87 @@ pub enum Verification {
     FileContains(String),
     /// The file's contents must equal this text exactly.
     FileEquals(String),
+    /// Run a caller-supplied command in the workspace's execution sandbox and
+    /// require this exit status (0.17.0).
+    ///
+    /// One variant that covers every language the machine has a toolchain for,
+    /// and the reason the crate stopped being a Rust-shaped harness: `cargo
+    /// test`, `npm test`, `go test ./...`, `pytest`, `dotnet test`, `make check`
+    /// are all the same criterion with a different argv.
+    ///
+    /// `argv` is an array, program first, and there is no shell — `;`, `&&`,
+    /// `$( )` and a backtick are bytes inside one argument, not syntax. `argv[0]`
+    /// is what the [`Policy`] is asked about, exactly as `rustc` is on the
+    /// Rust-specific gates, and verification cannot prompt, so the spawn happens
+    /// only when a rule explicitly allows it.
+    ///
+    /// ```
+    /// use io_harness::{TaskContract, Verification};
+    ///
+    /// // A JavaScript project. Nothing on this path is Rust-aware.
+    /// let contract = TaskContract::workspace(
+    ///     "make the failing test in test/parse.test.js pass",
+    ///     "/path/to/js-repo",
+    ///     Verification::Command {
+    ///         argv: vec!["npm".into(), "test".into()],
+    ///         expect_exit: 0,
+    ///     },
+    /// );
+    /// # let _ = contract;
+    /// ```
+    ///
+    /// `expect_exit` is a status rather than a bool because "the linter found
+    /// nothing" and "the command ran" are different claims, and some tools say
+    /// so with a number. A command killed by a signal or by a sandbox cap never
+    /// satisfies the criterion, whatever `expect_exit` says: it did not exit.
+    ///
+    /// Workspace mode only — the command runs with the workspace root as its
+    /// working directory, and a single-file contract has no root to give it.
+    Command {
+        /// The command to run, program first. Passed to the OS as an array; no
+        /// shell parses it.
+        argv: Vec<String>,
+        /// The exit status that means the criterion is satisfied. Usually 0.
+        expect_exit: i32,
+    },
+    /// No gate at all (0.17.0). The run ends when the agent stops calling tools.
+    ///
+    /// This is what makes an open-ended task expressible. Until 0.17.0
+    /// [`TaskContract`](crate::TaskContract) took a `Verification` by value and
+    /// four of the five variants ran `rustc`, so "debug this production issue" or
+    /// "work out why the deploy fails" could not be *stated*, let alone run —
+    /// there was no criterion to name and no way to say there was none.
+    ///
+    /// An assistant turn carrying no tool call ends the run with
+    /// [`RunOutcome::Finished`](crate::RunOutcome::Finished), which is a distinct
+    /// outcome from a step cap, a stall and a budget stop — so an unattended run
+    /// that simply finished is never later mistaken for one that ran out. No
+    /// `done` tool is added: an unverified run gains no tool surface over a
+    /// verified one, and a model that has nothing left to do says so by saying
+    /// something.
+    ///
+    /// ```
+    /// use io_harness::{RunOutcome, TaskContract, Verification};
+    ///
+    /// let contract = TaskContract::workspace(
+    ///     "work out why the nightly deploy has been failing and write up what you find",
+    ///     "/path/to/repo",
+    ///     Verification::None,
+    /// );
+    ///
+    /// // What "it worked" means for a run with no criterion: it finished on its
+    /// // own terms rather than hitting a ceiling. Nothing here claims the work is
+    /// // *correct* — with no gate, nothing could.
+    /// fn done(outcome: &RunOutcome) -> bool {
+    ///     matches!(outcome, RunOutcome::Finished { .. })
+    /// }
+    /// # let _ = (contract, done);
+    /// ```
+    ///
+    /// What you give up is what a gate was ever worth: nothing checked the work.
+    /// Reach for [`Verification::Command`] whenever the task *has* a checkable
+    /// criterion — this variant is for the tasks that genuinely do not.
+    None,
     /// The file must compile as a Rust library (`rustc --crate-type lib`), and
     /// its items must survive to be type-checked. Execution-based: a
     /// non-compiling stub fails.
@@ -160,6 +241,12 @@ pub enum Verification {
     /// a file whose body does not type-check compiled clean and passed. A subject
     /// that deletes its own contents now fails. Legitimate crate-level attributes
     /// — `#![allow(dead_code)]`, `#![no_std]` — are unaffected.
+    #[deprecated(
+        since = "0.17.0",
+        note = "use Verification::Command { argv: vec![\"cargo\".into(), \"build\".into()], \
+                expect_exit: 0 } — or any compiler invocation for the language in hand. \
+                Removed in 0.18.0."
+    )]
     CompilesRust,
     /// The file must compile, and `test_src` must compile against it and pass.
     /// Execution-based.
@@ -171,6 +258,12 @@ pub enum Verification {
     /// `pub` to pass. See the
     /// [type-level docs](Verification#what-a-passing-gate-proves) for what a
     /// pass does and does not prove.
+    #[deprecated(
+        since = "0.17.0",
+        note = "use Verification::Command { argv: vec![\"cargo\".into(), \"test\".into()], \
+                expect_exit: 0 } and put the test in the project's own test suite, where the \
+                project's own tooling can run it. Removed in 0.18.0."
+    )]
     RustTestPasses {
         /// Rust source compiled against the file, e.g. a `#[test] fn`.
         test_src: String,
@@ -236,6 +329,12 @@ pub enum Verification {
     /// Hardened with [`Verification::RustTestPasses`] in 0.8.1: a shadowing
     /// definition in any one of the files cannot defeat the gate, and a private
     /// item in any of them still reaches `test_src`.
+    #[deprecated(
+        since = "0.17.0",
+        note = "use Verification::Command { argv: vec![\"cargo\".into(), \"test\".into()], \
+                expect_exit: 0 }, which runs the repository's own suite over the whole crate \
+                rather than a concatenation of the files you listed. Removed in 0.18.0."
+    )]
     WorkspaceTestPasses {
         /// Files (relative to the workspace root) concatenated into the subject.
         files: Vec<PathBuf>,
@@ -414,11 +513,43 @@ impl<'a> ExecGuard<'a> {
         }
     }
 
+    /// Record what a failing gate command printed, bounded.
+    ///
+    /// `Ok(false)` on its own says a criterion did not pass and nothing about
+    /// why, and the two causes need opposite responses: the agent's work being
+    /// wrong is a run to resume, and the test runner not being installed is a
+    /// machine to fix. Bounded because a build log is unbounded and this is a
+    /// trace row, and truncated from the tail, which is where a test runner puts
+    /// the failure.
+    fn record_gate_output(&self, output: &str) {
+        if output.trim().is_empty() {
+            return;
+        }
+        if let Some((store, run_id, step)) = self.trace {
+            let (bounded, _) =
+                crate::tools::exec::head_and_tail(output.trim(), GATE_OUTPUT_TRACE_CHARS);
+            self.sandboxed_event(store, &SandboxEvent::gate_output(run_id, step, &bounded));
+        }
+    }
+
     /// Execute an already-policy-checked `argv` in `workdir`, returning whether
     /// it succeeded. Routes through the sandbox when one is configured (the
     /// 0.6.0 default) — so model-produced code never runs on the host directly —
     /// and falls back to a direct spawn when the sandbox is opted out (0.5.0).
     async fn exec(&self, argv: &[String], workdir: &Path) -> Result<bool> {
+        Ok(self.exec_output(argv, workdir).await?.exit == Some(0))
+    }
+
+    /// [`ExecGuard::exec`], keeping the exit status and the output rather than
+    /// reducing both to "did it work".
+    ///
+    /// The one execution path, which is why 0.17.0 put the detail here rather
+    /// than beside it: [`Verification::Command`] needs a *specific* exit status
+    /// and needs the command's own output for the trace, and the Rust-specific
+    /// gates need neither. A second spawn site for the second requirement would
+    /// be two places where the sandbox decision, the policy trace and the
+    /// lifecycle events could drift apart.
+    async fn exec_output(&self, argv: &[String], workdir: &Path) -> Result<GateRun> {
         match &self.sandbox {
             Some(cfg) => {
                 let sb = sandbox::select(cfg);
@@ -468,7 +599,18 @@ impl<'a> ExecGuard<'a> {
                         "sandboxed command failed"
                     );
                 }
-                Ok(outcome.success())
+                Ok(GateRun {
+                    // A cap hit is a real failure of the gate, not a pass, and
+                    // the exit code a killed process reports is not one it chose
+                    // — so it reports as no exit at all, which no `expect_exit`
+                    // can match.
+                    exit: if outcome.cap_hit.is_some() {
+                        None
+                    } else {
+                        outcome.exit_code
+                    },
+                    output: joined_streams(&outcome.stdout, &outcome.stderr),
+                })
             }
             None => {
                 // Direct host execution — the exact 0.5.0 path.
@@ -485,11 +627,48 @@ impl<'a> ExecGuard<'a> {
                         "host command failed"
                     );
                 }
-                Ok(out.status.success())
+                Ok(GateRun {
+                    exit: out.status.code(),
+                    output: joined_streams(
+                        &String::from_utf8_lossy(&out.stdout),
+                        &String::from_utf8_lossy(&out.stderr),
+                    ),
+                })
             }
         }
     }
 }
+
+/// One gate command's result: how it exited, and what it said.
+///
+/// `exit` is `None` when the command did not exit on its own terms — a signal,
+/// or a sandbox cap. That is deliberately not `Some(some_code)`: a killed
+/// process's status is the killer's, and matching it against a caller's
+/// `expect_exit` would let a command that was cut short pass a criterion.
+struct GateRun {
+    exit: Option<i32>,
+    output: String,
+}
+
+/// Both streams, in the order a reader wants them: what it printed, then what it
+/// complained about.
+///
+/// Shared with the `exec` tool's dispatch arm, so a command's output reads the
+/// same way whether it ran as a criterion or as a tool call.
+pub(crate) fn joined_streams(stdout: &str, stderr: &str) -> String {
+    match (stdout.trim(), stderr.trim()) {
+        ("", e) => e.to_string(),
+        (o, "") => o.to_string(),
+        (o, e) => format!("{o}\n{e}"),
+    }
+}
+
+/// How much of a failing gate command's output the trace keeps.
+///
+/// A test runner's useful output is a screenful; a build's is unbounded. This is
+/// a trace row rather than the model's context, so it is bounded on its own terms
+/// rather than by the run's per-observation cap.
+const GATE_OUTPUT_TRACE_CHARS: usize = 4_000;
 
 /// The logical name of the test binary verification builds and runs. Denying it
 /// while allowing `rustc` gives compile-only verification: the produced code is
@@ -532,6 +711,7 @@ impl Verification {
     }
 
     /// [`Verification::passes`], with every spawn checked against a policy.
+    #[allow(deprecated)] // the variants this release deprecates still work here
     pub async fn passes_guarded(
         &self,
         _path: &Path,
@@ -545,7 +725,13 @@ impl Verification {
             Verification::RustTestPasses { test_src } => {
                 compile_source(contents, Some(test_src), guard).await
             }
-            Verification::EachCompilesRust(_)
+            // There is no gate, so there is nothing here that can pass. The run
+            // ends on an assistant turn that calls no tool — see
+            // [`RunOutcome::Finished`](crate::RunOutcome::Finished) — which is a
+            // decision the loop makes and not one this function can.
+            Verification::None => Ok(false),
+            Verification::Command { .. }
+            | Verification::EachCompilesRust(_)
             | Verification::WorkspaceTestPasses { .. }
             | Verification::DocumentContains { .. }
             | Verification::WorkspaceFileContains { .. } => Err(Error::Config(
@@ -561,8 +747,38 @@ impl Verification {
     }
 
     /// [`Verification::passes_in`], with every spawn checked against a policy.
+    #[allow(deprecated)] // the variants this release deprecates still work here
     pub async fn passes_in_guarded(&self, root: &Path, guard: &ExecGuard<'_>) -> Result<bool> {
         match self {
+            // The one criterion that is not about Rust. Everything the gate
+            // needs is in the argv, so the same three lines check a Go test, a
+            // pytest run, an npm script or a Makefile target.
+            Verification::Command { argv, expect_exit } => {
+                let Some(program) = argv.first() else {
+                    return Err(Error::Config(
+                        "Verification::Command needs a non-empty argv".into(),
+                    ));
+                };
+                guard.check(program, &argv[1..])?;
+                let run = guard.exec_output(argv, root).await?;
+                let passed = run.exit == Some(*expect_exit);
+                if !passed {
+                    // What the command said about its own failure, where the next
+                    // diagnosis can read it. Without this a failing gate is an
+                    // outcome discriminant and nothing else, and "the agent's work
+                    // is wrong" is indistinguishable from "the test runner is not
+                    // installed".
+                    guard.record_gate_failure(&format!(
+                        "command exited {} (expected {expect_exit})",
+                        run.exit
+                            .map_or_else(|| "on a signal or a cap".to_string(), |c| c.to_string()),
+                    ));
+                    guard.record_gate_output(&run.output);
+                }
+                Ok(passed)
+            }
+            // No gate: see `passes_guarded`.
+            Verification::None => Ok(false),
             Verification::WorkspaceFileContains { file, needle } => {
                 let src = tokio::fs::read_to_string(root.join(file))
                     .await
@@ -603,8 +819,20 @@ impl Verification {
     }
 
     /// Human-readable description fed to the model as the success criterion.
+    #[allow(deprecated)] // the variants this release deprecates still describe themselves
     pub fn describe(&self) -> String {
         match self {
+            Verification::Command { argv, expect_exit } => format!(
+                "running `{}` in the workspace root must exit {expect_exit}",
+                argv.join(" ")
+            ),
+            // Said plainly rather than left blank. A model told nothing about
+            // how it will be judged infers a criterion and works to that one;
+            // told there is none, it works to the goal, which is the whole point
+            // of the variant.
+            Verification::None => "there is no automated check. Do the work the goal describes, \
+                                   then reply without calling a tool to end the run"
+                .to_string(),
             Verification::FileContains(needle) => {
                 format!("the file must contain exactly this text: {needle:?}")
             }
@@ -940,6 +1168,11 @@ async fn compile_source(
     }
 }
 
+// The Rust-specific variants are deprecated in 0.17.0 and removed in 0.18.0.
+// Their tests stay, unchanged, until the variants go: they are the specification
+// of what each one proves, and F10's claim that a 0.16.2-era contract still works
+// is only worth anything if the assertions behind it are still running.
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::*;

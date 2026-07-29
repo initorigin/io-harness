@@ -1,12 +1,17 @@
-//! Run an AI agent from a typed task contract to a verified result — in your own
-//! process, under a permission boundary you control.
+//! An embeddable agent runtime for Rust. Any task, any provider, in your process
+//! — with a permission boundary, a sandbox, and a durable trace you own.
 //!
-//! You hand it a [`TaskContract`]: the task, the file or workspace it may touch,
-//! and the [`Verification`] criterion that decides whether the work is done. The
-//! harness runs the loop — observe, reason, act, verify, stop — and returns a
-//! [`RunResult`] whose [`RunOutcome`] says a check actually passed, with every
-//! step, refusal, and budget draw in a SQLite trace ([`Store`]) you can read
-//! afterwards. Provider-agnostic, embeddable in-process, no daemon and no CLI.
+//! You hand it a [`TaskContract`]: the task, the workspace it may touch, and what
+//! it may read, write, run and dial. The harness runs the loop — observe, reason,
+//! act, check, stop — and returns a [`RunResult`] whose [`RunOutcome`] says why it
+//! stopped, with every step, refusal, and budget draw in a SQLite trace
+//! ([`Store`]) you can read afterwards. No daemon and no CLI.
+//!
+//! The agent can run the project's own toolchain, so the language a project is
+//! written in is not this crate's business. [`Verification`] is optional and
+//! language-agnostic: a criterion can be `cargo test`, `npm test`, `go test
+//! ./...` or [`Verification::None`] when the task has no checkable criterion at
+//! all.
 //!
 //! # Quickstart
 //!
@@ -18,19 +23,23 @@
 //!     let provider = OpenRouter::from_env()?; // OPENROUTER_API_KEY + OPENROUTER_MODEL
 //!     let store = Store::memory()?;
 //!
-//!     let contract = TaskContract::new(
-//!         "add a hello function returning 42",
-//!         "src/hello.rs",
-//!         // Not a substring check: this compiles the file the agent produced.
-//!         Verification::CompilesRust,
+//!     let contract = TaskContract::workspace(
+//!         "the test suite is failing; find out why and fix it",
+//!         "/path/to/repo",
+//!         // The project's own command decides whether the work is done. Nothing
+//!         // on this path is Rust-aware.
+//!         Verification::Command { argv: vec!["npm".into(), "test".into()], expect_exit: 0 },
 //!     );
 //!
-//!     // src/ is writable; secrets/ is refused outright and never reaches a human.
+//!     // src/ is writable, secrets/ is refused outright and never reaches a human,
+//!     // and the agent may run the test runner but nothing that publishes.
 //!     let policy = Policy::default()
 //!         .layer("app")
 //!         .allow_read("*")
 //!         .allow_write("src/*")
-//!         .deny_read("secrets/*");
+//!         .deny_read("secrets/*")
+//!         .allow_exec("npm*")
+//!         .deny_exec("npm publish*");
 //!
 //!     let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
 //!     println!("{:?}", result.outcome);
@@ -44,15 +53,28 @@
 //!
 //! # What it does
 //!
-//! **The loop.** [`TaskContract::new`] names one file to edit;
-//! [`TaskContract::workspace`] gives the agent `grep`, `find`, `read_file` and
-//! `write_file` across a repository root, verified together.
+//! **The loop.** [`TaskContract::workspace`] gives the agent `grep`, `find`,
+//! `read_file`, `write_file` and `edit_file` across a repository root;
+//! [`TaskContract::new`] names one file to edit.
 //!
-//! **Verification that executes.** A [`Verification`] criterion can compile the
-//! produced file ([`Verification::CompilesRust`]) or run a test against it
-//! ([`Verification::RustTestPasses`]), inside a sandbox, so a substring stub
-//! cannot pass. What a passing gate proves is narrower than it reads, and
-//! [`Verification`] states it exactly.
+//! **Commands, under the same boundary as everything else.** The agent runs the
+//! project's own build, tests, linter or package manager through an `exec` tool
+//! ([`tools::EXEC_TOOL`]) taking a fixed argv and never a shell string, so there
+//! is no `;`, `&&` or `$( )` to parse and therefore none to get wrong. Every call
+//! is an [`Act::Exec`] check on the program *and* on the whole argv, so
+//! `allow_exec("cargo test*")` beside `deny_exec("cargo publish*")` means what it
+//! reads. A command runs in the workspace with the embedding program's privileges
+//! and is **not** sandboxed — see [`tools::exec`] for the whole of that bound,
+//! and [`DEFAULT_EXEC_TIMEOUT`] for the ceiling on one that wedges.
+//!
+//! **Verification in any language, or none.** [`Verification::Command`] runs a
+//! caller-supplied command in the sandbox and asserts its exit status — one
+//! variant covering every language the machine has a toolchain for.
+//! [`Verification::None`] is a run with no gate, ended by an assistant turn that
+//! calls no tool and reported as [`RunOutcome::Finished`]. What a passing gate
+//! proves is narrower than it reads, and [`Verification`] states it exactly.
+//! [`toolchain::detect`] tells the agent what this project's commands
+//! conventionally are, so it does not spend turns finding out.
 //!
 //! **A permission boundary.** A [`Policy`] of layered, deny-first [`Rule`]s
 //! decides what the agent may read, write, execute ([`Act::Exec`]) and connect
@@ -188,6 +210,8 @@
 //! Longer prose than a doc comment should carry, one page per capability:
 //!
 //! - [Permissions and approval](https://github.com/initorigin/io-harness/blob/main/docs/guide/permissions.md)
+//! - [Command execution](https://github.com/initorigin/io-harness/blob/main/docs/guide/command-execution.md)
+//! - [Language support](https://github.com/initorigin/io-harness/blob/main/docs/guide/language-support.md)
 //! - [Verification](https://github.com/initorigin/io-harness/blob/main/docs/guide/verification.md)
 //! - [Agent composition](https://github.com/initorigin/io-harness/blob/main/docs/guide/composition.md)
 //! - [Execution sandbox](https://github.com/initorigin/io-harness/blob/main/docs/guide/sandbox.md)
@@ -234,6 +258,7 @@ mod run;
 pub mod sandbox;
 pub mod skills;
 mod state;
+pub mod toolchain;
 pub mod tools;
 mod verify;
 
@@ -287,5 +312,5 @@ pub use state::{
     SUCCESS_OUTCOME,
 };
 pub use tools::git::Identity;
-pub use tools::{Tool, ToolFuture, Toolbox};
+pub use tools::{Tool, ToolFuture, Toolbox, DEFAULT_EXEC_TIMEOUT};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

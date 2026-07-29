@@ -1,0 +1,55 @@
+=== OP5 live run: a real non-Rust project ===
+date: 2026-07-29T02:36:09Z
+provider: openrouter, model: openai/gpt-5.6-luna
+node: v24.15.0, npm: 11.12.1
+
+The fixture: a JavaScript package with one real npm dependency and one real
+bug (sum() starts its accumulator at 1). The agent is told nothing about the
+toolchain. The gate is the project's own `npm test`. test.js is denied by
+policy, so a run that 'passed' by rewriting the suite would have been refused.
+
+outcome:  Success { steps: 6 }
+provider: Some("openrouter")
+spend:    8951 tokens
+
+--- steps ---
+  1  find "*" (6 paths)
+     find:{"name_glob":"*"}
+  2  read package.json; read index.js; read test.js
+     read_file:{"path":"package.json"} | read_file:{"path":"index.js"} | read_file:{"path":"test.js"}
+  3  exec npm exit 0
+     exec:{"argv":["npm","install"]}
+  4  exec npm exit 1
+     exec:{"argv":["npm","test"]}
+  5  read index.js
+     read_file:{"path":"index.js"}
+  6  edited index.js
+     edit_file:{"path":"index.js","replace":"  let total = 0;","search":"  let total = 1;"}
+
+--- every exec row in policy_events ---
+step   1  decision  npm test  (rule Some("npm*"), layer Some("app"))
+step   2  decision  npm test  (rule Some("npm*"), layer Some("app"))
+step   3  decision  npm test  (rule Some("npm*"), layer Some("app"))
+step   4  decision  npm test  (rule Some("npm*"), layer Some("app"))
+step   5  decision  npm test  (rule Some("npm*"), layer Some("app"))
+step   6  decision  npm test  (rule Some("npm*"), layer Some("app"))
+
+--- index.js as the agent left it ---
+const isOdd = require('is-odd');
+
+function sum(numbers) {
+  let total = 0;
+  for (const n of numbers) {
+    total += n;
+  }
+  return total;
+}
+
+function oddsOnly(numbers) {
+  return numbers.filter((n) => isOdd(n));
+}
+
+module.exports = { sum, oddsOnly };
+
+
+verified by the project's own `npm test`, in 6 steps

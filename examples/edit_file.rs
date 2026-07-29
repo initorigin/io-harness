@@ -6,6 +6,13 @@
 //! cargo run --example edit_file
 //! ```
 
+// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
+// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
+// still work, and the fixtures are loose `.rs` files rather than cargo projects,
+// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
+// has no project to run in. See docs/guide/verification.md for the migration.
+#![allow(deprecated)]
+
 use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
 
 #[tokio::main]

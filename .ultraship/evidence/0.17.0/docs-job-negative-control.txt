@@ -1,0 +1,41 @@
+=== negative control 1: the 0.16.0 defect, reproduced ===
+$ RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps
+error[E0557]: feature has been removed
+error: Compilation failed, aborting rustdoc
+For more information about this error, try `rustc --explain E0557`.
+error: could not document `io-harness`
+exit: 
+
+=== negative control 2: the gate silently absent — cargo doc exits 0 and the pages carry no labels ===
+$ RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.38s
+   Generated /Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness/target/doc/io_harness/index.html
+doc exit: 0 — which is why exit zero is not the check
+$ grep -rql "Available on crate feature" target/doc/io_harness/
+no labels: the grep step fails the job, as it must
+
+=== positive control: the shipped tree ===
+toolchain: rustc 1.99.0-nightly (09ee43b2d 2026-07-27)
+$ RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps
+   Generated /Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness/target/doc/io_harness/index.html
+$ grep -rl "Available on crate feature" target/doc/io_harness/
+target/doc/io_harness/index.html
+target/doc/io_harness/tools/documents/index.html
+target/doc/io_harness/provider/index.html
+
+=== CI proof, GitHub Actions ===
+run 30415978901, branch feat/0.17.0-docs-job-control (the deliberate failure):
+  msrv: success
+  test (macos-latest): success
+  lint: success
+  docs.rs (nightly): failure
+  test (windows-latest): success
+  test (ubuntu-latest): success
+
+run 30415977056, branch feat/0.17.0 (the same workflow on the real tree):
+  docs.rs (nightly): success
+  test (windows-latest): success
+  msrv: success
+  lint: success
+  test (macos-latest): success
+  test (ubuntu-latest): success

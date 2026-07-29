@@ -35,6 +35,7 @@ async_fn run_with src/run.rs
 async_fn run_with_observed src/run.rs
 const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
+const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
 const IMAGE_MEDIA_TYPES src/provider/mod.rs (feature = "media")
 const MCP_TOOL_PREFIX src/mcp.rs
 const MEMORY_MAX_CHARS src/state.rs

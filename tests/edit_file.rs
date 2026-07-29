@@ -6,6 +6,13 @@
 //! (the I01 stub is rejected in the loop), the time and cost budgets, retry with
 //! escalation, and resuming an interrupted run.
 
+// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
+// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
+// still work, and the fixtures are loose `.rs` files rather than cargo projects,
+// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
+// has no project to run in. See docs/guide/verification.md for the migration.
+#![allow(deprecated)]
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 

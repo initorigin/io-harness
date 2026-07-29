@@ -137,6 +137,17 @@ pub struct TaskContract {
     /// though the two are related, since the share is taken of what the spend
     /// budget has left.
     pub context: ContextBudget,
+    /// How long a command the agent runs with the `exec` tool may take before it
+    /// is killed and reported as a timeout.
+    ///
+    /// Defaults to [`DEFAULT_EXEC_TIMEOUT`](crate::DEFAULT_EXEC_TIMEOUT). Set it
+    /// with [`TaskContract::with_exec_timeout`]. Separate from
+    /// [`TaskContract::max_duration`] because they bound different things: that is
+    /// how long the whole run may take, this is how long any one command may hang
+    /// before the run gets its turn back — without it, a wedged command consumes
+    /// the run's whole time budget and the run reports a budget stop, which is
+    /// the wrong diagnosis for what happened.
+    pub exec_timeout: Duration,
     /// Directory of skill files to offer the agent, or `None` (the default) for
     /// no skills.
     ///
@@ -170,6 +181,7 @@ impl TaskContract {
             context: ContextBudget::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
+            exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
             skills: None,
         }
     }
@@ -203,6 +215,7 @@ impl TaskContract {
             context: ContextBudget::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
+            exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
             skills: None,
         }
     }
@@ -316,6 +329,35 @@ impl TaskContract {
     /// Set the cost budget, in total tokens across all completions.
     pub fn with_token_budget(mut self, max_tokens: u64) -> Self {
         self.max_tokens = Some(max_tokens);
+        self
+    }
+
+    /// Set how long a command the agent runs with `exec` may take.
+    ///
+    /// A new named builder rather than a parameter, like every other capability
+    /// this crate has added: every entry point takes a `TaskContract`, so setting
+    /// it here works with all of them and changes no existing signature.
+    ///
+    /// ```
+    /// use io_harness::{TaskContract, Verification, DEFAULT_EXEC_TIMEOUT};
+    /// use std::time::Duration;
+    ///
+    /// // A repository whose cold build is slower than the default ceiling. Raise
+    /// // it rather than watching honest work be killed as if it had hung.
+    /// let patient = TaskContract::workspace("build and test it", "/monorepo", Verification::None)
+    ///     .with_exec_timeout(Duration::from_secs(2400));
+    ///
+    /// // And the other direction: an unattended fleet job that would rather give
+    /// // up on a command than sit behind it.
+    /// let impatient = TaskContract::workspace("lint it", "/repo", Verification::None)
+    ///     .with_exec_timeout(Duration::from_secs(60));
+    ///
+    /// assert!(patient.exec_timeout > DEFAULT_EXEC_TIMEOUT);
+    /// assert!(impatient.exec_timeout < DEFAULT_EXEC_TIMEOUT);
+    /// ```
+    #[must_use]
+    pub fn with_exec_timeout(mut self, exec_timeout: Duration) -> Self {
+        self.exec_timeout = exec_timeout;
         self
     }
 
