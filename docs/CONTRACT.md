@@ -116,7 +116,38 @@ Windows as "resource-capped".
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.18.0.
+is fixed as of 0.19.0.
+
+**What configuration is, and is not (0.19.0).** `io.toml` is a projection onto
+the typed API and never a second path into the run loop:
+
+- **The typed API is the authority.** Every key lands in a type this crate
+  already had — `Policy`, `SandboxConfig`, `Toolchain`, `PriceTable`,
+  `McpServer`, `TaskContract` — and a file can express nothing the typed API
+  cannot. A test asserts every key reaches a typed field.
+- **The file is read once, by the caller, before the run, and never again.**
+  Nothing in this crate discovers a config on its own: `Config::discover` is the
+  caller's own call. That is what makes the one guarantee here true — a config
+  the agent writes *during* a run cannot widen the boundary that run is already
+  under.
+- **A config file is not a security boundary against the agent.** The boundary is
+  the `Policy` the caller loaded; the file is where it was written down. An agent
+  that can write the workspace root can write an `io.toml`, and the *next* load —
+  the caller's act, not the agent's — will read it.
+- **An unknown key is an error**, naming the key and the file, rather than being
+  ignored. The exception is a key inside a `[[mcp]]` table, because `McpServer`
+  is `#[serde(flatten)]`-based and serde refuses `flatten` beside
+  `deny_unknown_fields`.
+- **A failed substitution is an error, never an empty string.** An unset
+  `${env:...}`, an unreadable `${file:...}`, and a value that resolves to nothing
+  each fail the load, because an empty string in a boundary rule is a rule that
+  matches nothing.
+- **The `[toolchain]` override does not reach this crate's own run loop.** The
+  harness detects for itself; `Config::toolchain(detected)` gives the embedding
+  application the merged value. Wiring it into the loop needs a new
+  `TaskContract` field, which is a break, and 0.19.0 carries none.
+- **Scope discovery is fixed**: four scopes, no `include`, no `extends`, no
+  parent-directory search, no JSON or YAML form, and no reload.
 
 **What every recorded number is, and is not (0.18.0).** The trace now answers
 what a run cost and which model spent it, and the provenance of each figure

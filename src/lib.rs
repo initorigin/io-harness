@@ -153,6 +153,16 @@
 //! [`Flow`] lets an observer ask the run to stop. [`provider::Record`] captures
 //! a case and [`provider::Replay`] runs it back identically.
 //!
+//!
+//! **Configuration in a file.** [`Config::discover`] reads one `io.toml` across
+//! four scopes — the crate's defaults, a user file, a committed project file, and
+//! a gitignored local one — and projects it onto this API: a [`Policy`], a
+//! [`SandboxConfig`], the run budgets applied through [`Config::apply_to`], the
+//! [`toolchain`] commands, a [`pricing::PriceTable`], and [`McpServer`]s.
+//! `${env:...}` and `${file:...}` keep a credential out of the file, an unknown
+//! key is an error rather than a shrug, and nothing is loaded implicitly — the
+//! caller reads the file, before the run, once, which is what stops an agent
+//! widening the boundary it is running under.
 //! **Documents and images**, behind opt-in features: spreadsheets, Word,
 //! PowerPoint text, PDF, and barcode decoding, each gated on [`Act::Read`] or
 //! [`Act::Write`] against the real path the model named, and verified with
@@ -221,6 +231,7 @@
 //! - [Context and memory](https://github.com/initorigin/io-harness/blob/main/docs/guide/context-and-memory.md)
 //! - [Resilience](https://github.com/initorigin/io-harness/blob/main/docs/guide/resilience.md)
 //! - [Observability and replay](https://github.com/initorigin/io-harness/blob/main/docs/guide/observability.md)
+//! - [Configuration](https://github.com/initorigin/io-harness/blob/main/docs/guide/configuration.md)
 //! - [Accounting](https://github.com/initorigin/io-harness/blob/main/docs/guide/accounting.md)
 //! - [Documents](https://github.com/initorigin/io-harness/blob/main/docs/guide/documents.md)
 //! - [Images and git](https://github.com/initorigin/io-harness/blob/main/docs/guide/images-and-git.md)
@@ -245,6 +256,7 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod approve;
+pub mod config;
 pub mod containment;
 pub mod context;
 mod contract;
@@ -265,6 +277,7 @@ pub mod tools;
 mod verify;
 
 pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
+pub use config::Config;
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use context::ContextBudget;
 pub use contract::TaskContract;

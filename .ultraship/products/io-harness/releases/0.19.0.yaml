@@ -1,0 +1,346 @@
+product: io-harness
+version: 0.19.0
+status: planned
+release_type: minor
+outcome:
+  user_can: >
+    Configure the harness in a file instead of in Rust. An operator writes `io.toml` and gets a
+    permission boundary, sandbox caps, run budgets, per-ecosystem toolchain commands, MCP servers and
+    a price table, without compiling anything. Four scopes merge in a fixed order — the crate's
+    defaults, a user file, a project file the team commits, and a gitignored local file — so a
+    project can set a boundary its collaborators inherit and an individual can override it without
+    editing a shared file. Values may name an environment variable or a file on disk, so a key never
+    has to be committed to get into a config.
+  business_value: >
+    Every consumer of this crate needs the same thing and none of them should invent it. io-cli and
+    io-studio both have to let a user set a boundary, caps and budgets without recompiling; if the
+    harness does not own the format, each invents its own, and two formats over one typed API have to
+    be reconciled later at the cost of a break in whichever loses. It also lands the two tables the
+    previous releases shipped as types with no way to fill them: `toolchain::Toolchain` is
+    operator-overridable in principle and reachable only from Rust in practice, and
+    `pricing::PriceTable` ships deliberately empty, so cost is zero out of the box until someone types
+    a price in — a file is the only place that price was ever going to come from.
+  evidence_of_value: >
+    A run driven entirely from a file behaves identically to the same run built by hand in Rust: the
+    same policy refusals, the same sandbox caps, the same budgets, the same derived cost. The four
+    scopes are demonstrated by a project file a collaborator inherits and a local file that overrides
+    one key of it and nothing else. A key added to the file with no typed field behind it fails the
+    load rather than being ignored, which is what makes "the file configures the harness" a true
+    sentence rather than a hopeful one.
+scope:
+  included:
+  - >
+    A new `config` module owning one file format, TOML, read by the `toml` crate — the dependency
+    this release exists to land, and the reason `cargo tree` stops being 401 lines. One format, not
+    three: a config layer that accepts TOML, JSON and YAML is three parsers and three sets of
+    surprises for one job.
+  - >
+    Four scopes merged in a fixed order, later winning: the crate's own defaults, a user-scope file,
+    a project-scope `io.toml` at the workspace root meant to be committed, and an
+    `io.local.toml` beside it meant to be gitignored. The user scope is `$IO_CONFIG_HOME/io.toml`
+    when set, else `$XDG_CONFIG_HOME/io/io.toml` or `~/.config/io/io.toml` on unix and
+    `%APPDATA%\io\io.toml` on Windows. Project discovery reads the workspace root and does not walk
+    upward out of it — a run's configuration comes from the directory the caller named, never from
+    somewhere above it that the caller did not choose.
+  - >
+    Projection onto the existing typed API, never a parallel path. `Config` yields a `Policy`, a
+    `SandboxConfig`, a `toolchain::Toolchain`, a `pricing::PriceTable`, a `Vec<McpServer>` and the
+    run-shaping defaults — `max_steps`, `max_duration`, `max_tokens`, `max_retries`, `RetryPolicy`,
+    `StallPolicy`, `ContextBudget`, `exec_timeout`, the skills directory and the commit identity —
+    applied to a `TaskContract` through a new named method. Each projection is a named accessor; none
+    is an added parameter on an existing function, per the standing constraint.
+  - >
+    `serde::Deserialize` (and `Serialize`) derived on the four run-shaping types that lack it —
+    `RetryPolicy`, `StallPolicy`, `ContextBudget` and `tools::git::Identity` — with `#[serde(default)]`
+    on their fields so a file names only what it changes. Additive: a derive added to a public type
+    breaks nothing a caller wrote.
+  - >
+    Environment and file substitution in string values: `${env:NAME}` and `${file:relative/path}`,
+    the latter resolved against the directory of the config file that wrote it. A named variable that
+    is unset, or a named file that cannot be read, fails the load with an error naming the key — it
+    never becomes an empty string, because an empty string in a boundary rule is a rule that matches
+    nothing and a config that silently disarms itself is the worst outcome this feature can produce.
+  - >
+    Unknown keys are an error. `#[serde(deny_unknown_fields)]` throughout, with the error naming the
+    key and the file it came from. A typo in a permission rule that is silently ignored leaves an
+    operator believing in a boundary that is not there; failing the load is the only honest answer.
+  - >
+    Merge semantics stated per section rather than assumed: a scalar is replaced by the later scope;
+    policy layers append in scope order and keep the layering rule the type already enforces, so a
+    later scope adds a layer rather than rewriting the boundary; price entries and toolchain
+    ecosystems merge by key with the later scope winning that key only; MCP server lists are replaced
+    whole, because a half-merged server definition is not a server.
+  - >
+    Nothing is loaded implicitly. No `run` entry point discovers a config on its own — the caller
+    calls `Config::discover` or `Config::load` and decides what to do with what comes back. The
+    harness therefore never re-reads a config during a run, which is what makes an agent that writes
+    `io.local.toml` mid-run unable to widen the boundary it is running under.
+  - >
+    A coverage test asserting that every key the format accepts reaches a typed field: a fixture
+    `io.toml` naming every supported key loads, and each projected value is asserted different from
+    its default, so a key that parses into nothing fails the suite rather than shipping as a
+    documented lie.
+  - >
+    Documentation: a `docs/guide/configuration.md` page with the full key reference, the scope order
+    and a worked example per section; a worked example on every new public item; `docs/public-api.txt`
+    updated by hand; `CHANGELOG.md` with the new-dependency note and the new `cargo tree` baseline;
+    and `docs/CONTRACT.md` amended with what configuration is and is not — including that the typed
+    API is the authority and the file is a front end to it, and that the file is read once, by the
+    caller, before the run.
+  excluded:
+  - >
+    Configuring the task itself. `goal`, `file`, `root` and `verify` stay arguments to the call: a
+    task is what the caller is asking for now, not a property of the project, and a `Verification`
+    carries no `Deserialize` today for exactly that reason. What the file configures is the
+    environment a task runs in.
+  - >
+    Custom tools and the `Toolbox`. Registering a tool is compiling code into the binary; a file
+    cannot name a Rust type. MCP servers are the out-of-process answer and are configurable.
+  - >
+    A CLI, an `io` binary, an `init` command that writes a starter file, or any interactive editor.
+    io-cli is the product that owns a command line; this release owns the format it will read.
+  - >
+    JSON and YAML config, config discovery by walking parent directories, an `include`/`extends`
+    directive, a `$schema` key, and hot reload or file watching. Each is a second mechanism over the
+    same job, and the four fixed scopes are the answer to what each would be reached for.
+  - >
+    Secrets management. `${env:...}` and `${file:...}` are how a credential reaches a value without
+    being committed; the crate does not encrypt, prompt for, or store one, and provider API keys stay
+    where they are.
+  - >
+    Making `Containment::max_total_cost` live. It stays documented inert, as 0.18.0 left it; a price
+    table reaching the run loop from a file does not change what enforces a mid-run money bound.
+  - >
+    The three carried `CONTRACT.md` defects — `resume_tree` not calling `record_run_policy`,
+    `SandboxLimits::max_processes` enforced by nothing, and no Linux seccomp filter. None is in a
+    module this release touches.
+  - >
+    Any change to the run loop's behaviour, the context assembler, the sandbox backends, the provider
+    clients or the store. `CHECKPOINT_FORMAT` stays 7 and no table is added or altered.
+  fallback_scope:
+  - >
+    The four scopes, the merge order, `${env:...}` substitution, unknown-key rejection, and
+    projection onto `Policy`, `SandboxConfig` and the run-shaping defaults on `TaskContract`. The
+    toolchain and price sections, the MCP section and `${file:...}` drop out. Still coherent: an
+    operator configures the boundary, the caps and the budgets in a file and a collaborator inherits
+    them — which is the outcome. What they lose is filling the two tables from the file, which stays
+    a Rust call for one more release.
+acceptance:
+  functional:
+  - >
+    F1 — the four scopes merge in order. A fixture with all four present, each setting the same
+    scalar to a different value, resolves to the local file's value; removing the local file resolves
+    to the project's; removing that resolves to the user's; removing that resolves to the crate
+    default. Asserted as four loads over the same directory, so the test measures precedence rather
+    than one file being read.
+  - >
+    F2 — a later scope overrides one key and nothing else. A local file naming a single sandbox cap
+    leaves every other cap and every other section at the project file's value. The negative control
+    is the same load with the local file absent, which must differ in exactly that one key.
+  - >
+    F3 — the boundary a file describes is the boundary a run enforces. A run driven from a config
+    whose policy denies a write refuses that write with the same refusal, recorded the same way in
+    the trace, as the identical policy built in Rust. Asserted through a real run, not by comparing
+    two `Policy` values.
+  - >
+    F4 — policy layers append rather than replace. A project file's layer and a local file's layer
+    are both present after the merge, in scope order, and the type's own rule that a later layer
+    cannot re-allow an earlier deny still holds across the seam. The negative control is a local
+    layer attempting to re-allow a project deny, which must not take effect.
+  - >
+    F5 — an unknown key fails the load. A file carrying a misspelled key is rejected with an error
+    naming the key and the file. The negative control is the correctly spelled key, which loads and
+    reaches its typed field — so the test proves rejection of the unknown rather than rejection in
+    general.
+  - >
+    F6 — substitution resolves or fails, never empties. `${env:SET_VAR}` reaches the typed field with
+    the variable's value; `${env:UNSET_VAR}` fails the load naming the key; `${file:./secret}` reaches
+    the field with the file's trimmed contents; `${file:./missing}` fails the load naming the key. An
+    empty string is never the result of a failed substitution.
+  - >
+    F7 — every key reaches a typed field. A fixture naming every supported key loads and each
+    projected value is asserted non-default: policy defaults and rules, every sandbox cap and both
+    flags, every run-shaping default, a toolchain override, a price entry, and an MCP server. The
+    negative control is a build of the same fixture with one key removed, which must leave that one
+    field at its default.
+  - >
+    F8 — the file fills the two tables the previous releases could not. A `[prices]` section produces
+    a `PriceTable` whose `as_of` is the file's own stated date and whose entry costs a fixture trace
+    at the hand-computed figure, and a `[toolchain]` section overrides one ecosystem's test command
+    while leaving the other ecosystems' shipped defaults intact.
+  - >
+    F9 — an agent cannot widen its own boundary. A run under a config-derived restrictive policy, in
+    which the agent writes an `io.local.toml` granting itself the denied write, still refuses the
+    write. The negative control is the same file present *before* the caller loads the config, which
+    must take effect — the difference between the two is the whole guarantee.
+  - >
+    F10 — no config file is no error. A workspace with no `io.toml`, no local file and no user file
+    loads the crate's defaults and produces exactly what the typed API produces with no config at
+    all, so adding this release to an existing consumer changes nothing until they write a file.
+  non_functional:
+  - >
+    NF1 — the dependency growth is stated, not discovered. The default `cargo tree` line count is
+    measured before and after, the new number recorded in the contract's evidence, the constraint
+    updated from 401 to that number, and the crates it adds are named in the changelog. `toml` is the
+    only new dependency this release adds.
+  - >
+    NF2 — no store change and no format bump. `CHECKPOINT_FORMAT` stays 7, no `CREATE TABLE` and no
+    `ALTER TABLE` is added, and a 0.18.0 database opens, resumes and is queried against 0.19.0
+    unchanged.
+  - >
+    NF3 — nothing is read at run time. Config loading happens in the caller's explicit call; the run
+    loop performs no file read for configuration, asserted by a run that deletes both config files
+    after loading and completes unaffected.
+  - >
+    NF4 — the full suite passes on macOS, Linux and Windows, with the Windows leg's `timeout-minutes`
+    unchanged at 40, including the user-scope path resolution which differs per platform.
+  - >
+    NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` pass,
+    and `cargo doc --all-features` is warning-free.
+  - >
+    NF6 — no public item is removed or renamed, so `docs/public-api.txt` grows and nothing in it
+    changes meaning. This release carries no break and no `#[deprecated]`.
+  operational:
+  - >
+    OP1 — `docs/public-api.txt` is updated by hand and `tests/public_api.rs` passes against the live
+    surface, and every added public item carries a fenced worked example, enforced by the existing
+    docs test.
+  - >
+    OP2 — `docs/guide/configuration.md` exists, is linked from the README and the crate root, lists
+    every key with its typed destination, and is covered by the existing guide-pages test.
+  - >
+    OP3 — `docs/CONTRACT.md` states what configuration is: the typed API is the authority and the
+    file is a projection onto it; the file is read once, by the caller, before the run, and never
+    again; an unknown key is an error; a failed substitution is an error; and a config file is not a
+    security boundary against the agent — the boundary is the `Policy` the caller loaded before the
+    run started.
+  - >
+    OP4 — `.gitignore` carries `io.local.toml` and the guide says plainly which of the two project
+    files is meant to be committed, because the whole scope split fails if a team commits the local
+    one.
+  - >
+    OP5 — a live run against a real provider, driven from an `io.toml` rather than from Rust, is
+    performed by hand before the release is cut and its trace kept as evidence. The suite proves the
+    projection; only a live run proves an operator can actually drive the harness from a file.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.19.0, GitHub at initorigin/io-harness with the tag `v0.19.0` and a
+    Release titled `io-harness 0.19.0`, and docs.rs, whose build is checked by the nightly CI job
+    added in 0.17.0.
+  deployment_method: >
+    The standing flow, unchanged. All work on `feat/0.19.0` off `develop`, including the sealed
+    UltraShip release record. PR into `develop`, merged. Release PR `develop` into `main`, merged.
+    GitHub Release cut from the tag with notes from the changelog. `cargo publish` last, after both
+    merges and the Release exist. `develop` synced to `main` fast-forward only at the end. No branch
+    is deleted. `git fetch --tags` after the Release, since `gh release create` makes the tag on the
+    remote only.
+  migrations:
+  - >
+    None for a caller's source. No public item is removed, renamed or given a new required argument,
+    and every new type is additive. A consumer who writes no config file gets the behaviour they had.
+  - >
+    One new dependency, `toml`, in the default build. A consumer vendoring or auditing dependencies
+    sees it and its own tree; the changelog names it and states the new `cargo tree` baseline against
+    the old 401.
+  - >
+    Four public types gain `Serialize`/`Deserialize`. Additive, but it does mean `RetryPolicy`,
+    `StallPolicy`, `ContextBudget` and `Identity` now have a wire format the crate is on the hook for,
+    which the guide states.
+  - >
+    No store migration, no checkpoint-format bump, nothing backfilled.
+  observability:
+  - >
+    A config load reports what it did: which scopes were found and merged, in order, through the
+    existing `tracing` instrumentation, so an operator whose setting did not take effect can see
+    which file won rather than guessing.
+  - >
+    A substituted value is never logged and never written to the trace. The whole point of
+    `${env:...}` is that the value is not in the file; putting it in a log line puts it somewhere
+    worse. Asserted, not assumed.
+  rollback: >
+    A published version cannot be recalled. The forward fix is 0.19.1; `cargo yank --version 0.19.0`
+    is the escape hatch and leaves 0.18.0 as what `cargo install` resolves. Nothing in the store or
+    the checkpoint format changes, so a consumer who reverts to 0.18.0 keeps their databases and
+    in-flight runs and simply builds the boundary in Rust again. A consumer's own config files are
+    inert to 0.18.0 rather than harmful to it.
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows
+  - A real provider account, for the config-driven live run that is OP5
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - Owner approval to merge to `main`, cut the Release, and publish, per the standing override.
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    Merge semantics are where a config layer is usually wrong. Scalars, appended policy layers,
+    per-key table merges and whole-list replacement are four different rules over one file, and each
+    needs its own test with its own negative control.
+  - >
+    Substitution has to be applied to the right values at the right time — after parsing, before
+    projection, only to strings, and with a failure that names the key rather than the offset.
+  - >
+    `deny_unknown_fields` across a nested structure interacts badly with `#[serde(default)]` and with
+    flattened sections; getting a helpful error message out of serde rather than a positional one is
+    fiddly work that is easy to underestimate.
+  - >
+    The user-scope path differs on three platforms and the Windows leg is the one that will disagree.
+  - >
+    Deriving serde on four existing types means auditing their fields for anything that should not be
+    settable from a file, and giving each a `#[serde(default)]` so a file may name one field of it.
+  preferred_tools:
+  - The `toml` crate, the one new dependency, with the `serde` already in the tree
+  - The existing `Serialize`/`Deserialize` on `Policy`, `SandboxConfig`, `Toolchain`, `PriceTable` and `McpServer`, which were derived for exactly this
+  - std `env` and `fs` for scope discovery and substitution; no `dirs`-style crate for four path lookups
+  constraints:
+  - CHECKPOINT_FORMAT stays 7 and no store table is added or altered
+  - No system package on any runner
+  - The default `cargo tree` baseline moves once, in this release, to a measured and recorded number
+  - A new capability ships as a new named function rather than an added parameter
+  - Every refusal test carries a negative control
+  - Stay 0.x
+risks:
+  - >
+    A config file that looks like a security boundary and is not. An operator may read "the project
+    file sets the policy" as "the agent cannot escape the project file", which is false in the case
+    that matters — the caller decides whether to load it at all. The mitigation is F9, which proves
+    the one guarantee that does hold (a file written mid-run cannot widen a running boundary), and a
+    CONTRACT.md statement that says the rest plainly.
+  - >
+    A second source of truth. Configuration that drifts from the typed API is exactly the failure
+    this release is meant to prevent in io-cli and io-studio, and it can just as easily be created
+    here. The mitigation is F7 — every key is asserted to reach a typed field — plus the rule that
+    the file adds no capability the typed API does not already have.
+  - >
+    The dependency tree grows for the first time in the default build since 0.14.0's optional
+    documents stack. `toml` is a well-maintained crate in near-universal use in the Rust ecosystem,
+    and the growth is stated in the changelog rather than discovered by a consumer, but the number
+    stops being 401 and that constraint has held since 0.16.0.
+  - >
+    Scope drift toward io-cli. Config is adjacent to a dozen conveniences — an init command, a
+    profile switcher, an env-var override for every key — and none of them belong in a library. The
+    excluded list is deliberately long for this reason.
+  - >
+    Deriving `Deserialize` on four existing public types commits the crate to their field names as a
+    wire format, which is a quieter promise than a function signature and is not covered by
+    `public-api.txt`. Taken deliberately: the guide documents each key, and a rename would be a
+    changelog-marked break like any other.
+open_questions:
+  - >
+    Whether `Verification` should become configurable later through a named-command form, given that
+    the toolchain section already carries each ecosystem's test command. Left out here because a
+    criterion is per-task; if it returns it is its own release with its own argument.
+  - >
+    Whether the user-scope file should exist on Windows at `%APPDATA%\io\io.toml` or be omitted there
+    for this release. Decided during development against what the Windows CI leg actually resolves,
+    rather than against what the path convention says it should.
+  - >
+    Whether `${file:...}` should be restricted to paths under the config file's own directory.
+    Restricting it protects nothing on the operator's own machine but does bound what a
+    collaborator's committed project file can read from a teammate's disk, which is a real difference.
+    Decided during development, and stated either way in the guide.

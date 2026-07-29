@@ -10,6 +10,13 @@ on:
     branches: [develop, main]
   workflow_dispatch:
 
+# Every action is pinned to a full-length commit SHA with its human-readable
+# version in a trailing comment. A tag is mutable — `v4` is a pointer its owner
+# can move, and a compromised or force-pushed tag would run someone else's code
+# with this workflow's token. The SHA is not movable, so what ran yesterday is
+# what runs today. Dependabot bumps these (see .github/dependabot.yml, which
+# targets `develop`) and rewrites the trailing comment with the new version.
+#
 # Least privilege: every job here only reads the checkout. Nothing publishes,
 # comments, or writes back, and no job takes a secret — so a fork PR running
 # under this workflow has nothing to exfiltrate and nothing to escalate to.
@@ -49,12 +56,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
       # rmcp and a bundled rusqlite are the expensive part of a cold build.
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # --all-targets also builds examples/: the mcp and checkpoint tests spawn
       # examples/mcp_fixture_server and examples/crash_fixture as child processes.
       - run: cargo build --all-targets
@@ -90,13 +97,13 @@ jobs:
     # Windows build plus the suite.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - id: rv
         run: echo "version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: ${{ steps.rv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo build --all-targets
       # The declared MSRV has to hold for the crate a consumer actually enables,
       # not only for the default build: an optional dependency raising the floor
@@ -113,12 +120,12 @@ jobs:
     # Windows build plus the suite.
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       # Both ways, because the feature gates change which code exists: an unused
@@ -146,11 +153,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@v1
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: nightly
-      - uses: Swatinem/rust-cache@v2.9.1
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # The exact build docs.rs performs: nightly, every feature, `--cfg docsrs`
       # set, dependencies skipped. `-D warnings` because a broken intra-doc link
       # is a page that ships with a dead link on it.

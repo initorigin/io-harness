@@ -412,7 +412,7 @@ versions:
       It lands third on purpose. Its schema is determined by what exists, and writing it before
       command execution, general verification, and the accounting tables would have meant writing it
       twice.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.20.0
     outcome: >

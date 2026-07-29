@@ -167,7 +167,20 @@ pub(crate) enum GitCmd {
 /// Neither field may be empty or hold a control character: both reach the
 /// commit object and the reflog, and a newline in a name has nowhere useful to
 /// go. A bad one is an [`Error::Config`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Serialize`/`Deserialize` since 0.19.0, so a team's commit identity can live
+/// in the project's config file rather than in each program that embeds the
+/// crate. Both fields are `#[serde(default)]`, and the validation below still
+/// runs when the identity is used — a deserialized identity is not a checked one.
+///
+/// ```
+/// use io_harness::Identity;
+///
+/// let team: Identity = serde_json::from_str(r#"{"name": "release bot"}"#).unwrap();
+/// assert_eq!(team.name, "release bot");
+/// assert_eq!(team.email, Identity::default().email);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Identity {
     /// The committer name.
     pub name: String,

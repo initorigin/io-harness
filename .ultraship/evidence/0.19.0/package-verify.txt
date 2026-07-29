@@ -1,0 +1,24 @@
+error: 19 files in the working directory contain changes that were not yet committed into git:
+
+.gitignore
+CHANGELOG.md
+Cargo.lock
+Cargo.toml
+README.md
+docs/CAPABILITIES.md
+docs/CONTRACT.md
+docs/RELEASE_PROCESS.md
+docs/guide/configuration.md
+docs/public-api.txt
+examples/config_live.rs
+src/config.rs
+src/context.rs
+src/lib.rs
+src/pricing.rs
+src/resilience.rs
+src/tools/git.rs
+tests/config.rs
+tests/guide_pages.rs
+
+to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag
+package exit: 101
