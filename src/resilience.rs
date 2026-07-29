@@ -21,6 +21,8 @@
 
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// How long to wait between provider attempts.
 ///
 /// Applied only to a failure that [`is_retryable`](crate::error::ProviderErrorKind::is_retryable);
@@ -56,12 +58,48 @@ use std::time::Duration;
 /// let gentle = RetryPolicy { base: Duration::from_secs(2), max: Duration::from_secs(60) };
 /// assert_eq!(gentle.wait(3, None), Duration::from_secs(8));
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// `Serialize`/`Deserialize` since 0.19.0, so a schedule can come from a config
+/// file. Both fields cross the wire as **milliseconds** — `base_ms` and
+/// `max_ms` — because serde's own form for a [`Duration`] is `{secs, nanos}`,
+/// which nobody would write in a config by hand. Each is `#[serde(default)]`, so
+/// a file may name one and leave the other at its default.
+///
+/// ```
+/// use std::time::Duration;
+/// use io_harness::RetryPolicy;
+///
+/// let gentle: RetryPolicy = serde_json::from_str(r#"{"base_ms": 2000}"#).unwrap();
+/// assert_eq!(gentle.base, Duration::from_secs(2));
+/// assert_eq!(gentle.max, RetryPolicy::default().max, "what a file omits keeps its default");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RetryPolicy {
     /// Wait before the first retry.
+    #[serde(rename = "base_ms", with = "millis")]
     pub base: Duration,
     /// Ceiling for one wait, so exponential growth cannot park a run for an hour.
+    #[serde(rename = "max_ms", with = "millis")]
     pub max: Duration,
+}
+
+/// A [`Duration`] as whole milliseconds — the config-file form of the two
+/// [`RetryPolicy`] fields. Sub-millisecond precision is not representable and is
+/// not wanted: a retry schedule measured in microseconds is a schedule nobody
+/// meant to write.
+mod millis {
+    use std::time::Duration;
+
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub(super) fn serialize<S: Serializer>(d: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_u64(u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        Ok(Duration::from_millis(u64::deserialize(d)?))
+    }
 }
 
 impl Default for RetryPolicy {
@@ -119,7 +157,19 @@ impl RetryPolicy {
 /// assert_eq!(progress.replans(), 0);
 /// # let _ = patient;
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` since 0.19.0, so an operator can set the window in
+/// a config file. Both fields are `#[serde(default)]`:
+///
+/// ```
+/// use io_harness::StallPolicy;
+///
+/// let patient: StallPolicy = serde_json::from_str(r#"{"window": 5}"#).unwrap();
+/// assert_eq!(patient.window, 5);
+/// assert_eq!(patient.max_replans, StallPolicy::default().max_replans);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct StallPolicy {
     /// Consecutive steps that change nothing before the agent is told so.
     /// `0` disables stall detection entirely, restoring 0.10.0 behaviour exactly.

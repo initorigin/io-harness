@@ -1,370 +1,251 @@
 product: io-harness
-version: 0.18.0
+version: 0.19.0
 tasks:
-  - id: US-IO-HARNESS-0.18.0-T01
+  - id: US-IO-HARNESS-0.19.0-T01
     summary: >
-      Widen `Usage` with cache-read, cache-write, reasoning and server-tool-request counters, and
-      widen `CompletionResponse` with the model that served the call, the finish reason, and the
-      time to first token. Both keep `..Default::default()` as the forward-compatible construction.
+      The `config` module's spine: the four scopes and where each is found, TOML parsing through the
+      new `toml` dependency, per-file validation so an error names its file, and the deep merge that
+      resolves them key by key with the later scope winning.
     why_required: >
-      Every other task in the release either fills these fields or reads them. There is nowhere to
-      put a cache token, a model id or a TTFT until the two vendor-neutral types carry them, and the
-      widening is the release's first break, so it happens once and everything else follows it.
-    status: done
+      Every other task projects a value out of the merged result. Without the scopes and the merge
+      there is nothing to project from, and the merge rule is what the outcome actually promises —
+      a project file a collaborator inherits and a local file that overrides one key of it.
+    status: todo
     depends_on: []
     acceptance_criteria:
       - >
-        F4 — `total_tokens` is still the provider's own figure. A fixture whose reported total disagrees
-        with the sum of its parts is stored as reported, and the ledger draw is made from it, because
-        re-deriving a total silently invents a number the vendor will not bill.
+        F1 — the four scopes merge in order. A fixture with all four present, each setting the same
+        scalar to a different value, resolves to the local file's value; removing the local file
+        resolves to the project's; removing that resolves to the user's; removing that resolves to
+        the crate default. Asserted as four loads over the same directory, so the test measures
+        precedence rather than one file being read.
+      - >
+        F2 — a later scope overrides one key and nothing else. A local file naming a single sandbox
+        cap leaves every other cap and every other section at the project file's value. The negative
+        control is the same load with the local file absent, which must differ in exactly that one
+        key.
+      - >
+        F10 — no config file is no error. A workspace with no `io.toml`, no local file and no user
+        file loads the crate's defaults and produces exactly what the typed API produces with no
+        config at all, so adding this release to an existing consumer changes nothing until they
+        write a file.
     files:
-      - src/provider/mod.rs
-    evidence:
-    - >
-      src/provider/mod.rs — `Usage` gains cache_read_tokens, cache_write_tokens, reasoning_tokens and
-        server_tool_requests (still `Copy`); `CompletionResponse` gains model, finish_reason and
-        ttft_ms. Both document `..Default::default()` as the forward-compatible construction, and
-        every literal in the crate, its tests, its examples and its doctests was migrated to it.
-    - >
-      F4 — provider::openai_wire::tests::a_disagreeing_total_is_kept_as_the_provider_reported_it: a
-        usage chunk reporting total 99 against parts summing to 12 is stored as 99, because
-        re-deriving a total invents a number the vendor will not bill.
-  - id: US-IO-HARNESS-0.18.0-T02
-    summary: >
-      Add the `provider_calls` and `edits` tables to `Store::from_conn` as additive
-      `CREATE TABLE IF NOT EXISTS`, with a typed record for each and the insert that writes it. No
-      existing table is altered and `CHECKPOINT_FORMAT` stays 7.
-    why_required: >
-      The outcome is that the trace answers the cost question. Without a durable row per provider
-      call there is nothing to query, and without the additive-only discipline a 0.17.0 database
-      stops opening — which is the release's own non-functional criterion.
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T01]
-    acceptance_criteria:
-      - >
-        NF2 — the store change is additive only. `CREATE TABLE IF NOT EXISTS` for `provider_calls` and
-        `edits`, no `ALTER TABLE` on an existing table, no column dropped, and `CHECKPOINT_FORMAT` stays
-        7 — so a 0.17.0 database opens, resumes and is queried against 0.18.0, and a 0.17.0 binary still
-        opens a database 0.18.0 has written. Asserted in both directions.
-    files:
-      - src/state.rs
-    evidence:
-    - >
-      src/state.rs — `provider_calls` and `edits` added as `CREATE TABLE IF NOT EXISTS` in
-        `Store::from_conn`, with `ProviderCall`, `Edit`, `record_provider_call`, `provider_calls`,
-        `record_edit` and `edits`. No ALTER TABLE, no column dropped, CHECKPOINT_FORMAT still 7 at
-        src/state.rs:106.
-    - >
-      NF2 — tests/accounting.rs::a_run_that_predates_the_tables_reports_no_calls_rather_than_zero:
-        a run with no rows returns empty vectors and does not appear in the groupings at all, rather
-        than reporting zeros, and the checkpoint format is asserted unchanged in the same test.
-  - id: US-IO-HARNESS-0.18.0-T03
-    summary: >
-      Parse cache-read, cache-write and reasoning tokens, the finish reason, the model id and the
-      server-tool request count in the Anthropic and OpenAI-wire streaming accumulators, and measure
-      time to first token where the stream is consumed.
-    why_required: >
-      The facts are already on the wire and are being discarded. Until both clients read them, every
-      row this release adds is zero for a real provider and the outcome is unreachable outside a
-      test double.
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T01]
-    acceptance_criteria:
-      - >
-        F3 — cache and reasoning tokens survive the wire. Anthropic's `cache_creation_input_tokens` and
-        `cache_read_input_tokens` and the OpenAI wire's `cached_tokens` and `reasoning_tokens` reach
-        `Usage` unchanged from a recorded fixture response, with a fixture that reports none producing
-        zeros rather than an error. Asserted against the accumulators, which is where the wire is parsed.
-      - >
-        F6 — the finish reason reaches the trace. A fixture ending on a length cap and one ending on a
-        tool call record different finish reasons, so an operator can tell a truncated turn from a
-        complete one.
-      - >
-        F7 — server-tool requests are counted. A fixture reporting a server-tool request count stores
-        it; one reporting none stores zero. Both providers.
-    files:
-      - src/provider/anthropic.rs
-      - src/provider/openai_wire.rs
-      - src/provider/openai.rs
-      - src/provider/openrouter.rs
-    evidence:
-    - >
-      src/provider/anthropic.rs and src/provider/openai_wire.rs parse what they already received:
-        cache_creation/cache_read input tokens and `server_tool_use` on Anthropic,
-        prompt_tokens_details.cached_tokens and completion_tokens_details.reasoning_tokens on the
-        OpenAI wire, plus the model id and the stop/finish reason on both. TTFT is measured from
-        before the socket opens, in all three clients.
-    - >
-      F3, F6, F7 — five accumulator tests, each with its negative control: a stream reporting none
-        of it yields zeros and `None`s rather than an error, which is also every pre-cache request
-        and therefore the common case.
-    - >
-      Anthropic's prompt/total now include the cached counts, which the vendor reports separately
-        and 0.17.0 dropped entirely. Asserted in
-        cache_tokens_the_model_reports_reach_usage_with_the_model_and_stop_reason (11 + 300 + 1,200).
-  - id: US-IO-HARNESS-0.18.0-T04
-    summary: >
-      Record one `provider_calls` row per `Provider::complete` invocation from `complete_with_retry`,
-      carrying the attempt number, the measured latency, the TTFT, and the failure flag, for every
-      run entry point.
-    why_required: >
-      This is the release's central claim: a step that retried once and then fell over is three rows
-      on three models. Only the run loop knows an attempt happened, so if it does not write the row,
-      nothing does.
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T02, US-IO-HARNESS-0.18.0-T03]
-    acceptance_criteria:
-      - >
-        F1 — one row per provider call. A run whose first attempt fails retryably and whose second
-        succeeds writes two `provider_calls` rows for that step, with attempt 0 and attempt 1, the
-        failure marked on the first. The negative control is a run with no retry, which writes exactly
-        one row for the step — so the test measures per-attempt recording rather than row-writing in
-        general.
-      - >
-        F2 — the model is recorded, not the vendor. A run through a `Fallback` whose primary fails
-        records two rows for the step naming two different model ids, while `runs.provider` holds one
-        label for the whole run. Asserted against the stored rows.
-      - >
-        F5 — latency and TTFT are measured and ordered. A scripted provider that delays its first chunk
-        and then its last produces a TTFT strictly smaller than its total latency, and both are within a
-        stated tolerance of the injected delays. The negative control is a non-streaming path, which
-        records latency and leaves TTFT null rather than reporting zero — an unmeasured TTFT and an
-        instant one are different facts.
-      - >
-        NF3 — the accounting is not on the critical path. Recording a call is one insert per provider
-        call, not per token, and the timing instrumentation adds no await to the streaming loop. A run
-        with the trace disabled behaves as before.
-    files:
-      - src/run.rs
-    evidence:
-    - >
-      src/run.rs — `complete_with_retry` times every attempt and calls `record_provider_call`, for
-        the call that answered and the one that failed alike. A store failure is logged and
-        swallowed rather than failing a run the provider answered.
-    - >
-      F1, F2, F5 — tests/accounting.rs, six tests. A retried step is two rows (attempt 0 marked
-        `Server (HTTP 503)`, attempt 1 clean) with a no-retry run as the control; two models serving
-        one run are two rows against one `runs.provider` label; a slow provider's TTFT is strictly
-        inside its own latency, with a provider that measured nothing recording `None` rather than
-        zero as the control.
-    - >
-      NF3 — the row count equals the provider call count the mock actually served, so recording is
-        per call rather than per token or per step.
-  - id: US-IO-HARNESS-0.18.0-T05
-    summary: >
-      Record an `edits` row for every file change a run makes, computing lines added and removed
-      from the before and after content, for `write_file` and `edit_file` alike.
-    why_required: >
-      "How much did this run actually change" is part of the stated outcome and is the one accounting
-      question that is not about money. Computed once in the crate rather than reconstructed from a
-      diff by every consumer.
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T02]
-    acceptance_criteria:
-      - >
-        F8 — edits record lines added and removed. A `write_file` creating a new file records its line
-        count added and zero removed; an `edit_file` replacing one line records one added and one
-        removed; a replacement changing nothing records zero and zero. Asserted against the `edits`
-        table after a run, not against a helper in isolation.
-    files:
-      - src/tools/fs.rs
-      - src/run.rs
-    evidence:
-    - >
-      src/run.rs records an `edits` row in both writing branches; `Edit::measure` computes the
-        counts by common head/tail comparison, in src/state.rs.
-    - >
-      F8 — tests/accounting.rs::edits_record_the_lines_each_change_added_and_removed: a new file is
-        (3, 0), a one-line replacement is (1, 1), and rewriting a file with what it already held is
-        (0, 0) — asserted against the table after a real run, not against the helper.
-  - id: US-IO-HARNESS-0.18.0-T06
-    summary: >
-      Ship pricing as data: a publicly constructible price table keyed by model id with input,
-      output, cache-read, cache-write and server-tool-request prices in a fixed-point unit per
-      million tokens, carrying the date it was accurate as of.
-    why_required: >
-      Cost is derived, never stored, and derivation needs prices the operator can correct. Without
-      the table the trace holds tokens and no one can turn them into money.
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T01]
-    acceptance_criteria:
-      - >
-        F10 — cost arithmetic does not drift. A price table applied to a million-token trace produces
-        the exact expected figure in the fixed-point unit, asserted against a hand-computed value, and
-        an unknown model yields a stated-unknown cost rather than zero — a free model and an unpriced
-        one are different facts.
-      - >
-        OP4 — the shipped price table names the date it was accurate as of, in the data, because a price
-        table with no date is a claim with no expiry.
-    files:
-      - src/pricing.rs
+      - src/config.rs
       - src/lib.rs
-    evidence:
-    - >
-      src/pricing.rs — `Price`, `PriceTable` and `Spend`, in integer micro-units per million
-        tokens. `PriceTable::new` requires the as-of date; the crate ships no prices, which resolved
-        the contract's open question in the direction it listed second.
-    - >
-      F10 — four unit tests: a hand-computed five-dimension figure comes out exact, an unpriced
-        model is `None` rather than `Some(0)` (the negative control that stops a table returning
-        zero for everything from passing), cache figures larger than the prompt saturate instead of
-        underflowing, and rounding is once at the end and half-up.
-    - >
-      OP4 — the as-of date is a required constructor argument, so every table in existence carries
-        one rather than only a shipped one.
-  - id: US-IO-HARNESS-0.18.0-T07
+      - Cargo.toml
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T02
     summary: >
-      Add the query surface: grouped raw rows by model, by day and by run, with the token sums and
-      the cost derived at query time from a supplied price table.
+      Unknown-key rejection and `${env:...}` / `${file:...}` substitution, both failing the load with
+      an error that names the key and the file rather than a byte offset, and neither ever producing
+      an empty string.
     why_required: >
-      It is the operator-facing half of the outcome. Rows in a table nobody can group do not answer
-      "what did that run cost, and which model spent it".
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T04, US-IO-HARNESS-0.18.0-T06]
+      A config that silently ignores a misspelled permission rule leaves an operator believing in a
+      boundary that is not there, and a substitution that quietly empties turns a rule into one that
+      matches nothing. These two are the difference between a config layer that can be trusted with
+      a boundary and one that cannot.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T01
     acceptance_criteria:
       - >
-        F9 — cost is derived and repairable. The same trace queried under two price tables yields two
-        different costs, and no cost column exists in the store to contradict either. Asserted by
-        querying, correcting a price, and querying again on an unchanged database.
+        F5 — an unknown key fails the load. A file carrying a misspelled key is rejected with an
+        error naming the key and the file. The negative control is the correctly spelled key, which
+        loads and reaches its typed field — so the test proves rejection of the unknown rather than
+        rejection in general.
       - >
-        F11 — grouping returns raw rows. By model, by day and by run each return the token sums and the
-        derived cost for a fixture trace spanning two models, two days and two runs, and the by-run
-        figures sum to the by-model figures. No rendering, no ordering promise beyond the one documented.
+        F6 — substitution resolves or fails, never empties. `${env:SET_VAR}` reaches the typed field
+        with the variable's value; `${env:UNSET_VAR}` fails the load naming the key;
+        `${file:./secret}` reaches the field with the file's trimmed contents; `${file:./missing}`
+        fails the load naming the key. An empty string is never the result of a failed substitution.
     files:
-      - src/state.rs
-      - src/pricing.rs
-    evidence:
-    - >
-      src/state.rs — `spend_by_model`, `spend_by_day` and `spend_by_run` over one read, grouped and
-        priced in Rust because pricing is arithmetic the database cannot do.
-    - >
-      F9 — tests/accounting.rs::correcting_a_price_changes_every_past_run_and_the_store_does_not_argue:
-        the same unchanged trace under two price tables yields two costs, and the test also asserts
-        no cost column exists in the schema to contradict either.
-    - >
-      F11 — grouping_by_model_by_day_and_by_run_agree_with_each_other: by-run, by-day and by-model
-        totals are equal across two runs and two models, the cache breakdown survives the summing,
-        and a table missing one model reports two unpriced calls rather than costing them at zero.
-  - id: US-IO-HARNESS-0.18.0-T08
+      - src/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T03
     summary: >
-      Remove `Verification::CompilesRust`, `RustTestPasses` and `WorkspaceTestPasses`, and re-express
-      their 0.17.0 tests over `Verification::Command` so the removal is proven not to have changed
-      what they proved.
+      Projection onto `Policy` and `SandboxConfig`: policy layers append in scope order under the
+      type's own layering rule, sandbox caps merge per key, and a run driven from the file enforces
+      the same boundary as the identical policy built in Rust.
     why_required: >
-      The second of the release's two breaks, promised by the 0.17.0 deprecation note which named
-      this version. Leaving it undone means the crate carries two execution paths and a deprecation
-      that expired.
-    status: done
-    depends_on: []
+      The boundary is the part of the outcome that matters most and the part a wrong merge damages
+      silently. A layer that replaced rather than appended, or a cap that fell back whole, would
+      leave the file describing a boundary the run does not have.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T01
     acceptance_criteria:
       - >
-        F12 — the deprecated variants are gone. A contract naming `Verification::CompilesRust` fails to
-        compile against 0.18.0, and the equivalent `Command` criterion produces the same outcome the
-        removed variant produced in 0.17.0 — asserted by the 0.17.0 tests for those variants, rewritten
-        over `Command` and still passing, so the removal is proven not to have changed what they proved.
+        F3 — the boundary a file describes is the boundary a run enforces. A run driven from a config
+        whose policy denies a write refuses that write with the same refusal, recorded the same way
+        in the trace, as the identical policy built in Rust. Asserted through a real run, not by
+        comparing two `Policy` values.
+      - >
+        F4 — policy layers append rather than replace. A project file's layer and a local file's
+        layer are both present after the merge, in scope order, and the type's own rule that a later
+        layer cannot re-allow an earlier deny still holds across the seam. The negative control is a
+        local layer attempting to re-allow a project deny, which must not take effect.
     files:
-      - src/verify.rs
-      - src/contract.rs
-    evidence:
-    - >
-      src/verify.rs — the three variants and the criterion-compile/test-run half of
-        `compile_source` are gone, with `CRITERION_OPEN`, `CRITERION_CLOSE` and `test_build_args`.
-        `Verification::Command` now works in single-file mode, running in the edited file's own
-        directory — without which the 0.17.0 migration note would have been false for a single-file
-        caller.
-    - >
-      F12 — the removed variants' own tests, rewritten over `Command` and still passing: a stub is
-        rejected and real code accepted through a `rustc` argv (what `CompilesRust` proved), and a
-        cargo fixture passes and then fails on its own suite (what `RustTestPasses` and
-        `WorkspaceTestPasses` proved). tests/language_agnostic.rs asserts the variants are gone from
-        the source and that no `#[deprecated]` attribute remains.
-    - >
-      tests/verify_gate.rs was rewritten rather than deleted: the shadowing half tested a mechanism
-        that no longer exists, and its replacement asserts the I01 payload cannot defeat a criterion
-        it does not share a crate with, with a passing control.
-  - id: US-IO-HARNESS-0.18.0-T09
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T04
     summary: >
-      Documentation: an accounting guide page, a worked example on every new public item,
-      `docs/public-api.txt` updated by hand, `CHANGELOG.md` migration notes for both breaks, and
-      `docs/CONTRACT.md` amended with the provenance of every recorded number.
+      The run-shaping half: `Serialize`/`Deserialize` on `RetryPolicy`, `StallPolicy`,
+      `ContextBudget` and `Identity` with a readable wire form for the `Duration` fields, and
+      `Config::apply_to`, which sets those and the budgets, the exec timeout, the skills directory
+      and the MCP servers on a `TaskContract`.
     why_required: >
-      A number that looks authoritative and is not is the release's largest risk, and the only
-      mitigation is stating what each figure is and is not where an operator will read it.
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T07, US-IO-HARNESS-0.18.0-T08]
+      Budgets and retry behaviour are the settings an operator changes most often and the ones they
+      currently have to recompile to change. They also have to land as a method on `Config` rather
+      than a new `TaskContract` field, because a field is a break and this release carries none.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T01
     acceptance_criteria:
       - >
-        OP1 — `docs/public-api.txt` is updated by hand and `tests/public_api.rs` passes against the live
-        surface, with the three removed variants gone from it.
-      - >
-        OP2 — `CHANGELOG.md` carries a migration note for each break, with the old call on one side and
-        the new on the other, and states plainly that a 0.16.2 consumer meets the removal with no
-        intervening deprecation warning. The changelog checker passes.
-      - >
-        OP3 — `docs/CONTRACT.md` states what the numbers are and are not: a token count is the
-        provider's report and not the crate's measurement, a latency is the harness's own wall clock and
-        includes its own request building, a TTFT is null where the path did not stream, and a cost is
-        derived from a table the operator owns and is therefore only as right as that table.
+        F7 — every key reaches a typed field. A fixture naming every supported key loads and each
+        projected value is asserted non-default: policy defaults and rules, every sandbox cap and
+        both flags, every run-shaping default, a toolchain override, a price entry, and an MCP
+        server. The negative control is a build of the same fixture with one key removed, which must
+        leave that one field at its default.
     files:
-      - docs/public-api.txt
-      - docs/guide
-      - CHANGELOG.md
+      - src/config.rs
+      - src/resilience.rs
+      - src/context.rs
+      - src/tools/git.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T05
+    summary: >
+      The `[toolchain]` and `[prices]` sections: an override merged onto a detected `Toolchain` by
+      ecosystem, and a `PriceTable` built from the file with the file's own `as_of` date.
+    why_required: >
+      These are the two tables the previous two releases shipped as types with no way to fill them.
+      `PriceTable` ships deliberately empty, so cost is zero out of the box until someone types a
+      price in, and a file is the only place that price was ever going to come from.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T01
+    acceptance_criteria:
+      - >
+        F8 — the file fills the two tables the previous releases could not. A `[prices]` section
+        produces a `PriceTable` whose `as_of` is the file's own stated date and whose entry costs a
+        fixture trace at the hand-computed figure, and a `[toolchain]` section overrides one
+        ecosystem's test command while leaving the other ecosystems' shipped defaults intact.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T06
+    summary: >
+      The two honesty criteria: a config file written by the agent mid-run cannot widen the boundary
+      the run is under, and nothing is read from disk for configuration once the caller has loaded it.
+    why_required: >
+      The one guarantee this release can actually make about an agent and a config file is that the
+      file is read once, by the caller, before the run. If that is not true, the whole feature is a
+      way for an agent to grant itself permissions.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T03
+    acceptance_criteria:
+      - >
+        F9 — an agent cannot widen its own boundary. A run under a config-derived restrictive policy,
+        in which the agent writes an `io.local.toml` granting itself the denied write, still refuses
+        the write. The negative control is the same file present *before* the caller loads the
+        config, which must take effect — the difference between the two is the whole guarantee.
+      - >
+        NF3 — nothing is read at run time. Config loading happens in the caller's explicit call; the
+        run loop performs no file read for configuration, asserted by a run that deletes both config
+        files after loading and completes unaffected.
+    files:
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T07
+    summary: >
+      Documentation and the public surface: the configuration guide page, the CONTRACT.md boundary
+      statements, the changelog with the new dependency and the new `cargo tree` baseline, the
+      hand-updated `docs/public-api.txt`, the README and crate-root links, and `io.local.toml` in
+      `.gitignore`.
+    why_required: >
+      A config format nobody can read the key reference for is a format nobody can use, and the
+      scope split fails outright if a team commits the local file. The public-surface snapshot is a
+      build failure until it is updated by hand, which is the mechanism, not a formality.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T04
+      - US-IO-HARNESS-0.19.0-T05
+    acceptance_criteria:
+      - >
+        OP1 — `docs/public-api.txt` is updated by hand and `tests/public_api.rs` passes against the
+        live surface, and every added public item carries a fenced worked example, enforced by the
+        existing docs test.
+      - >
+        OP2 — `docs/guide/configuration.md` exists, is linked from the README and the crate root,
+        lists every key with its typed destination, and is covered by the existing guide-pages test.
+      - >
+        OP3 — `docs/CONTRACT.md` states what configuration is: the typed API is the authority and
+        the file is a projection onto it; the file is read once, by the caller, before the run, and
+        never again; an unknown key is an error; a failed substitution is an error; and a config file
+        is not a security boundary against the agent — the boundary is the `Policy` the caller loaded
+        before the run started.
+      - >
+        OP4 — `.gitignore` carries `io.local.toml` and the guide says plainly which of the two
+        project files is meant to be committed, because the whole scope split fails if a team commits
+        the local one.
+      - >
+        NF6 — no public item is removed or renamed, so `docs/public-api.txt` grows and nothing in it
+        changes meaning. This release carries no break and no `#[deprecated]`.
+    files:
+      - docs/guide/configuration.md
       - docs/CONTRACT.md
-    evidence:
-    - >
-      docs/guide/accounting.md (new, with its limits block and registered in tests/guide_pages.rs),
-        docs/guide/verification.md and language-support.md rewritten for the removal,
-        docs/CONTRACT.md amended with the provenance of every recorded figure, CHANGELOG.md with
-        five marked breaks each carrying a migration note, README.md and docs/CAPABILITIES.md
-        indexed, and the crate root's guide list.
-    - >
-      OP1 — docs/public-api.txt updated by hand with `ProviderCall`, `Edit` and `UNKNOWN_MODEL`;
-        tests/public_api.rs passes, including its rule that every re-exported item carries a worked
-        example.
-    - >
-      OP2 — tests/changelog.rs passes: every `**BREAKING` entry carries a `Migration:` note,
-        including the one that says plainly that a 0.16.2 consumer meets the removal with no
-        intervening warning.
-  - id: US-IO-HARNESS-0.18.0-T10
+      - docs/public-api.txt
+      - CHANGELOG.md
+      - README.md
+      - src/lib.rs
+      - .gitignore
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T08
     summary: >
-      Prove the release: the full suite on three operating systems, the lint and doc gates, the
-      dependency-tree constraint, and a live run against a real provider whose recorded numbers
-      reconcile with the vendor's own reported usage.
+      The release gates: the full suite on every feature combination, clippy, fmt, a warning-free
+      `cargo doc`, the measured `cargo tree` baseline before and after, and the store and
+      checkpoint-format assertions.
     why_required: >
-      The suite proves the mechanism against fixtures; only a live run proves the numbers are the
-      ones a vendor will bill, which is the release's stated evidence of value.
-    status: done
-    depends_on: [US-IO-HARNESS-0.18.0-T09]
+      The dependency growth is the one cost this release imposes on every consumer, and a number
+      discovered by a consumer rather than stated by the changelog is the failure the constraint
+      exists to prevent.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T07
     acceptance_criteria:
       - >
-        NF1 — the default dependency tree does not grow. `cargo tree` on the default build stays at 401
-        lines. The price table is Rust data or JSON parsed by the `serde_json` already in the tree; the
-        TOML dependency belongs to 0.19.0.
+        NF1 — the dependency growth is stated, not discovered. The default `cargo tree` line count is
+        measured before and after, the new number recorded in the contract's evidence, the constraint
+        updated from 401 to that number, and the crates it adds are named in the changelog. `toml` is
+        the only new dependency this release adds.
       - >
-        NF4 — the full suite passes on macOS, Linux and Windows, with the Windows leg's `timeout-minutes`
-        unchanged at 40.
+        NF2 — no store change and no format bump. `CHECKPOINT_FORMAT` stays 7, no `CREATE TABLE` and
+        no `ALTER TABLE` is added, and a 0.18.0 database opens, resumes and is queried against 0.19.0
+        unchanged.
       - >
-        NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` pass,
-        and `cargo doc --all-features` is warning-free.
-      - >
-        OP5 — a live run against a real provider is performed by hand before the release is cut and its
-        trace kept as evidence. The suite proves the mechanism against fixtures; only a live run proves
-        the numbers reconcile with what a vendor actually reports.
+        NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check`
+        pass, and `cargo doc --all-features` is warning-free.
     files:
-      - .github/workflows/ci.yml
-      - examples
-    evidence:
-    - >
-      NF1 — `cargo tree | wc -l` is 401 on the default build, the standing constraint, unchanged.
-        NF5 — fmt, both clippy invocations and `cargo doc --all-features` are clean.
-        evidence/0.18.0/build-and-lint.txt.
-    - >
-      OP5 — two live runs against OpenRouter, evidence/0.18.0/live-run-accounting.txt. The second,
-        against a warm vendor cache, recorded 4,913 cache-read tokens and derived 4,846 micro-units
-        for the work the cold run derived 18,606 for — the cache discount visible in money, from
-        figures the vendor reported.
-    - >
-      scope.excluded verified absent rather than assumed: no cost column, `max_total_cost` still
-        inert, no configuration parser, the context assembler and sandbox byte-identical to 0.17.0,
-        `record_run_policy` untouched, and no LSP/web/todo/question tool.
-        evidence/0.18.0/scope-check.txt.
+      - .ultraship/evidence/0.19.0
+    evidence: []
+  - id: US-IO-HARNESS-0.19.0-T09
+    summary: >
+      The live run: a real task against a real provider, driven entirely from an `io.toml` rather
+      than from Rust, with its trace kept as evidence.
+    why_required: >
+      The suite proves the projection against fixtures. Only a live run proves that an operator can
+      actually drive this harness from a file, which is the sentence the release is for.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.19.0-T08
+    acceptance_criteria:
+      - >
+        OP5 — a live run against a real provider, driven from an `io.toml` rather than from Rust, is
+        performed by hand before the release is cut and its trace kept as evidence. The suite proves
+        the projection; only a live run proves an operator can actually drive the harness from a file.
+    files:
+      - examples/config_live.rs
+    evidence: []

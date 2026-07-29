@@ -29,7 +29,30 @@ the CHANGELOG. The public surface governed by this is defined in
 4. After review and merge, tag `main` as `vX.Y.Z`.
 5. Create the **GitHub Release** for `vX.Y.Z`. Its notes are taken **verbatim
    from the `## [X.Y.Z]` section of the CHANGELOG** — do not rewrite them.
-6. Record the release in the UltraShip release record for this product.
+6. Publish to crates.io. This is **last**, after both merges and the Release
+   exist, because it is the one step that cannot be undone.
+7. Record the release in the UltraShip release record for this product.
+8. Sync `develop` with `main` (`git merge --ff-only main`), so the two do not
+   diverge.
+
+## Steps 4–6, by workflow
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) does steps 4,
+5 and 6 in that order. Run it from the **Actions** tab, on `main`, with the
+version (no leading `v`) and whether to publish.
+
+It runs the same gate CI runs — `fmt`, `clippy --all-features`, the three test
+invocations, `cargo package --locked` — against the exact commit being released,
+then tags, cuts the Release with the CHANGELOG section as its notes, and only
+then publishes. It refuses to start when the ref is not `main`, when
+`Cargo.toml` declares a different version, when the tag already exists, or when
+the CHANGELOG has no section to quote.
+
+It changes what is typed, not what is decided: a human still decides the version
+is ready and presses the button, and steps 1–3, 7 and 8 stay by hand. Publishing
+needs a `CRATES_IO_TOKEN` secret in the repository's `crates-io` environment; add
+a required reviewer to that environment if the button should ask before spending
+the irreversible step.
 
 ## Why the CHANGELOG drives release notes
 

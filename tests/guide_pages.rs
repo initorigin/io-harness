@@ -43,6 +43,10 @@ const GUIDES: &[(&str, bool)] = &[
     // accounting figure is its provenance: a token count is the provider's
     // report, a cost is only as right as the operator's own price table, and a
     // run older than the release has no rows at all rather than zeros.
+    // 0.19.0. It carries a limits block because the interesting part of a
+    // config file is what it is *not*: not a boundary against the agent, not
+    // read by the run loop, and not loaded by anything the caller did not call.
+    ("configuration.md", true),
     ("accounting.md", true),
     ("documents.md", true),
     ("images-and-git.md", false),

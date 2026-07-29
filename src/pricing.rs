@@ -69,7 +69,20 @@ pub const MICROS_PER_UNIT: u64 = 1_000_000;
 /// Construct with `..Price::ZERO` and set only the dimensions the vendor
 /// actually charges for, so a dimension nobody priced stays an explicit zero
 /// rather than an accident.
+///
+/// Every field is `#[serde(default)]` for the same reason `..Price::ZERO` exists:
+/// a config file that prices input and output should not have to write three
+/// zeros to say the vendor charges nothing for cache and search.
+///
+/// ```
+/// use io_harness::pricing::Price;
+///
+/// let flat: Price = serde_json::from_str(r#"{"input": 3000000}"#).unwrap();
+/// assert_eq!(flat.input, 3_000_000);
+/// assert_eq!(flat.cache_read, 0, "an unnamed dimension is an explicit zero");
+/// ```
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Price {
     /// Input tokens read fresh — the prompt minus anything served from or
     /// written to cache.

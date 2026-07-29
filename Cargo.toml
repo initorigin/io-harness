@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.18.0"
+version = "0.19.0"
 edition = "2021"
 # rmcp 2.2.0 sets the real floor: it uses let-chains, stabilised in 1.88, and
 # publishes no rust-version of its own — so cargo cannot catch it at resolve time
@@ -62,6 +62,11 @@ tracing = "0.1"
 tempfile = "3"
 # grep tool: regex matching, and glob->regex for the find tool's patterns.
 regex = "1"
+# 0.19.0's config file. Parsing only — nothing here writes TOML back out, so the
+# `display` half of the crate is not compiled. This is the first dependency
+# added to the default build since 0.1.0, and the `cargo tree` constraint moved
+# from 401 lines to accommodate it rather than the other way round.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
 # MCP client only — no server mode, no macros. Stdio servers over the child-process
 # transport, remote servers over streamable HTTP with our own (no-redirect) Client.
 # Documents (0.14.0), all optional and all behind the `documents` feature. The
@@ -112,7 +117,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", 
 [dependencies.base64]
 # The image half only. Already compiled in every build as a transitive
 # dependency of reqwest, so enabling the feature costs a `cargo tree` line and
-# no build time; declaring it optional is what holds the default tree at 401.
+# no build time; declaring it optional is what keeps it off the default tree.
 version = "0.22"
 optional = true
 

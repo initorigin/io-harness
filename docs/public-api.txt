@@ -70,6 +70,7 @@ struct ApproveAll src/approve.rs
 struct CheckpointEvent src/state.rs
 struct CompletionRequest src/provider/mod.rs
 struct CompletionResponse src/provider/mod.rs
+struct Config src/config.rs
 struct Containment src/containment.rs
 struct ContextBudget src/context.rs
 struct ContextEvent src/state.rs

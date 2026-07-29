@@ -10,5 +10,10 @@ node_modules/
 *.env
 !.env.example
 
+# The local config scope (0.19.0). `io.toml` is committed and inherited by
+# everyone on the team; this one is a single person's overrides and the whole
+# scope split fails the moment it is shared.
+io.local.toml
+
 # UltraShip: transient deploy/publish hook output
 .ultraship/products/*/evidence/

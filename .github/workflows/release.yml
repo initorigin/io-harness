@@ -1,0 +1,207 @@
+name: Release
+
+# Cuts the GitHub Release for a version and publishes it to crates.io.
+#
+# This exists to remove the typing from the last two steps of
+# docs/RELEASE_PROCESS.md, not to remove the judgement. It is
+# `workflow_dispatch` only: nothing here fires on a push, a merge or a tag,
+# because the irreversible half of a release is `cargo publish` and a tag is too
+# easy to create by accident to be the trigger for something that cannot be
+# recalled. A human decides a version is ready, presses the button on `main`,
+# and the workflow does the same steps in the same order a human would.
+#
+# The order is the point and it is preserved exactly:
+#
+#   1. verify   — the version, the branch, the tag, the changelog, and the gate
+#   2. release  — tag `main` and publish the GitHub Release, notes from CHANGELOG
+#   3. publish  — `cargo publish`, LAST, only after the Release exists
+#
+# What it refuses to do, deliberately: run from any ref but `main`, release a
+# version the manifest does not declare, reuse a tag that already exists,
+# release with no changelog section to quote, or publish before the Release is
+# cut. Each of those is a mistake this repository has actually made by hand.
+#
+# One prerequisite, once: the repository needs a `CRATES_IO_TOKEN` secret in the
+# `crates-io` environment. Scoping it to an environment rather than to the
+# repository is what lets a required reviewer be added later without editing
+# this file.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 0.19.0). Must equal Cargo.toml's version."
+        required: true
+        type: string
+      publish:
+        description: "Publish to crates.io after the Release is cut. Irreversible."
+        required: true
+        type: boolean
+        default: true
+
+# Least privilege, per job rather than per workflow: `verify` only reads, and
+# only `release` may write to the repository. Nothing here uses the token to
+# comment, approve, or change a branch.
+permissions:
+  contents: read
+
+# Two releases of the same version at once is not a thing anyone wants halfway
+# through. Never cancel in progress: an interrupted publish is worse than a
+# queued one.
+concurrency:
+  group: release-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Everything that can say no, before anything has happened.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: verify ${{ inputs.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # The changelog section is read from the checkout, and the tag check
+          # below needs the tags themselves.
+          fetch-depth: 0
+
+      - name: The ref must be main
+        run: |
+          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
+            echo "::error::this workflow runs on main only; got ${GITHUB_REF}."
+            echo "::error::main takes nothing but a develop -> main release PR, so a"
+            echo "::error::release cut from anywhere else is a release of something"
+            echo "::error::that was never reviewed as one."
+            exit 1
+          fi
+
+      - name: The manifest must declare this version
+        run: |
+          declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$declared" != "${{ inputs.version }}" ]; then
+            echo "::error::Cargo.toml declares $declared, the run asked for ${{ inputs.version }}."
+            exit 1
+          fi
+
+      - name: The tag must not exist yet
+        run: |
+          if git rev-parse "v${{ inputs.version }}" >/dev/null 2>&1; then
+            echo "::error::tag v${{ inputs.version }} already exists. A published version"
+            echo "::error::cannot be replaced; the forward fix is the next patch."
+            exit 1
+          fi
+
+      # The notes are taken verbatim from the changelog, so a missing section is
+      # a release with nothing to say — caught here rather than after the tag.
+      - name: The changelog must carry this version's section
+        id: notes
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+          version = os.environ["VERSION"]
+          body = open("CHANGELOG.md", encoding="utf-8").read()
+          # From this version's heading to the next `## ` heading, exclusive.
+          match = re.search(
+              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)",
+              body,
+              re.S | re.M,
+          )
+          if not match or not match.group(1).strip():
+              sys.exit(f"CHANGELOG.md has no non-empty '## [{version}]' section")
+          notes = match.group(1).strip()
+          with open("release-notes.md", "w", encoding="utf-8") as f:
+              f.write(notes + "\n")
+          print(f"{len(notes.splitlines())} lines of notes")
+          PY
+        env:
+          VERSION: ${{ inputs.version }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # The same gate ci.yml runs, run again here against the exact commit being
+      # released. CI having been green on the PR is not the same claim.
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test
+      - run: cargo test --features documents --lib --tests
+      - run: cargo test --features media --lib --tests
+
+      # The package, built and compiled standalone from its own sources — the
+      # one check that catches a file the manifest forgot to include.
+      - run: cargo package --locked
+
+      - name: Keep the notes for the release job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-notes
+          path: release-notes.md
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # 2. The tag and the GitHub Release. Reversible: both can be deleted.
+  # ---------------------------------------------------------------------------
+  release:
+    name: release ${{ inputs.version }}
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-notes
+
+      # Title is the bare `<repo> X.Y.Z`, no tagline — the house format across
+      # every initorigin repo. `--target` pins the Release to the commit that
+      # passed the gate rather than to whatever main points at by then.
+      - name: Cut the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${{ inputs.version }}" \
+            --title "io-harness ${{ inputs.version }}" \
+            --notes-file release-notes.md \
+            --target "${{ github.sha }}"
+
+  # ---------------------------------------------------------------------------
+  # 3. crates.io. LAST, and the only step here that cannot be undone.
+  # ---------------------------------------------------------------------------
+  publish:
+    name: publish ${{ inputs.version }}
+    needs: release
+    if: ${{ inputs.publish }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      # `--locked` so the published crate resolves the dependency versions this
+      # repository tested against, not whatever was newest this morning.
+      - name: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+        run: cargo publish --locked
+
+      - name: What is left for a human
+        run: |
+          echo "::notice::Published io-harness ${{ inputs.version }}. Remaining by hand:"
+          echo "::notice::  - sync develop with main (git merge --ff-only main)"
+          echo "::notice::  - seal the UltraShip release record if it is not already sealed"
+          echo "::notice::  - check docs.rs built the page"

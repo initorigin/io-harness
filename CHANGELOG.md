@@ -26,6 +26,64 @@ notes are produced from it.
 
 ### Security
 
+## [0.19.0] - 2026-07-29
+
+The configuration release. An operator configures the harness in a file instead
+of in Rust: one `io.toml`, four scopes that merge in a fixed order, and every key
+landing in a type this crate already had. It exists so that io-cli and io-studio
+read the same file rather than inventing two formats that would have to be
+reconciled later, and it is where the two tables the last two releases shipped as
+types finally get something to fill them — `toolchain::Toolchain` was overridable
+only from Rust, and `pricing::PriceTable` ships deliberately empty, so cost was
+zero out of the box until someone typed a price in.
+
+Nothing a caller wrote against 0.18.0 changes. No public item is removed,
+renamed, or given a new argument, and a consumer who writes no config file gets
+the behaviour they had.
+
+### Added
+
+- `io_harness::Config` and the `config` module: `Config::discover(root)` reads
+  and merges the four scopes — the crate's defaults, `$IO_CONFIG_HOME/io.toml`
+  (else `$XDG_CONFIG_HOME/io/io.toml`, `~/.config/io/io.toml`, or
+  `%APPDATA%\io\io.toml`), the committed `io.toml` in the workspace root, and the
+  gitignored `io.local.toml` beside it. Later wins, key by key. Discovery does
+  not walk upward out of the root it was given.
+- Projection onto the typed API: `Config::policy`, `Config::sandbox`,
+  `Config::prices`, `Config::toolchain(detected)`, `Config::mcp_servers` and
+  `Config::apply_to(contract)`. Every key reaches a typed field, asserted by a
+  test over a fixture naming all of them.
+- `${env:NAME}` and `${file:path}` substitution in any string value, so a
+  credential reaches a config without being committed. `${file:...}` resolves
+  against the directory of the file that wrote it and its contents are trimmed.
+- `Serialize`/`Deserialize` on `RetryPolicy`, `StallPolicy`, `ContextBudget` and
+  `Identity`. `RetryPolicy` crosses the wire as `base_ms` / `max_ms`, since
+  serde's own form for a `Duration` is `{secs, nanos}`.
+- [docs/guide/configuration.md](docs/guide/configuration.md) — every key, its
+  typed destination, the merge rules, and the limits stated plainly.
+
+### Changed
+
+- One new dependency in the default build, `toml` 0.8 with default features off
+  and only `parse` enabled — the first added to the default build since 0.1.0. Five
+  crates are new to the tree: `toml`, `toml_edit`, `toml_datetime`,
+  `serde_spanned` and `winnow`. `indexmap`, `equivalent` and `hashbrown` are
+  *not* new — they were already there through `process-wrap`, and `cargo tree`
+  simply lists them a second time. The default `cargo tree` goes from **401 lines
+  to 413**; the standing constraint moved to accommodate it rather than the other
+  way round, and no other feature's tree changes.
+- An unknown key anywhere in the file is an error naming the key and the file,
+  rather than being ignored. A typo in a permission rule that is silently
+  discarded leaves an operator believing in a boundary that is not there. The one
+  exception is an unknown key inside a `[[mcp]]` table: `McpServer` is
+  `#[serde(flatten)]`-based and serde refuses `flatten` beside
+  `deny_unknown_fields`.
+- A failed substitution is an error, never an empty string — an unset variable,
+  an unreadable file, and a value that resolves to nothing each fail the load.
+- `Price` gains `#[serde(default)]`, so a config that prices input and output
+  need not write three zeros for the dimensions the vendor does not charge for.
+- `.gitignore` carries `io.local.toml`.
+
 ## [0.18.0] - 2026-07-29
 
 The accounting release. Cost is the first question anyone asks about an agent run

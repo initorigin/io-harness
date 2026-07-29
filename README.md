@@ -137,6 +137,14 @@ ends as a reviewable commit rather than a working tree someone has to
 reconstruct. The model supplies paths and a message, never a subcommand or a
 flag, so push, fetch, reset and rebase are unreachable by construction.
 
+**Configuration in a file.** `Config::discover(root)` reads one `io.toml` across
+four scopes — the crate's defaults, a user file, a committed project file, and a
+gitignored local one — and projects it onto the typed API: a `Policy`, a
+`SandboxConfig`, the run budgets, the toolchain commands, a price table, and MCP
+servers. `${env:...}` and `${file:...}` keep a credential out of the file, an
+unknown key is an error rather than a shrug, and nothing is loaded implicitly:
+the caller reads the file, before the run, once.
+
 ## Guides
 
 | Guide | What it covers |
@@ -153,6 +161,7 @@ flag, so push, fetch, reset and rebase are unreachable by construction.
 | [Context and memory](docs/guide/context-and-memory.md) | Per-turn assembly, compaction, invalidation, durable memory |
 | [Resilience](docs/guide/resilience.md) | Failure classification, retry, provider fallback, stall detection |
 | [Observability and replay](docs/guide/observability.md) | Observers, events, outcome records, deterministic replay |
+| [Configuration](docs/guide/configuration.md) | One `io.toml`, four layered scopes, projected onto the typed API |
 | [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
