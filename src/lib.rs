@@ -221,6 +221,7 @@
 //! - [Context and memory](https://github.com/initorigin/io-harness/blob/main/docs/guide/context-and-memory.md)
 //! - [Resilience](https://github.com/initorigin/io-harness/blob/main/docs/guide/resilience.md)
 //! - [Observability and replay](https://github.com/initorigin/io-harness/blob/main/docs/guide/observability.md)
+//! - [Accounting](https://github.com/initorigin/io-harness/blob/main/docs/guide/accounting.md)
 //! - [Documents](https://github.com/initorigin/io-harness/blob/main/docs/guide/documents.md)
 //! - [Images and git](https://github.com/initorigin/io-harness/blob/main/docs/guide/images-and-git.md)
 //!
@@ -252,6 +253,7 @@ pub mod mcp;
 mod net;
 pub mod observe;
 pub mod policy;
+pub mod pricing;
 pub mod provider;
 pub mod resilience;
 mod run;
@@ -306,10 +308,10 @@ pub use skills::{Skill, Skills};
 // through the public API. Exported in 0.12.0: an observability release cannot ship
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use state::{
-    AgentEvent, CheckpointEvent, ContextEvent, McpEvent, MemoryEntry, Pending, PolicyEvent,
-    RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, BUSY_TIMEOUT,
+    AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, Pending, PolicyEvent,
+    ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, BUSY_TIMEOUT,
     CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
-    SUCCESS_OUTCOME,
+    SUCCESS_OUTCOME, UNKNOWN_MODEL,
 };
 pub use tools::git::Identity;
 pub use tools::{Tool, ToolFuture, Toolbox, DEFAULT_EXEC_TIMEOUT};

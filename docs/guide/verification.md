@@ -15,12 +15,11 @@ read them before you rely on a gate anywhere downstream.
 | --- | --- | --- |
 | `FileContains(String)` | single-file | The file's text contains this substring |
 | `FileEquals(String)` | single-file | The file's text equals this exactly |
-| `CompilesRust` | single-file | The file compiles as a Rust library, and its items survived to be type-checked |
-| `RustTestPasses { test_src }` | single-file | The file compiles, and `test_src` compiles against it and passes |
+| `Command { argv, expect_exit }` | either | A command runs and exits with this status — in the workspace root, or in the edited file's own directory in single-file mode |
+| `None` | either | No gate. The run ends on an assistant turn that calls no tool |
 | `WorkspaceFileContains { file, needle }` | workspace | A named file under the workspace root contains this substring |
 | `DocumentContains { file, needle }` | workspace | A document's *extracted* text contains this substring — see [Documents](documents.md) |
-| `EachCompilesRust(Vec<PathBuf>)` | workspace | Every listed file compiles on its own; one wrong file fails the set |
-| `WorkspaceTestPasses { files, test_src }` | workspace | All listed files, concatenated in order, compile and pass `test_src` together |
+| `EachCompilesRust(Vec<PathBuf>)` | workspace | Every listed file compiles on its own as Rust; one wrong file fails the set |
 
 Single-file criteria are checked with `Verification::passes`; workspace criteria
 with `Verification::passes_in`. Using one in the other mode is a typed
@@ -42,32 +41,54 @@ are not evidence that anything runs.
 
 ## Execution-based verification
 
-Execution gates run the artifact:
+An execution gate runs something. Since 0.18.0 there is one general way to write
+it and one Rust-specific survivor:
 
-- `Verification::CompilesRust` — passes only if the file compiles
-  (`rustc --crate-type lib`) **and** its items survived to be type-checked.
-- `Verification::RustTestPasses { test_src }` — compiles `test_src` against the
-  file and passes only if the test binary passes.
+- `Verification::Command { argv, expect_exit }` — runs the command and requires
+  that exit status. The project's own runner decides, so this is the same
+  criterion for `cargo test`, `npm test`, `go test ./...`, `pytest` or
+  `make check`.
+- `Verification::EachCompilesRust(files)` — compiles each listed Rust file on its
+  own, with the probe described below. The one gate the harness still spawns
+  `rustc` for itself.
 
 ```rust
 use io_harness::{TaskContract, Verification};
 
-let contract = TaskContract::new(
-    "write a hello function returning 42",
-    "hello.rs",
-    Verification::RustTestPasses {
-        test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
+let contract = TaskContract::workspace(
+    "make `parse` reject an empty input instead of panicking",
+    "/path/to/repo",
+    Verification::Command {
+        argv: vec!["cargo".into(), "test".into()],
+        expect_exit: 0,
     },
 );
 ```
 
-Compilation runs locally in a throwaway temp dir (removed afterwards) and touches
-no network.
+`argv` is an array, program first. **There is no shell**: `;`, `&&`, `$( )` and a
+backtick are bytes inside one argument rather than syntax. `argv[0]` is what the
+exec [policy](permissions.md) is asked about, and verification cannot prompt, so
+the spawn happens only when a rule allows it outright.
 
-`test_src` calls the file's items **unqualified**, and reaches the file's
-**private** items — an implementation does not have to be `pub` to pass. A
-subject writing an idiomatic `fn hello() -> u32 { 42 }` with no `pub` passes the
-same gate a `pub fn hello` passes.
+In workspace mode the command runs in the workspace root; in single-file mode it
+runs in the edited file's own directory, which is the only root a single-file
+contract has.
+
+### Removed in 0.18.0
+
+`CompilesRust`, `RustTestPasses` and `WorkspaceTestPasses` were deprecated in
+0.17.0 and are **gone**. Each has a `Command` criterion that replaces it:
+
+| Removed | Write instead |
+| --- | --- |
+| `CompilesRust` | `Command { argv: vec!["cargo".into(), "build".into()], expect_exit: 0 }` |
+| `RustTestPasses { test_src }` | `Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 }`, with the test in the project's own suite |
+| `WorkspaceTestPasses { files, test_src }` | the same `cargo test` criterion, which runs the whole crate rather than a concatenation of files you listed |
+
+The `test_src` string has no replacement and does not need one: put the test in
+the repository, where the project's own tooling runs it, reviews it and keeps it.
+A criterion that lived only in a `TaskContract` was invisible to everyone except
+the run that used it.
 
 ## What a passing gate proves
 
@@ -85,8 +106,8 @@ What a pass does **not** prove:
   [sandbox](sandbox.md)'s job and the exec [policy](permissions.md)'s, not the
   gate's.
 - **Not that a compile-only gate type-checked anything interesting.**
-  `CompilesRust` proves the file is well-formed Rust whose items exist. It says
-  nothing about behaviour.
+  `EachCompilesRust` proves each file is well-formed Rust whose items exist. It
+  says nothing about behaviour.
 - **Not a guarantee against a hostile author.** The 0.8.1 work below is a
   boundary against *the file under verification* — the artifact the model
   produced. It is not a boundary against a human adversary with other tools; a
@@ -124,25 +145,24 @@ Two working bypasses:
 
 ### What stops each, now
 
-**Shadowing** is stopped by where the criterion sits. The subject and the
-criterion are still **one crate** — that is what lets a criterion call a private
-`fn hello`, and making them two crates broke exactly that during 0.8.1's
-development, because privacy is a wall between crates. Instead the criterion is
-wrapped in a child module of the subject's own crate that re-imports the prelude
-macros *explicitly* and then does `use super::*`. A subject defining
-`macro_rules! assert` — exported or not — now makes the name ambiguous (rustc
-E0659) rather than capturing it, so the gate **fails to compile instead of
-passing**. A macro the subject exports under any *other* name still reaches the
-criterion through the glob, which is what keeps this a fix rather than a
-restriction.
+**Shadowing is structurally impossible since 0.18.0.** It needed a criterion the
+harness compiled *into the subject's crate*, and the three variants that did that
+are gone. A `Command` criterion is a command: it runs in its own process, through
+the project's own runner, and never shares a compilation with the file the agent
+edited. Nothing in the subject can shadow a name the criterion resolves, because
+the criterion resolves its names somewhere the subject is not.
 
-**Deletion** is stopped by a probe. A reserved item is appended to the subject,
+Where you put the criterion now matters, and it is the same discipline any test
+suite already has: keep it somewhere the agent's policy does not let it write, or
+somewhere it has no reason to touch. A gate the agent can edit is not a gate,
+whatever the harness does.
+
+**Deletion** is still stopped by a probe, for `EachCompilesRust` — the one gate
+the harness still compiles itself. A reserved item is appended to the subject,
 the subject is compiled to an rlib on its own, and a second tiny crate is then
 type-checked that references that item through `extern crate subject`. A subject
 that deleted its own contents deleted the probe too, and the reference fails to
-resolve. This runs on both paths — compile-only and test — so
-`CompilesRust`, `EachCompilesRust`, `RustTestPasses` and `WorkspaceTestPasses`
-all confirm the file's items survived.
+resolve.
 
 The probe is used rather than the more obvious harness-authored root that
 `include!`s the subject, because that construct rejects crate-level inner
@@ -150,30 +170,26 @@ attributes outright — which would fail an honest file opening with
 `#![allow(dead_code)]` or `#![no_std]`. Legitimate inner attributes are
 unaffected; only *deleting the crate's contents* is caught.
 
-Nothing changed in what you write. `test_src` is the same source a 0.8.0 caller
-wrote, it still calls the file's items unqualified, a macro the file legitimately
-exports still reaches it, and a private implementation still passes.
+### Which phase failed
 
-### If a run stopped passing at 0.8.1
-
-The gate was being defeated. `SandboxEvent::gate_phase_failed` in the trace says
-which phase failed:
+`SandboxEvent::gate_phase_failed` in the trace says where a compile gate died:
 
 | Phase | Meaning |
 | --- | --- |
 | `subject-compile` | The file does not compile. The ordinary failure, unchanged since 0.8.0. |
 | `subject-emptied` | The file compiled, but its items are gone — the probe could not be found. |
-| `criterion-compile` | The file compiles, but the criterion will not compile beside it. A subject shadowing `assert!` lands here, as an E0659 ambiguity. |
-| `test-run` | Everything compiled and the test binary ran and failed. The honest failure. |
 
-`criterion-compile` and `subject-emptied` are the two shapes a pre-0.8.1 bypass
-takes. `test-run` is a test that ran and said no.
+There were two more phases before 0.18.0 — `criterion-compile` and `test-run` —
+and they belonged to the removed variants. A `Command` gate that fails records
+its own exit status and the command's output instead, which is strictly more
+useful: it is the runner's own diagnosis rather than the harness's guess at one.
 
 ## Governing what the gate is allowed to spawn
 
-Verification spawns `rustc` and then the test binary it built. Both go through
-`ExecGuard`, which checks the exec [policy](permissions.md) before every spawn
-and records the full argv against the run.
+Verification spawns whatever the criterion names — the command's `argv[0]`, or
+`rustc` for `EachCompilesRust`. Every spawn goes through `ExecGuard`, which checks
+the exec [policy](permissions.md) first and records the full argv against the
+run.
 
 Verification **cannot prompt** — there is no approver on this path — so a command
 is spawned only when the policy explicitly *allows* it. Anything else, including
@@ -181,16 +197,19 @@ is spawned only when the policy explicitly *allows* it. Anything else, including
 distinguishable from a verification that ran and returned `false`.
 
 ```rust
-use io_harness::{ExecGuard, Policy, Verification, TEST_BINARY};
+use io_harness::{ExecGuard, Policy};
 
-// Compile-only verification: the produced code is type-checked but never run.
-let policy = Policy::default().layer("no-exec").deny_exec(TEST_BINARY);
+// The gate may run the project's test runner and nothing else. `Policy::default()`
+// allows `rustc` by name, so a `Command` gate naming anything else needs saying.
+let policy = Policy::default().layer("gate").allow_exec("cargo test*");
 let guard = ExecGuard::new(&policy);
 ```
 
-`TEST_BINARY` is the logical name of the binary verification builds. Denying it
-while allowing `rustc` gives compile-only verification: `RustTestPasses` type-
-checks the criterion against the subject and then refuses to execute it.
+`TEST_BINARY` still exists, so a policy written against it still compiles, but
+**nothing spawns it since 0.18.0**: it was the logical name of the test binary the
+removed variants built, and no criterion builds one now. Denying it changes
+nothing. A compile-only gate today is `EachCompilesRust`, or a `Command` naming
+the compiler rather than the test runner.
 
 By default the compile runs inside an ephemeral [sandbox](sandbox.md).
 `ExecGuard::sandboxed` supplies a different config; `ExecGuard::no_sandbox` opts

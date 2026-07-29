@@ -19,7 +19,7 @@ the language the project is written in is not the harness's business.
 
 ```toml
 [dependencies]
-io-harness = "0.17"
+io-harness = "0.18"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -153,6 +153,7 @@ flag, so push, fetch, reset and rebase are unreachable by construction.
 | [Context and memory](docs/guide/context-and-memory.md) | Per-turn assembly, compaction, invalidation, durable memory |
 | [Resilience](docs/guide/resilience.md) | Failure classification, retry, provider fallback, stall detection |
 | [Observability and replay](docs/guide/observability.md) | Observers, events, outcome records, deterministic replay |
+| [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 

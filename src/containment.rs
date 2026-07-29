@@ -161,7 +161,12 @@ impl std::fmt::Display for SpawnRefusal {
 /// use io_harness::{Containment, Draw, Ledger, Usage};
 ///
 /// let ledger = Ledger::new(&Containment::new(4, 2, 1, 5_000));
-/// let usage = Usage { prompt_tokens: 4_000, completion_tokens: 800, total_tokens: 4_800 };
+/// let usage = Usage {
+///     prompt_tokens: 4_000,
+///     completion_tokens: 800,
+///     total_tokens: 4_800,
+///     ..Default::default()
+/// };
 ///
 /// // What the run loop does with a completion's usage: draw it, then branch. This
 /// // is the only place the tree's ceiling is checked, so ignoring the return is

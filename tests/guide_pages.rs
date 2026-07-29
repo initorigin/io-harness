@@ -39,6 +39,11 @@ const GUIDES: &[(&str, bool)] = &[
     ("context-and-memory.md", true),
     ("resilience.md", true),
     ("observability.md", false),
+    // 0.18.0. It carries a limits block because the interesting part of an
+    // accounting figure is its provenance: a token count is the provider's
+    // report, a cost is only as right as the operator's own price table, and a
+    // run older than the release has no rows at all rather than zeros.
+    ("accounting.md", true),
     ("documents.md", true),
     ("images-and-git.md", false),
 ];

@@ -5,14 +5,12 @@
 //! the Linux and Windows native backends are compile-gated + unit-tested in
 //! their modules and not exercised here.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
+// 0.18.0 removed the three Rust-specific `Verification` variants. The gate these
+// tests drive the sandbox through is now `EachCompilesRust` — the one criterion
+// that still spawns `rustc` itself — over a file written to a temp root, and
+// `Verification::Command` where a produced binary has to actually run.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use io_harness::sandbox::{RunSpec, Sandbox};
 use io_harness::{
@@ -22,6 +20,18 @@ use io_harness::{
 
 fn good() -> &'static str {
     "pub fn hello() -> u32 { 42 }\n"
+}
+
+/// The compile gate over `contents`, through `guard`. A root has to exist on
+/// disk for the criterion to read, which is the only thing that changed when the
+/// single-file Rust variants were removed — the spawn, the sandbox and the
+/// policy check are the same ones.
+async fn compile_gate(contents: &str, guard: &ExecGuard<'_>) -> io_harness::Result<bool> {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("x.rs"), contents).unwrap();
+    Verification::EachCompilesRust(vec![PathBuf::from("x.rs")])
+        .passes_in_guarded(dir.path(), guard)
+        .await
 }
 
 // --- backend selection ------------------------------------------------------
@@ -92,45 +102,52 @@ async fn sandbox_on_reaches_the_same_verified_success_as_direct() {
 
     // Sandbox on (the 0.6.0 default): real code passes, a substring stub fails.
     let on = ExecGuard::new(&policy);
-    assert!(Verification::CompilesRust
-        .passes_guarded(Path::new("x.rs"), good(), &on)
-        .await
-        .unwrap());
-    assert!(!Verification::CompilesRust
-        .passes_guarded(Path::new("x.rs"), "fn hello", &on)
-        .await
-        .unwrap());
+    assert!(compile_gate(good(), &on).await.unwrap());
+    assert!(!compile_gate("fn hello", &on).await.unwrap());
 
     // Sandbox opted off: the exact 0.5.0 direct-host path, same verdicts.
     let off = ExecGuard::new(&policy).no_sandbox();
-    assert!(Verification::CompilesRust
-        .passes_guarded(Path::new("x.rs"), good(), &off)
-        .await
-        .unwrap());
-    assert!(!Verification::CompilesRust
-        .passes_guarded(Path::new("x.rs"), "fn hello", &off)
-        .await
-        .unwrap());
+    assert!(compile_gate(good(), &off).await.unwrap());
+    assert!(!compile_gate("fn hello", &off).await.unwrap());
 }
 
+/// The sandbox runs a project's own test runner transparently, and a failing
+/// test still fails the gate through it. Until 0.18.0 this was asserted through
+/// `RustTestPasses`, which compiled a caller's criterion and ran the binary
+/// itself; the property is the same and the runner is now the project's.
 #[tokio::test]
-async fn sandbox_on_runs_the_produced_test_binary_transparently() {
-    let policy = Policy::default();
+async fn sandbox_on_runs_the_projects_test_runner_transparently() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let gate = Verification::Command {
+        argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+        expect_exit: 0,
+    };
+    // `cargo` is named explicitly: verification cannot prompt, so a gate spawns
+    // only what a rule allows outright, and `Policy::default()` allows `rustc`
+    // and nothing else.
+    let policy = Policy::default().layer("gate").allow_exec("cargo");
     let guard = ExecGuard::new(&policy);
-    let ok = Verification::RustTestPasses {
-        test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
-    };
-    assert!(ok
-        .passes_guarded(Path::new("x.rs"), good(), &guard)
-        .await
-        .unwrap());
-    let bad = Verification::RustTestPasses {
-        test_src: "#[test] fn t() { assert_eq!(hello(), 41); }".into(),
-    };
-    assert!(!bad
-        .passes_guarded(Path::new("x.rs"), good(), &guard)
-        .await
-        .unwrap());
+
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn hello() -> u32 { 42 }\n#[test] fn t() { assert_eq!(hello(), 42); }\n",
+    )
+    .unwrap();
+    assert!(gate.passes_in_guarded(root, &guard).await.unwrap());
+
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn hello() -> u32 { 42 }\n#[test] fn t() { assert_eq!(hello(), 41); }\n",
+    )
+    .unwrap();
+    assert!(!gate.passes_in_guarded(root, &guard).await.unwrap());
 }
 
 // --- default-deny network, enforced by the sandbox not the prompt -----------
@@ -187,10 +204,7 @@ async fn a_gate_run_leaves_no_workdir_behind() {
     let policy = Policy::default();
     let guard = ExecGuard::new(&policy);
     // A run that hits a cap still tears down — use a tiny CPU cap on a compile.
-    let _ = Verification::CompilesRust
-        .passes_guarded(Path::new("x.rs"), good(), &guard)
-        .await
-        .unwrap();
+    let _ = compile_gate(good(), &guard).await.unwrap();
     // The tempdir the gate used is dropped by now; there is no handle left to
     // it. (The workdir-drop guarantee itself is unit-tested in the module.)
 }
@@ -207,10 +221,7 @@ async fn sandbox_lifecycle_is_recorded_and_reconstructable() {
         let run = store.start_run("goal", "x.rs").unwrap();
         let policy = Policy::default();
         let guard = ExecGuard::new(&policy).tracing(&store, run, 1);
-        assert!(Verification::CompilesRust
-            .passes_guarded(Path::new("x.rs"), good(), &guard)
-            .await
-            .unwrap());
+        assert!(compile_gate(good(), &guard).await.unwrap());
         run
         // store dropped — the process that ran the sandbox is gone
     };
@@ -261,10 +272,7 @@ async fn a_cap_hit_in_the_gate_is_recorded() {
     let guard = ExecGuard::new(&policy)
         .sandboxed(cfg)
         .tracing(&store, run, 1);
-    let passed = Verification::CompilesRust
-        .passes_guarded(Path::new("x.rs"), good(), &guard)
-        .await
-        .unwrap();
+    let passed = compile_gate(good(), &guard).await.unwrap();
     assert!(!passed, "a cap-killed compile must not pass the gate");
     let events = store.sandbox_events(run).unwrap();
     assert!(
@@ -299,10 +307,7 @@ async fn windows_claims_no_cpu_cap_because_it_applies_none() {
     let guard = ExecGuard::new(&policy)
         .sandboxed(cfg)
         .tracing(&store, run, 1);
-    let passed = Verification::CompilesRust
-        .passes_guarded(Path::new("x.rs"), good(), &guard)
-        .await
-        .unwrap();
+    let passed = compile_gate(good(), &guard).await.unwrap();
 
     assert!(
         passed,

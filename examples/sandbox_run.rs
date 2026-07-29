@@ -11,13 +11,6 @@
 //! On macOS the native `sandbox-exec` backend runs; on another OS the strongest
 //! backend available there is selected, falling back to the portable floor.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use io_harness::sandbox::{RunSpec, Sandbox};
 use io_harness::{
     run, select, RunOutcome, SandboxConfig, SandboxLimits, Store, TaskContract, Verification,
@@ -34,7 +27,20 @@ async fn main() -> io_harness::Result<()> {
     let contract = TaskContract::new(
         "Write a Rust library file with a public function `hello` returning the u32 42.",
         dir.path().join("hello.rs").to_str().unwrap(),
-        Verification::CompilesRust,
+        Verification::Command {
+            // 0.18.0: the Rust-specific criteria are gone. A compiler is invoked
+            // by argv, in the edited file's own directory, like any other
+            // language's — and still inside the sandbox.
+            argv: vec![
+                "rustc".into(),
+                "--edition".into(),
+                "2021".into(),
+                "--crate-type".into(),
+                "lib".into(),
+                "hello.rs".into(),
+            ],
+            expect_exit: 0,
+        },
     )
     .with_max_steps(6);
 

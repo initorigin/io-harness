@@ -415,16 +415,34 @@ pub struct ToolCall {
 /// Token usage for one completion, in a vendor-neutral shape. Used to enforce
 /// the cost budget and to record spend in the trace.
 ///
+/// Construct with `..Default::default()`: fields are added in minor releases —
+/// 0.18.0 added the cache, reasoning and server-tool counters below — and a
+/// literal naming every field is what a widening breaks.
+///
 /// ```
 /// use io_harness::{Containment, Draw, Ledger, Usage};
 ///
 /// let ledger = Ledger::new(&Containment::new(4, 2, 1, 10_000));
-/// let usage = Usage { prompt_tokens: 4_000, completion_tokens: 500, total_tokens: 4_500 };
+/// let usage = Usage {
+///     prompt_tokens: 4_000,
+///     completion_tokens: 500,
+///     total_tokens: 4_500,
+///     // Of those 4,000 prompt tokens, 3,000 were served from the provider's
+///     // cache — which is billed at a fraction of a fresh read, and is why a
+///     // token-only figure understates nothing but overstates the bill.
+///     cache_read_tokens: 3_000,
+///     ..Default::default()
+/// };
 ///
 /// // `total_tokens` is the figure the budget is enforced in: the provider's own
 /// // total, taken as reported rather than re-derived from the other two.
 /// assert_eq!(ledger.draw_tokens(usage.total_tokens), Draw::Ok);
 /// assert_eq!(ledger.remaining_tokens(), 5_500);
+///
+/// // The cache counters are a *breakdown* of the prompt, not an addition to it:
+/// // adding them to `total_tokens` would double-count what the provider already
+/// // counted once.
+/// assert!(usage.cache_read_tokens <= usage.prompt_tokens);
 ///
 /// // A provider that reports nothing gives `None`, not a zero: an unknown cost
 /// // and a free step are different facts, and the loop treats them differently.
@@ -439,6 +457,25 @@ pub struct Usage {
     pub completion_tokens: u64,
     /// Total tokens billed for this completion.
     pub total_tokens: u64,
+    /// (0.18.0) Prompt tokens served from the provider's cache rather than read
+    /// fresh. A breakdown of [`Usage::prompt_tokens`], not an addition to it, and
+    /// priced far lower — which is the whole reason to record it separately.
+    pub cache_read_tokens: u64,
+    /// (0.18.0) Prompt tokens the provider wrote *into* its cache on this call.
+    /// Also a breakdown of [`Usage::prompt_tokens`], and usually priced above a
+    /// fresh read rather than below it.
+    pub cache_write_tokens: u64,
+    /// (0.18.0) Tokens the model spent reasoning before answering, where the
+    /// provider reports them separately. A breakdown of
+    /// [`Usage::completion_tokens`].
+    pub reasoning_tokens: u64,
+    /// (0.18.0) Provider-executed tool requests — a server-side web search, say
+    /// — made while serving this completion. Billed per request rather than per
+    /// token, so a token-only schema under-reports the money silently.
+    ///
+    /// Zero everywhere until the crate declares such tools (0.22.0). The counter
+    /// exists first so that adding them is not a second widening of this type.
+    pub server_tool_requests: u64,
 }
 
 /// One model completion.
@@ -454,7 +491,12 @@ pub struct Usage {
 ///         name: "write_file".into(),
 ///         arguments: serde_json::json!({ "path": "NOTES.md" }),
 ///     }],
-///     usage: Some(Usage { prompt_tokens: 1_200, completion_tokens: 80, total_tokens: 1_280 }),
+///     usage: Some(Usage { prompt_tokens: 1_200, completion_tokens: 80, total_tokens: 1_280,
+///                         ..Default::default() }),
+///     // Which model actually served this call, as the provider named it in its
+///     // own answer — not the slug that was asked for, and not the vendor.
+///     model: Some("claude-sonnet-4".into()),
+///     finish_reason: Some("tool_use".into()),
 ///     ..Default::default()
 /// };
 ///
@@ -470,6 +512,10 @@ pub struct Usage {
 /// // Usage is what the step's budget draw is made from; `None` means the provider
 /// // said nothing, which is why the field is an `Option` rather than a zero.
 /// assert_eq!(response.usage.map(|u| u.total_tokens), Some(1_280));
+///
+/// // Nothing measured the stream here, so time-to-first-token is unknown rather
+/// // than instant. The trace keeps that distinction.
+/// assert_eq!(response.ttft_ms, None);
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionResponse {
@@ -479,6 +525,29 @@ pub struct CompletionResponse {
     pub tool_calls: Vec<ToolCall>,
     /// Token usage, when the provider reports it. `None` if unknown.
     pub usage: Option<Usage>,
+    /// (0.18.0) The model that served this call, as the provider identified it.
+    /// `None` when the provider did not say.
+    ///
+    /// This is the field that makes a fallback auditable: `runs.provider` holds
+    /// one label for a whole run, and stops being true the moment a
+    /// [`Fallback`] swaps vendors mid-run.
+    pub model: Option<String>,
+    /// (0.18.0) Why the model stopped — `stop_reason` on Anthropic,
+    /// `finish_reason` on the OpenAI wire, recorded verbatim rather than
+    /// normalised, because a vendor's own word for it is what its documentation
+    /// explains. `None` when the provider did not say.
+    ///
+    /// A turn that ended on a length cap and one that finished are different
+    /// facts, and only this field tells them apart after the run.
+    pub finish_reason: Option<String>,
+    /// (0.18.0) Milliseconds from the request being sent to the first
+    /// content-bearing chunk arriving.
+    ///
+    /// `None` — never zero — when nothing measured it: a provider that does not
+    /// stream, or a test double. An unmeasured wait and an instant one are
+    /// different facts and averaging the second into a latency report would be
+    /// wrong in the direction that flatters the provider.
+    pub ttft_ms: Option<u64>,
 }
 
 /// Anything that can turn a [`CompletionRequest`] into a [`CompletionResponse`].
@@ -515,7 +584,12 @@ pub struct CompletionResponse {
 /// let provider = Scripted {
 ///     replies: std::sync::Mutex::new(vec![CompletionResponse {
 ///         text: Some("done".into()),
-///         usage: Some(Usage { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }),
+///         usage: Some(Usage {
+///             prompt_tokens: 10,
+///             completion_tokens: 2,
+///             total_tokens: 12,
+///             ..Default::default()
+///         }),
 ///         ..Default::default()
 ///     }]
 ///     .into_iter()),

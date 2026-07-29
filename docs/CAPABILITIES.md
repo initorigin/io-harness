@@ -25,6 +25,7 @@ the limits that capability actually has.
 | [Context and memory](guide/context-and-memory.md) | Per-turn assembly, compaction, invalidation, durable cross-run memory |
 | [Resilience](guide/resilience.md) | Failure classification, kind-aware retry, provider fallback, stall detection |
 | [Observability and replay](guide/observability.md) | Observers, event kinds, outcome records, deterministic replay |
+| [Accounting](guide/accounting.md) | One row per provider call, the cache and reasoning breakdown, latency and TTFT, and cost derived from a price table you own |
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 

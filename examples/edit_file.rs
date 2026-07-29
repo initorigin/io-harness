@@ -6,13 +6,6 @@
 //! cargo run --example edit_file
 //! ```
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
 
 #[tokio::main]
@@ -26,10 +19,19 @@ async fn main() -> io_harness::Result<()> {
     let contract = TaskContract::new(
         "Create a Rust function `hello` that returns the u32 value 42.",
         &file,
-        // Execution-based: the file must compile AND the test must pass. A
-        // substring stub (the 0.1.0 I01 failure) cannot satisfy this.
-        Verification::RustTestPasses {
-            test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
+        // Execution-based: the file must compile. A substring stub (the 0.1.0
+        // I01 failure) cannot satisfy this, which is the whole reason 0.2.0
+        // introduced an execution gate.
+        Verification::Command {
+            argv: vec![
+                "rustc".into(),
+                "--edition".into(),
+                "2021".into(),
+                "--crate-type".into(),
+                "lib".into(),
+                "hello.rs".into(),
+            ],
+            expect_exit: 0,
         },
     )
     .with_max_steps(4)

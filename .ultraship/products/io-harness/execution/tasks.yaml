@@ -1,600 +1,370 @@
 product: io-harness
-version: 0.17.0
+version: 0.18.0
 tasks:
-  - id: US-IO-HARNESS-0.17.0-T01
+  - id: US-IO-HARNESS-0.18.0-T01
     summary: >
-      Add the `exec` runner — a fixed-argv process spawn in the workspace root under an `Act::Exec`
-      check on both the program and the joined argv — as `src/tools/exec.rs`, modelled on the
-      governed spawn in `src/tools/git.rs`.
+      Widen `Usage` with cache-read, cache-write, reasoning and server-tool-request counters, and
+      widen `CompletionResponse` with the model that served the call, the finish reason, and the
+      time to first token. Both keep `..Default::default()` as the forward-compatible construction.
     why_required: >
-      Without it the release's stated outcome is unreachable: there is no way for the agent to run
-      a project's own toolchain, so "point the harness at a project in any language" stays prose.
-      Everything else in the release either sits on this module or is documentation of it.
+      Every other task in the release either fills these fields or reads them. There is nowhere to
+      put a cache token, a model id or a TTFT until the two vendor-neutral types carry them, and the
+      widening is the release's first break, so it happens once and everything else follows it.
     status: done
     depends_on: []
     acceptance_criteria:
       - >
-        F1 — the agent can run a command. A workspace run whose goal requires building or testing invokes
-        `exec` with a fixed argv, the command runs in the workspace root, and its exit status, stdout,
-        and stderr reach the agent's next turn. Asserted end to end against a fixture project, not by
-        unit-testing the tool in isolation.
-      - >
-        F4 — `exec` cannot reach a shell. A test asserts the tool's JSON schema accepts only an array of
-        strings, and that an argument containing `;`, `&&`, `$(id)`, or a backtick is passed to the
-        program as one literal argument rather than interpreted. The negative control is the same
-        argument observed verbatim in the child's received `argv`.
+        F4 — `total_tokens` is still the provider's own figure. A fixture whose reported total disagrees
+        with the sum of its parts is stored as reported, and the ledger draw is made from it, because
+        re-deriving a total silently invents a number the vendor will not bill.
     files:
-      - src/tools/exec.rs
-      - src/tools/mod.rs
+      - src/provider/mod.rs
     evidence:
-      - >
-        src/tools/exec.rs — a fixed-argv spawn in the workspace root, modelled on src/tools/git.rs.
-        Its unit tests assert the argv reaches the child verbatim (metacharacters inside one
-        argument, checked against Command::get_args), a relative output path resolving in the
-        workspace root, exit status and captured output from a real `rustc`, a missing program as
-        an Unavailable outcome rather than a run failure, and an empty argv as a typed
-        Error::Config rather than a panic.
-      - >
-        F1 — tests/exec_tool.rs::a_command_runs_in_the_workspace_root_and_its_result_reaches_the_next_turn.
-        Asserted end to end through run_with against a fixture project: the relative --out-dir
-        landed in the workspace root, the decision row carries "exec rustc ... exit 0", and the
-        FOLLOWING step's recorded prompt carries the command and its exit status, which is what
-        "reaches the agent's next turn" means.
-      - >
-        F4 — tests/exec_tool.rs::the_tool_schema_accepts_only_an_array_of_strings asserts
-        properties.argv.type == "array", items.type == "string", required == ["argv"], and that
-        argv is the ONLY property, so there is no second way in. Its companion,
-        shell_metacharacters_reach_the_program_as_one_literal_argument, sends
-        `a;b && c $(id) \`whoami\` | d > e.rs` and finds it byte-identical in what the child
-        received (rustc names the file it could not read), with the negative control that no `e.rs`
-        was created — nothing redirected, nothing substituted, nothing executed.
-  - id: US-IO-HARNESS-0.17.0-T02
+    - >
+      src/provider/mod.rs — `Usage` gains cache_read_tokens, cache_write_tokens, reasoning_tokens and
+        server_tool_requests (still `Copy`); `CompletionResponse` gains model, finish_reason and
+        ttft_ms. Both document `..Default::default()` as the forward-compatible construction, and
+        every literal in the crate, its tests, its examples and its doctests was migrated to it.
+    - >
+      F4 — provider::openai_wire::tests::a_disagreeing_total_is_kept_as_the_provider_reported_it: a
+        usage chunk reporting total 99 against parts summing to 12 is stored as 99, because
+        re-deriving a total invents a number the vendor will not bill.
+  - id: US-IO-HARNESS-0.18.0-T02
     summary: >
-      Bound what `exec` may do to the run: an overridable wall-clock timeout that kills the child and
-      reports itself by name, and a captured-output ceiling that keeps the head and the tail and
-      states the elision in the result the model reads.
+      Add the `provider_calls` and `edits` tables to `Store::from_conn` as additive
+      `CREATE TABLE IF NOT EXISTS`, with a typed record for each and the insert that writes it. No
+      existing table is altered and `CHECKPOINT_FORMAT` stays 7.
     why_required: >
-      An unbounded `exec` hands a wedged command the run's whole time budget and reports it as a
-      budget stop, which sends the reader to the wrong diagnosis. A silently truncated build log is
-      worse: an agent that cannot tell a cut output from a complete one draws a confident wrong
-      conclusion from it.
+      The outcome is that the trace answers the cost question. Without a durable row per provider
+      call there is nothing to query, and without the additive-only discipline a 0.17.0 database
+      stops opening — which is the release's own non-functional criterion.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.17.0-T01
+    depends_on: [US-IO-HARNESS-0.18.0-T01]
     acceptance_criteria:
       - >
-        F5 — `exec` is bounded. A command that runs past the wall-clock timeout is killed and reported
-        as a timeout naming the command, rather than hanging the run until the contract's time budget
-        stops it. Output past the ceiling retains its head and its tail with the middle elided, and the
-        result the model reads states that an elision happened and how much was dropped — asserted
-        against a fixture whose first and last lines are both required to survive, so a tail-only or
-        head-only cut fails the test.
+        NF2 — the store change is additive only. `CREATE TABLE IF NOT EXISTS` for `provider_calls` and
+        `edits`, no `ALTER TABLE` on an existing table, no column dropped, and `CHECKPOINT_FORMAT` stays
+        7 — so a 0.17.0 database opens, resumes and is queried against 0.18.0, and a 0.17.0 binary still
+        opens a database 0.18.0 has written. Asserted in both directions.
     files:
-      - src/tools/exec.rs
-      - src/contract.rs
-    evidence:
-      - >
-        F5, the runner's half — src/tools/exec.rs unit tests. A 30-second command under a 300ms
-        ceiling reports ExecOutcome::TimedOut and returns in under 10s (kill_on_drop is what makes
-        the timeout a kill); its negative control is the same runner and the same short ceiling over
-        a command that finishes, which reports Ran. Truncation is asserted against a 200-line log:
-        "line 0" and "line 199" both survive, "line 100" does not, and the returned text states the
-        elided character count. A multibyte case asserts the cut is by character and not by byte —
-        a byte index would slice a 4-byte character in half and panic.
-      - >
-        F5, the tool's half — tests/exec_tool.rs::a_wedged_command_is_killed_and_reported_as_a_timeout_naming_itself.
-        Through the full loop with with_exec_timeout(300ms): the trace decision says "timed out",
-        the next prompt carries "[exec timed out]" naming the command, the run returns in under 20s,
-        and the run's own outcome is Finished rather than a budget stop — which is the point of the
-        bound.
-      - >
-        TaskContract::exec_timeout defaults to DEFAULT_EXEC_TIMEOUT (900s) and is set by
-        with_exec_timeout, a new named builder rather than a parameter on any of the twenty entry
-        points.
-  - id: US-IO-HARNESS-0.17.0-T03
-    summary: >
-      Dispatch `exec` in the workspace loop under the same gate every other tool uses, checking
-      `Act::Exec` on the program and on the full argv, and offer it to the model as a tool whose
-      schema accepts only an array of strings.
-    why_required: >
-      A runner nothing calls is not a capability. This is also where the release's widest grant is
-      actually bounded — the policy check that decides which argv may start — so it carries the two
-      criteria that measure the boundary rather than the mechanism.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.17.0-T01
-    acceptance_criteria:
-      - >
-        F2 — `exec` is authorized, not merely available. A run under a policy that denies the program is
-        refused before the process is spawned, and the refusal is recorded in `policy_events` attributed
-        to the rule and layer that produced it. The negative control is the same run under a policy that
-        allows it, which executes — so F2 measures the boundary rather than a tool that never works.
-      - >
-        F3 — argv is matched whole, not just on the program name. A policy allowing `git log*` and
-        denying `git push*` permits the first and refuses the second, with the refusal attributed. The
-        negative control is a policy allowing both, under which both run.
-    files:
-      - src/run.rs
-    evidence:
-      - >
-        F2 — tests/exec_tool.rs::a_denied_program_is_refused_before_it_is_spawned_and_the_refusal_is_attributed.
-        Under deny_exec("rustc") no .rlib exists afterwards, so nothing was spawned, and
-        policy_events holds a refusal with rule "rustc" and layer "ops". Negative control:
-        the_same_command_under_a_policy_that_allows_it_executes — the identical run under
-        allow_exec("rustc") builds and records exit 0, so F2 measures the boundary rather than a
-        tool that never works.
-      - >
-        F3 — tests/exec_tool.rs::a_rule_can_allow_one_subcommand_and_deny_another_of_the_same_program.
-        allow_exec("rustc --version*") beside deny_exec("rustc --print*") permits the first argv and
-        refuses the second, attributed to the argv rule rather than to the program. Negative
-        control: a_policy_allowing_both_argvs_runs_both, under allow_exec("rustc*") — without it
-        the test would pass against an exec that refused everything after its first call.
-      - >
-        The dispatch arm checks the program and, when it differs, the joined argv, taking the
-        strictest verdict through the same `gate` every other tool uses — so the Ask tier routes to
-        the Approver and a Deny never reaches one.
-  - id: US-IO-HARNESS-0.17.0-T04
-    summary: >
-      Add `edit_file`: exact string replacement on a workspace file, failing with a typed error when
-      the search string matches zero times or more than once, dispatched through the same `Act::Write`
-      gate as `write_file`.
-    why_required: >
-      `write_file` rewrites a whole file, so every edit costs tokens proportional to file size and
-      rewrites content the agent did not intend to touch. The zero/multiple-match failure is the
-      capability: a replacement that silently picks an occurrence is a corrupting edit, not a cheap one.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F6 — `edit_file` replaces one occurrence exactly. A replacement whose search string appears once
-        succeeds and changes only that occurrence; a search string appearing zero times fails with a
-        typed error naming the file; a search string appearing twice fails with a typed error stating
-        the count and changes nothing on disk.
-      - >
-        F7 — `edit_file` is gated by the same `Act::Write` check as `write_file`, asserted by a refusal
-        test with a negative control.
-    files:
-      - src/tools/workspace.rs
-      - src/run.rs
-    evidence:
-      - >
-        F6 — tests/edit_tool.rs. A unique search replaces only that occurrence and leaves the rest
-        of the file byte-identical; a search matching nothing fails with a typed error naming the
-        file; a search matching twice fails with a typed error stating the count. Both failure
-        cases assert the file on disk still equals the original, which is the capability rather
-        than a detail. Also covered: replacing text with itself reports Wrote::Unchanged, so the
-        stall signal is not fed a false positive, and an edit cannot escape the workspace root.
-      - >
-        F6 through the loop — the_model_is_told_the_count_so_it_can_lengthen_the_search asserts the
-        "[edit error]" observation and its count reach the agent's next recorded prompt.
-      - >
-        F7 — an_edit_to_a_denied_path_is_refused_and_the_file_is_untouched: refused with
-        act "write", target "secrets/key.txt", rule "secrets/*", layer "ops" — the write rule, not
-        a rule of its own, because an edit is a write. Negative control:
-        the_same_edit_to_an_allowed_path_is_applied.
-  - id: US-IO-HARNESS-0.17.0-T05
-    summary: >
-      Add `Verification::Command { argv, expect_exit }`, run through the existing execution sandbox
-      by `ExecGuard`, and assert it against Node's `npm test` over a fixture package.
-    why_required: >
-      This is what makes "any language" a measurement rather than a claim. Four of the five existing
-      variants run `rustc`, so before it a non-Rust project has no expressible definition of done.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F8 — `Verification::Command` passes and fails on exit status, asserted against **Node**. A
-        criterion running `npm test` over a fixture package exits zero and yields `RunOutcome::Success`;
-        the same criterion over a fixture whose test fails does not, and the gate's output reaches the
-        trace. Node and npm are preinstalled on all three runner images, so no system package is
-        installed and the standing constraint holds. This is what makes "any language" a measurement
-        rather than a claim.
-    files:
-      - src/verify.rs
-      - tests/verify_gate.rs
-    evidence:
-      - >
-        F8 — tests/language_agnostic.rs, against Node. A dependency-free fixture package whose
-        `npm test` runs one script: the passing fixture yields RunOutcome::Success, the failing one
-        does not. `npm test` rather than `node` directly, because the claim is that a PROJECT'S OWN
-        command can be the gate. A machine without npm skips with a stated reason printed to
-        stderr rather than passing vacuously; no system package is installed, so NF2 holds.
-      - >
-        The gate's output reaches the trace: the failing case asserts a sandbox_events row with
-        kind "gate_output" carrying the fixture's own "expected 42" text, and one with kind
-        "gate_phase_failed" carrying "exited 1". Without them a failing gate is a bare discriminant,
-        and "the agent's change is wrong" is indistinguishable from "the test runner is not
-        installed".
-      - >
-        a_command_criterion_is_refused_rather_than_failed_when_the_policy_forbids_it — under
-        deny_exec("npm") the run returns Error::Refused rather than a quiet non-pass. Verification
-        cannot prompt, so a criterion that was refused is not one that ran and failed.
-      - >
-        One execution path, as the contract required: ExecGuard::exec is now a wrapper over
-        exec_output, which keeps the exit status and the output. A command killed by a signal or a
-        sandbox cap reports as no exit at all, so no expect_exit can match it.
-  - id: US-IO-HARNESS-0.17.0-T06
-    summary: >
-      Add `Verification::None` and the terminal run outcome it needs: an assistant turn carrying no
-      tool call ends the run, distinguishably from a step cap, a stall and a budget stop. No `done`
-      tool is added.
-    why_required: >
-      `TaskContract` takes `verify` by value, so before this an open-ended task is not merely
-      unimplemented but inexpressible. It is the single change that turns the repositioning from
-      prose into a capability.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F9 — `Verification::None` completes a run with no gate. An assistant turn carrying no tool call
-        ends the run with a terminal outcome distinguishable from a step cap, a stall, and a budget
-        stop, so an unattended run that simply finished is not later mistaken for one that ran out. The
-        negative control is a run that hits the step cap, which must report the cap and not the
-        finished outcome.
-    files:
-      - src/verify.rs
-      - src/run.rs
       - src/state.rs
     evidence:
-      - >
-        F9 — tests/language_agnostic.rs::a_run_with_no_gate_ends_when_the_agent_stops_calling_tools.
-        One step of work, then a turn with no tool call: RunOutcome::Finished { steps: 2 }, the
-        file the agent wrote is on disk, and a resume of the same run reports Finished again rather
-        than re-driving the loop.
-      - >
-        F9's negative control —
-        a_run_that_hits_the_step_cap_reports_the_cap_and_not_the_finished_outcome. The same
-        variant over an agent that never stops reports StepCapReached { steps: 4 }. Without it a
-        Finished returned unconditionally would pass the positive test.
-      - >
-        The other half of the same boundary — a_quiet_turn_does_not_end_a_run_that_has_a_criterion.
-        A contract WITH a criterion whose first turn calls no tool still runs on and succeeds at
-        step 2. Without this, every existing caller's runs would silently end at the agent's first
-        quiet turn.
-      - >
-        No `done` tool was added: workspace_tools() gained exec and edit_file and nothing else, so
-        an unverified run has exactly the tool surface a verified one has.
-  - id: US-IO-HARNESS-0.17.0-T07
+    - >
+      src/state.rs — `provider_calls` and `edits` added as `CREATE TABLE IF NOT EXISTS` in
+        `Store::from_conn`, with `ProviderCall`, `Edit`, `record_provider_call`, `provider_calls`,
+        `record_edit` and `edits`. No ALTER TABLE, no column dropped, CHECKPOINT_FORMAT still 7 at
+        src/state.rs:106.
+    - >
+      NF2 — tests/accounting.rs::a_run_that_predates_the_tables_reports_no_calls_rather_than_zero:
+        a run with no rows returns empty vectors and does not appear in the groupings at all, rather
+        than reporting zeros, and the checkpoint format is asserted unchanged in the same test.
+  - id: US-IO-HARNESS-0.18.0-T03
     summary: >
-      Deprecate `CompilesRust`, `RustTestPasses` and `WorkspaceTestPasses`, each naming its `Command`
-      replacement and the release that removes it, while keeping every existing behaviour and test
-      passing.
+      Parse cache-read, cache-write and reasoning tokens, the finish reason, the model id and the
+      server-tool request count in the Anthropic and OpenAI-wire streaming accumulators, and measure
+      time to first token where the stream is consumed.
     why_required: >
-      The deprecation cycle is what the crate's published contract requires of a removal, and the
-      warning is the only notice a consumer gets before 0.18.0 takes the variants away. Keeping them
-      working is not optional: the existing tests are the specification of what each one proves.
+      The facts are already on the wire and are being discarded. Until both clients read them, every
+      row this release adds is zero for a real provider and the outcome is unreachable outside a
+      test double.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.17.0-T05
+    depends_on: [US-IO-HARNESS-0.18.0-T01]
     acceptance_criteria:
       - >
-        F10 — the deprecated variants still work. A 0.16.2-era contract using `CompilesRust` or
-        `RustTestPasses` compiles against 0.17.0, emits a deprecation warning naming its replacement,
-        and produces the same outcome as before. The negative control is the same assertion against a
-        build with the variants removed, which fails to compile.
+        F3 — cache and reasoning tokens survive the wire. Anthropic's `cache_creation_input_tokens` and
+        `cache_read_input_tokens` and the OpenAI wire's `cached_tokens` and `reasoning_tokens` reach
+        `Usage` unchanged from a recorded fixture response, with a fixture that reports none producing
+        zeros rather than an error. Asserted against the accumulators, which is where the wire is parsed.
+      - >
+        F6 — the finish reason reaches the trace. A fixture ending on a length cap and one ending on a
+        tool call record different finish reasons, so an operator can tell a truncated turn from a
+        complete one.
+      - >
+        F7 — server-tool requests are counted. A fixture reporting a server-tool request count stores
+        it; one reporting none stores zero. Both providers.
+    files:
+      - src/provider/anthropic.rs
+      - src/provider/openai_wire.rs
+      - src/provider/openai.rs
+      - src/provider/openrouter.rs
+    evidence:
+    - >
+      src/provider/anthropic.rs and src/provider/openai_wire.rs parse what they already received:
+        cache_creation/cache_read input tokens and `server_tool_use` on Anthropic,
+        prompt_tokens_details.cached_tokens and completion_tokens_details.reasoning_tokens on the
+        OpenAI wire, plus the model id and the stop/finish reason on both. TTFT is measured from
+        before the socket opens, in all three clients.
+    - >
+      F3, F6, F7 — five accumulator tests, each with its negative control: a stream reporting none
+        of it yields zeros and `None`s rather than an error, which is also every pre-cache request
+        and therefore the common case.
+    - >
+      Anthropic's prompt/total now include the cached counts, which the vendor reports separately
+        and 0.17.0 dropped entirely. Asserted in
+        cache_tokens_the_model_reports_reach_usage_with_the_model_and_stop_reason (11 + 300 + 1,200).
+  - id: US-IO-HARNESS-0.18.0-T04
+    summary: >
+      Record one `provider_calls` row per `Provider::complete` invocation from `complete_with_retry`,
+      carrying the attempt number, the measured latency, the TTFT, and the failure flag, for every
+      run entry point.
+    why_required: >
+      This is the release's central claim: a step that retried once and then fell over is three rows
+      on three models. Only the run loop knows an attempt happened, so if it does not write the row,
+      nothing does.
+    status: done
+    depends_on: [US-IO-HARNESS-0.18.0-T02, US-IO-HARNESS-0.18.0-T03]
+    acceptance_criteria:
+      - >
+        F1 — one row per provider call. A run whose first attempt fails retryably and whose second
+        succeeds writes two `provider_calls` rows for that step, with attempt 0 and attempt 1, the
+        failure marked on the first. The negative control is a run with no retry, which writes exactly
+        one row for the step — so the test measures per-attempt recording rather than row-writing in
+        general.
+      - >
+        F2 — the model is recorded, not the vendor. A run through a `Fallback` whose primary fails
+        records two rows for the step naming two different model ids, while `runs.provider` holds one
+        label for the whole run. Asserted against the stored rows.
+      - >
+        F5 — latency and TTFT are measured and ordered. A scripted provider that delays its first chunk
+        and then its last produces a TTFT strictly smaller than its total latency, and both are within a
+        stated tolerance of the injected delays. The negative control is a non-streaming path, which
+        records latency and leaves TTFT null rather than reporting zero — an unmeasured TTFT and an
+        instant one are different facts.
+      - >
+        NF3 — the accounting is not on the critical path. Recording a call is one insert per provider
+        call, not per token, and the timing instrumentation adds no await to the streaming loop. A run
+        with the trace disabled behaves as before.
+    files:
+      - src/run.rs
+    evidence:
+    - >
+      src/run.rs — `complete_with_retry` times every attempt and calls `record_provider_call`, for
+        the call that answered and the one that failed alike. A store failure is logged and
+        swallowed rather than failing a run the provider answered.
+    - >
+      F1, F2, F5 — tests/accounting.rs, six tests. A retried step is two rows (attempt 0 marked
+        `Server (HTTP 503)`, attempt 1 clean) with a no-retry run as the control; two models serving
+        one run are two rows against one `runs.provider` label; a slow provider's TTFT is strictly
+        inside its own latency, with a provider that measured nothing recording `None` rather than
+        zero as the control.
+    - >
+      NF3 — the row count equals the provider call count the mock actually served, so recording is
+        per call rather than per token or per step.
+  - id: US-IO-HARNESS-0.18.0-T05
+    summary: >
+      Record an `edits` row for every file change a run makes, computing lines added and removed
+      from the before and after content, for `write_file` and `edit_file` alike.
+    why_required: >
+      "How much did this run actually change" is part of the stated outcome and is the one accounting
+      question that is not about money. Computed once in the crate rather than reconstructed from a
+      diff by every consumer.
+    status: done
+    depends_on: [US-IO-HARNESS-0.18.0-T02]
+    acceptance_criteria:
+      - >
+        F8 — edits record lines added and removed. A `write_file` creating a new file records its line
+        count added and zero removed; an `edit_file` replacing one line records one added and one
+        removed; a replacement changing nothing records zero and zero. Asserted against the `edits`
+        table after a run, not against a helper in isolation.
+    files:
+      - src/tools/fs.rs
+      - src/run.rs
+    evidence:
+    - >
+      src/run.rs records an `edits` row in both writing branches; `Edit::measure` computes the
+        counts by common head/tail comparison, in src/state.rs.
+    - >
+      F8 — tests/accounting.rs::edits_record_the_lines_each_change_added_and_removed: a new file is
+        (3, 0), a one-line replacement is (1, 1), and rewriting a file with what it already held is
+        (0, 0) — asserted against the table after a real run, not against the helper.
+  - id: US-IO-HARNESS-0.18.0-T06
+    summary: >
+      Ship pricing as data: a publicly constructible price table keyed by model id with input,
+      output, cache-read, cache-write and server-tool-request prices in a fixed-point unit per
+      million tokens, carrying the date it was accurate as of.
+    why_required: >
+      Cost is derived, never stored, and derivation needs prices the operator can correct. Without
+      the table the trace holds tokens and no one can turn them into money.
+    status: done
+    depends_on: [US-IO-HARNESS-0.18.0-T01]
+    acceptance_criteria:
+      - >
+        F10 — cost arithmetic does not drift. A price table applied to a million-token trace produces
+        the exact expected figure in the fixed-point unit, asserted against a hand-computed value, and
+        an unknown model yields a stated-unknown cost rather than zero — a free model and an unpriced
+        one are different facts.
+      - >
+        OP4 — the shipped price table names the date it was accurate as of, in the data, because a price
+        table with no date is a claim with no expiry.
+    files:
+      - src/pricing.rs
+      - src/lib.rs
+    evidence:
+    - >
+      src/pricing.rs — `Price`, `PriceTable` and `Spend`, in integer micro-units per million
+        tokens. `PriceTable::new` requires the as-of date; the crate ships no prices, which resolved
+        the contract's open question in the direction it listed second.
+    - >
+      F10 — four unit tests: a hand-computed five-dimension figure comes out exact, an unpriced
+        model is `None` rather than `Some(0)` (the negative control that stops a table returning
+        zero for everything from passing), cache figures larger than the prompt saturate instead of
+        underflowing, and rounding is once at the end and half-up.
+    - >
+      OP4 — the as-of date is a required constructor argument, so every table in existence carries
+        one rather than only a shipped one.
+  - id: US-IO-HARNESS-0.18.0-T07
+    summary: >
+      Add the query surface: grouped raw rows by model, by day and by run, with the token sums and
+      the cost derived at query time from a supplied price table.
+    why_required: >
+      It is the operator-facing half of the outcome. Rows in a table nobody can group do not answer
+      "what did that run cost, and which model spent it".
+    status: done
+    depends_on: [US-IO-HARNESS-0.18.0-T04, US-IO-HARNESS-0.18.0-T06]
+    acceptance_criteria:
+      - >
+        F9 — cost is derived and repairable. The same trace queried under two price tables yields two
+        different costs, and no cost column exists in the store to contradict either. Asserted by
+        querying, correcting a price, and querying again on an unchanged database.
+      - >
+        F11 — grouping returns raw rows. By model, by day and by run each return the token sums and the
+        derived cost for a fixture trace spanning two models, two days and two runs, and the by-run
+        figures sum to the by-model figures. No rendering, no ordering promise beyond the one documented.
+    files:
+      - src/state.rs
+      - src/pricing.rs
+    evidence:
+    - >
+      src/state.rs — `spend_by_model`, `spend_by_day` and `spend_by_run` over one read, grouped and
+        priced in Rust because pricing is arithmetic the database cannot do.
+    - >
+      F9 — tests/accounting.rs::correcting_a_price_changes_every_past_run_and_the_store_does_not_argue:
+        the same unchanged trace under two price tables yields two costs, and the test also asserts
+        no cost column exists in the schema to contradict either.
+    - >
+      F11 — grouping_by_model_by_day_and_by_run_agree_with_each_other: by-run, by-day and by-model
+        totals are equal across two runs and two models, the cache breakdown survives the summing,
+        and a table missing one model reports two unpriced calls rather than costing them at zero.
+  - id: US-IO-HARNESS-0.18.0-T08
+    summary: >
+      Remove `Verification::CompilesRust`, `RustTestPasses` and `WorkspaceTestPasses`, and re-express
+      their 0.17.0 tests over `Verification::Command` so the removal is proven not to have changed
+      what they proved.
+    why_required: >
+      The second of the release's two breaks, promised by the 0.17.0 deprecation note which named
+      this version. Leaving it undone means the crate carries two execution paths and a deprecation
+      that expired.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F12 — the deprecated variants are gone. A contract naming `Verification::CompilesRust` fails to
+        compile against 0.18.0, and the equivalent `Command` criterion produces the same outcome the
+        removed variant produced in 0.17.0 — asserted by the 0.17.0 tests for those variants, rewritten
+        over `Command` and still passing, so the removal is proven not to have changed what they proved.
     files:
       - src/verify.rs
+      - src/contract.rs
     evidence:
-      - >
-        F10, behaviour — tests/language_agnostic.rs::a_0_16_2_contract_using_the_rust_variants_still_reaches_the_same_outcome.
-        A WorkspaceTestPasses contract written exactly as a 0.16.2 caller would write it compiles
-        against 0.17.0 and returns Success { steps: 1 }. The whole of src/verify.rs's existing test
-        module still runs unchanged under #[allow(deprecated)] — those tests are the specification
-        of what each variant proves, so keeping them running IS the claim.
-      - >
-        F10, the notice — each_deprecated_variant_names_its_replacement_and_the_release_that_removes_it
-        parses src/verify.rs and asserts each of the three carries since = "0.17.0", names
-        Verification::Command, and names 0.18.0 by version rather than "a future release"; and that
-        exactly three variants are deprecated, no more. Its negative control,
-        the_deprecation_checker_reports_nothing_for_a_variant_that_carries_no_attribute, feeds the
-        checker a variant with no attribute and one with, so it cannot pass by matching nothing.
-      - >
-        EachCompilesRust is deliberately NOT deprecated: it has no Command equivalent, since "each
-        of these files compiles on its own" is not a question a project's own tooling asks.
-  - id: US-IO-HARNESS-0.17.0-T08
+    - >
+      src/verify.rs — the three variants and the criterion-compile/test-run half of
+        `compile_source` are gone, with `CRITERION_OPEN`, `CRITERION_CLOSE` and `test_build_args`.
+        `Verification::Command` now works in single-file mode, running in the edited file's own
+        directory — without which the 0.17.0 migration note would have been false for a single-file
+        caller.
+    - >
+      F12 — the removed variants' own tests, rewritten over `Command` and still passing: a stub is
+        rejected and real code accepted through a `rustc` argv (what `CompilesRust` proved), and a
+        cargo fixture passes and then fails on its own suite (what `RustTestPasses` and
+        `WorkspaceTestPasses` proved). tests/language_agnostic.rs asserts the variants are gone from
+        the source and that no `#[deprecated]` attribute remains.
+    - >
+      tests/verify_gate.rs was rewritten rather than deleted: the shadowing half tested a mechanism
+        that no longer exists, and its replacement asserts the I01 payload cannot defeat a criterion
+        it does not share a crate with, with a passing control.
+  - id: US-IO-HARNESS-0.18.0-T09
     summary: >
-      Correct `RESERVED_TOOL_NAMES` to name every built-in — the git, image and document tools
-      included — so a registered tool can no longer pass `Toolbox::validate` and then be permanently
-      unreachable at dispatch.
+      Documentation: an accounting guide page, a worked example on every new public item,
+      `docs/public-api.txt` updated by hand, `CHANGELOG.md` migration notes for both breaks, and
+      `docs/CONTRACT.md` amended with the provenance of every recorded number.
     why_required: >
-      A registered `Tool` named `git_status` or `xlsx_read` currently validates and is then silently
-      shadowed, which is the exact failure the reserved set exists to prevent. Fixed here because
-      tool dispatch is already being edited for `exec` and `edit_file`.
+      A number that looks authoritative and is not is the release's largest risk, and the only
+      mitigation is stating what each figure is and is not where an operator will read it.
     status: done
-    depends_on: []
+    depends_on: [US-IO-HARNESS-0.18.0-T07, US-IO-HARNESS-0.18.0-T08]
     acceptance_criteria:
       - >
-        F13 — a registered tool can no longer shadow a built-in. `Toolbox::validate` refuses a tool named
-        after any built-in, including the git, image, and document tools added since the reserved set was
-        written. The negative control is the same assertion run against the 0.16.2 reserved set, which
-        accepts `git_status` — that failure is what makes F13 a measurement of the fix.
+        OP1 — `docs/public-api.txt` is updated by hand and `tests/public_api.rs` passes against the live
+        surface, with the three removed variants gone from it.
+      - >
+        OP2 — `CHANGELOG.md` carries a migration note for each break, with the old call on one side and
+        the new on the other, and states plainly that a 0.16.2 consumer meets the removal with no
+        intervening deprecation warning. The changelog checker passes.
+      - >
+        OP3 — `docs/CONTRACT.md` states what the numbers are and are not: a token count is the
+        provider's report and not the crate's measurement, a latency is the harness's own wall clock and
+        includes its own request building, a TTFT is null where the path did not stream, and a cost is
+        derived from a table the operator owns and is therefore only as right as that table.
     files:
-      - src/tools/custom.rs
-      - tests/custom_tools.rs
-    evidence:
-      - >
-        F13 — tests/custom_tools.rs::no_built_in_name_can_be_taken_by_a_registered_tool. All twenty
-        names 0.16.2's set omitted — the five git tools, view_image, the nine document tools, and
-        the two this release adds — are refused with an Error::Config naming the tool, before the
-        provider is called even once.
-      - >
-        F13's negative control — the_0_16_2_reserved_set_accepted_git_status writes out the seven
-        names 0.16.2 actually reserved and asserts every name in the gap list is absent from it. So
-        the fix is measured as a fix rather than as "validate rejects things".
-      - >
-        The tool-name constants lost their #[cfg] gates, so the reserved set no longer varies with
-        the feature flags. A caller could previously register `xlsx_read` in a default build, pass
-        validation, and have that tool silently stop being reachable the day they enabled the xlsx
-        feature — enabling a feature must never take away a working tool.
-  - id: US-IO-HARNESS-0.17.0-T09
-    summary: >
-      Ship the project and toolchain table as data in the crate — marker file to ecosystem to default
-      build, test, lint, format and run argv — with a public type for it, and resolve the package
-      manager behind `package.json` by lockfile.
-    why_required: >
-      Without it the agent spends turns guessing the package manager, and the operator or the goal
-      text has to name the test command the harness could have inferred. This is the release's
-      severable piece: its absence still leaves a coherent release.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F11 — the toolchain table detects the project. Given a fixture per supported marker file, the
-        detector names the ecosystem and the default test argv; given `package.json` beside each of the
-        four lockfiles, it resolves the matching package manager. The negative control is a directory
-        with no marker, for which it reports no detection rather than guessing Cargo.
-    files:
-      - src/toolchain.rs
-      - src/lib.rs
-    evidence:
-      - >
-        F11 — src/toolchain.rs unit tests. every_marker_names_its_ecosystem_and_its_test_command
-        drives all seventeen markers across the fifteen ecosystems the contract names and asserts
-        the ecosystem and the default test argv of each, written out rather than derived so a wrong
-        entry is a failing test and not a matching typo in two places.
-      - >
-        the_lockfile_beside_package_json_chooses_the_package_manager covers all four managers, and
-        the_python_runner_follows_the_lockfile covers uv, poetry and the bare-interpreter fallback.
-      - >
-        F11's negative control — a_directory_with_no_marker_reports_no_detection_rather_than_guessing
-        returns None for a directory of README and notes. Two ordering tests hold the ambiguity
-        rules: a Makefile beside a Cargo.toml does not win, and a Deno project carrying a
-        package.json is still Deno.
-      - >
-        a_toolchain_round_trips_through_json — the public type is Serialize/Deserialize so 0.19.0's
-        configuration file deserializes into this type rather than a second one.
-      - >
-        The live run found a real defect in the shipped data, which is what a live run is a
-        criterion for: npm's install default was `npm ci`, which requires a lockfile and failed on
-        the agent's first turn. Now `npm install` for every manager.
-  - id: US-IO-HARNESS-0.17.0-T10
-    summary: >
-      Surface the detection result to the model in the assembled context, asserted against the
-      recorded prompt rather than against the assembler's internals.
-    why_required: >
-      A table the model never sees changes nothing about how many turns the agent spends guessing.
-      The table and its delivery are one capability; only the second half is observable to the user.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.17.0-T09
-    acceptance_criteria:
-      - >
-        F12 — the detection reaches the model. A workspace run in a detected project carries the
-        ecosystem and its default commands in the assembled context, asserted against the recorded
-        prompt rather than against the assembler's internals.
-    files:
-      - src/context.rs
-      - src/run.rs
-      - tests/context.rs
-    evidence:
-      - >
-        F12 — tests/exec_tool.rs::a_detected_project_puts_its_ecosystem_and_commands_in_the_recorded_prompt.
-        A package.json beside a pnpm-lock.yaml puts "node", "package.json" and "test: pnpm test"
-        into the prompt the trace RECORDED, which is asserted rather than the assembler's internals.
-      - >
-        Negative control — an_undetected_project_says_nothing_about_its_toolchain. A directory the
-        table knows nothing about carries no "Project:" line at all, so the agent is never handed a
-        guess to act on.
-      - >
-        Surfaced every turn rather than only the first: an agent forty steps into a run has had the
-        first turn compacted out from under it by ContextBudget, and the build command is exactly
-        the fact it would then have to rediscover.
-  - id: US-IO-HARNESS-0.17.0-T11
-    summary: >
-      Add the nightly `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps` job
-      to CI, and prove it fails on a documentation error before trusting it.
-    why_required: >
-      It is the only thing that would have caught the defect 0.16.2 had to fix, and its absence is
-      recorded as a known limitation on that release. 0.16.0 and 0.16.1 have no docs.rs page
-      permanently, because published sources are immutable and nothing local could see the failure.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        OP1 — the nightly docs job runs `--cfg docsrs` on nightly and fails on a documentation error,
-        proven by a deliberate failure in a scratch branch before the job is trusted. Exit zero is not
-        the check; the rendered HTML must contain the feature labels.
-    files:
-      - .github/workflows/ci.yml
-    evidence:
-      - >
-        OP1 — the `docs.rs (nightly)` job in .github/workflows/ci.yml builds the way docs.rs builds
-        (nightly, --cfg docsrs, --all-features, --no-deps, RUSTDOCFLAGS -D warnings) and then greps
-        the RENDERED HTML for "Available on crate feature". Exit zero is deliberately not the check.
-      - >
-        Both halves proven to fail before the job was trusted, recorded in
-        .ultraship/evidence/0.17.0/docs-job-negative-control.txt against nightly 1.99.0
-        (09ee43b2d 2026-07-27). Control 1: the 0.16.0 defect restored verbatim —
-        feature(doc_auto_cfg) — fails the doc step with error[E0557], the docs.rs build log's own
-        error. Control 2: the gate removed entirely — cargo doc exits 0, renders no labels, and the
-        grep step fails the job. Positive control: the shipped tree renders labels on three pages.
-      - >
-        Proven in real CI, not only locally. GitHub Actions run 30415978901 on the scratch branch
-        feat/0.17.0-docs-job-control carries the deliberate failure: every other job succeeds and
-        `docs.rs (nightly)` fails. Run 30415977056 on feat/0.17.0 has the same workflow green on
-        all six jobs. The scratch branch is kept, not deleted.
-  - id: US-IO-HARNESS-0.17.0-T12
-    summary: >
-      Documentation: guide pages for command execution and language support, a worked example on
-      every new public item, `docs/public-api.txt` updated by hand, `CHANGELOG.md` migration notes,
-      and `docs/CONTRACT.md` amended in both directions.
-    why_required: >
-      `exec` is the widest capability the crate has ever granted, and the contract's own risk entry
-      says the residual risk is an operator who does not read the bound. Stating it is the mitigation.
-      The public-surface and changelog checkers are build failures, not conventions.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.17.0-T03
-      - US-IO-HARNESS-0.17.0-T04
-      - US-IO-HARNESS-0.17.0-T06
-      - US-IO-HARNESS-0.17.0-T07
-      - US-IO-HARNESS-0.17.0-T08
-    acceptance_criteria:
-      - >
-        OP2 — `docs/public-api.txt` is updated by hand and `tests/public_api.rs` passes against the live
-        surface. There is deliberately no regenerate flag.
-      - >
-        OP3 — `CHANGELOG.md` carries a migration note for each of the two breaks, with the old call on
-        one side and the new call on the other, and the changelog checker passes.
-      - >
-        OP4 — `docs/CONTRACT.md` states what `exec` does and does not bound: that a command runs with the
-        embedding program's privileges outside the sandbox, that the policy decides what may start and
-        not what a started process then does, and that the tool-shadowing defect is closed. The
-        limitations list is updated in both directions.
-    files:
-      - docs/guide/command-execution.md
-      - docs/guide/language-support.md
       - docs/public-api.txt
-      - docs/CONTRACT.md
+      - docs/guide
       - CHANGELOG.md
-      - README.md
-      - src/lib.rs
+      - docs/CONTRACT.md
     evidence:
-      - >
-        OP2 — docs/public-api.txt gained one line by hand, `const DEFAULT_EXEC_TIMEOUT
-        src/tools/exec.rs`, and tests/public_api.rs passes against the live surface, including the
-        check that every re-exported item carries a worked example. There is no regenerate flag.
-      - >
-        OP3 — CHANGELOG.md carries four marked breaks, each with a Migration note showing the old
-        call and the new one: the two Verification variants, RunOutcome::Finished, the new public
-        exec_timeout field, and the behaviour change where a tool named after a built-in now fails
-        validation instead of being silently unreachable. tests/changelog.rs passes.
-      - >
-        OP4 — docs/CONTRACT.md updated in BOTH directions. The tool-shadowing defect moved from an
-        open limitation to a recorded closed one rather than being deleted; the exec bound and the
-        toolchain table's fallibility were added as new limitations, in the same words already used
-        for a registered Tool and a stdio MCP server.
-      - >
-        Guide pages docs/guide/command-execution.md and docs/guide/language-support.md, both
-        carrying a "stated plainly" limits block and both registered in tests/guide_pages.rs,
-        docs/CAPABILITIES.md and the README's guide table — tests/guide_pages.rs asserts no page is
-        orphaned from the index.
-      - >
-        The repositioning landed in Cargo.toml's description, the README's opening and quickstart,
-        and the crate-root docs. tests/readme.rs and tests/docs_drift.rs pass. Both the stable and
-        the nightly --cfg docsrs doc builds are warning-free.
-      - >
-        Two overstatements the live run caught and corrected: the guide and CONTRACT.md claimed
-        both policy checks land in policy_events. A refusal and an approver's decision do; a silent
-        allow does not, for exec no more and no less than for a read or a write.
-  - id: US-IO-HARNESS-0.17.0-T13
+    - >
+      docs/guide/accounting.md (new, with its limits block and registered in tests/guide_pages.rs),
+        docs/guide/verification.md and language-support.md rewritten for the removal,
+        docs/CONTRACT.md amended with the provenance of every recorded figure, CHANGELOG.md with
+        five marked breaks each carrying a migration note, README.md and docs/CAPABILITIES.md
+        indexed, and the crate root's guide list.
+    - >
+      OP1 — docs/public-api.txt updated by hand with `ProviderCall`, `Edit` and `UNKNOWN_MODEL`;
+        tests/public_api.rs passes, including its rule that every re-exported item carries a worked
+        example.
+    - >
+      OP2 — tests/changelog.rs passes: every `**BREAKING` entry carries a `Migration:` note,
+        including the one that says plainly that a 0.16.2 consumer meets the removal with no
+        intervening warning.
+  - id: US-IO-HARNESS-0.18.0-T10
     summary: >
-      Hold the standing non-functional constraints: the default dependency tree, no new system
-      package, an untouched store, the full suite green on three platforms, and a clean clippy,
-      fmt and doc build.
+      Prove the release: the full suite on three operating systems, the lint and doc gates, the
+      dependency-tree constraint, and a live run against a real provider whose recorded numbers
+      reconcile with the vendor's own reported usage.
     why_required: >
-      Each of these is a promise a consumer already relies on. A release that adds a TOML parser,
-      bumps the checkpoint format, or leaves Windows red breaks something nobody asked to have
-      broken, and none of it is visible from the functional criteria.
+      The suite proves the mechanism against fixtures; only a live run proves the numbers are the
+      ones a vendor will bill, which is the release's stated evidence of value.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.17.0-T02
-      - US-IO-HARNESS-0.17.0-T05
-      - US-IO-HARNESS-0.17.0-T09
+    depends_on: [US-IO-HARNESS-0.18.0-T09]
     acceptance_criteria:
       - >
         NF1 — the default dependency tree does not grow. `cargo tree` on the default build stays at 401
-        lines. The toolchain table is shipped as Rust data or as JSON parsed by the `serde_json` already
-        in the tree, because adding a TOML parser here would break the standing constraint a release
-        early, and the configuration release is where that dependency belongs.
+        lines. The price table is Rust data or JSON parsed by the `serde_json` already in the tree; the
+        TOML dependency belongs to 0.19.0.
       - >
-        NF2 — no new system package on any CI runner. The suite runs on the toolchains GitHub's runners
-        already provide and skips, with a stated reason, any ecosystem check whose toolchain is absent,
-        rather than installing one.
-      - >
-        NF3 — the store is untouched. No table is added or altered, and `CHECKPOINT_FORMAT` stays 7, so
-        a 0.16.2 database opens and resumes against 0.17.0 unchanged.
-      - >
-        NF4 — the full suite passes on macOS, Linux, and Windows. `exec` has a Windows path and its
-        tests either run there or are skipped with a stated reason; the Windows leg's `timeout-minutes`
-        stays at the 40 set in 0.16.0.
+        NF4 — the full suite passes on macOS, Linux and Windows, with the Windows leg's `timeout-minutes`
+        unchanged at 40.
       - >
         NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` pass,
         and `cargo doc --all-features` is warning-free.
+      - >
+        OP5 — a live run against a real provider is performed by hand before the release is cut and its
+        trace kept as evidence. The suite proves the mechanism against fixtures; only a live run proves
+        the numbers reconcile with what a vendor actually reports.
     files:
-      - Cargo.toml
       - .github/workflows/ci.yml
+      - examples
     evidence:
-      - >
-        NF1 — `cargo tree | wc -l` on the default build is 401, unchanged. The toolchain table is
-        Rust data and the only new code depends on tokio::process and serde, both already in the
-        tree; no TOML parser was added.
-      - >
-        NF2 — no system package is installed by any job. F8 uses node and npm, preinstalled on all
-        three runner images, and skips with a stated reason where they are absent. F1-F5 use rustc,
-        which is present wherever cargo test runs. The nightly docs job installs a toolchain, not a
-        package.
-      - >
-        NF3 — no CREATE TABLE, no ALTER, and CHECKPOINT_FORMAT is still 7 (src/state.rs:74). The
-        one trace addition is a new `kind` VALUE in the existing sandbox_events table, which a
-        0.6.0-era store takes with no migration.
-      - >
-        NF4 — GitHub Actions run 30415977056 on feat/0.17.0: test (ubuntu-latest), test
-        (macos-latest) and test (windows-latest) all green, alongside msrv, lint and the new docs
-        job. The Windows leg's timeout-minutes is still the 40 set in 0.16.0. exec's Windows path
-        is the same tokio::process code; its timeout test spells the sleep as `ping -n` there.
-      - >
-        NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check`
-        both exit 0, and `cargo doc --all-features` is warning-free. 35 test suites pass, 0 fail.
-  - id: US-IO-HARNESS-0.17.0-T14
-    summary: >
-      Perform a live run against a real non-Rust project before the release is cut, and keep its
-      trace as evidence.
-    why_required: >
-      The suite proves the mechanism; only a live run proves the claim in
-      `outcome.evidence_of_value`. Every previous release of this crate that skipped a live run
-      shipped a defect only a live run would have found — 0.8.0's macro-shadowing bypass and
-      0.8.1's private-item regression were both found this way.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.17.0-T03
-      - US-IO-HARNESS-0.17.0-T04
-      - US-IO-HARNESS-0.17.0-T05
-      - US-IO-HARNESS-0.17.0-T10
-    acceptance_criteria:
-      - >
-        OP5 — a live run against a real non-Rust project is performed by hand before the release is cut,
-        and its trace is kept as evidence. The suite proves the mechanism; only a live run proves the
-        claim in `outcome.evidence_of_value`.
-    files:
-      - examples/exec_live.rs
-    evidence:
-      - >
-        OP5 — examples/exec_live.rs, with the full trace kept at
-        .ultraship/evidence/0.17.0/live-run-node-project.txt. A JavaScript package with one real
-        npm dependency and one real bug, a model told nothing about the toolchain, and the
-        project's own `npm test` as the gate.
-      - >
-        The run (openrouter, openai/gpt-5.6-luna, node v24.15.0, npm 11.12.1): explored with find,
-        read the three files, ran `npm install` through exec against the real registry, ran `npm
-        test` and got exit 1, re-read the file, then fixed it with a one-line edit_file replacement
-        — `let total = 1;` to `let total = 0;`. Success in 6 steps, 8,951 tokens. No Rust is on
-        that path anywhere, which is the claim in outcome.evidence_of_value.
-      - >
-        The gate is not gameable in this run: test.js is denied by the policy, and the example
-        asserts after the fact that the suite it was judged against is byte-identical to the one it
-        started with.
-      - >
-        The first attempt found a real defect in the shipped toolchain table — `npm ci` as the
-        install default, which fails without a lockfile — which is exactly what a live run is a
-        release criterion for. Fixed, and the re-run installs first try.
+    - >
+      NF1 — `cargo tree | wc -l` is 401 on the default build, the standing constraint, unchanged.
+        NF5 — fmt, both clippy invocations and `cargo doc --all-features` are clean.
+        evidence/0.18.0/build-and-lint.txt.
+    - >
+      OP5 — two live runs against OpenRouter, evidence/0.18.0/live-run-accounting.txt. The second,
+        against a warm vendor cache, recorded 4,913 cache-read tokens and derived 4,846 micro-units
+        for the work the cold run derived 18,606 for — the cache discount visible in money, from
+        figures the vendor reported.
+    - >
+      scope.excluded verified absent rather than assumed: no cost column, `max_total_cost` still
+        inert, no configuration parser, the context assembler and sandbox byte-identical to 0.17.0,
+        `record_run_policy` untouched, and no LSP/web/todo/question tool.
+        evidence/0.18.0/scope-check.txt.

@@ -8,7 +8,7 @@
 //! block index here — no vendor SDK.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::json;
 
@@ -182,6 +182,11 @@ impl Provider for Anthropic {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
+        // Time to first token is measured from here — before the socket is
+        // opened — because that is the wait a caller actually experiences. It
+        // therefore includes connection setup, which `CONTRACT.md` states rather
+        // than quietly excluding to produce a flattering number.
+        let sent = Instant::now();
         let resp = self
             .client
             .post(&self.endpoint)
@@ -192,7 +197,7 @@ impl Provider for Anthropic {
             .await?;
         let resp = super::ensure_success(resp).await?;
 
-        let mut acc = Accumulator::default();
+        let mut acc = Accumulator::since(sent);
         read_sse(resp, |data| {
             if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
                 if value.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
@@ -216,9 +221,41 @@ struct Accumulator {
     tool_calls: BTreeMap<u64, (String, String)>,
     input_tokens: u64,
     output_tokens: u64,
+    /// 0.18.0 — the cache breakdown of `input_tokens`, the model that answered,
+    /// why it stopped, and the provider-executed tool requests it made. All
+    /// carried on events the accumulator already reads and, until now, dropped.
+    cache_write_tokens: u64,
+    cache_read_tokens: u64,
+    server_tool_requests: u64,
+    model: Option<String>,
+    finish_reason: Option<String>,
+    /// When the request was sent, and the elapsed time at the first
+    /// content-bearing event. `None` in a unit test that feeds events directly:
+    /// nothing measured the wait, so the response reports no TTFT rather than
+    /// zero.
+    sent: Option<Instant>,
+    ttft_ms: Option<u64>,
 }
 
 impl Accumulator {
+    /// An accumulator that measures time to first token from `sent`.
+    fn since(sent: Instant) -> Self {
+        Self {
+            sent: Some(sent),
+            ..Default::default()
+        }
+    }
+
+    /// The first content-bearing event stops the TTFT clock. Later events do
+    /// not: `Option::get_or_insert_with` is what makes it first-token rather
+    /// than last-token.
+    fn mark_first_token(&mut self) {
+        if let Some(sent) = self.sent {
+            self.ttft_ms
+                .get_or_insert(sent.elapsed().as_millis() as u64);
+        }
+    }
+
     fn ingest(&mut self, value: &serde_json::Value) {
         let index = || value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
         match value.get("type").and_then(|t| t.as_str()) {
@@ -229,8 +266,17 @@ impl Accumulator {
                 {
                     self.input_tokens = n;
                 }
+                if let Some(m) = value
+                    .pointer("/message/model")
+                    .and_then(|v| v.as_str())
+                    .filter(|m| !m.is_empty())
+                {
+                    self.model = Some(m.to_string());
+                }
+                self.ingest_usage(value.pointer("/message/usage"));
             }
             Some("content_block_start") => {
+                self.mark_first_token();
                 if let Some(cb) = value.get("content_block") {
                     if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
                         let name = cb
@@ -243,6 +289,7 @@ impl Accumulator {
                 }
             }
             Some("content_block_delta") => {
+                self.mark_first_token();
                 let delta = value.get("delta");
                 match delta.and_then(|d| d.get("type")).and_then(|t| t.as_str()) {
                     Some("text_delta") => {
@@ -269,8 +316,40 @@ impl Accumulator {
                 {
                     self.output_tokens = n;
                 }
+                if let Some(r) = value
+                    .pointer("/delta/stop_reason")
+                    .and_then(|v| v.as_str())
+                    .filter(|r| !r.is_empty())
+                {
+                    self.finish_reason = Some(r.to_string());
+                }
+                self.ingest_usage(value.pointer("/usage"));
             }
             _ => {}
+        }
+    }
+
+    /// The counters Anthropic reports inside a `usage` object, wherever that
+    /// object arrives. Cache tokens land on `message_start`, the server-tool
+    /// count can land on either event, and a field that is absent leaves the
+    /// running value alone rather than resetting it to zero.
+    fn ingest_usage(&mut self, usage: Option<&serde_json::Value>) {
+        let Some(usage) = usage else { return };
+        let get = |k: &str| usage.get(k).and_then(|v| v.as_u64());
+        if let Some(n) = get("cache_creation_input_tokens") {
+            self.cache_write_tokens = n;
+        }
+        if let Some(n) = get("cache_read_input_tokens") {
+            self.cache_read_tokens = n;
+        }
+        // `server_tool_use` is an object of per-tool counters; their sum is the
+        // number of billed requests, and summing rather than naming one keeps a
+        // tool Anthropic adds later from being silently uncounted.
+        if let Some(counts) = usage.get("server_tool_use").and_then(|v| v.as_object()) {
+            let sum = counts.values().filter_map(|v| v.as_u64()).sum();
+            if sum > 0 {
+                self.server_tool_requests = sum;
+            }
         }
     }
 
@@ -287,7 +366,17 @@ impl Accumulator {
             })
             .collect();
 
-        let total = self.input_tokens + self.output_tokens;
+        // Anthropic's `input_tokens` EXCLUDES the cached ones — it reports the
+        // three counts side by side and every one of them is billed — where the
+        // OpenAI wire's `prompt_tokens` includes them. `Usage::prompt_tokens` is
+        // defined as the whole prompt, so the vendors are reconciled here, at the
+        // wire boundary, rather than leaving every reader of the trace to know
+        // which vendor it came from. Before 0.18.0 the cached tokens were dropped
+        // entirely, so a cache-heavy run under-reported its prompt.
+        let prompt = self.input_tokens + self.cache_read_tokens + self.cache_write_tokens;
+        // Anthropic reports no total, so this one is summed rather than taken as
+        // reported.
+        let total = prompt + self.output_tokens;
         CompletionResponse {
             text: if self.text.is_empty() {
                 None
@@ -296,10 +385,20 @@ impl Accumulator {
             },
             tool_calls,
             usage: (total > 0).then_some(Usage {
-                prompt_tokens: self.input_tokens,
+                prompt_tokens: prompt,
                 completion_tokens: self.output_tokens,
                 total_tokens: total,
+                cache_read_tokens: self.cache_read_tokens,
+                cache_write_tokens: self.cache_write_tokens,
+                // Anthropic bills extended thinking inside `output_tokens` and
+                // reports no separate figure, so this stays zero rather than
+                // being guessed at from the text.
+                reasoning_tokens: 0,
+                server_tool_requests: self.server_tool_requests,
             }),
+            model: self.model,
+            finish_reason: self.finish_reason,
+            ttft_ms: self.ttft_ms,
         }
     }
 }
@@ -352,6 +451,75 @@ mod tests {
         assert_eq!(u.prompt_tokens, 11);
         assert_eq!(u.completion_tokens, 7);
         assert_eq!(u.total_tokens, 18);
+    }
+
+    /// F3, F6, F7 — the counters Anthropic already sends and 0.17.0 dropped.
+    #[test]
+    fn cache_tokens_the_model_reports_reach_usage_with_the_model_and_stop_reason() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"message_start","message":{
+            "model":"claude-sonnet-4-5",
+            "usage":{"input_tokens":11,"cache_creation_input_tokens":300,
+                     "cache_read_input_tokens":1_200}}}));
+        acc.ingest(
+            &json!({"type":"message_delta","delta":{"stop_reason":"max_tokens"},
+            "usage":{"output_tokens":7,"server_tool_use":{"web_search_requests":2}}}),
+        );
+
+        let out = acc.finish();
+        let u = out.usage.unwrap();
+        assert_eq!(u.cache_write_tokens, 300);
+        assert_eq!(u.cache_read_tokens, 1_200);
+        assert_eq!(u.server_tool_requests, 2);
+        // Anthropic reports `input_tokens` EXCLUDING the cached ones, so the
+        // prompt is the three added together — all three are billed, and a
+        // reader of the trace should not have to know which vendor wrote it.
+        assert_eq!(u.prompt_tokens, 11 + 300 + 1_200);
+        assert_eq!(u.total_tokens, 11 + 300 + 1_200 + 7);
+        // Extended thinking is billed inside `output_tokens` and reported
+        // nowhere separately, so this stays zero rather than being guessed at.
+        assert_eq!(u.reasoning_tokens, 0);
+        assert_eq!(out.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(out.finish_reason.as_deref(), Some("max_tokens"));
+    }
+
+    /// The negative control for the test above: a stream reporting none of it
+    /// yields zeros and `None`s, not an error and not a fabricated figure. This
+    /// is also every pre-cache request, so it is the common case.
+    #[test]
+    fn a_stream_that_reports_no_cache_or_stop_reason_yields_zeros_and_nones() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"message_start","message":{"usage":{"input_tokens":11}}}));
+        acc.ingest(&json!({"type":"message_delta","usage":{"output_tokens":7}}));
+
+        let out = acc.finish();
+        let u = out.usage.unwrap();
+        assert_eq!((u.cache_read_tokens, u.cache_write_tokens), (0, 0));
+        assert_eq!(u.server_tool_requests, 0);
+        assert_eq!(u.prompt_tokens, 11);
+        assert_eq!(u.total_tokens, 18);
+        assert_eq!(out.model, None);
+        assert_eq!(out.finish_reason, None);
+        // Nothing measured the stream, so TTFT is unknown rather than instant.
+        assert_eq!(out.ttft_ms, None);
+    }
+
+    /// F5, at the point of measurement: the clock stops on the FIRST
+    /// content-bearing event and not on a later one.
+    #[test]
+    fn the_ttft_clock_stops_at_the_first_content_event() {
+        let mut acc = Accumulator::since(Instant::now() - Duration::from_millis(40));
+        acc.ingest(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"a"}}));
+        let first = acc.ttft_ms.expect("measured");
+        std::thread::sleep(Duration::from_millis(15));
+        acc.ingest(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"b"}}));
+        assert_eq!(acc.ttft_ms, Some(first), "a later chunk moved the clock");
+        assert!(
+            first >= 40,
+            "the clock runs from the request, got {first}ms"
+        );
     }
 
     #[test]

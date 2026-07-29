@@ -1,0 +1,25 @@
+outcome: Success { steps: 3 }
+
+3 provider call(s):
+  step 1 attempt 0 — model Some("openai/gpt-5.6-luna")
+    prompt 1057 (cache read 1054, write 0), completion 61 (reasoning 39), total 1118
+    latency 3968ms, ttft Some(2850), finish Some("tool_calls"), failure None
+  step 2 attempt 0 — model Some("openai/gpt-5.6-luna")
+    prompt 1067 (cache read 1064, write 0), completion 115 (reasoning 42), total 1182
+    latency 3104ms, ttft Some(2164), finish Some("tool_calls"), failure None
+  step 3 attempt 0 — model Some("openai/gpt-5.6-luna")
+    prompt 2798 (cache read 2795, write 0), completion 47 (reasoning 21), total 2845
+    latency 2233ms, ttft Some(1942), finish Some("tool_calls"), failure None
+
+model recorded on every call: true (configured "openai/gpt-5.6-luna")
+every measured ttft is inside its own call's latency
+cache-read tokens across the run: 4913
+
+1 edit(s):
+  step 3 write_file NOTES.md (+1 -0)
+
+cost at $3/M input: 4846 micro-units
+cost at $6/M input: 9691 micro-units
+the trace did not change between those two answers — no cost is stored
+
+by model: openai/gpt-5.6-luna — 3 call(s), 5145 tokens, 4846 micro-units, 0 unpriced
