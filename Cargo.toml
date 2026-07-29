@@ -66,7 +66,7 @@ regex = "1"
 # `display` half of the crate is not compiled. This is the first dependency
 # added to the default build since 0.1.0, and the `cargo tree` constraint moved
 # from 401 lines to accommodate it rather than the other way round.
-toml = { version = "0.8", default-features = false, features = ["parse"] }
+toml = { version = "1.1", default-features = false, features = ["parse", "serde"] }
 # MCP client only — no server mode, no macros. Stdio servers over the child-process
 # transport, remote servers over streamable HTTP with our own (no-redirect) Client.
 # Documents (0.14.0), all optional and all behind the `documents` feature. The
