@@ -12,13 +12,6 @@
 //! Nothing about the interrupted run is lost: the trace, the token spend, and the
 //! resume point all live in the on-disk rusqlite store, not in the process.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use io_harness::{resume, run, RunStatus, Store, TaskContract, Verification};
 
 #[tokio::main]
@@ -29,7 +22,19 @@ async fn main() -> io_harness::Result<()> {
     let file = dir.path().join("hello.rs");
 
     let goal = "Write a Rust file with a public function `hello` returning the u32 42.";
-    let verify = Verification::CompilesRust;
+    let verify = Verification::Command {
+        // 0.18.0: the Rust-specific criteria are gone. A compiler is invoked by
+        // argv, in the edited file's own directory, like any other language's.
+        argv: vec![
+            "rustc".into(),
+            "--edition".into(),
+            "2021".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            "hello.rs".into(),
+        ],
+        expect_exit: 0,
+    };
 
     // First process: a tight step budget stands in for a crash partway through.
     let run_id = {

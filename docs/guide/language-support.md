@@ -131,13 +131,13 @@ way a `Success` may be shipped.
 
 ## Migrating off the Rust-specific criteria
 
-`CompilesRust`, `RustTestPasses` and `WorkspaceTestPasses` are deprecated in
-0.17.0 and **removed in 0.18.0**. Each one becomes a `Command`:
+`CompilesRust`, `RustTestPasses` and `WorkspaceTestPasses` were deprecated in
+0.17.0 and are **removed as of 0.18.0**. Each one becomes a `Command`:
 
 ```rust
 use io_harness::Verification;
 
-// Before (0.16.2, deprecated in 0.17.0, gone in 0.18.0):
+// Before (0.16.2, deprecated in 0.17.0, gone as of 0.18.0):
 //     Verification::CompilesRust
 // After:
 let compiles = Verification::Command {
@@ -156,14 +156,19 @@ let tested = Verification::Command {
 # let _ = (compiles, tested);
 ```
 
-The behaviours are not identical, and the difference is worth knowing before you
-move. The old variants compile the named files in a throwaway directory with your
-`test_src` appended as a module, so they reach *private* items and need no cargo
-project. `cargo test` runs the project's real suite, which is stronger in every
-way that matters and cannot check a criterion the project does not contain. If
-you were using `test_src` to assert something the repository does not test, write
-that test into the repository — which is where a caller reading the deprecation
-warning should end up anyway.
+The behaviours are not identical, and the difference is worth knowing as you
+move. The old variants compiled the named files in a throwaway directory with your
+`test_src` appended as a module, so they reached *private* items and needed no
+cargo project. `cargo test` runs the project's real suite, which is stronger in
+every way that matters and cannot check a criterion the project does not contain.
+If you were using `test_src` to assert something the repository does not test,
+write that test into the repository — which is where a caller reading the
+deprecation warning should have ended up anyway.
+
+**If you upgraded straight from 0.16.2 you never saw the warning.** The
+deprecation lived for one minor release, which is the shortest cycle this crate's
+contract allows, and a reader who upgrades one minor at a time is not the only
+reader. The table above is the whole migration.
 
 `EachCompilesRust` is **not** deprecated: it has no `Command` equivalent, since
 "each of these files compiles on its own" is not something a project's own

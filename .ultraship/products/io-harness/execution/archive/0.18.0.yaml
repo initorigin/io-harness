@@ -1,0 +1,57 @@
+product: io-harness
+version: 0.18.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: >
+    The owner's standing direction, restated at the start of this release: work to the stated
+    completion criteria without pausing for approval on PRs, merges, the GitHub Release or `cargo
+    publish` — all pre-authorised. A failing check is not to be re-attempted more than twice without
+    new information, and a criterion that turns out to be wrong about the codebase is recorded
+    through `/ultraship:iterate` with evidence rather than reworded to match what was built.
+  budget: null
+  capacity: >
+    The fallback is pre-decided rather than discovered under pressure: if the release does not fit,
+    the `edits` table and the server-tool request counters drop out and the rest ships, which is the
+    contract's own `fallback_scope`. These are the owner's own statements of how the session is to
+    be run, not anything measured here.
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The recorded time constraint above is the governing one, and it is what makes this `probable`
+      rather than `high`: the release is to be carried to a published crate in one pass, so the
+      measure is whether each piece can be built and proven without a round trip for approval. Every
+      design decision this release needs was closed in its contract, and the two open questions are
+      both decidable from the code rather than from the owner.
+    - >
+      The write path already exists and is one function. `complete_with_retry` in `src/run.rs` owns
+      the retry loop, so every provider attempt — including the one a `Fallback` served from its
+      secondary — passes through a single place that can time it and insert a row. Nothing has to be
+      threaded through the `Provider` trait to make per-attempt recording possible.
+    - >
+      The store migrates by additive idempotent DDL with no version table to fight, which is how the
+      last eight releases added tables. `provider_calls` and `edits` are `CREATE TABLE IF NOT
+      EXISTS` in `Store::from_conn` and nothing else changes, so NF2's both-directions assertion is
+      a test rather than a design problem.
+    - >
+      The facts being recorded are already on the wire and are being discarded. Anthropic's
+      accumulator already reads `/message/usage/input_tokens` and `/usage/output_tokens` from the
+      same events that carry `cache_creation_input_tokens`, `cache_read_input_tokens` and
+      `stop_reason`; the OpenAI wire already asks for `stream_options.include_usage` and parses the
+      usage object that carries `prompt_tokens_details` and `completion_tokens_details`. Both are
+      parsed in an `Accumulator` that already has unit tests over fixture events.
+  major_cost_drivers:
+    - >
+      Fixed-point money arithmetic across five price dimensions, which is the part that must be
+      exactly right rather than approximately right, and whose test is a hand-computed figure.
+    - >
+      Removing three `Verification` variants touches every test, example and doc comment that named
+      them, and the 0.17.0 tests for those variants are the specification for what must still pass
+      once they are expressed over `Command`.
+    - >
+      Three wire formats reporting the same facts under different names, on different stream events,
+      with TTFT having to be measured where the stream is consumed and left null where it was not.
+  recommended_scope_change: null

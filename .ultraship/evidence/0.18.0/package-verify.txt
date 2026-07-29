@@ -1,0 +1,6 @@
+   Packaging io-harness v0.18.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+    Updating crates.io index
+    Packaged 130 files, 2.3MiB (633.6KiB compressed)
+   Verifying io-harness v0.18.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+   Compiling io-harness v0.18.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness/target/package/io-harness-0.18.0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.88s

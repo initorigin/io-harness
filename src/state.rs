@@ -11,6 +11,38 @@ use rusqlite::Connection;
 use crate::context::{ObsKind, Observation};
 use crate::error::{Error, Result};
 use crate::policy::Policy;
+use crate::pricing::{PriceTable, Spend};
+use crate::provider::Usage;
+
+/// The group a call with no recorded model falls into. Named rather than
+/// silently merged into a neighbour, and counted as unpriced.
+///
+/// ```
+/// use io_harness::pricing::PriceTable;
+/// use io_harness::{ProviderCall, Store, Usage, UNKNOWN_MODEL};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("goal", "NOTES.md")?;
+/// // A custom provider that reports no model — a test double, or a wire that
+/// // omits it. The tokens are real and are summed; the money is not knowable.
+/// store.record_provider_call(run_id, &ProviderCall {
+///     step: 1,
+///     provider: "scripted".into(),
+///     usage: Some(Usage { total_tokens: 12, ..Default::default() }),
+///     ..Default::default()
+/// })?;
+///
+/// let spend = store.spend_by_model(&PriceTable::new("2026-07-29"))?;
+/// assert_eq!(spend[0].key, UNKNOWN_MODEL);
+/// assert_eq!(spend[0].usage.total_tokens, 12);
+/// // Counted as unpriced rather than as free, which is the distinction the
+/// // whole accounting release rests on.
+/// assert_eq!((spend[0].cost_micros, spend[0].unpriced_calls), (0, 1));
+/// # Ok(())
+/// # }
+/// ```
+pub const UNKNOWN_MODEL: &str = "(unknown model)";
 
 /// An observation kind as it is stored: the serde rendering, not
 /// [`ObsKind::label`], which is English for a prompt reader and renders `Write`
@@ -1300,6 +1332,175 @@ impl ContextEvent {
     }
 }
 
+/// One call to a provider: what it cost, which model served it, and how long it
+/// took (0.18.0).
+///
+/// **Per call, not per step.** A step that failed twice and then answered is
+/// three of these, and the two that failed are kept because a model that
+/// produced tokens before erroring was still billed for them. `steps.tokens`
+/// holds one integer per step and cannot express any of that.
+///
+/// ```
+/// use io_harness::{ProviderCall, Store, Usage};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("summarise the repo", "NOTES.md")?;
+/// // The first attempt died after the model had already produced tokens...
+/// store.record_provider_call(run_id, &ProviderCall {
+///     step: 1,
+///     attempt: 0,
+///     provider: "anthropic".into(),
+///     model: Some("claude-sonnet-4".into()),
+///     usage: Some(Usage { prompt_tokens: 900, completion_tokens: 20, total_tokens: 920,
+///                         ..Default::default() }),
+///     latency_ms: 4_100,
+///     failure: Some("Server (HTTP 529)".into()),
+///     ..Default::default()
+/// })?;
+/// // ...and the retry answered.
+/// store.record_provider_call(run_id, &ProviderCall {
+///     step: 1,
+///     attempt: 1,
+///     provider: "anthropic".into(),
+///     model: Some("claude-sonnet-4".into()),
+///     usage: Some(Usage { prompt_tokens: 900, completion_tokens: 310, total_tokens: 1_210,
+///                         cache_read_tokens: 850, ..Default::default() }),
+///     latency_ms: 2_300,
+///     ttft_ms: Some(420),
+///     finish_reason: Some("end_turn".into()),
+///     ..Default::default()
+/// })?;
+///
+/// let calls = store.provider_calls(run_id)?;
+/// assert_eq!(calls.len(), 2);
+///
+/// // What the step actually cost is the sum over its calls — including the one
+/// // that failed, which a trace keeping only the winner would have hidden.
+/// let billed: u64 = calls.iter().filter_map(|c| c.usage).map(|u| u.total_tokens).sum();
+/// assert_eq!(billed, 2_130);
+/// assert_eq!(calls[0].failure.as_deref(), Some("Server (HTTP 529)"));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderCall {
+    /// The step this call was made for.
+    pub step: u32,
+    /// Which attempt at that step this was, counting from 0.
+    pub attempt: u32,
+    /// The provider that was asked, by [`Provider::name`](crate::Provider::name).
+    /// For a [`Fallback`](crate::provider::Fallback) this is the combined label;
+    /// [`ProviderCall::model`] is what identifies who actually answered.
+    pub provider: String,
+    /// The model that served the call, as the provider named it. `None` when it
+    /// did not say — a custom provider, or a wire that omits it.
+    pub model: Option<String>,
+    /// Tokens, as reported. `None` when the provider reported none, which is not
+    /// the same fact as zero.
+    pub usage: Option<Usage>,
+    /// Milliseconds the whole call took, measured by the harness around
+    /// [`Provider::complete`](crate::Provider::complete) — so it includes the
+    /// crate's own request building and stream consumption, not only the
+    /// provider's part.
+    pub latency_ms: u64,
+    /// Milliseconds to the first content-bearing chunk, where the path streamed
+    /// and measured it. `None`, never zero, when nothing measured it.
+    pub ttft_ms: Option<u64>,
+    /// The provider's own word for why the model stopped, verbatim.
+    pub finish_reason: Option<String>,
+    /// `None` when the call answered; the failure's short name when it did not.
+    pub failure: Option<String>,
+}
+
+/// One file change a run made, and how many lines it added and removed
+/// (0.18.0).
+///
+/// The counts come from comparing the file's lines before and after, trimming
+/// the common head and tail — not from a minimal diff. A one-line replacement is
+/// therefore one added and one removed, and a rewrite of the middle of a file is
+/// the size of that middle. It answers "how much did this run change" without
+/// the crate carrying a diff algorithm it has no other use for.
+///
+/// ```
+/// use io_harness::{Edit, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// # let store = Store::memory()?;
+/// # let run_id = store.start_run("tidy the notes", "NOTES.md")?;
+/// // A run writes rows like this itself; recorded by hand here so the example
+/// // needs no model.
+/// store.record_edit(run_id, &Edit::measure(
+///     2,
+///     "edit_file",
+///     "src/parse.rs",
+///     "fn parse() {}\nfn other() {}\n",
+///     "fn parse(s: &str) {}\nfn other() {}\n",
+/// ))?;
+///
+/// let edits = store.edits(run_id)?;
+/// assert_eq!(edits[0].path, "src/parse.rs");
+/// // One line out, one line in — the untouched line is not counted as either.
+/// assert_eq!((edits[0].lines_added, edits[0].lines_removed), (1, 1));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Edit {
+    /// The step that made the change.
+    pub step: u32,
+    /// The tool that made it — `write_file` or `edit_file`.
+    pub tool: String,
+    /// The path, as the agent named it (relative to the workspace root).
+    pub path: String,
+    /// Lines present after and not before.
+    pub lines_added: u64,
+    /// Lines present before and not after.
+    pub lines_removed: u64,
+}
+
+impl Edit {
+    /// The change `new` makes to `old`, by common head and tail comparison.
+    ///
+    /// ```
+    /// use io_harness::Edit;
+    ///
+    /// // A one-line replacement inside a file: one line out, one line in.
+    /// let edit = Edit::measure(1, "edit_file", "a.rs", "fn one() {}\nfn two() {}\n",
+    ///                                                 "fn one() {}\nfn three() {}\n");
+    /// assert_eq!((edit.lines_added, edit.lines_removed), (1, 1));
+    ///
+    /// // A new file is all addition; rewriting a file with what it already held
+    /// // is neither, which is the fact a byte-count would have missed.
+    /// assert_eq!(Edit::measure(1, "write_file", "b.rs", "", "one\ntwo\n").lines_added, 2);
+    /// let same = Edit::measure(1, "write_file", "b.rs", "one\ntwo\n", "one\ntwo\n");
+    /// assert_eq!((same.lines_added, same.lines_removed), (0, 0));
+    /// ```
+    pub fn measure(step: u32, tool: &str, path: &str, old: &str, new: &str) -> Self {
+        let old: Vec<&str> = old.lines().collect();
+        let new: Vec<&str> = new.lines().collect();
+        let head = old
+            .iter()
+            .zip(&new)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(old.len().min(new.len()));
+        let tail = old[head..]
+            .iter()
+            .rev()
+            .zip(new[head..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        Self {
+            step,
+            tool: tool.to_string(),
+            path: path.to_string(),
+            lines_added: (new.len() - head - tail) as u64,
+            lines_removed: (old.len() - head - tail) as u64,
+        }
+    }
+}
+
 /// How long a contended statement waits for the writer before giving up, set on
 /// every store opened from a file. Without it rusqlite's default is to fail
 /// immediately with `SQLITE_BUSY`, which turns a moment of contention into an
@@ -1634,6 +1835,62 @@ impl Store {
              );",
         )?;
 
+        // 0.18.0: accounting. One row per provider call and one per file change.
+        //
+        // `provider_calls` is per CALL, not per step, which is the whole point:
+        // `steps.tokens` holds one integer for a step, so a step that retried
+        // twice and then fell over to a second vendor collapsed into a single
+        // number attributed to nothing. A row per attempt keeps what was actually
+        // paid for — including the attempts that failed after the model had
+        // already produced tokens.
+        //
+        // No cost column, deliberately. Money is derived at query time from a
+        // price table the operator owns ([`crate::pricing`]), because a stored
+        // dollar figure is wrong the moment a price changes or was entered wrong,
+        // and cannot then be repaired without rewriting history.
+        //
+        // `at` comes from SQLite's clock, like `runs.started_at`, so the day a
+        // call is grouped into and the run's elapsed time come from one clock
+        // rather than two that can disagree.
+        //
+        // New tables only, so a 0.17.0 database gains them and a 0.17.0 binary,
+        // which never queries them, still opens and resumes a migrated database.
+        // Deliberately NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout
+        // changed, and bumping it would make [`Store::check_resumable`] refuse
+        // every 0.17.0 store for two additive tables.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS provider_calls (
+                 id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id               INTEGER NOT NULL,
+                 step                 INTEGER NOT NULL,
+                 attempt              INTEGER NOT NULL,
+                 provider             TEXT NOT NULL,
+                 model                TEXT,
+                 prompt_tokens        INTEGER,
+                 completion_tokens    INTEGER,
+                 total_tokens         INTEGER,
+                 cache_read_tokens    INTEGER,
+                 cache_write_tokens   INTEGER,
+                 reasoning_tokens     INTEGER,
+                 server_tool_requests INTEGER,
+                 latency_ms           INTEGER NOT NULL,
+                 ttft_ms              INTEGER,
+                 finish_reason        TEXT,
+                 failure              TEXT,
+                 at                   TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE TABLE IF NOT EXISTS edits (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id        INTEGER NOT NULL,
+                 step          INTEGER NOT NULL,
+                 tool          TEXT NOT NULL,
+                 path          TEXT NOT NULL,
+                 lines_added   INTEGER NOT NULL,
+                 lines_removed INTEGER NOT NULL,
+                 at            TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -1895,6 +2152,231 @@ impl Store {
                 detail: r.get(2)?,
                 est_tokens: r.get::<_, Option<i64>>(3)?.map(|n| n as u64),
                 reported_tokens: r.get::<_, Option<i64>>(4)?.map(|n| n as u64),
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record one call to a provider (0.18.0).
+    ///
+    /// Called once per attempt, by the run loop, for a call that answered and
+    /// for one that failed alike. See [`ProviderCall`] for why the failures are
+    /// kept.
+    pub fn record_provider_call(&self, run_id: i64, call: &ProviderCall) -> Result<()> {
+        let u = call.usage;
+        self.conn.execute(
+            "INSERT INTO provider_calls
+                 (run_id, step, attempt, provider, model, prompt_tokens, completion_tokens,
+                  total_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                  server_tool_requests, latency_ms, ttft_ms, finish_reason, failure)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            rusqlite::params![
+                run_id,
+                call.step,
+                call.attempt,
+                &call.provider,
+                &call.model,
+                u.map(|u| u.prompt_tokens),
+                u.map(|u| u.completion_tokens),
+                u.map(|u| u.total_tokens),
+                u.map(|u| u.cache_read_tokens),
+                u.map(|u| u.cache_write_tokens),
+                u.map(|u| u.reasoning_tokens),
+                u.map(|u| u.server_tool_requests),
+                call.latency_ms,
+                call.ttft_ms,
+                &call.finish_reason,
+                &call.failure,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Every provider call recorded for a run, in the order they were made.
+    ///
+    /// A run that predates 0.18.0 has no rows, and this returns an empty vector
+    /// rather than zeros — an unrecorded run and a free one are different facts.
+    pub fn provider_calls(&self, run_id: i64) -> Result<Vec<ProviderCall>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT step, attempt, provider, model, prompt_tokens, completion_tokens,
+                    total_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    server_tool_requests, latency_ms, ttft_ms, finish_reason, failure
+             FROM provider_calls WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            // `total_tokens` decides whether the provider reported anything at
+            // all: a NULL there is the `None` the caller stored, and reading it
+            // back as a zeroed `Usage` would turn "unknown" into "free".
+            let total: Option<u64> = r.get(6)?;
+            Ok(ProviderCall {
+                step: r.get(0)?,
+                attempt: r.get(1)?,
+                provider: r.get(2)?,
+                model: r.get(3)?,
+                usage: match total {
+                    Some(total_tokens) => Some(Usage {
+                        prompt_tokens: r.get::<_, Option<u64>>(4)?.unwrap_or(0),
+                        completion_tokens: r.get::<_, Option<u64>>(5)?.unwrap_or(0),
+                        total_tokens,
+                        cache_read_tokens: r.get::<_, Option<u64>>(7)?.unwrap_or(0),
+                        cache_write_tokens: r.get::<_, Option<u64>>(8)?.unwrap_or(0),
+                        reasoning_tokens: r.get::<_, Option<u64>>(9)?.unwrap_or(0),
+                        server_tool_requests: r.get::<_, Option<u64>>(10)?.unwrap_or(0),
+                    }),
+                    None => None,
+                },
+                latency_ms: r.get(11)?,
+                ttft_ms: r.get(12)?,
+                finish_reason: r.get(13)?,
+                failure: r.get(14)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every provider call in the store, with the run and the day it belongs to.
+    ///
+    /// The grouped views are built from this one read: pricing is arithmetic the
+    /// database cannot do, so the rows come back and the grouping happens in
+    /// Rust rather than in half-SQL that would still need a second pass.
+    fn all_provider_calls(&self) -> Result<Vec<(i64, String, ProviderCall)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, date(at), step, attempt, provider, model, prompt_tokens,
+                    completion_tokens, total_tokens, cache_read_tokens, cache_write_tokens,
+                    reasoning_tokens, server_tool_requests, latency_ms, ttft_ms, finish_reason,
+                    failure
+             FROM provider_calls ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            let total: Option<u64> = r.get(8)?;
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                ProviderCall {
+                    step: r.get(2)?,
+                    attempt: r.get(3)?,
+                    provider: r.get(4)?,
+                    model: r.get(5)?,
+                    usage: match total {
+                        Some(total_tokens) => Some(Usage {
+                            prompt_tokens: r.get::<_, Option<u64>>(6)?.unwrap_or(0),
+                            completion_tokens: r.get::<_, Option<u64>>(7)?.unwrap_or(0),
+                            total_tokens,
+                            cache_read_tokens: r.get::<_, Option<u64>>(9)?.unwrap_or(0),
+                            cache_write_tokens: r.get::<_, Option<u64>>(10)?.unwrap_or(0),
+                            reasoning_tokens: r.get::<_, Option<u64>>(11)?.unwrap_or(0),
+                            server_tool_requests: r.get::<_, Option<u64>>(12)?.unwrap_or(0),
+                        }),
+                        None => None,
+                    },
+                    latency_ms: r.get(13)?,
+                    ttft_ms: r.get(14)?,
+                    finish_reason: r.get(15)?,
+                    failure: r.get(16)?,
+                },
+            ))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Spend grouped by the model that served each call, priced by `prices`
+    /// (0.18.0).
+    ///
+    /// Calls whose provider named no model group under `"(unknown model)"` and
+    /// are counted in [`Spend::unpriced_calls`], because attributing them to
+    /// anything else would be a guess.
+    ///
+    /// ```
+    /// use io_harness::pricing::{Price, PriceTable};
+    /// use io_harness::{ProviderCall, Store, Usage};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// # let store = Store::memory()?;
+    /// # let run_id = store.start_run("goal", "NOTES.md")?;
+    /// # store.record_provider_call(run_id, &ProviderCall {
+    /// #     step: 1, provider: "anthropic".into(), model: Some("m".into()),
+    /// #     usage: Some(Usage { prompt_tokens: 1_000_000, total_tokens: 1_000_000,
+    /// #                         ..Default::default() }), ..Default::default() })?;
+    /// let cheap = PriceTable::new("2026-07-29").with("m", Price { input: 1_000_000, ..Price::ZERO });
+    /// let dear = PriceTable::new("2026-07-29").with("m", Price { input: 2_000_000, ..Price::ZERO });
+    ///
+    /// // The same unchanged trace, two price tables, two answers — which is what
+    /// // "correcting a price repairs the whole history" means in practice.
+    /// assert_eq!(store.spend_by_model(&cheap)?[0].cost_micros, 1_000_000);
+    /// assert_eq!(store.spend_by_model(&dear)?[0].cost_micros, 2_000_000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn spend_by_model(&self, prices: &PriceTable) -> Result<Vec<Spend>> {
+        self.grouped(prices, |_, _, call| {
+            call.model.clone().unwrap_or_else(|| UNKNOWN_MODEL.into())
+        })
+    }
+
+    /// Spend grouped by day (`YYYY-MM-DD`, UTC, from the database clock), priced
+    /// by `prices` (0.18.0).
+    pub fn spend_by_day(&self, prices: &PriceTable) -> Result<Vec<Spend>> {
+        self.grouped(prices, |_, day, _| day.to_string())
+    }
+
+    /// Spend grouped by run id, priced by `prices` (0.18.0).
+    pub fn spend_by_run(&self, prices: &PriceTable) -> Result<Vec<Spend>> {
+        self.grouped(prices, |run_id, _, _| run_id.to_string())
+    }
+
+    /// The shared body of the three groupings: read once, key by `key`, sum and
+    /// price each group. Rows come back ordered by key, which is the only
+    /// ordering promised.
+    fn grouped(
+        &self,
+        prices: &PriceTable,
+        key: impl Fn(i64, &str, &ProviderCall) -> String,
+    ) -> Result<Vec<Spend>> {
+        let calls = self.all_provider_calls()?;
+        let mut groups: std::collections::BTreeMap<String, Vec<&ProviderCall>> =
+            std::collections::BTreeMap::new();
+        for (run_id, day, call) in &calls {
+            groups
+                .entry(key(*run_id, day, call))
+                .or_default()
+                .push(call);
+        }
+        Ok(groups
+            .into_iter()
+            .map(|(k, calls)| crate::pricing::group(k, &calls, prices))
+            .collect())
+    }
+
+    /// Record one file change and its line counts (0.18.0).
+    pub fn record_edit(&self, run_id: i64, edit: &Edit) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO edits (run_id, step, tool, path, lines_added, lines_removed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            (
+                run_id,
+                edit.step,
+                &edit.tool,
+                &edit.path,
+                edit.lines_added,
+                edit.lines_removed,
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Every file change recorded for a run, in the order they were made.
+    pub fn edits(&self, run_id: i64) -> Result<Vec<Edit>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT step, tool, path, lines_added, lines_removed
+             FROM edits WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(Edit {
+                step: r.get(0)?,
+                tool: r.get(1)?,
+                path: r.get(2)?,
+                lines_added: r.get(3)?,
+                lines_removed: r.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)

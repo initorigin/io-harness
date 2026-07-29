@@ -7,11 +7,14 @@
 //! string `fn hello`, which does not compile (see
 //! `.ultraship/.../iterations/US-IO-HARNESS-0.2.0-I01`).
 //!
-//! v0.2 adds execution-based checks ([`Verification::CompilesRust`],
-//! [`Verification::RustTestPasses`]) that compile — and optionally test — the
+//! v0.2 added execution-based checks that compile — and optionally test — the
 //! produced file with `rustc`. A substring stub fails to compile, so it fails
 //! the gate. Compilation happens in a throwaway temp dir that is removed
-//! afterwards, and `rustc` touches no network.
+//! afterwards, and `rustc` touches no network. 0.17.0 generalised that idea into
+//! [`Verification::Command`], which runs any project's own command; 0.18.0
+//! removed the three Rust-specific variants it replaced, leaving
+//! [`Verification::EachCompilesRust`] as the one gate that still spawns `rustc`
+//! itself.
 //!
 //! v0.8.1 closes the converse hole. Until then the file under verification and
 //! the caller's criterion were compiled as one crate, so the *subject could
@@ -45,11 +48,11 @@ use crate::state::{PolicyEvent, SandboxEvent, Store};
 /// execution gate can be. A criterion checks what it checks: a gate asserting
 /// `hello() == 42` is silent about everything else the file does.
 ///
-/// The execution gates ([`Verification::CompilesRust`],
-/// [`Verification::RustTestPasses`], and the workspace variants) are stronger
-/// than the content gates ([`Verification::FileContains`],
-/// [`Verification::FileEquals`]) because a stub cannot compile and run — that is
-/// why 0.2.0 introduced them — but "stronger" is not "sufficient".
+/// The execution gates ([`Verification::Command`] and
+/// [`Verification::EachCompilesRust`]) are stronger than the content gates
+/// ([`Verification::FileContains`], [`Verification::FileEquals`]) because a stub
+/// cannot compile and run — that is why 0.2.0 introduced them — but "stronger"
+/// is not "sufficient".
 ///
 /// # What 0.8.1 changed
 ///
@@ -97,23 +100,17 @@ use crate::state::{PolicyEvent, SandboxEvent, Store};
 /// use io_harness::{TaskContract, Verification};
 /// use std::time::Duration;
 ///
-/// // Execution-based, and the pair a repository task normally wants: the listed
-/// // files are concatenated and compiled together, then `test_src` is compiled
-/// // beside them and run. "Together" is the point — each file compiling on its
-/// // own (`EachCompilesRust`) would not catch a caller updated out of step with
-/// // the function it calls.
+/// // Execution-based, and what a repository task normally wants: the project's
+/// // own suite decides, over the whole crate rather than over a list of files
+/// // the caller remembered to name. Each file compiling on its own
+/// // (`EachCompilesRust`) would not catch a caller updated out of step with the
+/// // function it calls; the repository's own tests do.
 /// let contract = TaskContract::workspace(
 ///     "make `parse` reject an empty input instead of panicking",
 ///     "/path/to/repo",
-///     Verification::WorkspaceTestPasses {
-///         files: vec!["src/parse.rs".into(), "src/lib.rs".into()],
-///         test_src: r#"
-///             #[test]
-///             fn empty_input_is_an_error() {
-///                 assert!(parse("").is_err());
-///             }
-///         "#
-///         .into(),
+///     Verification::Command {
+///         argv: vec!["cargo".into(), "test".into()],
+///         expect_exit: 0,
 ///     },
 /// )
 /// .with_time_budget(Duration::from_secs(600));
@@ -139,9 +136,10 @@ use crate::state::{PolicyEvent, SandboxEvent, Store};
 /// assert!(cheap.passes("src/hello.rs".as_ref(), "pub fn hello() -> u32 { 42 }").await?);
 /// assert!(cheap.passes("src/hello.rs".as_ref(), "fn hello").await?);
 ///
-/// // `CompilesRust` fails the second: a substring stub does not type-check, and
-/// // since 0.8.1 a file that deletes its own items with `#![cfg(any())]` fails
-/// // too rather than compiling clean on nothing.
+/// // An execution gate fails the second: a substring stub does not type-check.
+/// // `Verification::Command { argv: vec!["cargo".into(), "build".into()],
+/// // expect_exit: 0 }` is what a Rust project reaches for, and the same shape
+/// // with a different argv is what every other language reaches for.
 /// # Ok(()) }
 /// ```
 #[derive(Debug, Clone)]
@@ -232,42 +230,6 @@ pub enum Verification {
     /// Reach for [`Verification::Command`] whenever the task *has* a checkable
     /// criterion — this variant is for the tasks that genuinely do not.
     None,
-    /// The file must compile as a Rust library (`rustc --crate-type lib`), and
-    /// its items must survive to be type-checked. Execution-based: a
-    /// non-compiling stub fails.
-    ///
-    /// Since 0.8.1 the second half of that is enforced. A crate-level attribute
-    /// such as `#![cfg(any())]` strips every item *before* rustc examines it, so
-    /// a file whose body does not type-check compiled clean and passed. A subject
-    /// that deletes its own contents now fails. Legitimate crate-level attributes
-    /// — `#![allow(dead_code)]`, `#![no_std]` — are unaffected.
-    #[deprecated(
-        since = "0.17.0",
-        note = "use Verification::Command { argv: vec![\"cargo\".into(), \"build\".into()], \
-                expect_exit: 0 } — or any compiler invocation for the language in hand. \
-                Removed in 0.18.0."
-    )]
-    CompilesRust,
-    /// The file must compile, and `test_src` must compile against it and pass.
-    /// Execution-based.
-    ///
-    /// Since 0.8.1 the file under verification can no longer shadow the names
-    /// `test_src` uses, nor delete it. `test_src` is unchanged: it still refers to
-    /// the file's items unqualified, and still reaches *private* items — the two
-    /// remain one crate, deliberately, so an implementation does not have to be
-    /// `pub` to pass. See the
-    /// [type-level docs](Verification#what-a-passing-gate-proves) for what a
-    /// pass does and does not prove.
-    #[deprecated(
-        since = "0.17.0",
-        note = "use Verification::Command { argv: vec![\"cargo\".into(), \"test\".into()], \
-                expect_exit: 0 } and put the test in the project's own test suite, where the \
-                project's own tooling can run it. Removed in 0.18.0."
-    )]
-    RustTestPasses {
-        /// Rust source compiled against the file, e.g. a `#[test] fn`.
-        test_src: String,
-    },
     /// (workspace/multi-file) A named file under the workspace root must contain
     /// this text. Deterministic and language-agnostic — no compilation — so a
     /// task whose success is "a file now holds X" can be verified directly. Like
@@ -319,28 +281,9 @@ pub enum Verification {
     /// — must compile on its own as a Rust library. The run only succeeds when
     /// all of them do, so one wrong file fails the whole set.
     ///
-    /// Hardened with [`Verification::CompilesRust`] in 0.8.1: each file goes
-    /// through the same check, so no listed file can pass by deleting itself.
+    /// Hardened in 0.8.1: each file goes through the same probe-backed compile,
+    /// so no listed file can pass by deleting its own contents.
     EachCompilesRust(Vec<PathBuf>),
-    /// (workspace/multi-file) All listed files, concatenated in order, must
-    /// compile, and `test_src` must compile against them and pass. This proves
-    /// the edited files work *together*, not merely each in isolation.
-    ///
-    /// Hardened with [`Verification::RustTestPasses`] in 0.8.1: a shadowing
-    /// definition in any one of the files cannot defeat the gate, and a private
-    /// item in any of them still reaches `test_src`.
-    #[deprecated(
-        since = "0.17.0",
-        note = "use Verification::Command { argv: vec![\"cargo\".into(), \"test\".into()], \
-                expect_exit: 0 }, which runs the repository's own suite over the whole crate \
-                rather than a concatenation of the files you listed. Removed in 0.18.0."
-    )]
-    WorkspaceTestPasses {
-        /// Files (relative to the workspace root) concatenated into the subject.
-        files: Vec<PathBuf>,
-        /// Rust source compiled against the files, e.g. a `#[test] fn`.
-        test_src: String,
-    },
 }
 
 /// What the verification layer is allowed to spawn, and where to record it.
@@ -357,26 +300,25 @@ pub enum Verification {
 /// use io_harness::{ExecGuard, Policy, Verification, TEST_BINARY};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// // Compile-only: `rustc` may run, the produced test binary may not. The gate
-/// // type-checks the criterion against the code and never executes it, which is
-/// // what you want when the code came from a model and this host is not a sandbox
-/// // you are willing to lose.
+/// // Compile-only: `rustc` may run, the produced test binary may not. A gate
+/// // that type-checks the criterion against the code and never executes it is
+/// // what you want when the code came from a model and this host is not a
+/// // sandbox you are willing to lose.
 /// let policy = Policy::permissive()
 ///     .layer("verify")
 ///     .allow_exec("rustc")
 ///     .deny_exec(TEST_BINARY);
 ///
-/// let criterion = Verification::RustTestPasses {
-///     test_src: "#[test] fn it_answers() { assert_eq!(hello(), 42); }".into(),
+/// // The same boundary refuses a criterion that wants to run something else —
+/// // `cargo` is not `rustc`, and this policy allowed one program by name.
+/// let criterion = Verification::Command {
+///     argv: vec!["cargo".into(), "test".into()],
+///     expect_exit: 0,
 /// };
 /// // An allow the policy does not give is `Error::Refused`, not a silent skip —
 /// // a verification that was refused is not one that ran and failed.
 /// let outcome = criterion
-///     .passes_guarded(
-///         "src/hello.rs".as_ref(),
-///         "pub fn hello() -> u32 { 42 }",
-///         &ExecGuard::new(&policy),
-///     )
+///     .passes_in_guarded("/path/to/repo".as_ref(), &ExecGuard::new(&policy))
 ///     .await;
 /// assert!(matches!(outcome, Err(io_harness::Error::Refused { .. })));
 /// # Ok(()) }
@@ -711,33 +653,69 @@ impl Verification {
     }
 
     /// [`Verification::passes`], with every spawn checked against a policy.
-    #[allow(deprecated)] // the variants this release deprecates still work here
     pub async fn passes_guarded(
         &self,
-        _path: &Path,
+        path: &Path,
         contents: &str,
         guard: &ExecGuard<'_>,
     ) -> Result<bool> {
         match self {
             Verification::FileContains(needle) => Ok(contents.contains(needle)),
             Verification::FileEquals(expected) => Ok(contents == expected),
-            Verification::CompilesRust => compile_source(contents, None, guard).await,
-            Verification::RustTestPasses { test_src } => {
-                compile_source(contents, Some(test_src), guard).await
+            // Single-file mode's execution gate since 0.18.0, which removed the
+            // Rust-specific variants that used to be it. Without this arm the
+            // migration note those variants carried would be false for a
+            // single-file caller: it says to use `Command`, and `Command` would
+            // have had nowhere to run. It runs in the edited file's own
+            // directory, which is the only root a single-file contract has.
+            Verification::Command { .. } => {
+                let root = path.parent().unwrap_or_else(|| Path::new("."));
+                self.run_command(root, guard).await
             }
             // There is no gate, so there is nothing here that can pass. The run
             // ends on an assistant turn that calls no tool — see
             // [`RunOutcome::Finished`](crate::RunOutcome::Finished) — which is a
             // decision the loop makes and not one this function can.
             Verification::None => Ok(false),
-            Verification::Command { .. }
-            | Verification::EachCompilesRust(_)
-            | Verification::WorkspaceTestPasses { .. }
+            Verification::EachCompilesRust(_)
             | Verification::DocumentContains { .. }
             | Verification::WorkspaceFileContains { .. } => Err(Error::Config(
                 "multi-file verification requires a workspace root".into(),
             )),
         }
+    }
+
+    /// Run a [`Verification::Command`] criterion in `root`. Shared by both
+    /// modes since 0.18.0 — single-file mode runs it in the edited file's
+    /// directory, workspace mode in the workspace root — so one gate cannot
+    /// behave two ways depending on which entry point reached it.
+    async fn run_command(&self, root: &Path, guard: &ExecGuard<'_>) -> Result<bool> {
+        let Verification::Command { argv, expect_exit } = self else {
+            return Err(Error::Config(
+                "run_command called with a criterion that is not a Command".into(),
+            ));
+        };
+        let Some(program) = argv.first() else {
+            return Err(Error::Config(
+                "Verification::Command needs a non-empty argv".into(),
+            ));
+        };
+        guard.check(program, &argv[1..])?;
+        let run = guard.exec_output(argv, root).await?;
+        let passed = run.exit == Some(*expect_exit);
+        if !passed {
+            // What the command said about its own failure, where the next
+            // diagnosis can read it. Without this a failing gate is an outcome
+            // discriminant and nothing else, and "the agent's work is wrong" is
+            // indistinguishable from "the test runner is not installed".
+            guard.record_gate_failure(&format!(
+                "command exited {} (expected {expect_exit})",
+                run.exit
+                    .map_or_else(|| "on a signal or a cap".to_string(), |c| c.to_string()),
+            ));
+            guard.record_gate_output(&run.output);
+        }
+        Ok(passed)
     }
 
     /// Check the criterion against a workspace `root` (0.3 multi-file mode). The
@@ -747,36 +725,12 @@ impl Verification {
     }
 
     /// [`Verification::passes_in`], with every spawn checked against a policy.
-    #[allow(deprecated)] // the variants this release deprecates still work here
     pub async fn passes_in_guarded(&self, root: &Path, guard: &ExecGuard<'_>) -> Result<bool> {
         match self {
             // The one criterion that is not about Rust. Everything the gate
             // needs is in the argv, so the same three lines check a Go test, a
             // pytest run, an npm script or a Makefile target.
-            Verification::Command { argv, expect_exit } => {
-                let Some(program) = argv.first() else {
-                    return Err(Error::Config(
-                        "Verification::Command needs a non-empty argv".into(),
-                    ));
-                };
-                guard.check(program, &argv[1..])?;
-                let run = guard.exec_output(argv, root).await?;
-                let passed = run.exit == Some(*expect_exit);
-                if !passed {
-                    // What the command said about its own failure, where the next
-                    // diagnosis can read it. Without this a failing gate is an
-                    // outcome discriminant and nothing else, and "the agent's work
-                    // is wrong" is indistinguishable from "the test runner is not
-                    // installed".
-                    guard.record_gate_failure(&format!(
-                        "command exited {} (expected {expect_exit})",
-                        run.exit
-                            .map_or_else(|| "on a signal or a cap".to_string(), |c| c.to_string()),
-                    ));
-                    guard.record_gate_output(&run.output);
-                }
-                Ok(passed)
-            }
+            Verification::Command { .. } => self.run_command(root, guard).await,
             // No gate: see `passes_guarded`.
             Verification::None => Ok(false),
             Verification::WorkspaceFileContains { file, needle } => {
@@ -793,22 +747,11 @@ impl Verification {
                     let src = tokio::fs::read_to_string(root.join(f))
                         .await
                         .unwrap_or_default();
-                    if !compile_source(&src, None, guard).await? {
+                    if !compile_source(&src, guard).await? {
                         return Ok(false);
                     }
                 }
                 Ok(true)
-            }
-            Verification::WorkspaceTestPasses { files, test_src } => {
-                let mut combined = String::new();
-                for f in files {
-                    let src = tokio::fs::read_to_string(root.join(f))
-                        .await
-                        .unwrap_or_default();
-                    combined.push_str(&src);
-                    combined.push('\n');
-                }
-                compile_source(&combined, Some(test_src), guard).await
             }
             // Single-file variants against a workspace need a target file, which
             // this method does not carry; use them in single-file mode.
@@ -819,7 +762,6 @@ impl Verification {
     }
 
     /// Human-readable description fed to the model as the success criterion.
-    #[allow(deprecated)] // the variants this release deprecates still describe themselves
     pub fn describe(&self) -> String {
         match self {
             Verification::Command { argv, expect_exit } => format!(
@@ -839,12 +781,6 @@ impl Verification {
             Verification::FileEquals(expected) => {
                 format!("the file's entire contents must equal exactly: {expected:?}")
             }
-            Verification::CompilesRust => {
-                "the file must compile as Rust (rustc --crate-type lib)".to_string()
-            }
-            Verification::RustTestPasses { test_src } => {
-                format!("the file must compile and pass this test:\n{test_src}")
-            }
             Verification::WorkspaceFileContains { file, needle } => {
                 format!("the file {file:?} must contain exactly this text: {needle:?}")
             }
@@ -855,9 +791,6 @@ impl Verification {
             Verification::EachCompilesRust(files) => {
                 format!("each of these files must compile as Rust: {files:?}")
             }
-            Verification::WorkspaceTestPasses { files, test_src } => format!(
-                "these files {files:?} must together compile and pass this test:\n{test_src}"
-            ),
         }
     }
 }
@@ -942,20 +875,6 @@ fn subject_lib_args(subject: &Path, rlib: &Path) -> Vec<String> {
     .collect()
 }
 
-/// The argv verification builds to compile and link the test binary from the
-/// combined crate — the subject with the criterion module appended.
-fn test_build_args(combined: &Path, bin: &Path) -> Vec<String> {
-    ["--edition", "2021", "--test"]
-        .iter()
-        .map(|s| s.to_string())
-        .chain([
-            combined.display().to_string(),
-            "-o".into(),
-            bin.display().to_string(),
-        ])
-        .collect()
-}
-
 /// The argv that type-checks the probe crate against the compiled subject.
 ///
 /// Every element is harness-constructed — no model or caller output reaches it —
@@ -995,184 +914,64 @@ const PROBE_ITEM: &str = "pub fn __io_harness_probe() {}\n";
 const PROBE_CRATE: &str = "extern crate subject;\n\
     pub fn __io_harness_check() { subject::__io_harness_probe() }\n";
 
-/// Opens the module the harness wraps the caller's criterion in, appended to the
-/// subject so the two are one crate. Closed by [`CRITERION_CLOSE`].
+/// Compile `source` with `rustc` in a throwaway temp dir, and report whether it
+/// type-checked. `rustc` touches no network and the temp dir is removed on drop.
 ///
-/// This preamble is why an execution gate cannot be answered by the file it is
-/// checking. Two properties, both load-bearing:
-///
-/// 1. The criterion is a *child module* of the subject's own crate, so
-///    `use super::*` reaches the subject's items — including private ones.
-///    `test_src` still calls `hello()` exactly as a 0.8.0 caller wrote it, and a
-///    subject that writes an idiomatic non-`pub` `fn hello` still passes. The
-///    0.8.1 development build made the subject a separate crate instead, and that
-///    is precisely what broke: privacy is a wall between crates, so an ordinary
-///    private implementation failed a gate it had always passed. The live run for
-///    F7 caught it — see `iterations/US-IO-HARNESS-0.8.1-I01`.
-/// 2. The prelude macros the criterion is likely to invoke are re-imported
-///    *explicitly*. A subject defining `macro_rules! assert` — exported or not —
-///    then makes the name ambiguous (rustc E0659) rather than capturing it, so
-///    the gate fails to compile instead of passing an impossible criterion. A
-///    macro the subject exports under any *other* name still reaches the
-///    criterion through the glob, which is what keeps this a fix rather than a
-///    restriction.
-///
-/// The deletion attack — a crate-level `#![cfg(any())]` that strips the criterion
-/// along with everything else, leaving a test binary that runs zero tests and
-/// exits 0 — is not this preamble's job. Being one crate again, it cannot be. It
-/// is caught before this point by the same probe the compile-only path uses.
-const CRITERION_OPEN: &str = "\n#[cfg(test)]
-mod __io_harness_criterion {
-#[allow(unused_imports)]
-use ::core::{assert, assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne,
-    matches, panic, todo, unimplemented, unreachable, write, writeln, format_args};
-#[allow(unused_imports)]
-use ::std::{dbg, eprint, eprintln, format, print, println, vec};
-#[allow(unused_imports)] use super::*;
-";
-
-/// Closes [`CRITERION_OPEN`].
-const CRITERION_CLOSE: &str = "\n}\n";
-
-/// Compile `source` with `rustc` in a throwaway temp dir. With `test_src`,
-/// append it and run the resulting test binary. Returns whether the gate
-/// passed. `rustc` touches no network and the temp dir is removed on drop.
-async fn compile_source(
-    source: &str,
-    test_src: Option<&str>,
-    guard: &ExecGuard<'_>,
-) -> Result<bool> {
+/// Compile-only since 0.18.0. The branch that appended a caller's criterion and
+/// ran the produced test binary went with the three Rust-specific variants that
+/// were its only callers; a criterion that runs a test is now
+/// [`Verification::Command`], where the project's own runner does it.
+async fn compile_source(source: &str, guard: &ExecGuard<'_>) -> Result<bool> {
     let dir = tempfile::tempdir()?; // removed on drop — nothing left behind
 
-    match test_src {
-        None => {
-            // Compile the subject as its own crate, with a probe item appended,
-            // then type-check a second crate that *references* the probe.
-            //
-            // The second compile is what makes the gate honest. Before 0.8.1 the
-            // subject was compiled alone, and "it compiled" was taken to mean its
-            // contents were type-checked. It does not: a crate-level
-            // `#![cfg(any())]` strips every item before rustc examines it, so a
-            // body as ill-typed as `pub fn hello() -> u32 { "not a u32" }`
-            // compiled clean and passed. A subject that deleted itself now fails,
-            // because the probe went with it and the probe crate cannot find it.
-            //
-            // The probe rather than the more obvious `include!` of the subject
-            // from a harness-authored root: that would reject crate-level inner
-            // attributes outright, which also fails an honest file opening with
-            // `#![allow(dead_code)]` or `#![no_std]`. Legitimate attributes keep
-            // working here — only *deleting the crate's contents* is caught.
-            let subject = dir.path().join("subject.rs");
-            tokio::fs::write(&subject, format!("{source}\n{PROBE_ITEM}")).await?;
-            let rlib = dir.path().join("libsubject.rlib");
-            let args = subject_lib_args(&subject, &rlib);
-            guard.check("rustc", &args)?;
-            let argv = std::iter::once("rustc".to_string())
-                .chain(args.iter().cloned())
-                .collect::<Vec<_>>();
-            if !guard.exec(&argv, dir.path()).await? {
-                guard.record_gate_failure("subject-compile");
-                return Ok(false);
-            }
-
-            let probe = dir.path().join("probe.rs");
-            tokio::fs::write(&probe, PROBE_CRATE).await?;
-            let args = probe_args(dir.path(), &probe, &rlib);
-            guard.check("rustc", &args)?;
-            let argv = std::iter::once("rustc".to_string())
-                .chain(args.iter().cloned())
-                .collect::<Vec<_>>();
-            let passed = guard.exec(&argv, dir.path()).await?;
-            if !passed {
-                // The subject compiled but its items are gone.
-                guard.record_gate_failure("subject-emptied");
-            }
-            Ok(passed)
-        }
-        Some(test) => {
-            // Three defences, because the two attacks this release closes are
-            // different and no single structure stops both without cost.
-            //
-            // The subject is compiled alone first, with the probe appended. That
-            // classifies an ordinary "the file does not compile" failure, and the
-            // probe reference then catches a subject that deleted its own items —
-            // a crate-level `#![cfg(any())]`, which would otherwise strip the
-            // criterion too and leave a test binary that runs zero tests and
-            // exits 0. Same mechanism as the compile-only path above.
-            //
-            // Only then is the criterion appended, as a module of the subject's
-            // own crate. It is deliberately NOT a separate crate: that was tried
-            // during 0.8.1 and it broke an ordinary private implementation, since
-            // privacy is a wall between crates. Shadowing is stopped inside the
-            // module by CRITERION_OPEN instead.
-            let subject = dir.path().join("subject.rs");
-            tokio::fs::write(&subject, format!("{source}\n{PROBE_ITEM}")).await?;
-            let rlib = dir.path().join("libsubject.rlib");
-
-            let args = subject_lib_args(&subject, &rlib);
-            guard.check("rustc", &args)?;
-            let subject_argv = std::iter::once("rustc".to_string())
-                .chain(args.iter().cloned())
-                .collect::<Vec<_>>();
-            if !guard.exec(&subject_argv, dir.path()).await? {
-                // The subject does not compile: the gate fails exactly as it did
-                // in 0.8.0.
-                guard.record_gate_failure("subject-compile");
-                return Ok(false);
-            }
-
-            let probe = dir.path().join("probe.rs");
-            tokio::fs::write(&probe, PROBE_CRATE).await?;
-            let args = probe_args(dir.path(), &probe, &rlib);
-            guard.check("rustc", &args)?;
-            let probe_argv = std::iter::once("rustc".to_string())
-                .chain(args.iter().cloned())
-                .collect::<Vec<_>>();
-            if !guard.exec(&probe_argv, dir.path()).await? {
-                // The subject compiled but its items are gone — so the criterion
-                // would be gone too, and the test binary would pass on nothing.
-                guard.record_gate_failure("subject-emptied");
-                return Ok(false);
-            }
-
-            let combined = dir.path().join("combined.rs");
-            tokio::fs::write(
-                &combined,
-                format!("{source}\n{CRITERION_OPEN}{test}{CRITERION_CLOSE}"),
-            )
-            .await?;
-            let bin = dir.path().join("t");
-
-            let args = test_build_args(&combined, &bin);
-            guard.check("rustc", &args)?;
-            let build_argv = std::iter::once("rustc".to_string())
-                .chain(args.iter().cloned())
-                .collect::<Vec<_>>();
-            if !guard.exec(&build_argv, dir.path()).await? {
-                // The interesting failure: the subject compiles on its own, but
-                // the criterion will not compile beside it. A subject shadowing
-                // `assert!` lands here, as an E0659 ambiguity.
-                guard.record_gate_failure("criterion-compile");
-                return Ok(false);
-            }
-
-            // The produced binary is its own spawn: denying TEST_BINARY while
-            // allowing rustc type-checks the code without ever running it.
-            guard.check(TEST_BINARY, &[bin.display().to_string()])?;
-            let passed = guard.exec(&[bin.display().to_string()], dir.path()).await?;
-            if !passed {
-                guard.record_gate_failure("test-run");
-            }
-            Ok(passed)
-        }
+    // Compile the subject as its own crate, with a probe item appended, then
+    // type-check a second crate that *references* the probe.
+    //
+    // The second compile is what makes the gate honest. Before 0.8.1 the subject
+    // was compiled alone, and "it compiled" was taken to mean its contents were
+    // type-checked. It does not: a crate-level `#![cfg(any())]` strips every item
+    // before rustc examines it, so a body as ill-typed as
+    // `pub fn hello() -> u32 { "not a u32" }` compiled clean and passed. A
+    // subject that deleted itself now fails, because the probe went with it and
+    // the probe crate cannot find it.
+    //
+    // The probe rather than the more obvious `include!` of the subject from a
+    // harness-authored root: that would reject crate-level inner attributes
+    // outright, which also fails an honest file opening with
+    // `#![allow(dead_code)]` or `#![no_std]`. Legitimate attributes keep working
+    // here — only *deleting the crate's contents* is caught.
+    let subject = dir.path().join("subject.rs");
+    tokio::fs::write(&subject, format!("{source}\n{PROBE_ITEM}")).await?;
+    let rlib = dir.path().join("libsubject.rlib");
+    let args = subject_lib_args(&subject, &rlib);
+    guard.check("rustc", &args)?;
+    let argv = std::iter::once("rustc".to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>();
+    if !guard.exec(&argv, dir.path()).await? {
+        guard.record_gate_failure("subject-compile");
+        return Ok(false);
     }
+
+    let probe = dir.path().join("probe.rs");
+    tokio::fs::write(&probe, PROBE_CRATE).await?;
+    let args = probe_args(dir.path(), &probe, &rlib);
+    guard.check("rustc", &args)?;
+    let argv = std::iter::once("rustc".to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>();
+    let passed = guard.exec(&argv, dir.path()).await?;
+    if !passed {
+        // The subject compiled but its items are gone.
+        guard.record_gate_failure("subject-emptied");
+    }
+    Ok(passed)
 }
 
-// The Rust-specific variants are deprecated in 0.17.0 and removed in 0.18.0.
-// Their tests stay, unchanged, until the variants go: they are the specification
-// of what each one proves, and F10's claim that a 0.16.2-era contract still works
-// is only worth anything if the assertions behind it are still running.
-#[allow(deprecated)]
+// The three Rust-specific variants were removed in 0.18.0 and their tests were
+// rewritten over `Verification::Command` rather than deleted: they are the
+// specification of what each one proved, and the removal is only safe if the
+// same properties still hold through the general gate.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1197,54 +996,46 @@ mod tests {
         assert!(!passes(&v, "a ").await);
     }
 
+    /// What `CompilesRust` proved, through the gate that replaced it: a
+    /// substring stub is not a program, and an execution gate says so where a
+    /// content gate cannot. Single-file mode, which is where `CompilesRust`
+    /// lived — so this also covers 0.18.0 giving `Command` a root there.
     #[tokio::test]
-    async fn compiles_rust_rejects_stub_accepts_real() {
+    async fn a_command_gate_rejects_a_stub_and_accepts_real_code() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("hello.rs");
+        let compiles = Verification::Command {
+            argv: vec![
+                "rustc".into(),
+                "--edition".into(),
+                "2021".into(),
+                "--crate-type".into(),
+                "lib".into(),
+                "hello.rs".into(),
+            ],
+            expect_exit: 0,
+        };
 
         // The I01 case: the literal substring, which is not valid Rust.
         tokio::fs::write(&file, "fn hello").await.unwrap();
-        assert!(!Verification::CompilesRust
-            .passes(&file, "fn hello")
-            .await
-            .unwrap());
+        assert!(!compiles.passes(&file, "fn hello").await.unwrap());
 
         let good = "pub fn hello() -> u32 { 42 }\n";
         tokio::fs::write(&file, good).await.unwrap();
-        assert!(Verification::CompilesRust
-            .passes(&file, good)
-            .await
-            .unwrap());
-    }
-
-    #[tokio::test]
-    async fn rust_test_passes_only_when_test_passes() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("hello.rs");
-        let good = "pub fn hello() -> u32 { 42 }\n";
-        tokio::fs::write(&file, good).await.unwrap();
-
-        let ok = Verification::RustTestPasses {
-            test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
-        };
-        assert!(ok.passes(&file, good).await.unwrap());
-
-        let bad = Verification::RustTestPasses {
-            test_src: "#[test] fn t() { assert_eq!(hello(), 41); }".into(),
-        };
-        assert!(!bad.passes(&file, good).await.unwrap());
+        assert!(compiles.passes(&file, good).await.unwrap());
     }
 
     #[tokio::test]
     async fn a_command_absent_from_the_allow_list_is_refused_not_failed() {
         // Denying rustc must refuse, and the refusal must be distinguishable
         // from a verification that ran and returned false.
-        let policy = Policy::default().layer("locked").deny_exec("rustc");
-        let guard = ExecGuard::new(&policy);
-        let good = "pub fn hello() -> u32 { 42 }\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() -> u32 { 1 }\n").unwrap();
+        let v = Verification::EachCompilesRust(vec!["a.rs".into()]);
 
-        let refused = Verification::CompilesRust
-            .passes_guarded(Path::new("x.rs"), good, &guard)
+        let policy = Policy::default().layer("locked").deny_exec("rustc");
+        let refused = v
+            .passes_in_guarded(dir.path(), &ExecGuard::new(&policy))
             .await;
         assert!(
             matches!(refused, Err(Error::Refused { ref target, .. }) if target == "rustc"),
@@ -1254,37 +1045,36 @@ mod tests {
         // The same code under the default policy runs and passes — so the
         // refusal above is the policy talking, not a broken compile.
         let allowed = Policy::default();
-        assert!(Verification::CompilesRust
-            .passes_guarded(Path::new("x.rs"), good, &ExecGuard::new(&allowed))
+        assert!(v
+            .passes_in_guarded(dir.path(), &ExecGuard::new(&allowed))
             .await
             .unwrap());
     }
 
     #[tokio::test]
-    async fn denying_the_test_binary_type_checks_without_running_it() {
-        // rustc allowed, the produced binary denied: the code compiles but is
-        // never executed, so the gate refuses rather than reporting a result.
+    async fn nothing_spawns_the_test_binary_since_the_rust_variants_were_removed() {
+        // 0.18.0 removed the only criteria that compiled a caller's test and ran
+        // the resulting binary, so `TEST_BINARY` names a spawn the crate no
+        // longer makes: denying it now changes nothing. Asserted rather than
+        // assumed, because a policy that reads as a restriction and enforces
+        // nothing is exactly the kind of thing an operator should not have to
+        // discover for themselves. `TEST_BINARY` is kept so that policies
+        // written against it still compile.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn a() -> u32 { 1 }\n").unwrap();
         let policy = Policy::default().layer("no-exec").deny_exec(TEST_BINARY);
-        let v = Verification::RustTestPasses {
-            test_src: "#[test] fn t() { assert_eq!(hello(), 42); }".into(),
-        };
-        let out = v
-            .passes_guarded(
-                Path::new("x.rs"),
-                "pub fn hello() -> u32 { 42 }\n",
-                &ExecGuard::new(&policy),
-            )
-            .await;
-        assert!(
-            matches!(out, Err(Error::Refused { ref target, .. }) if target == TEST_BINARY),
-            "expected the run of the test binary to be refused, got {out:?}"
-        );
+        assert!(Verification::EachCompilesRust(vec!["a.rs".into()])
+            .passes_in_guarded(dir.path(), &ExecGuard::new(&policy))
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
     async fn a_verification_with_no_policy_still_spawns_as_0_3_0_did() {
-        assert!(Verification::CompilesRust
-            .passes(Path::new("x.rs"), "pub fn hello() -> u32 { 42 }\n")
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "pub fn hello() -> u32 { 42 }\n").unwrap();
+        assert!(Verification::EachCompilesRust(vec!["a.rs".into()])
+            .passes_in(dir.path())
             .await
             .unwrap());
     }
@@ -1304,21 +1094,34 @@ mod tests {
         assert!(!v.passes_in(root).await.unwrap());
     }
 
+    /// What `WorkspaceTestPasses` proved, through the gate that replaced it: the
+    /// edited files have to work *together*, and the project's own runner is
+    /// what says so. The migration note tells a caller to write exactly this
+    /// criterion, so this is the assertion behind that note.
     #[tokio::test]
-    async fn workspace_test_passes_only_when_files_work_together() {
+    async fn a_command_gate_runs_the_projects_own_suite_and_fails_with_it() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join("a.rs"), "pub fn a() -> u32 { 40 }\n").unwrap();
-        std::fs::write(root.join("b.rs"), "pub fn b() -> u32 { 2 }\n").unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("src/a.rs"), "pub fn a() -> u32 { 40 }\n").unwrap();
+        std::fs::write(root.join("src/b.rs"), "pub fn b() -> u32 { 2 }\n").unwrap();
+        let lib =
+            "pub mod a;\npub mod b;\n#[test]\nfn together() { assert_eq!(a::a() + b::b(), 42); }\n";
+        std::fs::write(root.join("src/lib.rs"), lib).unwrap();
 
-        let v = Verification::WorkspaceTestPasses {
-            files: vec!["a.rs".into(), "b.rs".into()],
-            test_src: "#[test] fn t() { assert_eq!(a() + b(), 42); }".into(),
+        let v = Verification::Command {
+            argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+            expect_exit: 0,
         };
         assert!(v.passes_in(root).await.unwrap());
 
-        // One file wrong → the cross-file test fails.
-        std::fs::write(root.join("b.rs"), "pub fn b() -> u32 { 99 }\n").unwrap();
+        // One file wrong → the cross-file test fails, and so does the gate.
+        std::fs::write(root.join("src/b.rs"), "pub fn b() -> u32 { 99 }\n").unwrap();
         assert!(!v.passes_in(root).await.unwrap());
     }
 

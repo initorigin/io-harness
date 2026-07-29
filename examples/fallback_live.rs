@@ -15,13 +15,6 @@
 //! cargo run --example fallback_live
 //! ```
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use io_harness::provider::{CompletionRequest, CompletionResponse, Fallback, Provider};
 use io_harness::{run, Error, OpenRouter, Store, TaskContract, Verification};
 
@@ -47,13 +40,21 @@ async fn main() -> io_harness::Result<()> {
     let src = root.join("src");
     std::fs::create_dir_all(&src)?;
     std::fs::write(src.join("a.rs"), "pub fn a() -> u32 { 0 }\n")?;
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\n#[test] fn t() { assert_eq!(a::a(), 7); }\n",
+    )?;
 
     let contract = TaskContract::workspace(
         "Edit src/a.rs so a() == 7.",
         &root,
-        Verification::WorkspaceTestPasses {
-            files: vec!["src/a.rs".into()],
-            test_src: "#[test] fn t() { assert_eq!(a(), 7); }".into(),
+        Verification::Command {
+            argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+            expect_exit: 0,
         },
     )
     .with_max_steps(6)

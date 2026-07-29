@@ -110,6 +110,9 @@ impl Provider for OpenRouter {
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
+        // The TTFT clock starts before the socket is opened, so it measures the
+        // wait a caller actually experiences rather than only the model's part.
+        let sent = std::time::Instant::now();
         let resp = self
             .client
             .post(&self.endpoint)
@@ -118,6 +121,6 @@ impl Provider for OpenRouter {
             .send()
             .await?;
 
-        openai_wire::parse_stream(super::ensure_success(resp).await?).await
+        openai_wire::parse_stream(super::ensure_success(resp).await?, sent).await
     }
 }

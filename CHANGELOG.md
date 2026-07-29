@@ -26,6 +26,130 @@ notes are produced from it.
 
 ### Security
 
+## [0.18.0] - 2026-07-29
+
+The accounting release. Cost is the first question anyone asks about an agent run
+and this crate could not answer it at any price: the model identifier was
+recorded nowhere, cache tokens were parsed by neither provider client, no
+provider call was ever timed, and `steps.tokens` collapsed a step that retried
+twice and fell over to a second vendor into one integer attributed to nothing.
+Every provider call is now its own row — the model that served it, the tokens it
+reported, its latency and time to first token, and why the model stopped — and
+money is derived from a price table you own, so correcting one price repairs the
+whole history.
+
+### Breaking changes
+
+- **BREAKING** — `Usage` gains `cache_read_tokens`, `cache_write_tokens`,
+  `reasoning_tokens` and `server_tool_requests`, so a struct literal naming the
+  three existing fields no longer compiles.
+
+  *Migration:* construct with `..Default::default()`, which this type has
+  documented as the forward-compatible form since 0.2.0. Reading `total_tokens`
+  is unaffected.
+
+  ```rust
+  // Before:
+  let usage = Usage { prompt_tokens: 1_200, completion_tokens: 80, total_tokens: 1_280 };
+  // After:
+  let usage = Usage {
+      prompt_tokens: 1_200,
+      completion_tokens: 80,
+      total_tokens: 1_280,
+      ..Default::default()
+  };
+  ```
+
+- **BREAKING** — `CompletionResponse` gains `model`, `finish_reason` and
+  `ttft_ms`, with the same construction break. A custom `Provider` that already
+  built its response with `..Default::default()` needs no change and reports no
+  model, which is recorded as unknown rather than as absent.
+
+  *Migration:* add `..Default::default()`, and fill `model` in if your provider
+  knows which model answered — it is what makes a fallback auditable.
+
+- **BREAKING** — `Verification::CompilesRust`, `RustTestPasses` and
+  `WorkspaceTestPasses` are **removed**. They were deprecated in 0.17.0 naming
+  this release, which is the shortest cycle this crate's contract allows.
+  **A consumer upgrading straight from 0.16.2 meets the removal having never seen
+  the deprecation warning**, and that is the cost of the short cycle: a reader who
+  upgraded one minor at a time is not the only reader.
+
+  *Migration:* each becomes a `Command` criterion, with the test living in the
+  project's own suite where its own tooling runs it. `test_src` has no
+  replacement and needs none — write that test into the repository.
+
+  ```rust
+  // Before:                              After:
+  // Verification::CompilesRust           Verification::Command {
+  //                                          argv: vec!["cargo".into(), "build".into()],
+  //                                          expect_exit: 0 }
+  // Verification::RustTestPasses { .. }  Verification::Command {
+  // Verification::WorkspaceTestPasses {}     argv: vec!["cargo".into(), "test".into()],
+  //                                          expect_exit: 0 }
+  ```
+
+- **BREAKING (behaviour)** — Anthropic's `prompt_tokens` and `total_tokens` now
+  include cached input tokens. The vendor reports `input_tokens` *excluding* the
+  cached counts and bills all three, so 0.17.0 under-reported a cache-heavy
+  prompt; the OpenAI wire already included them. Both are reconciled at the wire
+  boundary, so a row does not mean two things depending on which vendor wrote it.
+
+  *Migration:* there is no opt-out, and none should be wanted — the previous
+  figure was lower than the invoice. A token budget calibrated against 0.17.0
+  numbers on a cache-heavy workload will be reached sooner, so raise it if a run
+  now stops early.
+
+- **BREAKING (behaviour)** — `TEST_BINARY` still exists so that policies written
+  against it compile, but **nothing spawns it**: it named the test binary the
+  removed variants built, and no criterion builds one now. `SandboxEvent`'s
+  `criterion-compile` and `test-run` gate phases are likewise never emitted.
+
+  *Migration:* there is nothing to write instead for the constant — a
+  `deny_exec(TEST_BINARY)` rule is now inert and can be dropped. For compile-only
+  verification use `EachCompilesRust`, or a `Command` naming the compiler rather
+  than the test runner.
+
+### Added
+
+- A `provider_calls` table and `Store::provider_calls`: one row per
+  `Provider::complete` call, with the attempt number, the provider, the model
+  that served it, the full token breakdown, latency, time to first token, the
+  finish reason, and the failure where there was one. A retried step is several
+  rows; the attempts that failed are kept, because a model that produced tokens
+  before the connection broke was still billed for them.
+- An `edits` table, `Edit` and `Store::edits`: the lines each file change added
+  and removed, for `write_file` and `edit_file` alike.
+- `io_harness::pricing` — `Price`, `PriceTable` and `Spend`. Cost is derived at
+  query time in integer micro-units and is never stored, so correcting a price
+  repairs every past run. The crate ships **no prices**: a price table requires
+  an as-of date at construction, and an unpriced model is counted in
+  `Spend::unpriced_calls` rather than costed at zero.
+- `Store::spend_by_model`, `spend_by_day` and `spend_by_run` — grouped raw rows
+  with the derived cost beside them. Renderings are the consuming app's business.
+- Both provider clients now parse what they already received and discarded:
+  cache-read and cache-write tokens, reasoning tokens, the model id, the finish
+  reason, and provider-executed tool request counts. Time to first token is
+  measured where the stream is consumed.
+- `Verification::Command` works in single-file mode, running in the edited file's
+  own directory. Without it the 0.17.0 migration note would have been false for a
+  single-file caller.
+- [Accounting](docs/guide/accounting.md) — a guide page stating what each
+  recorded number is and, more importantly, what it is not.
+
+### Changed
+
+- `docs/CONTRACT.md` records the provenance of every recorded figure: a token
+  count is the provider's report and not the crate's measurement, a latency is
+  the harness's own wall clock and includes its request building, a TTFT is
+  `None` rather than zero where nothing measured it, and a cost is only as right
+  as the operator's own price table.
+- The 0.8.1 gate-hardening is now structural rather than defensive. It guarded
+  against a subject shadowing a macro in a criterion the harness compiled into
+  the subject's crate; no criterion is compiled that way any more, so the class
+  is gone. Where the criterion lives — somewhere the agent's policy does not let
+  it write — is what matters now.
+
 ## [0.17.0] - 2026-07-29
 
 The release that makes the repositioning true in code. Before it the type system
