@@ -5,13 +5,6 @@
 //! refused and the run carries on, a sensitive action stops for a human, and
 //! every refusal and decision lands in the trace.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -65,21 +58,42 @@ fn fixture() -> tempfile::TempDir {
     std::fs::write(src.join("a.rs"), "pub fn a() -> u32 { 0 }\n").unwrap();
     std::fs::write(src.join("b.rs"), "pub fn b() -> u32 { 0 }\n").unwrap();
     std::fs::write(dir.path().join("secrets/key.txt"), "original-secret").unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\npub mod b;\n#[test] fn t() { assert_eq!(a::a() + b::b(), 42); }\n",
+    )
+    .unwrap();
     dir
 }
 
+/// The success spec: the two files, together, must make `a() + b() == 42`, and
+/// the project's own runner is what says so. Until 0.18.0 this was
+/// `WorkspaceTestPasses`, which concatenated the files the caller listed and
+/// compiled a criterion beside them; `cargo test` runs the crate's real suite,
+/// which is what the migration note tells a caller to write.
 fn verify() -> Verification {
-    Verification::WorkspaceTestPasses {
-        files: vec!["src/a.rs".into(), "src/b.rs".into()],
-        test_src: "#[test] fn t() { assert_eq!(a() + b(), 42); }".into(),
+    Verification::Command {
+        argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+        expect_exit: 0,
     }
 }
 
 /// src/ is writable, secrets/ is denied outright.
+///
+/// `cargo` is allowed because the verification gate is a command since 0.18.0
+/// and verification cannot prompt: a gate spawns only what a rule allows
+/// outright. It is an allow on the criterion's runner, not on the agent's reach
+/// — the read and write rules below are what these tests are about.
 fn guarded() -> Policy {
     Policy::default()
         .layer("base")
         .allow_read("*")
+        .allow_exec("cargo")
         .deny_read("secrets/*")
         .deny_write("secrets/*")
 }
@@ -441,7 +455,7 @@ async fn a_run_with_no_policy_behaves_exactly_as_0_3_0_did() {
     assert!(
         events
             .iter()
-            .any(|e| e.act == "exec" && e.target.starts_with("rustc ")),
+            .any(|e| e.act == "exec" && e.target.starts_with("cargo test")),
         "every spawn is recorded with its full argv"
     );
 }

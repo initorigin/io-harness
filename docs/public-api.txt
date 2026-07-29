@@ -45,6 +45,7 @@ const REQUEST_TIMEOUT src/net.rs
 const SPAWN_TOOL src/run.rs
 const SUCCESS_OUTCOME src/state.rs
 const TEST_BINARY src/verify.rs
+const UNKNOWN_MODEL src/state.rs
 enum Act src/policy.rs
 enum Backend src/sandbox.rs
 enum Cap src/sandbox.rs
@@ -73,6 +74,7 @@ struct Containment src/containment.rs
 struct ContextBudget src/context.rs
 struct ContextEvent src/state.rs
 struct Defaults src/policy.rs
+struct Edit src/state.rs
 struct DenyAll src/approve.rs
 struct ExecGuard src/verify.rs
 struct Identity src/tools/git.rs
@@ -88,6 +90,7 @@ struct OpenRouter src/provider/openrouter.rs
 struct Pending src/state.rs
 struct Policy src/policy.rs
 struct PolicyEvent src/state.rs
+struct ProviderCall src/state.rs
 struct Progress src/resilience.rs
 struct Request src/approve.rs
 struct RetryPolicy src/resilience.rs

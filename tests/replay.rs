@@ -217,7 +217,9 @@ async fn a_response_the_trace_would_mangle_survives_the_round_trip() {
             prompt_tokens: 11,
             completion_tokens: 22,
             total_tokens: 33,
+            ..Default::default()
         }),
+        ..Default::default()
     };
 
     let recorder = Record::new(Canned::new(vec![live.clone()]));
@@ -478,7 +480,9 @@ async fn a_real_run_replays_from_its_recording_without_a_provider() {
                 prompt_tokens: 7,
                 completion_tokens: 3,
                 total_tokens: 10,
+                ..Default::default()
             }),
+            ..Default::default()
         },
     ]);
 

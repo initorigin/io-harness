@@ -27,13 +27,6 @@
 //! from turning into a whitespace quiz. An agent that has the tool and the skill
 //! can hit it; an agent that has neither cannot guess it.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use std::sync::{Arc, Mutex};
 
 use io_harness::tools::{Tool, ToolFuture, Toolbox};
@@ -169,13 +162,22 @@ const GOAL: &str = "src/berth.rs must make record() return the berth record for 
     for BRT-2291 is held by the lookup_berth tool. Invent neither.";
 
 /// Lay out a fresh workspace: the stub the agent edits, and nothing else.
-fn workspace() -> std::io::Result<tempfile::TempDir> {
+fn workspace(gate: &str) -> std::io::Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
     std::fs::create_dir_all(dir.path().join("src"))?;
     std::fs::write(
         dir.path().join("src/berth.rs"),
         "pub fn record() -> &'static str {\n    \"\"\n}\n",
     )?;
+    // A real cargo project since 0.18.0, with the criterion in `tests/` where
+    // the agent's edits to src/berth.rs cannot reach it.
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(dir.path().join("src/lib.rs"), "pub mod berth;\n")?;
+    std::fs::create_dir_all(dir.path().join("tests"))?;
+    std::fs::write(dir.path().join("tests/gate.rs"), gate)?;
     Ok(dir)
 }
 
@@ -228,7 +230,9 @@ async fn main() -> io_harness::Result<()> {
     std::fs::write(skills.path().join("mooring-log/SKILL.md"), MOORING)?;
 
     let test_src = format!(
-        "{DIGEST_SRC}\n#[test]\nfn t() {{ assert_eq!(digest(&record()), {}); }}\n",
+        // An integration test in `tests/`, so it names the crate: the criterion
+        // sits outside the file the agent edits and cannot be edited with it.
+        "{DIGEST_SRC}\n#[test]\nfn t() {{ assert_eq!(digest(fixture::berth::record()), {}); }}\n",
         digest(RECORD)
     );
 
@@ -245,14 +249,14 @@ async fn main() -> io_harness::Result<()> {
 
     if only != "control" {
         println!("\n=== run 1: the full contract (tool + skill) ===");
-        let dir = workspace()?;
+        let dir = workspace(&test_src)?;
         let asked = Arc::new(Mutex::new(Vec::new()));
         let contract = TaskContract::workspace(
             GOAL,
             dir.path(),
-            Verification::WorkspaceTestPasses {
-                files: vec!["src/berth.rs".into()],
-                test_src: test_src.clone(),
+            Verification::Command {
+                argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+                expect_exit: 0,
             },
         )
         .with_tools(Toolbox::new().with(BerthTable {
@@ -276,13 +280,13 @@ async fn main() -> io_harness::Result<()> {
 
     if only != "positive" {
         println!("\n=== run 2: the same contract, with_tools and with_skills removed ===");
-        let dir = workspace()?;
+        let dir = workspace(&test_src)?;
         let contract = TaskContract::workspace(
             GOAL,
             dir.path(),
-            Verification::WorkspaceTestPasses {
-                files: vec!["src/berth.rs".into()],
-                test_src,
+            Verification::Command {
+                argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+                expect_exit: 0,
             },
         )
         .with_max_steps(6)

@@ -334,12 +334,10 @@ impl RunResult {
 /// let contract = TaskContract::new(
 ///     "add a `hello` function returning 42",
 ///     "src/hello.rs",
-///     // Execution-based: the file is compiled and this test is run against it,
-///     // so `fn hello` written as a literal string fails — which is exactly what
-///     // a model did to the cheaper `FileContains` in the 0.1.0 live run.
-///     Verification::RustTestPasses {
-///         test_src: "#[test] fn answers() { assert_eq!(hello(), 42); }".into(),
-///     },
+///     // Execution-based: the project's own build has to succeed, so `fn hello`
+///     // written as a literal string fails — which is exactly what a model did to
+///     // the cheaper `FileContains` in the 0.1.0 live run.
+///     Verification::Command { argv: vec!["cargo".into(), "build".into()], expect_exit: 0 },
 /// )
 /// .with_max_steps(6);
 ///
@@ -439,10 +437,7 @@ pub async fn run_observed<P: Provider>(
 /// let contract = TaskContract::workspace(
 ///     "make the failing test in tests/parse.rs pass",
 ///     "/path/to/repo",
-///     Verification::WorkspaceTestPasses {
-///         files: vec!["src/parse.rs".into()],
-///         test_src: "#[test] fn empty_is_err() { assert!(parse(\"\").is_err()); }".into(),
-///     },
+///     Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
 /// );
 ///
 /// // Three tiers, and the middle one is the only one anybody is asked about.
@@ -4153,32 +4148,52 @@ async fn dispatch(
                     remember,
                 } => {
                     let body = content.unwrap_or_default();
+                    // What is there now, read before the write so the line counts
+                    // below have something to compare against. The write gate has
+                    // already passed at this point; this is measurement, and the
+                    // content never reaches the model.
+                    let before = ws
+                        .resolve(&target)
+                        .ok()
+                        .and_then(|abs| std::fs::read_to_string(abs).ok())
+                        .unwrap_or_default();
                     match ws.write_file(&target, &body) {
-                        Ok(wrote) => Dispatched::Continue {
-                            decision: format!("wrote {target}"),
-                            // A write that changed nothing says so, to the model as
-                            // well as to the trace: an agent rewriting a file with
-                            // what it already held is the shape of a stall, and it
-                            // cannot correct for what it is not told.
-                            obs: bound(
-                                &format!(
-                                    "\n[wrote {target}] ({} chars{})\n",
-                                    body.chars().count(),
-                                    if wrote.moved_the_workspace() {
-                                        ""
-                                    } else {
-                                        ", identical to what was already there — the \
+                        Ok(wrote) => {
+                            record_edit(
+                                store,
+                                run_id,
+                                step,
+                                WRITE_FILE_TOOL,
+                                &target,
+                                &before,
+                                &body,
+                            );
+                            Dispatched::Continue {
+                                decision: format!("wrote {target}"),
+                                // A write that changed nothing says so, to the model as
+                                // well as to the trace: an agent rewriting a file with
+                                // what it already held is the shape of a stall, and it
+                                // cannot correct for what it is not told.
+                                obs: bound(
+                                    &format!(
+                                        "\n[wrote {target}] ({} chars{})\n",
+                                        body.chars().count(),
+                                        if wrote.moved_the_workspace() {
+                                            ""
+                                        } else {
+                                            ", identical to what was already there — the \
                                          workspace did not change"
-                                    }
+                                        }
+                                    ),
+                                    cap,
+                                    ObsKind::Write,
                                 ),
-                                cap,
-                                ObsKind::Write,
-                            ),
-                            kind: ObsKind::Write,
-                            target: Some(target.clone()),
-                            changed: wrote.moved_the_workspace(),
-                            remember,
-                        },
+                                kind: ObsKind::Write,
+                                target: Some(target.clone()),
+                                changed: wrote.moved_the_workspace(),
+                                remember,
+                            }
+                        }
                         Err(e) => Dispatched::go("write error", format!("\n[write error] {e}\n")),
                     }
                 }
@@ -4222,28 +4237,43 @@ async fn dispatch(
                 } => {
                     let replacement = content.unwrap_or_default();
                     match ws.edit_file(&target, search, &replacement) {
-                        Ok(wrote) => Dispatched::Continue {
-                            decision: format!("edited {target}"),
-                            obs: bound(
-                                &format!(
-                                    "\n[edited {target}] replaced {} chars with {}{}\n",
-                                    search.chars().count(),
-                                    replacement.chars().count(),
-                                    if wrote.moved_the_workspace() {
-                                        ""
-                                    } else {
-                                        " — the replacement is identical to what was there, so \
+                        Ok(wrote) => {
+                            // The replaced text against the text that replaced it.
+                            // Everything outside the match is byte-identical by
+                            // construction, so this is the same answer comparing the
+                            // whole file would give, without reading it twice.
+                            record_edit(
+                                store,
+                                run_id,
+                                step,
+                                EDIT_FILE_TOOL,
+                                &target,
+                                search,
+                                &replacement,
+                            );
+                            Dispatched::Continue {
+                                decision: format!("edited {target}"),
+                                obs: bound(
+                                    &format!(
+                                        "\n[edited {target}] replaced {} chars with {}{}\n",
+                                        search.chars().count(),
+                                        replacement.chars().count(),
+                                        if wrote.moved_the_workspace() {
+                                            ""
+                                        } else {
+                                            " — the replacement is identical to what was there, so \
                                          the workspace did not change"
-                                    }
+                                        }
+                                    ),
+                                    cap,
+                                    ObsKind::Write,
                                 ),
-                                cap,
-                                ObsKind::Write,
-                            ),
-                            kind: ObsKind::Write,
-                            target: Some(target.clone()),
-                            changed: wrote.moved_the_workspace(),
-                            remember,
-                        },
+                                kind: ObsKind::Write,
+                                target: Some(target.clone()),
+                                changed: wrote.moved_the_workspace(),
+                                remember,
+                            }
+                        }
                         // A miss or an ambiguity is the model's to fix and says how:
                         // an edit that guessed which of three occurrences was meant
                         // is the failure this tool exists to make impossible.
@@ -5112,7 +5142,28 @@ async fn complete_with_retry<P: Provider>(
     let max_duration = contract.max_duration;
     let mut attempt = 0;
     loop {
-        match provider.complete(request.clone()).await {
+        // 0.18.0: one `provider_calls` row per attempt, written here because this
+        // is the only place that knows an attempt happened — a `Fallback` is one
+        // `complete` call from the outside, and `steps.tokens` collapses a
+        // retried step into a single integer attributed to nothing.
+        //
+        // The clock is the harness's own and brackets `complete`, so it includes
+        // this crate's request building and stream consumption as well as the
+        // provider's part. `CONTRACT.md` says so rather than implying the figure
+        // is the vendor's.
+        let started = std::time::Instant::now();
+        let outcome = provider.complete(request.clone()).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        record_provider_call(
+            store,
+            run_id,
+            step,
+            attempt,
+            provider.name(),
+            latency_ms,
+            &outcome,
+        );
+        match outcome {
             Ok(response) => return Ok(response),
             // Only ask again if asking again could answer differently. Before
             // 0.11.0 every error was retried identically — including a 401 and a
@@ -5189,6 +5240,63 @@ async fn complete_with_retry<P: Provider>(
                 return Err(e);
             }
         }
+    }
+}
+
+/// Record one file change and the lines it added and removed (0.18.0).
+///
+/// Swallowed on a store failure for the same reason a provider call is: an edit
+/// that reached the disk is not undone by failing to write its bookkeeping row,
+/// and turning the run into an error here would lose the work as well as the
+/// row.
+fn record_edit(
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    tool: &str,
+    path: &str,
+    before: &str,
+    after: &str,
+) {
+    let edit = crate::state::Edit::measure(step, tool, path, before, after);
+    if let Err(e) = store.record_edit(run_id, &edit) {
+        tracing::warn!("could not record the edit to {path} at step {step}: {e}");
+    }
+}
+
+/// Record one provider call, answered or failed (0.18.0).
+///
+/// A failed attempt is recorded too, and deliberately: a model that produced
+/// tokens and then hit a broken connection was still billed for them, so a trace
+/// that kept only the winning attempt would understate the money.
+///
+/// A store that cannot take the row is logged and swallowed. The alternative is
+/// failing a run that the provider answered because the accounting could not be
+/// written, which trades a real answer for a bookkeeping entry.
+fn record_provider_call(
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    attempt: u32,
+    provider: &str,
+    latency_ms: u64,
+    outcome: &Result<CompletionResponse>,
+) {
+    let call = crate::state::ProviderCall {
+        step,
+        attempt,
+        provider: provider.to_string(),
+        model: outcome.as_ref().ok().and_then(|r| r.model.clone()),
+        usage: outcome.as_ref().ok().and_then(|r| r.usage),
+        latency_ms,
+        ttft_ms: outcome.as_ref().ok().and_then(|r| r.ttft_ms),
+        finish_reason: outcome.as_ref().ok().and_then(|r| r.finish_reason.clone()),
+        // The same short name the retry and escalation rows use, so the two
+        // surfaces name one failure identically rather than nearly so.
+        failure: outcome.as_ref().err().map(kind_of),
+    };
+    if let Err(e) = store.record_provider_call(run_id, &call) {
+        tracing::warn!("could not record the provider call for step {step}: {e}");
     }
 }
 

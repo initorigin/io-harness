@@ -11,9 +11,6 @@
 //! installs a system package; a machine without them skips with a stated reason
 //! rather than passing vacuously.
 
-// F10 is *about* the deprecated variants, so it uses them.
-#![allow(deprecated)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use io_harness::policy::Policy;
@@ -295,16 +292,28 @@ async fn a_quiet_turn_does_not_end_a_run_that_has_a_criterion() {
 }
 
 // ---------------------------------------------------------------------------
-// F10 — the deprecated variants still work
+// The removal (0.18.0): what the deprecated variants proved, proved through the
+// gate that replaced them
 // ---------------------------------------------------------------------------
 
-/// A 0.16.2-era contract, written exactly as it was then. That it compiles at all
-/// against 0.17.0 is half the claim; that it produces the same outcome is the
-/// other half.
+/// The 0.17.0 deprecation note told a caller to write this criterion instead,
+/// and named 0.18.0 as the release that would remove the old one. This is the
+/// assertion behind that note: the replacement reaches the same outcome, on the
+/// same fixture, through the same loop.
 #[tokio::test]
-async fn a_0_16_2_contract_using_the_rust_variants_still_reaches_the_same_outcome() {
+async fn the_replacement_criterion_reaches_the_outcome_the_removed_variants_did() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("src/lib.rs"),
+        "pub mod a;\n#[test] fn t() { assert_eq!(a::a(), 42); }\n",
+    )
+    .unwrap();
     std::fs::write(dir.path().join("src/a.rs"), "pub fn a() -> u32 { 0 }\n").unwrap();
     let store = Store::memory().unwrap();
     let provider = MockScript::new(vec![vec![write("src/a.rs", "pub fn a() -> u32 { 42 }\n")]]);
@@ -312,9 +321,9 @@ async fn a_0_16_2_contract_using_the_rust_variants_still_reaches_the_same_outcom
     let contract = TaskContract::workspace(
         "make a() return 42",
         dir.path(),
-        Verification::WorkspaceTestPasses {
-            files: vec!["src/a.rs".into()],
-            test_src: "#[test] fn t() { assert_eq!(a(), 42); }".into(),
+        Verification::Command {
+            argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+            expect_exit: 0,
         },
     )
     .with_max_steps(3);
@@ -325,90 +334,46 @@ async fn a_0_16_2_contract_using_the_rust_variants_still_reaches_the_same_outcom
     assert_eq!(result.outcome, RunOutcome::Success { steps: 1 });
 }
 
-/// The deprecation notice is a promise to a caller — that there is a replacement,
-/// and how long they have — and a promise in an attribute rots as quietly as one
-/// in prose. So it is checked.
+/// The deprecation was a promise with a date on it: three variants, replaced by
+/// `Verification::Command`, removed in 0.18.0. A promise in an attribute rots as
+/// quietly as one in prose, so the 0.17.0 suite checked the attribute existed.
+/// This is the other end of it — the promise was kept, and the source is what
+/// says so.
 ///
 /// A pure function over the source text, with a negative control below, in the
 /// style of this repository's other documentation checkers: a checker that
 /// silently matches nothing passes every input and reports a green claim.
-fn deprecations(src: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut note: Option<String> = None;
-    let mut collecting = false;
-    let mut buf = String::new();
-    for line in src.lines() {
+fn mentions_variant(src: &str, variant: &str) -> bool {
+    src.lines().any(|line| {
         let t = line.trim();
-        if t.starts_with("#[deprecated(") {
-            collecting = true;
-            buf.clear();
-        }
-        if collecting {
-            buf.push_str(t);
-            buf.push(' ');
-            if t.ends_with(")]") {
-                collecting = false;
-                note = Some(buf.clone());
-            }
-            continue;
-        }
-        if let Some(n) = note.take() {
-            // The variant the attribute sits on: the next non-attribute line.
-            let name: String = t
-                .chars()
-                .take_while(|c| c.is_alphanumeric() || *c == '_')
-                .collect();
-            if !name.is_empty() {
-                out.push((name, n));
-            }
-        }
-    }
-    out
+        // A doc comment may still discuss the removal; a `Verification::X` in
+        // code is what would mean the variant is back.
+        !t.starts_with("//") && t.contains(&format!("Verification::{variant}"))
+    })
 }
 
 #[test]
-fn each_deprecated_variant_names_its_replacement_and_the_release_that_removes_it() {
+fn the_three_deprecated_variants_are_gone_from_the_source() {
     let src = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/verify.rs"),
     )
     .unwrap();
-    let found = deprecations(&src);
 
     for variant in ["CompilesRust", "RustTestPasses", "WorkspaceTestPasses"] {
-        let (_, note) = found
-            .iter()
-            .find(|(name, _)| name == variant)
-            .unwrap_or_else(|| panic!("{variant} must carry a #[deprecated] attribute"));
         assert!(
-            note.contains("since = \"0.17.0\""),
-            "{variant}: the attribute says when: {note}"
-        );
-        assert!(
-            note.contains("Verification::Command"),
-            "{variant}: and what to write instead: {note}"
-        );
-        assert!(
-            note.contains("0.18.0"),
-            "{variant}: and how long they have, by name rather than \"a future release\": {note}"
+            !mentions_variant(&src, variant),
+            "{variant} was promised removed in 0.18.0 and is still in src/verify.rs"
         );
     }
-    assert_eq!(
-        found.len(),
-        3,
-        "exactly the three the contract deprecates, no more: {found:?}"
+
+    // The negative control. Without it this test passes against a checker that
+    // matches nothing at all — including against a file that never loaded.
+    assert!(
+        mentions_variant(&src, "Command"),
+        "the checker matches nothing, so its three passes above mean nothing"
     );
-}
-
-/// The negative control for the checker above. A variant with no attribute must
-/// not be reported as deprecated — otherwise the test passes on a release that
-/// deprecated nothing.
-#[test]
-fn the_deprecation_checker_reports_nothing_for_a_variant_that_carries_no_attribute() {
-    let fixture = "pub enum V {\n    /// doc\n    Undeprecated,\n}\n";
-    assert!(deprecations(fixture).is_empty());
-
-    // And it does find one that is there, so it is not a checker that matches
-    // nothing whatever it is given.
-    let marked = "pub enum V {\n    #[deprecated(since = \"0.17.0\", note = \"x\")]\n    Old,\n}\n";
-    assert_eq!(deprecations(marked).len(), 1);
+    assert!(
+        !src.contains("#[deprecated"),
+        "the deprecation cycle this release closes was the only one open"
+    );
 }

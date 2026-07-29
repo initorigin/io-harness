@@ -25,13 +25,11 @@ use crate::verify::Verification;
 /// let contract = TaskContract::workspace(
 ///     "make `parse` return an error on empty input instead of panicking",
 ///     "/path/to/repo",
-///     // The criterion is checked by compiling and running, so a plausible-looking
-///     // stub cannot satisfy it. This is the half of the contract that decides
-///     // whether the run *succeeded*, as opposed to merely stopping.
-///     Verification::WorkspaceTestPasses {
-///         files: vec!["src/parse.rs".into()],
-///         test_src: "#[test] fn empty_is_err() { assert!(parse(\"\").is_err()); }".into(),
-///     },
+///     // The criterion is checked by running the project's own suite, so a
+///     // plausible-looking stub cannot satisfy it. This is the half of the
+///     // contract that decides whether the run *succeeded*, as opposed to merely
+///     // stopping.
+///     Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
 /// )
 /// // And this is the half that decides when it stops regardless. All three are
 /// // independent stops with their own `RunOutcome`, so a run that ran out of
@@ -188,7 +186,8 @@ impl TaskContract {
 
     /// A workspace task: the agent may grep, find, read, and write several files
     /// under `root`. `verify` should be a multi-file variant
-    /// ([`Verification::EachCompilesRust`] / [`Verification::WorkspaceTestPasses`]).
+    /// ([`Verification::EachCompilesRust`], or a [`Verification::Command`] that runs
+    /// the project's own suite).
     /// Defaults match [`TaskContract::new`] (12 steps here, since repo tasks take
     /// more turns), no time/token budget, 2 retries.
     pub fn workspace(

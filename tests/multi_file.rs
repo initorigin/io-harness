@@ -3,13 +3,6 @@
 //! agent greps/finds across a repo, edits several files, and the run only
 //! succeeds when the whole edited set meets its spec.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
@@ -56,14 +49,28 @@ fn fixture() -> tempfile::TempDir {
     std::fs::create_dir_all(&src).unwrap();
     std::fs::write(src.join("a.rs"), "pub fn a() -> u32 { 0 }\n").unwrap();
     std::fs::write(src.join("b.rs"), "pub fn b() -> u32 { 0 }\n").unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\npub mod b;\n#[test] fn t() { assert_eq!(a::a() + b::b(), 42); }\n",
+    )
+    .unwrap();
     dir
 }
 
-/// The success spec: the two files, together, must make `a() + b() == 42`.
+/// The success spec: the two files, together, must make `a() + b() == 42`, and
+/// the project's own runner is what says so. Until 0.18.0 this was
+/// `WorkspaceTestPasses`, which concatenated the files the caller listed and
+/// compiled a criterion beside them; `cargo test` runs the crate's real suite,
+/// which is what the migration note tells a caller to write.
 fn verify() -> Verification {
-    Verification::WorkspaceTestPasses {
-        files: vec!["src/a.rs".into(), "src/b.rs".into()],
-        test_src: "#[test] fn t() { assert_eq!(a() + b(), 42); }".into(),
+    Verification::Command {
+        argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+        expect_exit: 0,
     }
 }
 

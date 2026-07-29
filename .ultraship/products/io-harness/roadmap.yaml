@@ -394,8 +394,8 @@ versions:
       to say plainly that a consumer upgrading 0.16.2 straight to 0.18.0 meets the removal with no
       intervening warning, because that is the cost of the short cycle and a reader who upgraded one
       minor at a time is not the only reader.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.19.0
     outcome: >
       An operator configures the harness in a file instead of in Rust, and io-cli and io-studio read

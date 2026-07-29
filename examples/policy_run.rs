@@ -10,13 +10,6 @@
 //! tree every write to which must be approved. The approver here prints the
 //! request and approves — swap it for [`StdinApprover`] to decide by hand.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use io_harness::approve::{Approver, Decision, DecisionFuture, Request};
 use io_harness::{run_with, Policy, RunOutcome, Store, TaskContract, Verification};
 
@@ -43,6 +36,16 @@ async fn main() -> io_harness::Result<()> {
     std::fs::write(src.join("a.rs"), "pub fn a() -> u32 { 0 }\n")?;
     std::fs::write(src.join("b.rs"), "pub fn b() -> u32 { 0 }\n")?;
     std::fs::write(dir.path().join("secrets/key.txt"), "do-not-touch")?;
+    // A real cargo project: the gate is the project's own `cargo test` since
+    // 0.18.0 removed the criteria that compiled loose `.rs` files.
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\npub mod b;\n#[test] fn t() { assert_eq!(a::a() + b::b(), 42); }\n",
+    )?;
 
     // Reads are open, secrets/ is denied outright, and every write asks
     // (Policy::default's write tier) before it happens.
@@ -57,9 +60,9 @@ async fn main() -> io_harness::Result<()> {
          report what it contains. Step 2: edit src/a.rs and src/b.rs so that \
          a() + b() returns 42 between them.",
         dir.path(),
-        Verification::WorkspaceTestPasses {
-            files: vec!["src/a.rs".into(), "src/b.rs".into()],
-            test_src: "#[test] fn t() { assert_eq!(a() + b(), 42); }".into(),
+        Verification::Command {
+            argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+            expect_exit: 0,
         },
     )
     // Without this, a model that meets a refusal tends to retry the same denied

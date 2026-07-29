@@ -6,13 +6,6 @@
 //! new connection with a fresh in-memory ledger and step counters, exactly what
 //! a restarted process sees. Nothing here touches the network.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -24,6 +17,23 @@ use io_harness::{
     Containment, Policy, Provider, RunOutcome, Store, TaskContract, Verification,
 };
 use serde_json::json;
+
+/// The compile gate these tests use, now that the Rust-specific criteria are
+/// gone: `rustc` invoked by argv, in the edited file's own directory, exactly as
+/// a caller following the 0.17.0 migration note would write it.
+fn compiles(file: &str) -> Verification {
+    Verification::Command {
+        argv: vec![
+            "rustc".into(),
+            "--edition".into(),
+            "2021".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            file.into(),
+        ],
+        expect_exit: 0,
+    }
+}
 
 // ---------- providers ----------
 
@@ -908,8 +918,7 @@ async fn a_sandboxed_verification_is_recreated_on_resume() {
     // steps are not re-run.
     let file = ws().path().join("lib.rs");
     let store = Store::memory().unwrap();
-    let capped =
-        TaskContract::new("make it compile", &file, Verification::CompilesRust).with_max_steps(1);
+    let capped = TaskContract::new("make it compile", &file, compiles("lib.rs")).with_max_steps(1);
     let broken = run(&capped, &Script::new(vec![("fn main( {\n", 5)]), &store)
         .await
         .unwrap();
@@ -917,7 +926,7 @@ async fn a_sandboxed_verification_is_recreated_on_resume() {
     let before = store.last_step(broken.run_id).unwrap();
 
     let contract =
-        TaskContract::new("make it compile", &file, Verification::CompilesRust).with_max_steps(4);
+        TaskContract::new("make it compile", &file, compiles("lib.rs")).with_max_steps(4);
     let r = resume(
         &contract,
         &Script::new(vec![("pub fn f() -> u32 { 42 }\n", 5)]),

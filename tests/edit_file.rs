@@ -6,19 +6,29 @@
 //! (the I01 stub is rejected in the loop), the time and cost budgets, retry with
 //! escalation, and resuming an interrupted run.
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{resume, run, Provider, RunOutcome, Store, TaskContract, Verification};
 use serde_json::json;
+
+/// The compile gate these tests use, now that the Rust-specific criteria are
+/// gone: `rustc` invoked by argv, in the edited file's own directory, exactly as
+/// a caller following the 0.17.0 migration note would write it.
+fn compiles(file: &str) -> Verification {
+    Verification::Command {
+        argv: vec![
+            "rustc".into(),
+            "--edition".into(),
+            "2021".into(),
+            "--crate-type".into(),
+            "lib".into(),
+            file.into(),
+        ],
+        expect_exit: 0,
+    }
+}
 
 /// A provider that always returns a scripted `write_file` call.
 struct MockWriter {
@@ -173,12 +183,12 @@ async fn stops_at_step_cap_when_never_verified() {
 #[tokio::test]
 async fn execution_verify_rejects_the_i01_stub_in_the_loop() {
     // The 0.1.0 failure: the model writes the literal substring "fn hello",
-    // which does not compile. Under CompilesRust the loop can never pass it.
+    // which does not compile. Under a compile gate the loop can never pass it.
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("hello.rs");
 
-    let contract = TaskContract::new("compile a hello fn", &file, Verification::CompilesRust)
-        .with_max_steps(2);
+    let contract =
+        TaskContract::new("compile a hello fn", &file, compiles("hello.rs")).with_max_steps(2);
     let stub = MockWriter::new("fn hello");
     let store = Store::memory().unwrap();
 
@@ -191,7 +201,7 @@ async fn execution_verify_accepts_a_compiling_file() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("hello.rs");
 
-    let contract = TaskContract::new("compile a hello fn", &file, Verification::CompilesRust);
+    let contract = TaskContract::new("compile a hello fn", &file, compiles("hello.rs"));
     let good = MockWriter::new("pub fn hello() -> u32 { 42 }\n");
     let store = Store::memory().unwrap();
 

@@ -11,7 +11,7 @@ itself, and that is precisely when a dependent needs the explanation most.
 The public surface is everything re-exported from the crate root plus the items
 reachable through the public modules it names.
 
-The re-exported half — the 106 items a caller reaches as `io_harness::Thing` —
+The re-exported half — the 110 items a caller reaches as `io_harness::Thing` —
 is enumerated in [public-api.txt](public-api.txt), which a test compares against
 the live crate on every run. That is the surface the deprecation cycle below
 covers and the surface every item of which carries a worked example.
@@ -116,14 +116,61 @@ Windows as "resource-capped".
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.17.0.
+is fixed as of 0.18.0.
 
-**What a passing verification gate proves.** It proves the criterion compiled
-and ran against the subject and reported success. It does not prove the
-implementation is correct, idiomatic, or complete. Since 0.8.1 a subject can no
-longer shadow a macro the criterion invokes, nor delete the criterion and pass on
-an empty test binary — but a gate is a check the caller wrote, and it proves
-exactly what that check tested. See the
+**What every recorded number is, and is not (0.18.0).** The trace now answers
+what a run cost and which model spent it, and the provenance of each figure
+matters more than the figure:
+
+- A **token count is the provider's report**, not this crate's measurement.
+  `Usage` is `None` where the provider reported nothing, which is not the same
+  fact as zero, and `total_tokens` is taken as reported rather than re-derived
+  from the parts — a vendor whose total disagrees with its own breakdown is
+  billing on the total.
+- A **latency is the harness's own wall clock**, bracketing `Provider::complete`.
+  It includes this crate's request building and stream consumption, so it is
+  slightly above what the vendor would call its own latency, by design: it is the
+  wait a caller actually experiences.
+- A **TTFT is `None`, never zero, where nothing measured it** — a provider that
+  does not stream, or a test double. An unmeasured wait and an instant one are
+  different facts.
+- **Cache and reasoning counters are breakdowns**, not additions: cache tokens of
+  `prompt_tokens`, reasoning tokens of `completion_tokens`. Anthropic reports its
+  cache counts *beside* a prompt count that excludes them and the crate
+  reconciles that at the wire boundary, so a row does not mean two things
+  depending on which vendor wrote it.
+- **`server_tool_requests` is zero everywhere** until the crate declares
+  provider-executed tools (0.22.0). The meter exists before the spending so that
+  adding them is not a second break of `Usage`.
+- A **cost is derived, never stored**, from a price table the operator supplies,
+  and is therefore only as right as that table. The crate ships **no prices** and
+  requires an as-of date on any table, because it cannot keep a vendor's price
+  list accurate on its own release schedule. An unpriced call is counted in
+  `Spend::unpriced_calls` rather than costed at zero: a group with calls there is
+  reporting a floor, not a total.
+- **A run recorded before 0.18.0 has no rows at all**, in either new table.
+  Nothing is backfilled, because the facts were never recorded. The queries
+  return nothing rather than zeros.
+
+**Lines added and removed are not a minimal diff.** `Edit::measure` compares the
+file's lines before and after and trims the common head and tail. A one-line
+replacement is one added and one removed; a rewrite of the middle of a file is
+the size of that middle. It is a size, not a patch.
+
+**What a passing verification gate proves.** It proves the criterion ran against
+the subject and reported success. It does not prove the implementation is
+correct, idiomatic, or complete. A gate is a check the caller wrote, and it
+proves exactly what that check tested.
+
+As of 0.18.0 a criterion is a command — the project's own runner, in its own
+process — or `EachCompilesRust`, the one gate the harness still spawns `rustc`
+for. The class of bypass 0.8.1 hardened against is therefore **structurally
+gone** rather than defended against: it required a caller-supplied criterion
+compiled into the subject's own crate, and no criterion is any more. What
+replaces that guarantee is ordinary discipline about where the criterion lives —
+a gate the agent is permitted to edit is not a gate, whatever the harness does.
+`TEST_BINARY` still exists so that policies written against it compile, but
+**nothing spawns it**: denying it changes nothing. See the
 [verification guide](guide/verification.md).
 
 **What the permission policy governs.** It decides whether an action is taken:

@@ -15,13 +15,6 @@
 //! cargo run --example context_growth
 //! ```
 
-// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
-// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
-// still work, and the fixtures are loose `.rs` files rather than cargo projects,
-// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
-// has no project to run in. See docs/guide/verification.md for the migration.
-#![allow(deprecated)]
-
 use io_harness::{run, OpenRouter, Store, TaskContract, Verification};
 
 #[tokio::main]
@@ -44,19 +37,26 @@ async fn main() -> io_harness::Result<()> {
         )?;
     }
 
+    // A real cargo project: the gate is the project's own `cargo test` since
+    // 0.18.0 removed the criteria that compiled loose `.rs` files.
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )?;
+    std::fs::write(
+        src.join("lib.rs"),
+        "pub mod a;\npub mod b;\npub mod c;\npub mod d;\n\
+         #[test] fn t() { assert_eq!(a::a() + b::b() + c::c() + d::d(), 100); }\n",
+    )?;
+
     let contract = TaskContract::workspace(
         "Edit the four source files so a() + b() + c() + d() == 100. Read every file \
          before you change it, and read a file again after you have written it to \
          confirm what it now contains.",
         &root,
-        Verification::WorkspaceTestPasses {
-            files: vec![
-                "src/a.rs".into(),
-                "src/b.rs".into(),
-                "src/c.rs".into(),
-                "src/d.rs".into(),
-            ],
-            test_src: "#[test] fn t() { assert_eq!(a() + b() + c() + d(), 100); }".into(),
+        Verification::Command {
+            argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+            expect_exit: 0,
         },
     )
     .with_max_steps(20)
