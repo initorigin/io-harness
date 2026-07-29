@@ -116,7 +116,7 @@ Windows as "resource-capped".
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.16.0.
+is fixed as of 0.17.0.
 
 **What a passing verification gate proves.** It proves the criterion compiled
 and ran against the subject and reported success. It does not prove the
@@ -134,15 +134,44 @@ program's privileges; a stdio MCP server is a separate process that, once
 started, dials what it likes. The harness decides what starts, not what a started
 thing then does.
 
-**A registered tool can be silently shadowed.** `Toolbox` rejects a tool that
-takes the name of a built-in, but the reserved set names only the original
-seven — `write_file`, `read_file`, `grep`, `find`, `read_skill`, `remember`,
-`spawn_agent`. The built-ins added since — the git, image and document tools —
-are not in it, while dispatch tests every built-in arm *before* it reaches the
-toolbox. So registering a tool called `git_status` or `xlsx_read` passes
-validation and is then permanently unreachable: the built-in answers every call.
-This is the exact silent shadowing the reserved set exists to prevent. Until it
-is closed, do not name a registered tool after any built-in.
+**What a command the agent runs is bounded by.** As of 0.17.0 the agent can run
+a command with the `exec` tool. Every call is an `Act::Exec` check on the program
+*and* on the whole argv, so `allow_exec("cargo test*")` beside
+`deny_exec("cargo publish*")` means what it reads, and both decisions land in
+`policy_events` attributed to the rule and layer. What the policy does **not**
+decide is what the command then does.
+
+A command runs **in the workspace root with the embedding program's privileges,
+outside the sandbox**. That is the same bound already stated above for a
+registered `Tool` and a stdio MCP server, and it is deliberate: the sandbox
+denies network egress and confines writes to its own workdir, which is right for
+a verification gate and makes `npm install` impossible. Three consequences worth
+naming. A policy written for file access does not constrain command execution —
+`Act::Read`/`Act::Write` rules say nothing about `exec`, and the tier default
+decides everything unnamed. A command can reach what the agent's own file rules
+would have refused, because `cat secrets/prod.env` is a command and not a read.
+And a timeout kills the **direct child only**: a process that child started
+itself may outlive it, on every platform this crate supports — the same gap the
+sandbox reports for its own wall-clock kill on the portable floor. See the
+[command execution guide](guide/command-execution.md).
+
+**Toolchain detection is a default, and it will be wrong for someone.** The
+shipped table maps one marker file in the workspace root to an ecosystem and its
+conventional commands, and puts that in front of the model. The harness never
+runs those commands itself. Ecosystems disagree with themselves — half of all
+`npm test` scripts do not run tests — and only the root is examined, so a
+monorepo whose packages each carry a marker gets one detection. It is not
+overridable until 0.19.0 puts a configuration file under it.
+
+**Closed in 0.17.0: a registered tool could be silently shadowed.** The reserved
+set named only the original seven built-ins while dispatch grew to twenty-six, so
+a registered tool called `git_status` or `xlsx_read` passed `Toolbox::validate`
+and was then permanently unreachable — the built-in answered every call. It now
+names every built-in, in every build regardless of feature flags, and a
+registered tool taking one of those names fails the run before the first
+completion. The names of feature-gated built-ins are reserved even where the tool
+itself is not compiled in, so enabling a feature can never take away a tool that
+was working.
 
 **Windows resource caps.** See the platform table above.
 

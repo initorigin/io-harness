@@ -26,6 +26,184 @@ notes are produced from it.
 
 ### Security
 
+## [0.17.0] - 2026-07-29
+
+The release that makes the repositioning true in code. Before it the type system
+required every run to name a `Verification`, and four of the five variants
+compiled or ran Rust — so "debug a production issue", "fix a deployment" or
+"build an application" could not be expressed, let alone executed, because there
+was no way to run a command and no way to say the work was done without a Rust
+gate. Point the harness at a project in any language and the agent can now run
+that project's own toolchain, change a file by replacing an exact string, and
+have the run's definition of done be that project's own test command — or nothing
+at all.
+
+### Breaking changes
+
+- **BREAKING** — `Verification` gains two variants, `Command { argv, expect_exit }`
+  and `None`, so an exhaustive `match` on it no longer compiles.
+
+  *Migration:* add an arm for each rather than a wildcard, so the next variant is
+  caught by the compiler instead of being silently absorbed.
+
+  ```rust
+  match verify {
+      Verification::Command { argv, expect_exit } => { /* a command criterion */ }
+      Verification::None => { /* no criterion at all */ }
+      // ... the existing arms, unchanged
+  }
+  ```
+
+- **BREAKING** — `RunOutcome` gains `Finished { steps }`, the terminal outcome of
+  a `Verification::None` run, so an exhaustive `match` on it no longer compiles.
+
+  *Migration:* add the arm. It means the agent stopped because it was done, not
+  because a ceiling stopped it — distinct from `StepCapReached`, `Stalled` and
+  the budget outcomes on purpose. It is **not** a claim the work is correct;
+  nothing checked it.
+
+  ```rust
+  match result.outcome {
+      RunOutcome::Finished { steps } => println!("agent finished at step {steps}; nothing verified it"),
+      // ... the existing arms, unchanged
+  }
+  ```
+
+- **BREAKING** — `TaskContract` gains a public `exec_timeout: Duration` field, so
+  a struct literal that names every field no longer compiles.
+
+  *Migration:* build the contract with `TaskContract::new` or
+  `TaskContract::workspace` and the `with_*` builders, which is the supported
+  path and was always the intended one. If you must construct one by literal, add
+  `exec_timeout: io_harness::DEFAULT_EXEC_TIMEOUT`.
+
+  ```rust
+  let contract = TaskContract::workspace(goal, root, verify)
+      .with_exec_timeout(std::time::Duration::from_secs(1800));
+  ```
+
+- **BREAKING (behaviour)** — a registered `Tool` named after **any** built-in now
+  fails validation at run start. The reserved set previously named only seven
+  built-ins while dispatch tested twenty-six, so a tool called `git_status`,
+  `xlsx_read` or `view_image` passed validation and was then permanently
+  unreachable — the built-in answered every call.
+
+  *Migration:* rename the tool. The change is not that it stopped working; it
+  never worked. The change is that the failure is now visible instead of silent.
+  The names of feature-gated built-ins are reserved in every build, including
+  builds that do not contain them, so enabling a feature can never take away a
+  tool that was working.
+
+### Added
+
+- **An `exec` tool.** The agent can run a command in the workspace root — the
+  project's own build, tests, linter, formatter or package manager. It takes a
+  fixed argv array and never a shell string, so `;`, `&&`, `$( )` and a backtick
+  are ordinary bytes inside one argument rather than syntax. Every call is an
+  `Act::Exec` check against the policy on the program **and** on the whole argv,
+  so `allow_exec("cargo test*")` beside `deny_exec("cargo publish*")` means what
+  it reads, and both decisions land in `policy_events` with the rule and layer
+  that produced them.
+- **Bounds on what a command may do to the run.** A wall-clock timeout —
+  `DEFAULT_EXEC_TIMEOUT`, 15 minutes, overridable per contract with
+  `TaskContract::with_exec_timeout` — so a wedged command dies naming itself
+  rather than consuming the contract's whole time budget and being reported as a
+  budget stop. Oversized output keeps its head and its tail and elides the
+  middle, stating in the result the model reads how much went, because a build
+  log's useful content is at both ends.
+- **An `edit_file` tool** performing exact string replacement. A search string
+  matching zero times or more than once is a typed error naming the file and the
+  count, and the file is not touched — a replacement that guessed which of three
+  occurrences was meant is a corrupting write, not a cheap one. Gated by the same
+  `Act::Write` check on the same path as `write_file`, because it is the same act.
+- **`Verification::Command { argv, expect_exit }`** — a criterion that runs a
+  caller-supplied command inside the existing execution sandbox and asserts its
+  exit status. One variant covering every language the machine has a toolchain
+  for. A command killed by a signal or a sandbox cap reports as no exit at all,
+  so no `expect_exit` can match it.
+- **`Verification::None`** — a run with no gate, ended by an assistant turn that
+  calls no tool. No `done` tool is added, so an unverified run gains no tool
+  surface over a verified one.
+- **A project and toolchain table**, shipped as data in the crate
+  (`io_harness::toolchain`). One marker file in the workspace root maps to an
+  ecosystem and its conventional install, build, test, lint, format and run
+  argvs, across Cargo, npm/pnpm/yarn/bun (resolved by lockfile), Deno, Go, Python
+  (uv/poetry/pip), Maven, Gradle, .NET, Ruby, PHP, Elixir, Swift, CMake and Make.
+  The detection is put in front of the model every turn, so it stops spending
+  turns guessing the package manager. `Toolchain` is `Serialize`/`Deserialize` so
+  0.19.0's configuration file can deserialize operator overrides into this same
+  type. A directory with no marker reports no detection rather than guessing.
+- **A `gate_output` sandbox event.** When a `Verification::Command` criterion
+  fails, what the command printed is recorded in the trace — without it, "the
+  agent's change is wrong" and "the test runner is not installed" are the same
+  discriminant and need opposite responses.
+- **A nightly docs.rs job in CI**, building the way docs.rs builds (nightly,
+  `--cfg docsrs`, all features) and checking the **rendered HTML** for the feature
+  labels rather than trusting exit zero. It is the only thing that would have
+  caught the defect 0.16.2 had to fix, and its absence was recorded as a known
+  limitation on that release.
+- Guide pages for [command execution](docs/guide/command-execution.md) and
+  [language support](docs/guide/language-support.md).
+
+### Changed
+
+- The crate's own description now states what it is: an embeddable agent runtime
+  for Rust — any task, any provider, in your process, with a permission boundary,
+  a sandbox and a durable trace you own. Verification is kept and demoted: it is
+  an optional, language-agnostic gate rather than an entry requirement, and that
+  demotion is what makes an open-ended task expressible at all.
+- The tool-name constants in `io_harness::tools` are no longer `#[cfg]`-gated on
+  their feature. The names exist in every build; only the tools behind them are
+  optional. See the behaviour break above for why.
+
+### Deprecated
+
+- **`Verification::CompilesRust`, `Verification::RustTestPasses` and
+  `Verification::WorkspaceTestPasses`.** They still work and behave exactly as
+  they did; each now emits a deprecation warning naming its replacement. **They
+  are removed in 0.18.0** — the minimum cycle this crate's contract allows, named
+  by version so a caller reading the warning knows exactly how long they have.
+
+  *Migration:* each becomes a `Command` criterion running the project's own
+  tooling.
+
+  ```rust
+  // Verification::CompilesRust
+  Verification::Command { argv: vec!["cargo".into(), "build".into()], expect_exit: 0 }
+
+  // Verification::RustTestPasses { test_src }
+  // Verification::WorkspaceTestPasses { files, test_src }
+  Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 }
+  ```
+
+  The behaviours are not identical and the difference is worth knowing. The old
+  variants compile the named files in a throwaway directory with your `test_src`
+  appended as a module, so they reach *private* items and need no cargo project.
+  `cargo test` runs the repository's real suite, which is stronger in every way
+  that matters and cannot check a criterion the repository does not contain — so
+  write that test into the repository, which is where the warning should send
+  you. `EachCompilesRust` is **not** deprecated: it has no `Command` equivalent.
+
+  A consumer upgrading 0.16.2 straight to 0.18.0 meets the removal with no
+  intervening warning. That is the known cost of the minimum cycle.
+
+### Fixed
+
+- **A registered tool can no longer silently shadow a built-in.**
+  `RESERVED_TOOL_NAMES` named seven built-ins while dispatch had grown to
+  twenty-six, so a tool called `git_status` or `xlsx_read` validated and was then
+  unreachable. It now names every one, in every build. See the behaviour break
+  above.
+
+### Unchanged, deliberately
+
+- No store schema change, no new table or column, and `CHECKPOINT_FORMAT` stays
+  7 — a 0.16.2 database opens and resumes against 0.17.0 unchanged.
+- The default `cargo tree` stays at 401 lines. The toolchain table is Rust data,
+  not a parsed configuration file; the dependency that would need lands in
+  0.19.0.
+- No new system package on any CI runner.
+
 ## [0.16.2] - 2026-07-28
 
 A build fix for docs.rs. **There are no breaking changes and no behaviour

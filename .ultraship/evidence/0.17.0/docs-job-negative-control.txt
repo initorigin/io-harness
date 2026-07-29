@@ -22,3 +22,20 @@ $ grep -rl "Available on crate feature" target/doc/io_harness/
 target/doc/io_harness/index.html
 target/doc/io_harness/tools/documents/index.html
 target/doc/io_harness/provider/index.html
+
+=== CI proof, GitHub Actions ===
+run 30415978901, branch feat/0.17.0-docs-job-control (the deliberate failure):
+  msrv: success
+  test (macos-latest): success
+  lint: success
+  docs.rs (nightly): failure
+  test (windows-latest): success
+  test (ubuntu-latest): success
+
+run 30415977056, branch feat/0.17.0 (the same workflow on the real tree):
+  docs.rs (nightly): success
+  test (windows-latest): success
+  msrv: success
+  lint: success
+  test (macos-latest): success
+  test (ubuntu-latest): success

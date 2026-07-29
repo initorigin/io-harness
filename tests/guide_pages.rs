@@ -25,6 +25,12 @@ use std::path::{Path, PathBuf};
 const GUIDES: &[(&str, bool)] = &[
     ("permissions.md", false),
     ("verification.md", false),
+    // 0.17.0. Both carry a limits block because both document capabilities whose
+    // bound is the interesting part: `exec` runs outside the sandbox with the
+    // embedding program's privileges, and the toolchain table is a default that
+    // will be wrong for someone on day one.
+    ("command-execution.md", true),
+    ("language-support.md", true),
     ("composition.md", false),
     ("sandbox.md", true),
     ("durable-runs.md", false),

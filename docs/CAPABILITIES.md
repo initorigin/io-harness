@@ -14,6 +14,8 @@ the limits that capability actually has.
 | Guide | What it covers |
 | --- | --- |
 | [Permissions and approval](guide/permissions.md) | Layered deny-first rules, what asks and what is refused, deferring a decision past process exit |
+| [Command execution](guide/command-execution.md) | Running a project's own toolchain under an `Act::Exec` check on the whole argv, and the bound that is not there |
+| [Language support](guide/language-support.md) | Toolchain detection, a criterion in any language, and migrating off the Rust-specific gates |
 | [Verification](guide/verification.md) | The criteria, execution-based gates, and exactly what a pass proves |
 | [Agent composition](guide/composition.md) | Sub-agents, inherit-and-narrow containment, the shared ledger |
 | [Execution sandbox](guide/sandbox.md) | Backends per platform, resource caps, the portable floor |
