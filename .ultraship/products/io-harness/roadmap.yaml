@@ -366,7 +366,7 @@ versions:
       already being edited and a registered tool named after a git, image, or document built-in is
       currently accepted by validation and then permanently unreachable.
     detail: specified
-    status: planned
+    status: released
   - version: 0.18.0
     outcome: >
       An operator can answer "what did that run cost, and which model spent it" from the trace

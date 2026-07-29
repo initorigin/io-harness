@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.17.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -347,3 +347,146 @@ open_questions:
     sandbox has the same gap and reports the portable floor honestly rather than pretending. This
     must be measured on the Windows runner, not assumed; if orphans survive, it is recorded as a
     known limitation on the release rather than papered over.
+released_at: '2026-07-29T03:05:00Z'
+mode: published
+delivered: >
+  Point the harness at a project in any language and the agent does real work in it. A live run
+  against a JavaScript project it was told nothing about, recorded in
+  evidence/0.17.0/live-run-node-project.txt, went: find the project, read its three files, install
+  its dependency from the real npm registry through `exec`, run `npm test` and get exit 1, re-read
+  the file, and fix the bug with a one-line `edit_file` replacement — six steps, 8,951 tokens,
+  ending `Success` because the project's own `npm test` exited zero. No Rust is on that path
+  anywhere, which is the whole claim. The same run under a policy denying the command is refused
+  before anything is spawned, with the rule and the layer in the trace.
+evidence:
+  tests:
+  - >
+    `cargo test` (default), `cargo test --features documents --lib --tests`, and
+    `cargo test --features media` — 104 suites, 1,940 assertions passing, 0 failing, 0 FAILED lines.
+    Full output at evidence/0.17.0/tests.txt.
+  - >
+    F1-F5 and F12 — tests/exec_tool.rs, 12 tests. The command runs in the workspace root and its
+    exit status reaches the FOLLOWING step's recorded prompt; a denied program is refused before a
+    process is spawned, attributed to rule "rustc" in layer "ops"; `allow_exec("rustc --version*")`
+    beside `deny_exec("rustc --print*")` permits one argv and refuses the other; the tool schema
+    offers exactly one property, an array of strings; `a;b && c $(id) `whoami` | d > e.rs` arrives
+    at the child byte-identical and creates no `e.rs`; a 30-second command under a 300ms ceiling is
+    killed, named as a timeout, and the run returns in under 20 seconds.
+  - >
+    Each of those refusal criteria has its own negative control, and two of them are load-bearing
+    rather than ceremonial: F3's control (a policy allowing both argvs) is what stops the test
+    passing against an exec that refused everything after its first call, and F13's (the 0.16.2
+    reserved set written out) is what makes the test a measurement of the fix rather than of
+    `validate` in general.
+  - >
+    F6 and F7 — tests/edit_tool.rs, 8 tests. Zero matches and two matches both fail with a typed
+    error and both assert the file on disk is still byte-identical to the original. A denied path is
+    refused as act "write" by rule "secrets/*" in layer "ops" — the write rule, because an edit is a
+    write — with the allowed path as the control.
+  - >
+    F8, F9 and F10 — tests/language_agnostic.rs, 9 tests. `npm test` over a Node fixture passes and
+    fails on exit status, and the failing case records the command's own "expected 42" text as a
+    `gate_output` sandbox event. `Verification::None` returns `Finished { steps: 2 }` and reports the
+    same on resume, with a step-cap run as the control and a criterion-carrying run proving a quiet
+    turn is still just an unproductive step. A 0.16.2-era `WorkspaceTestPasses` contract still
+    compiles and still returns `Success { steps: 1 }`.
+  - >
+    F11 — src/toolchain.rs, 8 tests covering all seventeen markers, all four Node package managers,
+    both Python runners, the two ordering rules, JSON round-trip, and the no-marker control that
+    returns None rather than guessing Cargo.
+  - >
+    F13 — tests/custom_tools.rs. All twenty built-in names 0.16.2's reserved set omitted are now
+    refused with an Error::Config naming the tool, before the provider is called once.
+  builds:
+  - >
+    `cargo build --all-targets` exit 0; `cargo fmt --check` exit 0; `cargo clippy --all-targets
+    -- -D warnings` and `cargo clippy --all-targets --all-features -- -D warnings` both exit 0;
+    `cargo doc --all-features --no-deps` warning-free. evidence/0.17.0/build-and-lint.txt.
+  - >
+    NF1 — `cargo tree | wc -l` is 401 on the default build, the standing constraint, unchanged.
+    NF3 — `CHECKPOINT_FORMAT` is still 7 at src/state.rs:74, and the diff from 6117c11 adds no
+    CREATE TABLE and no ALTER TABLE; the one trace addition is a new `kind` value in the existing
+    sandbox_events table.
+  - >
+    `cargo package` produced io-harness-0.17.0.crate, 126 files, 2.2 MiB (608.9 KiB compressed), and
+    its verify build compiled the packaged sources standalone. evidence/0.17.0/package-verify.txt.
+  - >
+    scope.excluded verified still absent rather than assumed: the exec schema's only property is
+    `argv` (no shell-string form), src/tools/exec.rs makes no code reference to Sandbox, RunSpec or
+    SandboxConfig, no configuration parser is in Cargo.toml, src/context.rs and the sandbox modules
+    are byte-identical to 0.16.2, `record_run_policy` is untouched, and no LSP, web, todo or
+    question tool exists. evidence/0.17.0/scope-check.txt.
+  reviews: []
+  deployments:
+  - >
+    NF4 — GitHub Actions run 30417562388 on feat/0.17.0 at 130ae56: all six jobs green, including
+    test (windows-latest) at 18m44s against the `timeout-minutes: 40` set in 0.16.0, plus
+    test (ubuntu-latest), test (macos-latest), msrv, lint, and the new nightly docs job.
+    evidence/0.17.0/ci.txt.
+  health_checks:
+  - >
+    OP1 — the nightly docs job is proven to fail before it is trusted, in CI and not only locally.
+    Run 30415978901 on the scratch branch feat/0.17.0-docs-job-control carries the 0.16.0 defect
+    restored verbatim: every job succeeds except `docs.rs (nightly)`, which fails with error[E0557].
+    Locally, evidence/0.17.0/docs-job-negative-control.txt records both halves against nightly
+    1.99.0 — the removed feature name failing the doc step, and the gate deleted entirely producing
+    exit 0 with no feature labels, which is why exit zero is not the check.
+  - >
+    OP5 — the live run against a real non-Rust project, evidence/0.17.0/live-run-node-project.txt.
+    The gate is not gameable in it: test.js is denied by the policy, and the example asserts
+    afterwards that the suite the run was judged against is byte-identical to the one it started
+    with.
+known_limitations:
+- >
+  This record is sealed on `feat/0.17.0` before the crates.io upload, which is the standing flow:
+  the record states the authorized target and the flow makes it true. The upload follows the
+  develop -> main merge and the GitHub Release, and is the last step.
+- >
+  **A command runs with the embedding program's privileges, outside the sandbox.** The widest
+  capability this crate has ever granted, taken deliberately — the sandbox denies egress and
+  discards its workdir, which would make `npm install` impossible. The policy decides what may
+  start, not what a started process then does. A policy written for file access does not constrain
+  command execution, and `cat secrets/prod.env` is a command rather than a read. Stated in
+  CONTRACT.md and in the command-execution guide; the residual risk is an operator who reads
+  neither.
+- >
+  **An exec timeout kills the direct child only.** A process that child started itself may outlive
+  it, on every platform. This was the release's own open question about Windows and the answer is
+  not Windows-specific: `kill_on_drop` reaches one process, and the crate has no Job Object backend
+  to reach a tree with. It is recorded rather than papered over, and it is the same honest floor the
+  sandbox already reports for its wall-clock kill.
+- >
+  **The toolchain table will be wrong for someone.** It was already wrong once, in this release's
+  own live run: npm's install default was `npm ci`, which requires a lockfile the fixture did not
+  have, and the agent's first move was to run it and watch it fail. Fixed to `npm install`, but the
+  class remains — half of all `npm test` scripts do not run tests, and a Python project with a
+  `pyproject.toml` may really be driven by a Makefile. It is data shown to the model rather than
+  commands the harness runs, so a wrong entry costs a turn and cannot widen a boundary. Overridable
+  in 0.19.0; until then the workaround is the goal text.
+- >
+  **Only the workspace root is examined for a marker.** A monorepo whose packages each carry their
+  own `package.json` or `go.mod` gets one detection, for the root. A real case, deliberately not
+  handled here; per-directory configuration is 0.19.0's.
+- >
+  **An allowed exec writes no `policy_events` row.** Refusals and approver decisions do; a silent
+  allow does not, for exec no more and no less than for a read or a write. "What actually ran" is
+  answered by `steps.tool_call`, not by `policy_events`. Both the guide and CONTRACT.md claimed
+  otherwise in draft and were corrected when the live run's trace showed it.
+- >
+  **A consumer who skips 0.17.0 entirely meets the removal with no warning.** The three Rust
+  verification variants are deprecated here and removed in 0.18.0, the minimum cycle, so an upgrade
+  straight from 0.16.2 to 0.18.0 never sees the deprecation. The 0.18.0 changelog must say so
+  plainly rather than assume a reader upgraded one minor at a time.
+- >
+  **`Verification::Command` runs inside the sandbox, so a gate cannot reach the network.** A
+  criterion that needs to fetch dependencies will not work; the install belongs in the agent's own
+  `exec` calls, where egress is available, and the gate belongs on the command that tests.
+- >
+  Carried unchanged from 0.16.2 and untouched by this release, as `scope.excluded` requires:
+  `resume_tree` still does not call `record_run_policy`, so a tree resumed under a widened policy
+  leaves an audit that understates what was permitted; `SandboxLimits::max_processes` is enforced by
+  nothing on any platform; and the Linux backend installs no seccomp filter. Each needs a release
+  that touches its module.
+supersedes: 0.16.2
+next_recommended_version: 0.18.0
+immutable: true

@@ -6,18 +6,17 @@ blockers: []
 constraints:
   time: >
     The owner's standing direction, restated when this release was started: work to the stated
-    completion criteria without pausing for approval on PRs, merges, the GitHub Release or
-    `cargo publish` — all pre-authorised. A failing check is not to be re-attempted more than
-    twice without new information, and a criterion that turns out to be wrong about the codebase
-    is recorded through `/ultraship:iterate` with evidence rather than reworded to match what was
-    built. Every design decision in this contract was closed on 2026-07-29 and is not to be
-    reopened.
+    completion criteria without pausing for approval on PRs, merges, the GitHub Release or `cargo
+    publish` — all pre-authorised. A failing check is not to be re-attempted more than twice without
+    new information, and a criterion that turns out to be wrong about the codebase is recorded
+    through `/ultraship:iterate` with evidence rather than reworded to match what was built. Every
+    design decision in this contract was closed on 2026-07-29 and is not to be reopened.
   budget: null
   capacity: >
-    The fallback is pre-decided rather than discovered under pressure: if the release does not
-    fit, the toolchain detection table drops out and the rest ships, which is exactly the
-    contract's own `fallback_scope`. These are the owner's own statements of how the session is
-    to be run, not anything measured here.
+    The fallback is pre-decided rather than discovered under pressure: if the release does not fit,
+    the toolchain detection table drops out and the rest ships, which is exactly the contract's own
+    `fallback_scope`. These are the owner's own statements of how the session is to be run, not
+    anything measured here.
   source: user-estimate
 release_fit:
   assessment: probable
@@ -26,9 +25,9 @@ release_fit:
       Recorded constraint: the fallback is already chosen and is the contract's `fallback_scope` —
       drop the toolchain detection table, keep `exec`, `edit_file`, both `Verification` variants,
       the deprecation cycle and the `RESERVED_TOOL_NAMES` fix. That severs the single largest and
-      least certain piece (fifteen ecosystems, each needing a fixture and a detection test) from
-      the pieces that carry the release's stated outcome, so the release can be finished short
-      without being finished wrong.
+      least certain piece (fifteen ecosystems, each needing a fixture and a detection test) from the
+      pieces that carry the release's stated outcome, so the release can be finished short without
+      being finished wrong.
     - >
       Recorded constraint: no failing check re-attempted more than twice without new information.
       The one criterion that cannot be settled by reasoning — whether killing a process tree on
@@ -51,8 +50,8 @@ release_fit:
     - >
       Cross-platform process execution. Spawning, timing out, killing a process tree and capturing
       output differ on Windows, and the crate's existing Windows story is the portable floor — the
-      sandbox's Job Object backend was designed and never implemented, so there is no prior art
-      here to copy, only a gap to report honestly.
+      sandbox's Job Object backend was designed and never implemented, so there is no prior art here
+      to copy, only a gap to report honestly.
     - >
       The toolchain table's breadth: fifteen-odd ecosystems, each needing a fixture and a detection
       test, and four package managers to resolve behind one marker file. This is the severable
