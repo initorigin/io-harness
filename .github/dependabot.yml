@@ -1,0 +1,38 @@
+version: 2
+
+# Dependabot opens its pull requests against the DEFAULT branch unless told
+# otherwise, and this repository's default branch is `main`. `main` takes
+# nothing but a release merge from `develop` — a bot PR into it would bypass the
+# whole flow — so every ecosystem here targets `develop` explicitly.
+#
+# The cost of that line is real and worth stating: GitHub does not raise
+# Dependabot *security* updates against a non-default target branch. Security
+# advisories therefore have to be acted on by hand here, through the same
+# develop -> main path as any other change.
+#
+# CI covers these PRs already: `ci.yml` runs on `pull_request` into `develop`,
+# takes no secret, and holds `permissions: contents: read`, so a bot PR runs the
+# three-OS matrix with nothing to escalate to. The `msrv` job reads
+# `rust-version` from Cargo.toml and builds against it, which is what catches a
+# bump that quietly raises the crate's declared 1.88 floor.
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    target-branch: develop
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for routine patch bumps instead of a dozen. This crate is a
+      # library, so a patch bump usually moves Cargo.lock and nothing a consumer
+      # resolves — reviewing them one at a time is cost with no signal. Minor
+      # and major bumps still arrive individually, which is where the review
+      # attention belongs.
+      patch-updates:
+        update-types: ["patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    target-branch: develop
+    schedule:
+      interval: monthly

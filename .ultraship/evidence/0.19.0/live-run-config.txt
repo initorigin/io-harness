@@ -1,0 +1,35 @@
+merged Project: /var/folders/ft/gds0vhjx2p121hq746gw7_hc0000gn/T/io-harness-config-example/io.toml
+merged Local: /var/folders/ft/gds0vhjx2p121hq746gw7_hc0000gn/T/io-harness-config-example/io.local.toml
+
+boundary from the file: write src/lib.rs = Allow, write secrets/key.txt = Deny
+budgets from the file: max_steps = 8 (the local scope's 8, not the project's 40), max_tokens = Some(200000)
+
+outcome: Success { steps: 4 }
+(no refusal this run: the model did not attempt the denied write. The boundary was still the file's — see the Deny above — and the secret is checked below either way.)
+
+as of 2026-07-29:
+  openai/gpt-5.6-luna: 4 call(s), 4431 prompt + 441 completion tokens, cost 11206 micro-units, 0 unpriced
+
+trace: /var/folders/ft/gds0vhjx2p121hq746gw7_hc0000gn/T/io-harness-config-example/runs.db
+live exit: 0
+
+--- OP5, the arithmetic checked by hand against the trace ---
+provider_calls (model | prompt | cache_read | completion):
+  openai/gpt-5.6-luna | 1062 | 1059 |  55
+  openai/gpt-5.6-luna | 1067 | 1064 | 138
+  openai/gpt-5.6-luna | 1103 | 1100 | 144
+  openai/gpt-5.6-luna | 1199 |    0 | 104
+
+Priced from the file only: input 3_000_000, output 15_000_000, cache_read 300_000
+micro-units per million tokens.
+
+  fresh input   (prompt - cache_read) * 3        =     3 +     3 +     3 + 3597
+  cache reads   cache_read * 0.3                 = 317.7 + 319.2 +   330 +    0
+  output        completion * 15                  =   825 +  2070 +  2160 + 1560
+                                                   -------------------------------
+                                                   1151.7 2398.2  2499    5157
+  total 11205.9 -> 11206 micro-units, rounded ONCE at the end, half-up.
+
+The crate reported 11206 and 0 unpriced calls. The figure comes from a price the
+operator typed into a TOML file and from token counts the vendor reported; the
+crate ships no prices and invented none.

@@ -242,7 +242,18 @@ pub fn estimate_tokens(text: &str) -> u64 {
 /// ```
 ///
 /// [`TaskContract::with_token_budget`]: crate::TaskContract::with_token_budget
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// `Serialize`/`Deserialize` since 0.19.0, so an operator can set the ceiling in
+/// a config file. Both fields are `#[serde(default)]`:
+///
+/// ```
+/// use io_harness::ContextBudget;
+///
+/// let tight: ContextBudget = serde_json::from_str(r#"{"max_tokens": 8000}"#).unwrap();
+/// assert_eq!(tight.max_tokens, 8_000);
+/// assert_eq!(tight.share, ContextBudget::default().share, "an omitted key keeps its default");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ContextBudget {
     /// Absolute per-request ceiling for the assembled prompt.
     pub max_tokens: u64,

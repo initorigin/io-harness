@@ -412,8 +412,8 @@ versions:
       It lands third on purpose. Its schema is determined by what exists, and writing it before
       command execution, general verification, and the accounting tables would have meant writing it
       twice.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.20.0
     outcome: >
       A run stops being one-shot. An operator opens a session, sends a turn, watches tokens arrive
