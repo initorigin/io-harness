@@ -35,10 +35,17 @@ async fn main() -> io_harness::Result<()> {
         )?;
     }
 
+    // The model the run will actually use, so the `[prices]` section prices the
+    // calls this run makes rather than a model it never dials — a price table
+    // that costs nothing proves nothing.
+    let model = std::env::var("OPENROUTER_MODEL")
+        .expect("OPENROUTER_MODEL, so the price table can name the model that answers");
+
     // The project file: committed, and what a collaborator inherits.
     std::fs::write(
         root.join("io.toml"),
-        r#"
+        format!(
+            r#"
 [policy.defaults]
 read = "allow"
 write = "deny"
@@ -48,9 +55,9 @@ net = "deny"
 [[policy.layers]]
 name = "project"
 rules = [
-  { act = "write", effect = "allow", pattern = "src/*" },
-  { act = "write", effect = "allow", pattern = "NOTES.md" },
-  { act = "write", effect = "deny",  pattern = "secrets/*" },
+  {{ act = "write", effect = "allow", pattern = "src/*" }},
+  {{ act = "write", effect = "allow", pattern = "NOTES.md" }},
+  {{ act = "write", effect = "deny",  pattern = "secrets/*" }},
 ]
 
 [run]
@@ -60,11 +67,14 @@ max_tokens = 200000
 [prices]
 as_of = "2026-07-29"
 
-[prices.models."anthropic/claude-sonnet-4"]
+# Micro-units per MILLION tokens. Whatever the operator's own figures are — the
+# crate ships none and cannot, since a vendor changes prices on its own schedule.
+[prices.models."{model}"]
 input = 3000000
 output = 15000000
 cache_read = 300000
-"#,
+"#
+        ),
     )?;
     // The local file: one key, overriding the project's own.
     std::fs::write(root.join("io.local.toml"), "[run]\nmax_steps = 8\n")?;
@@ -116,6 +126,13 @@ cache_read = 300000
         .into_iter()
         .filter(|e| e.kind == "refusal")
         .collect();
+    if refusals.is_empty() {
+        println!(
+            "(no refusal this run: the model did not attempt the denied write. The \
+             boundary was still the file's — see the Deny above — and the secret is \
+             checked below either way.)"
+        );
+    }
     for r in &refusals {
         println!(
             "refused: {} {} (rule {:?} in layer {:?})",

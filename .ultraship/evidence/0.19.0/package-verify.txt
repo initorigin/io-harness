@@ -1,24 +1,29 @@
-error: 19 files in the working directory contain changes that were not yet committed into git:
-
-.gitignore
-CHANGELOG.md
-Cargo.lock
-Cargo.toml
-README.md
-docs/CAPABILITIES.md
-docs/CONTRACT.md
-docs/RELEASE_PROCESS.md
-docs/guide/configuration.md
-docs/public-api.txt
-examples/config_live.rs
-src/config.rs
-src/context.rs
-src/lib.rs
-src/pricing.rs
-src/resilience.rs
-src/tools/git.rs
-tests/config.rs
-tests/guide_pages.rs
-
-to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag
-package exit: 101
+   Packaging io-harness v0.19.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+    Updating crates.io index
+    Packaged 134 files, 2.4MiB (657.4KiB compressed)
+   Verifying io-harness v0.19.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+   Compiling tokio v1.53.1
+   Compiling serde_core v1.0.229
+   Compiling getrandom v0.4.3
+   Compiling tempfile v3.27.0
+   Compiling serde v1.0.229
+   Compiling serde_json v1.0.151
+   Compiling toml_datetime v0.6.11
+   Compiling serde_spanned v0.6.9
+   Compiling chrono v0.4.45
+   Compiling toml_edit v0.22.27
+   Compiling hyper v1.11.0
+   Compiling tokio-rustls v0.26.4
+   Compiling tower v0.5.3
+   Compiling tokio-util v0.7.19
+   Compiling process-wrap v9.1.0
+   Compiling tokio-stream v0.1.19
+   Compiling tower-http v0.6.11
+   Compiling toml v0.8.23
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling rmcp v2.2.0
+   Compiling io-harness v0.19.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness/target/package/io-harness-0.19.0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.26s
+package exit: 0
