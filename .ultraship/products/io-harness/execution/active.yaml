@@ -1,0 +1,69 @@
+product: io-harness
+version: 0.17.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: >
+    The owner's standing direction, restated when this release was started: work to the stated
+    completion criteria without pausing for approval on PRs, merges, the GitHub Release or
+    `cargo publish` — all pre-authorised. A failing check is not to be re-attempted more than
+    twice without new information, and a criterion that turns out to be wrong about the codebase
+    is recorded through `/ultraship:iterate` with evidence rather than reworded to match what was
+    built. Every design decision in this contract was closed on 2026-07-29 and is not to be
+    reopened.
+  budget: null
+  capacity: >
+    The fallback is pre-decided rather than discovered under pressure: if the release does not
+    fit, the toolchain detection table drops out and the rest ships, which is exactly the
+    contract's own `fallback_scope`. These are the owner's own statements of how the session is
+    to be run, not anything measured here.
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      Recorded constraint: the fallback is already chosen and is the contract's `fallback_scope` —
+      drop the toolchain detection table, keep `exec`, `edit_file`, both `Verification` variants,
+      the deprecation cycle and the `RESERVED_TOOL_NAMES` fix. That severs the single largest and
+      least certain piece (fifteen ecosystems, each needing a fixture and a detection test) from
+      the pieces that carry the release's stated outcome, so the release can be finished short
+      without being finished wrong.
+    - >
+      Recorded constraint: no failing check re-attempted more than twice without new information.
+      The one criterion that cannot be settled by reasoning — whether killing a process tree on
+      Windows without a Job Object leaves orphaned grandchildren — is already scoped as a
+      measurement whose negative answer is a recorded known limitation rather than a fix. That is
+      what keeps a cross-platform unknown from becoming an unbounded retry loop.
+    - >
+      Every design decision is closed. The contract carries no `human_approvals` entry that is not
+      granted and no `open_questions` entry that is a design choice: the two that remain are a
+      numeric tuning value and a platform measurement. Development starts with nothing to decide,
+      which is the condition US-IO-HARNESS-0.17.0-I02 existed to create.
+    - >
+      Every new mechanism has a working template in the repository rather than a design problem.
+      `src/tools/git.rs` is fixed-argv process execution under an `Act::Exec` check with a pinned
+      environment, a null stdin and bounded capture — `exec` is that shape with the argv supplied
+      rather than constructed. `Workspace::write_file` is the gate `edit_file` reuses unchanged.
+      `ExecGuard::exec` is the execution path `Verification::Command` runs on. The additions are
+      arrangements of parts that exist.
+  major_cost_drivers:
+    - >
+      Cross-platform process execution. Spawning, timing out, killing a process tree and capturing
+      output differ on Windows, and the crate's existing Windows story is the portable floor — the
+      sandbox's Job Object backend was designed and never implemented, so there is no prior art
+      here to copy, only a gap to report honestly.
+    - >
+      The toolchain table's breadth: fifteen-odd ecosystems, each needing a fixture and a detection
+      test, and four package managers to resolve behind one marker file. This is the severable
+      piece, and it is severable precisely because it is the expensive one.
+    - >
+      Refusal tests with negative controls for every new gated action. The standing constraint, and
+      it roughly doubles the test count for `exec` and `edit_file` — F2, F3, F4, F7, F11 and F13
+      each carry one.
+    - >
+      Two enum additions that are breaks (`Verification`) plus one more the contract did not
+      enumerate (`RunOutcome` gains the terminal outcome F9 requires). Each needs its migration
+      note, and the crate's own `-D warnings` build has to keep compiling against three variants it
+      is simultaneously deprecating.
+  recommended_scope_change: null

@@ -1,136 +1,346 @@
 product: io-harness
-version: 0.16.2
+version: 0.17.0
 tasks:
-  - id: US-IO-HARNESS-0.16.2-T01
+  - id: US-IO-HARNESS-0.17.0-T01
     summary: >
-      Reproduce the docs.rs failure locally on nightly with the `docsrs` cfg set, before changing
-      anything, and record the toolchain version alongside the output.
+      Add the `exec` runner — a fixed-argv process spawn in the workspace root under an `Act::Exec`
+      check on both the program and the joined argv — as `src/tools/exec.rs`, modelled on the
+      governed spawn in `src/tools/git.rs`.
     why_required: >
-      The defect exists because no command this repository runs can see it. Fixing it without first
-      reproducing it would mean the fix is verified by the same stable `cargo doc` that passed on
-      the broken tree for two releases. This task is also the release's negative control: without
-      the pre-fix failure on this exact toolchain, a passing post-fix build proves nothing.
-    status: done
+      Without it the release's stated outcome is unreachable: there is no way for the agent to run
+      a project's own toolchain, so "point the harness at a project in any language" stays prose.
+      Everything else in the release either sits on this module or is documentation of it.
+    status: todo
     depends_on: []
     acceptance_criteria:
       - >
-        F3 — the same command on the pre-fix tree fails with "feature has been removed", establishing
-        that the check discriminates rather than passing on everything. This is the negative control
-        the crate requires of every gate it ships.
+        F1 — the agent can run a command. A workspace run whose goal requires building or testing invokes
+        `exec` with a fixed argv, the command runs in the workspace root, and its exit status, stdout,
+        and stderr reach the agent's next turn. Asserted end to end against a fixture project, not by
+        unit-testing the tool in isolation.
+      - >
+        F4 — `exec` cannot reach a shell. A test asserts the tool's JSON schema accepts only an array of
+        strings, and that an argument containing `;`, `&&`, `$(id)`, or a backtick is passed to the
+        program as one literal argument rather than interpreted. The negative control is the same
+        argument observed verbatim in the child's received `argv`.
     files:
-      - src/lib.rs
-    evidence:
-      - >
-        rustc 1.99.0-nightly (09ee43b2d 2026-07-27), recorded in evidence/0.16.2/toolchain.txt —
-        after 1.92.0, so the removal is in effect and the control is not vacuous.
-      - >
-        `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps` on the pre-fix line
-        fails with `error[E0557]: feature has been removed` at src/lib.rs:220:29, noting "removed in
-        1.92.0" and "merged into `doc_cfg`" — the docs.rs build log's error, reproduced verbatim off
-        the builder. Output at evidence/0.16.2/doc-nightly-negative-control.txt.
-  - id: US-IO-HARNESS-0.16.2-T02
+      - src/tools/exec.rs
+      - src/tools/mod.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T02
     summary: >
-      Replace `feature(doc_auto_cfg)` with `feature(doc_cfg)` in the crate root's `cfg_attr(docsrs,
-      ...)` gate, and extend the comment above it to record why the name changed.
+      Bound what `exec` may do to the run: an overridable wall-clock timeout that kills the child and
+      reports itself by name, and a captured-output ceiling that keeps the head and the tail and
+      states the elision in the result the model reads.
     why_required: >
-      This line is the release. It is the only reason docs.rs has no page for 0.16.0 or 0.16.1, and
-      without the change 0.16.2 would fail its build for the third consecutive time.
-    status: done
+      An unbounded `exec` hands a wedged command the run's whole time budget and reports it as a
+      budget stop, which sends the reader to the wrong diagnosis. A silently truncated build log is
+      worse: an agent that cannot tell a cut output from a complete one draws a confident wrong
+      conclusion from it.
+    status: todo
     depends_on:
-      - US-IO-HARNESS-0.16.2-T01
+      - US-IO-HARNESS-0.17.0-T01
     acceptance_criteria:
       - >
-        F1 — `src/lib.rs` contains `#![cfg_attr(docsrs, feature(doc_cfg))]` and no occurrence of
-        `doc_auto_cfg` anywhere in the repository outside CHANGELOG.md and the sealed release records.
-      - >
-        F2 — `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps` exits 0 on a
-        nightly at or after 1.92.0, emitting no warning and no `unexpected_cfg` diagnostic.
+        F5 — `exec` is bounded. A command that runs past the wall-clock timeout is killed and reported
+        as a timeout naming the command, rather than hanging the run until the contract's time budget
+        stops it. Output past the ceiling retains its head and its tail with the middle elided, and the
+        result the model reads states that an elision happened and how much was dropped — asserted
+        against a fixture whose first and last lines are both required to survive, so a tail-only or
+        head-only cut fails the test.
     files:
-      - src/lib.rs
-    evidence:
-      - >
-        src/lib.rs:220 is `#![cfg_attr(docsrs, feature(doc_cfg))]`, with three comment lines above it
-        naming the removal, the upstream PR, and the 0.16.1 build that failed on the old name.
-      - >
-        The same nightly command now exits 0 with no warning (evidence/0.16.2/doc-nightly.txt) — the
-        only difference from T01 being the feature name.
-      - >
-        The labelling still happens, which is what the gate is for: the rendered HTML under
-        target/doc/io_harness carries "Available on crate feature `x` only" for barcode, docx, media,
-        pdf, pptx and xlsx. `doc_cfg` performs the automatic labelling itself since the merge, so no
-        per-item `#[doc(cfg(...))]` attribute was needed.
-  - id: US-IO-HARNESS-0.16.2-T03
+      - src/tools/exec.rs
+      - src/contract.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T03
     summary: >
-      Bump the version to 0.16.2 in Cargo.toml and Cargo.lock, and write the CHANGELOG `[0.16.2]`
-      section under Fixed.
+      Dispatch `exec` in the workspace loop under the same gate every other tool uses, checking
+      `Act::Exec` on the program and on the full argv, and offer it to the model as a tool whose
+      schema accepts only an array of strings.
     why_required: >
-      A published version's sources are immutable, so the only way this fix reaches docs.rs is a new
-      version. The CHANGELOG entry is where a reader learns that the missing 0.16.0 and 0.16.1 pages
-      are not coming back, which is the one thing about this release they cannot infer.
-    status: done
+      A runner nothing calls is not a capability. This is also where the release's widest grant is
+      actually bounded — the policy check that decides which argv may start — so it carries the two
+      criteria that measure the boundary rather than the mechanism.
+    status: todo
     depends_on:
-      - US-IO-HARNESS-0.16.2-T02
+      - US-IO-HARNESS-0.17.0-T01
     acceptance_criteria:
       - >
-        F4 — CHANGELOG.md has a `[0.16.2]` section under `Fixed` that names `doc_auto_cfg`, links
-        rust-lang/rust#138907, states there is no behaviour change, and states that 0.16.0 and 0.16.1
-        remain unbuildable on docs.rs.
+        F2 — `exec` is authorized, not merely available. A run under a policy that denies the program is
+        refused before the process is spawned, and the refusal is recorded in `policy_events` attributed
+        to the rule and layer that produced it. The negative control is the same run under a policy that
+        allows it, which executes — so F2 measures the boundary rather than a tool that never works.
+      - >
+        F3 — argv is matched whole, not just on the program name. A policy allowing `git log*` and
+        denying `git push*` permits the first and refuses the second, with the refusal attributed. The
+        negative control is a policy allowing both, under which both run.
+    files:
+      - src/run.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T04
+    summary: >
+      Add `edit_file`: exact string replacement on a workspace file, failing with a typed error when
+      the search string matches zero times or more than once, dispatched through the same `Act::Write`
+      gate as `write_file`.
+    why_required: >
+      `write_file` rewrites a whole file, so every edit costs tokens proportional to file size and
+      rewrites content the agent did not intend to touch. The zero/multiple-match failure is the
+      capability: a replacement that silently picks an occurrence is a corrupting edit, not a cheap one.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F6 — `edit_file` replaces one occurrence exactly. A replacement whose search string appears once
+        succeeds and changes only that occurrence; a search string appearing zero times fails with a
+        typed error naming the file; a search string appearing twice fails with a typed error stating
+        the count and changes nothing on disk.
+      - >
+        F7 — `edit_file` is gated by the same `Act::Write` check as `write_file`, asserted by a refusal
+        test with a negative control.
+    files:
+      - src/tools/workspace.rs
+      - src/run.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T05
+    summary: >
+      Add `Verification::Command { argv, expect_exit }`, run through the existing execution sandbox
+      by `ExecGuard`, and assert it against Node's `npm test` over a fixture package.
+    why_required: >
+      This is what makes "any language" a measurement rather than a claim. Four of the five existing
+      variants run `rustc`, so before it a non-Rust project has no expressible definition of done.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F8 — `Verification::Command` passes and fails on exit status, asserted against **Node**. A
+        criterion running `npm test` over a fixture package exits zero and yields `RunOutcome::Success`;
+        the same criterion over a fixture whose test fails does not, and the gate's output reaches the
+        trace. Node and npm are preinstalled on all three runner images, so no system package is
+        installed and the standing constraint holds. This is what makes "any language" a measurement
+        rather than a claim.
+    files:
+      - src/verify.rs
+      - tests/verify_gate.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T06
+    summary: >
+      Add `Verification::None` and the terminal run outcome it needs: an assistant turn carrying no
+      tool call ends the run, distinguishably from a step cap, a stall and a budget stop. No `done`
+      tool is added.
+    why_required: >
+      `TaskContract` takes `verify` by value, so before this an open-ended task is not merely
+      unimplemented but inexpressible. It is the single change that turns the repositioning from
+      prose into a capability.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F9 — `Verification::None` completes a run with no gate. An assistant turn carrying no tool call
+        ends the run with a terminal outcome distinguishable from a step cap, a stall, and a budget
+        stop, so an unattended run that simply finished is not later mistaken for one that ran out. The
+        negative control is a run that hits the step cap, which must report the cap and not the
+        finished outcome.
+    files:
+      - src/verify.rs
+      - src/run.rs
+      - src/state.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T07
+    summary: >
+      Deprecate `CompilesRust`, `RustTestPasses` and `WorkspaceTestPasses`, each naming its `Command`
+      replacement and the release that removes it, while keeping every existing behaviour and test
+      passing.
+    why_required: >
+      The deprecation cycle is what the crate's published contract requires of a removal, and the
+      warning is the only notice a consumer gets before 0.18.0 takes the variants away. Keeping them
+      working is not optional: the existing tests are the specification of what each one proves.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.17.0-T05
+    acceptance_criteria:
+      - >
+        F10 — the deprecated variants still work. A 0.16.2-era contract using `CompilesRust` or
+        `RustTestPasses` compiles against 0.17.0, emits a deprecation warning naming its replacement,
+        and produces the same outcome as before. The negative control is the same assertion against a
+        build with the variants removed, which fails to compile.
+    files:
+      - src/verify.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T08
+    summary: >
+      Correct `RESERVED_TOOL_NAMES` to name every built-in — the git, image and document tools
+      included — so a registered tool can no longer pass `Toolbox::validate` and then be permanently
+      unreachable at dispatch.
+    why_required: >
+      A registered `Tool` named `git_status` or `xlsx_read` currently validates and is then silently
+      shadowed, which is the exact failure the reserved set exists to prevent. Fixed here because
+      tool dispatch is already being edited for `exec` and `edit_file`.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F13 — a registered tool can no longer shadow a built-in. `Toolbox::validate` refuses a tool named
+        after any built-in, including the git, image, and document tools added since the reserved set was
+        written. The negative control is the same assertion run against the 0.16.2 reserved set, which
+        accepts `git_status` — that failure is what makes F13 a measurement of the fix.
+    files:
+      - src/tools/custom.rs
+      - tests/custom_tools.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T09
+    summary: >
+      Ship the project and toolchain table as data in the crate — marker file to ecosystem to default
+      build, test, lint, format and run argv — with a public type for it, and resolve the package
+      manager behind `package.json` by lockfile.
+    why_required: >
+      Without it the agent spends turns guessing the package manager, and the operator or the goal
+      text has to name the test command the harness could have inferred. This is the release's
+      severable piece: its absence still leaves a coherent release.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F11 — the toolchain table detects the project. Given a fixture per supported marker file, the
+        detector names the ecosystem and the default test argv; given `package.json` beside each of the
+        four lockfiles, it resolves the matching package manager. The negative control is a directory
+        with no marker, for which it reports no detection rather than guessing Cargo.
+    files:
+      - src/toolchain.rs
+      - src/lib.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T10
+    summary: >
+      Surface the detection result to the model in the assembled context, asserted against the
+      recorded prompt rather than against the assembler's internals.
+    why_required: >
+      A table the model never sees changes nothing about how many turns the agent spends guessing.
+      The table and its delivery are one capability; only the second half is observable to the user.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.17.0-T09
+    acceptance_criteria:
+      - >
+        F12 — the detection reaches the model. A workspace run in a detected project carries the
+        ecosystem and its default commands in the assembled context, asserted against the recorded
+        prompt rather than against the assembler's internals.
+    files:
+      - src/context.rs
+      - src/run.rs
+      - tests/context.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T11
+    summary: >
+      Add the nightly `RUSTDOCFLAGS="--cfg docsrs" cargo +nightly doc --all-features --no-deps` job
+      to CI, and prove it fails on a documentation error before trusting it.
+    why_required: >
+      It is the only thing that would have caught the defect 0.16.2 had to fix, and its absence is
+      recorded as a known limitation on that release. 0.16.0 and 0.16.1 have no docs.rs page
+      permanently, because published sources are immutable and nothing local could see the failure.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        OP1 — the nightly docs job runs `--cfg docsrs` on nightly and fails on a documentation error,
+        proven by a deliberate failure in a scratch branch before the job is trusted. Exit zero is not
+        the check; the rendered HTML must contain the feature labels.
+    files:
+      - .github/workflows/ci.yml
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T12
+    summary: >
+      Documentation: guide pages for command execution and language support, a worked example on
+      every new public item, `docs/public-api.txt` updated by hand, `CHANGELOG.md` migration notes,
+      and `docs/CONTRACT.md` amended in both directions.
+    why_required: >
+      `exec` is the widest capability the crate has ever granted, and the contract's own risk entry
+      says the residual risk is an operator who does not read the bound. Stating it is the mitigation.
+      The public-surface and changelog checkers are build failures, not conventions.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.17.0-T03
+      - US-IO-HARNESS-0.17.0-T04
+      - US-IO-HARNESS-0.17.0-T06
+      - US-IO-HARNESS-0.17.0-T07
+      - US-IO-HARNESS-0.17.0-T08
+    acceptance_criteria:
+      - >
+        OP2 — `docs/public-api.txt` is updated by hand and `tests/public_api.rs` passes against the live
+        surface. There is deliberately no regenerate flag.
+      - >
+        OP3 — `CHANGELOG.md` carries a migration note for each of the two breaks, with the old call on
+        one side and the new call on the other, and the changelog checker passes.
+      - >
+        OP4 — `docs/CONTRACT.md` states what `exec` does and does not bound: that a command runs with the
+        embedding program's privileges outside the sandbox, that the policy decides what may start and
+        not what a started process then does, and that the tool-shadowing defect is closed. The
+        limitations list is updated in both directions.
+    files:
+      - docs/guide/command-execution.md
+      - docs/guide/language-support.md
+      - docs/public-api.txt
+      - docs/CONTRACT.md
+      - CHANGELOG.md
+      - README.md
+      - src/lib.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T13
+    summary: >
+      Hold the standing non-functional constraints: the default dependency tree, no new system
+      package, an untouched store, the full suite green on three platforms, and a clean clippy,
+      fmt and doc build.
+    why_required: >
+      Each of these is a promise a consumer already relies on. A release that adds a TOML parser,
+      bumps the checkpoint format, or leaves Windows red breaks something nobody asked to have
+      broken, and none of it is visible from the functional criteria.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.17.0-T02
+      - US-IO-HARNESS-0.17.0-T05
+      - US-IO-HARNESS-0.17.0-T09
+    acceptance_criteria:
+      - >
+        NF1 — the default dependency tree does not grow. `cargo tree` on the default build stays at 401
+        lines. The toolchain table is shipped as Rust data or as JSON parsed by the `serde_json` already
+        in the tree, because adding a TOML parser here would break the standing constraint a release
+        early, and the configuration release is where that dependency belongs.
+      - >
+        NF2 — no new system package on any CI runner. The suite runs on the toolchains GitHub's runners
+        already provide and skips, with a stated reason, any ecosystem check whose toolchain is absent,
+        rather than installing one.
+      - >
+        NF3 — the store is untouched. No table is added or altered, and `CHECKPOINT_FORMAT` stays 7, so
+        a 0.16.2 database opens and resumes against 0.17.0 unchanged.
+      - >
+        NF4 — the full suite passes on macOS, Linux, and Windows. `exec` has a Windows path and its
+        tests either run there or are skipped with a stated reason; the Windows leg's `timeout-minutes`
+        stays at the 40 set in 0.16.0.
+      - >
+        NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` pass,
+        and `cargo doc --all-features` is warning-free.
     files:
       - Cargo.toml
-      - Cargo.lock
-      - CHANGELOG.md
-    evidence:
-      - >
-        Cargo.toml and Cargo.lock both read 0.16.2. The CHANGELOG `[0.16.2]` section opens by stating
-        there is no breaking and no behaviour change, explains under Fixed that the build failed for
-        both 0.16.0 and 0.16.1, names the removed feature and links the upstream PR, and closes by
-        saying the two published versions stay unbuildable and 0.16.2 is the first 0.16 with a page.
-  - id: US-IO-HARNESS-0.16.2-T04
+      - .github/workflows/ci.yml
+    evidence: []
+  - id: US-IO-HARNESS-0.17.0-T14
     summary: >
-      Run the standing release gates on stable — the full suite including the five checkers, clippy,
-      fmt, `cargo package`, the public-surface diff and the dependency-tree line count.
+      Perform a live run against a real non-Rust project before the release is cut, and keep its
+      trace as evidence.
     why_required: >
-      The CI wait is waived for this release, so the local run is the only evidence that the change
-      broke nothing. A one-line change is the easiest kind to ship untested and the cheapest kind to
-      verify.
-    status: done
+      The suite proves the mechanism; only a live run proves the claim in
+      `outcome.evidence_of_value`. Every previous release of this crate that skipped a live run
+      shipped a defect only a live run would have found — 0.8.0's macro-shadowing bypass and
+      0.8.1's private-item regression were both found this way.
+    status: todo
     depends_on:
-      - US-IO-HARNESS-0.16.2-T03
+      - US-IO-HARNESS-0.17.0-T03
+      - US-IO-HARNESS-0.17.0-T04
+      - US-IO-HARNESS-0.17.0-T05
+      - US-IO-HARNESS-0.17.0-T10
     acceptance_criteria:
       - >
-        NF1 — no public API change. `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` is empty
-        for the whole branch, and `tests/public_api.rs` passes against the unchanged snapshot.
-      - >
-        NF2 — the five 0.16.0 checkers stay green with no test edited to accommodate the change:
-        `readme`, `public_api`, `docs_drift`, `changelog`, `guide_pages`. `changelog` is the one this
-        release could plausibly break, since it inspects the file being edited.
-      - >
-        NF3 — `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cargo fmt --check` all
-        exit 0 on stable, MSRV stays 1.88, and the default `cargo tree` stays at 401 lines.
-      - >
-        NF4 — `cargo package` succeeds and the packaged `.crate` is inspected for a `.env`, a
-        secret-shaped path, or any file the `exclude` list should have caught.
-    files: []
-    evidence:
-      - >
-        cargo test — 603 passed, 0 failed across every target including the doctests, exit 0
-        (evidence/0.16.2/tests-default.txt). Same total as 0.16.1, as expected of a release that adds
-        no test and changes no behaviour.
-      - >
-        NF2 — the five checkers pass with no test file edited: changelog 5/5, docs_drift 10/10,
-        guide_pages 7/7, public_api 9/9, readme 8/8. `changelog` inspects the file this release
-        edits and passes on the new `[0.16.2]` section unmodified.
-      - >
-        cargo clippy --all-targets -- -D warnings — exit 0 (evidence/0.16.2/clippy.txt).
-        cargo fmt --check — exit 0 (evidence/0.16.2/fmt.txt).
-      - >
-        NF1 — `git diff origin/main -- src/ | grep -E "^[-+]\s*pub "` returns nothing for the whole
-        branch, and the public-surface snapshot is untouched. NF3 — default `cargo tree` is 401
-        lines, the standing constraint, unchanged.
-      - >
-        cargo package — io-harness-0.16.2.crate, 118 files, 564 KiB compressed, verification build
-        exit 0 (evidence/0.16.2/package.txt, package-list.txt). Inspected: no `.env`, no
-        `.ultraship/`, no `.github/`, no secret-shaped path.
-      - >
-        Secrets gate — `.env` is matched by `.gitignore:10` and untracked, and the branch diff
-        contains no secret-shaped assignment.
+        OP5 — a live run against a real non-Rust project is performed by hand before the release is cut,
+        and its trace is kept as evidence. The suite proves the mechanism; only a live run proves the
+        claim in `outcome.evidence_of_value`.
+    files:
+      - examples/exec_live.rs
+    evidence: []
