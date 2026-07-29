@@ -286,6 +286,101 @@ async fn a_registered_tool_may_not_shadow_a_built_in() {
     }
 }
 
+/// The names 0.16.2's reserved set left out, every one of which is a dispatch
+/// arm. A registered tool taking one of these passed `Toolbox::validate` and was
+/// then permanently unreachable, because dispatch tests every built-in first.
+///
+/// The document and image names are here in every build, feature flags or not:
+/// 0.17.0 removed their `#[cfg]` gates precisely so that turning a feature on can
+/// never take away a tool the caller had working.
+const NAMES_0_16_2_MISSED: &[&str] = &[
+    "git_log",
+    "git_status",
+    "git_diff",
+    "git_add",
+    "git_commit",
+    "view_image",
+    "xlsx_read",
+    "xlsx_sheets",
+    "xlsx_write",
+    "xlsx_set_cell",
+    "docx_read",
+    "docx_write",
+    "pptx_read",
+    "pdf_read",
+    "pdf_write",
+    "pdf_watermark",
+    "pdf_fill_form",
+    "barcode_decode",
+    "edit_file",
+    "exec",
+];
+
+/// F13 — a registered tool can no longer shadow a built-in.
+///
+/// The negative control is `the_0_16_2_reserved_set_accepted_git_status` below:
+/// without it, this test would pass against a `validate` that rejected every name
+/// on earth, and it would say nothing about whether the *gap* was closed.
+#[tokio::test]
+async fn no_built_in_name_can_be_taken_by_a_registered_tool() {
+    for reserved in NAMES_0_16_2_MISSED {
+        let dir = ws();
+        let contract =
+            never_passes(dir.path(), 1).with_tools(Toolbox::new().with(Fixed::new(reserved, "x")));
+        let provider = MockScript::new(vec![]);
+        let err = run_with(
+            &contract,
+            &provider,
+            &Store::memory().unwrap(),
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await
+        .expect_err("a tool named after a built-in must be rejected");
+
+        assert!(
+            matches!(err, io_harness::Error::Config(ref m) if m.contains(reserved)),
+            "expected a Config error naming {reserved}, got {err:?}"
+        );
+        assert_eq!(
+            provider.calls(),
+            0,
+            "arbitration must run before the provider is called"
+        );
+    }
+}
+
+/// F13's negative control, and it is what makes the test above a measurement of
+/// the fix rather than of `validate` in general.
+///
+/// The set 0.16.2 shipped, written out. Every name in it is still rejected — so
+/// the fix added names and removed none — and every name it *omitted* would have
+/// been accepted by a `validate` checking only this list, which is exactly the
+/// defect `docs/CONTRACT.md` recorded from 0.15.0.
+#[test]
+fn the_0_16_2_reserved_set_accepted_git_status() {
+    const RESERVED_IN_0_16_2: &[&str] = &[
+        "write_file",
+        "grep",
+        "find",
+        "read_file",
+        "read_skill",
+        "remember",
+        "spawn_agent",
+    ];
+
+    for name in NAMES_0_16_2_MISSED {
+        assert!(
+            !RESERVED_IN_0_16_2.contains(name),
+            "{name} was already reserved in 0.16.2, so it does not belong in the gap list"
+        );
+    }
+    assert!(
+        RESERVED_IN_0_16_2.contains(&"write_file"),
+        "the control list is the real 0.16.2 set, not an empty one"
+    );
+}
+
 /// F3 — the `mcp__` prefix belongs to MCP servers and an in-process tool may not
 /// take it, or a server tool could be impersonated by a local one.
 #[tokio::test]

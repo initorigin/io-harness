@@ -234,6 +234,7 @@ mod run;
 pub mod sandbox;
 pub mod skills;
 mod state;
+pub mod toolchain;
 pub mod tools;
 mod verify;
 

@@ -32,6 +32,7 @@ use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
+use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
 use crate::tools::git::{Git, GitCmd, GitOutcome};
 #[cfg(feature = "barcode")]
@@ -2150,6 +2151,11 @@ async fn run_workspace_from<P: Provider>(
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
+    // Detected once, before the first turn. The marker files do not change under
+    // a run often enough to be worth a filesystem walk every step, and a run that
+    // creates its own `package.json` is creating a project rather than working in
+    // one.
+    let toolchain = crate::toolchain::detect(root);
     let mem_key = memory_key(root);
     // Images the agent looked at last step, carried into this one's request and
     // dropped once shown. A viewed image is a tool result, not a permanent part
@@ -2196,7 +2202,7 @@ async fn run_workspace_from<P: Provider>(
             },
         )
         .await?;
-        let user = workspace_user_prompt(contract, &assembled.text);
+        let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
         #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
             system: system.clone(),
@@ -3058,6 +3064,8 @@ fn run_agent<'f, P: Provider>(
         // is the same child, at whatever depth it sits.
         let (mut ledger, mut written) = restore_ledger(tree.store, run_id)?;
         let mut progress = Progress::new();
+        // Children share their parent's workspace, so they share its detection too.
+        let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);
@@ -3103,7 +3111,7 @@ fn run_agent<'f, P: Provider>(
                 },
             )
             .await?;
-            let user = workspace_user_prompt(contract, &assembled.text);
+            let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 system: system.clone(),
@@ -5329,7 +5337,11 @@ fn with_skill_catalog(base: String, skills: &Skills) -> String {
     )
 }
 
-fn workspace_user_prompt(contract: &TaskContract, observations: &str) -> String {
+fn workspace_user_prompt(
+    contract: &TaskContract,
+    observations: &str,
+    toolchain: Option<&Toolchain>,
+) -> String {
     let constraints = if contract.constraints.is_empty() {
         "(none)".to_string()
     } else {
@@ -5340,8 +5352,17 @@ fn workspace_user_prompt(contract: &TaskContract, observations: &str) -> String 
     } else {
         observations.to_string()
     };
+    // Every turn, not only the first. An agent forty steps into a run has had the
+    // first turn compacted out from under it by `ContextBudget`, and the project's
+    // build command is exactly the fact it would then have to rediscover — which
+    // is what this exists to stop it paying for twice.
+    let project = match toolchain {
+        Some(t) => format!("Project: {}\n", t.describe()),
+        None => String::new(),
+    };
     format!(
-        "Goal: {goal}\nConstraints: {constraints}\nSuccess criterion: {criterion}\n\n\
+        "Goal: {goal}\nConstraints: {constraints}\nSuccess criterion: {criterion}\n\
+         {project}\n\
          Observations so far (results of your tool calls):\n{obs}\n\n\
          Call a tool to make progress toward the success criterion.",
         goal = contract.goal,
