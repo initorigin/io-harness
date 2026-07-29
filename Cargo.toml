@@ -86,7 +86,7 @@ docx-rs = { version = "0.4", optional = true }
 # ten-day-old extraction crate, and the vetting rule that removed OCR applies to
 # convenience too.
 zip = { version = "2", optional = true, default-features = false, features = ["deflate"] }
-quick-xml = { version = "0.37", optional = true }
+quick-xml = { version = "0.41", optional = true }
 lopdf = { version = "0.44", optional = true }
 pdf-extract = { version = "0.12", optional = true }
 rxing = { version = "0.9", optional = true }
