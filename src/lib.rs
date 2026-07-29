@@ -287,5 +287,5 @@ pub use state::{
     SUCCESS_OUTCOME,
 };
 pub use tools::git::Identity;
-pub use tools::{Tool, ToolFuture, Toolbox};
+pub use tools::{Tool, ToolFuture, Toolbox, DEFAULT_EXEC_TIMEOUT};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

@@ -27,6 +27,13 @@
 //! from turning into a whitespace quiz. An agent that has the tool and the skill
 //! can hit it; an agent that has neither cannot guess it.
 
+// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
+// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
+// still work, and the fixtures are loose `.rs` files rather than cargo projects,
+// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
+// has no project to run in. See docs/guide/verification.md for the migration.
+#![allow(deprecated)]
+
 use std::sync::{Arc, Mutex};
 
 use io_harness::tools::{Tool, ToolFuture, Toolbox};

@@ -21,6 +21,13 @@
 //!    its original id, still refuses the denied path, and carries the context it
 //!    had rather than re-deriving one.
 
+// The Rust-specific `Verification` variants are deprecated in 0.17.0 and removed
+// in 0.18.0. They are kept here deliberately: these files are what F10 asserts
+// still work, and the fixtures are loose `.rs` files rather than cargo projects,
+// so `Verification::Command { argv: ["cargo", "test"], .. }` — the replacement —
+// has no project to run in. See docs/guide/verification.md for the migration.
+#![allow(deprecated)]
+
 use io_harness::{resume, resume_with, run_with, ApproveAll, Policy, Store, TaskContract};
 use io_harness::{RunOutcome, Verification};
 

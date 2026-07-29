@@ -331,13 +331,50 @@ impl Toolbox {
 
 /// Names the harness owns. A registered tool taking one of these would shadow a
 /// built-in the agent and the verification layer depend on.
+///
+/// **Every** built-in, as of 0.17.0. It listed seven until then — the set as it
+/// stood in 0.9.0 — while dispatch grew the five git tools, the image tool, the
+/// nine document tools, and now `exec` and `edit_file`. The gap was not cosmetic:
+/// `Toolbox::validate` accepted a registered tool called `git_status` or
+/// `xlsx_read`, and dispatch then tested every built-in arm first, so that tool
+/// was permanently unreachable and nothing said so. A tool that validates and
+/// never runs is the exact silent shadowing this set exists to prevent, and it
+/// was recorded as an open defect in `docs/CONTRACT.md` from 0.15.0.
+///
+/// Feature-gated built-ins are reserved in every build, including builds that do
+/// not contain them — see [`VIEW_IMAGE_TOOL`](super::VIEW_IMAGE_TOOL) for why
+/// the alternative is worse.
+///
+/// The one name here that is not a dispatch arm is
+/// [`SPAWN_TOOL`](crate::SPAWN_TOOL), which the tree loop intercepts before
+/// dispatch. It shadows just as completely.
 pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::WRITE_FILE_TOOL,
+    super::EDIT_FILE_TOOL,
+    super::EXEC_TOOL,
     super::GREP_TOOL,
     super::FIND_TOOL,
     super::READ_FILE_TOOL,
     super::READ_SKILL_TOOL,
     super::REMEMBER_TOOL,
+    super::GIT_LOG_TOOL,
+    super::GIT_STATUS_TOOL,
+    super::GIT_DIFF_TOOL,
+    super::GIT_ADD_TOOL,
+    super::GIT_COMMIT_TOOL,
+    super::VIEW_IMAGE_TOOL,
+    super::XLSX_READ_TOOL,
+    super::XLSX_SHEETS_TOOL,
+    super::XLSX_WRITE_TOOL,
+    super::XLSX_SET_CELL_TOOL,
+    super::DOCX_READ_TOOL,
+    super::DOCX_WRITE_TOOL,
+    super::PPTX_READ_TOOL,
+    super::PDF_READ_TOOL,
+    super::PDF_WRITE_TOOL,
+    super::PDF_WATERMARK_TOOL,
+    super::PDF_FILL_FORM_TOOL,
+    super::BARCODE_DECODE_TOOL,
     crate::run::SPAWN_TOOL,
 ];
 
