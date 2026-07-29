@@ -413,7 +413,7 @@ versions:
       command execution, general verification, and the accounting tables would have meant writing it
       twice.
     detail: specified
-    status: planned
+    status: released
   - version: 0.20.0
     outcome: >
       A run stops being one-shot. An operator opens a session, sends a turn, watches tokens arrive

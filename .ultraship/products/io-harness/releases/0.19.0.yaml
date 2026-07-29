@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.19.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -344,3 +344,166 @@ open_questions:
     Restricting it protects nothing on the operator's own machine but does bound what a
     collaborator's committed project file can read from a teammate's disk, which is a real difference.
     Decided during development, and stated either way in the guide.
+released_at: '2026-07-29T21:55:00Z'
+mode: published
+delivered: >
+  An operator configures the harness in a file instead of in Rust. One `io.toml`, four scopes merged
+  in a fixed order — the crate's defaults, a user file, a committed project file, and a gitignored
+  local one — every key of which lands in a type this crate already had: a `Policy`, a
+  `SandboxConfig`, a `toolchain::Toolchain`, a `pricing::PriceTable`, `McpServer`s, and the
+  run-shaping defaults applied to a `TaskContract` through `Config::apply_to`. `${env:...}` and
+  `${file:...}` keep a credential out of the file; an unknown key and a failed substitution are each
+  an error naming the key and the file, because a boundary that silently disarms itself is the worst
+  thing a config layer can do. Nothing is loaded implicitly, which is what makes the one honest
+  guarantee true: a config the agent writes mid-run cannot widen the boundary that run is already
+  under. The live proof is a real run against OpenRouter whose boundary, budgets and price table came
+  entirely out of two TOML files: the local scope's `max_steps = 8` beat the project's 40, the
+  denied write never happened, and the four provider calls cost 11,206 micro-units from a price the
+  operator typed — against 11,205.9 computed by hand from the trace, the crate rounding once at the
+  end exactly as it documents.
+evidence:
+  tests:
+  - >
+    `cargo test` (default) — 37 suites, 713 tests passing, 0 failing, exit 0, from a clean target.
+    Full output at evidence/0.19.0/tests-default.txt.
+  - >
+    `cargo test --features documents --lib --tests` and `cargo test --features media --lib --tests` —
+    both exit 0, 36 suites each. evidence/0.19.0/tests-features.txt. An earlier run of these showed
+    13 failures in tests/policy.rs; the cause was a full disk (the machine had 0 bytes free and the
+    gate tests spawn `cargo test` in temp dirs), not the code — they pass from the same commit with
+    space available, which is why the evidence file is the post-clean run.
+  - >
+    F1 through F10 and NF3 — tests/config.rs, 14 tests through the real loader and the real run loop.
+    Four loads over one directory with a scope removed each time resolve local -> project -> user ->
+    crate default; a local file naming one sandbox cap leaves every other cap and section identical
+    (asserted by rebuilding the whole `SandboxConfig` with that one field changed); a policy from a
+    file refuses the same write, records the same refusal with the same rule and layer, and produces
+    the same outcome as the identical policy built in Rust; two scopes' layers are both present in
+    scope order and the local one cannot re-allow the project's deny; `max_stepz` is rejected naming
+    key and file while `max_steps` loads; `${env:...}` and `${file:...}` reach an MCP header and each
+    failure names its key; a fixture naming every supported key reaches every typed field, each
+    asserted different from its default; a `[prices]` section costs a fixture trace at the
+    hand-computed figure and a `[toolchain]` section overrides cargo's test command while leaving a
+    node detection untouched; and a workspace with no files at all produces exactly what the typed
+    API produces with none.
+  - >
+    F9, the one guarantee — an agent that writes `io.local.toml` granting itself the denied write
+    mid-run is still refused, and the negative control is the same file present *before* the caller
+    loads the config, which does take effect. The difference between the two is the whole claim.
+  - >
+    NF3 — a run whose two config files are deleted between the load and the run completes unaffected,
+    because nothing reads a config at run time.
+  - >
+    The substituted-secret claim is now tested rather than asserted: a run under a config whose MCP
+    header carries `${env:...}` leaves the value out of every event and step the store holds, with a
+    non-empty-trace control so the assertion measures absence from something.
+  - >
+    Unit tests in src/config.rs cover the merge and the expander directly: a later scope wins one key
+    and leaves its siblings, `policy.layers` append while every other array is replaced whole, and
+    every substitution failure — unset, empty, unreadable, unknown prefix, unterminated — names its
+    key, with a no-substitution string returned unchanged as the control.
+  builds:
+  - >
+    `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings` and
+    `cargo clippy --all-targets --all-features -- -D warnings` both exit 0;
+    `cargo doc --all-features --no-deps` exit 0 with zero warnings (evidence/0.19.0/doc.txt).
+  - >
+    NF1 — `cargo tree` on the default build is **413 lines**, up from 401. Five crates are new to the
+    tree: toml, toml_edit, toml_datetime, serde_spanned, winnow. `indexmap`, `equivalent` and
+    `hashbrown` are NOT new — `cargo tree --invert` shows process-wrap already depended on them — so
+    the 12 extra lines are partly the same crates listed a second time. evidence/0.19.0/dependency-tree.txt.
+  - >
+    NF2 — `CHECKPOINT_FORMAT` is still 7 at src/state.rs:106, and the diff against 900d694 adds no
+    `CREATE TABLE` and no `ALTER TABLE`. src/state.rs, src/run.rs, src/sandbox.rs, src/policy.rs,
+    src/provider/mod.rs, src/mcp.rs, src/toolchain.rs and src/verify.rs are byte-identical to 0.18.0.
+    evidence/0.19.0/scope-check.txt.
+  - >
+    scope.excluded verified absent rather than assumed: `Containment::max_total_cost` is still inert,
+    no `#[deprecated]` exists anywhere (NF6), src/context.rs's only change is the `ContextBudget`
+    derive the contract's scope.included names — the assembler is untouched — and the only callers of
+    `Config` in the repository are src/lib.rs's re-export, tests/config.rs and examples/config_live.rs,
+    so no entry point reads a config implicitly. evidence/0.19.0/scope-check.txt.
+  - >
+    `cargo package --locked` produced io-harness-0.19.0.crate, 134 files, 2.4 MiB (657.4 KiB
+    compressed), and its verify build compiled the packaged sources standalone, exit 0. The archive
+    carries `.env.example` and no `.env`, no `.ultraship/`, no `.github/`. evidence/0.19.0/package-verify.txt.
+  - >
+    OP1 — `docs/public-api.txt` updated by hand with the one added item (`struct Config src/config.rs`)
+    and tests/public_api.rs passes, including the every-item-has-a-worked-example check. OP2 —
+    docs/guide/configuration.md exists, is linked from README.md, docs/CAPABILITIES.md and the crate
+    root, and tests/guide_pages.rs passes with it added to the expected set. tests/changelog.rs,
+    tests/readme.rs and tests/docs_drift.rs pass after the prose changes.
+  reviews: []
+  deployments: []
+  health_checks:
+  - >
+    OP5 — a live run against OpenRouter driven entirely from `io.toml` and `io.local.toml`,
+    evidence/0.19.0/live-run-config.txt. Both scopes are reported as merged; the boundary comes from
+    the file (write src/lib.rs Allow, write secrets/key.txt Deny); the local scope's `max_steps = 8`
+    beat the project file's 40; the run succeeded in 4 steps; the secret the TOML denied is
+    byte-identical afterwards; and the price table from the file costed all four provider calls at
+    11,206 micro-units with 0 unpriced, matching 11,205.9 computed by hand from the stored per-call
+    tokens. The example asserts the Deny, the budget and the untouched secret itself, so a regression
+    fails the run rather than printing a number nobody checked.
+known_limitations:
+- >
+  This record is sealed on `feat/0.19.0` before the crates.io upload, which is the standing flow: the
+  record states the authorized target and the flow makes it true. The upload follows the
+  develop -> main merge and the GitHub Release, and is the last step.
+- >
+  **NF4 — the three-OS suite is proven by CI on the PR, not from this machine.** Everything above was
+  run on macOS. The Windows leg matters more than usual this release: `config::user_path` resolves
+  `%APPDATA%\io\io.toml` there and `$XDG_CONFIG_HOME`/`$HOME` everywhere else, and only CI exercises
+  the Windows branch. The open question about that path is resolved in favour of `%APPDATA%`.
+- >
+  **The `[toolchain]` override does not reach this crate's own run loop.** `run` detects the
+  ecosystem for itself; `Config::toolchain(detected)` gives the embedding application the merged
+  value. Wiring it into the loop needs a new `TaskContract` field, which is a break, and this release
+  carries none — so an operator who overrides `test` in `io.toml` changes what io-cli or io-studio
+  would show, not what the harness's own prompt says. Stated in the guide and in CONTRACT.md.
+- >
+  **An unknown key inside a `[[mcp]]` table is not rejected.** `McpServer` is `#[serde(flatten)]`-based
+  and serde refuses `flatten` beside `deny_unknown_fields`. Every other section rejects what it does
+  not know; that one accepts and ignores it.
+- >
+  **`${` always begins a substitution and there is no escape**, so a literal `${` in a value — in a
+  glob pattern, say — is not expressible. An unknown prefix is an error rather than a passthrough,
+  which is the trade: a typo cannot reach a policy rule as text.
+- >
+  **`${file:...}` is not restricted to the config file's own directory.** This resolves the contract's
+  open question in the permissive direction: it resolves any path relative to that directory,
+  `../` included. Restricting it would bound what a collaborator's committed project file can read
+  from a teammate's disk, which is a real difference — but a project file is already code review's
+  problem, and a restriction that stops `${file:~/.secrets/token}` would break the ordinary case it
+  exists for. Stated in the guide.
+- >
+  **A config file is not a security boundary against the agent, and the guarantee is narrower than it
+  reads.** What holds is that the file is read once, by the caller, before the run, so a config the
+  agent writes mid-run cannot widen the boundary of the run in progress. What does not hold is
+  anything about the *next* load: an agent that can write the workspace root can leave an `io.toml`
+  there, and the caller's next `Config::discover` will read it.
+- >
+  **`Config` derives `Debug`, and a substituted secret is in it.** The crate never logs or traces a
+  config value — that is now tested — but a caller who debug-prints a `Config` prints whatever
+  `${env:...}` resolved to. Redacting was not done: a config a caller cannot inspect is a config
+  nobody can debug.
+- >
+  **The live run recorded no refusal.** The model declined to attempt the denied write, so the
+  boundary's live proof is that the secret is untouched and that the policy read from the file
+  answers `Deny` — refusal-under-a-config-derived-policy through the real loop is proven offline by
+  F3, against a scripted provider that does attempt it.
+- >
+  **The default dependency tree grows for the first time since 0.1.0.** 401 to 413 lines. Stated in
+  the changelog rather than discovered by a consumer, but a consumer who audits dependencies has five
+  more crates to audit.
+- >
+  Carried unchanged from 0.18.0 and untouched by this release, as `scope.excluded` requires:
+  `resume_tree` still does not call `record_run_policy`; `SandboxLimits::max_processes` is enforced by
+  nothing on any platform; the Linux backend installs no seccomp filter; `Containment::max_total_cost`
+  is inert; `server_tool_requests` is zero everywhere until 0.22.0; the crate ships no prices;
+  `git_status` lacks `-z`; `fill_form` has never been opened in a real viewer; the Windows Job Object
+  is unimplemented; `pdf::read_text`'s `catch_unwind` is a no-op under `panic = "abort"`; and
+  `TEST_BINARY` is inert.
+supersedes: 0.18.0
+next_recommended_version: 0.20.0
+immutable: true

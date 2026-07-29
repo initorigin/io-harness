@@ -8,13 +8,14 @@ constraints:
     The owner's standing direction, restated at the start of this release: carry it to a published
     crate in one pass, without pausing for approval on PRs, merges, the GitHub Release or `cargo
     publish` — all pre-authorised. A criterion that turns out to be wrong about the codebase is
-    recorded through `/ultraship:iterate` with evidence rather than reworded to match what was built.
+    recorded through `/ultraship:iterate` with evidence rather than reworded to match what was
+    built.
   budget: null
   capacity: >
     The fallback is pre-decided rather than discovered under pressure: if the release does not fit,
     the `[toolchain]`, `[prices]` and `[mcp]` sections and `${file:...}` substitution drop out and
-    the four scopes, the merge order, `${env:...}`, unknown-key rejection and the policy, sandbox and
-    run-defaults projection ship — which is the contract's own `fallback_scope`. These are the
+    the four scopes, the merge order, `${env:...}`, unknown-key rejection and the policy, sandbox
+    and run-defaults projection ship — which is the contract's own `fallback_scope`. These are the
     owner's own statements of how the session is to be run, not anything measured here.
   source: user-estimate
 release_fit:
@@ -33,10 +34,10 @@ release_fit:
       types need the derive added, which is additive.
     - >
       The merge is one algorithm rather than one per section. Each scope is parsed to a
-      `toml::Table`, substituted against its own directory, validated on its own so an error can name
-      its file, and then deep-merged key by key — so per-key override, F2's single-cap case, and the
-      appending of policy layers are three rules over one walk rather than a partial mirror struct
-      per section.
+      `toml::Table`, substituted against its own directory, validated on its own so an error can
+      name its file, and then deep-merged key by key — so per-key override, F2's single-cap case,
+      and the appending of policy layers are three rules over one walk rather than a partial mirror
+      struct per section.
     - >
       `toolchain.rs:30` already carries the sentence "and that 0.19.0 makes it overridable", so the
       shape of the toolchain half was decided when that module was written.
@@ -47,7 +48,8 @@ release_fit:
       its own validation path rather than the derive attribute.
     - >
       Substitution has to run after parsing, before validation, only over strings, resolved against
-      the directory of the file that wrote it, and must fail naming the key rather than a byte offset.
+      the directory of the file that wrote it, and must fail naming the key rather than a byte
+      offset.
     - >
       The user-scope path differs across three platforms and the Windows leg is the one that will
       disagree.
