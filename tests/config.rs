@@ -749,3 +749,60 @@ async fn nf3_nothing_is_read_from_disk_for_configuration_once_the_caller_has_loa
     );
     assert!(project.path().join("src/a.rs").is_file());
 }
+
+#[tokio::test]
+async fn a_substituted_secret_reaches_the_field_and_not_the_trace() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join("src")).unwrap();
+
+    const SECRET: &str = "io-harness-test-secret-9f3a2b";
+    let (policy, contract) = {
+        let _guard = env(user_dir.path());
+        std::env::set_var("IO_HARNESS_CONFIG_TEST_SECRET", SECRET);
+        write(
+            project.path(),
+            "io.toml",
+            &format!(
+                "{DENYING}\n[[mcp]]\nid = \"svc\"\ntransport = \"http\"\n\
+                 url = \"https://example.test\"\n[mcp.headers]\n\
+                 Authorization = \"Bearer ${{env:IO_HARNESS_CONFIG_TEST_SECRET}}\"\n"
+            ),
+        );
+        let config = Config::discover(project.path()).unwrap();
+        // It did reach the typed field — the point of substitution.
+        let io_harness::McpTransport::Http { headers, .. } = &config.mcp_servers()[0].transport
+        else {
+            panic!("an http server");
+        };
+        assert_eq!(headers["Authorization"], format!("Bearer {SECRET}"));
+        (
+            config.policy().unwrap(),
+            // The MCP server is deliberately not attached to the contract: this
+            // test is about what the *config* leaks, not about dialling a server.
+            contract(project.path()).with_max_steps(1),
+        )
+    };
+
+    let store = Store::memory().unwrap();
+    let script = script(vec![vec![write_call("src/a.rs", "pub fn a() {}\n")]]);
+    let result = run_with(&contract, &script, &store, &policy, &ApproveAll)
+        .await
+        .unwrap();
+
+    // Nothing the crate writes about this run carries the value.
+    let mut written = String::new();
+    for e in store.events(result.run_id).unwrap() {
+        written.push_str(&format!("{e:?}"));
+    }
+    for s in store.steps(result.run_id).unwrap() {
+        written.push_str(&format!("{s:?}"));
+    }
+    assert!(
+        !written.contains(SECRET),
+        "a substituted secret must not reach the trace"
+    );
+    // The negative control: the trace is not empty, so the assertion above is
+    // measuring absence from something rather than absence of everything.
+    assert!(!written.is_empty(), "the run did record something");
+}
