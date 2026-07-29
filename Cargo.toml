@@ -2,9 +2,10 @@
 name = "io-harness"
 version = "0.19.0"
 edition = "2021"
-# rmcp 2.2.0 sets the real floor: it uses let-chains, stabilised in 1.88, and
-# publishes no rust-version of its own — so cargo cannot catch it at resolve time
-# and a 1.87 build fails inside the dependency. The other floors are lower:
+# rmcp sets the real floor: it uses let-chains, stabilised in 1.88. On 2.2.0 it
+# published no rust-version of its own, so cargo could not catch it at resolve
+# time and a 1.87 build failed inside the dependency; 3.0.0 declares 1.88
+# itself, which is the same number arrived at honestly. The other floors are lower:
 # process-wrap (via rmcp's child-process transport) needs 1.87, reqwest 0.13
 # needs 1.85. 0.8.0 and 0.8.1 declared 1.87 by counting only process-wrap.
 rust-version = "1.88"
@@ -49,8 +50,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
-# 0.13 (not 0.12) because rmcp 2.2.0 requires it, and the streamable-HTTP MCP
-# transport only accepts a Client of the same version — one reqwest, one TLS stack.
+# 0.13 (not 0.12) because rmcp requires it, and the streamable-HTTP MCP
+# transport only accepts a Client of the same version — one reqwest, one TLS
+# stack. Still true on rmcp 3.0.0, which is why that bump needed no reqwest
+# change.
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
