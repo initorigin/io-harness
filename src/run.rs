@@ -5038,7 +5038,49 @@ async fn dispatch(
             };
 
             let git = Git::new(ws.policy(), ws.root(), cap);
-            match git.run(&cmd).await? {
+            // 0.21.0 — a refused git built-in costs a step, not the run.
+            //
+            // Until here, `Git::run`'s refusal left the loop as `Error::Refused`, so
+            // one speculative `git status` under a policy denying `Act::Exec` for
+            // `git` escalated the whole run. Found while running the 0.20.0 live
+            // session and recorded in `docs/CONTRACT.md`; not fixed there because
+            // that release touched no tool. Every other refusal in this crate is an
+            // observation the model reads and adapts to, and this is now one too.
+            //
+            // Both of `Git::run`'s refusals land here — the policy denying the `git`
+            // program, and a path that would be read as an option — and the row is
+            // written exactly as `gate` writes one, so a reader cannot tell a git
+            // refusal from any other and does not have to.
+            let outcome = match git.run(&cmd).await {
+                Ok(out) => out,
+                Err(Error::Refused {
+                    act,
+                    target,
+                    rule,
+                    layer,
+                }) => {
+                    let mut ev = PolicyEvent::refusal(step, act.clone(), target.clone());
+                    ev.rule = rule.clone();
+                    ev.layer = layer.clone();
+                    store.record_event(run_id, &ev)?;
+                    // Qualified: this arm has a local `refused` holding the gate's
+                    // verdict for the paths, which shadows the function.
+                    crate::run::refused(watch, run_id, depth, &ev);
+                    let why = rule
+                        .as_deref()
+                        .map(|r| format!(" (rule {r})"))
+                        .unwrap_or_default();
+                    return Ok(Dispatched::go(
+                        format!("{name} refused"),
+                        format!(
+                            "\n[{act} refused] {target}{why} — the policy forbids this; carry on \
+                             without git\n"
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            match outcome {
                 GitOutcome::Unavailable { reason } => Dispatched::go(
                     "git unavailable",
                     format!(
