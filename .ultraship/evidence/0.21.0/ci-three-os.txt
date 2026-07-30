@@ -16,3 +16,22 @@ The first attempt, on 492c22d, failed the Windows leg only — see
 windows-crlf-failure.txt. It failed identically on both the push-triggered and
 the pull-request-triggered run of that commit, so it was not the known flaky
 timing assertion.
+
+---
+
+The workflow was then tuned for wall clock (commits 6b59315 and 593c836), and
+NF4 was re-proven on the tuned workflow at head 593c836, run 30553055624, all
+green:
+
+  0.6m   msrv                    (was 11m — three cargo builds became two checks)
+  0.9m   lint
+  0.3m   docs.rs (nightly)
+  4.5m   test (macos-latest)     (was 9.3m)
+  5.0m   test (ubuntu-latest)    (was 9.0m)
+  10.8m  test (windows-latest)   (was ~13m)
+
+and one run per commit rather than two, because `feat/**` is no longer a push
+trigger. The gate itself did not weaken: the default leg still runs all 251
+doctests on all three runners, the `--all-features --lib --tests` leg replaces the
+two per-feature legs, `--all-features --doc` adds the two media-gated doctests on
+Linux, and per-feature isolation is the lint job's clippy steps.
