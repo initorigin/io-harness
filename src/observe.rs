@@ -390,6 +390,25 @@ pub enum EventKind {
         /// The note's key.
         key: String,
     },
+    /// A chunk of assistant text arrived from the provider, while the model was
+    /// still producing the rest of it.
+    ///
+    /// Emitted only on a [`Session`](crate::Session) turn given an observer: a
+    /// one-shot [`run_with_observed`](crate::run_with_observed) never produces
+    /// one, so adding this variant changes no existing run's event stream. The
+    /// deltas of one step concatenate to that step's final assistant text, in
+    /// order.
+    ///
+    /// **Provisional.** A delta is what the model has said so far, not a decision
+    /// it has made: the turn may still fall over to another provider, be retried,
+    /// or be interrupted, and text already emitted is not withdrawn. Render it;
+    /// do not act on it. What is settled is the committed step —
+    /// [`EventKind::Step`].
+    Token {
+        /// The chunk, exactly as the provider sent it. Not trimmed, not
+        /// re-segmented: concatenation is the property that matters.
+        text: String,
+    },
     /// A sandbox was created, ran something, hit a cap, or was destroyed.
     Sandbox {
         /// `"create"`, `"exec"`, `"cap_hit"`, `"destroy"` or
@@ -687,6 +706,9 @@ mod tests {
                 steps: 4,
                 tokens: 9,
             },
+            EventKind::Token {
+                text: "hello".into(),
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -708,6 +730,7 @@ mod tests {
                 | EventKind::MemoryWrote { .. }
                 | EventKind::Sandbox { .. }
                 | EventKind::Mcp { .. }
+                | EventKind::Token { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

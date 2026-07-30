@@ -75,9 +75,10 @@ fn user_content(request: &CompletionRequest) -> serde_json::Value {
 /// Un-parseable `data:` lines are skipped, as a robust SSE reader should — but a
 /// stream where *every* line was skipped is a failure, not an empty answer, so
 /// the result goes through [`ensure_parsed`].
-pub(crate) async fn parse_stream(
+pub(crate) async fn parse_stream_with(
     resp: reqwest::Response,
     sent: std::time::Instant,
+    on_token: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<CompletionResponse> {
     let mut acc = Accumulator::since(sent);
     read_sse(resp, |data| {
@@ -85,12 +86,26 @@ pub(crate) async fn parse_stream(
             return true;
         }
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(data) {
+            if let Some(delta) = text_delta(&value) {
+                on_token(delta);
+            }
             acc.ingest(&value);
         }
         false
     })
     .await?;
     ensure_parsed(acc.finish())
+}
+
+/// The assistant-text delta a chunk carries, if it carries one.
+///
+/// Text only: a `tool_calls` argument fragment is not renderable and is not safe
+/// to act on half-parsed, and the accumulator owns reassembling those.
+fn text_delta(value: &serde_json::Value) -> Option<&str> {
+    value
+        .pointer("/choices/0/delta/content")?
+        .as_str()
+        .filter(|t| !t.is_empty())
 }
 
 /// Accumulates streamed deltas into one response.

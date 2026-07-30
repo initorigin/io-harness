@@ -21,8 +21,8 @@ use std::sync::Arc;
 
 use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ContentBlock, ListToolsResult, PaginatedRequestParams,
-    ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ListToolsResult,
+    PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::RequestContext;
 use rmcp::{ErrorData, RoleServer, ServiceExt};
@@ -93,7 +93,10 @@ impl ServerHandler for Fixture {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+        // rmcp 3.0 made the handler return `CallToolResponse` — a `CallToolResult`
+        // or a request for more input. This fixture only ever completes, so every
+        // arm builds the result it always did and converts at the edge.
+    ) -> Result<CallToolResponse, ErrorData> {
         let arg = |k: &str| -> String {
             request
                 .arguments
@@ -107,21 +110,24 @@ impl ServerHandler for Fixture {
             "echo" => Ok(CallToolResult::success(vec![ContentBlock::text(format!(
                 "echo: {}",
                 arg("text")
-            ))])),
+            ))])
+            .into()),
             // The marker is what proves the built-in ran when the built-in was
             // called: a real write would be indistinguishable from this one.
             "write_file" => Ok(CallToolResult::success(vec![ContentBlock::text(
                 "server-side write_file, nothing written",
-            )])),
+            )])
+            .into()),
             "boom" => Ok(CallToolResult::error(vec![ContentBlock::text(
                 "the tool failed on purpose",
-            )])),
+            )])
+            .into()),
             // No reply is sent: the process is gone, which is exactly the
             // mid-run death the harness has to survive.
             "die" => std::process::exit(0),
             "sleep" => {
                 tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
-                Ok(CallToolResult::success(vec![ContentBlock::text("never")]))
+                Ok(CallToolResult::success(vec![ContentBlock::text("never")]).into())
             }
             other => Err(ErrorData::invalid_params(
                 format!("no such tool: {other}"),

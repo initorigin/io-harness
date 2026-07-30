@@ -180,6 +180,30 @@ impl Provider for Anthropic {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        self.stream(request, &|_| {}).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<CompletionResponse> {
+        self.stream(request, on_token).await
+    }
+}
+
+impl Anthropic {
+    /// One completion, with each text delta handed to `on_token` on its way into
+    /// the accumulator.
+    ///
+    /// Both trait methods are this function; `complete` passes a sink that does
+    /// nothing. The stream was always consumed delta by delta — 0.20.0 only stops
+    /// throwing each one away before anything else can see it.
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<CompletionResponse> {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
         // Time to first token is measured from here — before the socket is
@@ -203,6 +227,12 @@ impl Provider for Anthropic {
                 if value.get("type").and_then(|t| t.as_str()) == Some("message_stop") {
                     return true;
                 }
+                // Before `ingest`, so the delta a caller renders is the same string
+                // the accumulated text ends up carrying rather than a re-derivation
+                // of it.
+                if let Some(delta) = text_delta(&value) {
+                    on_token(delta);
+                }
                 acc.ingest(&value);
             }
             false
@@ -211,6 +241,21 @@ impl Provider for Anthropic {
         // A stream where nothing at all parsed is a failure, not a quiet model.
         super::ensure_parsed(acc.finish())
     }
+}
+
+/// The assistant-text delta an event carries, if it carries one.
+///
+/// Text only. A `input_json_delta` fragment of a tool call is not renderable and
+/// is not safe to act on — the accumulator owns reassembling those.
+fn text_delta(value: &serde_json::Value) -> Option<&str> {
+    if value.get("type").and_then(|t| t.as_str()) != Some("content_block_delta") {
+        return None;
+    }
+    let delta = value.get("delta")?;
+    if delta.get("type").and_then(|t| t.as_str()) != Some("text_delta") {
+        return None;
+    }
+    delta.get("text")?.as_str()
 }
 
 /// Accumulates Anthropic's typed stream events into one response.

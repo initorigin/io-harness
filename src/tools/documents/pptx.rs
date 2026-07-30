@@ -80,7 +80,21 @@ fn slide_text(xml: &[u8]) -> std::result::Result<String, quick_xml::Error> {
                 _ => {}
             },
             Event::Empty(e) if e.local_name().as_ref() == b"br" => out.push('\n'),
-            Event::Text(t) if in_text => out.push_str(&t.unescape()?),
+            // quick-xml 0.41 split what `BytesText::unescape` used to do. A text
+            // event no longer carries entities at all — the reader emits each one
+            // as its own `GeneralRef` — so the text arm only decodes and
+            // normalises end-of-lines, which is what `xml10_content` is for. A
+            // slide is XML 1.0.
+            Event::Text(t) if in_text => out.push_str(&t.xml10_content()?),
+            // `&amp;` arrives here as the bare name `amp`. Rebuilding the
+            // reference and handing it to `unescape` resolves the five predefined
+            // entities and a numeric character reference alike, and an entity
+            // this crate cannot resolve stays an error rather than silently
+            // deleting a character from someone's slide.
+            Event::GeneralRef(r) if in_text => {
+                let name = r.decode()?;
+                out.push_str(&quick_xml::escape::unescape(&format!("&{name};"))?);
+            }
             Event::Eof => break,
             _ => {}
         }

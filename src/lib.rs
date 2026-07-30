@@ -154,6 +154,19 @@
 //! a case and [`provider::Replay`] runs it back identically.
 //!
 //!
+//! **Durable conversations.** [`Session`] holds one instead of firing a task:
+//! open a session over a workspace, take a turn, and the next turn reads the ones
+//! before it. A turn **is** a run — its own trace, budgets, boundary and
+//! checkpoint — so a session survives a crash for the reason a run does, and
+//! [`Session::reopen`] picks it up in a later process from the id alone. The
+//! conversation is an append-only tree: [`Session::branch_from`] takes the next
+//! turn from any earlier one without disturbing what came after it. An observed
+//! turn streams the model's text as [`EventKind::Token`] while it is still being
+//! produced, and a [`Steer`] lets an operator say something else mid-turn or
+//! interrupt — both honoured at the next step boundary, and neither an
+//! authorization: a steer reaches the model as text, and every call it leads to is
+//! checked against the same [`Policy`].
+//!
 //! **Configuration in a file.** [`Config::discover`] reads one `io.toml` across
 //! four scopes — the crate's defaults, a user file, a committed project file, and
 //! a gitignored local one — and projects it onto this API: a [`Policy`], a
@@ -231,6 +244,7 @@
 //! - [Context and memory](https://github.com/initorigin/io-harness/blob/main/docs/guide/context-and-memory.md)
 //! - [Resilience](https://github.com/initorigin/io-harness/blob/main/docs/guide/resilience.md)
 //! - [Observability and replay](https://github.com/initorigin/io-harness/blob/main/docs/guide/observability.md)
+//! - [Sessions](https://github.com/initorigin/io-harness/blob/main/docs/guide/sessions.md)
 //! - [Configuration](https://github.com/initorigin/io-harness/blob/main/docs/guide/configuration.md)
 //! - [Accounting](https://github.com/initorigin/io-harness/blob/main/docs/guide/accounting.md)
 //! - [Documents](https://github.com/initorigin/io-harness/blob/main/docs/guide/documents.md)
@@ -270,6 +284,7 @@ pub mod provider;
 pub mod resilience;
 mod run;
 pub mod sandbox;
+pub mod session;
 pub mod skills;
 mod state;
 pub mod toolchain;
@@ -313,6 +328,7 @@ pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
     Selected,
 };
+pub use session::{Session, Steer, SteerInbox, TurnResult};
 pub use skills::{Skill, Skills};
 // `AgentEvent` and `SpawnRow` were `pub` inside this private module but were not
 // re-exported, so `Store::agent_events` and `Store::find_spawn` returned values an
@@ -322,8 +338,8 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, Pending, PolicyEvent,
-    ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, BUSY_TIMEOUT,
-    CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Turn,
+    BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
     SUCCESS_OUTCOME, UNKNOWN_MODEL,
 };
 pub use tools::git::Identity;

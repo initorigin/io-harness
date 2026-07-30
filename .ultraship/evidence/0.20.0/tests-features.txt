@@ -1,0 +1,44 @@
+=== cargo test --features documents --lib --tests ===
+test sub_agents_are_opt_in_a_plain_run_never_exposes_spawn ... ok
+test the_aggregate_ceiling_halts_the_whole_tree ... ok
+test concurrent_fanout_to_over_100_stays_bounded_and_completes ... ok
+test a_tree_with_no_duration_ceiling_is_unaffected ... ok
+test a_tree_halts_on_its_duration_ceiling_instead_of_ignoring_it ... ok
+test children_are_composed_in_spawn_order_not_completion_order ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/verify_gate.rs (target/debug/deps/verify_gate-7c688e92d834bec0)
+
+running 5 tests
+test the_added_subject_compile_is_still_policy_checked ... ok
+test a_compile_gate_rejects_a_subject_that_deletes_its_own_items ... ok
+test the_trace_names_a_subject_that_deleted_its_own_items ... ok
+test an_honest_file_still_passes_the_compile_gates ... ok
+test a_subject_cannot_shadow_a_macro_a_command_criterion_never_compiles_with ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.42s
+
+exit=0
+=== cargo test --features media --lib --tests ===
+test sub_agents_are_opt_in_a_plain_run_never_exposes_spawn ... ok
+test the_aggregate_ceiling_halts_the_whole_tree ... ok
+test concurrent_fanout_to_over_100_stays_bounded_and_completes ... ok
+test a_tree_with_no_duration_ceiling_is_unaffected ... ok
+test a_tree_halts_on_its_duration_ceiling_instead_of_ignoring_it ... ok
+test children_are_composed_in_spawn_order_not_completion_order ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.52s
+
+     Running tests/verify_gate.rs (target/debug/deps/verify_gate-17cda5a73381cef8)
+
+running 5 tests
+test the_added_subject_compile_is_still_policy_checked ... ok
+test a_compile_gate_rejects_a_subject_that_deletes_its_own_items ... ok
+test the_trace_names_a_subject_that_deleted_its_own_items ... ok
+test an_honest_file_still_passes_the_compile_gates ... ok
+test a_subject_cannot_shadow_a_macro_a_command_criterion_never_compiles_with ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+exit=0

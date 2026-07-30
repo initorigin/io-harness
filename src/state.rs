@@ -1097,6 +1097,73 @@ pub struct MemoryEntry {
     pub created_at: String,
 }
 
+/// One turn of a conversation: what was asked, which run answered it, and which
+/// earlier turn it answers from.
+///
+/// A node of the tree [`Session`](crate::Session) walks. `parent_turn_id` is what
+/// makes it a tree rather than a list: two turns may share a parent, which is
+/// what a branch is, and nothing is rewritten to create one.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let session = store.create_session("/repo")?;
+///
+/// // A turn is recorded against the run that will serve it, before that run
+/// // starts, so a turn whose process dies is still in the tree.
+/// let run = store.start_run("where is the retry policy applied?", "/repo")?;
+/// let first = store.record_turn(session, None, run, "where is the retry policy applied?")?;
+/// store.finish_turn(first, Some("in `complete_with_retry`"), "finished")?;
+///
+/// let turn = store.session_turn(first)?.expect("recorded above");
+/// assert_eq!(turn.run_id, run);
+/// assert_eq!(turn.parent_turn_id, None); // the root of this conversation
+/// assert_eq!(turn.reply.as_deref(), Some("in `complete_with_retry`"));
+///
+/// // Everything that turn cost, refused or committed is in the run tables under
+/// // `turn.run_id` — a turn adds a conversation over a run, not a second trace.
+/// assert!(store.run_status(turn.run_id)?.is_some());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn {
+    /// The turn's own id, and what [`Session::branch_from`](crate::Session::branch_from) takes.
+    pub id: i64,
+    /// The session it belongs to.
+    pub session_id: i64,
+    /// The turn it answers from, or `None` for the root of a conversation.
+    pub parent_turn_id: Option<i64>,
+    /// The run that served it. Every step, refusal and budget draw is under this id.
+    pub run_id: i64,
+    /// What the operator said.
+    pub prompt: String,
+    /// What the agent said back, when it said anything. `None` while the turn is
+    /// still running, and for a turn that stopped without a closing message.
+    pub reply: Option<String>,
+    /// Why the turn stopped, as the run's outcome string. `None` while it runs.
+    pub outcome: Option<String>,
+    /// UTC creation time.
+    pub created_at: String,
+}
+
+/// Read one `session_turns` row. One place, so the two queries that read the
+/// table cannot drift in their column order.
+fn turn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
+    Ok(Turn {
+        id: r.get(0)?,
+        session_id: r.get(1)?,
+        parent_turn_id: r.get(2)?,
+        run_id: r.get(3)?,
+        prompt: r.get(4)?,
+        reply: r.get(5)?,
+        outcome: r.get(6)?,
+        created_at: r.get(7)?,
+    })
+}
+
 /// Most entries one workspace may hold.
 ///
 /// A write past the cap is not refused — the oldest entry is evicted to make
@@ -1290,6 +1357,15 @@ impl ContextEvent {
     /// Notes from earlier runs were carried into this turn's context.
     pub fn memory_recall(step: u32, detail: impl Into<String>) -> Self {
         Self::of("memory_recall", step, detail)
+    }
+
+    /// An operator's mid-turn message entered the conversation at this step
+    /// (0.20.0). Recorded rather than only delivered: a turn that changed course
+    /// because a human said something must be readable as that afterwards, and the
+    /// detail is the message's length rather than its text — the message itself is
+    /// already in the step's observations.
+    pub fn steered(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("steered", step, detail)
     }
 
     /// Which provider actually answered this step.
@@ -1888,6 +1964,39 @@ impl Store {
                  lines_added   INTEGER NOT NULL,
                  lines_removed INTEGER NOT NULL,
                  at            TEXT NOT NULL DEFAULT (datetime('now'))
+             );",
+        )?;
+
+        // 0.20.0 — the session layer. A conversation is a tree of turns and a turn
+        // is a run, so the only new state is the tree itself: which turns a session
+        // has, which turn each one answers, and which run served it. Everything a
+        // turn cost, refused, or committed is already in the tables above under its
+        // `run_id`.
+        //
+        // New tables only, as every addition since 0.13.0 has been, and deliberately
+        // NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout changed, and bumping
+        // it would make [`Store::check_resumable`] refuse every 0.19.0 store for two
+        // additive tables. A 0.19.0 binary never queries them and opens a migrated
+        // database unchanged.
+        //
+        // `head_turn_id` is a column rather than "the last row", because branching
+        // means the head is a choice and not a maximum.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 root         TEXT NOT NULL,
+                 head_turn_id INTEGER,
+                 created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE TABLE IF NOT EXISTS session_turns (
+                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                 session_id     INTEGER NOT NULL,
+                 parent_turn_id INTEGER,
+                 run_id         INTEGER NOT NULL,
+                 prompt         TEXT NOT NULL,
+                 reply          TEXT,
+                 outcome        TEXT,
+                 created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              );",
         )?;
 
@@ -3113,6 +3222,128 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    // -----------------------------------------------------------------------
+    // 0.20.0 — the session tree. The conversation's shape lives here; what a
+    // turn did lives in the run tables under its `run_id`.
+    // -----------------------------------------------------------------------
+
+    /// Open a new session over `root`. Returns its id, which is all a later
+    /// process needs to pick the conversation back up.
+    pub fn create_session(&self, root: &str) -> Result<i64> {
+        self.conn
+            .execute("INSERT INTO sessions (root) VALUES (?1)", [root])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The root a session was opened over, or `None` if no such session exists.
+    ///
+    /// A reopen reads the root from here rather than taking it from the caller
+    /// again: a session whose workspace moved between processes would otherwise
+    /// carry a conversation about one directory into another.
+    pub fn session_root(&self, session_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT root FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| r.get(0),
+            )
+            .ok())
+    }
+
+    /// Which turn a session is currently answering from.
+    pub fn session_head(&self, session_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT head_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .ok()
+            .flatten())
+    }
+
+    /// Move a session's head. Called when a turn is taken and when a caller
+    /// branches from an earlier one.
+    pub fn set_session_head(&self, session_id: i64, turn_id: Option<i64>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE sessions SET head_turn_id = ?1 WHERE id = ?2",
+            (turn_id, session_id),
+        )?;
+        Ok(())
+    }
+
+    /// Record a turn against a session, under the run that will serve it.
+    ///
+    /// Written before the run loop starts, so a turn whose process dies mid-answer
+    /// is still in the tree with a `run_id` a resume can continue from — the same
+    /// reason a run row exists before the first completion is billed.
+    pub fn record_turn(
+        &self,
+        session_id: i64,
+        parent_turn_id: Option<i64>,
+        run_id: i64,
+        prompt: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO session_turns (session_id, parent_turn_id, run_id, prompt)
+             VALUES (?1, ?2, ?3, ?4)",
+            (session_id, parent_turn_id, run_id, prompt),
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Close a turn with what the agent said and why it stopped. Append-only in
+    /// spirit: the prompt and the parentage a turn was created with never change.
+    pub fn finish_turn(&self, turn_id: i64, reply: Option<&str>, outcome: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE session_turns SET reply = ?1, outcome = ?2 WHERE id = ?3",
+            (reply, outcome, turn_id),
+        )?;
+        Ok(())
+    }
+
+    /// One turn by id, if it exists.
+    pub fn session_turn(&self, turn_id: i64) -> Result<Option<Turn>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id, session_id, parent_turn_id, run_id, prompt, reply, outcome, created_at
+                 FROM session_turns WHERE id = ?1",
+                [turn_id],
+                turn_row,
+            )
+            .ok())
+    }
+
+    /// Which turn a run served, if it served one.
+    ///
+    /// The seam between the two halves of a turn: the run loop writes the row, and
+    /// the session reads its id back rather than being handed it — the run id is
+    /// the only thing both halves are guaranteed to know.
+    pub fn turn_for_run(&self, run_id: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT id FROM session_turns WHERE run_id = ?1",
+                [run_id],
+                |r| r.get(0),
+            )
+            .ok())
+    }
+
+    /// Every turn of a session, oldest first — the whole tree, not one path
+    /// through it. [`crate::Session::history`] is the path.
+    pub fn session_turns(&self, session_id: i64) -> Result<Vec<Turn>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, session_id, parent_turn_id, run_id, prompt, reply, outcome, created_at
+             FROM session_turns WHERE session_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([session_id], turn_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// One entry of `workspace` by key, if it holds one.
     pub fn memory_get(&self, workspace: &str, key: &str) -> Result<Option<MemoryEntry>> {
         Ok(self
@@ -3234,6 +3465,90 @@ mod tests {
             .record_event(1, &PolicyEvent::refusal(1, "read", ".env"))
             .unwrap();
         assert_eq!(store.events(1).unwrap().len(), 1);
+    }
+
+    /// NF1 — a 0.19.0 database gains the two session tables on open and keeps
+    /// everything it had. The integration test cannot write a pre-session schema
+    /// (`Store::open` always creates them), so the legacy shape is built here.
+    #[test]
+    fn a_pre_session_database_gains_the_session_tables_and_keeps_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.db");
+
+        // A 0.19.0-shaped database: everything except `sessions` and
+        // `session_turns`, which is what the version before this one wrote.
+        {
+            let store = Store::open(&path).unwrap();
+            let run = store.start_run("an older run", "notes.md").unwrap();
+            store.finish_run(run, "success").unwrap();
+            store
+                .conn
+                .execute_batch("DROP TABLE sessions; DROP TABLE session_turns;")
+                .unwrap();
+            // No format bump means the old file is still resumable by this binary.
+            let format: i64 = store
+                .conn
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(format, CHECKPOINT_FORMAT);
+        }
+
+        let store = Store::open(&path).unwrap();
+        // The run it already had is untouched...
+        assert_eq!(
+            store.run_summary(1).unwrap().map(|s| s.outcome),
+            Some("success".to_string())
+        );
+        // ...and a conversation works over the same file.
+        let session = store.create_session("/repo").unwrap();
+        let run = store.start_run("a turn", "/repo").unwrap();
+        let turn = store.record_turn(session, None, run, "hello").unwrap();
+        assert_eq!(store.turn_for_run(run).unwrap(), Some(turn));
+        assert_eq!(store.session_turns(session).unwrap().len(), 1);
+        assert_eq!(
+            store.session_root(session).unwrap().as_deref(),
+            Some("/repo")
+        );
+    }
+
+    /// A branch is two turns with one parent, and reading one path never sees the
+    /// other's turns. The tree half of F3 at the store level, where the walk
+    /// [`crate::Session::history`] performs is one query.
+    #[test]
+    fn two_turns_may_share_a_parent_and_neither_is_rewritten() {
+        let store = Store::memory().unwrap();
+        let session = store.create_session("/repo").unwrap();
+        let run = |n: &str| store.start_run(n, "/repo").unwrap();
+
+        let root = store
+            .record_turn(session, None, run("t1"), "plan it")
+            .unwrap();
+        let left = store
+            .record_turn(session, Some(root), run("t2"), "plan A")
+            .unwrap();
+        let right = store
+            .record_turn(session, Some(root), run("t3"), "plan B")
+            .unwrap();
+
+        store.finish_turn(left, Some("did A"), "finished").unwrap();
+        // Closing one branch does not touch the other.
+        assert_eq!(
+            store.session_turn(right).unwrap().unwrap().reply,
+            None,
+            "closing a sibling turn changed this one"
+        );
+        assert_eq!(
+            store.session_turn(left).unwrap().unwrap().reply.as_deref(),
+            Some("did A")
+        );
+        let all = store.session_turns(session).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(
+            all.iter()
+                .filter(|t| t.parent_turn_id == Some(root))
+                .count(),
+            2
+        );
     }
 
     #[test]

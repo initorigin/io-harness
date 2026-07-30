@@ -101,6 +101,14 @@ use crate::verify::{ExecGuard, Verification};
 /// lower those caps.
 pub const SPAWN_TOOL: &str = "spawn_agent";
 
+/// What the loop writes into an observation when the model called no tool.
+///
+/// Shared with [`crate::session`], which reads a turn's closing message back out
+/// of the observations: two literals would drift the first time one of them was
+/// reworded, and the symptom would be a session that silently stopped reporting
+/// replies.
+pub(crate) const NO_TOOL_CALL: &str = "(no tool call)";
+
 /// How many grep hits are folded into one observation. A relevance ceiling, not a
 /// size one — the size ceiling is the budget-derived per-entry cap on top of it.
 const OBS_GREP_CAP: usize = 50;
@@ -523,6 +531,55 @@ pub async fn run_with_observed<P: Provider>(
     approver: &dyn Approver,
     observer: &dyn Observer,
 ) -> Result<RunResult> {
+    run_with_extras(
+        contract,
+        provider,
+        store,
+        policy,
+        approver,
+        observer,
+        &TurnExtras::default(),
+    )
+    .await
+}
+
+/// What a session turn adds to a run, and nothing else does.
+///
+/// Three fields, all inert by default, which is what makes 0.20.0's session layer
+/// a layer: every 0.19.0 entry point drives the loop with `TurnExtras::default()`
+/// and therefore behaves exactly as it did — no seeded conversation, no steer
+/// inbox to read, and `complete` rather than `complete_streaming`.
+#[derive(Default)]
+pub(crate) struct TurnExtras<'a> {
+    /// The conversation this turn continues, rendered one entry per prior turn on
+    /// the path from the tree's root to the head. Seeded into the observation
+    /// ledger before the first step, so it is compacted by the assembler that
+    /// already compacts a long run rather than by a second rule of its own.
+    pub seed: &'a [String],
+    /// Where an operator's mid-turn messages and an interrupt arrive. Drained at
+    /// the step boundary and nowhere else.
+    pub steer: Option<&'a crate::session::SteerInbox>,
+    /// Whether to ask the provider for deltas as they arrive.
+    pub stream: bool,
+    /// The conversation this run is a turn of, when it is one. Written as a
+    /// `session_turns` row immediately after the run row exists, so a turn whose
+    /// process dies mid-answer is in the tree with a run id a resume can continue
+    /// from.
+    pub turn: Option<crate::session::SessionTurn<'a>>,
+}
+
+/// [`run_with_observed`] with the session layer's extras. Crate-internal: the
+/// public surface gains named session methods, not a seventh parameter on the
+/// entry points every caller already uses.
+pub(crate) async fn run_with_extras<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    policy: &Policy,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+    extras: &TurnExtras<'_>,
+) -> Result<RunResult> {
     // Arbitration before anything else: a toolbox that cannot be dispatched
     // unambiguously is a configuration mistake, and the caller should hear about
     // it before a run row exists and before the provider is billed for a turn.
@@ -533,6 +590,12 @@ pub async fn run_with_observed<P: Provider>(
     let skills = contract.discover_skills()?;
     let file_str = contract.file.display().to_string();
     let run_id = store.start_run(&contract.goal, &file_str)?;
+    // A session turn joins the tree here: after the run exists, before the first
+    // completion is billed. The order matters — a turn row with no run to point at
+    // would be a conversation entry nothing can explain.
+    if let Some(turn) = &extras.turn {
+        store.record_turn(turn.session_id, turn.parent_turn_id, run_id, turn.prompt)?;
+    }
     store.set_provider(run_id, provider.name())?;
     // The caller's policy, before the provider layer below is merged into it —
     // what the caller asked for, not what the harness added. Recorded so a later
@@ -573,7 +636,8 @@ pub async fn run_with_observed<P: Provider>(
         Some(root) => {
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &skills, watch,
+                contract, provider, store, run_id, &root, 1, policy, approver, &mcp, &skills,
+                watch, extras,
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
@@ -996,8 +1060,18 @@ pub async fn resume_with_observed<P: Provider>(
             };
             let mcp = McpSession::connect(&contract.mcp, policy, store, run_id, watch).await?;
             let result = run_workspace_from(
-                contract, provider, store, run_id, &root, start_step, policy, approver, &mcp,
-                &skills, watch,
+                contract,
+                provider,
+                store,
+                run_id,
+                &root,
+                start_step,
+                policy,
+                approver,
+                &mcp,
+                &skills,
+                watch,
+                &TurnExtras::default(),
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
@@ -1231,6 +1305,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 &mcp,
                 &skills,
                 watch,
+                &TurnExtras::default(),
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
@@ -1304,6 +1379,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 &mcp,
                 &skills,
                 watch,
+                &TurnExtras::default(),
             )
             .await;
             mcp.shutdown(store, run_id, watch).await;
@@ -1991,9 +2067,10 @@ async fn run_from<P: Provider>(
             ..Default::default()
         };
 
-        let response =
-            complete_with_retry(provider, &request, contract, store, run_id, step, watch, 0)
-                .await?;
+        let response = complete_with_retry(
+            provider, &request, contract, store, run_id, step, watch, 0, false,
+        )
+        .await?;
 
         // Which provider answered, when that is not a foregone conclusion. A
         // `Fallback` that fell over served this step from its secondary, and a trace
@@ -2112,6 +2189,7 @@ async fn run_workspace_from<P: Provider>(
     mcp: &McpSession,
     skills: &Skills,
     watch: &Watch<'_>,
+    extras: &TurnExtras<'_>,
 ) -> Result<RunResult> {
     // The effective policy grows as approvers remember rules; it is rebuilt as a
     // merge so a remembered allow can still never defeat a deny beneath it.
@@ -2142,6 +2220,20 @@ async fn run_workspace_from<P: Provider>(
     // run, and empty for a run checkpointed before 0.13.0, which is the same
     // re-derivation that binary did.
     let (mut ledger, mut written) = restore_ledger(store, run_id)?;
+    // A session turn continues a conversation, and the conversation enters as
+    // observations rather than as a longer goal: the assembler then bounds and
+    // compacts it under the contract's context budget, which is the machinery that
+    // already decides what a long run's history gets to say. Step 0, because no
+    // step of THIS run produced them.
+    //
+    // Only when the ledger is empty, which is a fresh turn. A resumed turn already
+    // has them from the store — the seed was persisted with the first step — and
+    // seeding again would say everything twice.
+    if ledger.is_empty() {
+        for entry in extras.seed {
+            ledger.push(Observation::new(0, ObsKind::Message, None, entry.clone()));
+        }
+    }
     // Is the agent getting anywhere? Restored from nothing on resume by design: a
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
@@ -2162,6 +2254,45 @@ async fn run_workspace_from<P: Provider>(
         // The step boundary, where a cancellation is honoured (see `cancelled`).
         if let Some(o) = cancelled(store, watch, run_id, 0, step - 1)? {
             return Ok(RunResult::new(o, run_id).with_remembered(remembered));
+        }
+        // The same boundary is where an operator's steering lands, for the same
+        // reason: the points in between are not safe to stop at or to change course
+        // from — a tool call is in flight and a file may be half-written.
+        if let Some(inbox) = extras.steer {
+            let steered = inbox.drain();
+            if steered.interrupted {
+                // The cancel path, not a second one. An interrupted turn is
+                // finished rather than abandoned: `runs.status` stops being
+                // `running`, a summary is written, and a resume reports the
+                // cancellation instead of re-driving the loop.
+                finish(store, watch, run_id, 0, step - 1, "cancelled")?;
+                info!(run_id, steps = step - 1, "turn interrupted by its operator");
+                return Ok(
+                    RunResult::new(RunOutcome::Cancelled { steps: step - 1 }, run_id)
+                        .with_remembered(remembered),
+                );
+            }
+            for message in steered.messages {
+                // An observation like any other: bounded by the same budget,
+                // recorded in the same trace, and — carrying no target — never
+                // superseded away. It is text the model reads, not permission the
+                // model has: every tool call it leads to is checked against the
+                // same policy by the same code.
+                info!(run_id, step, "operator steered the turn");
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::steered(
+                        step,
+                        format!("operator message ({} chars)", message.len()),
+                    ),
+                )?;
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Message,
+                    None,
+                    format!("\n[operator, mid-turn] {message}\n"),
+                ));
+            }
         }
         if let Some(max) = contract.max_duration {
             if store.elapsed_secs(run_id)? > max.as_secs_f64() {
@@ -2208,9 +2339,18 @@ async fn run_workspace_from<P: Provider>(
             ..Default::default()
         };
 
-        let response =
-            complete_with_retry(provider, &request, contract, store, run_id, step, watch, 0)
-                .await?;
+        let response = complete_with_retry(
+            provider,
+            &request,
+            contract,
+            store,
+            run_id,
+            step,
+            watch,
+            0,
+            extras.stream,
+        )
+        .await?;
 
         // Which provider answered, when that is not a foregone conclusion. A
         // `Fallback` that fell over served this step from its secondary, and a trace
@@ -2247,7 +2387,7 @@ async fn run_workspace_from<P: Provider>(
                 ObsKind::Message,
                 None,
                 bound(
-                    &format!("\n[step {step}] (no tool call) {said}\n"),
+                    &format!("\n[step {step}] {NO_TOOL_CALL} {said}\n"),
                     entry_cap,
                     ObsKind::Message,
                 ),
@@ -3125,6 +3265,7 @@ fn run_agent<'f, P: Provider>(
                 step,
                 tree.watch,
                 depth,
+                false,
             )
             .await?;
 
@@ -3158,7 +3299,7 @@ fn run_agent<'f, P: Provider>(
                     ObsKind::Message,
                     None,
                     bound(
-                        &format!("\n[step {step}] (no tool call) {said}\n"),
+                        &format!("\n[step {step}] {NO_TOOL_CALL} {said}\n"),
                         entry_cap,
                         ObsKind::Message,
                     ),
@@ -5128,6 +5269,7 @@ async fn complete_with_retry<P: Provider>(
     step: u32,
     watch: &Watch<'_>,
     depth: u32,
+    stream: bool,
 ) -> Result<CompletionResponse> {
     // The general media boundary. Every completion in every loop goes through
     // here, so this covers an out-of-tree `Provider` as well as the three built
@@ -5152,7 +5294,15 @@ async fn complete_with_retry<P: Provider>(
         // provider's part. `CONTRACT.md` says so rather than implying the figure
         // is the vendor's.
         let started = std::time::Instant::now();
-        let outcome = provider.complete(request.clone()).await;
+        // A streamed attempt and a plain one are the same attempt: the same clock,
+        // the same `provider_calls` row, the same retry classification. The only
+        // difference is that the deltas of a streamed one reach the observer while
+        // it is still in flight instead of being accumulated in silence.
+        let outcome = if stream {
+            stream_completion(provider, request, watch, run_id, step, depth).await
+        } else {
+            provider.complete(request.clone()).await
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
         record_provider_call(
             store,
@@ -5241,6 +5391,66 @@ async fn complete_with_retry<P: Provider>(
             }
         }
     }
+}
+
+/// One completion whose text deltas reach the observer while the model is still
+/// producing them.
+///
+/// The provider's sink has to be `Send + Sync` — its future is `Send` and a
+/// built-in provider's is driven inside `reqwest`'s stream — and [`Watch`] is
+/// neither: it holds a `Cell` so a cancellation can outlive the `event()` call
+/// that asked for it, and `Store` is `!Sync` besides. A channel is the seam
+/// between the two halves: the sink is a closure over an `mpsc` sender, which is
+/// `Send + Sync`, and the emitting happens here, on the loop's own task, where
+/// `Watch` already lives.
+///
+/// Which also means an observer that returns [`Flow::Cancel`](crate::Flow::Cancel)
+/// from a `Token` event is honoured exactly where every other cancellation is —
+/// at the next step boundary — rather than tearing down a request mid-body.
+async fn stream_completion<P: Provider>(
+    provider: &P,
+    request: &CompletionRequest,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
+) -> Result<CompletionResponse> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    // Unbounded deliberately: a bounded sender would either block the provider's
+    // stream on a slow observer — turning rendering latency into wire latency — or
+    // drop a delta, and a stream missing one delta reads like a complete answer
+    // and is not.
+    let sink = move |text: &str| {
+        // A closed receiver means this function has already returned, which cannot
+        // happen while the future it awaits is still alive. Ignored rather than
+        // escalated: a completion must not fail because nobody was listening.
+        let _ = tx.send(text.to_string());
+    };
+    let completion = provider.complete_streaming(request.clone(), &sink);
+    tokio::pin!(completion);
+    let outcome = loop {
+        tokio::select! {
+            // Deltas first, so a burst that lands with the final chunk is emitted
+            // in order rather than after the response it belongs to.
+            biased;
+            Some(text) = rx.recv() => {
+                watch.emit(RunEvent::at_depth(run_id, step, depth, EventKind::Token { text }));
+            }
+            done = &mut completion => break done,
+        }
+    };
+    // Whatever the provider sent between the last poll and its return. Without this
+    // the last delta of every stream is lost, which is the failure mode a
+    // concatenation assertion exists to catch.
+    while let Ok(text) = rx.try_recv() {
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            step,
+            depth,
+            EventKind::Token { text },
+        ));
+    }
+    outcome
 }
 
 /// Record one file change and the lines it added and removed (0.18.0).

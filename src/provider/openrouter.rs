@@ -108,6 +108,27 @@ impl Provider for OpenRouter {
     }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+        self.stream(request, &|_| {}).await
+    }
+
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<CompletionResponse> {
+        self.stream(request, on_token).await
+    }
+}
+
+impl OpenRouter {
+    /// One completion, with each text delta handed to `on_token` as it arrives.
+    /// Both trait methods are this function; `complete` passes a sink that does
+    /// nothing.
+    async fn stream(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<CompletionResponse> {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
         // The TTFT clock starts before the socket is opened, so it measures the
@@ -121,6 +142,6 @@ impl Provider for OpenRouter {
             .send()
             .await?;
 
-        openai_wire::parse_stream(super::ensure_success(resp).await?, sent).await
+        openai_wire::parse_stream_with(super::ensure_success(resp).await?, sent, on_token).await
     }
 }
