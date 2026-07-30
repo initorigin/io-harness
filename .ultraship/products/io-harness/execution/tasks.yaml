@@ -11,7 +11,7 @@ tasks:
       Half the release's outcome is that an operator can watch the agent's plan. Without a durable
       list written by the agent and readable from SQLite mid-run there is no plan to watch, and the
       first thing io-cli and io-studio would each build for themselves is this table.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -32,7 +32,9 @@ tasks:
       - src/tools/custom.rs
       - src/lib.rs
       - tests/todo.rs
-    evidence: []
+    evidence:
+      - >
+        tests/todo.rs — 7 tests. The mid-run read is asserted from a SECOND `Store` opened inside an `Observer` at step 1, not after the run; a write that landed at the end would leave it empty. Wholesale replace, empty-clears, order, malformed-is-an-observation, and inertness (no `policy_events` row, with a gated workspace write in the same run as the control).
   - id: US-IO-HARNESS-0.21.0-T02
     summary: >
       Repetition detection in the existing stall machinery: `StallPolicy::repeat` with
@@ -44,7 +46,7 @@ tasks:
       the current logic clears the whole window whenever a write lands, so the looping agent shape that
       actually occurs in practice is invisible until the step cap. Without this the release ships an
       agency story with the one signal that catches a confused agent still half blind.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -63,7 +65,19 @@ tasks:
       - src/resilience.rs
       - src/run.rs
       - tests/stall.rs
-    evidence: []
+    evidence:
+      - >
+        DEVIATION from this task's summary, and it is smaller than planned: `StallPolicy` gained NO
+        `repeat` field. Adding a public field to a struct with public fields breaks every struct
+        literal — `#[serde(default)]` covers deserialization only, and the type is built by literal
+        in its own doctests — so it would have been a FOURTH break. The threshold is the existing
+        `window`: "the same call three times in a row" and "three unproductive steps" are one
+        patience setting, and a second knob whose only correct value is the first knob's is a knob
+        nobody can set correctly. Behaviour for every `changed == false` case is identical, traced
+        step by step against the existing doctest; only the `changed == true` case is new.
+        NF3 therefore holds by construction rather than by a defaulted field.
+      - >
+        tests/stall.rs — F11 and its negative control, plus 9 total passing. The repeated-spawn case fails on 0.20.0's logic, where a child that ran reset the parent's window every step. Three DIFFERENT spawns that each do work are untouched. src/resilience.rs unit tests amended where they pinned the old directive wording.
   - id: US-IO-HARNESS-0.21.0-T03
     summary: >
       The 0.20.0 live-run defect: a refused git built-in becomes an observation instead of
@@ -75,7 +89,7 @@ tasks:
       that release. A speculative `git status` under an exec-denying policy currently escalates a whole
       run, which is the opposite of the crate's stated rule that a refusal is an observation the model
       adapts to.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -89,7 +103,9 @@ tasks:
       - src/tools/git.rs
       - tests/git.rs
       - docs/CONTRACT.md
-    evidence: []
+    evidence:
+      - >
+        tests/git.rs — 12 passing, 3 added: the exec refusal, the argv guard, and the negative control that the same call under a policy allowing `git` still runs. F12 panics on 0.20.0, where the refusal left the loop as `Err`. docs/CONTRACT.md's defect paragraph removed.
   - id: US-IO-HARNESS-0.21.0-T04
     summary: >
       The `question` tool and its in-process answering channel: `Question`, `Answer`, the `Responder`
@@ -101,7 +117,7 @@ tasks:
       guessing. This is the channel; without it an ambiguous goal is still resolved by a guess that
       costs a whole run, and the crate still has no way to ask a human anything except whether an
       action is permitted.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.21.0-T01
     acceptance_criteria:
@@ -123,7 +139,19 @@ tasks:
       - src/tools/custom.rs
       - src/lib.rs
       - tests/question.rs
-    evidence: []
+    evidence:
+      - >
+        DEVIATION, also smaller than planned: the `Responder` is carried on the contract
+        (`TaskContract::with_responder`) rather than added as an argument to every run entry point.
+        The planned signature change would have broken `run`, `run_with`, `run_tree` and their
+        observed and resume variants — every existing call site — to add an argument almost all of
+        them would pass `None` for. `Toolbox` already establishes that caller-supplied behaviour
+        rides the contract. So this release ships TWO breaks, not the three NF2 anticipated:
+        `EventKind` (+3 variants) and `RunOutcome::AwaitingAnswer` are match breaks, and
+        `CompletionRequest::model` is a struct-literal break. NF2's inventory needs correcting at
+        the complete stage.
+      - >
+        tests/question.rs — 8 passing. `an_answer_is_not_authorization` carries the control proving the write was reachable, so the refusal is the policy's. Malformed question is an observation, not the end of the run.
   - id: US-IO-HARNESS-0.21.0-T05
     summary: >
       The durable half of the question path: the `pending_questions` table with its put/read/resolve
@@ -134,7 +162,7 @@ tasks:
       agent that needs a human is a lost run. This is what makes a question survive a process exit for
       the same reason a pending approval does, and it is the only path by which a spawned child can
       reach a human.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.21.0-T04
     acceptance_criteria:
@@ -157,7 +185,9 @@ tasks:
       - src/state.rs
       - src/run.rs
       - tests/question.rs
-    evidence: []
+    evidence:
+      - >
+        tests/question.rs — the pause asserted across a DROPPED `Store` in a second connection, plus double-answer and wrong-run refusals, plus the child-question tree pause and resume.
   - id: US-IO-HARNESS-0.21.0-T06
     summary: >
       `CompletionRequest::model`, the per-request override, honoured by `OpenRouter`, `Anthropic`,
@@ -169,7 +199,7 @@ tasks:
       wire: every provider fixes its model at construction and a tree shares one provider instance.
       This is the mechanism, and it is the release's one hard break, so it lands as its own task with
       its own migration note.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -186,7 +216,9 @@ tasks:
       - src/provider/openai_wire.rs
       - src/provider/fallback.rs
       - src/run.rs
-    evidence: []
+    evidence:
+      - >
+        docs/public-api.txt + 214 doctests. Every in-crate `CompletionRequest` literal already used `..Default::default()`, so the break reaches only external callers who enumerate fields.
   - id: US-IO-HARNESS-0.21.0-T07
     summary: >
       Named agent definitions: `AgentDef` and the `Agents` registry, `TaskContract::with_agents`, the
@@ -197,7 +229,7 @@ tasks:
       Without this a sub-agent is identical to its parent apart from a goal string, so a role and a
       cheaper or stronger model per agent are unexpressible — the largest cost lever the crate has.
       The release's claim that an agent has an identity rests entirely here.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.21.0-T06
     acceptance_criteria:
@@ -220,7 +252,9 @@ tasks:
       - src/state.rs
       - src/lib.rs
       - tests/agents.rs
-    evidence: []
+    evidence:
+      - >
+        tests/agents.rs — 7 passing. Models read back from the `provider_calls` rows rather than from the roster; the mock echoes the model it was sent. The silent-definition test proves a definition cannot restore a parent's deny.
   - id: US-IO-HARNESS-0.21.0-T08
     summary: >
       Prompt templates: `Template`, `Templates::discover` and `Templates::render` reusing the `skills`
@@ -232,7 +266,7 @@ tasks:
       the release's cheapest included item — a pure function over text — and leaving it out would put
       a template parser into io-cli and io-studio separately, which is the divergence 0.19.0 exists to
       prevent.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -246,7 +280,9 @@ tasks:
       - src/lib.rs
       - tests/template.rs
       - tests/fixtures
-    evidence: []
+    evidence:
+      - >
+        tests/template.rs — 12 tests + 13 doctests. `split_front_matter`/`first_prose_line`/`clamp` lifted to `pub(crate)` in `skills` and shared rather than duplicated.
   - id: US-IO-HARNESS-0.21.0-T09
     summary: >
       Configuration reach: `[[agent]]` tables projecting onto an `Agents` registry with per-file
@@ -256,7 +292,7 @@ tasks:
       The roadmap says a definition comes "from configuration rather than from a hand-built contract".
       A programmatic registry alone leaves the operator-facing half of the promise unbuilt, and io-cli
       and io-studio consume `io.toml` rather than construct Rust values.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.21.0-T07
       - US-IO-HARNESS-0.21.0-T08
@@ -270,7 +306,9 @@ tasks:
     files:
       - src/config.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - >
+        tests/config.rs — 20 passing, 6 added, and both new keys in the EVERY_KEY fixture. Roster equality against the programmatic value; unknown key inside `[[agent]]` rejected naming key and file.
   - id: US-IO-HARNESS-0.21.0-T10
     summary: >
       Documentation and the drift gates: `docs/guide/agency.md`, a worked example on every added public
@@ -281,7 +319,7 @@ tasks:
       Four gate tests fail without it (`public_api`, `guide_pages`, `changelog`, `docs_drift`), and the
       contract's operational criteria are documentation criteria. A break shipped without its migration
       snippet is a break a consumer meets at compile time with no instructions.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.21.0-T09
     acceptance_criteria:
@@ -310,7 +348,9 @@ tasks:
       - README.md
       - src/lib.rs
       - tests/guide_pages.rs
-    evidence: []
+    evidence:
+      - >
+        docs/public-api.txt at 137 items with a worked example each; docs/guide/agency.md registered and linked from README, CAPABILITIES and the crate root; CONTRACT.md amended and the git defect removed; CHANGELOG.md with all breaks and compiling migration snippets. public_api, guide_pages, readme, docs_drift, changelog all green.
   - id: US-IO-HARNESS-0.21.0-T11
     summary: >
       The release gate and the live proof: the full suite on the default and both feature sets, fmt,

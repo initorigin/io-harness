@@ -873,12 +873,15 @@ pub async fn resume_with<P: Provider>(
 /// checked against the same [`Policy`] by the same code. A human answering "just write
 /// the file" does not make a denied write permitted.
 ///
-/// This is deliberately thin, and the thinness is the design. The step that asked was
-/// never committed, so recording the answer and resuming normally is enough: the loop
-/// replays that step, the `ask_question` call arrives again, and
-/// [`Store::answered_question`] hands it the answer instead of asking a second time.
-/// A second resume path would be a second place for the ledger, the checkpoint and the
-/// policy to be got wrong.
+/// This is deliberately thin, and the thinness is the design: recording the answer and
+/// resuming normally is enough, so there is no second resume path for the ledger, the
+/// checkpoint and the policy to be got wrong in.
+///
+/// The step that asked **was** committed — a paused step commits and the resume starts
+/// after it — so the `ask_question` call is not replayed and cannot be handed its own
+/// answer. The answer is delivered instead as an observation on the run's ledger, which
+/// is what puts it in the next assembled prompt. This is the same mechanism 0.20.0 uses
+/// to deliver a steer.
 ///
 /// Answering a question that was already answered is an [`Error::Resume`] rather than a
 /// second run — see [`Store::answer_question`].

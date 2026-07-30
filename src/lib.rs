@@ -245,6 +245,7 @@
 //! - [Resilience](https://github.com/initorigin/io-harness/blob/main/docs/guide/resilience.md)
 //! - [Observability and replay](https://github.com/initorigin/io-harness/blob/main/docs/guide/observability.md)
 //! - [Sessions](https://github.com/initorigin/io-harness/blob/main/docs/guide/sessions.md)
+//! - [Agency](https://github.com/initorigin/io-harness/blob/main/docs/guide/agency.md)
 //! - [Configuration](https://github.com/initorigin/io-harness/blob/main/docs/guide/configuration.md)
 //! - [Accounting](https://github.com/initorigin/io-harness/blob/main/docs/guide/accounting.md)
 //! - [Documents](https://github.com/initorigin/io-harness/blob/main/docs/guide/documents.md)

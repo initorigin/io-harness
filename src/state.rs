@@ -1201,7 +1201,13 @@ pub struct PendingQuestion {
     pub id: i64,
     /// The run that asked.
     pub run_id: i64,
-    /// The step it was asked on. The step was not committed, so a resume replays it.
+    /// The step it was asked on.
+    ///
+    /// That step **is** committed before the run pauses, so a resume starts after it and
+    /// the `ask_question` call is not replayed;
+    /// [`resume_with_answer`](crate::resume_with_answer) delivers the answer as a ledger
+    /// observation. (A *parent* whose child asked is the different case: its own spawn
+    /// step is left uncommitted so the resume re-adopts that child.)
     pub step: u32,
     /// What the agent asked.
     pub question: String,
