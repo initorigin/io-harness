@@ -1,30 +1,7 @@
-error: 25 files in the working directory contain changes that were not yet committed into git:
-
-CHANGELOG.md
-Cargo.lock
-Cargo.toml
-README.md
-assets/initorigin-logo.png
-docs/CAPABILITIES.md
-docs/CONTRACT.md
-docs/guide/sessions.md
-docs/public-api.txt
-examples/session_live.rs
-src/lib.rs
-src/observe.rs
-src/provider/anthropic.rs
-src/provider/fallback.rs
-src/provider/mod.rs
-src/provider/openai.rs
-src/provider/openai_wire.rs
-src/provider/openrouter.rs
-src/run.rs
-src/session.rs
-src/state.rs
-tests/guide_pages.rs
-tests/session.rs
-tests/session_steering.rs
-tests/session_streaming.rs
-
-to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag
-exit=101
+   Packaging io-harness v0.20.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+    Updating crates.io index
+    Packaged 141 files, 2.5MiB (703.7KiB compressed)
+   Verifying io-harness v0.20.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+   Compiling io-harness v0.20.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness/target/package/io-harness-0.20.0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.81s
+exit=0
