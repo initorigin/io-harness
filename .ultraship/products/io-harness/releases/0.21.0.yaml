@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.21.0
-status: planned
+status: released
 release_type: minor
 outcome:
   user_can: >
@@ -489,3 +489,205 @@ open_questions:
   is consistent with the existing "a replanned agent gets a clean window" rule; not resetting catches
   an agent that resumes the same loop immediately after being told to stop. Decided during
   development against F11's script.
+released_at: '2026-07-30T13:11:10Z'
+mode: published
+delivered: >
+  The agent becomes legible. It writes down a plan an operator reads out of SQLite from another
+  process while the run is still going, and when the goal is genuinely ambiguous it asks what was
+  meant instead of guessing — answered in-process by a `Responder`, or by pausing the run, persisting
+  the question and resuming in a later process on a human's answer, exactly as an approval already
+  does. A question is not an approval anywhere in the crate: an answer is text delivered as an
+  observation, and every tool call after it is re-checked against the same `Policy` by the same code.
+  A sub-agent gets an identity — `AgentDef`/`Agents`, programmatic or from `[[agent]]` tables in
+  `io.toml` — carrying a role, a model string and narrowings that can only ever pass through
+  `Policy::contain`, so "search on the cheap model, write on the strong one" is finally expressible
+  and a definition can never widen what its parent allowed. Prompt templates reuse the skills
+  discovery and frontmatter parser to turn a named `.md` file plus arguments into a `String` the
+  caller hands to a turn, and nothing else. Repetition detection rides the 0.11.0 stall machinery
+  with a counter a workspace write does not reset, so the looping agent 0.20.0's live run had to run
+  to its step cap is now replanned and then stalled. And the defect that live run exposed is fixed:
+  a git built-in refused by the exec policy costs one step and an observation instead of ending the
+  run. The live proof is a real OpenRouter run — a three-item plan read from a second connection
+  mid-run, a question answered "beta.txt" with beta.txt the file that changed, and two named agents
+  served by openai/gpt-4o-mini and openai/gpt-4o under a root on openai/gpt-5.6-luna, each asserted
+  by the example itself.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — 44 result groups, 855 tests passing, 0 failing, exit 0,
+    including 251 lib unit tests and 217 doctests. evidence/0.21.0/tests-default.txt.
+  - >
+    `cargo test --all-features` — 44 result groups, 934 tests passing, 0 failing, exit 0.
+    evidence/0.21.0/tests-features.txt.
+  - >
+    Every acceptance criterion is mapped to the test that proves it in
+    evidence/0.21.0/acceptance-map.txt. F1–F2 are tests/todo.rs (7 tests: a plan read from a second
+    connection mid-run, a second write replacing the list wholesale, a plan outliving its store, a
+    plan producing no `policy_events` row with a workspace write in the same run as the control).
+    F3–F6 and NF6 are tests/question.rs (8 tests: an answer changing the next action, an
+    unanswerable question pausing the run and surviving the process, answering twice being an
+    error, an answer to another run's question refused, an answer under a denying policy still
+    refused with the permissive run as the control, and a child's question pausing the whole tree).
+  - >
+    F7–F8 are tests/agents.rs (7 tests: two definitions putting their own two model strings on the
+    wire read back from `provider_calls`, a spawn with no agent named carrying the provider's own
+    model as the control, the role prepended to the child's prompt, `deny_write` producing a child
+    refused a write the parent is allowed, a definition silent about a denied path *not* restoring
+    it, an unknown name yielding an error observation and no child, and the trace recording which
+    definition a child came from). F9 is tests/config.rs, where `[[agent]]` tables project onto the
+    same roster the programmatic API builds and accumulate across scopes the way `policy.layers`
+    does.
+  - >
+    F10 is tests/template.rs (12 tests, including a placeholder with no argument being an error
+    rather than an empty string, a substituted value never being re-substituted, and a rendered
+    prompt driving a real run unchanged). F11 is tests/stall.rs, where the same spawn repeated three
+    times is caught even though every step writes, with three *different* writing spawns as the
+    control and `repeat: 0` restoring 0.20.0's behaviour exactly; the eleven pre-existing stall
+    tests still hold. F12 is tests/git.rs, where a `git_status` refused by the exec policy is an
+    observation the run continues past, the same for a path beginning with `-`, and the identical run
+    under a permissive policy actually runs the command — a test that would have failed on 0.20.0.
+  - >
+    NF3 — tests/parity.rs, tests/determinism.rs, tests/replay.rs and tests/observe.rs all pass
+    unamended, so a run that uses none of this behaves as it did; `StallPolicy`'s new `repeat` field
+    is `#[serde(default)]`, so an existing `io.toml` and an existing struct literal both keep
+    working.
+  builds:
+  - >
+    `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+    `cargo clippy --all-targets --all-features -- -D warnings` and
+    `cargo doc --all-features --no-deps` all exit 0 with zero warnings.
+    evidence/0.21.0/build-and-lint.txt.
+  - >
+    NF1 — the default `cargo tree` is **407 lines**, the number inherited from `develop`, unchanged;
+    the only Cargo.toml edit in the whole release is the version line, so no dependency was added.
+    `CHECKPOINT_FORMAT` is still 7, `todos` and `pending_questions` are both
+    `CREATE TABLE IF NOT EXISTS`, and the diff adds no `ALTER TABLE` (the seven in src/state.rs are
+    the 0.1.0 in-place migration and predate 0.2.0). evidence/0.21.0/scope-check.txt and
+    evidence/0.21.0/dependency-tree.txt.
+  - >
+    NF2 — exactly three breaks, and the surface is narrower than the contract planned. `EventKind`
+    gains `TodoWrote`, `QuestionAsked` and `QuestionAnswered`; `RunOutcome` gains `AwaitingAnswer`;
+    `CompletionRequest` gains `model: Option<String>`. **No existing public signature changed at
+    all** — the `Responder` arrives through `TaskContract::with_responder` rather than as a parameter
+    on the run entry points, so the contract's fourth planned migration did not have to happen and
+    `run`, `run_with`, `resume*` and the tree variants are untouched. docs/public-api.txt loses no
+    item (its four deletions are the same lines re-added in sort order), and CHANGELOG.md carries a
+    compiling migration snippet for each of the three. evidence/0.21.0/scope-check.txt.
+  - >
+    `scope.excluded` verified absent rather than assumed: no fifth `Act` variant (the enum is still
+    Read/Write/Exec/Net), no `Session::turn_tree` anywhere in `src/`, no template conditional, loop,
+    include or partial in src/template.rs, and no new dependency. evidence/0.21.0/scope-check.txt.
+  - >
+    `cargo package --locked` produced io-harness-0.21.0.crate — 153 files, 2.7 MiB (768.6 KiB
+    compressed) — and its verify build compiled the packaged sources standalone, exit 0. The archive
+    carries no `.env`, no `.ultraship/` and no `.github/`. evidence/0.21.0/package-verify.txt.
+  - >
+    OP1 — docs/public-api.txt updated by hand with the 18 added items, and tests/public_api.rs
+    passes against the live surface including the worked-example check. OP2 — docs/guide/agency.md
+    exists (25K), is listed in tests/guide_pages.rs with its limits block, and is linked from
+    README.md, docs/CAPABILITIES.md and the crate root. OP3 — docs/CONTRACT.md states what a plan, a
+    question, a definition and a template each guarantee and do not, and the refused-git-built-in
+    defect paragraph is **removed** because it is fixed here. OP4 — tests/changelog.rs passes over a
+    155-line [0.21.0] section carrying all three breaks with migration snippets.
+  - >
+    No secret is committed: `.env` is untracked and ignored (.gitignore:10, `*.env`), and the
+    0.20.0..0.21.0 diff contains no provider- or registry-token-shaped string.
+  reviews: []
+  deployments: []
+  health_checks:
+  - >
+    OP5 — a live agency run against OpenRouter, exit 0, "All live claims held".
+    evidence/0.21.0/live-run-agency.txt. The agent wrote a three-item plan and moved its items
+    through pending/active/done; the observer read that plan from a **second connection** to the same
+    database four times while the run was still going, which is what a UI in another process has; the
+    agent asked "Which file should receive the appended line `reviewed`?" offering alpha.txt and
+    beta.txt, the responder answered beta.txt, and beta.txt is the file that gained the line while
+    alpha.txt was left byte-identical; every question the responder saw is in the trace with
+    `answered_by = responder`; and a tree spawning the `searcher` and `author` definitions produced
+    `provider_calls` rows carrying openai/gpt-4o-mini and openai/gpt-4o against a root running on
+    openai/gpt-5.6-luna, with the spawn prompts and the originating definition recorded. The example
+    asserts each claim itself, so a regression fails the run rather than printing output nobody
+    reads.
+known_limitations:
+- >
+  This record is sealed on `feat/0.21.0` before the crates.io upload, which is the standing flow:
+  the record states the authorized target and the flow makes it true. The upload follows the
+  develop -> main merge and the GitHub Release, and is the last step.
+- >
+  **NF4 — the three-OS suite is proven by CI on the pull request, not from this machine.**
+  Everything above was run on macOS. The question tests are store- and process-boundary-bound and
+  the template tests read a directory, which are the two places the Windows leg historically
+  disagrees. `skills::discovery_over_a_32_skill_directory_is_under_50ms` is a wall-clock assertion
+  that fails intermittently on the Windows runner under load and passes on re-run.
+- >
+  **The live run's two agent models are not the two the example documents.** Its defaults are
+  anthropic/claude-haiku-4.5 and anthropic/claude-sonnet-4, and both were refused with HTTP 402 —
+  the OpenRouter balance could afford 59,266 completion tokens and those models' 64,000-token
+  ceiling costs more than that. The first attempt is kept as
+  evidence/0.21.0/live-run-agency-attempt1-402.txt, where claims 1 and 2 had already passed. The
+  recorded run used openai/gpt-4o-mini and openai/gpt-4o instead, which proves the same thing — two
+  definitions, two model strings, read back from `provider_calls` — on a smaller balance. What was
+  not exercised live is a per-agent model from a *different vendor* than the root's.
+- >
+  **The live run's `searcher` never attempted a write, so its `deny_write` was not exercised in
+  anger.** It obeyed "do not modify any files" on its own, which is the model behaving well rather
+  than the boundary being tested. That a definition's deny actually refuses is proven offline by
+  tests/agents.rs against a provider scripted to try the write, with the child layer named in the
+  attribution.
+- >
+  **A plan is the agent's stated intent, never a commitment.** Nothing checks that the agent did
+  what its plan said, no outcome depends on a todo state, and a run whose plan is unfinished still
+  reports whatever its verification and budgets dictate. In the live run the agent left item 2
+  `active` and item 3 `pending` at the step cap while having already made the edit — an honest
+  illustration of the limitation. A plan the harness policed would be a second verification layer
+  competing with the one the crate has; the answer here is documentation, and it is the honest one.
+- >
+  **A `Responder` is the only answering channel, and there is no UI for it.** `StdinResponder` and
+  `FixedResponder` ship; a TUI, an HTTP endpoint and a JSON event envelope do not, deliberately —
+  io-cli and io-studio own their front ends. An answer is also an untyped `String`, optionally one of
+  `choices`; nothing validates it against them.
+- >
+  **A question can only be asked of the operator.** No provider-side clarification round-trip, no
+  question routed to another agent, and a parent cannot answer for its child — a child's question
+  pauses the whole tree and reaches the human, which is the only answer path this release has.
+- >
+  **A definition names a model string, not a provider.** One run has one provider and one key; two
+  definitions naming models from different vendors is a `provider::Fallback` question. The recorded
+  `CompletionResponse::model` keeps saying what actually served each call, so a vendor silently
+  substituting a model reads honestly in the trace rather than being hidden — but a definition
+  asking for a model the account cannot reach fails the call, as the 402 above shows.
+- >
+  **There is still no run-level or turn-level model override.** `CompletionRequest::model` exists
+  because named agents need it; exposing a model swap on `TaskContract` or on a session turn stays
+  shut, as 0.20.0 left it.
+- >
+  **`AgentDef` narrows by `deny_write`/`deny_net` only.** The contract's second open question is
+  resolved in the narrow direction: there is no per-agent tool allow-list, because it would be the
+  one narrowing not proven by `Policy::contain`.
+- >
+  **A template renders text and can set nothing** — no policy, no budget, no toolbox, no model, no
+  verification criterion — and its language is placeholder substitution plus `$ARGUMENTS`, nothing
+  more. Discovery stays caller-side (the contract's third open question): a run cannot name a
+  template by id in its trace, because a `TaskContract` field would have been a wider surface and a
+  break.
+- >
+  **The stall window still does not survive a resume.** `Progress` is in-memory, so a resumed run
+  starts its repetition counter and its unproductive window at zero, exactly as on 0.20.0. Making it
+  durable is a checkpoint change and this release makes none. Repetition also resets with the window
+  on a replan (the contract's fourth open question, resolved consistently with the existing
+  "a replanned agent gets a clean window" rule), so an agent that resumes the same loop immediately
+  after being told to stop needs the second window to catch it again.
+- >
+  Carried unchanged from 0.20.0 and untouched by this release, as `scope.excluded` requires:
+  `resume_tree` still does not call `record_run_policy`; `SandboxLimits::max_processes` is enforced
+  by nothing on any platform; the Linux backend installs no seccomp filter;
+  `Containment::max_total_cost` is inert; `server_tool_requests` is zero everywhere until 0.22.0;
+  the crate ships no prices; the `[toolchain]` config override does not reach this crate's own run
+  loop; an unknown key inside a `[[mcp]]` table is not rejected; `git_status` lacks `-z`;
+  `fill_form` has never been opened in a real viewer; the Windows Job Object is unimplemented;
+  `pdf::read_text`'s `catch_unwind` is a no-op under `panic = "abort"`; `TEST_BINARY` is inert;
+  there is no `Session::resume_turn`, no `turn_bounded_steered`, and `Session::history` is linear
+  per hop.
+supersedes: 0.20.0
+next_recommended_version: 0.22.0
+immutable: true

@@ -448,7 +448,7 @@ versions:
       layer: a refused git built-in becomes an observation the model adapts to instead of ending the
       run.
     detail: specified
-    status: planned
+    status: released
   - version: 0.22.0
     outcome: >
       The agent can reach current information. Web search and fetch are declared and configured by
