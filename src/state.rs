@@ -1351,9 +1351,46 @@ impl TodoItem {
 /// A write past the cap is truncated to the cap rather than refused, and the tool
 /// says so in its observation — the same shape as every other bounded tool result
 /// in the crate, which caps and tells rather than failing.
+///
+/// ```
+/// use io_harness::{Store, TodoItem, TodoState, TODO_MAX_ITEMS};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("a very long plan", "/repo")?;
+///
+/// // Two past the cap. The plan is held to the cap and the overflow is reported,
+/// // rather than the write being refused.
+/// let long: Vec<TodoItem> = (0..TODO_MAX_ITEMS + 2)
+///     .map(|i| TodoItem::new(format!("step {i}"), TodoState::Pending))
+///     .collect();
+/// let dropped = store.write_todos(run, &long)?;
+///
+/// assert_eq!(dropped, 2);
+/// assert_eq!(store.todos(run)?.len(), TODO_MAX_ITEMS);
+/// # Ok(())
+/// # }
+/// ```
 pub const TODO_MAX_ITEMS: usize = 64;
 
 /// Longest one item's text may be, in characters.
+///
+/// Truncated to fit rather than refused, like every other bounded tool result here.
+///
+/// ```
+/// use io_harness::{Store, TodoItem, TodoState, TODO_TEXT_CAP};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("a wordy plan", "/repo")?;
+///
+/// let wordy = "x".repeat(TODO_TEXT_CAP + 50);
+/// store.write_todos(run, &[TodoItem::new(wordy, TodoState::Active)])?;
+///
+/// assert_eq!(store.todos(run)?[0].text.chars().count(), TODO_TEXT_CAP);
+/// # Ok(())
+/// # }
+/// ```
 pub const TODO_TEXT_CAP: usize = 200;
 
 /// Most entries one workspace may hold.

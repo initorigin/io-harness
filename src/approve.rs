@@ -499,6 +499,25 @@ impl Question {
 
 /// The future a [`Responder`] returns. Boxed for the same reason
 /// [`DecisionFuture`] is: object safety.
+///
+/// `Option<String>`, not `String`: `None` is "nobody here can answer", which is a real
+/// answer and the one that makes the run pause for a human rather than guess.
+///
+/// ```
+/// use io_harness::{AnswerFuture, Question, Responder};
+///
+/// #[derive(Debug)]
+/// struct AlwaysDeclines;
+///
+/// impl Responder for AlwaysDeclines {
+///     fn answer<'a>(&'a self, _question: &'a Question) -> AnswerFuture<'a> {
+///         Box::pin(async { None })
+///     }
+/// }
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// assert!(rt.block_on(AlwaysDeclines.answer(&Question::new("Which?"))).is_none());
+/// ```
 pub type AnswerFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
 
 /// Answers an agent's question about intent, in this process.
@@ -533,19 +552,16 @@ pub type AnswerFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send +
 ///     }
 /// }
 ///
-/// # tokio_test_stub(); fn tokio_test_stub() {}
 /// let responder = FirstChoice;
-/// let answered = futures_executor_block_on(responder.answer(
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+///
+/// let answered = rt.block_on(responder.answer(
 ///     &Question::new("Which?").with_choices(["left", "right"]),
 /// ));
 /// assert_eq!(answered.as_deref(), Some("left"));
 ///
 /// // No options, so this responder has nothing to say and the run will pause.
-/// assert!(futures_executor_block_on(responder.answer(&Question::new("Why?"))).is_none());
-///
-/// # fn futures_executor_block_on<F: std::future::Future>(f: F) -> F::Output {
-/// #     futures_util::executor::block_on(f)
-/// # }
+/// assert!(rt.block_on(responder.answer(&Question::new("Why?"))).is_none());
 /// ```
 pub trait Responder: Send + Sync + fmt::Debug {
     /// Answer one question, or return `None` to let the run pause for a human.
@@ -561,9 +577,8 @@ pub trait Responder: Send + Sync + fmt::Debug {
 /// ```
 /// use io_harness::{Question, Responder, ResponderNone};
 ///
-/// let answered = futures_util::executor::block_on(
-///     ResponderNone.answer(&Question::new("Which config?")),
-/// );
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let answered = rt.block_on(ResponderNone.answer(&Question::new("Which config?")));
 /// assert!(answered.is_none(), "it declines, and the run pauses");
 /// ```
 #[derive(Debug, Clone, Copy, Default)]
@@ -581,9 +596,8 @@ impl Responder for ResponderNone {
 /// use io_harness::{FixedResponder, Question, Responder};
 ///
 /// let responder = FixedResponder::new("the second one");
-/// let answered = futures_util::executor::block_on(
-///     responder.answer(&Question::new("Which one?")),
-/// );
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let answered = rt.block_on(responder.answer(&Question::new("Which one?")));
 /// assert_eq!(answered.as_deref(), Some("the second one"));
 /// ```
 #[derive(Debug, Clone, Default)]
@@ -614,6 +628,18 @@ impl Responder for FixedResponder {
 ///
 /// Blocking stdin on the async runtime is acceptable for the same reason it is in
 /// [`StdinApprover`]: a run that is waiting for a human has nothing else to do.
+///
+/// ```no_run
+/// use io_harness::{StdinResponder, TaskContract, Verification};
+/// use std::sync::Arc;
+///
+/// // A CLI that can hold a conversation about intent: the agent asks, the operator
+/// // types, the run carries on. An empty line declines, and the run pauses instead —
+/// // the question is durable, so nothing is lost by deciding later.
+/// let contract = TaskContract::workspace("port the parser", "/repo", Verification::None)
+///     .with_responder(Arc::new(StdinResponder));
+/// # let _ = contract;
+/// ```
 #[derive(Debug, Clone, Copy, Default)]
 pub struct StdinResponder;
 

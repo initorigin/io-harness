@@ -116,7 +116,7 @@ Windows as "resource-capped".
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.20.0.
+is fixed as of 0.21.0.
 
 **What a session is, and is not (0.20.0).** A [`Session`] is a conversation over
 the runs, not a second execution path:
@@ -316,16 +316,83 @@ that understates what was permitted. `resume_tree_from_stored_policy` is
 unaffected — it reads that same row back, so what is recorded is what runs — and
 it is the entry point to prefer when the boundary matters.
 
-**A refused git built-in ends the run.** Every other refusal is an observation
-the model reads and adapts to — a denied write comes back as text, and the agent
-tries something else. The five git built-ins are the exception: a policy that
-denies `Act::Exec` for `git` makes `git_status`, `git_diff`, `git_log`,
-`git_add` and `git_commit` return `Error::Refused` out of the run loop, so one
-speculative `git status` under an exec-denying policy escalates the whole run
-instead of costing a step. Found while running the 0.20.0 live session; not fixed
-there, because that release touches no tool. Until it is fixed, a policy that
-denies exec should allow the git built-ins explicitly if the agent might reach for
-one.
+**What a plan is, and is not (0.21.0).** The `todo_write` tool holds the agent's
+plan in a `todos` table, replaced wholesale on every write.
+
+- **A plan is never enforced.** Nothing verifies it, no `RunOutcome` depends on
+  it, and no refusal consults it. An item whose state is `done` is the agent's
+  claim, not a fact the harness checked. What a plan buys is a long run that can
+  be recognised as going the wrong way before it ends.
+- **A plan is not gated, and neither is a question.** Both write into the
+  harness's own store rather than the workspace, the network or a binary, so
+  there is no `Act` to check them against. There is deliberately no fifth `Act`
+  variant: a permission rule in front of the channel whose purpose is to ask a
+  human something would be a category error.
+- **A plan is readable while the run is going.** The write is one transaction, so
+  a reader on another connection sees the previous plan or the next one and never
+  half of each.
+
+**An answer to a question is text, never authorization (0.21.0).** The approval
+path asks whether an action is *permitted* and its answer can only narrow what
+happens. `ask_question` asks what the operator *wanted*, and its answer is
+delivered to the model as an observation. Every tool call that follows one is
+checked against the same `Policy` by the same code — the rule steering has
+followed since 0.20.0. A human answering "write the file, I authorize it" does
+not make a denied write permitted.
+
+- **A paused question's step is committed, so the asking call is not replayed.**
+  `resume_with_answer` therefore delivers the answer as a ledger observation
+  rather than by re-running the tool. `Store::answered_question` is a query for
+  reconstructing a run, not the resume mechanism.
+- **`answered_by` distinguishes a machine from a person.** A `Responder` in the
+  run's own process and a human answering after a pause are different facts about
+  a run, and the trace keeps them apart.
+- **A child's question pauses the whole tree**, as a child's deferred approval
+  does, and `resume_tree_with_answer` takes the *root's* run id.
+
+**What a named agent definition can and cannot do (0.21.0).** An `AgentDef` gives
+a spawned child a role, a model and a narrower boundary.
+
+- **A definition can only narrow.** `deny_write` and `deny_net` compose through
+  `Policy::contain`, which has bounded every child since 0.5.0 — allows
+  intersect, denies union, at any depth. There is no `allow_write` and no
+  `allow_net`, and there must never be one: a roster in a configuration file that
+  could grant would be a privilege-escalation path. A definition silent about a
+  path its parent denies still yields a child that is refused it.
+- **A model is a request, not a fact.** `AgentDef::model` travels as
+  `CompletionRequest::model`, which a vendor may substitute or alias. What
+  actually served a call is `CompletionResponse::model`, and that is what the
+  trace records.
+- **One provider serves a whole tree.** A definition names a model *string*; it
+  cannot carry its own provider, vendor or API key. Two definitions naming models
+  from different vendors is not supported.
+- **A definition cannot carry its own skills directory.** The tree's skill
+  catalogue is the root's and is shared, as it has been since 0.5.0.
+- **The roster is advertised in the spawn tool's description, not as a schema
+  `enum`**, so an unknown name is a recoverable error observation naming what is
+  available rather than a malformed call.
+
+**What a prompt template is (0.21.0).** `Templates::render` substitutes
+`{{placeholder}}` values and routes the remainder to `$ARGUMENTS`, and returns a
+`String`.
+
+- **Rendering can set nothing.** No policy, no budget, no toolbox, no model, no
+  verification criterion — it returns text, which is what makes a shared template
+  directory safe to read.
+- **A placeholder with no argument is an error, never an empty string** — the rule
+  0.19.0 set for `${env:}`, for the same reason: a goal with a hole in it still
+  reads like a goal.
+- **There is no template language.** No conditionals, loops, includes, partials or
+  nesting, and substitution is single-pass: a value containing `{{x}}` is emitted
+  literally rather than re-read.
+
+**Repetition detection does not survive a resume (0.21.0).** There are now two
+stall signals: the 0.11.0 window (the workspace stayed still *and* a call
+repeated) and bare repetition (the same call `window` times in a row, whether or
+not the workspace moved — the shape a parent respawning one child takes, which
+the window could never see because a child that ran sets `changed`
+unconditionally). Both live in `Progress`, which is in-memory, so a resumed run
+starts its window at zero exactly as it did before.
 
 **`git_status` output.** It uses `--porcelain=v1` without `-z`, so a path
 containing a newline renders ambiguously to the model. A display concern, not a

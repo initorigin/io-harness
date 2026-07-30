@@ -135,6 +135,11 @@ const OBS_GREP_CAP: usize = 50;
 ///     // `resume_with_decision` with that id. Never retry the run from scratch.
 ///     RunOutcome::AwaitingApproval { request_id: _, .. } => "ask a human, then resume",
 ///
+///     // (0.21.0) Also paused, and a different question: the agent asked what you
+///     // MEANT, not whether it may act. `resume_with_answer` continues it with the
+///     // answer, which reaches the model as text and authorizes nothing.
+///     RunOutcome::AwaitingAnswer { question_id: _, .. } => "answer it, then resume",
+///
 ///     // Ceilings, and they mean different things. More steps or more time is a
 ///     // knob; a token ceiling that keeps being hit is usually a task too big
 ///     // for one contract.
@@ -929,6 +934,21 @@ pub async fn resume_with_answer<P: Provider>(
 }
 
 /// [`resume_with_answer`] with an [`Observer`].
+///
+/// ```no_run
+/// use io_harness::{resume_with_answer_observed, ApproveAll, Ignore, OpenRouter, Policy,
+///                  Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// let result = resume_with_answer_observed(
+///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?,
+///     7, 3, "io.local.toml", &Policy::permissive(), &ApproveAll, &Ignore,
+/// ).await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_with_answer_observed<P: Provider>(
     contract: &TaskContract,
@@ -955,6 +975,31 @@ pub async fn resume_with_answer_observed<P: Provider>(
 /// is the ROOT's run id and `question_id` identifies the question, which may belong to
 /// any agent in the tree — the resume walks the tree and every agent continues from its
 /// own last committed step.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_answer, ApproveAll, Containment, OpenRouter, Policy,
+///                  Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// let store = Store::open("runs.db")?;
+///
+/// // The question belongs to whichever agent asked it — often a child — but the run id
+/// // passed here is the root's, because what resumes is the tree.
+/// let root_run_id = 7;
+/// let question_id = 4;
+/// let asked_by = store.question(question_id)?.map(|q| q.run_id);
+/// println!("the question came from run {asked_by:?}");
+///
+/// let result = resume_tree_with_answer(
+///     &contract, &OpenRouter::from_env()?, &store, root_run_id, question_id,
+///     "keep the old column", &Policy::permissive(), &ApproveAll,
+///     &Containment::new(10, 4, 3, 1_000_000),
+/// ).await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree_with_answer<P: Provider>(
     contract: &TaskContract,
@@ -983,6 +1028,22 @@ pub async fn resume_tree_with_answer<P: Provider>(
 }
 
 /// [`resume_tree_with_answer`] with an [`Observer`].
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_answer_observed, ApproveAll, Containment, Ignore,
+///                  OpenRouter, Policy, Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// let result = resume_tree_with_answer_observed(
+///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, 7, 4,
+///     "keep the old column", &Policy::permissive(), &ApproveAll,
+///     &Containment::new(10, 4, 3, 1_000_000), &Ignore,
+/// ).await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
 #[allow(clippy::too_many_arguments)]
 pub async fn resume_tree_with_answer_observed<P: Provider>(
     contract: &TaskContract,
