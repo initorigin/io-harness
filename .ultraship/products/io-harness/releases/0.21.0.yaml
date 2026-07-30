@@ -620,6 +620,23 @@ known_limitations:
   disagrees. `skills::discovery_over_a_32_skill_directory_is_under_50ms` is a wall-clock assertion
   that fails intermittently on the Windows runner under load and passes on re-run.
 - >
+  **This record was re-sealed once, before publication, because CI found a defect after it was
+  first sealed.** The Windows leg of PR #68 failed on
+  `tests/template.rs::render_substitutes_placeholders_and_routes_the_remainder_to_arguments` and
+  nowhere else: the GitHub Windows runner checks out with `core.autocrlf=true`, so every LF in
+  `tests/fixtures/**` became CRLF, and that test compares a rendered template body byte for byte —
+  which compares the fixture's bytes too. It is not the known flaky timing test and it was not a
+  flake; it failed identically on both runs of the same commit. The parser is not at fault and was
+  not touched: `src/skills.rs` returns a frontmatter body verbatim on purpose, pinned by its own
+  `crlf_line_endings_parse` unit test, so a Windows user with a CRLF template legitimately gets CRLF
+  in the rendered prompt. The fix is a `.gitattributes` marking `tests/fixtures/** text eol=lf`,
+  which makes a fixture's bytes the same on every platform for CI and for anyone cloning on Windows,
+  and covers the older `readme-0.15.0-headings.md` fixture that had the same latent exposure
+  (commit 19806ae, with a CHANGELOG entry under Fixed). Every gate above was re-checked against the
+  fixed tree and the three-OS matrix is green on it. The evidence figures are unchanged, because
+  nothing in the crate changed. Recorded here rather than left out: the first seal predated a real
+  defect, and a reader of this ledger is entitled to know that.
+- >
   **The live run's two agent models are not the two the example documents.** Its defaults are
   anthropic/claude-haiku-4.5 and anthropic/claude-sonnet-4, and both were refused with HTTP 402 —
   the OpenRouter balance could afford 59,266 completion tokens and those models' 64,000-token

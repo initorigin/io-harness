@@ -1,0 +1,18 @@
+NF4 — the three-OS suite, proven by CI on PR #68 (initorigin/io-harness)
+
+Head commit 19806ae (the .gitattributes fix). All nine required checks pass:
+
+  pass		CodeQL
+  pass	CI	docs.rs (nightly)
+  pass	CI	lint
+  pass	CI	msrv
+  pass	CI	test (macos-latest)
+  pass	CI	test (ubuntu-latest)
+  pass	CI	test (windows-latest)
+  pass	CodeQL	Analyze (actions)
+  pass	CodeQL	Analyze (rust)
+
+The first attempt, on 492c22d, failed the Windows leg only — see
+windows-crlf-failure.txt. It failed identically on both the push-triggered and
+the pull-request-triggered run of that commit, so it was not the known flaky
+timing assertion.
