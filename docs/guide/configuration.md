@@ -206,6 +206,29 @@ Declaring a server does not start it. Its binary is still an `Act::Exec` check
 and its host still an `Act::Net` check, so without a policy rule naming them the
 run refuses before the server process exists.
 
+### `[web]` → `WebAccess`, via `Config::apply_to`
+
+```toml
+[web]
+search = true                          # let the provider run a search
+fetch = false                          # let the provider fetch a URL
+max_uses = 5                           # cap on provider-executed requests per completion
+allowed_domains = ["docs.rs"]          # empty means the vendor's default: anywhere
+blocked_domains = ["evil.test"]        # empty means no block-list
+```
+
+The table lands on the same `WebAccess` the programmatic builder produces, and it
+merges key by key like any other table: a local scope writing `search = false`
+switches it off without dropping the project's `max_uses` or domain lists.
+
+Nothing here is on by default, and writing the table is not the same as switching
+it on — a file that carries `[web]` with `search = false` has stated a decision,
+and the contract records it as one.
+
+**The boundary is declared, not enforced.** The provider dials the URL, so
+`Act::Net` never sees it and the domain lists are filling in the *vendor's* filter.
+A caller who needs the boundary enforced in this process must leave this off.
+
 ## Secrets: `${env:...}` and `${file:...}`
 
 Any string value may name an environment variable or a file:

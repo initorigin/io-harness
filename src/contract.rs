@@ -175,6 +175,15 @@ pub struct TaskContract {
     /// Behind an `Arc` so a whole tree shares one responder, exactly as it shares one
     /// [`Approver`](crate::Approver).
     pub responder: Option<std::sync::Arc<dyn crate::approve::Responder>>,
+    /// What the provider may look up on the agent's behalf (0.22.0).
+    ///
+    /// `None` — the default — is every release before 0.22.0: nothing is declared
+    /// and no vendor is asked to search. Set it with [`TaskContract::with_web`].
+    ///
+    /// Carried on the contract rather than passed to an entry point, the way a
+    /// [`Toolbox`](crate::Toolbox) is, and governing the whole tree: a spawned
+    /// child searches under the same declaration its parent did.
+    pub web: Option<crate::web::WebAccess>,
 }
 
 impl TaskContract {
@@ -203,6 +212,7 @@ impl TaskContract {
             skills: None,
             agents: crate::agent::Agents::new(),
             responder: None,
+            web: None,
         }
     }
 
@@ -240,6 +250,7 @@ impl TaskContract {
             skills: None,
             agents: crate::agent::Agents::new(),
             responder: None,
+            web: None,
         }
     }
 
@@ -253,6 +264,34 @@ impl TaskContract {
         I: IntoIterator<Item = crate::mcp::McpServer>,
     {
         self.mcp = servers.into_iter().collect();
+        self
+    }
+
+    /// Let the provider look things up on the agent's behalf (0.22.0).
+    ///
+    /// The *provider* runs the search and dials the URL, so this crate opens no
+    /// socket for it and [`Act::Net`](crate::Act::Net) never sees one. The domain
+    /// lists on the declaration are handed to the vendor's own filter: a boundary
+    /// declared here and enforced there, exactly as `docs/CONTRACT.md` describes
+    /// for a stdio MCP server. Use
+    /// [`WebAccess::from_policy`](crate::WebAccess::from_policy) to derive them
+    /// from the run's policy rather than writing the same hosts twice.
+    ///
+    /// ```
+    /// use io_harness::{TaskContract, Verification, WebAccess};
+    ///
+    /// let contract = TaskContract::workspace(
+    ///     "update the README's install line to the current release",
+    ///     "/path/to/repo",
+    ///     Verification::WorkspaceFileContains { file: "README.md".into(), needle: "install".into() },
+    /// )
+    /// .with_web(WebAccess::search().max_uses(3).allow("crates.io"));
+    ///
+    /// assert!(contract.web.is_some());
+    /// ```
+    #[must_use]
+    pub fn with_web(mut self, web: crate::web::WebAccess) -> Self {
+        self.web = Some(web);
         self
     }
 

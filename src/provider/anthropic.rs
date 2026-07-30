@@ -21,6 +21,15 @@ pub use crate::net::REQUEST_TIMEOUT;
 
 const ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
+/// Anthropic versions a server tool by a dated `type` string, so the constant is
+/// one line to change when the vendor supersedes it — and the body test names it,
+/// so a stale one fails here rather than on the wire.
+const WEB_SEARCH_TYPE: &str = "web_search_20250305";
+const WEB_FETCH_TYPE: &str = "web_fetch_20250910";
+/// Web fetch is beta-gated; web search is not. The header is sent only when fetch
+/// is asked for, so a search-only request is byte-identical to what it would have
+/// been without the feature.
+const WEB_FETCH_BETA: &str = "web-fetch-2025-09-10";
 // ponytail: Anthropic requires max_tokens; fixed cap. Thread through from the
 // contract if agent outputs get truncated.
 const MAX_TOKENS: u64 = 8192;
@@ -105,7 +114,7 @@ impl Anthropic {
     }
 
     fn body(&self, request: &CompletionRequest) -> serde_json::Value {
-        let tools: Vec<serde_json::Value> = request
+        let mut tools: Vec<serde_json::Value> = request
             .tools
             .iter()
             .map(|t| {
@@ -116,6 +125,11 @@ impl Anthropic {
                 })
             })
             .collect();
+        // 0.22.0 — provider-executed search and fetch are declared as tools in the
+        // same array, distinguished by a dated `type` rather than an
+        // `input_schema`: Anthropic runs them itself and the model never sends
+        // this crate a call to dispatch.
+        tools.extend(Self::web_tools(request.web.as_ref()));
 
         json!({
             // 0.21.0 — a per-request model override, for a named agent definition
@@ -130,6 +144,40 @@ impl Anthropic {
             ],
             "tools": tools,
         })
+    }
+
+    /// The server-tool entries a [`WebAccess`](crate::WebAccess) declaration adds
+    /// to the `tools` array, in Anthropic's shape.
+    ///
+    /// Empty for `None` and for a declaration with nothing switched on, which is
+    /// what keeps a non-searching request's body byte-identical to 0.21.0's.
+    fn web_tools(web: Option<&crate::web::WebAccess>) -> Vec<serde_json::Value> {
+        let Some(web) = web.filter(|w| w.enabled()) else {
+            return Vec::new();
+        };
+        let (allowed, blocked) = web.vendor_filter();
+        let entry = |type_: &str, name: &str| {
+            let mut tool = json!({ "type": type_, "name": name });
+            let map = tool.as_object_mut().expect("a json object");
+            if let Some(uses) = web.max_uses {
+                map.insert("max_uses".into(), json!(uses));
+            }
+            if !allowed.is_empty() {
+                map.insert("allowed_domains".into(), json!(allowed));
+            }
+            if !blocked.is_empty() {
+                map.insert("blocked_domains".into(), json!(blocked));
+            }
+            tool
+        };
+        let mut tools = Vec::new();
+        if web.search {
+            tools.push(entry(WEB_SEARCH_TYPE, "web_search"));
+        }
+        if web.fetch {
+            tools.push(entry(WEB_FETCH_TYPE, "web_fetch"));
+        }
+        tools
     }
 
     /// The user turn's `content`: a bare string when there is no image, and
@@ -214,14 +262,18 @@ impl Anthropic {
         // therefore includes connection setup, which `CONTRACT.md` states rather
         // than quietly excluding to produce a flattering number.
         let sent = Instant::now();
-        let resp = self
+        let mut post = self
             .client
             .post(&self.endpoint)
             .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .json(&self.body(&request))
-            .send()
-            .await?;
+            .header("anthropic-version", API_VERSION);
+        // Only when fetch is asked for: an unnecessary beta header opts a request
+        // into a preview it does not use, and a search-only request should send
+        // exactly what 0.21.0 sent plus its tool entry.
+        if request.web.as_ref().is_some_and(|w| w.fetch) {
+            post = post.header("anthropic-beta", WEB_FETCH_BETA);
+        }
+        let resp = post.json(&self.body(&request)).send().await?;
         let resp = super::ensure_success(resp).await?;
 
         let mut acc = Accumulator::since(sent);
@@ -277,6 +329,13 @@ struct Accumulator {
     server_tool_requests: u64,
     model: Option<String>,
     finish_reason: Option<String>,
+    /// 0.22.0 — what the provider cited, and what its own server tools did. The
+    /// tool name is remembered per `tool_use_id` from the `server_tool_use` block
+    /// that asked for it, so the result block a few events later is attributed to
+    /// `web_search` or `web_fetch` rather than guessed at.
+    citations: Vec<crate::web::Citation>,
+    server_tools: Vec<crate::web::ServerToolCall>,
+    server_tool_names: BTreeMap<String, String>,
     /// When the request was sent, and the elapsed time at the first
     /// content-bearing event. `None` in a unit test that feeds events directly:
     /// nothing measured the wait, so the response reports no TTFT rather than
@@ -326,13 +385,28 @@ impl Accumulator {
             Some("content_block_start") => {
                 self.mark_first_token();
                 if let Some(cb) = value.get("content_block") {
-                    if cb.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
-                        let name = cb
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or_default()
-                            .to_string();
-                        self.tool_calls.entry(index()).or_default().0 = name;
+                    match cb.get("type").and_then(|t| t.as_str()) {
+                        Some("tool_use") => {
+                            let name = cb
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            self.tool_calls.entry(index()).or_default().0 = name;
+                        }
+                        // The model asking Anthropic to run a search: not a call
+                        // this crate dispatches, so it never joins `tool_calls`.
+                        // Its id is kept so the result block can be named.
+                        Some("server_tool_use") => self.ingest_server_tool_use(cb),
+                        // The result, which Anthropic sends whole rather than as
+                        // deltas — including, inside an HTTP 200, the error object
+                        // that means the search failed.
+                        Some(t) if t.ends_with("_tool_result") => {
+                            self.ingest_server_tool_result(t, cb);
+                        }
+                        // A text block can arrive with its citations already
+                        // attached when the stream is replayed or recorded.
+                        _ => self.ingest_citations(cb.get("citations")),
                     }
                 }
             }
@@ -353,6 +427,11 @@ impl Accumulator {
                         {
                             self.tool_calls.entry(index()).or_default().1.push_str(p);
                         }
+                    }
+                    // 0.22.0 — a source arriving mid-sentence, one delta per
+                    // citation, on the text block it supports.
+                    Some("citations_delta") => {
+                        self.push_citation(delta.and_then(|d| d.get("citation")));
                     }
                     _ => {}
                 }
@@ -375,6 +454,104 @@ impl Accumulator {
             }
             _ => {}
         }
+    }
+
+    /// A `server_tool_use` block: remember which tool the id belongs to, so the
+    /// result block that follows is named rather than assumed to be a search.
+    fn ingest_server_tool_use(&mut self, block: &serde_json::Value) {
+        let (Some(id), Some(name)) = (
+            block.get("id").and_then(|v| v.as_str()),
+            block.get("name").and_then(|v| v.as_str()),
+        ) else {
+            return;
+        };
+        self.server_tool_names
+            .insert(id.to_string(), name.to_string());
+    }
+
+    /// A `web_search_tool_result` / `web_fetch_tool_result` block.
+    ///
+    /// The failure this release exists to catch lives here: the vendor reports a
+    /// broken search as an error *object* inside a 200, and a parser that only
+    /// looks for results reads it as a search that found nothing. The `_error`
+    /// content type is what tells the two apart, and its `error_code` is recorded
+    /// in the vendor's own words.
+    fn ingest_server_tool_result(&mut self, block_type: &str, block: &serde_json::Value) {
+        let tool = block
+            .get("tool_use_id")
+            .and_then(|v| v.as_str())
+            .and_then(|id| self.server_tool_names.get(id))
+            .cloned()
+            // The result block names its own kind, so an unmatched id still
+            // records the right tool rather than a guess.
+            .unwrap_or_else(|| block_type.trim_end_matches("_tool_result").to_string());
+        let content = block.get("content");
+        let error = content
+            .and_then(|c| c.get("type"))
+            .and_then(|t| t.as_str())
+            .filter(|t| t.ends_with("_error"))
+            .and(
+                content
+                    .and_then(|c| c.get("error_code"))
+                    .and_then(|c| c.as_str()),
+            );
+        self.server_tools.push(match error {
+            Some(code) => crate::web::ServerToolCall::failed("anthropic", tool, code),
+            None => crate::web::ServerToolCall::ok("anthropic", tool),
+        });
+        // A fetch result carries the page it read; a search result carries the
+        // pages it found. Both are sources the answer may draw on, so both are
+        // recorded as citations rather than only the ones the model quotes.
+        if let Some(results) = content.and_then(|c| c.as_array()) {
+            for result in results {
+                self.push_citation(Some(result));
+            }
+        }
+    }
+
+    /// Every citation on a block that carries a `citations` array.
+    fn ingest_citations(&mut self, citations: Option<&serde_json::Value>) {
+        let Some(list) = citations.and_then(|c| c.as_array()) else {
+            return;
+        };
+        for citation in list {
+            self.push_citation(Some(citation));
+        }
+    }
+
+    /// One citation, from whichever shape carried it. A block with no `url` is
+    /// not a source and is skipped rather than recorded as an empty one.
+    fn push_citation(&mut self, citation: Option<&serde_json::Value>) {
+        let Some(url) = citation
+            .and_then(|c| c.get("url"))
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
+        else {
+            return;
+        };
+        let text = |key: &str| {
+            citation
+                .and_then(|c| c.get(key))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let found = crate::web::Citation {
+            url: url.to_string(),
+            title: text("title"),
+            cited_text: text("cited_text"),
+        };
+        // A page cited twice in one answer is one source. Anthropic repeats the
+        // url on every sentence it supports, and a trace with the same row forty
+        // times is a trace nobody reads. The second mention still enriches the
+        // first: a result block gives the url and title, and the citation delta a
+        // few events later adds the quoted passage.
+        if let Some(seen) = self.citations.iter_mut().find(|c| c.url == found.url) {
+            seen.title = seen.title.take().or(found.title);
+            seen.cited_text = seen.cited_text.take().or(found.cited_text);
+            return;
+        }
+        self.citations.push(found);
     }
 
     /// The counters Anthropic reports inside a `usage` object, wherever that
@@ -447,6 +624,8 @@ impl Accumulator {
             model: self.model,
             finish_reason: self.finish_reason,
             ttft_ms: self.ttft_ms,
+            citations: self.citations,
+            server_tools: self.server_tools,
         }
     }
 }
@@ -580,6 +759,244 @@ mod tests {
         let out = acc.finish();
         assert_eq!(out.text.as_deref(), Some("hello world"));
         assert!(out.tool_calls.is_empty());
+    }
+}
+
+/// 0.22.0 — the provider-executed web tools: what is declared on the wire, what
+/// header a beta-gated tool adds, and what comes back.
+#[cfg(test)]
+mod web_wire {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    use super::*;
+    use crate::web::WebAccess;
+
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn req(web: Option<WebAccess>) -> CompletionRequest {
+        CompletionRequest {
+            system: "sys".into(),
+            user: "what shipped this week".into(),
+            web,
+            ..Default::default()
+        }
+    }
+
+    /// F1 — one declaration, Anthropic's shape.
+    #[test]
+    fn a_declaration_becomes_dated_server_tool_entries() {
+        let web = WebAccess::search()
+            .with_fetch()
+            .max_uses(5)
+            .allow("docs.rs")
+            .allow("crates.io");
+        let b = Anthropic::new("k", "claude-x").body(&req(Some(web)));
+        let tools = b["tools"].as_array().expect("a tools array");
+        assert_eq!(tools.len(), 2, "search and fetch, got {tools:?}");
+        assert_eq!(tools[0]["type"], WEB_SEARCH_TYPE);
+        assert_eq!(tools[0]["name"], "web_search");
+        assert_eq!(tools[0]["max_uses"], 5);
+        assert_eq!(tools[0]["allowed_domains"], json!(["docs.rs", "crates.io"]));
+        assert_eq!(tools[1]["type"], WEB_FETCH_TYPE);
+        assert_eq!(tools[1]["name"], "web_fetch");
+        // A vendor rejects both lists at once, so only the narrower one is sent.
+        assert!(tools[0].get("blocked_domains").is_none());
+    }
+
+    /// The block-list alone reaches the vendor when there is no allow-list.
+    #[test]
+    fn a_block_list_alone_is_sent_as_one() {
+        let b = Anthropic::new("k", "claude-x")
+            .body(&req(Some(WebAccess::search().block("evil.test"))));
+        assert_eq!(b["tools"][0]["blocked_domains"], json!(["evil.test"]));
+        assert!(b["tools"][0].get("allowed_domains").is_none());
+        assert!(b["tools"][0].get("max_uses").is_none(), "no cap declared");
+    }
+
+    /// NF3, the negative control: a request that declares nothing sends exactly
+    /// the body 0.21.0 sent.
+    #[test]
+    fn no_declaration_sends_the_0_21_0_body() {
+        let b = Anthropic::new("k", "claude-x").body(&req(None));
+        assert_eq!(b["tools"], json!([]));
+        // And a declaration with both switches off is the same as none: a filter
+        // around a capability nobody asked for is not a capability.
+        let off =
+            Anthropic::new("k", "claude-x").body(&req(Some(WebAccess::default().allow("docs.rs"))));
+        assert_eq!(off["tools"], json!([]));
+    }
+
+    /// F2 — the fetch beta header, and its absence.
+    #[test]
+    fn the_fetch_beta_header_is_sent_only_when_fetch_is_asked_for() {
+        for (web, expected) in [
+            (WebAccess::search().with_fetch(), true),
+            (WebAccess::search(), false),
+        ] {
+            let head = head_of_request(web);
+            assert_eq!(
+                head.contains(&format!("anthropic-beta: {WEB_FETCH_BETA}")),
+                expected,
+                "wrong beta header for fetch={}, head was:\n{head}",
+                expected
+            );
+        }
+    }
+
+    /// Send one real request at a local socket and hand back the request head, so
+    /// the header assertion runs through the same code a live call does.
+    fn head_of_request(web: WebAccess) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok(mut stream) = listener.incoming().next().expect("one connection") else {
+                return;
+            };
+            let mut seen = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                seen.push(byte[0]);
+                if seen.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = tx.send(String::from_utf8_lossy(&seen).to_ascii_lowercase());
+            let body = "data: {\"type\":\"message_stop\"}\n\n";
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.flush();
+        });
+        let provider = Anthropic::at(url, Duration::from_secs(5));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // The response is deliberately empty, so the call itself fails; the head
+        // is what this test is about and it has already been captured.
+        let _ = runtime.block_on(provider.complete(req(Some(web))));
+        rx.recv().expect("the request head")
+    }
+
+    /// F3 — citations reach the response, deduplicated by url.
+    #[test]
+    fn citations_arrive_from_deltas_and_from_result_blocks() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"}}));
+        acc.ingest(&json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1",
+                "content":[{"type":"web_search_result","url":"https://docs.rs/io-harness",
+                            "title":"io-harness"}]}}));
+        acc.ingest(&json!({"type":"content_block_delta","index":2,
+            "delta":{"type":"text_delta","text":"0.22.0 adds web search"}}));
+        acc.ingest(&json!({"type":"content_block_delta","index":2,
+            "delta":{"type":"citations_delta","citation":{"type":"web_search_result_location",
+                "url":"https://docs.rs/io-harness","title":"io-harness",
+                "cited_text":"provider-executed web search"}}}));
+        acc.ingest(
+            &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},
+            "usage":{"output_tokens":9,"server_tool_use":{"web_search_requests":1}}}),
+        );
+
+        let out = acc.finish();
+        assert_eq!(
+            out.citations.len(),
+            1,
+            "one page, cited twice: {:?}",
+            out.citations
+        );
+        assert_eq!(out.citations[0].url, "https://docs.rs/io-harness");
+        assert_eq!(out.citations[0].title.as_deref(), Some("io-harness"));
+        assert_eq!(
+            out.citations[0].cited_text.as_deref(),
+            Some("provider-executed web search"),
+            "the quoted passage arrives on the delta, not on the result block"
+        );
+        assert_eq!(
+            out.server_tools,
+            vec![crate::web::ServerToolCall::ok("anthropic", "web_search")]
+        );
+        assert_eq!(out.usage.unwrap().server_tool_requests, 1);
+    }
+
+    /// F4 — a search that failed inside an HTTP 200, and the negative control of
+    /// one that succeeded and found nothing.
+    #[test]
+    fn a_search_that_failed_inside_a_200_is_recorded_as_a_failure() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"server_tool_use","id":"srvtoolu_1","name":"web_search"}}));
+        acc.ingest(&json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_1",
+                "content":{"type":"web_search_tool_result_error",
+                           "error_code":"max_uses_exceeded"}}}));
+        acc.ingest(&json!({"type":"message_delta","usage":{"output_tokens":3}}));
+
+        let out = acc.finish();
+        assert_eq!(
+            out.server_tools,
+            vec![crate::web::ServerToolCall::failed(
+                "anthropic",
+                "web_search",
+                "max_uses_exceeded"
+            )]
+        );
+        assert!(out.citations.is_empty(), "a failed search cites nothing");
+
+        // The control: a search that worked and returned nothing is a SUCCESSFUL
+        // call with no citations. Reading that as a failure — or reading the
+        // failure above as this — is the defect the release exists to prevent.
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"server_tool_use","id":"srvtoolu_2","name":"web_search"}}));
+        acc.ingest(&json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"web_search_tool_result","tool_use_id":"srvtoolu_2",
+                "content":[]}}));
+        acc.ingest(&json!({"type":"message_delta","usage":{"output_tokens":3}}));
+        let out = acc.finish();
+        assert_eq!(out.server_tools.len(), 1);
+        assert!(out.server_tools[0].succeeded());
+        assert!(out.citations.is_empty());
+    }
+
+    /// A fetch result is attributed to `web_fetch`, from the id its request block
+    /// carried rather than from the block type alone.
+    #[test]
+    fn a_fetch_result_is_named_by_the_request_that_asked_for_it() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"server_tool_use","id":"srvtoolu_9","name":"web_fetch"}}));
+        acc.ingest(&json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"web_fetch_tool_result","tool_use_id":"srvtoolu_9",
+                "content":[{"type":"web_fetch_result","url":"https://example.test/page"}]}}));
+        acc.ingest(&json!({"type":"message_delta","usage":{"output_tokens":2}}));
+
+        let out = acc.finish();
+        assert_eq!(out.server_tools[0].tool, "web_fetch");
+        assert_eq!(out.citations[0].url, "https://example.test/page");
+        // No title and no quote reported is `None`, not an empty string.
+        assert_eq!(out.citations[0].title, None);
+    }
+
+    /// The negative control for the whole module: a 0.21.0-shaped stream carries
+    /// no citations and no server-tool rows.
+    #[test]
+    fn a_stream_with_no_web_activity_reports_none() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"hello"}}));
+        acc.ingest(&json!({"type":"message_delta","usage":{"output_tokens":1}}));
+        let out = acc.finish();
+        assert!(out.citations.is_empty());
+        assert!(out.server_tools.is_empty());
+        assert_eq!(out.usage.unwrap().server_tool_requests, 0);
     }
 }
 

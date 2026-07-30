@@ -1,0 +1,56 @@
+product: io-harness
+version: 0.22.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      No constraints are recorded for this workspace (`ultraship state` reports `active: null` and
+      no blockers), so this assessment is grounded in the contract's own `resource_profile` and in
+      the repository's measured condition rather than in a user estimate. Nothing below is a
+      measured cost figure; the framework has no provider telemetry.
+    - >
+      The accounting half of this release already exists and has been dormant on purpose.
+      `Usage::server_tool_requests` is parsed by the Anthropic accumulator and by `openai_wire`,
+      stored on `provider_calls`, and priced by `pricing.rs::per_server_tool_request` — all shipped
+      in 0.18.0 against the day something would declare a provider-executed tool. This release
+      supplies the input, not the plumbing.
+    - >
+      The work is three body keys and three response parsers over a provider layer whose split is
+      already the right shape: `openai_wire::body` is shared by the two OpenAI-wire providers and
+      each of those two is a thin wrapper that adds its own endpoint and auth, which is exactly
+      where two differing web keys belong.
+    - >
+      Additive-only storage again. `citations` and `server_tool_calls` are new `CREATE TABLE IF NOT
+      EXISTS` tables, so `CHECKPOINT_FORMAT` stays 7 and there is no migration to design —
+      historically the riskiest part of a release here.
+    - >
+      The repository is clean and current: `feat/0.22.0` is cut from `develop`, which equals `main`
+      at the 0.21.0 merge (`cbc28c2`), `cargo build --all-targets` is green, and `target/` is 9.1
+      GiB with 25 GiB free — not the disk-full condition that spuriously failed 13 policy tests
+      during an earlier release, though it is worth a `cargo clean` before `cargo publish` as 0.21.0
+      learned.
+  major_cost_drivers:
+    - >
+      Three vendors that agree on nothing. Anthropic puts a server tool in `tools` behind a dated
+      type string and gates fetch behind a beta header; OpenAI puts `web_search_options` at the top
+      level of the Chat Completions body; OpenRouter puts a `plugins` array there. Three shapes,
+      three body tests, and a shared builder that has to stay shared.
+    - >
+      The response side is three more shapes, and the Anthropic one lands inside an `Accumulator`
+      keyed by content-block index that currently recognises exactly two block types. A new block
+      type has to enter it without disturbing how tool-call arguments are reassembled from
+      `input_json_delta` fragments.
+    - >
+      Failure inside an HTTP 200 is the defect the roadmap names, and the naive parse is the one
+      that gets written by accident. Each vendor's error object needs a test carrying that vendor's
+      own literal payload.
+    - >
+      The policy projection has one inverting case — an allow-everything rule must project to *no*
+      filter rather than an empty allow-list — whose failure mode is silent and closed.
+    - >
+      Three source breaks, each needing a migration snippet that compiles, and every added public
+      item needing a worked example that compiles.
+  recommended_scope_change: null

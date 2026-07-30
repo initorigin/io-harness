@@ -79,6 +79,7 @@ struct Agents src/agent.rs
 struct Anthropic src/provider/anthropic.rs
 struct ApproveAll src/approve.rs
 struct CheckpointEvent src/state.rs
+struct Citation src/web.rs
 struct CompletionRequest src/provider/mod.rs
 struct CompletionResponse src/provider/mod.rs
 struct Config src/config.rs
@@ -118,6 +119,7 @@ struct SandboxConfig src/sandbox.rs
 struct SandboxEvent src/state.rs
 struct SandboxLimits src/sandbox.rs
 struct SandboxOutcome src/sandbox.rs
+struct ServerToolCall src/web.rs
 struct Session src/session.rs
 struct Skill src/skills.rs
 struct Skills src/skills.rs
@@ -140,6 +142,7 @@ struct Turn src/state.rs
 struct TurnResult src/session.rs
 struct Usage src/provider/mod.rs
 struct Verdict src/policy.rs
+struct WebAccess src/web.rs
 trait Approver src/approve.rs
 trait Observer src/observe.rs
 trait Provider src/provider/mod.rs

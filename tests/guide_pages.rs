@@ -56,6 +56,12 @@ const GUIDES: &[(&str, bool)] = &[
     // not authorization, a definition can only narrow and never grant, and a template
     // sets nothing.
     ("agency.md", true),
+    // 0.22.0. It carries a limits block because the capability is defined by where
+    // it is *not* enforced: the provider dials the URL, so `Act::Net` never sees it
+    // and the domain filter is the vendor's; a citation is what the provider
+    // returned rather than a checked source; and a paused turn resumes as a fresh
+    // request that may repeat a search already paid for.
+    ("web.md", true),
     ("configuration.md", true),
     ("accounting.md", true),
     ("documents.md", true),

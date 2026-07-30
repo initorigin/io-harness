@@ -428,6 +428,26 @@ pub enum EventKind {
         /// through [`resume_with_answer`](crate::resume_with_answer) after a pause.
         by: String,
     },
+    /// The provider ran a web search or fetch for the model (0.22.0).
+    ///
+    /// Emitted once per call the provider reported, wherever the answer came from
+    /// — a search it ran itself, a page it fetched — and emitted for the failures
+    /// too. `ok: false` is a search that broke *inside* an otherwise successful
+    /// response, which is a different fact from a search that found nothing and is
+    /// why this variant carries a flag rather than only a name.
+    ///
+    /// Nothing in this process dialled the URL: the provider did. See
+    /// [`WebAccess`](crate::WebAccess) for what the declaration does and does not
+    /// enforce.
+    ServerToolUsed {
+        /// The provider that ran it, as [`Provider::name`](crate::Provider::name)
+        /// reports it.
+        provider: String,
+        /// The vendor's own name for the tool — `web_search`, `web_fetch`.
+        tool: String,
+        /// Whether the provider reported it as having worked.
+        ok: bool,
+    },
     /// A chunk of assistant text arrived from the provider, while the model was
     /// still producing the rest of it.
     ///
@@ -747,6 +767,11 @@ mod tests {
             EventKind::Token {
                 text: "hello".into(),
             },
+            EventKind::ServerToolUsed {
+                provider: "anthropic".into(),
+                tool: "web_search".into(),
+                ok: true,
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -772,6 +797,7 @@ mod tests {
                 | EventKind::TodoWrote { .. }
                 | EventKind::QuestionAsked { .. }
                 | EventKind::QuestionAnswered { .. }
+                | EventKind::ServerToolUsed { .. }
                 | EventKind::Finished { .. } => {}
             }
         }
