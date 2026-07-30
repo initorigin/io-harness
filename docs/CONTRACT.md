@@ -116,7 +116,43 @@ Windows as "resource-capped".
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.19.0.
+is fixed as of 0.20.0.
+
+**What a session is, and is not (0.20.0).** A [`Session`] is a conversation over
+the runs, not a second execution path:
+
+- **A turn is a run.** Each turn has its own `runs` row, steps, refusals, budget
+  draws and checkpoint, and carries every guarantee a run carries — it is
+  auditable, resumable by its `run_id` through the ordinary `resume*` entry
+  points, and bounded by the same `Policy`. A session adds the tree and nothing
+  else.
+- **The tree is append-only.** Branching makes an earlier turn the parent of the
+  next one; it edits, deletes and rewrites nothing, so an abandoned branch stays
+  readable. There is no turn edit, no history rewrite, and no session-level
+  compaction — what bounds a long conversation is the `ContextBudget`, which
+  elides what the model sees and never what the store holds.
+- **A streamed delta is provisional until the completion returns.**
+  `EventKind::Token` is what the model has said so far, not a decision it has
+  made: the turn may still fall over to another provider, be retried, or be
+  interrupted, and text already emitted is not withdrawn. Render it; do not act on
+  it. The committed step is the settled fact.
+- **A `Provider` that does not override `complete_streaming` streams nothing.**
+  The default emits the finished text as one delta, which keeps a consumer
+  rendering, and is not incremental. The three built-in providers and `Fallback`
+  override it.
+- **Steering is text, not authorization.** An operator's mid-turn message reaches
+  the model exactly as a `TaskContract` constraint does, and every tool call it
+  leads to is checked against the same policy by the same code. A `Steer` cannot
+  change the policy, the budgets, the sandbox or the contract of a turn in flight.
+- **A steer and an interrupt land at the next step boundary**, never where they
+  were sent — the same rule `Flow::Cancel` has always had, for the same reason: in
+  between, a tool call is in flight and a file may be half-written.
+- **One session, one driver.** Two processes taking turns on the same session id
+  concurrently is unsupported and undefended beyond SQLite's own busy timeout;
+  their turns would interleave into one tree in an order nobody chose.
+- **A session has no aggregate budget.** Every turn is a fresh run with its own
+  ceilings, so `max_steps` on one turn does not bound the next. A conversation-wide
+  limit is the caller's to enforce, per turn, from `Store::run_summary`.
 
 **What configuration is, and is not (0.19.0).** `io.toml` is a projection onto
 the typed API and never a second path into the run loop:
@@ -279,6 +315,17 @@ started with. A tree resumed under a *widened* policy therefore leaves an audit
 that understates what was permitted. `resume_tree_from_stored_policy` is
 unaffected — it reads that same row back, so what is recorded is what runs — and
 it is the entry point to prefer when the boundary matters.
+
+**A refused git built-in ends the run.** Every other refusal is an observation
+the model reads and adapts to — a denied write comes back as text, and the agent
+tries something else. The five git built-ins are the exception: a policy that
+denies `Act::Exec` for `git` makes `git_status`, `git_diff`, `git_log`,
+`git_add` and `git_commit` return `Error::Refused` out of the run loop, so one
+speculative `git status` under an exec-denying policy escalates the whole run
+instead of costing a step. Found while running the 0.20.0 live session; not fixed
+there, because that release touches no tool. Until it is fixed, a policy that
+denies exec should allow the git built-ins explicitly if the agent might reach for
+one.
 
 **`git_status` output.** It uses `--porcelain=v1` without `-z`, so a path
 containing a newline renders ambiguously to the model. A display concern, not a

@@ -1,251 +1,280 @@
 product: io-harness
-version: 0.19.0
+version: 0.20.0
 tasks:
-  - id: US-IO-HARNESS-0.19.0-T01
+  - id: US-IO-HARNESS-0.20.0-T01
     summary: >
-      The `config` module's spine: the four scopes and where each is found, TOML parsing through the
-      new `toml` dependency, per-file validation so an error names its file, and the deep merge that
-      resolves them key by key with the later scope winning.
+      The `session` module's spine: the `sessions` and `session_turns` tables, `Session::open` /
+      `Session::reopen` / `id` / `head` / `history`, a turn driven as a run through the existing
+      workspace loop, and the crate-internal seam that assembles the path root->head into the turn's
+      request through the existing context assembler.
     why_required: >
-      Every other task projects a value out of the merged result. Without the scopes and the merge
-      there is nothing to project from, and the merge rule is what the outcome actually promises —
-      a project file a collaborator inherits and a local file that overrides one key of it.
-    status: todo
+      Every other task acts on a session that exists and a turn that runs. Without the tables and the
+      turn-as-a-run seam there is no conversation to branch, stream into, or steer, and the release's
+      whole claim — that a session is durable for the same reason a run is — rests here.
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
-        F1 — the four scopes merge in order. A fixture with all four present, each setting the same
-        scalar to a different value, resolves to the local file's value; removing the local file
-        resolves to the project's; removing that resolves to the user's; removing that resolves to
-        the crate default. Asserted as four loads over the same directory, so the test measures
-        precedence rather than one file being read.
+        F1 — a session outlives its process. Two turns are taken against a file-backed store, the
+        `Session` is dropped and the store closed, `Session::reopen` picks it up by id in a fresh
+        `Store`, and the third turn's request carries what the first two established. The negative
+        control is a second session opened over the same root, whose first turn carries none of it.
       - >
-        F2 — a later scope overrides one key and nothing else. A local file naming a single sandbox
-        cap leaves every other cap and every other section at the project file's value. The negative
-        control is the same load with the local file absent, which must differ in exactly that one
-        key.
+        F2 — a turn is a run, with everything a run has. Each turn produces its own `runs` row reachable
+        from `session_turns`, its own steps, and its own `RunSummary`; a policy denial inside a turn is
+        recorded in `policy_events` attributed to the rule and layer exactly as in a one-shot run; and
+        `Store::run_status` reports the turn's run.
       - >
-        F10 — no config file is no error. A workspace with no `io.toml`, no local file and no user
-        file loads the crate's defaults and produces exactly what the typed API produces with no
-        config at all, so adding this release to an existing consumer changes nothing until they
-        write a file.
+        F4 — a turn may be bounded or unbounded. `Session::turn` runs with `Verification::None` and
+        stops on an assistant turn that calls no tool, reported as `RunOutcome::Finished`;
+        `Session::turn_bounded` with a `Verification::Command` succeeds only when that command passes
+        and reports `RunOutcome::Success`. A step cap set on one bounded turn does not bound the next
+        turn.
+      - >
+        NF1 — no store format bump and no new dependency. `CHECKPOINT_FORMAT` stays 7, the two new
+        tables are `CREATE TABLE IF NOT EXISTS` and nothing existing is altered, a 0.19.0 database
+        opens, resumes and is queried against 0.20.0 unchanged, and the default `cargo tree` line count
+        is still the 407 lines inherited from `develop`.
     files:
-      - src/config.rs
-      - src/lib.rs
-      - Cargo.toml
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T02
-    summary: >
-      Unknown-key rejection and `${env:...}` / `${file:...}` substitution, both failing the load with
-      an error that names the key and the file rather than a byte offset, and neither ever producing
-      an empty string.
-    why_required: >
-      A config that silently ignores a misspelled permission rule leaves an operator believing in a
-      boundary that is not there, and a substitution that quietly empties turns a rule into one that
-      matches nothing. These two are the difference between a config layer that can be trusted with
-      a boundary and one that cannot.
-    status: todo
-    depends_on:
-      - US-IO-HARNESS-0.19.0-T01
-    acceptance_criteria:
-      - >
-        F5 — an unknown key fails the load. A file carrying a misspelled key is rejected with an
-        error naming the key and the file. The negative control is the correctly spelled key, which
-        loads and reaches its typed field — so the test proves rejection of the unknown rather than
-        rejection in general.
-      - >
-        F6 — substitution resolves or fails, never empties. `${env:SET_VAR}` reaches the typed field
-        with the variable's value; `${env:UNSET_VAR}` fails the load naming the key;
-        `${file:./secret}` reaches the field with the file's trimmed contents; `${file:./missing}`
-        fails the load naming the key. An empty string is never the result of a failed substitution.
-    files:
-      - src/config.rs
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T03
-    summary: >
-      Projection onto `Policy` and `SandboxConfig`: policy layers append in scope order under the
-      type's own layering rule, sandbox caps merge per key, and a run driven from the file enforces
-      the same boundary as the identical policy built in Rust.
-    why_required: >
-      The boundary is the part of the outcome that matters most and the part a wrong merge damages
-      silently. A layer that replaced rather than appended, or a cap that fell back whole, would
-      leave the file describing a boundary the run does not have.
-    status: todo
-    depends_on:
-      - US-IO-HARNESS-0.19.0-T01
-    acceptance_criteria:
-      - >
-        F3 — the boundary a file describes is the boundary a run enforces. A run driven from a config
-        whose policy denies a write refuses that write with the same refusal, recorded the same way
-        in the trace, as the identical policy built in Rust. Asserted through a real run, not by
-        comparing two `Policy` values.
-      - >
-        F4 — policy layers append rather than replace. A project file's layer and a local file's
-        layer are both present after the merge, in scope order, and the type's own rule that a later
-        layer cannot re-allow an earlier deny still holds across the seam. The negative control is a
-        local layer attempting to re-allow a project deny, which must not take effect.
-    files:
-      - src/config.rs
-      - tests/config.rs
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T04
-    summary: >
-      The run-shaping half: `Serialize`/`Deserialize` on `RetryPolicy`, `StallPolicy`,
-      `ContextBudget` and `Identity` with a readable wire form for the `Duration` fields, and
-      `Config::apply_to`, which sets those and the budgets, the exec timeout, the skills directory
-      and the MCP servers on a `TaskContract`.
-    why_required: >
-      Budgets and retry behaviour are the settings an operator changes most often and the ones they
-      currently have to recompile to change. They also have to land as a method on `Config` rather
-      than a new `TaskContract` field, because a field is a break and this release carries none.
-    status: todo
-    depends_on:
-      - US-IO-HARNESS-0.19.0-T01
-    acceptance_criteria:
-      - >
-        F7 — every key reaches a typed field. A fixture naming every supported key loads and each
-        projected value is asserted non-default: policy defaults and rules, every sandbox cap and
-        both flags, every run-shaping default, a toolchain override, a price entry, and an MCP
-        server. The negative control is a build of the same fixture with one key removed, which must
-        leave that one field at its default.
-    files:
-      - src/config.rs
-      - src/resilience.rs
+      - src/session.rs
+      - src/state.rs
+      - src/run.rs
       - src/context.rs
-      - src/tools/git.rs
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T05
+      - src/lib.rs
+      - tests/session.rs
+    evidence:
+      - >
+        tests/session.rs F1/F2/F4 and the store unit tests: a session reopened in a second `Store`
+        over the same file carries its first two turns into the third, with a second session over
+        the same root as the negative control; a turn's run row, summary, refusal attribution and
+        `run_status` are a run's; an unbounded turn ends `Finished` and a bounded one `Success`.
+      - >
+        src/state.rs unit test `a_pre_session_database_gains_the_session_tables_and_keeps_its_rows`
+        — a database with the two tables dropped opens, keeps its runs, and gains them;
+        CHECKPOINT_FORMAT still 7.
+  - id: US-IO-HARNESS-0.20.0-T02
     summary: >
-      The `[toolchain]` and `[prices]` sections: an override merged onto a detected `Toolchain` by
-      ecosystem, and a `PriceTable` built from the file with the file's own `as_of` date.
+      Branching: any turn id may parent the next turn, `Session::branch_from` moves the head, and the
+      tree stays append-only so an abandoned branch is still readable.
     why_required: >
-      These are the two tables the previous two releases shipped as types with no way to fill them.
-      `PriceTable` ships deliberately empty, so cost is zero out of the box until someone types a
-      price in, and a file is the only place that price was ever going to come from.
-    status: todo
+      Without it a session is a list, and the outcome promises a tree — coming back and taking a
+      different path from an earlier turn rather than starting over is half of what makes a
+      conversation durable rather than merely persisted.
+    status: done
     depends_on:
-      - US-IO-HARNESS-0.19.0-T01
+      - US-IO-HARNESS-0.20.0-T01
     acceptance_criteria:
       - >
-        F8 — the file fills the two tables the previous releases could not. A `[prices]` section
-        produces a `PriceTable` whose `as_of` is the file's own stated date and whose entry costs a
-        fixture trace at the hand-computed figure, and a `[toolchain]` section overrides one
-        ecosystem's test command while leaving the other ecosystems' shipped defaults intact.
+        F3 — the tree branches and nothing is lost. A branch taken from turn 1 produces a turn whose
+        request carries turn 1 and not turn 2, turn 2 remains readable and unmodified afterwards, and
+        `history` from each head returns its own path. The negative control is the unbranched head,
+        which still sees turn 2.
     files:
-      - src/config.rs
-      - tests/config.rs
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T06
+      - src/session.rs
+      - src/state.rs
+      - tests/session.rs
+    evidence:
+      - >
+        tests/session.rs F3: a branch from turn 1 carries turn 1 and not turn 2 into the request;
+        turn 2 is unmodified afterwards with its own reply and run; both heads return their own
+        path; a turn from another session is refused.
+      - >
+        src/state.rs unit test `two_turns_may_share_a_parent_and_neither_is_rewritten`.
+  - id: US-IO-HARNESS-0.20.0-T03
     summary: >
-      The two honesty criteria: a config file written by the agent mid-run cannot widen the boundary
-      the run is under, and nothing is read from disk for configuration once the caller has loaded it.
+      Token streaming: `Provider::complete_streaming` as a defaulted trait method, overridden by the
+      three built-in providers to emit each text delta as its SSE event arrives, surfaced as
+      `EventKind::Token { text }` through the existing observer channel and only on a session turn
+      that was given an observer.
     why_required: >
-      The one guarantee this release can actually make about an agent and a config file is that the
-      file is read once, by the caller, before the run. If that is not true, the whole feature is a
-      way for an agent to grant itself permissions.
-    status: todo
+      This is the release's named blocker: until deltas leave the provider there is nothing for a
+      terminal or a desktop window to render while the model is typing, which is the reason the
+      roadmap says this release is what makes those products possible.
+    status: done
     depends_on:
-      - US-IO-HARNESS-0.19.0-T03
+      - US-IO-HARNESS-0.20.0-T01
     acceptance_criteria:
       - >
-        F9 — an agent cannot widen its own boundary. A run under a config-derived restrictive policy,
-        in which the agent writes an `io.local.toml` granting itself the denied write, still refuses
-        the write. The negative control is the same file present *before* the caller loads the
-        config, which must take effect — the difference between the two is the whole guarantee.
+        F5 — tokens arrive before the answer does. Against a scripted SSE provider, the deltas an
+        observer receives concatenate exactly to the response's final text, in order, and the first
+        `Token` event is observed strictly before `complete_streaming` returns. Asserted on recorded
+        instants, not on a sleep.
       - >
-        NF3 — nothing is read at run time. Config loading happens in the caller's explicit call; the
-        run loop performs no file read for configuration, asserted by a run that deletes both config
-        files after loading and completes unaffected.
+        F6 — streaming is opt-in and existing behaviour is untouched. A `run_with_observed` run against
+        the same streaming provider emits zero `Token` events and the identical event sequence it emits
+        on 0.19.0; the negative control is the same provider driven through a session turn, which does
+        emit them.
+      - >
+        F7 — a provider that does not implement streaming still works. A `Provider` implementing only
+        `complete` drives a session turn to completion and produces exactly one `Token` event carrying
+        the whole text, so a UI written against the event renders something rather than nothing.
+      - >
+        NF2 — one break, marked, and no other. `EventKind` gains `Token { text }`; nothing else in
+        `docs/public-api.txt` changes meaning, no item is removed or renamed, and the changelog carries
+        the migration note (`match` on `EventKind` needs a `Token` arm or a `_` arm).
+      - >
+        NF3 — streaming costs nothing when nobody is listening. A session turn with no observer performs
+        no per-delta allocation beyond what 0.19.0 did, asserted by the streaming path being entered
+        only when a sink exists rather than by a timing measurement.
     files:
-      - tests/config.rs
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T07
+      - src/provider/mod.rs
+      - src/provider/anthropic.rs
+      - src/provider/openai_wire.rs
+      - src/provider/openrouter.rs
+      - src/provider/openai.rs
+      - src/observe.rs
+      - src/session.rs
+      - tests/session_streaming.rs
+    evidence:
+      - >
+        tests/session_streaming.rs F5/F6/F7/NF3: the deltas concatenate to the response's final text
+        in order, every delta of a step is observed before that step commits, and the first is
+        observed before the stream ends; a `run_with_observed` run over the same provider emits zero
+        Token events and the identical 0.19.0 sequence (started, step, finished); a `complete`-only
+        provider yields one delta carrying the whole text; a turn with no observer never enters the
+        streaming path.
+      - >
+        Live: 13 deltas over a real OpenRouter turn, the step's text arriving before that step
+        committed. evidence/0.20.0/live-run-session.txt.
+  - id: US-IO-HARNESS-0.20.0-T04
     summary: >
-      Documentation and the public surface: the configuration guide page, the CONTRACT.md boundary
-      statements, the changelog with the new dependency and the new `cargo tree` baseline, the
-      hand-updated `docs/public-api.txt`, the README and crate-root links, and `io.local.toml` in
-      `.gitignore`.
+      Steering and interruption: `Steer::channel`, `Steer::say` delivering an operator message at the
+      next step boundary as an observation the next request carries, and `Steer::interrupt` stopping
+      the turn through the existing cancel path — with the policy unchanged by either.
     why_required: >
-      A config format nobody can read the key reference for is a format nobody can use, and the
-      scope split fails outright if a team commits the local file. The public-surface snapshot is a
-      build failure until it is updated by hand, which is the mechanism, not a formality.
-    status: todo
+      Without it the only way to change course is to kill the process, which abandons a run mid-step
+      and leaves `runs.status` at `running` forever. It is also where the release could do real harm:
+      an operator's chat message must not read as an authorization, and that has to be proven rather
+      than asserted.
+    status: done
     depends_on:
-      - US-IO-HARNESS-0.19.0-T04
-      - US-IO-HARNESS-0.19.0-T05
+      - US-IO-HARNESS-0.20.0-T01
     acceptance_criteria:
       - >
-        OP1 — `docs/public-api.txt` is updated by hand and `tests/public_api.rs` passes against the
-        live surface, and every added public item carries a fenced worked example, enforced by the
-        existing docs test.
+        F8 — steering reaches the model at the next step boundary. A `Steer::say` issued during a turn
+        appears in the next request and changes what the agent does; the negative control is the same
+        turn with no steering, which does the original thing. Asserted through the real loop against a
+        scripted provider that branches on whether the message is present.
       - >
-        OP2 — `docs/guide/configuration.md` exists, is linked from the README and the crate root,
-        lists every key with its typed destination, and is covered by the existing guide-pages test.
+        F9 — an interrupt stops the turn cleanly and the session goes on. `Steer::interrupt()` ends the
+        turn at the next step boundary with `RunOutcome::Cancelled`, the turn's last step is whole in
+        the store (no half-committed step), the turn is present in `history` marked with its outcome,
+        and the next turn on the same session proceeds normally.
       - >
-        OP3 — `docs/CONTRACT.md` states what configuration is: the typed API is the authority and
-        the file is a projection onto it; the file is read once, by the caller, before the run, and
-        never again; an unknown key is an error; a failed substitution is an error; and a config file
-        is not a security boundary against the agent — the boundary is the `Policy` the caller loaded
-        before the run started.
+        F10 — steering is not authorization. A turn under a policy denying a write, steered with an
+        operator message explicitly asking for that write, still refuses it, with the refusal attributed
+        to the same rule and layer. The negative control is a policy that allows the write, where the
+        same steered message results in the write happening.
       - >
-        OP4 — `.gitignore` carries `io.local.toml` and the guide says plainly which of the two
-        project files is meant to be committed, because the whole scope split fails if a team commits
-        the local one.
-      - >
-        NF6 — no public item is removed or renamed, so `docs/public-api.txt` grows and nothing in it
-        changes meaning. This release carries no break and no `#[deprecated]`.
+        NF6 — an interrupted or cancelled turn never leaves `runs.status` at `running`, and neither does
+        a dropped `Session`. The state a crash leaves is the state a resume already understands.
     files:
-      - docs/guide/configuration.md
-      - docs/CONTRACT.md
+      - src/session.rs
+      - src/run.rs
+      - tests/session_steering.rs
+    evidence:
+      - >
+        tests/session_steering.rs F8/F9/F10/NF6: a steer changes the next step's action with the
+        unsteered turn as control; an interrupt after one committed step ends the turn `Cancelled`
+        with `runs.status` completed, one whole step in the workspace, the turn in the tree marked
+        `cancelled`, and the session continuing; a steered request for a denied write is refused by
+        the rule that denies it and the secret is byte-identical, with the deny lifted as the
+        control.
+      - >
+        Live: the operator's message reached the model at step 2 of 6 and the trace carries the
+        `steered` row. evidence/0.20.0/live-run-session.txt.
+  - id: US-IO-HARNESS-0.20.0-T05
+    summary: >
+      Documentation and the surface record: `docs/guide/sessions.md`, a worked example on every added
+      public item, `docs/public-api.txt` by hand, the `EventKind` break and its migration note in
+      `CHANGELOG.md`, and the `docs/CONTRACT.md` section on what a session does and does not
+      guarantee.
+    why_required: >
+      The crate's own tests enforce it — a public item with no worked example, an unlisted guide page
+      or an unmarked break fails the suite. It is also where the honest limits of the release are
+      stated: streamed text is provisional, steering is not authorization, and one session driven by
+      two processes at once is unsupported.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.20.0-T01
+      - US-IO-HARNESS-0.20.0-T02
+      - US-IO-HARNESS-0.20.0-T03
+      - US-IO-HARNESS-0.20.0-T04
+    acceptance_criteria:
+      - >
+        OP1 — `docs/public-api.txt` is updated by hand, `tests/public_api.rs` passes against the live
+        surface, and every added public item carries a fenced worked example, enforced by the existing
+        docs test.
+      - >
+        OP2 — `docs/guide/sessions.md` exists, is linked from the README and the crate root, and is
+        covered by the existing guide-pages test.
+      - >
+        OP3 — `docs/CONTRACT.md` states what a session is and is not: a turn is a run and carries a
+        run's guarantees; the tree is append-only; streamed text is provisional until the completion
+        returns and a caller must not act on a partial delta; steering is text and not authorization;
+        and one session driven by two processes at once is unsupported.
+      - >
+        OP4 — `CHANGELOG.md` carries the break with its migration note and the new capability in the
+        user-facing voice the changelog test enforces.
+      - >
+        NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` pass,
+        and `cargo doc --all-features` is warning-free.
+    files:
+      - docs/guide/sessions.md
       - docs/public-api.txt
+      - docs/CONTRACT.md
       - CHANGELOG.md
       - README.md
       - src/lib.rs
-      - .gitignore
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T08
+      - src/session.rs
+    evidence:
+      - >
+        OP1: docs/public-api.txt updated by hand with the five added items; tests/public_api.rs
+        passes, including the worked-example check over all 116 items.
+      - >
+        OP2: docs/guide/sessions.md written, listed in tests/guide_pages.rs with a limits block,
+        linked from docs/CAPABILITIES.md, README.md and the crate root; tests/guide_pages.rs,
+        tests/readme.rs and tests/docs_drift.rs pass.
+      - >
+        OP3/OP4: docs/CONTRACT.md carries the eight session limits and the newly found refused-git
+        defect; CHANGELOG.md carries the `EventKind` break with its migration snippet and
+        tests/changelog.rs passes.
+      - >
+        NF5: cargo fmt --check, clippy --all-targets --all-features -D warnings, and cargo doc
+        --all-features all clean.
+  - id: US-IO-HARNESS-0.20.0-T06
     summary: >
-      The release gates: the full suite on every feature combination, clippy, fmt, a warning-free
-      `cargo doc`, the measured `cargo tree` baseline before and after, and the store and
-      checkpoint-format assertions.
+      The live session example kept as evidence, and the three-OS suite: a real session against a real
+      provider that streams tokens ahead of the completion, steers mid-turn, branches, and reopens
+      across a process boundary, asserting each itself.
     why_required: >
-      The dependency growth is the one cost this release imposes on every consumer, and a number
-      discovered by a consumer rather than stated by the changelog is the failure the constraint
-      exists to prevent.
-    status: todo
+      The suite proves the mechanism against a scripted provider; only a live session proves an
+      operator can hold a conversation with the crate. The three-OS leg is where a store- and channel-
+      bound feature historically disagrees.
+    status: done
     depends_on:
-      - US-IO-HARNESS-0.19.0-T07
+      - US-IO-HARNESS-0.20.0-T01
+      - US-IO-HARNESS-0.20.0-T02
+      - US-IO-HARNESS-0.20.0-T03
+      - US-IO-HARNESS-0.20.0-T04
     acceptance_criteria:
       - >
-        NF1 — the dependency growth is stated, not discovered. The default `cargo tree` line count is
-        measured before and after, the new number recorded in the contract's evidence, the constraint
-        updated from 401 to that number, and the crates it adds are named in the changelog. `toml` is
-        the only new dependency this release adds.
+        OP5 — a live session against a real provider is run by hand before the release is cut and its
+        output kept as evidence: streamed deltas timestamped ahead of the completion, a mid-turn steer
+        that changes the agent's next action, a branch, and a reopen across a process boundary. The
+        suite proves the mechanism; only a live run proves an operator can hold a conversation with it.
       - >
-        NF2 — no store change and no format bump. `CHECKPOINT_FORMAT` stays 7, no `CREATE TABLE` and
-        no `ALTER TABLE` is added, and a 0.18.0 database opens, resumes and is queried against 0.19.0
-        unchanged.
-      - >
-        NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check`
-        pass, and `cargo doc --all-features` is warning-free.
+        NF4 — the full suite passes on macOS, Linux and Windows with the Windows leg's `timeout-minutes`
+        unchanged at 40. The session tests are store- and channel-bound, which is where the Windows leg
+        historically disagrees.
     files:
-      - .ultraship/evidence/0.19.0
-    evidence: []
-  - id: US-IO-HARNESS-0.19.0-T09
-    summary: >
-      The live run: a real task against a real provider, driven entirely from an `io.toml` rather
-      than from Rust, with its trace kept as evidence.
-    why_required: >
-      The suite proves the projection against fixtures. Only a live run proves that an operator can
-      actually drive this harness from a file, which is the sentence the release is for.
-    status: todo
-    depends_on:
-      - US-IO-HARNESS-0.19.0-T08
-    acceptance_criteria:
+      - examples/session_live.rs
+      - .ultraship/evidence/0.20.0/
+    evidence:
       - >
-        OP5 — a live run against a real provider, driven from an `io.toml` rather than from Rust, is
-        performed by hand before the release is cut and its trace kept as evidence. The suite proves
-        the projection; only a live run proves an operator can actually drive the harness from a file.
-    files:
-      - examples/config_live.rs
-    evidence: []
+        OP5: examples/session_live.rs run against OpenRouter end to end — streamed 13 deltas ahead
+        of the step, the steer delivered and traced, a branch whose path is root -> branch with the
+        abandoned turn intact, and a reopen in a second connection that recalled the conversation's
+        first prompt. 28,461 tokens over four turns. evidence/0.20.0/live-run-session.txt.
+      - >
+        NF4: the three-OS suite is CI's on the PR; everything here ran on macOS.

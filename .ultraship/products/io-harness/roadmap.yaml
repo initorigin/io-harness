@@ -428,8 +428,8 @@ versions:
       This is the release that makes a terminal or a desktop app possible. Until it lands, SSE is
       consumed internally and accumulated, events are emitted at step granularity, and there is
       nothing for a UI to render while the model is still typing.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.21.0
     outcome: >
       The agent can plan and can ask. A todo tool lets it hold a multi-step plan the operator can

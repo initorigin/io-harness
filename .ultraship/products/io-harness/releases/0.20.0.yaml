@@ -1,0 +1,530 @@
+product: io-harness
+version: 0.20.0
+status: released
+release_type: minor
+outcome:
+  user_can: >
+    Hold a conversation with the harness instead of firing one task at it. An operator opens a
+    durable session over a workspace, sends a turn, watches the answer arrive token by token while
+    the model is still producing it, says something else mid-turn or interrupts outright, exits the
+    process, reopens the same session by its id later, and branches the conversation from any earlier
+    turn rather than starting over. Every turn is still a run — its own trace, its own budgets, its
+    own policy boundary, its own checkpoint — so a session is durable for the same reason a run
+    already is.
+  business_value: >
+    Until this lands the crate is one-shot by construction: every entry point takes a `TaskContract`,
+    runs to a `RunOutcome` and returns, SSE is consumed inside the provider and accumulated before
+    anything else sees it, and the observer channel is step-granular. There is nothing for a terminal
+    or a desktop window to render while the model is typing, and no way to say "no, not that" without
+    killing the process — which abandons a run mid-step and leaves `runs.status` at `running` forever.
+    io-cli and io-studio are both blocked on exactly this, and if the harness does not own the
+    conversation they will each build one over the same trace tables and diverge, which is the failure
+    0.19.0 exists to have prevented for configuration.
+  evidence_of_value: >
+    A session survives its process: two turns are sent, the process exits, the session is reopened by
+    id in a fresh process, and the third turn knows what the first turn established. A branch from
+    the first turn does not see the second, and the second is still readable afterwards — the tree is
+    append-only. On a live provider, the first token reaches the observer strictly before the
+    completion returns, timestamped, so "streaming" is a measured claim rather than a described one.
+    A steered turn changes course on the operator's mid-turn message, with the same turn unsteered as
+    the negative control.
+scope:
+  included:
+  - >
+    A new `session` module owning one type, `Session`, durable over the `Store` the crate already
+    keeps: `Session::open(store, root)` starts one, `Session::reopen(store, id)` picks it up in
+    another process, and `id`, `head`, `history` and `branch_from` read and move within it. Two new
+    tables, `sessions` and `session_turns`, created the way `memory`, `context_events` and
+    `provider_calls` were — additively, with no `CHECKPOINT_FORMAT` bump, because no checkpoint layout
+    changes and a 0.19.0 database opens unchanged.
+  - >
+    A turn is a run. `Session::turn` drives the existing workspace loop and the turn gets its own
+    `runs` row, its own steps, its own refusals, its own ledger draws and its own checkpoint. The
+    session layer adds a conversation over the run loop; it does not add a second execution path,
+    which is what keeps a turn resumable, auditable and policy-bounded without any of that being
+    rebuilt.
+  - >
+    Conversation continuity through a crate-internal seam rather than a new public field. The turns on
+    the path from the tree's root to its head are assembled into the turn's request by the existing
+    context assembler, under the existing `ContextBudget`, so a long conversation is compacted by the
+    machinery that already compacts a long run. `TaskContract` gains no field and
+    `CompletionRequest` gains no field, so nothing a 0.19.0 caller wrote stops compiling.
+  - >
+    A durable conversation tree, append-only. Any turn id may become the parent of the next turn, so
+    branching is one write and not a copy: no turn is edited, deleted or rewritten, an abandoned
+    branch stays readable, and `history` is the path from the root to whichever head the session is
+    on.
+  - >
+    `TaskContract` becomes optional per turn, as the roadmap says it always was in practice.
+    `Session::turn` synthesizes a workspace contract over the session's root with
+    `Verification::None` and the session's defaults; `Session::turn_bounded` takes a caller-supplied
+    contract for that one turn, so a verification gate, a budget, a toolbox, MCP servers or a skills
+    directory can bound a single turn without bounding the session. Every 0.19.0 entry point keeps
+    its exact behaviour: a headless one-shot is still `run_with`, unchanged.
+  - >
+    Token streaming, opt-in and provider-side. `Provider::complete_streaming(request, on_token)` is a
+    defaulted trait method — additive, like `accepts_images` — whose default delegates to `complete`
+    and emits the finished text as a single delta, so an out-of-tree provider keeps compiling and
+    keeps working while being honestly non-incremental. The three built-in providers override it and
+    emit each text delta as its SSE event arrives; they already parse typed deltas into an
+    accumulator, so this adds a sink, not a second parser.
+  - >
+    `EventKind::Token { text }`, delivered through the `Observer` channel the crate already has rather
+    than through a second callback path. Emitted **only** on a session turn that was given an
+    observer: no existing run entry point starts producing them, so the break is compile-time only and
+    no current consumer is suddenly flooded with per-delta events it did not ask for.
+  - >
+    Steering and interruption. `Steer::channel()` yields a `Steer` the caller keeps and a `SteerInbox`
+    the turn consumes. `Steer::say(text)` queues an operator message that reaches the model at the
+    next step boundary as an observation the next request carries; `Steer::interrupt()` stops the turn
+    at the next step boundary through the existing cancel path, so it reports
+    `RunOutcome::Cancelled`, commits a whole step or none of it, and stays resumable. Both are
+    honoured at a step boundary for the reason `Flow::Cancel` already is: the points in between are
+    not safe to stop at.
+  - >
+    Steering is text, never authorization. An operator's mid-turn message is surfaced to the model
+    exactly as a constraint is, and every tool call it leads to is checked against the same `Policy`
+    by the same code. A `Steer` cannot change the policy, the budgets, the sandbox or the contract of
+    a turn in flight, and the guide says so in those words.
+  - >
+    Documentation: a `docs/guide/sessions.md` page covering the session, the tree, branching,
+    streaming and steering with a worked example each; a worked example on every new public item;
+    `docs/public-api.txt` updated by hand; `CHANGELOG.md` with the `EventKind` break and its migration
+    note; and `docs/CONTRACT.md` amended with what a session guarantees — that a turn is a run, that
+    the tree is append-only, that streamed text is not a commitment until the completion returns, and
+    that one session driven by two processes at once is not supported.
+  - >
+    A live example kept as evidence: a real session against a real provider that streams tokens,
+    steers mid-turn, branches, and reopens across a process boundary, asserting each of those itself
+    so a regression fails the example rather than printing output nobody reads.
+  excluded:
+  - >
+    A message-array wire format. `CompletionRequest` keeps `system` and `user`: the crate flattens a
+    conversation into one user turn through the context assembler, which is where compaction,
+    invalidation and the token budget already live. Moving to a role-tagged array is a second context
+    path and a break to every provider's body builder, and it buys nothing the assembler does not
+    already do.
+  - >
+    Provider-side conversation state, prompt-cache management, or a session id sent to a vendor. What
+    the crate holds is its own tree in its own store.
+  - >
+    Deltas for anything but assistant text. Tool-call arguments and reasoning blocks stay
+    accumulated: a half-parsed tool call is not renderable and is not safe to act on, and the
+    accumulators already own reassembling them.
+  - >
+    Concurrent drive of one session. Two processes taking turns on the same session id is not
+    supported and not defended against beyond what SQLite's `BUSY_TIMEOUT` already gives; no session
+    lock, no lease, no advisory row. The contract states it rather than implying safety.
+  - >
+    Any interface or transport: no CLI, no TUI, no HTTP server, no WebSocket, no JSON event envelope.
+    io-cli and io-studio own their front ends; this release owns the API they call.
+  - >
+    Editing or deleting a turn, rewriting history, session-level summarization, or a "compact this
+    conversation" command. The tree is append-only and the existing `ContextBudget` is what bounds a
+    long conversation.
+  - >
+    Steering that mutates the run's boundary or bounds — a policy change, a budget raise, a tool
+    added mid-turn, a model swap. Each is a different release's question and each would make an
+    operator's chat message an authorization.
+  - >
+    Named agent definitions, the todo tool, the question tool and prompt templates (0.21.0), and
+    provider-executed web search (0.22.0). A session makes those useful; it does not include them.
+  - >
+    The four carried `CONTRACT.md` defects — `resume_tree` not calling `record_run_policy`,
+    `SandboxLimits::max_processes` enforced by nothing, no Linux seccomp filter, and
+    `Containment::max_total_cost` inert. None is in a module this release touches.
+  - >
+    Any new dependency. Channels come from the `tokio` already in the tree, and the store is the
+    `rusqlite` already in the tree, so the default `cargo tree` stays at the 407 lines this release
+    inherits from `develop`.
+  fallback_scope:
+  - >
+    The `session` module, a turn as a run, the durable append-only tree with branching, reopen across
+    a process boundary, and token streaming through `complete_streaming` and `EventKind::Token`.
+    Steering and interruption drop out. Still coherent, and still the release the roadmap describes as
+    the one that makes a terminal possible: an operator holds a durable, branchable conversation and a
+    UI has something to render while the model types. What they lose is changing course without
+    waiting for the turn to end, which stays `Flow::Cancel` plus a new turn for one more release.
+acceptance:
+  functional:
+  - >
+    F1 — a session outlives its process. Two turns are taken against a file-backed store, the `Session`
+    is dropped and the store closed, `Session::reopen` picks it up by id in a fresh `Store`, and the
+    third turn's request carries what the first two established. The negative control is a second
+    session opened over the same root, whose first turn carries none of it.
+  - >
+    F2 — a turn is a run, with everything a run has. Each turn produces its own `runs` row reachable
+    from `session_turns`, its own steps, and its own `RunSummary`; a policy denial inside a turn is
+    recorded in `policy_events` attributed to the rule and layer exactly as in a one-shot run; and
+    `Store::run_status` reports the turn's run.
+  - >
+    F3 — the tree branches and nothing is lost. A branch taken from turn 1 produces a turn whose
+    request carries turn 1 and not turn 2, turn 2 remains readable and unmodified afterwards, and
+    `history` from each head returns its own path. The negative control is the unbranched head, which
+    still sees turn 2.
+  - >
+    F4 — a turn may be bounded or unbounded. `Session::turn` runs with `Verification::None` and stops
+    on an assistant turn that calls no tool, reported as `RunOutcome::Finished`;
+    `Session::turn_bounded` with a `Verification::Command` succeeds only when that command passes and
+    reports `RunOutcome::Success`. A step cap set on one bounded turn does not bound the next turn.
+  - >
+    F5 — tokens arrive before the answer does. Against a scripted SSE provider, the deltas an observer
+    receives concatenate exactly to the response's final text, in order, and the first `Token` event
+    is observed strictly before `complete_streaming` returns. Asserted on recorded instants, not on a
+    sleep.
+  - >
+    F6 — streaming is opt-in and existing behaviour is untouched. A `run_with_observed` run against
+    the same streaming provider emits zero `Token` events and the identical event sequence it emits
+    on 0.19.0; the negative control is the same provider driven through a session turn, which does
+    emit them.
+  - >
+    F7 — a provider that does not implement streaming still works. A `Provider` implementing only
+    `complete` drives a session turn to completion and produces exactly one `Token` event carrying
+    the whole text, so a UI written against the event renders something rather than nothing.
+  - >
+    F8 — steering reaches the model at the next step boundary. A `Steer::say` issued during a turn
+    appears in the next request and changes what the agent does; the negative control is the same
+    turn with no steering, which does the original thing. Asserted through the real loop against a
+    scripted provider that branches on whether the message is present.
+  - >
+    F9 — an interrupt stops the turn cleanly and the session goes on. `Steer::interrupt()` ends the
+    turn at the next step boundary with `RunOutcome::Cancelled`, the turn's last step is whole in the
+    store (no half-committed step), the turn is present in `history` marked with its outcome, and the
+    next turn on the same session proceeds normally.
+  - >
+    F10 — steering is not authorization. A turn under a policy denying a write, steered with an
+    operator message explicitly asking for that write, still refuses it, with the refusal attributed
+    to the same rule and layer. The negative control is a policy that allows the write, where the same
+    steered message results in the write happening.
+  non_functional:
+  - >
+    NF1 — no store format bump and no new dependency. `CHECKPOINT_FORMAT` stays 7, the two new tables
+    are `CREATE TABLE IF NOT EXISTS` and nothing existing is altered, a 0.19.0 database opens,
+    resumes and is queried against 0.20.0 unchanged, and the default `cargo tree` line count is still
+    the 407 lines inherited from `develop`.
+  - >
+    NF2 — one break, marked, and no other. `EventKind` gains `Token { text }`; nothing else in
+    `docs/public-api.txt` changes meaning, no item is removed or renamed, and the changelog carries the
+    migration note (`match` on `EventKind` needs a `Token` arm or a `_` arm).
+  - >
+    NF3 — streaming costs nothing when nobody is listening. A session turn with no observer performs
+    no per-delta allocation beyond what 0.19.0 did, asserted by the streaming path being entered only
+    when a sink exists rather than by a timing measurement.
+  - >
+    NF4 — the full suite passes on macOS, Linux and Windows with the Windows leg's `timeout-minutes`
+    unchanged at 40. The session tests are store- and channel-bound, which is where the Windows leg
+    historically disagrees.
+  - >
+    NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` pass, and
+    `cargo doc --all-features` is warning-free.
+  - >
+    NF6 — an interrupted or cancelled turn never leaves `runs.status` at `running`, and neither does a
+    dropped `Session`. The state a crash leaves is the state a resume already understands.
+  operational:
+  - >
+    OP1 — `docs/public-api.txt` is updated by hand, `tests/public_api.rs` passes against the live
+    surface, and every added public item carries a fenced worked example, enforced by the existing
+    docs test.
+  - >
+    OP2 — `docs/guide/sessions.md` exists, is linked from the README and the crate root, and is
+    covered by the existing guide-pages test.
+  - >
+    OP3 — `docs/CONTRACT.md` states what a session is and is not: a turn is a run and carries a run's
+    guarantees; the tree is append-only; streamed text is provisional until the completion returns and
+    a caller must not act on a partial delta; steering is text and not authorization; and one session
+    driven by two processes at once is unsupported.
+  - >
+    OP4 — `CHANGELOG.md` carries the break with its migration note and the new capability in the
+    user-facing voice the changelog test enforces.
+  - >
+    OP5 — a live session against a real provider is run by hand before the release is cut and its
+    output kept as evidence: streamed deltas timestamped ahead of the completion, a mid-turn steer
+    that changes the agent's next action, a branch, and a reopen across a process boundary. The suite
+    proves the mechanism; only a live run proves an operator can hold a conversation with it.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.20.0, GitHub at initorigin/io-harness with the tag `v0.20.0` and a
+    Release titled `io-harness 0.20.0`, and docs.rs, whose build is checked by the nightly CI job.
+  deployment_method: >
+    The standing flow, unchanged. All work on `feat/0.20.0` off `develop`, including the sealed
+    UltraShip release record. PR into `develop`, merged with the PR button. Release PR `develop` into
+    `main`, merged the same way. GitHub Release cut from the tag with notes from the changelog.
+    `cargo publish` last, after both merges and the Release exist. `develop` synced to `main`
+    fast-forward only at the end. No branch is deleted. `git fetch --tags` after the Release, since
+    `gh release create` makes the tag on the remote only.
+  migrations:
+  - >
+    One source break: an exhaustive `match` on `EventKind` gains a `Token { text }` variant to handle
+    or ignore. The changelog says what to write; no name changes and no signature changes.
+  - >
+    An out-of-tree `Provider` needs no change. `complete_streaming` has a default that delegates to
+    `complete`, and the run loop still calls `complete` for every non-session path.
+  - >
+    No store migration and no checkpoint-format bump. Two tables are created on open; a 0.19.0
+    database gains them and is otherwise untouched, and 0.19.0 reading a 0.20.0 database ignores
+    tables it does not know.
+  - >
+    No new dependency, so a consumer auditing the tree has nothing new to audit.
+  observability:
+  - >
+    A session and each of its turns are in the store and readable afterwards: the turn's prompt, its
+    parent, its run id and its outcome, so a conversation is reconstructable from SQLite without the
+    program that drove it.
+  - >
+    `EventKind::Token` carries only the delta text. A streamed delta is not written to the trace as its
+    own row — the accumulated text is already recorded on the step, and per-delta rows would multiply
+    the trace by a factor nobody reads.
+  - >
+    A steer and an interrupt are visible in the trace, not only in the caller's memory: a steered turn
+    records that an operator message entered it, and an interrupted turn records `cancelled` the way
+    `Flow::Cancel` already does.
+  rollback: >
+    A published version cannot be recalled. The forward fix is 0.20.1; `cargo yank --version 0.20.0`
+    is the escape hatch and leaves 0.19.0 as what `cargo install` resolves. Nothing in the checkpoint
+    format changes and no existing table is altered, so a consumer who reverts to 0.19.0 keeps their
+    databases and their in-flight runs; the two session tables are simply inert to 0.19.0. The one
+    source break is a `match` arm, which reverts as easily as it applied.
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows
+  - A real provider account, for the live session that is OP5
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - Owner approval to merge to `main`, cut the Release, and publish, per the standing override.
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    The run loop is 6,000 lines with three loops in it (single-file, workspace, sub-agent) and the
+    session seam has to enter exactly one of them without touching the other two or the public
+    signatures around them.
+  - >
+    Streaming crosses a trait boundary into three provider implementations, each with its own
+    accumulator, and a `&dyn Fn` sink has to travel through an async body without borrowing something
+    that is not `Send`.
+  - >
+    Steering is a channel read at a step boundary, which is the one place in the loop where the
+    commit transaction, the checkpoint, the stall window and the cancel check already all happen. Four
+    existing mechanisms meet there and a fifth has to fit without reordering them.
+  - >
+    Conversation assembly has to reuse the context assembler rather than prepend text to a goal, which
+    means the assembler learns about a turn without learning about a session.
+  - >
+    Every new public item needs a worked example that compiles, and a session example needs a store and
+    a provider, so the doc tests are heavier than usual.
+  preferred_tools:
+  - The existing run loop, store, context assembler, observer channel and cancel path — this release adds a layer, not a mechanism
+  - '`tokio::sync::mpsc` for the steer channel, already in the tree'
+  - The providers' existing SSE accumulators, which already see each typed delta
+  constraints:
+  - CHECKPOINT_FORMAT stays 7; new tables only, nothing altered
+  - No new dependency; the default `cargo tree` stays at 407 lines
+  - Exactly one break, `EventKind::Token`, with a migration note
+  - A new capability ships as a new named function rather than an added parameter
+  - Every refusal test carries a negative control
+  - Stay 0.x
+risks:
+- >
+  Scope. A session layer is adjacent to a conversation UI, a summarizer, a message-array wire
+  format, per-turn model switching and provider prompt caching, and each of those is where this
+  release could quietly become three. The excluded list is long on purpose and the fallback scope is
+  the answer to schedule pressure.
+- >
+  A second context path. If a turn assembles its own history instead of going through the context
+  assembler, a long conversation gets two compaction rules that disagree, which is the exact failure
+  0.19.0 was written to prevent for configuration. The mitigation is that continuity is an assembler
+  input, asserted by a test that a conversation past the budget is compacted rather than truncated.
+- >
+  Streaming that lies. A delta stream that omits the last chunk, or reorders, reads as a complete
+  answer and is not. F5 asserts concatenation equality against the final text, in order, so a sink
+  that drops one delta fails rather than looking plausible.
+- >
+  An operator's chat message reading as permission. "Just do it" in a steer is the most natural
+  thing anyone will type, and the boundary must not care. F10 proves it does not, and the guide says
+  it in the same words the permissions guide already uses.
+- >
+  Interruption leaving a half-state. Stopping anywhere but a step boundary is what
+  `RunOutcome::Cancelled` exists to avoid; a new stop path that does not go through it would leave a
+  run `running` forever. The mitigation is that interrupt is the existing cancel path with a
+  different trigger, not a second one.
+open_questions:
+- >
+  Whether `Session::turn` should also exist in a `_tree` form, so a turn may spawn sub-agents. The
+  machinery is there and the composition is obvious, but a conversation whose turn is a tree raises
+  the question of which agent the operator is steering. Decided during development; if it costs a
+  day it goes to 0.21.0, which is the release about agent identity anyway.
+- >
+  Whether `EventKind::Token` should carry the turn's run id only, or also a delta index. The run id
+  is on every `RunEvent` already; an index helps a consumer detect a dropped event and is another
+  field to keep true. Decided during development against what the live example actually needs to
+  render.
+- >
+  Whether a turn should be resumable through the existing `resume` entry points by its run id
+  directly, or only through the session. Both are true today by construction; the question is which
+  one the contract promises, and it is answered in `CONTRACT.md` either way.
+released_at: '2026-07-30T08:20:00Z'
+mode: published
+delivered: >
+  The crate stops being one-shot. An operator opens a durable session over a workspace, sends a
+  turn, watches the answer arrive token by token while the model is still producing it, says
+  something else mid-turn or interrupts, comes back in a later process from the id alone, and
+  branches the conversation from any earlier turn without disturbing what came after it. A turn is a
+  run — its own trace, budgets, boundary and checkpoint — so a session is durable for exactly the
+  reason a run already is, and `TaskContract` became what the roadmap said it always was: an
+  optional bound on a turn, or a headless one-shot. The live proof is a real OpenRouter session:
+  13 deltas streamed ahead of the step that carried them, an operator's mid-turn message delivered
+  at step 2 of 6 and recorded as a `steered` row, a branch whose path is root -> branch with the
+  abandoned turn intact, and a reopen in a second connection that recalled the conversation's first
+  prompt. 28,461 tokens over four turns, all readable from SQLite afterwards.
+evidence:
+  tests:
+  - >
+    `cargo test` (default) — 40 suites, 742 tests passing, 0 failing, exit 0, including 164
+    doctests. evidence/0.20.0/tests-default.txt.
+  - >
+    `cargo test --features documents --lib --tests` and `--features media --lib --tests` — both
+    exit 0. evidence/0.20.0/tests-features.txt.
+  - >
+    F1, F2, F3, F4 and the store's own unit tests — tests/session.rs, 5 tests through the real loop.
+    A session's first two turns reach its third across a second `Store` over the same file, with a
+    different session over the same root as the negative control; a turn's run row, summary,
+    `run_status` and rule-and-layer-attributed refusal are a run's; a branch carries turn 1 and not
+    turn 2, turn 2 keeps its reply and its run, and both heads return their own path; an unbounded
+    turn ends `Finished` while a bounded one reports `Success` only when its command passes, and the
+    bound does not outlive its turn.
+  - >
+    F5, F6, F7, NF3 — tests/session_streaming.rs, 4 tests. The deltas concatenate to exactly the
+    response's final text in order; every delta of a step is observed before that step commits and
+    the first before the stream ends; a `run_with_observed` run over the same streaming provider
+    emits zero `Token` events and the identical 0.19.0 sequence, with the same provider through a
+    session turn as the control; a `complete`-only provider yields one delta carrying the whole
+    text; a turn with no observer never enters the streaming path at all.
+  - >
+    F8, F9, F10, NF6 — tests/session_steering.rs, 4 tests. A steer changes the next step's action
+    with the unsteered turn as the control; an interrupt raised on the first committed step ends the
+    turn `Cancelled` with `runs.status` completed, exactly one whole step in the workspace, the turn
+    in the tree marked `cancelled`, and the session continuing; and a steered demand for a denied
+    write is refused by the rule that denies it with the secret byte-identical afterwards, the same
+    steer under a policy with the deny lifted performing the write as the control.
+  - >
+    The store unit tests cover the two halves the integration tests cannot: a database with the
+    session tables dropped opens, keeps its runs and gains them with `CHECKPOINT_FORMAT` still 7,
+    and two turns sharing one parent leave each other untouched when one is closed.
+  builds:
+  - >
+    `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`,
+    `cargo clippy --all-targets --all-features -- -D warnings` and
+    `cargo doc --all-features --no-deps` all exit 0 with zero warnings.
+    evidence/0.20.0/build-and-lint.txt.
+  - >
+    NF1 — the default `cargo tree` is **407 lines**, the number this release inherited from
+    `develop` after the dependency sweep, unchanged. No new crate: `tokio` gained its `sync`
+    feature for the steer channel, which adds no dependency of its own.
+  - >
+    NF1 — `CHECKPOINT_FORMAT` is still 7, both new tables are `CREATE TABLE IF NOT EXISTS`, and the
+    diff carries no `ALTER TABLE`. evidence/0.20.0/scope-check.txt.
+  - >
+    NF2 and scope.excluded verified absent rather than assumed: `src/contract.rs` and
+    `src/context.rs` are byte-identical to 0.19.0, so `TaskContract` gained no field and the
+    assembler gained no second path; `CompletionRequest` gained none either; and the only public
+    surface change is the five added items plus the `EventKind::Token` variant.
+    evidence/0.20.0/scope-check.txt.
+  - >
+    `cargo package --locked` produced io-harness-0.20.0.crate, 141 files, 2.5 MiB (703.7 KiB
+    compressed), and its verify build compiled the packaged sources standalone, exit 0. The archive
+    carries `.env.example` and no `.env`, no `.ultraship/` and no `.github/`.
+    evidence/0.20.0/package-verify.txt.
+  - >
+    OP1 — `docs/public-api.txt` updated by hand with `Session`, `Steer`, `SteerInbox`, `Turn` and
+    `TurnResult`, and tests/public_api.rs passes, including the worked-example check across all 116
+    items. OP2 — docs/guide/sessions.md exists, is listed in tests/guide_pages.rs with its limits
+    block, and is linked from README.md, docs/CAPABILITIES.md and the crate root. OP4 —
+    tests/changelog.rs passes with the `EventKind` break and its migration snippet.
+  reviews: []
+  deployments: []
+  health_checks:
+  - >
+    OP5 — a live session against OpenRouter, evidence/0.20.0/live-run-session.txt. Turn 1 streamed
+    13 deltas and the step's text reached the observer before that step committed; turn 2's
+    mid-turn operator message reached the model at step 2 of 6 and left a `steered` row in the
+    trace; a branch from turn 1 answered the other question with the path asserted as
+    root -> branch and the abandoned turn intact; and the session reopened in a second connection
+    from its id alone recalled its own first prompt. The example asserts each of those itself, so a
+    regression fails the run rather than printing output nobody checks.
+known_limitations:
+- >
+  This record is sealed on `feat/0.20.0` before the crates.io upload, which is the standing flow:
+  the record states the authorized target and the flow makes it true. The upload follows the
+  develop -> main merge and the GitHub Release, and is the last step.
+- >
+  **NF4 — the three-OS suite is proven by CI on the PR, not from this machine.** Everything above
+  was run on macOS. The session tests are store- and channel-bound, which is where the Windows leg
+  historically disagrees.
+- >
+  **The live steer was delivered, not obeyed.** Turn 2 of the live session carried the operator's
+  message into the very next request and recorded it, and then the model looped on `find` and
+  `read_file` until the stall detector stopped it, writing neither file. What this crate guarantees
+  is delivery at the next step boundary; whether a model changes course on being told to is the
+  model's business, so the example asserts the delivery and prints the rest. That a steer *changes
+  what the agent does next* is proven offline by F8 against a provider scripted to branch on it.
+- >
+  **A turn resumed directly does not move the session's head.** A turn is a run, so
+  `resume_with(contract, provider, store, run_id, policy, approver)` continues one — but the
+  session bookkeeping (`finish_turn`, the head) happens in `Session::turn*`, so a turn resumed
+  outside the session keeps `outcome: null` in the tree and the head stays where it was. There is
+  no `Session::resume_turn`. This resolves the contract's third open question in the narrow
+  direction: what is promised is resumability by run id, not a session-level resume.
+- >
+  **No `turn_bounded_steered`.** Steering is available on the unbounded turn only. A caller who
+  wants both a verification gate and a mid-turn steer has to reach for `turn_steered` and enforce
+  the criterion themselves. Four turn methods already cover the cases asked for; a fifth
+  combination waits for someone to want it.
+- >
+  **`EventKind::Token` carries no delta index.** This resolves the contract's second open question:
+  the `RunEvent` already carries `run_id`, `step` and `depth`, and an index would be another field
+  to keep true. A consumer therefore cannot detect a dropped event from the event itself — what
+  holds is that the crate's own path does not drop one, asserted by concatenation equality in F5.
+- >
+  **A session turn cannot spawn sub-agents.** This resolves the contract's first open question:
+  there is no `turn_tree`, because a conversation whose turn is a tree raises the question of which
+  agent the operator is steering — which is 0.21.0's subject.
+- >
+  **A streamed delta is provisional and a `Fallback` mid-stream shows it.** If the primary provider
+  streams and then fails, its deltas were already emitted and the secondary's answer arrives whole,
+  so an operator sees partial text followed by different complete text. Stated in CONTRACT.md and
+  in the guide rather than smoothed over.
+- >
+  **An interrupt is indistinguishable from an observer's cancel in the trace.** Both record
+  `cancelled`, deliberately — it is the same path, which is what makes an interrupt resumable and
+  whole-stepped. A steered *message* does leave its own `steered` row; the interrupt does not.
+- >
+  **A session has no aggregate budget, and one session takes one driver.** Every turn is a fresh
+  run with its own ceilings, so `max_steps` on one turn does not bound the next and a
+  conversation-wide limit is the caller's to enforce per turn. Two processes taking turns on the
+  same session id concurrently is unsupported and undefended beyond SQLite's busy timeout.
+- >
+  **`Session::history` is linear per hop over the session's turns**, so walking the path is
+  quadratic in the number of turns in the tree. Bounded in practice by how long a conversation gets
+  and by the one query it costs; a recursive CTE is the upgrade if a session ever holds thousands.
+- >
+  **A refused git built-in ends the run** — found while running the live session, recorded in
+  docs/CONTRACT.md, and NOT fixed here because this release touches no tool. A policy denying
+  `Act::Exec` for `git` turns a speculative `git status` into `Error::Refused` out of the run loop
+  instead of an observation the model adapts to. The live example allows `git*` for that reason.
+  It belongs to the next release that touches the tool layer.
+- >
+  Carried unchanged from 0.19.0 and untouched by this release, as `scope.excluded` requires:
+  `resume_tree` still does not call `record_run_policy`; `SandboxLimits::max_processes` is enforced
+  by nothing on any platform; the Linux backend installs no seccomp filter;
+  `Containment::max_total_cost` is inert; `server_tool_requests` is zero everywhere until 0.22.0;
+  the crate ships no prices; the `[toolchain]` config override does not reach this crate's own run
+  loop; an unknown key inside a `[[mcp]]` table is not rejected; `git_status` lacks `-z`;
+  `fill_form` has never been opened in a real viewer; the Windows Job Object is unimplemented;
+  `pdf::read_text`'s `catch_unwind` is a no-op under `panic = "abort"`; and `TEST_BINARY` is inert.
+supersedes: 0.19.0
+next_recommended_version: 0.21.0
+immutable: true

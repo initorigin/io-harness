@@ -604,6 +604,80 @@ pub trait Provider {
         request: CompletionRequest,
     ) -> impl std::future::Future<Output = Result<CompletionResponse>> + Send;
 
+    /// Perform one completion, handing each chunk of assistant text to `on_token`
+    /// as it arrives rather than only when the whole answer does.
+    ///
+    /// The default delegates to [`complete`](Provider::complete) and calls
+    /// `on_token` once with the finished text. That keeps every implementation
+    /// written before 0.20.0 compiling *and* working — a consumer rendering
+    /// tokens sees the answer appear in one piece rather than nothing at all —
+    /// while being honest that nothing was incremental. The three built-in
+    /// providers override it and emit each delta as its SSE event arrives.
+    ///
+    /// Only the session layer calls this: a one-shot [`run_with`](crate::run_with)
+    /// still calls `complete`, so no existing run starts producing
+    /// [`EventKind::Token`](crate::EventKind::Token) events.
+    ///
+    /// The sink is `&dyn Fn` rather than a trait: there is one method to
+    /// implement and a closure is the whole of it.
+    ///
+    /// ```
+    /// use io_harness::{CompletionRequest, CompletionResponse, Provider};
+    /// use std::sync::Mutex;
+    ///
+    /// /// A provider that answers from a script, one delta per word.
+    /// struct Scripted(&'static str);
+    ///
+    /// impl Provider for Scripted {
+    ///     async fn complete(&self, _request: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         Ok(CompletionResponse { text: Some(self.0.into()), ..Default::default() })
+    ///     }
+    ///
+    ///     async fn complete_streaming(
+    ///         &self,
+    ///         _request: CompletionRequest,
+    ///         on_token: &(dyn Fn(&str) + Send + Sync),
+    ///     ) -> io_harness::Result<CompletionResponse> {
+    ///         for word in self.0.split_inclusive(' ') {
+    ///             on_token(word);
+    ///         }
+    ///         Ok(CompletionResponse { text: Some(self.0.into()), ..Default::default() })
+    ///     }
+    /// }
+    ///
+    /// # async fn demo() -> io_harness::Result<()> {
+    /// let seen = Mutex::new(String::new());
+    /// let response = Scripted("two words")
+    ///     .complete_streaming(CompletionRequest::default(), &|t| seen.lock().unwrap().push_str(t))
+    ///     .await?;
+    ///
+    /// // The deltas concatenate to exactly the final text. A stream that drops or
+    /// // reorders one reads like a complete answer and is not, so this is the
+    /// // property to assert about any implementation.
+    /// assert_eq!(*seen.lock().unwrap(), response.text.unwrap());
+    /// # Ok(()) }
+    /// ```
+    /// No `+ Send` on the returned future, unlike [`complete`](Provider::complete).
+    /// The default body holds `&self` across an await, which would need
+    /// `Self: Sync` — a bound the trait does not otherwise ask for, and one that
+    /// would have to be spelled at every session entry point to be usable. Nothing
+    /// needs it: a streamed turn is driven on the loop's own task, where `Store`
+    /// and `Watch` already are.
+    fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+    ) -> impl std::future::Future<Output = Result<CompletionResponse>> {
+        async move {
+            let response = self.complete(request).await?;
+            match response.text.as_deref() {
+                Some(text) if !text.is_empty() => on_token(text),
+                _ => {}
+            }
+            Ok(response)
+        }
+    }
+
     /// A short label recorded in the run's trace so an audit shows which
     /// provider ran. Defaults to `"provider"` so existing implementers keep
     /// compiling; the built-in providers override it.
