@@ -1,0 +1,39 @@
+io-harness 0.21.0 — build, lint, doc and package gates
+Run on macOS (darwin 25.5.0), 2026-07-30. Stable toolchain.
+
+=== cargo fmt --all --check ===
+exit 0, no diff
+
+=== cargo clippy --all-targets -- -D warnings ===
+    Checking io-harness v0.21.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.85s
+exit 0, zero warnings
+
+=== cargo clippy --all-targets --all-features -- -D warnings ===
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.57s
+exit 0, zero warnings
+
+=== cargo doc --all-features --no-deps ===
+    Documenting io-harness v0.21.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 11.35s
+    Generated target/doc/io_harness/index.html
+exit 0, zero lines matching "warning"
+
+The docs.rs-shaped build (`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly
+doc --all-features --no-deps`) plus the rendered feature-label grep is the `docs`
+job in .github/workflows/ci.yml and runs on the pull request; it is not
+duplicated here.
+
+=== cargo package --locked ===
+   Compiling io-harness v0.21.0 (target/package/io-harness-0.21.0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.22s
+exit 0 — target/package/io-harness-0.21.0.crate, 787K
+
+=== crates.io description length ===
+461 characters (the registry cap is 1000)
+
+=== secrets ===
+`.env` is untracked and ignored (.gitignore:10, `*.env`); the 0.20.0..0.21.0
+diff contains no provider- or registry-token-shaped string.
+
+Test suites are in tests-default.txt (exit 0) and tests-features.txt (exit 0).

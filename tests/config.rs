@@ -260,6 +260,7 @@ max_tokens = 88
 max_retries = 9
 exec_timeout_secs = 101
 skills = "skills"
+templates = "templates"
 
 [run.retry]
 base_ms = 1500
@@ -302,6 +303,18 @@ transport = "stdio"
 command = "github-mcp-server"
 args = ["stdio"]
 timeout_secs = 30
+
+[[agent]]
+name = "searcher"
+role = "You find things and never edit them."
+model = "cheap-model"
+max_steps = 8
+deny_write = true
+deny_net = true
+
+[[agent]]
+name = "author"
+model = "strong-model"
 "#;
 
 #[test]
@@ -805,4 +818,201 @@ async fn a_substituted_secret_reaches_the_field_and_not_the_trace() {
     // The negative control: the trace is not empty, so the assertion above is
     // measuring absence from something rather than absence of everything.
     assert!(!written.is_empty(), "the run did record something");
+}
+
+// ---------------------------------------------------------------------------
+// 0.21.0 — `[[agent]]` and `[run] templates`
+// ---------------------------------------------------------------------------
+
+/// The 0.21.0 acceptance criterion: `[[agent]]` reaches a run from configuration,
+/// projects onto the same roster the programmatic API builds, and accumulates across
+/// scopes rather than being replaced by the narrower one.
+///
+/// Named for the release rather than `f9_`, which this file already uses for one of
+/// 0.19.0's criteria.
+#[test]
+fn agent_tables_project_onto_the_same_roster_the_programmatic_api_builds() {
+    use io_harness::{AgentDef, Agents};
+
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        r#"
+[[agent]]
+name = "searcher"
+role = "You find things and never edit them."
+model = "cheap-model"
+max_steps = 8
+deny_write = true
+deny_net = true
+
+[[agent]]
+name = "author"
+model = "strong-model"
+"#,
+    );
+
+    let from_file = Config::discover(project.path()).unwrap().agents();
+    let programmatic = Agents::new()
+        .with(
+            AgentDef::new("searcher")
+                .with_role("You find things and never edit them.")
+                .with_model("cheap-model")
+                .with_max_steps(8)
+                .deny_write()
+                .deny_net(),
+        )
+        .with(AgentDef::new("author").with_model("strong-model"));
+
+    assert_eq!(
+        from_file, programmatic,
+        "a roster from a file and one built in Rust must be the same value"
+    );
+}
+
+/// `[[agent]]` accumulates across scopes the way `policy.layers` does. A local file
+/// that silently deleted the project's agents would be a roster nobody could rely on.
+#[test]
+fn agent_tables_accumulate_across_scopes_rather_than_being_replaced() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[[agent]]\nname = \"shared\"\nmodel = \"project-model\"\n",
+    );
+    write(
+        project.path(),
+        "io.local.toml",
+        "[[agent]]\nname = \"mine\"\nmodel = \"local-model\"\n",
+    );
+
+    let agents = Config::discover(project.path()).unwrap().agents();
+    assert_eq!(
+        agents.names(),
+        vec!["mine", "shared"],
+        "both scopes' agents must survive the merge"
+    );
+    assert_eq!(
+        agents.get("shared").unwrap().model.as_deref(),
+        Some("project-model")
+    );
+}
+
+/// A later scope redefining the same *name* replaces that one definition, because a
+/// roster is keyed by name — accumulation is across scopes, not within a name.
+#[test]
+fn a_later_scope_redefining_one_agent_replaces_only_that_agent() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[[agent]]\nname = \"worker\"\nmodel = \"project-model\"\n\
+         [[agent]]\nname = \"other\"\nmodel = \"untouched\"\n",
+    );
+    write(
+        project.path(),
+        "io.local.toml",
+        "[[agent]]\nname = \"worker\"\nmodel = \"local-model\"\n",
+    );
+
+    let agents = Config::discover(project.path()).unwrap().agents();
+    assert_eq!(
+        agents.get("worker").unwrap().model.as_deref(),
+        Some("local-model"),
+        "the narrower scope wins for the name it redefines"
+    );
+    assert_eq!(
+        agents.get("other").unwrap().model.as_deref(),
+        Some("untouched"),
+        "and leaves every other definition alone"
+    );
+}
+
+/// An unknown key inside an `[[agent]]` table is an error naming the key and the file.
+///
+/// This matters more here than anywhere else in the file: the keys being misspelled are
+/// the ones that narrow a boundary, and `deny_writes = true` silently ignored is a
+/// child that can write. `[[mcp]]` cannot have this check — `#[serde(flatten)]` and
+/// `deny_unknown_fields` cannot coexist — so it is worth pinning that `[[agent]]` does.
+#[test]
+fn an_unknown_key_inside_an_agent_table_is_rejected_naming_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[agent]]\nname = \"searcher\"\ndeny_writes = true\n",
+    );
+
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("deny_writes"),
+        "the error must name the misspelled key, got: {err}"
+    );
+    assert!(err.contains("io.toml"), "and the file it is in, got: {err}");
+}
+
+/// A roster in a file reaches a run: `apply_to` carries it onto the contract, including
+/// for a file that declares agents and nothing else.
+#[test]
+fn a_file_that_declares_only_agents_still_reaches_the_contract() {
+    use io_harness::{TaskContract, Verification};
+
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[agent]]\nname = \"searcher\"\ndeny_write = true\n",
+    );
+
+    let config = Config::discover(project.path()).unwrap();
+    let contract = config.apply_to(TaskContract::workspace(
+        "do the thing",
+        project.path(),
+        Verification::None,
+    ));
+
+    assert_eq!(contract.agents.names(), vec!["searcher"]);
+    assert!(contract.agents.get("searcher").unwrap().deny_write);
+}
+
+/// `[run] templates` reaches the typed accessor. Discovery stays the caller's, because
+/// it is fallible and rendering happens before a run exists.
+#[test]
+fn the_run_section_carries_a_template_directory() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[run]\ntemplates = \"prompts\"\n",
+    );
+
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        config.templates(),
+        Some(std::path::Path::new("prompts")),
+        "the template directory must reach a typed field"
+    );
+
+    // And a file that does not mention it leaves it unset rather than guessing.
+    let empty = tempfile::tempdir().unwrap();
+    write(empty.path(), "io.toml", "[run]\nmax_steps = 3\n");
+    assert!(Config::discover(empty.path())
+        .unwrap()
+        .templates()
+        .is_none());
 }

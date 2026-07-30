@@ -26,6 +26,7 @@ the limits that capability actually has.
 | [Resilience](guide/resilience.md) | Failure classification, kind-aware retry, provider fallback, stall detection |
 | [Observability and replay](guide/observability.md) | Observers, event kinds, outcome records, deterministic replay |
 | [Sessions](guide/sessions.md) | A durable, branchable conversation: turns that are runs, token streaming, steering and interruption |
+| [Agency](guide/agency.md) | A plan you can watch, a question about intent, named agents with their own model and boundary, and prompt templates |
 | [Configuration](guide/configuration.md) | One `io.toml`, four scopes, `${env:}` and `${file:}` substitution, projected onto the typed API |
 | [Accounting](guide/accounting.md) | One row per provider call, the cache and reasoning breakdown, latency and TTFT, and cost derived from a price table you own |
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |

@@ -173,6 +173,12 @@ struct File {
     // tables is not rejected. Stated in the guide rather than papered over.
     #[serde(default)]
     mcp: Vec<McpServer>,
+    // 0.21.0. `AgentDef` carries `deny_unknown_fields` of its own, so unlike
+    // `[[mcp]]` above a misspelled key inside one of these tables IS rejected —
+    // which matters more here than anywhere else in this file, because the keys
+    // being misspelled are the ones that narrow a boundary.
+    #[serde(default)]
+    agent: Vec<crate::agent::AgentDef>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -224,6 +230,7 @@ struct RunSection {
     max_retries: Option<u32>,
     exec_timeout_secs: Option<u64>,
     skills: Option<PathBuf>,
+    templates: Option<PathBuf>,
     retry: Option<RetryPolicy>,
     stall: Option<StallPolicy>,
     context: Option<ContextBudget>,
@@ -368,6 +375,7 @@ impl Config {
             && self.file.toolchain.is_empty()
             && self.file.prices.is_none()
             && self.file.mcp.is_empty()
+            && self.file.agent.is_empty()
     }
 
     // -----------------------------------------------------------------------
@@ -574,6 +582,57 @@ impl Config {
         &self.file.mcp
     }
 
+    /// The named agent definitions this configuration declares (0.21.0).
+    ///
+    /// `[[agent]]` tables **accumulate** across scopes the way `policy.layers` does,
+    /// rather than the narrower scope replacing the wider one: a project roster and a
+    /// developer's own extra agent are both wanted, and a local file that silently
+    /// deleted the project's agents would be a roster nobody could rely on. A later
+    /// scope registering the same *name* still replaces that one definition, because
+    /// [`Agents`](crate::Agents) is keyed by name.
+    ///
+    /// A definition can only ever narrow a child's boundary — there is no
+    /// `allow_write` to write here — so a roster in a config file grants nothing.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let config = Config::from_toml(
+    ///     r#"
+    ///     [[agent]]
+    ///     name = "searcher"
+    ///     model = "cheap-model"
+    ///     deny_write = true
+    ///
+    ///     [[agent]]
+    ///     name = "author"
+    ///     role = "You make the edit the searcher located."
+    ///     "#,
+    /// )?;
+    ///
+    /// let agents = config.agents();
+    /// assert_eq!(agents.names(), vec!["author", "searcher"]);
+    /// assert!(agents.get("searcher").unwrap().deny_write);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn agents(&self) -> crate::agent::Agents {
+        self.file
+            .agent
+            .iter()
+            .cloned()
+            .fold(crate::agent::Agents::new(), |roster, def| roster.with(def))
+    }
+
+    /// The prompt-template directory this configuration points at, if any (0.21.0).
+    ///
+    /// Discovery is the caller's to do — [`Templates::discover`](crate::Templates) is
+    /// fallible and this is not, and rendering a template happens before a run exists.
+    pub fn templates(&self) -> Option<&std::path::Path> {
+        self.file.run.as_ref().and_then(|r| r.templates.as_deref())
+    }
+
     /// `contract` with everything this configuration's `[run]` and `[[mcp]]`
     /// sections set.
     ///
@@ -619,6 +678,13 @@ impl Config {
         if !self.file.mcp.is_empty() {
             out = out.with_mcp(self.file.mcp.iter().cloned());
         }
+        // 0.21.0 — `[[agent]]` is top-level, not part of `[run]`, so it is applied
+        // before the `[run]` guard below: a file that declares a roster and nothing
+        // else must still get its roster.
+        if !self.file.agent.is_empty() {
+            out = out.with_agents(self.agents());
+        }
+
         let Some(run) = &self.file.run else {
             return out;
         };
@@ -830,7 +896,7 @@ fn bad_key(path: &Path, key: &[String], why: impl std::fmt::Display) -> Error {
 /// Only one, and it is the one the [`Policy`] type's own semantics call for: a
 /// later scope adds a layer, it does not rewrite the boundary. Everything else
 /// replaces, because a half-merged MCP server definition is not a server.
-const APPENDING: &[&[&str]] = &[&["policy", "layers"]];
+const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"]];
 
 /// Deep-merge `over` onto `base`, later winning key by key.
 fn merge(base: &mut toml::value::Table, over: toml::value::Table, at: &mut Vec<String>) {

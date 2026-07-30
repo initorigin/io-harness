@@ -1,0 +1,72 @@
+=== NF1: dependency tree (default build) ===
+     407
+=== NF1: CHECKPOINT_FORMAT ===
+106:pub const CHECKPOINT_FORMAT: i64 = 7;
+=== NF1: no ALTER TABLE anywhere ===
+src/state.rs:7
+=== NF1: new tables are IF NOT EXISTS ===
+2275:            "CREATE TABLE IF NOT EXISTS todos (
+2284:             CREATE TABLE IF NOT EXISTS pending_questions (
+=== NF2: the three breaks in the public API diff ===
++async_fn resume_tree_with_answer src/run.rs
++async_fn resume_tree_with_answer_observed src/run.rs
++async_fn resume_with_answer src/run.rs
++async_fn resume_with_answer_observed src/run.rs
++const ASK_QUESTION_TOOL src/tools/mod.rs
++const TODO_MAX_ITEMS src/state.rs
++const TODO_TEXT_CAP src/state.rs
++const TODO_WRITE_TOOL src/tools/mod.rs
++enum TodoState src/state.rs
++struct AgentDef src/agent.rs
++struct Agents src/agent.rs
+-struct Edit src/state.rs
++struct Edit src/state.rs
++struct FixedResponder src/approve.rs
++struct PendingQuestion src/state.rs
+-struct ProviderCall src/state.rs
++struct ProviderCall src/state.rs
++struct Question src/approve.rs
++struct ResponderNone src/approve.rs
++struct StdinResponder src/approve.rs
++struct Template src/template.rs
++struct Templates src/template.rs
++struct TodoItem src/state.rs
+-struct Turn src/state.rs
+-struct TurnResult src/session.rs
++struct Turn src/state.rs
++struct TurnResult src/session.rs
++trait Responder src/approve.rs
++type AnswerFuture src/approve.rs
+=== NF2: no public item removed (deletions in public-api.txt) ===
+4
+=== excluded: no fifth Act variant ===
+57:pub enum Act {
+58-    /// Read a file's contents into context.
+59-    Read,
+60-    /// Create or overwrite a file.
+61-    Write,
+62-    /// Spawn a binary (the verification layer's compile/test commands).
+63-    Exec,
+64-    /// Open an outbound connection. The target is a host, normally in
+65-    /// `host:port` form — see [`Policy::check`] for how a rule matches one.
+66-    Net,
+67-}
+68-
+69-/// What a rule does. Ordered by strictness: `Allow` < `Ask` < `Deny`.
+=== excluded: no new dependency (Cargo.toml deps diff) ===
+-version = "0.20.0"
++version = "0.21.0"
+=== excluded: no Session::turn_tree ===
+absent
+=== excluded: no template conditionals/loops/includes ===
+src/template.rs:13://! whole grammar. A value that itself contains `{{x}}` is emitted literally
+src/template.rs:339:    pub fn iter(&self) -> impl Iterator<Item = &Template> {
+src/template.rs:370:    /// itself contains `{{x}}` or `$ARGUMENTS` is emitted literally.
+=== OP3: the git-built-in defect paragraph is gone from CONTRACT.md ===
+absent (removed)
+=== files changed since 0.20.0 ===
+ tests/question.rs                                  | 639 +++++++++++++++++
+ tests/stall.rs                                     | 173 ++++-
+ tests/template.rs                                  | 379 ++++++++++
+ tests/todo.rs                                      | 424 +++++++++++
+ 44 files changed, 7389 insertions(+), 271 deletions(-)

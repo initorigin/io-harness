@@ -10,6 +10,7 @@
 //! An action the policy *denies* never reaches the approver at all. Refusal and
 //! approval are different things: only the sensitive-but-permitted tier prompts.
 
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -404,5 +405,272 @@ mod tests {
         let d = Slow.decide(&Request::new(Act::Write, "x")).await;
         assert_eq!(d, Decision::approve());
         assert!(started.elapsed() >= std::time::Duration::from_millis(50));
+    }
+}
+
+// ===========================================================================
+// 0.21.0 — asking the operator what they MEANT, which is not asking permission
+// ===========================================================================
+
+/// A question the agent is asking the operator about **intent**.
+///
+/// The distinction from [`Request`] is the whole reason this type exists, and the
+/// crate keeps it everywhere:
+///
+/// | | asks | an answer can |
+/// |---|---|---|
+/// | [`Request`] / [`Approver`] | may I do this action? | only *narrow* what happens |
+/// | `Question` / [`Responder`] | what did you actually want? | only add *text the model reads* |
+///
+/// An answer authorizes nothing. Every tool call that follows one is checked against
+/// the same [`Policy`](crate::Policy) by the same code — the rule 0.20.0 set for
+/// steering, and for the same reason: "just do it" is the most natural thing anyone
+/// will ever type, and the boundary must not care.
+///
+/// ```
+/// use io_harness::Question;
+///
+/// let q = Question::new("Which config should I edit?")
+///     .with_context("There is a committed io.toml and a gitignored io.local.toml.")
+///     .with_choices(["io.toml", "io.local.toml"]);
+///
+/// assert_eq!(q.question, "Which config should I edit?");
+/// assert_eq!(q.choices, ["io.toml", "io.local.toml"]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Question {
+    /// What the agent wants to know.
+    pub question: String,
+    /// What it already knows, so a human can answer without re-deriving the
+    /// situation. `None` when the question stands on its own.
+    pub context: Option<String>,
+    /// Options the agent is offering, if any. A UI renders these as buttons; an
+    /// answer is **not** obliged to be one of them, because an operator whose real
+    /// answer is "neither, do this instead" must not be forced to pick a wrong one.
+    pub choices: Vec<String>,
+}
+
+impl Question {
+    /// A bare question.
+    ///
+    /// ```
+    /// use io_harness::Question;
+    ///
+    /// let q = Question::new("Should the old column be dropped or kept?");
+    /// assert!(q.context.is_none() && q.choices.is_empty());
+    /// ```
+    pub fn new(question: impl Into<String>) -> Self {
+        Self {
+            question: question.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Add what the agent already established.
+    ///
+    /// ```
+    /// use io_harness::Question;
+    ///
+    /// let q = Question::new("Which one?").with_context("Both exist.");
+    /// assert_eq!(q.context.as_deref(), Some("Both exist."));
+    /// ```
+    pub fn with_context(mut self, context: impl Into<String>) -> Self {
+        self.context = Some(context.into());
+        self
+    }
+
+    /// Offer options.
+    ///
+    /// ```
+    /// use io_harness::Question;
+    ///
+    /// let q = Question::new("Which?").with_choices(["a", "b"]);
+    /// assert_eq!(q.choices.len(), 2);
+    /// ```
+    pub fn with_choices<I, S>(mut self, choices: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.choices = choices.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// The future a [`Responder`] returns. Boxed for the same reason
+/// [`DecisionFuture`] is: object safety.
+///
+/// `Option<String>`, not `String`: `None` is "nobody here can answer", which is a real
+/// answer and the one that makes the run pause for a human rather than guess.
+///
+/// ```
+/// use io_harness::{AnswerFuture, Question, Responder};
+///
+/// #[derive(Debug)]
+/// struct AlwaysDeclines;
+///
+/// impl Responder for AlwaysDeclines {
+///     fn answer<'a>(&'a self, _question: &'a Question) -> AnswerFuture<'a> {
+///         Box::pin(async { None })
+///     }
+/// }
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// assert!(rt.block_on(AlwaysDeclines.answer(&Question::new("Which?"))).is_none());
+/// ```
+pub type AnswerFuture<'a> = Pin<Box<dyn Future<Output = Option<String>> + Send + 'a>>;
+
+/// Answers an agent's question about intent, in this process.
+///
+/// `None` means "nobody here can answer this", which is a real answer and not a
+/// failure: the run then persists the question and pauses, so a human can answer it
+/// after this process has exited — see
+/// [`resume_with_answer`](crate::resume_with_answer). A run that could not ask would
+/// have to guess, and a wrong guess spends a whole run.
+///
+/// `&self` and `Send + Sync`, exactly like [`Approver`]: one responder serves a whole
+/// [`run_tree`](crate::run_tree), and state it needs goes behind a `Mutex` or a
+/// channel.
+///
+/// Registered on the contract with
+/// [`TaskContract::with_responder`](crate::TaskContract::with_responder) rather than
+/// passed to every entry point, which is how a [`Toolbox`](crate::Toolbox) is carried
+/// too. `Debug` is required for that reason and that reason only —
+/// [`TaskContract`](crate::TaskContract) derives `Debug`, and a `#[derive(Debug)]` on
+/// your responder is the whole obligation.
+///
+/// ```
+/// use io_harness::{AnswerFuture, Question, Responder};
+///
+/// /// Always picks the first option offered, and declines an open question.
+/// #[derive(Debug)]
+/// struct FirstChoice;
+///
+/// impl Responder for FirstChoice {
+///     fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a> {
+///         Box::pin(async move { question.choices.first().cloned() })
+///     }
+/// }
+///
+/// let responder = FirstChoice;
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+///
+/// let answered = rt.block_on(responder.answer(
+///     &Question::new("Which?").with_choices(["left", "right"]),
+/// ));
+/// assert_eq!(answered.as_deref(), Some("left"));
+///
+/// // No options, so this responder has nothing to say and the run will pause.
+/// assert!(rt.block_on(responder.answer(&Question::new("Why?"))).is_none());
+/// ```
+pub trait Responder: Send + Sync + fmt::Debug {
+    /// Answer one question, or return `None` to let the run pause for a human.
+    fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a>;
+}
+
+/// Answers nothing, so every question pauses the run for a human.
+///
+/// The default, and the honest one for an unattended run: a machine standing in for
+/// an absent human is exactly what a question about intent must not have. The
+/// question is persisted and the run is resumable, so nothing is lost by waiting.
+///
+/// ```
+/// use io_harness::{Question, Responder, ResponderNone};
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let answered = rt.block_on(ResponderNone.answer(&Question::new("Which config?")));
+/// assert!(answered.is_none(), "it declines, and the run pauses");
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResponderNone;
+
+impl Responder for ResponderNone {
+    fn answer<'a>(&'a self, _question: &'a Question) -> AnswerFuture<'a> {
+        Box::pin(async { None })
+    }
+}
+
+/// Answers every question with the same text. For tests.
+///
+/// ```
+/// use io_harness::{FixedResponder, Question, Responder};
+///
+/// let responder = FixedResponder::new("the second one");
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let answered = rt.block_on(responder.answer(&Question::new("Which one?")));
+/// assert_eq!(answered.as_deref(), Some("the second one"));
+/// ```
+#[derive(Debug, Clone, Default)]
+pub struct FixedResponder {
+    answer: String,
+}
+
+impl FixedResponder {
+    /// A responder that always says `answer`.
+    pub fn new(answer: impl Into<String>) -> Self {
+        Self {
+            answer: answer.into(),
+        }
+    }
+}
+
+impl Responder for FixedResponder {
+    fn answer<'a>(&'a self, _question: &'a Question) -> AnswerFuture<'a> {
+        Box::pin(async { Some(self.answer.clone()) })
+    }
+}
+
+/// Prints the question on the terminal and reads one line back, so a CLI can hold a
+/// conversation about intent without building an event loop.
+///
+/// An empty line means "I would rather not answer here", which returns `None` and
+/// pauses the run — the same escape hatch [`StdinApprover`] gives.
+///
+/// Blocking stdin on the async runtime is acceptable for the same reason it is in
+/// [`StdinApprover`]: a run that is waiting for a human has nothing else to do.
+///
+/// ```no_run
+/// use io_harness::{StdinResponder, TaskContract, Verification};
+/// use std::sync::Arc;
+///
+/// // A CLI that can hold a conversation about intent: the agent asks, the operator
+/// // types, the run carries on. An empty line declines, and the run pauses instead —
+/// // the question is durable, so nothing is lost by deciding later.
+/// let contract = TaskContract::workspace("port the parser", "/repo", Verification::None)
+///     .with_responder(Arc::new(StdinResponder));
+/// # let _ = contract;
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StdinResponder;
+
+impl Responder for StdinResponder {
+    fn answer<'a>(&'a self, question: &'a Question) -> AnswerFuture<'a> {
+        Box::pin(async move {
+            use std::io::Write;
+            println!("\n[the agent is asking] {}", question.question);
+            if let Some(context) = &question.context {
+                println!("  context: {context}");
+            }
+            for (i, choice) in question.choices.iter().enumerate() {
+                println!("  {}) {choice}", i + 1);
+            }
+            print!("your answer (empty to decide later): ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return None;
+            }
+            let line = line.trim();
+            if line.is_empty() {
+                return None;
+            }
+            // A bare number picks an offered choice, which is what anyone types.
+            if let Ok(n) = line.parse::<usize>() {
+                if n >= 1 && n <= question.choices.len() {
+                    return Some(question.choices[n - 1].clone());
+                }
+            }
+            Some(line.to_string())
+        })
     }
 }

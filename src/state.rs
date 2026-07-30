@@ -1164,6 +1164,241 @@ fn turn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
     })
 }
 
+/// One question the agent asked the operator, and its answer if it has one (0.21.0).
+///
+/// The mirror of [`Pending`], for the other channel: [`Pending`] is an action awaiting
+/// permission, this is an intent awaiting clarification. An answer here is text the
+/// model reads and authorizes nothing.
+///
+/// ```
+/// use io_harness::{Question, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+///
+/// let id = store.put_question(run, 3, &Question::new("Which config should I edit?")
+///     .with_choices(["io.toml", "io.local.toml"]))?;
+///
+/// // Unanswered, and readable by whatever process is going to answer it.
+/// let q = store.question(id)?.expect("just written");
+/// assert!(!q.resolved && q.answer.is_none());
+/// assert_eq!(q.choices, ["io.toml", "io.local.toml"]);
+///
+/// store.answer_question(id, "io.local.toml", "human")?;
+/// let q = store.question(id)?.unwrap();
+/// assert_eq!(q.answer.as_deref(), Some("io.local.toml"));
+/// assert_eq!(q.answered_by.as_deref(), Some("human"));
+///
+/// // Answering twice is an error, not a silent second write.
+/// assert!(store.answer_question(id, "io.toml", "human").is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    /// The question's own id, and what [`resume_with_answer`](crate::resume_with_answer) takes.
+    pub id: i64,
+    /// The run that asked.
+    pub run_id: i64,
+    /// The step it was asked on.
+    ///
+    /// That step **is** committed before the run pauses, so a resume starts after it and
+    /// the `ask_question` call is not replayed;
+    /// [`resume_with_answer`](crate::resume_with_answer) delivers the answer as a ledger
+    /// observation. (A *parent* whose child asked is the different case: its own spawn
+    /// step is left uncommitted so the resume re-adopts that child.)
+    pub step: u32,
+    /// What the agent asked.
+    pub question: String,
+    /// What the agent already knew, if it said.
+    pub context: Option<String>,
+    /// Options the agent offered. An answer need not be one of them.
+    pub choices: Vec<String>,
+    /// The answer, once there is one.
+    pub answer: Option<String>,
+    /// `"responder"` if a [`Responder`](crate::Responder) in the run's own process
+    /// answered, `"human"` if the answer arrived through a resume after a pause.
+    /// "The machine decided" and "a person decided" are different facts about a run.
+    pub answered_by: Option<String>,
+    /// Whether it has been answered.
+    pub resolved: bool,
+}
+
+/// Read one `pending_questions` row. One place, so the three queries that read the
+/// table cannot drift in their column order.
+fn question_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingQuestion> {
+    let choices: Option<String> = r.get(5)?;
+    Ok(PendingQuestion {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        step: r.get(2)?,
+        question: r.get(3)?,
+        context: r.get(4)?,
+        choices: choices
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default(),
+        answer: r.get(6)?,
+        answered_by: r.get(7)?,
+        resolved: r.get::<_, i64>(8)? != 0,
+    })
+}
+
+/// Where one item of an agent's plan has got to (0.21.0).
+///
+/// Three states and no more. A plan is for an operator to read at a glance, and
+/// every state past these three — blocked, cancelled, deferred, in-review — is a
+/// distinction the harness would have to define, the model would have to choose
+/// correctly, and nothing would ever check.
+///
+/// ```
+/// use io_harness::TodoState;
+///
+/// // The wire form is what the model writes and what the column holds.
+/// assert_eq!(TodoState::Active.as_str(), "active");
+/// assert_eq!(TodoState::parse("done"), Some(TodoState::Done));
+///
+/// // An unknown state is not silently a default: a plan that says something the
+/// // crate does not understand is a plan whose author should hear about it.
+/// assert_eq!(TodoState::parse("blocked"), None);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoState {
+    /// Not started.
+    Pending,
+    /// Being worked on now. Nothing enforces that only one item is active.
+    Active,
+    /// Finished, as far as the agent is concerned. Nothing verifies it.
+    Done,
+}
+
+impl TodoState {
+    /// The wire and column form.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Active => "active",
+            Self::Done => "done",
+        }
+    }
+
+    /// Parse the wire form, or `None` for anything else.
+    ///
+    /// `None` rather than a default, so a model that invents a state gets told
+    /// instead of having its plan quietly rewritten.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "pending" => Some(Self::Pending),
+            "active" => Some(Self::Active),
+            "done" => Some(Self::Done),
+            _ => None,
+        }
+    }
+}
+
+/// One line of an agent's plan (0.21.0).
+///
+/// A plan is the agent's *stated intent*: it is written by the agent, read by an
+/// operator, and enforced by nothing. No [`RunOutcome`](crate::RunOutcome) depends
+/// on it, no verification consults it, and writing one is not an act the policy
+/// gates — see the plan section of `docs/CONTRACT.md`. What it buys is a long run
+/// that can be recognised as going the wrong way before it ends.
+///
+/// There is no item id. The whole list is replaced on every write, which is why
+/// there is nothing for a model to mis-address.
+///
+/// ```
+/// use io_harness::{Store, TodoItem, TodoState};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+///
+/// store.write_todos(run, &[
+///     TodoItem::new("read the current parser", TodoState::Done),
+///     TodoItem::new("port the tokenizer", TodoState::Active),
+///     TodoItem::new("port the error paths", TodoState::Pending),
+/// ])?;
+///
+/// // Read back in the order it was written — which is the order an operator reads.
+/// let plan = store.todos(run)?;
+/// assert_eq!(plan.len(), 3);
+/// assert_eq!(plan[1].text, "port the tokenizer");
+/// assert_eq!(plan[1].state, TodoState::Active);
+///
+/// // A second write replaces the list rather than merging into it.
+/// store.write_todos(run, &[TodoItem::new("ship it", TodoState::Active)])?;
+/// assert_eq!(store.todos(run)?.len(), 1);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TodoItem {
+    /// What the agent said it would do, in its own words.
+    pub text: String,
+    /// Where it says that has got to.
+    pub state: TodoState,
+}
+
+impl TodoItem {
+    /// One item.
+    pub fn new(text: impl Into<String>, state: TodoState) -> Self {
+        Self {
+            text: text.into(),
+            state,
+        }
+    }
+}
+
+/// Most items one plan may hold.
+///
+/// A plan longer than this is not a plan an operator reads; it is a transcript.
+/// A write past the cap is truncated to the cap rather than refused, and the tool
+/// says so in its observation — the same shape as every other bounded tool result
+/// in the crate, which caps and tells rather than failing.
+///
+/// ```
+/// use io_harness::{Store, TodoItem, TodoState, TODO_MAX_ITEMS};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("a very long plan", "/repo")?;
+///
+/// // Two past the cap. The plan is held to the cap and the overflow is reported,
+/// // rather than the write being refused.
+/// let long: Vec<TodoItem> = (0..TODO_MAX_ITEMS + 2)
+///     .map(|i| TodoItem::new(format!("step {i}"), TodoState::Pending))
+///     .collect();
+/// let dropped = store.write_todos(run, &long)?;
+///
+/// assert_eq!(dropped, 2);
+/// assert_eq!(store.todos(run)?.len(), TODO_MAX_ITEMS);
+/// # Ok(())
+/// # }
+/// ```
+pub const TODO_MAX_ITEMS: usize = 64;
+
+/// Longest one item's text may be, in characters.
+///
+/// Truncated to fit rather than refused, like every other bounded tool result here.
+///
+/// ```
+/// use io_harness::{Store, TodoItem, TodoState, TODO_TEXT_CAP};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("a wordy plan", "/repo")?;
+///
+/// let wordy = "x".repeat(TODO_TEXT_CAP + 50);
+/// store.write_todos(run, &[TodoItem::new(wordy, TodoState::Active)])?;
+///
+/// assert_eq!(store.todos(run)?[0].text.chars().count(), TODO_TEXT_CAP);
+/// # Ok(())
+/// # }
+/// ```
+pub const TODO_TEXT_CAP: usize = 200;
+
 /// Most entries one workspace may hold.
 ///
 /// A write past the cap is not refused — the oldest entry is evicted to make
@@ -1357,6 +1592,24 @@ impl ContextEvent {
     /// Notes from earlier runs were carried into this turn's context.
     pub fn memory_recall(step: u32, detail: impl Into<String>) -> Self {
         Self::of("memory_recall", step, detail)
+    }
+
+    /// The agent wrote down its plan at this step (0.21.0). The detail is the shape
+    /// of the plan — how many items and how many done — rather than its text, which
+    /// is already in the `todos` table and would otherwise be stored twice.
+    pub fn todo_write(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("todo_write", step, detail)
+    }
+
+    /// The agent asked the operator about intent at this step (0.21.0).
+    pub fn question_asked(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("question_asked", step, detail)
+    }
+
+    /// An answer to that question entered the run (0.21.0). The detail names who
+    /// answered — a `Responder` in the process, or a human after a pause.
+    pub fn question_answered(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("question_answered", step, detail)
     }
 
     /// An operator's mid-turn message entered the conversation at this step
@@ -1997,6 +2250,48 @@ impl Store {
                  reply          TEXT,
                  outcome        TEXT,
                  created_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );",
+        )?;
+
+        // 0.21.0. The agent's plan, one row per item, and the question channel that
+        // asks an operator what they actually wanted.
+        //
+        // New tables again, and again deliberately NOT a `CHECKPOINT_FORMAT` bump:
+        // no checkpoint layout changed, and bumping it would make
+        // [`Store::check_resumable`] refuse every 0.20.0 store over two additive
+        // tables a 0.20.0 binary never queries.
+        //
+        // `todos.position` is a column rather than "the rowid order", because the
+        // list is replaced wholesale and an operator reads it in the order the agent
+        // wrote it — which after a replace is not the order the ids run in.
+        //
+        // `pending_questions` mirrors `pending_approvals` field for field, including
+        // the `resolved` marker, so a question survives a process exit for exactly
+        // the reason a pending approval does. `answer` is NULL until a human writes
+        // one, and `answered_by` records whether it was a `Responder` in the process
+        // or a person after a pause — "the machine decided" and "a person decided"
+        // are different facts about a run.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS todos (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id     INTEGER NOT NULL,
+                 position   INTEGER NOT NULL,
+                 text       TEXT NOT NULL,
+                 state      TEXT NOT NULL,
+                 written_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS todos_run ON todos(run_id, position);
+             CREATE TABLE IF NOT EXISTS pending_questions (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id      INTEGER NOT NULL,
+                 step        INTEGER NOT NULL,
+                 question    TEXT NOT NULL,
+                 context     TEXT,
+                 choices     TEXT,
+                 answer      TEXT,
+                 answered_by TEXT,
+                 resolved    INTEGER NOT NULL DEFAULT 0,
+                 asked_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              );",
         )?;
 
@@ -3136,6 +3431,181 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- 0.21.0: the question channel ----
+
+    /// Persist a question nobody in this process could answer, and return its id.
+    ///
+    /// The mirror of [`Self::put_pending`], deliberately: a question survives a
+    /// process exit for exactly the reason a pending approval does, and the two stay
+    /// in separate tables because they are separate things — one asks whether an act
+    /// is permitted, the other what the operator meant.
+    pub fn put_question(
+        &self,
+        run_id: i64,
+        step: u32,
+        q: &crate::approve::Question,
+    ) -> Result<i64> {
+        let choices = if q.choices.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&q.choices).unwrap_or_default())
+        };
+        self.conn.execute(
+            "INSERT INTO pending_questions (run_id, step, question, context, choices)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![run_id, step, q.question, q.context, choices],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Read one question by id, answered or not.
+    pub fn question(&self, question_id: i64) -> Result<Option<PendingQuestion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+             FROM pending_questions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([question_id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(question_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The answer already recorded for this exact question on this run and step, if
+    /// there is one.
+    ///
+    /// A query for a caller reconstructing a run, **not** the mechanism a resume uses.
+    /// The step that asks a question is committed before the run pauses, so a resume
+    /// starts at the step after it and the `ask_question` call is never replayed —
+    /// [`resume_with_answer`](crate::resume_with_answer) delivers the answer as an
+    /// observation instead. See [`Self::questions`] for the whole conversation.
+    pub fn answered_question(
+        &self,
+        run_id: i64,
+        step: u32,
+        question: &str,
+    ) -> Result<Option<PendingQuestion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+             FROM pending_questions
+             WHERE run_id = ?1 AND step = ?2 AND question = ?3 AND resolved = 1
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![run_id, step, question])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(question_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record an answer and mark the question resolved.
+    ///
+    /// `by` is `"responder"` or `"human"`. Answering an already-answered question is
+    /// an [`Error::Resume`] rather than a silent second write, the way
+    /// [`Self::resolve_pending`] refuses a second decision: two answers to one
+    /// question means one of them was never acted on, and a caller should hear which.
+    pub fn answer_question(&self, question_id: i64, answer: &str, by: &str) -> Result<()> {
+        let existing = self.question(question_id)?;
+        match existing {
+            None => {
+                return Err(Error::Resume {
+                    reason: format!("no question {question_id} to answer"),
+                })
+            }
+            Some(q) if q.resolved => {
+                return Err(Error::Resume {
+                    reason: format!("question {question_id} was already answered"),
+                })
+            }
+            Some(_) => {}
+        }
+        self.conn.execute(
+            "UPDATE pending_questions SET answer = ?2, answered_by = ?3, resolved = 1
+             WHERE id = ?1",
+            rusqlite::params![question_id, answer, by],
+        )?;
+        Ok(())
+    }
+
+    /// Every question asked on a run, in the order they were asked.
+    pub fn questions(&self, run_id: i64) -> Result<Vec<PendingQuestion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+             FROM pending_questions WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], question_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- 0.21.0: the agent's plan ----
+
+    /// Replace this run's plan with `items`.
+    ///
+    /// Wholesale, in one transaction: the old rows go and the new ones land, so a
+    /// reader on another connection sees the previous plan or the next one and never
+    /// a half-written mixture of the two. That atomicity is the whole reason an
+    /// operator can read a plan mid-run and trust what they see.
+    ///
+    /// Bounded like every other tool result in the crate rather than refused: at most
+    /// [`TODO_MAX_ITEMS`] items, each at most [`TODO_TEXT_CAP`] characters. Returns
+    /// how many items were dropped to hold the cap, so the caller can say so in the
+    /// observation instead of letting a plan quietly lose its tail.
+    ///
+    /// Writes no trace row of its own — the run loop records the write where the
+    /// step number is known, exactly as it does for [`Self::memory_put`].
+    pub fn write_todos(&self, run_id: i64, items: &[TodoItem]) -> Result<usize> {
+        let kept = items.len().min(TODO_MAX_ITEMS);
+        let dropped = items.len() - kept;
+        // One transaction: a reader on another connection sees the old plan or the
+        // new one, never both halves.
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM todos WHERE run_id = ?1", [run_id])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO todos (run_id, position, text, state) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (i, item) in items.iter().take(kept).enumerate() {
+                let text: String = item.text.chars().take(TODO_TEXT_CAP).collect();
+                stmt.execute(rusqlite::params![
+                    run_id,
+                    i as i64,
+                    text,
+                    item.state.as_str()
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(dropped)
+    }
+
+    /// This run's plan, in the order the agent wrote it.
+    ///
+    /// Empty for a run that never wrote one, and empty — not absent — for a run that
+    /// cleared its plan, because an agent that finished its work and emptied its list
+    /// is not an agent that never had one.
+    ///
+    /// A row whose `state` is not one [`TodoState`] understands is skipped rather than
+    /// guessed at; the writer above only ever writes the three, so this can only
+    /// happen to a database another program has written to.
+    pub fn todos(&self, run_id: i64) -> Result<Vec<TodoItem>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT text, state FROM todos WHERE run_id = ?1 ORDER BY position")?;
+        let rows = stmt.query_map([run_id], |r| {
+            let text: String = r.get(0)?;
+            let state: String = r.get(1)?;
+            Ok((text, state))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (text, state) = row?;
+            if let Some(state) = TodoState::parse(&state) {
+                out.push(TodoItem { text, state });
+            }
+        }
+        Ok(out)
     }
 
     // ---- 0.10.0: durable cross-run memory ----

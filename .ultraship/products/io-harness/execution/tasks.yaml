@@ -1,280 +1,392 @@
 product: io-harness
-version: 0.20.0
+version: 0.21.0
 tasks:
-  - id: US-IO-HARNESS-0.20.0-T01
+  - id: US-IO-HARNESS-0.21.0-T01
     summary: >
-      The `session` module's spine: the `sessions` and `session_turns` tables, `Session::open` /
-      `Session::reopen` / `id` / `head` / `history`, a turn driven as a run through the existing
-      workspace loop, and the crate-internal seam that assembles the path root->head into the turn's
-      request through the existing context assembler.
+      The `todo` tool end to end: `TodoItem` and its state, the `todos` table with
+      `Store::write_todos` / `Store::todos`, the `todo_write` tool spec and its dispatch arm,
+      `EventKind::TodoWrote`, and the new reserved name. The whole list is replaced on every write and
+      the write is not gated.
     why_required: >
-      Every other task acts on a session that exists and a turn that runs. Without the tables and the
-      turn-as-a-run seam there is no conversation to branch, stream into, or steer, and the release's
-      whole claim — that a session is durable for the same reason a run is — rests here.
+      Half the release's outcome is that an operator can watch the agent's plan. Without a durable
+      list written by the agent and readable from SQLite mid-run there is no plan to watch, and the
+      first thing io-cli and io-studio would each build for themselves is this table.
     status: done
     depends_on: []
     acceptance_criteria:
       - >
-        F1 — a session outlives its process. Two turns are taken against a file-backed store, the
-        `Session` is dropped and the store closed, `Session::reopen` picks it up by id in a fresh
-        `Store`, and the third turn's request carries what the first two established. The negative
-        control is a second session opened over the same root, whose first turn carries none of it.
+        F1 — a plan is durable and readable mid-run. An agent's `todo_write` is in the `todos` table
+        keyed by its run id before the next step commits, `Store::todos` returns the items in order
+        with their states, and a second write replaces the list wholesale rather than merging. The plan
+        is readable from a fresh `Store` over the same file after the process that wrote it is gone.
       - >
-        F2 — a turn is a run, with everything a run has. Each turn produces its own `runs` row reachable
-        from `session_turns`, its own steps, and its own `RunSummary`; a policy denial inside a turn is
-        recorded in `policy_events` attributed to the rule and layer exactly as in a one-shot run; and
-        `Store::run_status` reports the turn's run.
-      - >
-        F4 — a turn may be bounded or unbounded. `Session::turn` runs with `Verification::None` and
-        stops on an assistant turn that calls no tool, reported as `RunOutcome::Finished`;
-        `Session::turn_bounded` with a `Verification::Command` succeeds only when that command passes
-        and reports `RunOutcome::Success`. A step cap set on one bounded turn does not bound the next
-        turn.
-      - >
-        NF1 — no store format bump and no new dependency. `CHECKPOINT_FORMAT` stays 7, the two new
-        tables are `CREATE TABLE IF NOT EXISTS` and nothing existing is altered, a 0.19.0 database
-        opens, resumes and is queried against 0.20.0 unchanged, and the default `cargo tree` line count
-        is still the 407 lines inherited from `develop`.
+        F2 — a plan is inert. A run whose plan is never completed still reports the outcome its
+        verification and budgets dictate; no `RunOutcome` and no refusal anywhere depends on a todo
+        state; and a `todo_write` produces no `policy_events` row, because it is not gated. The
+        negative control is a write to the workspace in the same run, which does produce one.
     files:
-      - src/session.rs
       - src/state.rs
       - src/run.rs
-      - src/context.rs
+      - src/observe.rs
+      - src/tools/mod.rs
+      - src/tools/custom.rs
       - src/lib.rs
-      - tests/session.rs
+      - tests/todo.rs
     evidence:
       - >
-        tests/session.rs F1/F2/F4 and the store unit tests: a session reopened in a second `Store`
-        over the same file carries its first two turns into the third, with a second session over
-        the same root as the negative control; a turn's run row, summary, refusal attribution and
-        `run_status` are a run's; an unbounded turn ends `Finished` and a bounded one `Success`.
-      - >
-        src/state.rs unit test `a_pre_session_database_gains_the_session_tables_and_keeps_its_rows`
-        — a database with the two tables dropped opens, keeps its runs, and gains them;
-        CHECKPOINT_FORMAT still 7.
-  - id: US-IO-HARNESS-0.20.0-T02
+        tests/todo.rs — 7 tests. The mid-run read is asserted from a SECOND `Store` opened inside an `Observer` at step 1, not after the run; a write that landed at the end would leave it empty. Wholesale replace, empty-clears, order, malformed-is-an-observation, and inertness (no `policy_events` row, with a gated workspace write in the same run as the control).
+  - id: US-IO-HARNESS-0.21.0-T02
     summary: >
-      Branching: any turn id may parent the next turn, `Session::branch_from` moves the head, and the
-      tree stays append-only so an abandoned branch is still readable.
+      Repetition detection in the existing stall machinery: `StallPolicy::repeat` with
+      `#[serde(default)]`, a consecutive-identical-signature counter in `Progress::step` that a
+      workspace write does not reset, and `replan_directive` extended to name the repeated call.
+      Escalation stays `Replan` then `Stalled`, with no new outcome variant.
     why_required: >
-      Without it a session is a list, and the outcome promises a tree — coming back and taking a
-      different path from an earlier turn rather than starting over is half of what makes a
-      conversation durable rather than merely persisted.
+      The roadmap makes repetition detection part of this release, and the 0.20.0 live run showed why:
+      the current logic clears the whole window whenever a write lands, so the looping agent shape that
+      actually occurs in practice is invisible until the step cap. Without this the release ships an
+      agency story with the one signal that catches a confused agent still half blind.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.20.0-T01
+    depends_on: []
     acceptance_criteria:
       - >
-        F3 — the tree branches and nothing is lost. A branch taken from turn 1 produces a turn whose
-        request carries turn 1 and not turn 2, turn 2 remains readable and unmodified afterwards, and
-        `history` from each head returns its own path. The negative control is the unbranched head,
-        which still sees turn 2.
+        F11 — repetition is caught even when the workspace moves. An agent making the same call three
+        times consecutively while a write lands on each step is replanned and then stalled, where the
+        same script on 0.20.0's logic runs to the step cap. The negative control is three *different*
+        calls each of which writes, which is progress and is left alone. Both asserted through the real
+        loop against a scripted provider, with the `context_events` rows checked.
+      - >
+        NF3 — a run that uses none of this behaves exactly as it did. A 0.20.0-shaped run with no todo
+        call, no question, no agents registry, no templates and `StallPolicy::default()` produces the
+        identical event sequence, the identical step count and the identical outcome, and its
+        `CompletionRequest`s carry `model: None`. `StallPolicy`'s new field defaults so an existing
+        `io.toml` and an existing struct literal both keep working.
     files:
-      - src/session.rs
-      - src/state.rs
-      - tests/session.rs
+      - src/resilience.rs
+      - src/run.rs
+      - tests/stall.rs
     evidence:
       - >
-        tests/session.rs F3: a branch from turn 1 carries turn 1 and not turn 2 into the request;
-        turn 2 is unmodified afterwards with its own reply and run; both heads return their own
-        path; a turn from another session is refused.
+        DEVIATION from this task's summary, and it is smaller than planned: `StallPolicy` gained NO
+        `repeat` field. Adding a public field to a struct with public fields breaks every struct
+        literal — `#[serde(default)]` covers deserialization only, and the type is built by literal
+        in its own doctests — so it would have been a FOURTH break. The threshold is the existing
+        `window`: "the same call three times in a row" and "three unproductive steps" are one
+        patience setting, and a second knob whose only correct value is the first knob's is a knob
+        nobody can set correctly. Behaviour for every `changed == false` case is identical, traced
+        step by step against the existing doctest; only the `changed == true` case is new.
+        NF3 therefore holds by construction rather than by a defaulted field.
       - >
-        src/state.rs unit test `two_turns_may_share_a_parent_and_neither_is_rewritten`.
-  - id: US-IO-HARNESS-0.20.0-T03
+        tests/stall.rs — F11 and its negative control, plus 9 total passing. The repeated-spawn case fails on 0.20.0's logic, where a child that ran reset the parent's window every step. Three DIFFERENT spawns that each do work are untouched. src/resilience.rs unit tests amended where they pinned the old directive wording.
+  - id: US-IO-HARNESS-0.21.0-T03
     summary: >
-      Token streaming: `Provider::complete_streaming` as a defaulted trait method, overridden by the
-      three built-in providers to emit each text delta as its SSE event arrives, surfaced as
-      `EventKind::Token { text }` through the existing observer channel and only on a session turn
-      that was given an observer.
+      The 0.20.0 live-run defect: a refused git built-in becomes an observation instead of
+      `Error::Refused` leaving the run loop. `Git::run`'s exec refusal and `check_path`'s leading-`-`
+      refusal are caught in the dispatch arm and returned as a refusal observation with its
+      `policy_events` row, and the defect paragraph leaves `docs/CONTRACT.md`.
     why_required: >
-      This is the release's named blocker: until deltas leave the provider there is nothing for a
-      terminal or a desktop window to render while the model is typing, which is the reason the
-      roadmap says this release is what makes those products possible.
+      The 0.20.0 record commits this fix to the next release that touches the tool layer, and this is
+      that release. A speculative `git status` under an exec-denying policy currently escalates a whole
+      run, which is the opposite of the crate's stated rule that a refusal is an observation the model
+      adapts to.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.20.0-T01
+    depends_on: []
     acceptance_criteria:
       - >
-        F5 — tokens arrive before the answer does. Against a scripted SSE provider, the deltas an
-        observer receives concatenate exactly to the response's final text, in order, and the first
-        `Token` event is observed strictly before `complete_streaming` returns. Asserted on recorded
-        instants, not on a sleep.
+        F12 — a refused git built-in costs a step, not the run. Under a policy denying `Act::Exec` for
+        `git`, a `git_status` call returns an observation naming the refusal, the run continues to its
+        next step, and a `policy_events` row attributes the refusal to the rule and layer. The same
+        holds for a path beginning with `-`. The negative control is the identical run under a policy
+        allowing `git`, where the command runs. This test would have failed on 0.20.0.
+    files:
+      - src/run.rs
+      - src/tools/git.rs
+      - tests/git.rs
+      - docs/CONTRACT.md
+    evidence:
       - >
-        F6 — streaming is opt-in and existing behaviour is untouched. A `run_with_observed` run against
-        the same streaming provider emits zero `Token` events and the identical event sequence it emits
-        on 0.19.0; the negative control is the same provider driven through a session turn, which does
-        emit them.
+        tests/git.rs — 12 passing, 3 added: the exec refusal, the argv guard, and the negative control that the same call under a policy allowing `git` still runs. F12 panics on 0.20.0, where the refusal left the loop as `Err`. docs/CONTRACT.md's defect paragraph removed.
+  - id: US-IO-HARNESS-0.21.0-T04
+    summary: >
+      The `question` tool and its in-process answering channel: `Question`, `Answer`, the `Responder`
+      trait with `ResponderNone`, `StdinResponder` and `FixedResponder`, the `ask_question` tool spec
+      and dispatch arm, `EventKind::QuestionAsked` / `QuestionAnswered`, and the answer delivered as an
+      observation that authorizes nothing.
+    why_required: >
+      The other half of the release's outcome is that the agent can ask about intent instead of
+      guessing. This is the channel; without it an ambiguous goal is still resolved by a guess that
+      costs a whole run, and the crate still has no way to ask a human anything except whether an
+      action is permitted.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.21.0-T01
+    acceptance_criteria:
       - >
-        F7 — a provider that does not implement streaming still works. A `Provider` implementing only
-        `complete` drives a session turn to completion and produces exactly one `Token` event carrying
-        the whole text, so a UI written against the event renders something rather than nothing.
+        F3 — a question is answered in-process and changes what the agent does. A run under a
+        `Responder` that answers "the second file" acts on the second file; the same run, the same
+        provider script and a `Responder` answering "the first file" acts on the first. Both answers
+        reach the model as an observation, and both are recorded.
       - >
-        NF2 — one break, marked, and no other. `EventKind` gains `Token { text }`; nothing else in
-        `docs/public-api.txt` changes meaning, no item is removed or renamed, and the changelog carries
-        the migration note (`match` on `EventKind` needs a `Token` arm or a `_` arm).
+        F5 — an answer is text, never authorization. A run under a policy denying a write, asked what
+        to do and answered "write the secret file", still refuses the write, attributed to the same
+        rule and layer. The negative control is the same answer under a policy that allows it, where
+        the write happens.
+    files:
+      - src/approve.rs
+      - src/run.rs
+      - src/observe.rs
+      - src/tools/mod.rs
+      - src/tools/custom.rs
+      - src/lib.rs
+      - tests/question.rs
+    evidence:
       - >
-        NF3 — streaming costs nothing when nobody is listening. A session turn with no observer performs
-        no per-delta allocation beyond what 0.19.0 did, asserted by the streaming path being entered
-        only when a sink exists rather than by a timing measurement.
+        DEVIATION, also smaller than planned: the `Responder` is carried on the contract
+        (`TaskContract::with_responder`) rather than added as an argument to every run entry point.
+        The planned signature change would have broken `run`, `run_with`, `run_tree` and their
+        observed and resume variants — every existing call site — to add an argument almost all of
+        them would pass `None` for. `Toolbox` already establishes that caller-supplied behaviour
+        rides the contract. So this release ships TWO breaks, not the three NF2 anticipated:
+        `EventKind` (+3 variants) and `RunOutcome::AwaitingAnswer` are match breaks, and
+        `CompletionRequest::model` is a struct-literal break. NF2's inventory needs correcting at
+        the complete stage.
+      - >
+        tests/question.rs — 8 passing. `an_answer_is_not_authorization` carries the control proving the write was reachable, so the refusal is the policy's. Malformed question is an observation, not the end of the run.
+  - id: US-IO-HARNESS-0.21.0-T05
+    summary: >
+      The durable half of the question path: the `pending_questions` table with its put/read/resolve
+      triangle, `RunOutcome::AwaitingAnswer { question_id, steps }`, `resume_with_answer` and its
+      observed variant, and the tree variants so a child's question pauses the whole tree.
+    why_required: >
+      A question nobody can answer in-process must pause the run rather than fail it, or an unattended
+      agent that needs a human is a lost run. This is what makes a question survive a process exit for
+      the same reason a pending approval does, and it is the only path by which a spawned child can
+      reach a human.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.21.0-T04
+    acceptance_criteria:
+      - >
+        F4 — a question with no answerer pauses the run and survives the process. `ResponderNone`
+        yields `RunOutcome::AwaitingAnswer { question_id, steps }` with the question in
+        `pending_questions` and `runs.status` not left at `running`; a fresh `Store` in a second
+        connection reads the question, and `resume_with_answer` continues the same run from the same
+        step with the answer as an observation. Asserted across a dropped store, not within one.
+      - >
+        F6 — a child's question pauses the tree. A spawned agent asking a question with no responder
+        leaves the whole tree `AwaitingAnswer`, the parent uncommitted past that step, and
+        `resume_tree_with_answer` resumes to completion with the ledger not double-charged — the same
+        assertions the existing child-approval test makes, against the new path.
+      - >
+        NF6 — a paused question never leaves `runs.status` at `running`, and an answered one is
+        resolved exactly once. Answering an already-answered question is an error rather than a second
+        resume, the way `resolve_pending` already behaves for approvals.
+    files:
+      - src/state.rs
+      - src/run.rs
+      - tests/question.rs
+    evidence:
+      - >
+        tests/question.rs — the pause asserted across a DROPPED `Store` in a second connection, plus double-answer and wrong-run refusals, plus the child-question tree pause and resume.
+  - id: US-IO-HARNESS-0.21.0-T06
+    summary: >
+      `CompletionRequest::model`, the per-request override, honoured by `OpenRouter`, `Anthropic`,
+      `OpenAi` and `provider::Fallback` in preference to their own configured model, with every
+      in-crate struct-literal site updated and `CompletionResponse::model` still reporting what
+      actually served the call.
+    why_required: >
+      A named agent definition carrying a model means nothing without a way to put that model on the
+      wire: every provider fixes its model at construction and a tree shares one provider instance.
+      This is the mechanism, and it is the release's one hard break, so it lands as its own task with
+      its own migration note.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - >
+        NF2 — exactly three breaks, each marked, and no others. `CompletionRequest` gains
+        `model: Option<String>`; `RunOutcome` gains `AwaitingAnswer`; `EventKind` gains three variants.
+        Nothing is removed or renamed, no existing signature changes except the run entry points that
+        take a `Responder`, and every other item in `docs/public-api.txt` keeps its meaning. The
+        changelog carries a migration snippet for each.
     files:
       - src/provider/mod.rs
-      - src/provider/anthropic.rs
-      - src/provider/openai_wire.rs
       - src/provider/openrouter.rs
+      - src/provider/anthropic.rs
       - src/provider/openai.rs
-      - src/observe.rs
-      - src/session.rs
-      - tests/session_streaming.rs
+      - src/provider/openai_wire.rs
+      - src/provider/fallback.rs
+      - src/run.rs
     evidence:
       - >
-        tests/session_streaming.rs F5/F6/F7/NF3: the deltas concatenate to the response's final text
-        in order, every delta of a step is observed before that step commits, and the first is
-        observed before the stream ends; a `run_with_observed` run over the same provider emits zero
-        Token events and the identical 0.19.0 sequence (started, step, finished); a `complete`-only
-        provider yields one delta carrying the whole text; a turn with no observer never enters the
-        streaming path.
-      - >
-        Live: 13 deltas over a real OpenRouter turn, the step's text arriving before that step
-        committed. evidence/0.20.0/live-run-session.txt.
-  - id: US-IO-HARNESS-0.20.0-T04
+        docs/public-api.txt + 214 doctests. Every in-crate `CompletionRequest` literal already used `..Default::default()`, so the break reaches only external callers who enumerate fields.
+  - id: US-IO-HARNESS-0.21.0-T07
     summary: >
-      Steering and interruption: `Steer::channel`, `Steer::say` delivering an operator message at the
-      next step boundary as an observation the next request carries, and `Steer::interrupt` stopping
-      the turn through the existing cancel path — with the policy unchanged by either.
+      Named agent definitions: `AgentDef` and the `Agents` registry, `TaskContract::with_agents`, the
+      optional `agent` argument on `spawn_agent`, and `spawn_child` applying the definition's role to
+      the child's system prompt, its model to the request, and its `deny_write`/`deny_net` through the
+      existing `Policy::contain`. An unknown name is an error observation, not a spawn.
     why_required: >
-      Without it the only way to change course is to kill the process, which abandons a run mid-step
-      and leaves `runs.status` at `running` forever. It is also where the release could do real harm:
-      an operator's chat message must not read as an authorization, and that has to be proven rather
-      than asserted.
+      Without this a sub-agent is identical to its parent apart from a goal string, so a role and a
+      cheaper or stronger model per agent are unexpressible — the largest cost lever the crate has.
+      The release's claim that an agent has an identity rests entirely here.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.20.0-T01
+      - US-IO-HARNESS-0.21.0-T06
     acceptance_criteria:
       - >
-        F8 — steering reaches the model at the next step boundary. A `Steer::say` issued during a turn
-        appears in the next request and changes what the agent does; the negative control is the same
-        turn with no steering, which does the original thing. Asserted through the real loop against a
-        scripted provider that branches on whether the message is present.
+        F7 — a named agent gets its model on the wire. A tree spawning two definitions naming two
+        different models produces two `provider_calls` rows carrying those two model strings, read back
+        from the store rather than from the configuration that asked for them. The negative control is
+        a spawn with no `agent` argument, which carries the provider's own configured model.
       - >
-        F9 — an interrupt stops the turn cleanly and the session goes on. `Steer::interrupt()` ends the
-        turn at the next step boundary with `RunOutcome::Cancelled`, the turn's last step is whole in
-        the store (no half-committed step), the turn is present in `history` marked with its outcome,
-        and the next turn on the same session proceeds normally.
-      - >
-        F10 — steering is not authorization. A turn under a policy denying a write, steered with an
-        operator message explicitly asking for that write, still refuses it, with the refusal attributed
-        to the same rule and layer. The negative control is a policy that allows the write, where the
-        same steered message results in the write happening.
-      - >
-        NF6 — an interrupted or cancelled turn never leaves `runs.status` at `running`, and neither does
-        a dropped `Session`. The state a crash leaves is the state a resume already understands.
+        F8 — a named agent gets its role and can only narrow the boundary. The child's system prompt
+        contains its definition's role text; a definition setting `deny_write` produces a child that is
+        refused a write the parent is allowed, attributed to the child layer; and a definition whose
+        `deny_write`/`deny_net` are absent produces a child no wider than its parent — proven by a
+        parent policy denying a path and a definition that says nothing about it, where the child is
+        still refused. An unknown agent name yields an error observation and no child.
     files:
-      - src/session.rs
+      - src/agent.rs
+      - src/contract.rs
       - src/run.rs
-      - tests/session_steering.rs
+      - src/state.rs
+      - src/lib.rs
+      - tests/agents.rs
     evidence:
       - >
-        tests/session_steering.rs F8/F9/F10/NF6: a steer changes the next step's action with the
-        unsteered turn as control; an interrupt after one committed step ends the turn `Cancelled`
-        with `runs.status` completed, one whole step in the workspace, the turn in the tree marked
-        `cancelled`, and the session continuing; a steered request for a denied write is refused by
-        the rule that denies it and the secret is byte-identical, with the deny lifted as the
-        control.
-      - >
-        Live: the operator's message reached the model at step 2 of 6 and the trace carries the
-        `steered` row. evidence/0.20.0/live-run-session.txt.
-  - id: US-IO-HARNESS-0.20.0-T05
+        tests/agents.rs — 7 passing. Models read back from the `provider_calls` rows rather than from the roster; the mock echoes the model it was sent. The silent-definition test proves a definition cannot restore a parent's deny.
+  - id: US-IO-HARNESS-0.21.0-T08
     summary: >
-      Documentation and the surface record: `docs/guide/sessions.md`, a worked example on every added
-      public item, `docs/public-api.txt` by hand, the `EventKind` break and its migration note in
-      `CHANGELOG.md`, and the `docs/CONTRACT.md` section on what a session does and does not
-      guarantee.
+      Prompt templates: `Template`, `Templates::discover` and `Templates::render` reusing the `skills`
+      module's directory discovery, frontmatter parser, duplicate-name and count caps and description
+      clamp. `{{placeholder}}` substitution with `$ARGUMENTS` for the remainder; a missing argument is
+      an error, never an empty string. Rendering returns a `String` and touches no run-loop path.
     why_required: >
-      The crate's own tests enforce it — a public item with no worked example, an unlisted guide page
-      or an unmarked break fails the suite. It is also where the honest limits of the release are
-      stated: streamed text is provisional, steering is not authorization, and one session driven by
-      two processes at once is unsupported.
+      The roadmap's fourth agency primitive is an operator's repeatable way to start a turn. It is also
+      the release's cheapest included item — a pure function over text — and leaving it out would put
+      a template parser into io-cli and io-studio separately, which is the divergence 0.19.0 exists to
+      prevent.
+    status: done
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F10 — a template renders and nothing else. `Templates::discover` over a fixture directory finds
+        the templates with their descriptions, `render` substitutes every `{{placeholder}}` and routes
+        the remainder to `$ARGUMENTS`, an unknown template name is an error, and a placeholder with no
+        argument is an error rather than an empty string — the rule 0.19.0 set for `${env:}`, applied
+        here. The rendered string drives a real run through `TaskContract::workspace` unchanged.
+    files:
+      - src/template.rs
+      - src/lib.rs
+      - tests/template.rs
+      - tests/fixtures
+    evidence:
+      - >
+        tests/template.rs — 12 tests + 13 doctests. `split_front_matter`/`first_prose_line`/`clamp` lifted to `pub(crate)` in `skills` and shared rather than duplicated.
+  - id: US-IO-HARNESS-0.21.0-T09
+    summary: >
+      Configuration reach: `[[agent]]` tables projecting onto an `Agents` registry with per-file
+      unknown-key rejection and cross-scope accumulation the way `policy.layers` accumulates, and
+      `[run] templates` pointing at a template directory.
+    why_required: >
+      The roadmap says a definition comes "from configuration rather than from a hand-built contract".
+      A programmatic registry alone leaves the operator-facing half of the promise unbuilt, and io-cli
+      and io-studio consume `io.toml` rather than construct Rust values.
     status: done
     depends_on:
-      - US-IO-HARNESS-0.20.0-T01
-      - US-IO-HARNESS-0.20.0-T02
-      - US-IO-HARNESS-0.20.0-T03
-      - US-IO-HARNESS-0.20.0-T04
+      - US-IO-HARNESS-0.21.0-T07
+      - US-IO-HARNESS-0.21.0-T08
+    acceptance_criteria:
+      - >
+        F9 — `[[agent]]` reaches a run from configuration. An `io.toml` carrying two `[[agent]]` tables
+        projects onto an `Agents` registry equal to the programmatic one, an unknown key inside an
+        `[[agent]]` table is an error naming the key and the file, and the `[[agent]]` array
+        accumulates across scopes the way `policy.layers` does rather than being replaced by the
+        narrower scope.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence:
+      - >
+        tests/config.rs — 20 passing, 6 added, and both new keys in the EVERY_KEY fixture. Roster equality against the programmatic value; unknown key inside `[[agent]]` rejected naming key and file.
+  - id: US-IO-HARNESS-0.21.0-T10
+    summary: >
+      Documentation and the drift gates: `docs/guide/agency.md`, a worked example on every added public
+      item, `docs/public-api.txt` updated by hand, `CHANGELOG.md` with all three breaks and their
+      migration snippets, and `docs/CONTRACT.md` amended — including the removal of the
+      refused-git-built-in paragraph.
+    why_required: >
+      Four gate tests fail without it (`public_api`, `guide_pages`, `changelog`, `docs_drift`), and the
+      contract's operational criteria are documentation criteria. A break shipped without its migration
+      snippet is a break a consumer meets at compile time with no instructions.
+    status: done
+    depends_on:
+      - US-IO-HARNESS-0.21.0-T09
     acceptance_criteria:
       - >
         OP1 — `docs/public-api.txt` is updated by hand, `tests/public_api.rs` passes against the live
         surface, and every added public item carries a fenced worked example, enforced by the existing
         docs test.
       - >
-        OP2 — `docs/guide/sessions.md` exists, is linked from the README and the crate root, and is
-        covered by the existing guide-pages test.
+        OP2 — `docs/guide/agency.md` exists, is listed in `tests/guide_pages.rs` with its limits block,
+        and is linked from `README.md`, `docs/CAPABILITIES.md` and the crate root.
       - >
-        OP3 — `docs/CONTRACT.md` states what a session is and is not: a turn is a run and carries a
-        run's guarantees; the tree is append-only; streamed text is provisional until the completion
-        returns and a caller must not act on a partial delta; steering is text and not authorization;
-        and one session driven by two processes at once is unsupported.
+        OP3 — `docs/CONTRACT.md` states, in its own voice: a plan is not gated and is never enforced;
+        an answer to a question is text and not authorization; a named definition can only narrow a
+        boundary and a model string is a request the vendor may substitute; a template renders text and
+        can set nothing; the stall window still does not survive a resume; and the refused-git-built-in
+        paragraph is **removed**, because it is fixed here.
       - >
-        OP4 — `CHANGELOG.md` carries the break with its migration note and the new capability in the
-        user-facing voice the changelog test enforces.
-      - >
-        NF5 — `cargo clippy --all-targets --all-features -- -D warnings` and `cargo fmt --check` pass,
-        and `cargo doc --all-features` is warning-free.
+        OP4 — `CHANGELOG.md` carries all three breaks with migration snippets and the new capabilities
+        in the user-facing voice the changelog test enforces.
     files:
-      - docs/guide/sessions.md
+      - docs/guide/agency.md
       - docs/public-api.txt
       - docs/CONTRACT.md
+      - docs/CAPABILITIES.md
       - CHANGELOG.md
       - README.md
       - src/lib.rs
-      - src/session.rs
+      - tests/guide_pages.rs
     evidence:
       - >
-        OP1: docs/public-api.txt updated by hand with the five added items; tests/public_api.rs
-        passes, including the worked-example check over all 116 items.
-      - >
-        OP2: docs/guide/sessions.md written, listed in tests/guide_pages.rs with a limits block,
-        linked from docs/CAPABILITIES.md, README.md and the crate root; tests/guide_pages.rs,
-        tests/readme.rs and tests/docs_drift.rs pass.
-      - >
-        OP3/OP4: docs/CONTRACT.md carries the eight session limits and the newly found refused-git
-        defect; CHANGELOG.md carries the `EventKind` break with its migration snippet and
-        tests/changelog.rs passes.
-      - >
-        NF5: cargo fmt --check, clippy --all-targets --all-features -D warnings, and cargo doc
-        --all-features all clean.
-  - id: US-IO-HARNESS-0.20.0-T06
+        docs/public-api.txt at 137 items with a worked example each; docs/guide/agency.md registered and linked from README, CAPABILITIES and the crate root; CONTRACT.md amended and the git defect removed; CHANGELOG.md with all breaks and compiling migration snippets. public_api, guide_pages, readme, docs_drift, changelog all green.
+  - id: US-IO-HARNESS-0.21.0-T11
     summary: >
-      The live session example kept as evidence, and the three-OS suite: a real session against a real
-      provider that streams tokens ahead of the completion, steers mid-turn, branches, and reopens
-      across a process boundary, asserting each itself.
+      The release gate and the live proof: the full suite on the default and both feature sets, fmt,
+      both clippy passes, warning-free docs, the `cargo tree` line count and `CHECKPOINT_FORMAT`
+      re-checked, `cargo package --locked` verified, and a live run against a real provider kept as
+      evidence.
     why_required: >
-      The suite proves the mechanism against a scripted provider; only a live session proves an
-      operator can hold a conversation with the crate. The three-OS leg is where a store- and channel-
-      bound feature historically disagrees.
-    status: done
+      The contract's non-functional and operational criteria are only true once observed. The live run
+      is the only thing that proves a real model will reach for a todo tool and ask a question when it
+      should — the suite proves the mechanism, not the behaviour.
+    status: todo
     depends_on:
-      - US-IO-HARNESS-0.20.0-T01
-      - US-IO-HARNESS-0.20.0-T02
-      - US-IO-HARNESS-0.20.0-T03
-      - US-IO-HARNESS-0.20.0-T04
+      - US-IO-HARNESS-0.21.0-T10
     acceptance_criteria:
       - >
-        OP5 — a live session against a real provider is run by hand before the release is cut and its
-        output kept as evidence: streamed deltas timestamped ahead of the completion, a mid-turn steer
-        that changes the agent's next action, a branch, and a reopen across a process boundary. The
-        suite proves the mechanism; only a live run proves an operator can hold a conversation with it.
+        NF1 — no store format bump and no new dependency. `CHECKPOINT_FORMAT` stays 7, `todos` and
+        `pending_questions` are `CREATE TABLE IF NOT EXISTS`, the diff carries no `ALTER TABLE`, a
+        0.20.0 database opens, resumes and is queried against 0.21.0 unchanged, and the default
+        `cargo tree` line count is still the 407 lines inherited from `develop`.
       - >
-        NF4 — the full suite passes on macOS, Linux and Windows with the Windows leg's `timeout-minutes`
-        unchanged at 40. The session tests are store- and channel-bound, which is where the Windows leg
-        historically disagrees.
+        NF4 — the full suite passes on macOS, Linux and Windows with the Windows leg's
+        `timeout-minutes` unchanged at 40. The question tests are store- and process-boundary-bound,
+        which is where the Windows leg historically disagrees, and the template tests read a directory,
+        which is where its path handling does.
+      - >
+        NF5 — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+        `cargo clippy --all-targets --all-features -- -D warnings` and `cargo doc --all-features` all
+        pass with zero warnings.
+      - >
+        OP5 — a live run against a real provider is performed by hand before the release is cut and its
+        output kept as evidence: a plan written and read back from SQLite, a question asked and answered
+        by a `Responder` with the answer changing the next action, and two named agents spawned on two
+        different models with the model strings read from `provider_calls`. The suite proves the
+        mechanism; only a live run proves a model will use a todo tool and ask a question when it
+        should.
     files:
-      - examples/session_live.rs
-      - .ultraship/evidence/0.20.0/
-    evidence:
-      - >
-        OP5: examples/session_live.rs run against OpenRouter end to end — streamed 13 deltas ahead
-        of the step, the steer delivered and traced, a branch whose path is root -> branch with the
-        abandoned turn intact, and a reopen in a second connection that recalled the conversation's
-        first prompt. 28,461 tokens over four turns. evidence/0.20.0/live-run-session.txt.
-      - >
-        NF4: the three-OS suite is CI's on the PR; everything here ran on macOS.
+      - examples/agency_live.rs
+      - evidence/0.21.0
+    evidence: []

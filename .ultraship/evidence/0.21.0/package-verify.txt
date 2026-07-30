@@ -1,0 +1,23 @@
+   Packaging io-harness v0.21.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+    Updating crates.io index
+    Packaged 153 files, 2.7MiB (768.6KiB compressed)
+   Verifying io-harness v0.21.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness)
+   Compiling tokio v1.53.1
+   Compiling serde v1.0.229
+   Compiling getrandom v0.4.3
+   Compiling serde_json v1.0.151
+   Compiling chrono v0.4.45
+   Compiling tempfile v3.27.0
+   Compiling hyper v1.11.0
+   Compiling tokio-rustls v0.26.4
+   Compiling tower v0.5.3
+   Compiling tokio-util v0.7.19
+   Compiling tokio-stream v0.1.19
+   Compiling process-wrap v9.1.0
+   Compiling tower-http v0.6.11
+   Compiling hyper-util v0.1.20
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.13.4
+   Compiling rmcp v3.0.0
+   Compiling io-harness v0.21.0 (/Users/aakashpawar/Documents/Aakash/AI/Apps/live/initorigin/io-harness/target/package/io-harness-0.21.0)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 15.22s

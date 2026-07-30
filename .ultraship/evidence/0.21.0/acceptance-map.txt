@@ -1,0 +1,90 @@
+io-harness 0.21.0 — every acceptance criterion, and the test that proves it
+All named tests are in the `cargo test` and `cargo test --all-features` runs that
+both exited 0 (tests-default.txt, tests-features.txt).
+
+F1  a plan is durable and readable mid-run
+    tests/todo.rs::a_plan_is_readable_from_a_second_connection_while_the_run_is_still_going
+    tests/todo.rs::a_second_write_replaces_the_whole_list_rather_than_merging_it
+    tests/todo.rs::a_plan_outlives_the_store_that_wrote_it
+    tests/todo.rs::a_plan_reads_back_in_the_order_the_agent_wrote_it
+    also live: live-run-agency.txt read the plan from a second connection mid-run
+
+F2  a plan is inert (no policy_events row; the workspace write is the control)
+    tests/todo.rs::a_plan_is_inert
+    tests/todo.rs::an_empty_plan_clears_the_list_and_is_not_an_error
+    tests/todo.rs::a_malformed_plan_is_an_observation_rather_than_the_end_of_the_run
+
+F3  a question is answered in-process and changes what the agent does
+    tests/question.rs::a_responder_answers_and_the_answer_changes_what_the_agent_does
+    also live: the responder answered "beta.txt" and beta.txt is the file that changed
+
+F4  a question with no answerer pauses the run and survives the process
+    tests/question.rs::an_unanswerable_question_pauses_the_run_and_survives_the_process
+
+F5  an answer is text, never authorization (with the permissive negative control)
+    tests/question.rs::an_answer_is_not_authorization
+    tests/question.rs::an_answer_to_another_runs_question_is_refused
+
+F6  a child's question pauses the tree
+    tests/question.rs::a_childs_question_pauses_the_whole_tree_and_the_tree_resumes_on_the_answer
+
+F7  a named agent gets its model on the wire, read from provider_calls
+    tests/agents.rs::two_named_agents_put_their_own_two_models_on_the_wire
+    tests/agents.rs::a_spawn_with_no_agent_named_uses_the_providers_configured_model (control)
+    also live: provider_calls carried openai/gpt-4o-mini and openai/gpt-4o for the
+    two definitions while the root ran on openai/gpt-5.6-luna
+
+F8  a named agent gets its role and can only narrow the boundary
+    tests/agents.rs::a_named_agents_role_is_prepended_to_its_system_prompt
+    tests/agents.rs::a_definition_that_denies_writes_produces_a_child_that_cannot_write
+    tests/agents.rs::a_definition_silent_about_a_denied_path_does_not_restore_it
+    tests/agents.rs::an_unknown_agent_name_yields_an_error_observation_and_no_child
+    tests/agents.rs::the_trace_records_which_definition_a_child_was_spawned_from
+
+F9  [[agent]] reaches a run from configuration
+    tests/config.rs::agent_tables_project_onto_the_same_roster_the_programmatic_api_builds
+    tests/config.rs::agent_tables_accumulate_across_scopes_rather_than_being_replaced
+    tests/config.rs::f5_an_unknown_key_fails_the_load_naming_the_key_and_the_file
+
+F10 a template renders and nothing else
+    tests/template.rs — twelve tests, including
+    a_placeholder_with_no_argument_is_an_error_not_an_empty_string,
+    a_substituted_value_is_never_re_substituted,
+    a_rendered_prompt_drives_a_real_run_unchanged, a_template_is_plain_data
+
+F11 repetition is caught even when the workspace moves
+    tests/stall.rs::the_same_spawn_repeated_is_caught_even_though_every_step_counts_as_progress
+    tests/stall.rs::three_different_spawns_that_each_do_work_are_never_flagged (control)
+    tests/stall.rs::a_window_of_zero_restores_the_old_step_cap_behaviour_exactly
+    the eleven pre-existing stall tests still pass unamended in behaviour
+
+F12 a refused git built-in costs a step, not the run
+    tests/git.rs::a_git_builtin_refused_by_the_exec_policy_is_an_observation_and_the_run_goes_on
+    tests/git.rs::a_path_that_would_be_read_as_an_option_is_refused_without_ending_the_run
+    tests/git.rs::the_same_call_under_a_policy_that_allows_git_actually_runs_it (control)
+
+NF1 no store format bump, no new dependency — scope-check.txt: CHECKPOINT_FORMAT
+    is 7, `todos` and `pending_questions` are CREATE TABLE IF NOT EXISTS, the diff
+    adds no ALTER TABLE (the seven in src/state.rs predate 0.2.0), `cargo tree` is
+    407 lines, and the only Cargo.toml change is the version line
+NF2 exactly three breaks — scope-check.txt: docs/public-api.txt loses no item (its
+    four deletions are re-sorted re-additions), no existing public signature
+    changed (the Responder arrives through `TaskContract::with_responder`, not as a
+    parameter), and CHANGELOG.md carries a migration snippet for each of
+    EventKind, RunOutcome and CompletionRequest
+NF3 an unchanged run is unchanged — tests/parity.rs, tests/determinism.rs,
+    tests/replay.rs, tests/observe.rs all pass; StallPolicy's new `repeat` field is
+    #[serde(default)], proven by tests/stall.rs::a_window_of_zero_...
+NF4 the three-OS suite — the pull-request CI run; not reproducible on one machine
+NF5 fmt, both clippy invocations, cargo doc — build-and-lint.txt, all exit 0
+NF6 a paused question leaves no `running` status and resolves once
+    tests/question.rs::answering_the_same_question_twice_is_an_error
+    tests/question.rs::an_unanswerable_question_pauses_the_run_and_survives_the_process
+
+OP1 tests/public_api.rs and the docs-example test pass in the suite
+OP2 tests/guide_pages.rs passes with docs/guide/agency.md listed (25K page)
+OP3 docs/CONTRACT.md carries the four new guarantees and the refused-git-built-in
+    defect paragraph is removed — scope-check.txt
+OP4 CHANGELOG.md [0.21.0], 155 lines, Breaking changes / Added / Changed / Fixed /
+    Security, three migration snippets; tests/changelog.rs passes
+OP5 live-run-agency.txt — exit 0, "All live claims held"

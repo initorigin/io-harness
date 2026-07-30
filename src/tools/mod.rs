@@ -129,6 +129,56 @@ pub const BARCODE_DECODE_TOOL: &str = "barcode_decode";
 /// to the run and step that wrote it, and readable and clearable by the embedding
 /// program through [`Store`](crate::state::Store).
 pub const REMEMBER_TOOL: &str = "remember";
+/// The name the model uses to write down its plan (0.21.0).
+///
+/// Narrow for the same reason [`REMEMBER_TOOL`] is: it writes into the harness's own
+/// store, not into the workspace, the network, or a binary, so it is not an
+/// [`Act`](crate::Act) and it is not gated. The whole list is replaced on every call,
+/// which is why there is no item id and no partial-update semantics for a model to
+/// get wrong.
+///
+/// What it is for is a long run that can be recognised as going the wrong way before
+/// it ends. What it is explicitly *not* is a commitment: nothing verifies a plan and
+/// no outcome depends on one. See the plan section of `docs/CONTRACT.md`.
+///
+/// ```
+/// use io_harness::{Toolbox, Tool, TODO_WRITE_TOOL};
+///
+/// assert_eq!(TODO_WRITE_TOOL, "todo_write");
+///
+/// // Reserved, so a caller's own tool cannot shadow the built-in and silently
+/// // replace the operator's view of the plan.
+/// # #[derive(Debug)]
+/// # struct Mine;
+/// # impl Tool for Mine {
+/// #     fn spec(&self) -> io_harness::provider::ToolSpec {
+/// #         io_harness::provider::ToolSpec {
+/// #             name: TODO_WRITE_TOOL.to_string(),
+/// #             description: "mine".into(),
+/// #             parameters: serde_json::json!({"type": "object"}),
+/// #         }
+/// #     }
+/// #     fn invoke(&self, _args: &serde_json::Value) -> io_harness::ToolFuture {
+/// #         Box::pin(async { Ok(String::new()) })
+/// #     }
+/// # }
+/// assert!(Toolbox::new().with(Mine).validate().is_err());
+/// ```
+pub const TODO_WRITE_TOOL: &str = "todo_write";
+/// The name the model uses to ask the operator what they actually wanted (0.21.0).
+///
+/// The distinction this tool exists to draw: the approval path
+/// ([`Approver`](crate::Approver)) asks whether an action is *permitted*; this asks
+/// what the operator *meant*. An answer is text the model reads, delivered as an
+/// observation, and it authorizes nothing — every tool call that follows it is checked
+/// against the same [`Policy`](crate::Policy) by the same code.
+///
+/// ```
+/// use io_harness::ASK_QUESTION_TOOL;
+///
+/// assert_eq!(ASK_QUESTION_TOOL, "ask_question");
+/// ```
+pub const ASK_QUESTION_TOOL: &str = "ask_question";
 /// Keep a tool result within `cap` chars, reporting whether it was cut.
 ///
 /// A tool that returns a megabyte would otherwise spend the rest of the run's
