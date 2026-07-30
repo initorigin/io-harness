@@ -53,9 +53,10 @@ figure. None of this is fixed as of 0.18.0; all of it is deliberate.
   cannot: it releases on its own schedule and vendors change prices on theirs.
 - **An unpriced call is counted, not costed at zero.** A group with
   `unpriced_calls` above zero is reporting a floor.
-- **`server_tool_requests` is zero everywhere** until 0.22.0 declares
-  provider-executed tools. The meter exists before the spending, so that adding
-  them is not a second break of `Usage`.
+- **`server_tool_requests` was zero on every row written before 0.22.0**, because
+  nothing declared a tool for a provider to execute. Provider-executed web search
+  is the first thing that moves it, and it is charged per request rather than per
+  token — see [A search is charged per request](#a-search-is-charged-per-request).
 - **A run older than 0.18.0 has no rows**, and the queries say nothing rather
   than zero. Nothing is backfilled because nothing was recorded.
 - **Line counts are a size, not a patch** — see [Edits](#edits).
@@ -69,7 +70,7 @@ figure. None of this is fixed as of 0.18.0; all of it is deliberate.
 | `total_tokens` | Taken as reported, never re-derived from the parts. A vendor whose total disagrees with its own breakdown is billing on the total. |
 | `cache_read_tokens`, `cache_write_tokens` | A *breakdown* of `prompt_tokens`, not an addition to it. Anthropic reports these beside a prompt count that excludes them; the crate reconciles that at the wire boundary so a reader does not have to know which vendor wrote the row. |
 | `reasoning_tokens` | A breakdown of `completion_tokens`, where the provider reports one. Anthropic bills extended thinking inside its output count and reports no separate figure, so it stays zero there rather than being guessed at. |
-| `server_tool_requests` | Provider-executed tool requests, billed per request rather than per token. Zero everywhere until the crate declares such tools (0.22.0); the counter exists first so adding them is not a second break of `Usage`. |
+| `server_tool_requests` | Provider-executed tool requests — a search or fetch the vendor ran on its own side — billed per request rather than per token. Zero on every row written before 0.22.0, because nothing declared such a tool; a run that declares web access is the first that reports one. The counter shipped in 0.18.0 so that using it later was not a second break of `Usage`. |
 | `latency_ms` | **The harness's own wall clock**, bracketing `Provider::complete`. It includes this crate's request building and stream consumption, not only the provider's part. |
 | `ttft_ms` | Milliseconds to the first content-bearing chunk, measured from before the socket opens. `None` — never zero — where nothing measured it: an unmeasured wait and an instant one are different facts. |
 | `finish_reason` | The vendor's own word, verbatim and un-normalised, because the vendor's documentation is what explains it. |
@@ -127,6 +128,36 @@ by omission.
 The as-of date is required at construction for the same reason: a price list with
 no date is a claim with no expiry, and yours *will* go stale.
 
+## A search is charged per request
+
+`Price::per_server_tool_request` is the one line in the table that is **not** per
+million: it is micro-units for **one** provider-executed request, because that is
+how a vendor bills a search it ran on its own side. It has existed since 0.18.0
+and had nothing to charge until 0.22.0, when a run that declares web access
+started reporting `Usage::server_tool_requests` above zero.
+
+```rust
+use io_harness::pricing::{Price, PriceTable};
+
+let prices = PriceTable::new("2026-07-30")
+    .with("some-vendor/some-model", Price {
+        input: 3_000_000,
+        output: 15_000_000,
+        // $0.01 per search — per request, not per million requests.
+        per_server_tool_request: 10_000,
+        ..Price::ZERO
+    });
+```
+
+The charge follows the counter, not the citation and not the
+`server_tool_calls` row: a run whose responses reported two requests draws the
+per-request price twice on top of whatever its tokens cost, and a run that
+reported none is charged for its tokens alone even if it declared web access and
+came back with sources. A search that failed still counted as a request if the
+vendor said so — a vendor that bills for a broken search is billing for it in the
+counter, and the trace records what the vendor reported rather than what it ought
+to have charged.
+
 ## Grouped rows, and where the crate stops
 
 Three groupings, each returning the raw sums with the derived cost beside them:
@@ -178,6 +209,8 @@ against 0.18.0, and a 0.17.0 binary still opens a database this release wrote.
 
 ## See also
 
+- [Web search and fetch](web.md) — what a provider-executed request is, and where
+  the per-request charge above comes from
 - [Observability and replay](observability.md) — watching a run while it happens
 - [Durable runs](durable-runs.md) — what survives a crash, and how a resume reads it
 - [Resilience](resilience.md) — retry and fallback, which are what make a step

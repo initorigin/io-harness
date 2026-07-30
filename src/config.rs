@@ -11,7 +11,7 @@
 //!
 //! **The typed API is the authority.** Every key here lands in a type this crate
 //! already had — [`Policy`], [`SandboxConfig`], [`Toolchain`], [`PriceTable`],
-//! [`McpServer`], [`TaskContract`] — and a file can express nothing the typed
+//! [`McpServer`], [`WebAccess`], [`TaskContract`] — and a file can express nothing the typed
 //! API cannot. Configuration is the ergonomic front end to that API, never a
 //! second path into the run loop.
 //!
@@ -112,6 +112,7 @@ use crate::resilience::{RetryPolicy, StallPolicy};
 use crate::sandbox::SandboxConfig;
 use crate::toolchain::Toolchain;
 use crate::tools::git::Identity;
+use crate::web::WebAccess;
 use crate::TaskContract;
 
 /// The project-scope file name: committed, and inherited by everyone on the team.
@@ -179,6 +180,14 @@ struct File {
     // being misspelled are the ones that narrow a boundary.
     #[serde(default)]
     agent: Vec<crate::agent::AgentDef>,
+    // 0.22.0. There is no `WebSection` because there is nothing for one to do:
+    // `WebAccess` already carries `#[serde(default, deny_unknown_fields)]`, every
+    // field of it is already optional-by-default, and the merge below has already
+    // reconciled the scopes key by key before this deserializes. A section struct
+    // here would be a second spelling of the same five keys, which is exactly the
+    // drift this module's "the typed API is the authority" rule exists to prevent.
+    #[serde(default)]
+    web: Option<WebAccess>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -376,6 +385,7 @@ impl Config {
             && self.file.prices.is_none()
             && self.file.mcp.is_empty()
             && self.file.agent.is_empty()
+            && self.file.web.is_none()
     }
 
     // -----------------------------------------------------------------------
@@ -633,8 +643,8 @@ impl Config {
         self.file.run.as_ref().and_then(|r| r.templates.as_deref())
     }
 
-    /// `contract` with everything this configuration's `[run]` and `[[mcp]]`
-    /// sections set.
+    /// `contract` with everything this configuration's `[run]`, `[[mcp]]`,
+    /// `[[agent]]` and `[web]` sections set.
     ///
     /// A method on `Config` rather than a field on [`TaskContract`]: a new public
     /// field is a break, and this release carries none. What the file cannot set
@@ -643,7 +653,7 @@ impl Config {
     ///
     /// ```
     /// use std::time::Duration;
-    /// use io_harness::{Config, TaskContract, Verification};
+    /// use io_harness::{Config, TaskContract, Verification, WebAccess};
     ///
     /// let config = Config::from_toml(r#"
     ///     [run]
@@ -656,6 +666,11 @@ impl Config {
     ///
     ///     [run.stall]
     ///     window = 5
+    ///
+    ///     [web]
+    ///     search = true
+    ///     max_uses = 3
+    ///     allowed_domains = ["docs.rs"]
     /// "#).unwrap();
     ///
     /// let contract = config.apply_to(TaskContract::new(
@@ -671,6 +686,13 @@ impl Config {
     /// // A key the file left out keeps the type's own default.
     /// assert_eq!(contract.retry.max, Duration::from_secs(30));
     /// assert_eq!(contract.stall.window, 5);
+    /// // `[web]` is the same value the programmatic builder produces, which is
+    /// // what makes the file a projection of the typed API rather than a second
+    /// // way of describing web access.
+    /// assert_eq!(
+    ///     contract.web,
+    ///     Some(WebAccess::search().max_uses(3).allow("docs.rs")),
+    /// );
     /// ```
     #[must_use]
     pub fn apply_to(&self, contract: TaskContract) -> TaskContract {
@@ -683,6 +705,13 @@ impl Config {
         // else must still get its roster.
         if !self.file.agent.is_empty() {
             out = out.with_agents(self.agents());
+        }
+        // 0.22.0 — `[web]` is top-level too, and it is carried whenever the table
+        // is present rather than only when a switch is on: a file that writes
+        // `[web]` with `search = false` is stating a decision, and dropping it here
+        // would make the contract say "nothing was configured" instead.
+        if let Some(web) = &self.file.web {
+            out = out.with_web(web.clone());
         }
 
         let Some(run) = &self.file.run else {

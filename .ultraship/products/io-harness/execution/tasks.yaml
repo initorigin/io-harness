@@ -1,346 +1,348 @@
 product: io-harness
-version: 0.21.0
+version: 0.22.0
 tasks:
-  - id: US-IO-HARNESS-0.21.0-T01
+  - id: US-IO-HARNESS-0.22.0-T01
     summary: >
-      The `todo` tool end to end: `TodoItem` and its state, the `todos` table with
-      `Store::write_todos` / `Store::todos`, the `todo_write` tool spec and its dispatch arm,
-      `EventKind::TodoWrote`, and the new reserved name. The whole list is replaced on every write and
-      the write is not gated.
+      The vendor-neutral declaration and its two response types: `src/web.rs` with `WebAccess` and
+      `Citation`, `CompletionRequest::web`, `CompletionResponse::citations`, `TaskContract::with_web`,
+      and the re-exports. Everything off by default, so the types existing changes no run.
     why_required: >
-      Half the release's outcome is that an operator can watch the agent's plan. Without a durable
-      list written by the agent and readable from SQLite mid-run there is no plan to watch, and the
-      first thing io-cli and io-studio would each build for themselves is this table.
+      Every other task in this release either fills these types or reads them. Without one neutral
+      declaration the three providers would each grow their own configuration, which is the divergence
+      the release exists to prevent.
     status: done
     depends_on: []
     acceptance_criteria:
       - >
-        F1 — a plan is durable and readable mid-run. An agent's `todo_write` is in the `todos` table
-        keyed by its run id before the next step commits, `Store::todos` returns the items in order
-        with their states, and a second write replaces the list wholesale rather than merging. The plan
-        is readable from a fresh `Store` over the same file after the process that wrote it is gone.
+        F9 — an out-of-tree provider is unaffected. A `Provider` implementation written before
+        0.22.0 that ignores `request.web` compiles and runs unchanged, its responses carry no
+        citations, and the run completes — a provider that cannot search is honestly non-searching,
+        not an error.
       - >
-        F2 — a plan is inert. A run whose plan is never completed still reports the outcome its
-        verification and budgets dictate; no `RunOutcome` and no refusal anywhere depends on a todo
-        state; and a `todo_write` produces no `policy_events` row, because it is not gated. The
-        negative control is a write to the workspace in the same run, which does produce one.
+        NF2 — exactly three break sites, each marked, and no others. `CompletionRequest` gains `web:
+        Option<WebAccess>`; `CompletionResponse` gains both `citations: Vec<Citation>` and
+        `server_tools: Vec<ServerToolCall>`, because a call that failed inside an HTTP 200 cannot be
+        represented by the citations it did not produce; `EventKind` gains `ServerToolUsed`. Nothing
+        is removed or renamed, no existing signature changes, and every other item in
+        `docs/public-api.txt` keeps its meaning. Each break is fixed by `..Default::default()` or a
+        `_` arm, and the changelog carries a migration snippet for each.
     files:
-      - src/state.rs
-      - src/run.rs
-      - src/observe.rs
-      - src/tools/mod.rs
-      - src/tools/custom.rs
-      - src/lib.rs
-      - tests/todo.rs
-    evidence:
-      - >
-        tests/todo.rs — 7 tests. The mid-run read is asserted from a SECOND `Store` opened inside an `Observer` at step 1, not after the run; a write that landed at the end would leave it empty. Wholesale replace, empty-clears, order, malformed-is-an-observation, and inertness (no `policy_events` row, with a gated workspace write in the same run as the control).
-  - id: US-IO-HARNESS-0.21.0-T02
-    summary: >
-      Repetition detection in the existing stall machinery: `StallPolicy::repeat` with
-      `#[serde(default)]`, a consecutive-identical-signature counter in `Progress::step` that a
-      workspace write does not reset, and `replan_directive` extended to name the repeated call.
-      Escalation stays `Replan` then `Stalled`, with no new outcome variant.
-    why_required: >
-      The roadmap makes repetition detection part of this release, and the 0.20.0 live run showed why:
-      the current logic clears the whole window whenever a write lands, so the looping agent shape that
-      actually occurs in practice is invisible until the step cap. Without this the release ships an
-      agency story with the one signal that catches a confused agent still half blind.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F11 — repetition is caught even when the workspace moves. An agent making the same call three
-        times consecutively while a write lands on each step is replanned and then stalled, where the
-        same script on 0.20.0's logic runs to the step cap. The negative control is three *different*
-        calls each of which writes, which is progress and is left alone. Both asserted through the real
-        loop against a scripted provider, with the `context_events` rows checked.
-      - >
-        NF3 — a run that uses none of this behaves exactly as it did. A 0.20.0-shaped run with no todo
-        call, no question, no agents registry, no templates and `StallPolicy::default()` produces the
-        identical event sequence, the identical step count and the identical outcome, and its
-        `CompletionRequest`s carry `model: None`. `StallPolicy`'s new field defaults so an existing
-        `io.toml` and an existing struct literal both keep working.
-    files:
-      - src/resilience.rs
-      - src/run.rs
-      - tests/stall.rs
-    evidence:
-      - >
-        DEVIATION from this task's summary, and it is smaller than planned: `StallPolicy` gained NO
-        `repeat` field. Adding a public field to a struct with public fields breaks every struct
-        literal — `#[serde(default)]` covers deserialization only, and the type is built by literal
-        in its own doctests — so it would have been a FOURTH break. The threshold is the existing
-        `window`: "the same call three times in a row" and "three unproductive steps" are one
-        patience setting, and a second knob whose only correct value is the first knob's is a knob
-        nobody can set correctly. Behaviour for every `changed == false` case is identical, traced
-        step by step against the existing doctest; only the `changed == true` case is new.
-        NF3 therefore holds by construction rather than by a defaulted field.
-      - >
-        tests/stall.rs — F11 and its negative control, plus 9 total passing. The repeated-spawn case fails on 0.20.0's logic, where a child that ran reset the parent's window every step. Three DIFFERENT spawns that each do work are untouched. src/resilience.rs unit tests amended where they pinned the old directive wording.
-  - id: US-IO-HARNESS-0.21.0-T03
-    summary: >
-      The 0.20.0 live-run defect: a refused git built-in becomes an observation instead of
-      `Error::Refused` leaving the run loop. `Git::run`'s exec refusal and `check_path`'s leading-`-`
-      refusal are caught in the dispatch arm and returned as a refusal observation with its
-      `policy_events` row, and the defect paragraph leaves `docs/CONTRACT.md`.
-    why_required: >
-      The 0.20.0 record commits this fix to the next release that touches the tool layer, and this is
-      that release. A speculative `git status` under an exec-denying policy currently escalates a whole
-      run, which is the opposite of the crate's stated rule that a refusal is an observation the model
-      adapts to.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F12 — a refused git built-in costs a step, not the run. Under a policy denying `Act::Exec` for
-        `git`, a `git_status` call returns an observation naming the refusal, the run continues to its
-        next step, and a `policy_events` row attributes the refusal to the rule and layer. The same
-        holds for a path beginning with `-`. The negative control is the identical run under a policy
-        allowing `git`, where the command runs. This test would have failed on 0.20.0.
-    files:
-      - src/run.rs
-      - src/tools/git.rs
-      - tests/git.rs
-      - docs/CONTRACT.md
-    evidence:
-      - >
-        tests/git.rs — 12 passing, 3 added: the exec refusal, the argv guard, and the negative control that the same call under a policy allowing `git` still runs. F12 panics on 0.20.0, where the refusal left the loop as `Err`. docs/CONTRACT.md's defect paragraph removed.
-  - id: US-IO-HARNESS-0.21.0-T04
-    summary: >
-      The `question` tool and its in-process answering channel: `Question`, `Answer`, the `Responder`
-      trait with `ResponderNone`, `StdinResponder` and `FixedResponder`, the `ask_question` tool spec
-      and dispatch arm, `EventKind::QuestionAsked` / `QuestionAnswered`, and the answer delivered as an
-      observation that authorizes nothing.
-    why_required: >
-      The other half of the release's outcome is that the agent can ask about intent instead of
-      guessing. This is the channel; without it an ambiguous goal is still resolved by a guess that
-      costs a whole run, and the crate still has no way to ask a human anything except whether an
-      action is permitted.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.21.0-T01
-    acceptance_criteria:
-      - >
-        F3 — a question is answered in-process and changes what the agent does. A run under a
-        `Responder` that answers "the second file" acts on the second file; the same run, the same
-        provider script and a `Responder` answering "the first file" acts on the first. Both answers
-        reach the model as an observation, and both are recorded.
-      - >
-        F5 — an answer is text, never authorization. A run under a policy denying a write, asked what
-        to do and answered "write the secret file", still refuses the write, attributed to the same
-        rule and layer. The negative control is the same answer under a policy that allows it, where
-        the write happens.
-    files:
-      - src/approve.rs
-      - src/run.rs
-      - src/observe.rs
-      - src/tools/mod.rs
-      - src/tools/custom.rs
-      - src/lib.rs
-      - tests/question.rs
-    evidence:
-      - >
-        DEVIATION, also smaller than planned: the `Responder` is carried on the contract
-        (`TaskContract::with_responder`) rather than added as an argument to every run entry point.
-        The planned signature change would have broken `run`, `run_with`, `run_tree` and their
-        observed and resume variants — every existing call site — to add an argument almost all of
-        them would pass `None` for. `Toolbox` already establishes that caller-supplied behaviour
-        rides the contract. So this release ships TWO breaks, not the three NF2 anticipated:
-        `EventKind` (+3 variants) and `RunOutcome::AwaitingAnswer` are match breaks, and
-        `CompletionRequest::model` is a struct-literal break. NF2's inventory needs correcting at
-        the complete stage.
-      - >
-        tests/question.rs — 8 passing. `an_answer_is_not_authorization` carries the control proving the write was reachable, so the refusal is the policy's. Malformed question is an observation, not the end of the run.
-  - id: US-IO-HARNESS-0.21.0-T05
-    summary: >
-      The durable half of the question path: the `pending_questions` table with its put/read/resolve
-      triangle, `RunOutcome::AwaitingAnswer { question_id, steps }`, `resume_with_answer` and its
-      observed variant, and the tree variants so a child's question pauses the whole tree.
-    why_required: >
-      A question nobody can answer in-process must pause the run rather than fail it, or an unattended
-      agent that needs a human is a lost run. This is what makes a question survive a process exit for
-      the same reason a pending approval does, and it is the only path by which a spawned child can
-      reach a human.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.21.0-T04
-    acceptance_criteria:
-      - >
-        F4 — a question with no answerer pauses the run and survives the process. `ResponderNone`
-        yields `RunOutcome::AwaitingAnswer { question_id, steps }` with the question in
-        `pending_questions` and `runs.status` not left at `running`; a fresh `Store` in a second
-        connection reads the question, and `resume_with_answer` continues the same run from the same
-        step with the answer as an observation. Asserted across a dropped store, not within one.
-      - >
-        F6 — a child's question pauses the tree. A spawned agent asking a question with no responder
-        leaves the whole tree `AwaitingAnswer`, the parent uncommitted past that step, and
-        `resume_tree_with_answer` resumes to completion with the ledger not double-charged — the same
-        assertions the existing child-approval test makes, against the new path.
-      - >
-        NF6 — a paused question never leaves `runs.status` at `running`, and an answered one is
-        resolved exactly once. Answering an already-answered question is an error rather than a second
-        resume, the way `resolve_pending` already behaves for approvals.
-    files:
-      - src/state.rs
-      - src/run.rs
-      - tests/question.rs
-    evidence:
-      - >
-        tests/question.rs — the pause asserted across a DROPPED `Store` in a second connection, plus double-answer and wrong-run refusals, plus the child-question tree pause and resume.
-  - id: US-IO-HARNESS-0.21.0-T06
-    summary: >
-      `CompletionRequest::model`, the per-request override, honoured by `OpenRouter`, `Anthropic`,
-      `OpenAi` and `provider::Fallback` in preference to their own configured model, with every
-      in-crate struct-literal site updated and `CompletionResponse::model` still reporting what
-      actually served the call.
-    why_required: >
-      A named agent definition carrying a model means nothing without a way to put that model on the
-      wire: every provider fixes its model at construction and a tree shares one provider instance.
-      This is the mechanism, and it is the release's one hard break, so it lands as its own task with
-      its own migration note.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        NF2 — exactly three breaks, each marked, and no others. `CompletionRequest` gains
-        `model: Option<String>`; `RunOutcome` gains `AwaitingAnswer`; `EventKind` gains three variants.
-        Nothing is removed or renamed, no existing signature changes except the run entry points that
-        take a `Responder`, and every other item in `docs/public-api.txt` keeps its meaning. The
-        changelog carries a migration snippet for each.
-    files:
+      - src/web.rs
       - src/provider/mod.rs
-      - src/provider/openrouter.rs
-      - src/provider/anthropic.rs
-      - src/provider/openai.rs
-      - src/provider/openai_wire.rs
-      - src/provider/fallback.rs
-      - src/run.rs
-    evidence:
-      - >
-        docs/public-api.txt + 214 doctests. Every in-crate `CompletionRequest` literal already used `..Default::default()`, so the break reaches only external callers who enumerate fields.
-  - id: US-IO-HARNESS-0.21.0-T07
-    summary: >
-      Named agent definitions: `AgentDef` and the `Agents` registry, `TaskContract::with_agents`, the
-      optional `agent` argument on `spawn_agent`, and `spawn_child` applying the definition's role to
-      the child's system prompt, its model to the request, and its `deny_write`/`deny_net` through the
-      existing `Policy::contain`. An unknown name is an error observation, not a spawn.
-    why_required: >
-      Without this a sub-agent is identical to its parent apart from a goal string, so a role and a
-      cheaper or stronger model per agent are unexpressible — the largest cost lever the crate has.
-      The release's claim that an agent has an identity rests entirely here.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.21.0-T06
-    acceptance_criteria:
-      - >
-        F7 — a named agent gets its model on the wire. A tree spawning two definitions naming two
-        different models produces two `provider_calls` rows carrying those two model strings, read back
-        from the store rather than from the configuration that asked for them. The negative control is
-        a spawn with no `agent` argument, which carries the provider's own configured model.
-      - >
-        F8 — a named agent gets its role and can only narrow the boundary. The child's system prompt
-        contains its definition's role text; a definition setting `deny_write` produces a child that is
-        refused a write the parent is allowed, attributed to the child layer; and a definition whose
-        `deny_write`/`deny_net` are absent produces a child no wider than its parent — proven by a
-        parent policy denying a path and a definition that says nothing about it, where the child is
-        still refused. An unknown agent name yields an error observation and no child.
-    files:
-      - src/agent.rs
       - src/contract.rs
-      - src/run.rs
+      - src/lib.rs
+    evidence:
+      - >
+        src/web.rs — `WebAccess`, `Citation` and `ServerToolCall`, all `Default`-off, all
+        with worked examples. `CompletionRequest::web`, `CompletionResponse::citations` and
+        `CompletionResponse::server_tools`, `TaskContract::with_web`, and the three re-
+        exports in `src/lib.rs` with their lines in `docs/public-api.txt`.
+      - >
+        DEVIATION, recorded in US-IO-HARNESS-0.22.0-I01: `CompletionResponse` gained TWO
+        fields, not one. A call that failed inside an HTTP 200 cannot be represented by the
+        citations it did not produce, so `server_tools: Vec<ServerToolCall>` carries it.
+        Still three break sites; NF2 was amended to say four items across three sites.
+      - >
+        tests/web.rs::a_provider_that_ignores_the_declaration_still_runs — a 0.21.0-shaped
+        `Provider` that never mentions `web` compiles, runs and completes with no citations.
+        Passing.
+  - id: US-IO-HARNESS-0.22.0-T02
+    summary: >
+      The Anthropic translation and parse: `web_search_20250305` and `web_fetch_20250910` entries in
+      `tools` carrying `max_uses` and both domain lists, the `web-fetch-2025-09-10` beta header sent
+      only when fetch is asked for, citations read off text blocks, and
+      `web_search_tool_result_error` recognised as a failure with its error code.
+    why_required: >
+      Anthropic is the provider whose server-tool shape is richest and whose failure-inside-a-200
+      object is the one the roadmap names. If this parse is naive the release ships the quiet failure
+      it was written to avoid.
+    status: done
+    depends_on: [US-IO-HARNESS-0.22.0-T01]
+    acceptance_criteria:
+      - >
+        F1 — a declaration reaches each vendor in that vendor's own shape, and a declaration a
+        vendor cannot carry is refused rather than trimmed. A `WebAccess` with search, fetch,
+        `max_uses` and both domain lists produces an Anthropic body carrying a `web_search_20250305`
+        and a `web_fetch_20250910` tool entry with those fields; a search-only declaration with an
+        allow-list produces an OpenAI body carrying `web_search_options` with that filter; a
+        search-only declaration with a cap produces an OpenRouter body carrying the `web` plugin
+        with its `max_results`. Asked for what it does not have — fetch on either OpenAI-wire
+        vendor, a block-list on OpenAI, any domain list on OpenRouter — the provider returns an
+        `Error::Config` naming itself and what it cannot do, before a request is sent. Asserted
+        against the built bodies and the refusals, not a live call. The negative control is `web:
+        None`, which produces bodies byte-identical to 0.21.0's for all three.
+      - >
+        F2 — the Anthropic fetch beta header is sent when fetch is asked for and not otherwise. A
+        request with `fetch: true` carries `anthropic-beta: web-fetch-2025-09-10`; a search-only
+        request carries no beta header at all.
+      - >
+        F4 — a failed search is a failure, not an empty result. A 200 response carrying a
+        `web_search_tool_result_error` with `error_code: max_uses_exceeded` produces a
+        `server_tool_calls` row marked failed with that code, an observation to the model naming the
+        failure, and an `EventKind::ServerToolUsed { ok: false }`. The negative control is a
+        successful search with zero results, which is recorded as a successful call — the two are
+        different facts and the trace tells them apart. This test fails on 0.21.0's parser, which
+        has no concept of either.
+    files:
+      - src/provider/anthropic.rs
+      - src/web.rs
+    evidence:
+      - >
+        src/provider/anthropic.rs — `web_tools` building `web_search_20250305` /
+        `web_fetch_20250910` entries from one declaration, the `web-fetch-2025-09-10` beta
+        header sent only when fetch is asked for, and the `Accumulator` extended with
+        `server_tool_use`, `*_tool_result`, `citations_delta` and `citations` handling.
+      - >
+        6 unit tests in `provider::anthropic::web_wire`, all passing: the dated tool entries
+        with their fields; a block-list alone; the 0.21.0 body when nothing is declared; the
+        beta header on and off, asserted by capturing the real request head over a local
+        socket; citations from both a result block and a delta, deduplicated by url and
+        enriched by the later mention; and the failure inside a 200 with its negative
+        control — a search that succeeded and found nothing.
+  - id: US-IO-HARNESS-0.22.0-T03
+    summary: >
+      The two OpenAI-wire translations and their parse: `web_search_options` with its domain filter on
+      the OpenAI body, a `web` `plugins` entry with `max_results` on the OpenRouter body, and
+      `annotations` with `url_citation` read into `CompletionResponse::citations` — with the shared
+      `openai_wire::body` staying shared while the two web keys stay apart.
+    why_required: >
+      The release promises the declaration works across all three providers. Two of them share a body
+      builder and differ in exactly this key, so the split has to be made deliberately rather than by
+      copying the builder.
+    status: done
+    depends_on: [US-IO-HARNESS-0.22.0-T01]
+    acceptance_criteria:
+      - >
+        F1 — a declaration reaches each vendor in that vendor's own shape, and a declaration a
+        vendor cannot carry is refused rather than trimmed. A `WebAccess` with search, fetch,
+        `max_uses` and both domain lists produces an Anthropic body carrying a `web_search_20250305`
+        and a `web_fetch_20250910` tool entry with those fields; a search-only declaration with an
+        allow-list produces an OpenAI body carrying `web_search_options` with that filter; a
+        search-only declaration with a cap produces an OpenRouter body carrying the `web` plugin
+        with its `max_results`. Asked for what it does not have — fetch on either OpenAI-wire
+        vendor, a block-list on OpenAI, any domain list on OpenRouter — the provider returns an
+        `Error::Config` naming itself and what it cannot do, before a request is sent. Asserted
+        against the built bodies and the refusals, not a live call. The negative control is `web:
+        None`, which produces bodies byte-identical to 0.21.0's for all three.
+      - >
+        NF3 — a run that uses none of this behaves exactly as it did. A 0.21.0-shaped run with `web:
+        None` produces the identical event sequence, the identical step count, the identical outcome
+        and — for all three providers — a byte-identical request body, proven by comparing the built
+        body against the literal 0.21.0 shape rather than against itself.
+    files:
+      - src/provider/openai_wire.rs
+      - src/provider/openai.rs
+      - src/provider/openrouter.rs
+    evidence:
+      - >
+        src/provider/openai_wire.rs — `WebFlavor`, `web_key` adding `web_search_options` for
+        OpenAI and a `web` `plugins` entry for OpenRouter to the shared body,
+        `ensure_web_supported` refusing what a vendor cannot carry, and `annotations` /
+        `url_citation` parsing plus the mid-stream `error` object.
+      - >
+        DEVIATION, recorded in US-IO-HARNESS-0.22.0-I01: the three vendors do not accept the
+        same declaration. OpenAI has no fetch tool and an allow-list-only filter; OpenRouter
+        has neither fetch nor any domain filter. Unsupported combinations are refused with
+        `Error::Config` before a request is sent rather than trimmed to fit, and F1 was
+        amended to assert each vendor's supported subset plus the refusals.
+      - >
+        6 unit tests in `provider::openai_wire::web_wire`, all passing, including
+        `no_declaration_adds_no_key_to_either_body`, which asserts the built body's key set
+        is exactly the five keys 0.21.0 sent.
+  - id: US-IO-HARNESS-0.22.0-T04
+    summary: >
+      The trace and the loop: the `citations` and `server_tool_calls` tables with their writers and
+      readers, `EventKind::ServerToolUsed`, the failure observation handed to the model, and
+      `pause_turn` treated as a continuation rather than an ending.
+    why_required: >
+      An answer whose sources are not recorded is the same answer a scraper would have produced, and a
+      paused turn that ends the run is a defect the release would ship on its first long search. This
+      is the task that makes the feature auditable and the loop correct.
+    status: done
+    depends_on: [US-IO-HARNESS-0.22.0-T02, US-IO-HARNESS-0.22.0-T03]
+    acceptance_criteria:
+      - >
+        F3 — citations survive to SQLite. A scripted response carrying each vendor's citation shape
+        produces `CompletionResponse::citations` with the url, title and cited text, rows in the
+        `citations` table keyed by run and step, and the same rows readable from a fresh `Store`
+        over the same file after the writing process is gone. The negative control is an answer with
+        no citations, which produces no rows rather than one empty row.
+      - >
+        F5 — a paused turn continues. A response with `stop_reason: "pause_turn"` and partial text
+        does not end the run: the text becomes an observation, the step's usage is drawn from the
+        ledger once, and the loop takes another step. The negative control is `end_turn`, which ends
+        the run as it does today. Asserted through the real loop against a scripted provider.
+      - >
+        F10 — the observer sees it. A run that searches emits `ServerToolUsed` with the provider
+        name, the tool and `ok: true` in the same place `Refused` is emitted, and a failing search
+        emits the same variant with `ok: false`. A consumer that matches `_` is unaffected, which is
+        what the changelog's migration snippet says.
+      - >
+        F13 — a spawned child inherits the root's declaration and cannot ask for its own. A tree
+        whose root declared web access spawns a child whose every request carries that same
+        declaration, read from the requests the provider actually received; a spawn call whose
+        arguments ask for web access, or for a wider domain list, changes nothing — the spawn tool
+        never reads one, exactly as it never reads a toolbox, a skills directory or an agent roster
+        from the model.
+      - >
+        NF1 — no store format bump and no new dependency. `CHECKPOINT_FORMAT` stays 7, `citations`
+        and `server_tool_calls` are `CREATE TABLE IF NOT EXISTS`, the diff carries no `ALTER TABLE`,
+        a 0.21.0 database opens, resumes and is queried against 0.22.0 unchanged, and the default
+        `cargo tree` line count is still the 407 lines inherited from `develop`.
+    files:
       - src/state.rs
-      - src/lib.rs
-      - tests/agents.rs
+      - src/run.rs
+      - src/observe.rs
+      - tests/web.rs
     evidence:
       - >
-        tests/agents.rs — 7 passing. Models read back from the `provider_calls` rows rather than from the roster; the mock echoes the model it was sent. The silent-definition test proves a definition cannot restore a parent's deny.
-  - id: US-IO-HARNESS-0.21.0-T08
+        src/state.rs — `citations` and `server_tool_calls` as `CREATE TABLE IF NOT EXISTS`
+        with their indexes, `Store::record_citations` / `citations` /
+        `record_server_tool_calls` / `server_tool_calls`. `CHECKPOINT_FORMAT` untouched at
+        7.
+      - >
+        src/run.rs — `record_web_activity` writing both tables and emitting
+        `EventKind::ServerToolUsed` beside the existing `provider_calls` row; `paused_turn`
+        making a `pause_turn` stop reason a continuation rather than an ending;
+        `web_failure_note` handing a failed provider call to the model as an observation in
+        both the flat and the tree loop; the root declaration carried on `Tree` and copied
+        onto every spawned child by `spawn_child`.
+      - >
+        tests/web.rs — 10 tests, all passing: citations readable from a fresh `Store` after
+        the writing process is gone, with a no-citation negative control; the failed search
+        recorded, evented with `ok: false` and reaching the next step's prompt; the found-
+        nothing control recorded as a success with nothing told to the model; the paused
+        turn continuing to step 2 with both turns charged, and an `end_turn` control ending
+        at step 1; and a spawned child inheriting the root's declaration while a spawn
+        argument asking for `evil.test` is ignored.
+      - >
+        `cargo tree` is 407 lines, unchanged.
+  - id: US-IO-HARNESS-0.22.0-T05
     summary: >
-      Prompt templates: `Template`, `Templates::discover` and `Templates::render` reusing the `skills`
-      module's directory discovery, frontmatter parser, duplicate-name and count caps and description
-      clamp. `{{placeholder}}` substitution with `$ARGUMENTS` for the remainder; a missing argument is
-      an error, never an empty string. Rendering returns a `String` and touches no run-loop path.
+      One declaration, two boundaries: `WebAccess::from_policy` projecting `Act::Net` allow- and
+      deny-rules onto the vendor domain filter with an allow-everything rule projecting to no filter,
+      and `[web]` in `io.toml` layering onto `WebAccess` through the existing config machinery.
     why_required: >
-      The roadmap's fourth agency primitive is an operator's repeatable way to start a turn. It is also
-      the release's cheapest included item — a pure function over text — and leaving it out would put
-      a template parser into io-cli and io-studio separately, which is the divergence 0.19.0 exists to
-      prevent.
+      Without the projection an operator states the same boundary twice and the two drift; without
+      `[web]` the feature is unreachable from configuration and io-cli and io-studio each write their
+      own. The inverting case is the release's worst silent failure and is decided here.
     status: done
-    depends_on: []
+    depends_on: [US-IO-HARNESS-0.22.0-T01]
     acceptance_criteria:
       - >
-        F10 — a template renders and nothing else. `Templates::discover` over a fixture directory finds
-        the templates with their descriptions, `render` substitutes every `{{placeholder}}` and routes
-        the remainder to `$ARGUMENTS`, an unknown template name is an error, and a placeholder with no
-        argument is an error rather than an empty string — the rule 0.19.0 set for `${env:}`, applied
-        here. The rendered string drives a real run through `TaskContract::workspace` unchanged.
-    files:
-      - src/template.rs
-      - src/lib.rs
-      - tests/template.rs
-      - tests/fixtures
-    evidence:
+        F6 — the policy projects onto the vendor filter. A policy allowing `docs.rs:443` and
+        `crates.io:443` and denying `*.example.com` yields a `WebAccess::from_policy` whose
+        `allowed_domains` are the two hosts without their ports and whose `blocked_domains` carry
+        the denied pattern. A policy allowing `*` yields no allow-list rather than an empty one —
+        the inversion that would silently allow nothing — and a rule the filter cannot express is an
+        `Error::Config` naming the rule.
       - >
-        tests/template.rs — 12 tests + 13 doctests. `split_front_matter`/`first_prose_line`/`clamp` lifted to `pub(crate)` in `skills` and shared rather than duplicated.
-  - id: US-IO-HARNESS-0.21.0-T09
-    summary: >
-      Configuration reach: `[[agent]]` tables projecting onto an `Agents` registry with per-file
-      unknown-key rejection and cross-scope accumulation the way `policy.layers` accumulates, and
-      `[run] templates` pointing at a template directory.
-    why_required: >
-      The roadmap says a definition comes "from configuration rather than from a hand-built contract".
-      A programmatic registry alone leaves the operator-facing half of the promise unbuilt, and io-cli
-      and io-studio consume `io.toml` rather than construct Rust values.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.21.0-T07
-      - US-IO-HARNESS-0.21.0-T08
-    acceptance_criteria:
-      - >
-        F9 — `[[agent]]` reaches a run from configuration. An `io.toml` carrying two `[[agent]]` tables
-        projects onto an `Agents` registry equal to the programmatic one, an unknown key inside an
-        `[[agent]]` table is an error naming the key and the file, and the `[[agent]]` array
-        accumulates across scopes the way `policy.layers` does rather than being replaced by the
-        narrower scope.
+        F7 — `[web]` reaches a run from configuration. An `io.toml` carrying `[web]` with search,
+        fetch, `max_uses` and both domain lists projects onto a `WebAccess` equal to the
+        programmatic one, an unknown key inside `[web]` is an error naming the key and the file, and
+        a local scope turning `search` off overrides a project scope that turned it on — the
+        existing layering, asserted for the new table rather than assumed.
     files:
+      - src/web.rs
       - src/config.rs
       - tests/config.rs
     evidence:
       - >
-        tests/config.rs — 20 passing, 6 added, and both new keys in the EVERY_KEY fixture. Roster equality against the programmatic value; unknown key inside `[[agent]]` rejected naming key and file.
-  - id: US-IO-HARNESS-0.21.0-T10
+        src/web.rs — `WebAccess::from_policy` projecting `Act::Net` rules onto the vendor
+        filter, with the inverting case handled explicitly: an allow-everything rule yields
+        NO allow-list rather than an empty one. An `Ask` rule and a pattern carrying a
+        scheme or a path are `Error::Config` naming the rule, because neither can be
+        honoured by a filter the provider enforces.
+      - >
+        src/config.rs — `[web]` as a top-level table merged key by key through the existing
+        scope layering, with unknown keys rejected by the type's own `deny_unknown_fields`
+        and reported by the existing per-scope validation that names the file. No new public
+        item, so `docs/public-api.txt` is unchanged.
+      - >
+        3 unit tests in `web::tests` and 3 in tests/config.rs, all passing, including a
+        local scope switching `search` off over a project scope that turned it on, asserting
+        the project's `max_uses` and domain list survive the override.
+  - id: US-IO-HARNESS-0.22.0-T06
     summary: >
-      Documentation and the drift gates: `docs/guide/agency.md`, a worked example on every added public
-      item, `docs/public-api.txt` updated by hand, `CHANGELOG.md` with all three breaks and their
-      migration snippets, and `docs/CONTRACT.md` amended — including the removal of the
-      refused-git-built-in paragraph.
+      The meter moves: `server_tool_requests` reaching the ledger from a run, the per-request price
+      charged on top of tokens, and the accounting guide's "always zero" sentence removed.
     why_required: >
-      Four gate tests fail without it (`public_api`, `guide_pages`, `changelog`, `docs_drift`), and the
-      contract's operational criteria are documentation criteria. A break shipped without its migration
-      snippet is a break a consumer meets at compile time with no instructions.
+      0.18.0 built the counter, the column and the price against this release. If the money is not
+      charged and asserted, the release adds a per-request cost the operator cannot see, which is the
+      failure the accounting tables were built to prevent.
     status: done
-    depends_on:
-      - US-IO-HARNESS-0.21.0-T09
+    depends_on: [US-IO-HARNESS-0.22.0-T04]
     acceptance_criteria:
       - >
-        OP1 — `docs/public-api.txt` is updated by hand, `tests/public_api.rs` passes against the live
-        surface, and every added public item carries a fenced worked example, enforced by the existing
-        docs test.
+        F8 — the meter moves where the vendor reports one, and the money is charged. A run whose
+        responses report two `server_tool_requests` is priced at the per-request charge twice on top
+        of its tokens, the `provider_calls` rows carry the count, and `Store` reads it back. The
+        negative control is the identical run reporting zero, which is charged for tokens alone.
+        This is the first non-zero `server_tool_requests` in the crate's history and the test says
+        so. The counter is the vendor's: Anthropic reports it and the crate reads it; the OpenAI
+        wire reports no such member today, so a run that demonstrably searched there records a zero
+        rather than a count this crate derived for itself. The `server_tool_calls` row is the
+        vendor-independent record that the call happened.
       - >
-        OP2 — `docs/guide/agency.md` exists, is listed in `tests/guide_pages.rs` with its limits block,
+        NF6 — no key, no host and no query is logged that was not already. Citations hold URLs the
+        model was given and the run recorded; the API key never enters a `server_tool_calls` row;
+        and a query is stored only where the vendor discloses it in the response, never
+        reconstructed from the prompt.
+    files:
+      - src/pricing.rs
+      - src/run.rs
+      - docs/guide/accounting.md
+      - tests/accounting.rs
+    evidence:
+      - >
+        No code change was needed: `pricing.rs::cost_micros` has charged
+        `server_tool_requests * per_server_tool_request` since 0.18.0, and `run.rs` never
+        prices anything — money reaches a caller through `Store::spend_by_*(&PriceTable)`.
+        Verified by reading the path and then pinning it with tests rather than editing it.
+      - >
+        tests/accounting.rs — 3 tests, all passing: the same recorded trace priced twice,
+        once with a zero per-request price and once with 10_000, differing by exactly two
+        charges; the negative control charging the identical amount under both tables when
+        the counter is zero, which a flat per-run search charge would fail; and NF6, which
+        puts a credential-shaped string and a distinctive phrase in the goal and asserts
+        neither reaches any column of either web table, while the provider's own url does.
+      - >
+        DEVIATION, recorded in US-IO-HARNESS-0.22.0-I01: the counter is the vendor's.
+        Anthropic reports it; the OpenAI wire reports no such member, so a run that
+        demonstrably searched there records a zero rather than a count this crate derived.
+        F8 was amended to say so.
+  - id: US-IO-HARNESS-0.22.0-T07
+    summary: >
+      Documentation and the public surface: `docs/guide/web.md`, `docs/public-api.txt` by hand, the
+      `CHANGELOG.md` entry with all three migration snippets, the `docs/CONTRACT.md` amendments
+      including removing the 0.18.0 "always zero" sentence, and the README / CAPABILITIES / crate-root
+      links.
+    why_required: >
+      The release's central honesty — the domain filter is enforced by the vendor and not by this
+      process — lives in the contract and the guide. Shipping the code without it ships a false sense
+      of containment, which the contract names as the release's first risk.
+    status: done
+    depends_on: [US-IO-HARNESS-0.22.0-T04, US-IO-HARNESS-0.22.0-T05]
+    acceptance_criteria:
+      - >
+        OP1 — `docs/public-api.txt` is updated by hand, `tests/public_api.rs` passes against the
+        live surface, and every added public item carries a fenced worked example, enforced by the
+        existing docs test.
+      - >
+        OP2 — `docs/guide/web.md` exists, is listed in `tests/guide_pages.rs` with its limits block,
         and is linked from `README.md`, `docs/CAPABILITIES.md` and the crate root.
       - >
-        OP3 — `docs/CONTRACT.md` states, in its own voice: a plan is not gated and is never enforced;
-        an answer to a question is text and not authorization; a named definition can only narrow a
-        boundary and a model string is a request the vendor may substitute; a template renders text and
-        can set nothing; the stall window still does not survive a resume; and the refused-git-built-in
-        paragraph is **removed**, because it is fixed here.
+        OP3 — `docs/CONTRACT.md` states, in its own voice: a provider-executed fetch is dialled by
+        the provider, so `Act::Net` never sees it and the domain filter is enforced by the vendor,
+        not by this process; a citation is what the provider returned and is not verified by the
+        crate; a paused turn resumes as a fresh request and may repeat a search; and the 0.18.0
+        sentence saying `server_tool_requests` is always zero is **removed**, because this release
+        makes it non-zero.
       - >
-        OP4 — `CHANGELOG.md` carries all three breaks with migration snippets and the new capabilities
+        OP4 — `CHANGELOG.md` carries all three breaks with migration snippets and the new capability
         in the user-facing voice the changelog test enforces.
     files:
-      - docs/guide/agency.md
+      - docs/guide/web.md
       - docs/public-api.txt
       - docs/CONTRACT.md
       - docs/CAPABILITIES.md
@@ -350,43 +352,74 @@ tasks:
       - tests/guide_pages.rs
     evidence:
       - >
-        docs/public-api.txt at 137 items with a worked example each; docs/guide/agency.md registered and linked from README, CAPABILITIES and the crate root; CONTRACT.md amended and the git defect removed; CHANGELOG.md with all breaks and compiling migration snippets. public_api, guide_pages, readme, docs_drift, changelog all green.
-  - id: US-IO-HARNESS-0.21.0-T11
+        docs/guide/web.md — the declaration, the three vendors and what each refuses, the
+        policy projection and its inverting case, citations and what a citation is not, the
+        failure inside a 200, the paused turn and its repeat-cost, the price, `[web]`,
+        reading it back, and a limits block. Listed in tests/guide_pages.rs and linked from
+        README.md and docs/CAPABILITIES.md.
+      - >
+        docs/CONTRACT.md — the provider dials the URL so `Act::Net` never sees it and the
+        filter is the vendor's; a mismatched declaration is refused, not narrowed; a
+        citation is unverified; a paused turn may repeat a search; a child inherits the
+        root's declaration and cannot ask for its own. The 0.18.0 sentence saying
+        `server_tool_requests` is zero until 0.22.0 is gone, replaced by the truthful per-
+        vendor statement.
+      - >
+        CHANGELOG.md — the 0.22.0 entry with all three break sites and a migration snippet
+        each. README.md carries `io-harness = "0.22"`, the capability and the guide link;
+        `Cargo.toml` is at 0.22.0.
+      - >
+        One correction after the fact: the docs first described children as NOT inheriting
+        the declaration, which was true of the code at the time. The code was fixed to
+        inherit and both pages were corrected — the guide and CONTRACT now describe what T04
+        actually does.
+  - id: US-IO-HARNESS-0.22.0-T08
     summary: >
-      The release gate and the live proof: the full suite on the default and both feature sets, fmt,
-      both clippy passes, warning-free docs, the `cargo tree` line count and `CHECKPOINT_FORMAT`
-      re-checked, `cargo package --locked` verified, and a live run against a real provider kept as
-      evidence.
+      The gate and the live evidence: `cargo fmt --check`, both clippy legs, `cargo doc --all-features`,
+      the full suite on three platforms via CI, and a hand-run live example that asserts a citation, a
+      non-zero `server_tool_requests` and the per-request charge.
     why_required: >
-      The contract's non-functional and operational criteria are only true once observed. The live run
-      is the only thing that proves a real model will reach for a todo tool and ask a question when it
-      should — the suite proves the mechanism, not the behaviour.
-    status: todo
-    depends_on:
-      - US-IO-HARNESS-0.21.0-T10
+      The suite proves the translation this crate wrote; only a live call proves a vendor accepts the
+      body it builds. Every release since 0.9.0 has been gated this way and OP5 makes it a criterion.
+    status: done
+    depends_on: [US-IO-HARNESS-0.22.0-T07]
     acceptance_criteria:
       - >
-        NF1 — no store format bump and no new dependency. `CHECKPOINT_FORMAT` stays 7, `todos` and
-        `pending_questions` are `CREATE TABLE IF NOT EXISTS`, the diff carries no `ALTER TABLE`, a
-        0.20.0 database opens, resumes and is queried against 0.21.0 unchanged, and the default
-        `cargo tree` line count is still the 407 lines inherited from `develop`.
-      - >
         NF4 — the full suite passes on macOS, Linux and Windows with the Windows leg's
-        `timeout-minutes` unchanged at 40. The question tests are store- and process-boundary-bound,
-        which is where the Windows leg historically disagrees, and the template tests read a directory,
-        which is where its path handling does.
+        `timeout-minutes` unchanged at 40. Every new test is offline: bodies are asserted as JSON
+        and responses are scripted, so nothing in CI depends on a vendor being up, on a key
+        existing, or on what a search returns today.
       - >
-        NF5 — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
-        `cargo clippy --all-targets --all-features -- -D warnings` and `cargo doc --all-features` all
-        pass with zero warnings.
+        NF5 — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy
+        --all-targets --all-features -- -D warnings` and `cargo doc --all-features` all pass with
+        zero warnings.
       - >
-        OP5 — a live run against a real provider is performed by hand before the release is cut and its
-        output kept as evidence: a plan written and read back from SQLite, a question asked and answered
-        by a `Responder` with the answer changing the next action, and two named agents spawned on two
-        different models with the model strings read from `provider_calls`. The suite proves the
-        mechanism; only a live run proves a model will use a todo tool and ask a question when it
-        should.
+        OP5 — a live run against a real provider is performed by hand before the release is cut and
+        its output kept as evidence: a question answered from current information, at least one
+        citation read back from SQLite, and a `server_tool_calls` row for the call that produced it
+        — plus a non-zero `server_tool_requests` where the vendor reports one, which of the three is
+        Anthropic alone. The suite proves the translation; only a live run proves a vendor accepts
+        the body this crate builds.
     files:
-      - examples/agency_live.rs
-      - evidence/0.21.0
-    evidence: []
+      - examples/web_search.rs
+      - .ultraship/products/io-harness/evidence
+    evidence:
+      - >
+        Gate, all green on this machine after a `cargo clean` (the disk was full at 140 MiB
+        free with `target/` at 31 GiB, which surfaced as a linker failure — the known
+        machine fact, not a code defect): `cargo fmt --check`; `cargo clippy --all-targets
+        -- -D warnings`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo
+        doc --all-features --no-deps`; `cargo test` (45 test binaries, 0 failures, including
+        237 doc tests); `cargo test --all-features --lib --tests`.
+      - >
+        OP5 — live run on OpenRouter, kept at evidence/0.22.0/live-web-search.txt. The
+        vendor accepted the body this crate builds, ran a search, and the run cited two
+        sources newer than the model: docs.rs showing io-harness 0.21.0 and the CHANGELOG on
+        GitHub. One `server_tool_calls` row, `ok`. The vendor-reported
+        `server_tool_requests` is 0, because OpenRouter's chat-completions response carries
+        no such counter.
+      - >
+        LIMITATION, recorded in US-IO-HARNESS-0.22.0-I01: a live non-zero counter needs an
+        Anthropic key, and the `.env` in this workspace holds placeholders for both
+        `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. The Anthropic path is therefore proven by
+        its wire tests and not by a live call.

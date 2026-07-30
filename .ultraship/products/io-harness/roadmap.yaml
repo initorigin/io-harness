@@ -462,14 +462,29 @@ versions:
       declared. That is a boundary enforced by the provider, and the contract says so in the same
       words it already uses for a stdio MCP server.
 
-      Three things have to be right or the feature fails quietly rather than loudly: search results
-      carry encrypted content that must be echoed back byte-identical, so server-tool blocks become
-      opaque ledger entries the context assembler never compacts; a long search turn returns a
-      paused stop reason that the run loop must resume rather than treat as an ending; and a failed
-      search arrives as a successful HTTP response carrying an error object, which must reach the
-      trace as a failure instead of reading as a search that found nothing.
+      Three things have to be right or the feature fails quietly rather than loudly: a long search
+      turn returns a paused stop reason that the run loop must resume rather than treat as an
+      ending; a failed search arrives as a successful HTTP response carrying an error object, which
+      must reach the trace as a failure instead of reading as a search that found nothing; and an
+      allow-everything network rule must project to no domain filter rather than to an empty one,
+      which a vendor would read as allow-nothing and fail closed in silence.
 
-      An LSP client follows in the same release if it fits: goto-definition, references, and
-      diagnostics are what stop an agent guessing at symbol names in a large repository.
-    detail: outline
+      The outline assumed encrypted server-tool content would have to be echoed back byte-identical.
+      It does not, at this request shape: the crate sends one flattened user turn, so a server tool
+      runs and returns inside a single completion. The price of that shape is that a paused turn
+      resumes as a fresh request and may repeat a search it already paid for, which the release
+      documents rather than hides.
+
+      The LSP client the outline hoped would fit here moves to 0.23.0 whole. A language server is a
+      second subprocess lifecycle, a second JSON-RPC framing and a per-language discovery problem,
+      and it shares no line with a body key and a citation parser.
+    detail: specified
+    status: released
+  - version: 0.23.0
+    outcome: >
+      The agent stops guessing at symbol names in a large repository. An LSP client gives it
+      goto-definition, references and diagnostics from the same language server a human's editor
+      talks to, so "where is this defined" and "what breaks if I change it" are answered by the
+      toolchain rather than inferred from a grep.
+    detail: hypothesis
     status: planned

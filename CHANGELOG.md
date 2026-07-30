@@ -26,6 +26,161 @@ notes are produced from it.
 
 ### Security
 
+## [0.22.0] - 2026-07-30
+
+The web release. The agent can look something up before it answers, and the run
+records what it read.
+
+Every provider this crate talks to will run a search for the model, inside the
+completion, server-side. Until now there was no way to ask for one: a model
+answered from what it was trained on, and a task that turned on a current fact —
+the release that shipped yesterday, the API that changed last month — was a task
+the harness could not do honestly.
+
+The declaration is one type, `WebAccess`, and each provider translates it into its
+own shape. What a provider cannot express is refused before anything is sent
+rather than quietly dropped, because a boundary silently discarded is worse than
+no boundary: the caller believes in it.
+
+One line has to be said plainly, and it is said in `docs/CONTRACT.md` too. **The
+provider dials the URL.** This crate opens no socket for a search or a fetch, so
+`Act::Net` never sees one, no approver is consulted, and the domain lists you
+declare are handed to the vendor's own filter and enforced there. A boundary that
+must hold inside this process is a reason not to turn this on.
+
+### Breaking changes
+
+- **BREAKING** — `CompletionRequest` gains `web: Option<WebAccess>`, what the
+  provider may look up on the model's behalf. Every existing caller meant `None`,
+  which is the body every release before 0.22.0 sent. This affects only code that
+  builds a `CompletionRequest` with a struct literal listing every field.
+  *Migration:* add the field, or spread the default.
+
+  ```rust
+  let request = CompletionRequest {
+      system: system.into(),
+      user: user.into(),
+      tools,
+      ..Default::default() // or: web: None,
+  };
+  ```
+
+  An out-of-tree `Provider` that ignores the field keeps compiling and keeps
+  working, and is honestly non-searching rather than broken.
+
+- **BREAKING** — `CompletionResponse` gains `citations: Vec<Citation>` and
+  `server_tools: Vec<ServerToolCall>`, so a struct literal listing every field no
+  longer compiles. Both are empty for a completion that searched nothing, which is
+  every completion a pre-0.22.0 provider returns. *Migration:* spread the default,
+  or set both to `Vec::new()`.
+
+  ```rust
+  // before — a literal naming every field
+  CompletionResponse {
+      text, tool_calls, usage, model, finish_reason, ttft_ms,
+  }
+  // after
+  CompletionResponse {
+      text, tool_calls, usage, model, finish_reason, ttft_ms,
+      citations: Vec::new(),
+      server_tools: Vec::new(),
+  }
+  // or, better, stop naming every field
+  CompletionResponse { text, tool_calls, usage, ..Default::default() }
+  ```
+
+- **BREAKING** — `EventKind` gains `ServerToolUsed { provider, tool, ok }`, so an
+  exhaustive `match` over it no longer compiles. A run that declares no web access
+  never emits it. *Migration:* add an arm, or a `_` arm.
+
+  ```rust
+  match &event.kind {
+      EventKind::Step { .. } => { /* … */ }
+      EventKind::ServerToolUsed { tool, ok, .. } => render_search(tool, *ok),
+      // …or ignore it, which is what a consumer that renders neither wants.
+      _ => {}
+  }
+  ```
+
+### Added
+
+- `WebAccess`, and `TaskContract::with_web`: one declaration of what the provider
+  may look up — `WebAccess::search()`, `.with_fetch()`, `.max_uses(n)`,
+  `.allow(host)`, `.block(host)`, with `enabled()` and `vendor_filter()` reading it
+  back. Nothing is on by default and a contract that declares nothing sends the
+  body 0.21.0 sent.
+
+  A vendor takes an allow-list *or* a block-list, never both, so `vendor_filter`
+  sends the allow-list with anything also blocked removed from it — exactly the set
+  the two lists together described.
+- `WebAccess::from_policy`, which projects a `Policy`'s `Act::Net` rules onto the
+  vendor's domain filter so the same hosts are not written twice. The port is
+  dropped, and an allow-everything rule projects to **no** filter rather than an
+  empty one: an empty allow-list reads to a vendor as "allow nothing", which fails
+  closed in silence and leaves the model answering from memory believing it
+  searched. An `ask_net` rule, and a pattern carrying a scheme or a path, are each
+  an `Error::Config` naming the rule rather than a boundary dropped on the wire.
+- Provider-executed search on all three vendors, and fetch on the one that has it.
+  Anthropic gets dated `web_search_20250305` / `web_fetch_20250910` server-tool
+  entries, with the fetch beta header sent only when fetch is asked for; OpenAI
+  gets `web_search_options` with its allow-list; OpenRouter gets its `web` plugin.
+  A declaration a vendor cannot carry — a fetch on OpenAI or OpenRouter, a
+  block-list on OpenAI, any domain filter on OpenRouter — is an `Error::Config`
+  before the request is built, naming what to write instead.
+- `Citation` and `CompletionResponse::citations`, with the `citations` table and
+  `Store::record_citations` / `Store::citations`: the sources an answer drew on,
+  per run and step, readable after the process that ran it is gone. Recorded
+  verbatim — the crate does not fetch the url or check the page, so a row says the
+  provider cited a page and not that the page says what the model claimed.
+- `ServerToolCall` and `CompletionResponse::server_tools`, with the
+  `server_tool_calls` table and `Store::record_server_tool_calls` /
+  `Store::server_tool_calls`: which vendor ran which tool, and the vendor's own
+  error code when it failed. A broken search arrives inside an HTTP 200 as an error
+  object, so without this a search that failed and a search that found nothing are
+  the same empty result set.
+- `EventKind::ServerToolUsed { provider, tool, ok }`, emitted as each
+  provider-executed call is recorded.
+- `[web]` in `io.toml` — `search`, `fetch`, `max_uses`, `allowed_domains`,
+  `blocked_domains` — applied by `Config::apply_to`. The table is carried whenever
+  it is present, so a file writing `search = false` states a decision instead of
+  reading as nothing configured.
+- [The web guide](docs/guide/web.md).
+
+### Changed
+
+- **A failed provider-executed call reaches the model as an observation.** The
+  step's log gains `provider web tool: web_search failed (<vendor code>)`, so the
+  model can retry or answer knowingly. A search that ran and found nothing says
+  nothing, because nothing went wrong.
+- **A `pause_turn` stop reason no longer ends an unverified run.** A provider
+  running a long search hands back partial text with no tool call, which is exactly
+  the shape of a finished answer to a `Verification::None` contract — so before
+  this release such a run stopped mid-search and reported success. The loop now
+  takes another step, and both turns are charged, because a paused turn is a
+  completion like any other.
+
+  The crate does not echo the vendor's partial assistant blocks back — the request
+  has been one flattened user turn since 0.1.0 — so a paused turn resumes as a
+  fresh request and the provider may repeat a search it already charged for.
+  `max_uses` is the lever against that.
+- `Usage::server_tool_requests`, added in 0.18.0, reads non-zero for the first
+  time. These requests are billed per request rather than per token. It is
+  populated where the vendor reports a counter: Anthropic does, and OpenAI and
+  OpenRouter do not in the shape the crate reads, so the meter is zero on those two
+  even when a `server_tool_calls` row says a search ran.
+- Two new tables, `citations` and `server_tool_calls`, created on open like every
+  addition since 0.13.0. `CHECKPOINT_FORMAT` stays 7, no existing table is altered,
+  and a 0.21.0 database opens, resumes and is queried unchanged.
+- No new dependency.
+
+### Security
+
+- Nothing in this release widens what an agent may do inside this process. A
+  provider-executed search opens no socket here, executes no binary and touches no
+  file; what it can reach is bounded by the vendor's own domain filter, which the
+  declaration fills in and the vendor enforces. A run needing that boundary held
+  locally should not declare web access at all.
+
 ## [0.21.0] - 2026-07-30
 
 The agency release. The agent can plan where you can watch it, and it can ask you

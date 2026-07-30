@@ -27,6 +27,7 @@ the limits that capability actually has.
 | [Observability and replay](guide/observability.md) | Observers, event kinds, outcome records, deterministic replay |
 | [Sessions](guide/sessions.md) | A durable, branchable conversation: turns that are runs, token streaming, steering and interruption |
 | [Agency](guide/agency.md) | A plan you can watch, a question about intent, named agents with their own model and boundary, and prompt templates |
+| [Web search and fetch](guide/web.md) | Provider-executed search and fetch, what each vendor takes and what it refuses, citations, and the boundary the vendor enforces rather than this process |
 | [Configuration](guide/configuration.md) | One `io.toml`, four scopes, `${env:}` and `${file:}` substitution, projected onto the typed API |
 | [Accounting](guide/accounting.md) | One row per provider call, the cache and reasoning breakdown, latency and TTFT, and cost derived from a price table you own |
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
@@ -57,6 +58,9 @@ it, not when a release merely touched it.
 
 - **Providers** — OpenRouter, Anthropic, OpenAI, over the crate's own HTTP+SSE
   client, with fallback between them
+- **Provider-executed web search and fetch** — one `WebAccess` declaration each
+  vendor translates into its own shape, with the sources cited recorded in the
+  trace; the provider dials the URL, so the domain filter is the vendor's
 - **Agent composition** — spawn and nest many agents under one shared budget
 - **Ephemeral code-exec sandboxes** — OS-native per platform over a portable floor
 - **Long-running autonomous tasks** — unattended and crash-resumable

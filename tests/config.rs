@@ -315,6 +315,13 @@ deny_net = true
 [[agent]]
 name = "author"
 model = "strong-model"
+
+[web]
+search = true
+fetch = true
+max_uses = 4
+allowed_domains = ["docs.rs", "crates.io"]
+blocked_domains = ["evil.test"]
 "#;
 
 #[test]
@@ -373,6 +380,11 @@ fn f7_every_key_reaches_a_typed_field() {
     assert_eq!(applied.commit_identity.email, "bot@example.invalid");
     assert_eq!(applied.mcp[0].id, "github");
     assert_eq!(applied.mcp[0].timeout_secs, 30);
+    let web = applied.web.clone().expect("[web] reaches the contract");
+    assert!(web.search && web.fetch);
+    assert_eq!(web.max_uses, Some(4));
+    assert_eq!(web.allowed_domains, ["docs.rs", "crates.io"]);
+    assert_eq!(web.blocked_domains, ["evil.test"]);
 
     // Every one of those is different from the default it would otherwise hold.
     let plain = contract(project.path());
@@ -383,6 +395,7 @@ fn f7_every_key_reaches_a_typed_field() {
     assert_ne!(applied.context, plain.context);
     assert_ne!(applied.exec_timeout, plain.exec_timeout);
     assert_ne!(applied.commit_identity, plain.commit_identity);
+    assert_ne!(applied.web, plain.web);
 }
 
 #[test]
@@ -1015,4 +1028,151 @@ fn the_run_section_carries_a_template_directory() {
         .unwrap()
         .templates()
         .is_none());
+}
+
+// ---------------------------------------------------------------------------
+// 0.22.0 — `[web]`
+// ---------------------------------------------------------------------------
+
+/// The 0.22.0 acceptance criterion F7: a `[web]` table reaches a run from
+/// configuration and lands on exactly the `WebAccess` the programmatic builder
+/// produces.
+///
+/// Named for the release rather than `f7_`, which this file already uses for one of
+/// 0.19.0's criteria.
+///
+/// Equality against the builder — rather than five field assertions — is the point:
+/// it is what proves the file is a projection of the typed API and not a second way
+/// of describing web access, and it fails if a later field is added to `WebAccess`
+/// and the two paths fill it differently.
+#[test]
+fn a_web_table_projects_onto_the_same_web_access_the_programmatic_api_builds() {
+    use io_harness::WebAccess;
+
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        r#"
+[web]
+search = true
+fetch = true
+max_uses = 5
+allowed_domains = ["docs.rs", "crates.io"]
+blocked_domains = ["evil.test"]
+"#,
+    );
+
+    let applied = Config::discover(project.path())
+        .unwrap()
+        .apply_to(contract(project.path()));
+
+    let programmatic = WebAccess::search()
+        .with_fetch()
+        .max_uses(5)
+        .allow("docs.rs")
+        .allow("crates.io")
+        .block("evil.test");
+    assert_eq!(
+        applied.web,
+        Some(programmatic),
+        "a declaration from a file and one built in Rust must be the same value"
+    );
+
+    // The negative control: a file with no `[web]` table leaves the contract with
+    // no declaration at all, which is the 0.21.0 behaviour and the one that sends
+    // no server tool to any vendor.
+    let quiet = tempfile::tempdir().unwrap();
+    write(quiet.path(), "io.toml", "[run]\nmax_steps = 3\n");
+    assert_eq!(
+        Config::discover(quiet.path())
+            .unwrap()
+            .apply_to(contract(quiet.path()))
+            .web,
+        None,
+        "an absent [web] table is not an empty one"
+    );
+}
+
+/// An unknown key inside `[web]` is an error naming the key and the file.
+///
+/// `WebAccess` carries its own `deny_unknown_fields`, so this is inherited rather
+/// than added — but a misspelled `blocked_domain` silently ignored is a block-list
+/// that does not exist, and the operator would have no way to see it, so the
+/// inheritance is worth pinning here rather than assuming.
+#[test]
+fn an_unknown_key_inside_the_web_table_is_rejected_naming_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[web]\nsearch = true\nblocked_domain = [\"evil.test\"]\n",
+    );
+
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("blocked_domain"),
+        "the error must name the misspelled key, got: {err}"
+    );
+    assert!(err.contains("io.toml"), "and the file it is in, got: {err}");
+}
+
+/// `[web]` obeys the same layering every other table does: a later scope wins one
+/// key and leaves its siblings alone.
+///
+/// Asserted rather than assumed, because this is the direction that matters — an
+/// individual switching search *off* over a project that turned it on. If the table
+/// were replaced whole instead of merged, the local file would also silently drop
+/// the project's domain lists, and the run would search a wider web than the
+/// project's file described.
+#[test]
+fn a_local_scope_switching_search_off_overrides_a_project_scope_that_turned_it_on() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[web]\nsearch = true\nmax_uses = 5\nallowed_domains = [\"docs.rs\"]\n",
+    );
+    write(project.path(), "io.local.toml", "[web]\nsearch = false\n");
+
+    let web = Config::discover(project.path())
+        .unwrap()
+        .apply_to(contract(project.path()))
+        .web
+        .expect("the table is still present, it is just switched off");
+
+    assert!(!web.search, "the narrower scope is the last word");
+    assert!(
+        !web.enabled(),
+        "and with fetch never turned on, nothing is declared to any vendor"
+    );
+    assert_eq!(
+        web.max_uses,
+        Some(5),
+        "a sibling key the local scope never named survives the merge"
+    );
+    assert_eq!(
+        web.allowed_domains,
+        ["docs.rs"],
+        "and so does the project's domain list"
+    );
+
+    // The negative control for the direction: without the local file, the project
+    // scope's `search = true` is what reaches the run.
+    std::fs::remove_file(project.path().join("io.local.toml")).unwrap();
+    assert!(
+        Config::discover(project.path())
+            .unwrap()
+            .apply_to(contract(project.path()))
+            .web
+            .unwrap()
+            .search
+    );
 }
