@@ -269,6 +269,7 @@
 // itself. 0.16.1's docs.rs build failed on the removed feature name.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
+pub mod agent;
 pub mod approve;
 pub mod config;
 pub mod containment;
@@ -337,6 +338,7 @@ pub use skills::{Skill, Skills};
 // only audit of per-step budget draws against the shared tree ledger, unreadable
 // through the public API. Exported in 0.12.0: an observability release cannot ship
 // leaving its own audit table reachable only by opening the SQLite file.
+pub use agent::{AgentDef, Agents};
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, Pending, PolicyEvent,
     ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, TodoItem,

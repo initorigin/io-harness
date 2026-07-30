@@ -118,7 +118,10 @@ impl Anthropic {
             .collect();
 
         json!({
-            "model": self.model,
+            // 0.21.0 — a per-request model override, for a named agent definition
+            // spawned into a tree that shares this one provider. `None` is the
+            // model this provider was constructed with.
+            "model": request.model.as_deref().unwrap_or(&self.model),
             "max_tokens": MAX_TOKENS,
             "stream": true,
             "system": request.system,

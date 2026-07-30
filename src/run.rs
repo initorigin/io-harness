@@ -16,6 +16,7 @@ use std::time::Duration;
 use serde_json::json;
 use tracing::info;
 
+use crate::agent::{AgentDef, Agents};
 use crate::approve::{ApproveAll, Approver, Decision, Request};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
@@ -1599,6 +1600,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 mcp: &mcp,
                 tools: &contract.tools,
                 skills: &skills,
+                agents: &contract.agents,
                 provider,
                 store,
                 approver,
@@ -1608,7 +1610,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 root,
                 root_run_id: run_id,
             };
-            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
+            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
         }
@@ -1675,6 +1677,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 mcp: &mcp,
                 tools: &contract.tools,
                 skills: &skills,
+                agents: &contract.agents,
                 provider,
                 store,
                 approver,
@@ -1684,7 +1687,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 root,
                 root_run_id: run_id,
             };
-            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
+            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
         }
@@ -2619,6 +2622,10 @@ struct Tree<'a, P: Provider> {
     /// for the same reason `tools` is: a child contract the *model* wrote must
     /// not be able to conjure skills its parent was never offered.
     skills: &'a Skills,
+    /// The roster a spawn may name (0.21.0). Shared tree-wide for the same reason
+    /// `skills` is: a definition is the operator's, so a child cannot conjure one
+    /// its parent's contract never registered.
+    agents: &'a Agents,
     provider: &'a P,
     store: &'a Store,
     approver: &'a dyn Approver,
@@ -2819,6 +2826,7 @@ pub async fn run_tree_observed<P: Provider>(
         mcp: &mcp,
         tools: &contract.tools,
         skills: &skills,
+        agents: &contract.agents,
         provider,
         store,
         approver,
@@ -2828,7 +2836,7 @@ pub async fn run_tree_observed<P: Provider>(
         root,
         root_run_id: run_id,
     };
-    let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await;
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
@@ -3006,6 +3014,7 @@ pub async fn resume_tree_observed<P: Provider>(
         mcp: &mcp,
         tools: &contract.tools,
         skills: &skills,
+        agents: &contract.agents,
         provider,
         store,
         approver,
@@ -3015,7 +3024,7 @@ pub async fn resume_tree_observed<P: Provider>(
         root,
         root_run_id: run_id,
     };
-    let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await;
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
@@ -3165,6 +3174,7 @@ pub async fn resume_tree_from_stored_policy_observed<P: Provider>(
 /// `depth` is 0 at the root; a child's depth is its parent's + 1. Returns the
 /// agent's [`RunOutcome`]; a tree-wide budget halt propagates up as
 /// [`RunOutcome::BudgetCeilingReached`].
+#[allow(clippy::too_many_arguments)]
 fn run_agent<'f, P: Provider>(
     tree: &'f Tree<'_, P>,
     contract: &'f TaskContract,
@@ -3172,6 +3182,11 @@ fn run_agent<'f, P: Provider>(
     depth: u32,
     policy: &'f Policy,
     start_step: u32,
+    // 0.21.0 — the definition this agent was spawned from, if it was spawned from
+    // one. Crate-internal rather than a `TaskContract` field: a run-level model
+    // override is a separate decision about whether a conversation may change models
+    // mid-thread, and 0.20.0 deliberately left that shut.
+    identity: Option<&'f AgentDef>,
 ) -> Pin<Box<dyn Future<Output = Result<RunOutcome>> + 'f>> {
     // Boxed so the loop can recurse into itself when an agent spawns a child.
     Box::pin(async move {
@@ -3185,7 +3200,15 @@ fn run_agent<'f, P: Provider>(
         extra.extend(skill_tool(tree.skills));
         let system =
             with_skill_catalog(with_extra_tools(tree_system_prompt(), &extra), tree.skills);
-        let mut tools = tree_tools();
+        // A role is PREPENDED, never a replacement: the tree prompt is what tells an
+        // agent how to use its tools and that its result composes back into its
+        // parent, and a role that replaced it would produce an agent that did not
+        // know how to be one.
+        let system = match identity.and_then(|d| d.role.as_deref()) {
+            Some(role) => format!("{}\n\n{system}", role.trim()),
+            None => system,
+        };
+        let mut tools = tree_tools(tree.agents);
         tools.extend(extra);
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
@@ -3252,6 +3275,10 @@ fn run_agent<'f, P: Provider>(
                 system: system.clone(),
                 user: user.clone(),
                 tools: tools.clone(),
+                // 0.21.0 — a named agent's model. `None` for the root and for any
+                // child spawned without a definition, which is what every provider
+                // reads as "the model you were built with".
+                model: identity.and_then(|d| d.model.clone()),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -3660,9 +3687,43 @@ async fn spawn_child<P: Provider>(
 
     let child_depth = depth + 1;
 
+    // 0.21.0 — an optional named definition. Unknown is an error observation and no
+    // child: a spawn that silently became an unnarrowed agent because its definition
+    // was misspelled is exactly the failure a roster must not have.
+    let named = a
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .filter(|n| !n.is_empty());
+    let def = match named {
+        Some(name) => match tree.agents.get(name) {
+            Some(def) => Some(def),
+            None => {
+                let known = tree.agents.names().join(", ");
+                return Ok(SpawnResult::Composed {
+                    decision: format!("unknown agent {name}"),
+                    obs: format!(
+                        "\n[spawn error] no agent named `{name}`. Available: {}\n",
+                        if known.is_empty() { "none" } else { &known }
+                    ),
+                });
+            }
+        },
+        None => None,
+    };
+
     // A child inherits the parent policy and may only narrow it. Optional
-    // `deny_write` globs let the parent tighten the child further.
+    // `deny_write` globs let the parent tighten the child further, and a definition
+    // narrows it again — both through `Policy::contain`, which is why neither can
+    // widen anything. There is no path here that adds an allow.
     let mut overlay = Policy::permissive().layer("child");
+    if let Some(def) = def {
+        if def.deny_write {
+            overlay = overlay.deny_write("*");
+        }
+        if def.deny_net {
+            overlay = overlay.deny_net("*");
+        }
+    }
     if let Some(denies) = a.get("deny_write").and_then(|v| v.as_array()) {
         for d in denies.iter().filter_map(|v| v.as_str()) {
             overlay = overlay.deny_write(d);
@@ -3682,6 +3743,10 @@ async fn spawn_child<P: Provider>(
     let mut child_contract = TaskContract::workspace(goal, &tree.root, verify);
     if let Some(n) = a.get("max_steps").and_then(|v| v.as_u64()) {
         child_contract = child_contract.with_max_steps(n as u32);
+    }
+    // A definition's cap is the operator's and outranks the model's own request.
+    if let Some(n) = def.and_then(|d| d.max_steps) {
+        child_contract = child_contract.with_max_steps(n);
     }
 
     // Spawn-or-adopt. On a fresh run this spawn has no persisted record, so a new
@@ -3736,11 +3801,18 @@ async fn spawn_child<P: Provider>(
                 parent_run_id,
                 child_depth,
             )?;
+            // `detail` is free-form and documented as the child's goal; a child
+            // spawned from a definition records that too, so the trace says which
+            // role ran without the `spawns` table gaining a column (and this
+            // release alters no table).
             tree.store.record_agent_event(&AgentEvent::spawn(
                 parent_run_id,
                 step,
                 child_run,
-                goal,
+                match def {
+                    Some(d) => format!("as {}: {goal}", d.name),
+                    None => goal.to_string(),
+                },
             ))?;
             // Attributed to the PARENT's run and depth: the parent is what spawned
             // it, and the child's own events (which carry `child_depth`) start
@@ -3781,6 +3853,7 @@ async fn spawn_child<P: Provider>(
         child_depth,
         &child_policy,
         child_start,
+        def,
     )
     .await?;
 
@@ -5839,18 +5912,33 @@ fn tree_system_prompt() -> String {
 }
 
 /// Workspace tools plus [`SPAWN_TOOL`] — offered only inside an agent tree.
-fn tree_tools() -> Vec<ToolSpec> {
+fn tree_tools(agents: &Agents) -> Vec<ToolSpec> {
     let mut tools = workspace_tools();
+    // 0.21.0 — the roster is named in the description rather than as a schema `enum`,
+    // because a model that asks for a name nobody registered gets a plain error
+    // observation naming what IS available, and that recovers in one step. An `enum`
+    // would instead make the whole call malformed at the provider.
+    let roster = if agents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Named agents you may spawn with \"agent\", each with its own role, model and \
+             (possibly narrower) permissions:\n{}",
+            agents.catalog()
+        )
+    };
     tools.push(ToolSpec {
         name: SPAWN_TOOL.to_string(),
-        description: "Spawn a contained sub-agent to pursue a smaller goal over the same \
-                      workspace. The sub-agent inherits your permissions (it can only be \
-                      further restricted) and its outcome is reported back to you."
-            .to_string(),
+        description: format!(
+            "Spawn a contained sub-agent to pursue a smaller goal over the same \
+             workspace. The sub-agent inherits your permissions (it can only be \
+             further restricted) and its outcome is reported back to you.{roster}"
+        ),
         parameters: json!({
             "type": "object",
             "properties": {
                 "goal": { "type": "string", "description": "The sub-agent's goal." },
+                "agent": { "type": "string", "description": "Optional name of a configured agent to spawn, which gives the sub-agent that agent's role, model and permissions." },
                 "verify_file": { "type": "string", "description": "File (relative to the workspace root) whose contents decide the sub-agent's success." },
                 "verify_contains": { "type": "string", "description": "Text that file must contain for the sub-agent to succeed." },
                 "deny_write": { "type": "array", "items": { "type": "string" }, "description": "Optional globs the sub-agent must not write — tightens its inherited policy." },
