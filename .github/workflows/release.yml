@@ -55,6 +55,11 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # See the same pair in ci.yml: full debuginfo is the most expensive part of a
+  # debug build and nothing on a runner can use it. A panic still names its file
+  # and line, and a backtrace still names its frames'.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -133,8 +138,14 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo test
-      - run: cargo test --features documents --lib --tests
-      - run: cargo test --features media --lib --tests
+      # One `--all-features` leg rather than one per feature: a feature flip
+      # recompiles the crate and that feature's dependency tree from scratch, so
+      # two legs cost two recompiles to prove what the superset proves in one.
+      # `--lib --tests` because the default `cargo test` above already ran the
+      # doctests. Per-feature isolation is the `lint` job's clippy steps in
+      # ci.yml, and the default leg above is what covers the
+      # `#[cfg(not(feature = ..))]` code that `--all-features` cannot reach.
+      - run: cargo test --all-features --lib --tests
 
       # The package, built and compiled standalone from its own sources — the
       # one check that catches a file the manifest forgot to include.
