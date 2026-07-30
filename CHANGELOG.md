@@ -174,6 +174,14 @@ could not be expressed at all.
   running the 0.20.0 live session, and fixed here because this is the release that
   touches the tool layer.
 
+- **The test suite passes on a Windows clone.** A `.gitattributes` pins
+  `tests/fixtures/**` to LF. Without it, a checkout with `core.autocrlf=true` —
+  the default for Git for Windows and for the GitHub Windows runner — rewrote
+  every fixture's line endings, and the template test that compares a rendered
+  body byte for byte failed on Windows and nowhere else. Nothing in the crate
+  changed: the frontmatter parser returns a body verbatim on purpose, so the
+  fixture's bytes were the thing that had to be made the same everywhere.
+
 ### Security
 
 - Nothing in this release widens what an agent may do. Both new tools are

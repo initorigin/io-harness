@@ -1,0 +1,9 @@
+# Test fixtures are compared byte for byte, so their line endings are part of the
+# fixture. Without this, a Windows checkout with `core.autocrlf=true` — which is
+# what the GitHub Windows runner and a default Git for Windows install both do —
+# rewrites every LF to CRLF, and a test that asserts a rendered template equals a
+# string written with `\n` fails on Windows and nowhere else. The frontmatter
+# parser these fixtures feed returns a body verbatim on purpose (see the
+# `crlf_line_endings_parse` unit test in src/skills.rs), so the fix belongs at the
+# checkout boundary rather than in the parser.
+tests/fixtures/** text eol=lf
