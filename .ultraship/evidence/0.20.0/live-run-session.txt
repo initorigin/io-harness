@@ -1,0 +1,37 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.36s
+     Running `target/debug/examples/session_live`
+session 1 over /var/folders/ft/gds0vhjx2p121hq746gw7_hc0000gn/T/io-harness-session-example
+
+--- turn 1 -------------------------------------------------------
+
+
+
+
+
+The `alpha()` function returns the largest number, 41.
+
+outcome: Finished { steps: 6 }
+streamed 13 deltas across 1 step(s) whose text arrived before the step committed (first delta at +Some(22.70017575s) after the turn began)
+
+--- turn 2 (steered mid-turn) ------------------------------------
+
+[operator types] stop; only write to SECOND.md
+outcome: Stalled { steps: 6 }
+the steer reached the model at step 2 of 6 — and the trace says so
+what the model did with it: SECOND.md exists: false, NOTES.md exists: false
+
+--- branch from turn 1 -------------------------------------------
+The `beta()` function returns the smallest number, 0.
+tree: 3 turns, path after the branch: [1, 3]
+
+--- reopened -----------------------------------------------------
+Read every file under `src/` and tell me, in one sentence, which function returns the largest number.
+
+--- the conversation, from the store ----------------------------
+  turn 1 (parent None, run 1): "finished", 7639 tokens — Read every file under src/ and tell me, in one sentence, which function returns the largest number. Do not write anything.
+  turn 2 (parent Some(1), run 2): "stalled", 7924 tokens — Read each file under src/ one more time, then write that function's name and its value to NOTES.md, and stop.
+  turn 3 (parent Some(1), run 3): "finished", 7814 tokens — Instead, tell me which function returns the SMALLEST number. One sentence.
+  turn 4 (parent Some(3), run 4): "finished", 5084 tokens — What was the first thing I asked you in this conversation?
+
+28461 tokens across the conversation
+trace: /var/folders/ft/gds0vhjx2p121hq746gw7_hc0000gn/T/io-harness-session-example/runs.db

@@ -26,6 +26,88 @@ notes are produced from it.
 
 ### Security
 
+## [0.20.0] - 2026-07-30
+
+The session release. The crate stops being one-shot: an operator opens a durable
+conversation over a workspace, sends a turn, watches the answer arrive token by
+token while the model is still producing it, says something else mid-turn or
+interrupts, and comes back later to branch from any earlier turn instead of
+starting over.
+
+A turn **is** a run — its own trace, its own budgets, its own policy boundary, its
+own checkpoint — so a session is durable for exactly the reason a run already is,
+and none of that machinery is rebuilt for conversations. `TaskContract` becomes
+what it always was in practice: an optional bound on a turn, or a headless
+one-shot for unattended work.
+
+This is the release that makes a terminal or a desktop application possible.
+Before it, SSE was consumed inside the provider and accumulated before anything
+else saw it, events were step-granular, and there was nothing to render while the
+model was typing.
+
+### Breaking changes
+
+- **BREAKING** — `EventKind` gains a `Token { text }` variant, so an exhaustive
+  `match` over it no longer compiles. Nothing else changed: no item was removed or
+  renamed, and no signature changed. Runtime behaviour is untouched for every
+  existing entry point — `Token` is emitted only by a `Session` turn that was
+  given an observer, so a one-shot run's event stream is byte-for-byte what it was.
+  *Migration:* add an arm.
+
+  ```rust
+  match &event.kind {
+      EventKind::Step { .. } => { /* … */ }
+      // Either handle the new variant…
+      EventKind::Token { text } => print!("{text}"),
+      // …or ignore it, which is what a consumer that does not render text wants.
+      _ => {}
+  }
+  ```
+
+### Added
+
+- `io_harness::Session` and the `session` module: `Session::open(store, root)`
+  starts a conversation, `Session::reopen(store, id)` picks it up in any later
+  process, and `id`, `root`, `head`, `history` and `branch_from` read and move
+  within it. The conversation is a durable, append-only tree — branching is one
+  write, and the branch you left stays readable.
+- Five ways to take a turn: `Session::turn` (no criterion, quiet),
+  `turn_observed` (streams to an `Observer`), `turn_steered` (streams and reads a
+  `Steer`), `turn_bounded` (your own `TaskContract` for that one turn) and
+  `turn_bounded_observed`. A bound applies to the turn that carries it, not to the
+  session.
+- `Provider::complete_streaming`, a defaulted trait method whose default delegates
+  to `complete` and emits the finished text as one delta — so an out-of-tree
+  provider keeps compiling and a UI still renders something. `OpenRouter`,
+  `Anthropic`, `OpenAi` and `provider::Fallback` override it and emit each text
+  delta as its SSE event arrives.
+- `EventKind::Token { text }`: the model's text as it is produced. The deltas of
+  one step concatenate to exactly that step's final assistant text, in order.
+  Emitted only by an observed session turn.
+- `Steer` and `SteerInbox`: `Steer::say` delivers an operator's message to the
+  model at the next step boundary, and `Steer::interrupt` ends the turn there
+  through the existing cancel path — whole steps only, recorded as `cancelled`,
+  still resumable. A steer is text and not authorization: every tool call it leads
+  to is checked against the same `Policy` by the same code.
+- `Turn` and `TurnResult`, and the `Store` methods behind them —
+  `create_session`, `session_root`, `session_head`, `set_session_head`,
+  `record_turn`, `finish_turn`, `session_turn`, `session_turns`, `turn_for_run` —
+  so a conversation is reconstructable from SQLite without the program that drove
+  it.
+- A `steered` context event, so a turn that changed course because a human said
+  something reads that way in the trace afterwards.
+- [The sessions guide](docs/guide/sessions.md), and a `session_live` example that
+  streams, steers, branches and reopens across a process boundary, asserting each
+  itself.
+
+### Changed
+
+- The `tokio` dependency gains its `sync` feature, for the steer channel. No new
+  crate: the default `cargo tree` is unchanged at 407 lines.
+- Two new tables, `sessions` and `session_turns`, created on open like every
+  addition since 0.13.0. `CHECKPOINT_FORMAT` stays 7, no existing table is
+  altered, and a 0.19.0 database opens, resumes and is queried unchanged.
+
 ## [0.19.0] - 2026-07-29
 
 The configuration release. An operator configures the harness in a file instead

@@ -1,3 +1,7 @@
+<div align="center">
+
+<img src="https://raw.githubusercontent.com/initorigin/io-harness/main/assets/initorigin-logo.png" alt="InitOrigin" width="112" height="112">
+
 # IO Harness
 
 [![crates.io](https://img.shields.io/crates/v/io-harness.svg)](https://crates.io/crates/io-harness)
@@ -5,6 +9,8 @@
 [![CI](https://github.com/initorigin/io-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/initorigin/io-harness/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/crates/l/io-harness.svg)](LICENSE)
 [![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
+
+</div>
 
 **An embeddable agent runtime for Rust. Any task, any provider, in your process —
 with a permission boundary, a sandbox, and a durable trace you own.**
@@ -19,7 +25,7 @@ the language the project is written in is not the harness's business.
 
 ```toml
 [dependencies]
-io-harness = "0.18"
+io-harness = "0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -137,6 +143,13 @@ ends as a reviewable commit rather than a working tree someone has to
 reconstruct. The model supplies paths and a message, never a subcommand or a
 flag, so push, fetch, reset and rebase are unreachable by construction.
 
+**Durable conversations.** `Session::open(store, root)` holds a conversation
+instead of firing one task: turns that read the turns before them, text streamed
+to an observer as the model produces it, a mid-turn steer or an interrupt honoured
+at the next step boundary, and a tree an operator can branch from any earlier turn.
+A turn is a run, so every turn is budgeted, policy-bounded, checkpointed and
+resumable — see the [sessions guide](docs/guide/sessions.md).
+
 **Configuration in a file.** `Config::discover(root)` reads one `io.toml` across
 four scopes — the crate's defaults, a user file, a committed project file, and a
 gitignored local one — and projects it onto the typed API: a `Policy`, a
@@ -161,6 +174,7 @@ the caller reads the file, before the run, once.
 | [Context and memory](docs/guide/context-and-memory.md) | Per-turn assembly, compaction, invalidation, durable memory |
 | [Resilience](docs/guide/resilience.md) | Failure classification, retry, provider fallback, stall detection |
 | [Observability and replay](docs/guide/observability.md) | Observers, events, outcome records, deterministic replay |
+| [Sessions](docs/guide/sessions.md) | Durable conversations: a turn is a run, token streaming, steering, branching |
 | [Configuration](docs/guide/configuration.md) | One `io.toml`, four layered scopes, projected onto the typed API |
 | [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |

@@ -124,6 +124,48 @@ impl<A: Provider + Sync, B: Provider + Sync> Provider for Fallback<A, B> {
         }
     }
 
+    /// Streams from whichever provider serves, as [`complete`](Provider::complete)
+    /// answers from whichever provider serves.
+    ///
+    /// Forwarded rather than left to the default, which would delegate to
+    /// `complete` and collapse a real stream into one delta on the one path a
+    /// caller is most likely to be watching. A fallover mid-stream means the
+    /// primary's deltas were already emitted and the secondary's answer arrives
+    /// whole — the caller sees the primary's partial text followed by the
+    /// secondary's complete text, which is why a delta is provisional until the
+    /// completion returns.
+    async fn complete_streaming(
+        &self,
+        request: CompletionRequest,
+        on_token: &(dyn Fn(&str) + Send + Sync),
+    ) -> Result<CompletionResponse> {
+        match self
+            .primary
+            .complete_streaming(request.clone(), on_token)
+            .await
+        {
+            Ok(response) => {
+                self.note(1);
+                Ok(response)
+            }
+            Err(e) if worth_another_provider(&e) => {
+                tracing::warn!(
+                    primary = self.primary.name(),
+                    secondary = self.secondary.name(),
+                    error = %e,
+                    "provider failed mid-stream; falling over"
+                );
+                let out = self.secondary.complete_streaming(request, on_token).await;
+                self.note(if out.is_ok() { 2 } else { 0 });
+                out
+            }
+            Err(e) => {
+                self.note(0);
+                Err(e)
+            }
+        }
+    }
+
     fn name(&self) -> &str {
         &self.name
     }

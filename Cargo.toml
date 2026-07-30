@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2021"
 # rmcp sets the real floor: it uses let-chains, stabilised in 1.88. On 2.2.0 it
 # published no rust-version of its own, so cargo could not catch it at resolve
@@ -49,7 +49,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", "process", "sync"] }
 # 0.13 (not 0.12) because rmcp requires it, and the streamable-HTTP MCP
 # transport only accepts a Client of the same version — one reqwest, one TLS
 # stack. Still true on rmcp 3.0.0, which is why that bump needed no reqwest

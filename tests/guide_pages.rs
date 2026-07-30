@@ -46,6 +46,11 @@ const GUIDES: &[(&str, bool)] = &[
     // 0.19.0. It carries a limits block because the interesting part of a
     // config file is what it is *not*: not a boundary against the agent, not
     // read by the run loop, and not loaded by anything the caller did not call.
+    // 0.20.0. It carries a limits block because the interesting part of a session
+    // is what a conversation does *not* make true: steering is text and not
+    // authorization, a streamed delta is provisional until the completion returns,
+    // and one session driven by two processes at once is unsupported.
+    ("sessions.md", true),
     ("configuration.md", true),
     ("accounting.md", true),
     ("documents.md", true),
