@@ -357,6 +357,8 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::READ_FILE_TOOL,
     super::READ_SKILL_TOOL,
     super::REMEMBER_TOOL,
+    super::TODO_WRITE_TOOL,
+    super::ASK_QUESTION_TOOL,
     super::GIT_LOG_TOOL,
     super::GIT_STATUS_TOOL,
     super::GIT_DIFF_TOOL,

@@ -287,6 +287,7 @@ pub mod sandbox;
 pub mod session;
 pub mod skills;
 mod state;
+pub mod template;
 pub mod toolchain;
 pub mod tools;
 mod verify;
@@ -338,10 +339,13 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, Pending, PolicyEvent,
-    ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Turn,
-    BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
-    SUCCESS_OUTCOME, UNKNOWN_MODEL,
+    ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, TodoItem,
+    TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
+    MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
+pub use template::{Template, Templates};
 pub use tools::git::Identity;
-pub use tools::{Tool, ToolFuture, Toolbox, DEFAULT_EXEC_TIMEOUT};
+pub use tools::{
+    Tool, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, TODO_WRITE_TOOL,
+};
 pub use verify::{ExecGuard, Verification, TEST_BINARY};

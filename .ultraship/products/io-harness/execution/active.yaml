@@ -1,0 +1,45 @@
+product: io-harness
+version: 0.21.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+  - >
+    No constraints are recorded for this workspace (`ultraship state` reports `active: null` and no
+    blockers), so this assessment is grounded in the contract's own `resource_profile` and in the
+    repository's measured condition rather than in a user estimate. Nothing below is a measured cost
+    figure; the framework has no provider telemetry.
+  - >
+    Every mechanism this release needs already exists and is proven. The question path copies the
+    approval triangle (`put_pending`/`pending`/`resolve_pending` plus `resume_with_decision`), agent
+    narrowing is `Policy::contain` unchanged, templates reuse the `skills` discovery and frontmatter
+    parser, and repetition detection is two counters inside a nine-line function. This release adds a
+    layer over proven parts, which is the same shape 0.20.0 had and it landed.
+  - >
+    Additive-only storage. `todos` and `pending_questions` are new `CREATE TABLE IF NOT EXISTS`
+    tables, so `CHECKPOINT_FORMAT` stays 7 and there is no migration to design — historically the
+    riskiest part of a release here.
+  - >
+    The repository is clean and current: `develop` equals `main` at the 0.20.0 merge, the working tree
+    has no uncommitted changes, `cargo build --all-targets` is green, and `target/` was cleaned at the
+    start of this session, freeing 36.8 GiB — the disk-full condition that spuriously failed 13 policy
+    tests during an earlier release is not present.
+  major_cost_drivers:
+  - >
+    Three source breaks in one release, of which `CompletionRequest::model` is the widest: 26 in-crate
+    struct-literal sites across `src/`, `tests/` and `examples/` must gain the field, and each of the
+    three breaks needs a migration snippet that compiles.
+  - >
+    The `Responder` argument joins four resume entry points, their observed variants and their tree
+    variants, none of which may acquire a second meaning.
+  - >
+    `Progress::step` is pinned by 9 unit tests in `src/resilience.rs` and 7 integration tests in
+    `tests/stall.rs`. Changing what a workspace write resets means every one of those stays true or is
+    deliberately amended, and the failure mode to avoid — stopping a productive run — is worse than
+    the one being fixed.
+  - >
+    Every added public item needs a worked example that compiles, and the question example needs a
+    store, a provider and a responder, so the doc tests are heavier than usual.
+  recommended_scope_change: null

@@ -31,7 +31,7 @@ use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall,
 use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
-use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
+use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store, TodoItem, TodoState};
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
 use crate::tools::git::{Git, GitCmd, GitOutcome};
@@ -49,7 +49,7 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     FsTool, Toolbox, Workspace, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL,
-    READ_SKILL_TOOL, REMEMBER_TOOL, WRITE_FILE_TOOL,
+    READ_SKILL_TOOL, REMEMBER_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -4027,6 +4027,46 @@ pub(crate) type PendingMedia = Vec<crate::provider::Media>;
 #[cfg(not(feature = "media"))]
 pub(crate) type PendingMedia = ();
 
+/// Read a `todo_write` argument object into a plan, or say what was wrong with it.
+///
+/// Strict on purpose, and the error goes back to the model as an observation rather
+/// than out of the run: an item whose state the crate does not understand is an item
+/// whose state nobody knows, and guessing `pending` would show an operator a plan the
+/// agent did not write. The message names the three legal states, so the correction
+/// costs one step and needs no documentation.
+fn parse_todo_items(args: &serde_json::Value) -> std::result::Result<Vec<TodoItem>, String> {
+    let list = args
+        .get("items")
+        .ok_or_else(|| "`items` is required: send the whole plan as a list".to_string())?
+        .as_array()
+        .ok_or_else(|| {
+            "`items` must be a list of {text, state} objects, and the whole plan is sent \
+             every time"
+                .to_string()
+        })?;
+    let mut out = Vec::with_capacity(list.len());
+    for (i, raw) in list.iter().enumerate() {
+        let text = raw
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| format!("item {} needs a non-empty `text`", i + 1))?;
+        let state = raw
+            .get("state")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("item {} (`{text}`) needs a `state`", i + 1))?;
+        let state = TodoState::parse(state).ok_or_else(|| {
+            format!(
+                "item {} (`{text}`) has state `{state}`; use pending, active or done",
+                i + 1
+            )
+        })?;
+        out.push(TodoItem::new(text, state));
+    }
+    Ok(out)
+}
+
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
@@ -4152,6 +4192,62 @@ async fn dispatch(
             Dispatched::seen(
                 format!("remembered {key}"),
                 format!("\n[remember {key}]\n"),
+                ObsKind::Tool,
+                None,
+            )
+        }
+        TODO_WRITE_TOOL => {
+            // Not gated, and deliberately so: this writes into the harness's own
+            // store, not into the workspace, the network or a binary, so there is no
+            // `Act` it could be checked against. Inventing one would put a permission
+            // rule in front of the agent stating its intentions. See the plan section
+            // of `docs/CONTRACT.md`.
+            let items = match parse_todo_items(a) {
+                Ok(items) => items,
+                Err(why) => {
+                    return Ok(Dispatched::go(
+                        "todo error",
+                        format!("\n[todo error] {why}\n"),
+                    ))
+                }
+            };
+            // The store caps the list and reports what it dropped; it writes no trace
+            // row of its own, so both are recorded here, where the step is known.
+            let dropped = store.write_todos(run_id, &items)?;
+            let done = items
+                .iter()
+                .filter(|i| i.state == crate::state::TodoState::Done)
+                .count();
+            store.record_context_event(
+                run_id,
+                &ContextEvent::todo_write(step, format!("{} items, {done} done", items.len())),
+            )?;
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::TodoWrote {
+                    items: items.clone(),
+                },
+            ));
+            info!(run_id, step, items = items.len(), done, dropped, "plan");
+            // The plan back in one line, so the model sees what was actually recorded
+            // rather than assuming its write landed verbatim — the cap is visible.
+            let mut obs = format!("\n[plan {} items, {done} done]\n", items.len());
+            for item in &items {
+                obs.push_str(&format!("- [{}] {}\n", item.state.as_str(), item.text));
+            }
+            if dropped > 0 {
+                obs.push_str(&format!(
+                    "({dropped} item(s) past the {} the plan holds were dropped)\n",
+                    crate::state::TODO_MAX_ITEMS
+                ));
+            }
+            // No target: a plan supersedes nothing and cannot go stale — the next
+            // write replaces it wholesale.
+            Dispatched::seen(
+                format!("plan: {} items, {done} done", items.len()),
+                obs,
                 ObsKind::Tool,
                 None,
             )
@@ -6013,6 +6109,33 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "value": { "type": "string", "description": "The fact, in one or two sentences." }
                 },
                 "required": ["key", "value"]
+            }),
+        },
+        ToolSpec {
+            name: TODO_WRITE_TOOL.to_string(),
+            description: "Write down your plan so the operator can see where you are. Send the \
+                          WHOLE list every time — it replaces the previous one, so include the items \
+                          already done with state \"done\". Keep one item \"active\". This is for the \
+                          human watching; nothing here is checked, and writing a plan does not do \
+                          any of the work in it."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "The whole plan, in order. Replaces any previous plan.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "description": "One step of the plan, in a short phrase." },
+                                "state": { "type": "string", "enum": ["pending", "active", "done"], "description": "Where this step has got to." }
+                            },
+                            "required": ["text", "state"]
+                        }
+                    }
+                },
+                "required": ["items"]
             }),
         },
         ToolSpec {

@@ -440,8 +440,14 @@ versions:
       hand-built contract, and prompt templates give an operator a repeatable way to start a turn.
 
       Repetition detection rides along: an agent that makes the same call three times in a row is
-      not progressing, and the stall machinery added in 0.11.0 already has the signal to notice.
-    detail: outline
+      not progressing, and the stall machinery added in 0.11.0 already has the signal to notice —
+      though not quite the way the outline assumed: a workspace write currently clears the whole
+      window, so the counter this release adds is one a write does not reset.
+
+      The 0.20.0 live-run defect is fixed here, because this is the release that touches the tool
+      layer: a refused git built-in becomes an observation the model adapts to instead of ending the
+      run.
+    detail: specified
     status: planned
   - version: 0.22.0
     outcome: >

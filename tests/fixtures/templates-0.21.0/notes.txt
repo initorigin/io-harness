@@ -1,0 +1,2 @@
+Not a template: the discovery rule is the .md extension and nothing else, so
+this file is here to prove it is skipped.
