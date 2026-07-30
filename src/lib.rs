@@ -293,7 +293,10 @@ pub mod toolchain;
 pub mod tools;
 mod verify;
 
-pub use approve::{ApproveAll, Approver, Decision, DenyAll, Request, StdinApprover};
+pub use approve::{
+    AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Question, Request,
+    Responder, ResponderNone, StdinApprover, StdinResponder,
+};
 pub use config::Config;
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use context::ContextBudget;
@@ -321,10 +324,11 @@ pub use resilience::{Progress, Progressing, RetryPolicy, StallPolicy};
 pub use run::{
     resume, resume_from_stored_policy, resume_from_stored_policy_observed, resume_observed,
     resume_tree, resume_tree_from_stored_policy, resume_tree_from_stored_policy_observed,
-    resume_tree_observed, resume_tree_with_decision, resume_tree_with_decision_observed,
-    resume_with, resume_with_decision, resume_with_decision_observed, resume_with_observed, run,
-    run_observed, run_tree, run_tree_observed, run_with, run_with_observed, RunOutcome, RunResult,
-    SPAWN_TOOL,
+    resume_tree_observed, resume_tree_with_answer, resume_tree_with_answer_observed,
+    resume_tree_with_decision, resume_tree_with_decision_observed, resume_with, resume_with_answer,
+    resume_with_answer_observed, resume_with_decision, resume_with_decision_observed,
+    resume_with_observed, run, run_observed, run_tree, run_tree_observed, run_with,
+    run_with_observed, RunOutcome, RunResult, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
@@ -340,10 +344,11 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use agent::{AgentDef, Agents};
 pub use state::{
-    AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, Pending, PolicyEvent,
-    ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, TodoItem,
-    TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
-    MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
+    AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, Pending,
+    PendingQuestion, PolicyEvent, ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow,
+    StepRecord, Store, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
+    MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS,
+    TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;

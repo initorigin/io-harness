@@ -162,6 +162,19 @@ pub struct TaskContract {
     /// composed through [`Policy::contain`](crate::Policy::contain), which has
     /// bounded every child since 0.5.0 — so registering a roster grants nothing.
     pub agents: crate::agent::Agents,
+    /// Who answers the agent's questions about intent, in this process (0.21.0).
+    ///
+    /// `None` — the default — means nobody does, so a question persists and pauses
+    /// the run for a human, which is the honest default for unattended work.
+    ///
+    /// Carried on the contract rather than passed to every entry point, the way a
+    /// [`Toolbox`](crate::Toolbox) is: adding an argument to `run`, `run_with`,
+    /// `run_tree` and their observed and resume variants would break every existing
+    /// call site to add something almost all of them would pass `None` for.
+    ///
+    /// Behind an `Arc` so a whole tree shares one responder, exactly as it shares one
+    /// [`Approver`](crate::Approver).
+    pub responder: Option<std::sync::Arc<dyn crate::approve::Responder>>,
 }
 
 impl TaskContract {
@@ -189,6 +202,7 @@ impl TaskContract {
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
             skills: None,
             agents: crate::agent::Agents::new(),
+            responder: None,
         }
     }
 
@@ -225,6 +239,7 @@ impl TaskContract {
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
             skills: None,
             agents: crate::agent::Agents::new(),
+            responder: None,
         }
     }
 
@@ -344,6 +359,33 @@ impl TaskContract {
     /// ```
     pub fn with_agents(mut self, agents: crate::agent::Agents) -> Self {
         self.agents = agents;
+        self
+    }
+
+    /// Register who answers the agent's questions about intent (0.21.0).
+    ///
+    /// Without one, a question is persisted and the run pauses with
+    /// [`RunOutcome::AwaitingAnswer`](crate::RunOutcome::AwaitingAnswer) for a human
+    /// to answer through [`resume_with_answer`](crate::resume_with_answer).
+    ///
+    /// An answer is text the model reads. It authorizes nothing: every tool call that
+    /// follows one is checked against the same [`Policy`](crate::Policy) by the same
+    /// code, which is the rule steering has followed since 0.20.0.
+    ///
+    /// ```
+    /// use io_harness::{FixedResponder, TaskContract, Verification};
+    /// use std::sync::Arc;
+    ///
+    /// let contract = TaskContract::workspace("port the parser", "/repo", Verification::None)
+    ///     .with_responder(Arc::new(FixedResponder::new("use io.local.toml")));
+    ///
+    /// assert!(contract.responder.is_some());
+    /// ```
+    pub fn with_responder(
+        mut self,
+        responder: std::sync::Arc<dyn crate::approve::Responder>,
+    ) -> Self {
+        self.responder = Some(responder);
         self
     }
 

@@ -1164,6 +1164,80 @@ fn turn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
     })
 }
 
+/// One question the agent asked the operator, and its answer if it has one (0.21.0).
+///
+/// The mirror of [`Pending`], for the other channel: [`Pending`] is an action awaiting
+/// permission, this is an intent awaiting clarification. An answer here is text the
+/// model reads and authorizes nothing.
+///
+/// ```
+/// use io_harness::{Question, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+///
+/// let id = store.put_question(run, 3, &Question::new("Which config should I edit?")
+///     .with_choices(["io.toml", "io.local.toml"]))?;
+///
+/// // Unanswered, and readable by whatever process is going to answer it.
+/// let q = store.question(id)?.expect("just written");
+/// assert!(!q.resolved && q.answer.is_none());
+/// assert_eq!(q.choices, ["io.toml", "io.local.toml"]);
+///
+/// store.answer_question(id, "io.local.toml", "human")?;
+/// let q = store.question(id)?.unwrap();
+/// assert_eq!(q.answer.as_deref(), Some("io.local.toml"));
+/// assert_eq!(q.answered_by.as_deref(), Some("human"));
+///
+/// // Answering twice is an error, not a silent second write.
+/// assert!(store.answer_question(id, "io.toml", "human").is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingQuestion {
+    /// The question's own id, and what [`resume_with_answer`](crate::resume_with_answer) takes.
+    pub id: i64,
+    /// The run that asked.
+    pub run_id: i64,
+    /// The step it was asked on. The step was not committed, so a resume replays it.
+    pub step: u32,
+    /// What the agent asked.
+    pub question: String,
+    /// What the agent already knew, if it said.
+    pub context: Option<String>,
+    /// Options the agent offered. An answer need not be one of them.
+    pub choices: Vec<String>,
+    /// The answer, once there is one.
+    pub answer: Option<String>,
+    /// `"responder"` if a [`Responder`](crate::Responder) in the run's own process
+    /// answered, `"human"` if the answer arrived through a resume after a pause.
+    /// "The machine decided" and "a person decided" are different facts about a run.
+    pub answered_by: Option<String>,
+    /// Whether it has been answered.
+    pub resolved: bool,
+}
+
+/// Read one `pending_questions` row. One place, so the three queries that read the
+/// table cannot drift in their column order.
+fn question_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingQuestion> {
+    let choices: Option<String> = r.get(5)?;
+    Ok(PendingQuestion {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        step: r.get(2)?,
+        question: r.get(3)?,
+        context: r.get(4)?,
+        choices: choices
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default(),
+        answer: r.get(6)?,
+        answered_by: r.get(7)?,
+        resolved: r.get::<_, i64>(8)? != 0,
+    })
+}
+
 /// Where one item of an agent's plan has got to (0.21.0).
 ///
 /// Three states and no more. A plan is for an operator to read at a glance, and
@@ -3313,6 +3387,112 @@ impl Store {
                 tokens: r.get::<_, i64>(5)? as u64,
             })
         })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- 0.21.0: the question channel ----
+
+    /// Persist a question nobody in this process could answer, and return its id.
+    ///
+    /// The mirror of [`Self::put_pending`], deliberately: a question survives a
+    /// process exit for exactly the reason a pending approval does, and the two stay
+    /// in separate tables because they are separate things — one asks whether an act
+    /// is permitted, the other what the operator meant.
+    pub fn put_question(
+        &self,
+        run_id: i64,
+        step: u32,
+        q: &crate::approve::Question,
+    ) -> Result<i64> {
+        let choices = if q.choices.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&q.choices).unwrap_or_default())
+        };
+        self.conn.execute(
+            "INSERT INTO pending_questions (run_id, step, question, context, choices)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![run_id, step, q.question, q.context, choices],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Read one question by id, answered or not.
+    pub fn question(&self, question_id: i64) -> Result<Option<PendingQuestion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+             FROM pending_questions WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([question_id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(question_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The answer already recorded for this exact question on this run and step, if
+    /// there is one.
+    ///
+    /// A query for a caller reconstructing a run, **not** the mechanism a resume uses.
+    /// The step that asks a question is committed before the run pauses, so a resume
+    /// starts at the step after it and the `ask_question` call is never replayed —
+    /// [`resume_with_answer`](crate::resume_with_answer) delivers the answer as an
+    /// observation instead. See [`Self::questions`] for the whole conversation.
+    pub fn answered_question(
+        &self,
+        run_id: i64,
+        step: u32,
+        question: &str,
+    ) -> Result<Option<PendingQuestion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+             FROM pending_questions
+             WHERE run_id = ?1 AND step = ?2 AND question = ?3 AND resolved = 1
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![run_id, step, question])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(question_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record an answer and mark the question resolved.
+    ///
+    /// `by` is `"responder"` or `"human"`. Answering an already-answered question is
+    /// an [`Error::Resume`] rather than a silent second write, the way
+    /// [`Self::resolve_pending`] refuses a second decision: two answers to one
+    /// question means one of them was never acted on, and a caller should hear which.
+    pub fn answer_question(&self, question_id: i64, answer: &str, by: &str) -> Result<()> {
+        let existing = self.question(question_id)?;
+        match existing {
+            None => {
+                return Err(Error::Resume {
+                    reason: format!("no question {question_id} to answer"),
+                })
+            }
+            Some(q) if q.resolved => {
+                return Err(Error::Resume {
+                    reason: format!("question {question_id} was already answered"),
+                })
+            }
+            Some(_) => {}
+        }
+        self.conn.execute(
+            "UPDATE pending_questions SET answer = ?2, answered_by = ?3, resolved = 1
+             WHERE id = ?1",
+            rusqlite::params![question_id, answer, by],
+        )?;
+        Ok(())
+    }
+
+    /// Every question asked on a run, in the order they were asked.
+    pub fn questions(&self, run_id: i64) -> Result<Vec<PendingQuestion>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, question, context, choices, answer, answered_by, resolved
+             FROM pending_questions WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], question_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
