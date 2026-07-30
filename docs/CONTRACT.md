@@ -116,7 +116,44 @@ Windows as "resource-capped".
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.21.0.
+is fixed as of 0.22.0.
+
+**What a provider-executed search or fetch is, and is not (0.22.0).** A
+`WebAccess` on the contract asks the *provider* to look something up inside the
+completion:
+
+- **The provider dials the URL, so this process never does.** No socket is opened
+  here for a search or a fetch, `Act::Net` is therefore never consulted for one,
+  no `Approver` sees it, and the sandbox is not involved. The boundary is
+  **declared, not enforced by this crate**: `allowed_domains` and
+  `blocked_domains` fill in the vendor's own filter and are enforced there. It is
+  the arrangement already stated below for a stdio MCP server — the harness states
+  a boundary another process enforces, and records what it stated. Enforcement in
+  *this* process means not turning the feature on and using a tool the harness
+  executes itself.
+- **A declaration a vendor cannot carry is refused, not narrowed.** OpenAI's Chat
+  Completions takes an allow-list and has no fetch tool; OpenRouter's web plugin
+  takes no domain filter and has no fetch tool. Either mismatch is an
+  `Error::Config` before the first request is sent, so a `WebAccess` is not
+  automatically portable between providers.
+- **A citation is what the provider returned, and is not verified here.** The
+  crate does not fetch the cited URL, does not check that the page says what the
+  model claimed, and does not rank what it was given. A `citations` row is
+  evidence about the answer, not about the world, and nothing in the run consults
+  one.
+- **A paused turn resumes as a fresh request and may repeat a search.** A
+  `pause_turn` stop reason is a continuation, so the loop takes another step — but
+  the request has been one flattened user turn since 0.1.0 and the crate does not
+  echo the vendor's partial assistant blocks back. The provider may therefore
+  re-run, and re-charge for, a search it already performed. `WebAccess::max_uses`
+  is the only lever against it.
+- **A spawned child inherits the root's declaration and cannot ask for its own.**
+  The spawn tool copies the root contract's `WebAccess` onto the child and never
+  reads one from the spawn arguments, so the model cannot widen it; there is no
+  per-child narrowing either. A plain `Session::turn` has no declaration, because
+  it builds its own contract — `turn_bounded` carries one.
+
+See the [web guide](guide/web.md).
 
 **What a session is, and is not (0.20.0).** A [`Session`] is a conversation over
 the runs, not a second execution path:
@@ -206,9 +243,13 @@ matters more than the figure:
   cache counts *beside* a prompt count that excludes them and the crate
   reconciles that at the wire boundary, so a row does not mean two things
   depending on which vendor wrote it.
-- **`server_tool_requests` is zero everywhere** until the crate declares
-  provider-executed tools (0.22.0). The meter exists before the spending so that
-  adding them is not a second break of `Usage`.
+- **`server_tool_requests` is only as complete as the vendor's reporting.** It is
+  non-zero from 0.22.0, where a provider both executes a tool and reports a count
+  for it — Anthropic does. OpenAI and OpenRouter report no such counter in the
+  shape the crate reads, so the meter is zero on those providers even for a run
+  whose `server_tool_calls` rows say a search ran. A provider-executed request is
+  billed per request rather than per token, and a `PriceTable` prices tokens: no
+  derived cost includes it.
 - A **cost is derived, never stored**, from a price table the operator supplies,
   and is therefore only as right as that table. The crate ships **no prices** and
   requires an as-of date on any table, because it cannot keep a vendor's price
@@ -245,8 +286,10 @@ which paths are read and written, which binaries and tools may be invoked, which
 hosts may be dialled. It does not govern what a thing does once it is running. A
 registered `Tool` executes in the harness's own process with the embedding
 program's privileges; a stdio MCP server is a separate process that, once
-started, dials what it likes. The harness decides what starts, not what a started
-thing then does.
+started, dials what it likes; and a provider-executed search or fetch (0.22.0) is
+dialled by the provider, so no `Act::Net` decision is taken for it at all and its
+domain filter is the vendor's rather than the policy's. The harness decides what
+starts, not what a started thing then does.
 
 **What a command the agent runs is bounded by.** As of 0.17.0 the agent can run
 a command with the `exec` tool. Every call is an `Act::Exec` check on the program

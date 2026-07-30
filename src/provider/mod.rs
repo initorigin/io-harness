@@ -366,6 +366,19 @@ pub struct CompletionRequest {
     /// honestly non-selecting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// (0.22.0) What the provider may look up on the model's behalf, or `None`
+    /// (the default, and every caller before 0.22.0) for nothing.
+    ///
+    /// The provider *executes* this — it runs the search and dials the URL — so
+    /// what reaches the wire is a declaration, not a call this crate makes. A
+    /// provider that ignores the field is honestly non-searching rather than
+    /// broken, which is why it is an `Option` on the request instead of a method
+    /// on the trait.
+    ///
+    /// The requests are billed per request, not per token, and arrive back in
+    /// [`Usage::server_tool_requests`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<crate::web::WebAccess>,
     /// Images the model should see alongside `user`.
     ///
     /// A provider that does not accept images refuses a request carrying any,
@@ -567,6 +580,23 @@ pub struct CompletionResponse {
     /// different facts and averaging the second into a latency report would be
     /// wrong in the direction that flatters the provider.
     pub ttft_ms: Option<u64>,
+    /// (0.22.0) Sources the provider cited, in the order it gave them. Empty
+    /// unless the request declared [`CompletionRequest::web`] and the model
+    /// actually searched.
+    ///
+    /// Recorded per run and step in the `citations` table. Verbatim: this crate
+    /// does not fetch the URL or check that the page says what the model claimed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<crate::web::Citation>,
+    /// (0.22.0) The provider-executed requests this completion reported, whether
+    /// they succeeded and — when they did not — the vendor's own error code.
+    ///
+    /// A failed search arrives inside an HTTP 200 as an error *object*, so a
+    /// provider that returns an empty `citations` and an empty this is reporting
+    /// "found nothing"; one with a failed entry here is reporting "the search
+    /// broke". Keeping them apart is the whole reason this field exists.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub server_tools: Vec<crate::web::ServerToolCall>,
 }
 
 /// Anything that can turn a [`CompletionRequest`] into a [`CompletionResponse`].

@@ -17,8 +17,8 @@ use std::time::Duration;
 use io_harness::pricing::{Price, PriceTable};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    run_with, ApproveAll, Error, Policy, Provider, ProviderCall, RetryPolicy, RunOutcome, Store,
-    TaskContract, Verification, UNKNOWN_MODEL,
+    run_with, ApproveAll, Citation, Error, Policy, Provider, ProviderCall, RetryPolicy, RunOutcome,
+    ServerToolCall, Store, TaskContract, Verification, WebAccess, UNKNOWN_MODEL,
 };
 use serde_json::json;
 
@@ -580,5 +580,282 @@ async fn a_run_that_predates_the_tables_reports_no_calls_rather_than_zero() {
         io_harness::CHECKPOINT_FORMAT,
         7,
         "the accounting tables are additive; a format bump would refuse every 0.17.0 store"
+    );
+}
+
+// ------------------------------------------------------ 0.22.0 F8, and NF6
+//
+// `Usage::server_tool_requests`, the `provider_calls` column behind it and
+// `Price::per_server_tool_request` have all existed since 0.18.0 with no way to
+// reach a non-zero value: nothing declared a tool for a provider to execute, so
+// the counter read zero on every row ever written. 0.22.0's web access is the
+// first thing that moves it, and these are the first tests in the crate's
+// history that assert a non-zero one — and that the money follows it.
+//
+// The pricing arithmetic was already written for this in 0.18.0, which is why
+// nothing in `src/pricing.rs` changed here. That is precisely the claim worth an
+// end-to-end test rather than a comment: a per-request line that is charged in a
+// unit test but lost somewhere between the response and `Store::spend_by_run`
+// would be an under-billed run that no unit test can see.
+
+/// Plays a fixed script of whole responses, one per step. The per-request charge
+/// is a fact about what a response *reported*, not about which tools the model
+/// asked the harness to run, so this drives the loop with responses rather than
+/// with the `Turn` script above.
+struct Searching {
+    replies: Vec<CompletionResponse>,
+    at: AtomicUsize,
+}
+
+impl Searching {
+    fn new(replies: Vec<CompletionResponse>) -> Self {
+        Self {
+            replies,
+            at: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Provider for Searching {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        let i = self.at.fetch_add(1, Ordering::SeqCst);
+        Ok(self.replies.get(i).cloned().unwrap_or(CompletionResponse {
+            text: Some("nothing more to do".into()),
+            finish_reason: Some("end_turn".into()),
+            ..Default::default()
+        }))
+    }
+
+    fn name(&self) -> &str {
+        "scripted"
+    }
+}
+
+/// One turn that spent tokens and reported `requests` provider-executed requests.
+/// The token figures are the same on every turn so that the only thing that can
+/// move the total between the test below and its control is the request count.
+fn searched(requests: u64, finish: &str) -> CompletionResponse {
+    CompletionResponse {
+        text: Some("looking".into()),
+        usage: Some(Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 100,
+            total_tokens: 1_100,
+            server_tool_requests: requests,
+            ..Default::default()
+        }),
+        model: Some("searching-model".into()),
+        finish_reason: Some(finish.into()),
+        server_tools: vec![ServerToolCall::ok("scripted", "web_search")],
+        ..Default::default()
+    }
+}
+
+/// One price table with the per-request line dialled to `per_request`, so pricing
+/// one unchanged trace twice isolates the search charge from the token charge
+/// exactly, rather than leaving it to be inferred from one total.
+fn searching_prices(per_request: u64) -> PriceTable {
+    PriceTable::new("2026-07-29").with(
+        "searching-model",
+        Price {
+            input: 3_000_000,
+            output: 15_000_000,
+            per_server_tool_request: per_request,
+            ..Price::ZERO
+        },
+    )
+}
+
+/// A two-turn run whose every response reports `requests` provider-executed
+/// requests. The first turn pauses mid-search and the second ends, which is the
+/// shape a real search turn has.
+async fn a_searching_run(store: &Store, requests: u64) -> i64 {
+    let dir = tempfile::tempdir().unwrap();
+    let contract =
+        TaskContract::workspace("what shipped this week", dir.path(), Verification::None)
+            .with_max_steps(4)
+            .with_web(WebAccess::search().max_uses(3));
+    let provider = Searching::new(vec![
+        searched(requests, "pause_turn"),
+        searched(requests, "end_turn"),
+    ]);
+    run_with(&contract, &provider, store, &open(), &ApproveAll)
+        .await
+        .unwrap()
+        .run_id
+}
+
+/// F8 — the meter moves and the money is charged. Two reported requests draw the
+/// per-request price twice on top of the tokens, and every step of that is read
+/// back out of the store rather than out of the response.
+#[tokio::test]
+async fn a_run_that_searched_is_charged_the_per_request_price_on_top_of_its_tokens() {
+    let store = Store::memory().unwrap();
+    let run_id = a_searching_run(&store, 1).await;
+
+    // The rows carry the count. Every `provider_calls.server_tool_requests` ever
+    // written before this release held a zero, so an implementation that dropped
+    // the field on the way to SQLite would have passed every test until now.
+    let calls = store.provider_calls(run_id).unwrap();
+    assert_eq!(calls.len(), 2, "two completions, got {calls:?}");
+    let counted: u64 = calls
+        .iter()
+        .filter_map(|c| c.usage)
+        .map(|u| u.server_tool_requests)
+        .sum();
+    assert_eq!(
+        counted, 2,
+        "the store must read back the request count the provider reported"
+    );
+
+    // 1_000 fresh input at $3/M is 3_000 micro-units and 100 output at $15/M is
+    // 1_500; twice over, that is 9_000 for the tokens and nothing else.
+    let tokens_only = store.spend_by_run(&searching_prices(0)).unwrap();
+    assert_eq!(
+        tokens_only[0].cost_micros, 9_000,
+        "the token half of the bill must be the same figure in both tables below"
+    );
+
+    // The same unchanged trace, priced with the per-request line: two searches at
+    // 10_000 micro-units each, and no other line moves. A per-request price that
+    // was charged in `PriceTable::cost_micros` but never reached this query would
+    // show up here as 9_000.
+    let charged = store.spend_by_run(&searching_prices(10_000)).unwrap();
+    assert_eq!(charged[0].cost_micros, 9_000 + 2 * 10_000);
+    assert_eq!(
+        charged[0].usage.server_tool_requests, 2,
+        "the grouping must sum the counter, not only price it"
+    );
+    assert_eq!(
+        charged[0].unpriced_calls, 0,
+        "a group reporting a floor would make the figure above meaningless"
+    );
+}
+
+/// F8's negative control: the identical run reporting zero requests is charged
+/// for its tokens alone, and the per-request price cannot move its total. Without
+/// this, the test above passes against an implementation that adds a flat search
+/// charge to every run that declared web access.
+#[tokio::test]
+async fn the_same_run_reporting_no_searches_is_charged_for_its_tokens_alone() {
+    let store = Store::memory().unwrap();
+    let run_id = a_searching_run(&store, 0).await;
+
+    let counted: u64 = store
+        .provider_calls(run_id)
+        .unwrap()
+        .iter()
+        .filter_map(|c| c.usage)
+        .map(|u| u.server_tool_requests)
+        .sum();
+    assert_eq!(counted, 0);
+
+    assert_eq!(
+        store.spend_by_run(&searching_prices(0)).unwrap()[0].cost_micros,
+        9_000
+    );
+    assert_eq!(
+        store.spend_by_run(&searching_prices(10_000)).unwrap()[0].cost_micros,
+        9_000,
+        "a run that reported no request must not be charged for one"
+    );
+
+    // Both responses still reported a tool call, and the run is still charged
+    // nothing for them: what is billed is the counter the vendor reports, not the
+    // `server_tool_calls` row, and the two are separate facts from separate parts
+    // of the response.
+    assert_eq!(store.server_tool_calls(run_id).unwrap().len(), 2);
+}
+
+/// NF6 — the two web tables carry what the provider returned and nothing the run
+/// knows. A credential and a search phrase are both sitting in this run's goal,
+/// and neither reaches a `citations` or `server_tool_calls` row: there is no
+/// column for either, and no query is reconstructed from the prompt.
+///
+/// The prompt itself is recorded in `steps`, deliberately and since long before
+/// this release. The claim here is narrower and is the one 0.22.0 could have
+/// broken: the tables that exist to record what a *vendor* did hold only what the
+/// vendor said.
+#[tokio::test]
+async fn the_web_tables_carry_no_credential_and_no_prompt_derived_query() {
+    const KEY: &str = "sk-ant-notarealkey-0123456789";
+    const QUERY: &str = "what the kilotonne shipment cost";
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let contract = TaskContract::workspace(
+        format!("find out {QUERY}, authenticating with {KEY}"),
+        dir.path(),
+        Verification::None,
+    )
+    .with_max_steps(2)
+    .with_web(WebAccess::search());
+    let provider = Searching::new(vec![CompletionResponse {
+        text: Some("it cost rather a lot".into()),
+        usage: Some(Usage {
+            prompt_tokens: 1_000,
+            completion_tokens: 100,
+            total_tokens: 1_100,
+            server_tool_requests: 1,
+            ..Default::default()
+        }),
+        model: Some("searching-model".into()),
+        finish_reason: Some("end_turn".into()),
+        citations: vec![Citation {
+            url: "https://docs.rs/io-harness".into(),
+            title: Some("io-harness".into()),
+            cited_text: Some("provider-executed web search".into()),
+        }],
+        server_tools: vec![ServerToolCall::ok("scripted", "web_search")],
+        ..Default::default()
+    }]);
+
+    let run_id = run_with(&contract, &provider, &store, &open(), &ApproveAll)
+        .await
+        .unwrap()
+        .run_id;
+
+    // What was returned is what was stored, field for field.
+    let cited = store.citations(run_id).unwrap();
+    assert_eq!(
+        cited,
+        [Citation {
+            url: "https://docs.rs/io-harness".into(),
+            title: Some("io-harness".into()),
+            cited_text: Some("provider-executed web search".into()),
+        }]
+    );
+    let ran = store.server_tool_calls(run_id).unwrap();
+    assert_eq!(ran, [ServerToolCall::ok("scripted", "web_search")]);
+
+    // Every string either table can hold, gathered in one place so the assertion
+    // is over all of them rather than over the fields this test remembers.
+    let stored: Vec<String> = cited
+        .iter()
+        .flat_map(|c| [Some(c.url.clone()), c.title.clone(), c.cited_text.clone()])
+        .chain(ran.iter().flat_map(|c| {
+            [
+                Some(c.provider.clone()),
+                Some(c.tool.clone()),
+                c.error.clone(),
+            ]
+        }))
+        .flatten()
+        .collect();
+    for field in &stored {
+        assert!(
+            !field.contains(KEY),
+            "a credential reached the web tables: {field}"
+        );
+        assert!(
+            !field.contains(QUERY),
+            "a query reconstructed from the prompt reached the web tables: {field}"
+        );
+    }
+    // The positive half, without which the loop above passes over empty rows: the
+    // provider's own strings did get through.
+    assert!(
+        stored.iter().any(|f| f.contains("docs.rs")),
+        "the rows must still hold what the provider did return, got {stored:?}"
     );
 }

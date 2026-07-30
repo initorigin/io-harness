@@ -1886,6 +1886,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 containment,
                 root,
                 root_run_id: run_id,
+                web: contract.web.clone(),
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
@@ -1964,6 +1965,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 containment,
                 root,
                 root_run_id: run_id,
+                web: contract.web.clone(),
             };
             let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
@@ -1995,7 +1997,51 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
 /// unverified run has exactly the tool surface a verified one has, and a model
 /// that has finished says so by saying something.
 fn finished(contract: &TaskContract, response: &CompletionResponse) -> bool {
-    matches!(contract.verify, Verification::None) && response.tool_calls.is_empty()
+    matches!(contract.verify, Verification::None)
+        && response.tool_calls.is_empty()
+        // 0.22.0 — and the turn actually ended. A provider running a long web
+        // search hands back what it has so far with a *paused* stop reason and no
+        // tool call, which is indistinguishable from a finished answer by the two
+        // conditions above. Ending there would stop an unverified run in the
+        // middle of the search it was told to make.
+        && !paused_turn(response)
+}
+
+/// Did the provider pause this turn rather than end it?
+///
+/// Anthropic says `pause_turn` when a server-executed tool has been running long
+/// enough that it would rather hand back control than hold the connection. It is
+/// a continuation signal, not a finish: the loop takes another step, and the
+/// partial text is an observation like any other.
+///
+/// What this crate does NOT do is echo the vendor's partial assistant blocks back
+/// verbatim — the request has been one flattened user turn since 0.1.0 — so a
+/// paused turn resumes as a fresh request and the provider may repeat a search it
+/// already charged for. `docs/CONTRACT.md` says so.
+fn paused_turn(response: &CompletionResponse) -> bool {
+    response.finish_reason.as_deref() == Some("pause_turn")
+}
+
+/// The note a failed provider-executed call leaves in the observation log, if
+/// this response reported one.
+///
+/// A vendor reports a broken search inside an otherwise successful response, so
+/// without this the model sees an answer with no results and concludes the web
+/// had nothing to say. Naming the failure lets it retry or proceed knowingly.
+fn web_failure_note(response: &CompletionResponse) -> Option<String> {
+    let failed: Vec<String> = response
+        .server_tools
+        .iter()
+        .filter(|c| !c.succeeded())
+        .map(|c| {
+            format!(
+                "{} failed ({})",
+                c.tool,
+                c.error.as_deref().unwrap_or("no reason given")
+            )
+        })
+        .collect();
+    (!failed.is_empty()).then(|| failed.join("; "))
 }
 
 fn record_resume_markers(store: &Store, run_id: i64) -> Result<u32> {
@@ -2341,6 +2387,10 @@ async fn run_from<P: Provider>(
             system: system.clone(),
             user: user.clone(),
             tools: vec![tool.clone()],
+            // 0.22.0 — what the provider may look up, as the contract declared it.
+            // `None` for every contract that declared nothing, which is what the
+            // three built-in providers read as "send the 0.21.0 body".
+            web: contract.web.clone(),
             // Single-file mode has no `view_image` tool, so only the caller's
             // images are in play here.
             #[cfg(feature = "media")]
@@ -2615,6 +2665,8 @@ async fn run_workspace_from<P: Provider>(
             system: system.clone(),
             user: user.clone(),
             tools: tools.clone(),
+            // 0.22.0 — the run's web declaration, unchanged per step.
+            web: contract.web.clone(),
             #[cfg(feature = "media")]
             media: attach_media(contract, pending_media)?,
             ..Default::default()
@@ -2661,6 +2713,21 @@ async fn run_workspace_from<P: Provider>(
         // different can, and it is the half of the stall signal that says the agent
         // is not merely repeating itself but achieving nothing.
         let mut step_changed = false;
+        // 0.22.0 — a provider-executed search that broke reaches the model as an
+        // observation, so it can retry or answer knowingly. Without it the model
+        // sees an answer with no sources and concludes the web had nothing.
+        if let Some(note) = web_failure_note(&response) {
+            ledger.push(Observation::new(
+                step,
+                ObsKind::Message,
+                None,
+                bound(
+                    &format!("\n[step {step}] provider web tool: {note}\n"),
+                    entry_cap,
+                    ObsKind::Message,
+                ),
+            ));
+        }
         if response.tool_calls.is_empty() {
             let said = response.text.clone().unwrap_or_default();
             ledger.push(Observation::new(
@@ -2947,6 +3014,13 @@ struct Tree<'a, P: Provider> {
     /// the ceiling is about the whole tree, so the root's stamp is the only
     /// correct clock. Held here because [`Ledger`] has no store access.
     root_run_id: i64,
+    /// The ROOT contract's web declaration (0.22.0), shared tree-wide for exactly
+    /// the reason `tools`, `skills` and `agents` are: it is the operator's, and a
+    /// child contract the *model* writes must not be able to conjure web access
+    /// its parent was never given — nor to lose the one its parent had, which
+    /// would leave a sub-agent answering from memory on a task that needs the
+    /// current answer.
+    web: Option<crate::web::WebAccess>,
 }
 
 /// Run a workspace contract as the root of an agent tree under `containment`.
@@ -3139,6 +3213,7 @@ pub async fn run_tree_observed<P: Provider>(
         containment,
         root,
         root_run_id: run_id,
+        web: contract.web.clone(),
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
@@ -3328,6 +3403,7 @@ pub async fn resume_tree_observed<P: Provider>(
         containment,
         root,
         root_run_id: run_id,
+        web: contract.web.clone(),
     };
     let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;
@@ -3584,6 +3660,10 @@ fn run_agent<'f, P: Provider>(
                 // child spawned without a definition, which is what every provider
                 // reads as "the model you were built with".
                 model: identity.and_then(|d| d.model.clone()),
+                // 0.22.0 — this agent's declaration, which for a child is the
+                // root's, copied in by `spawn_child` rather than taken from the
+                // spawn arguments.
+                web: contract.web.clone(),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -3624,6 +3704,20 @@ fn run_agent<'f, P: Provider>(
             let mut decisions: Vec<String> = Vec::new();
             let mut calls_json: Vec<String> = Vec::new();
             let mut step_changed = false;
+            // The same note as the flat loop: a broken provider-executed search is
+            // an observation the child can act on, not silence.
+            if let Some(note) = web_failure_note(&response) {
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Message,
+                    None,
+                    bound(
+                        &format!("\n[step {step}] provider web tool: {note}\n"),
+                        entry_cap,
+                        ObsKind::Message,
+                    ),
+                ));
+            }
             if response.tool_calls.is_empty() {
                 let said = response.text.clone().unwrap_or_default();
                 ledger.push(Observation::new(
@@ -4088,6 +4182,11 @@ async fn spawn_child<P: Provider>(
         needle: needle.into(),
     };
     let mut child_contract = TaskContract::workspace(goal, &tree.root, verify);
+    // 0.22.0 — the tree's web declaration, not one the model asked for. A child
+    // inherits exactly what the root was given and has no way to widen it: the
+    // spawn arguments are never read for this, so "give the sub-agent web access"
+    // is unwritable in the JSON the model controls.
+    child_contract.web = tree.web.clone();
     if let Some(n) = a.get("max_steps").and_then(|v| v.as_u64()) {
         child_contract = child_contract.with_max_steps(n as u32);
     }
@@ -5993,6 +6092,10 @@ async fn complete_with_retry<P: Provider>(
             latency_ms,
             &outcome,
         );
+        // 0.22.0 — and what the provider looked up while serving it: the sources
+        // it cited and the server-side calls it ran, including the ones that
+        // failed inside an otherwise successful response.
+        record_web_activity(store, watch, run_id, step, depth, &outcome);
         match outcome {
             Ok(response) => return Ok(response),
             // Only ask again if asking again could answer differently. Before
@@ -6187,6 +6290,49 @@ fn record_provider_call(
     };
     if let Err(e) = store.record_provider_call(run_id, &call) {
         tracing::warn!("could not record the provider call for step {step}: {e}");
+    }
+}
+
+/// Record what the provider looked up while serving one call (0.22.0).
+///
+/// Citations and server-tool rows are written here, beside the `provider_calls`
+/// row, because this is the only place that knows which attempt produced them —
+/// and because a failed attempt that still ran a search was still billed for it.
+///
+/// A store that cannot take a row is logged and swallowed, exactly as the
+/// accounting row is: failing a run the provider answered because a citation
+/// could not be written trades a real answer for a bookkeeping entry.
+fn record_web_activity(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
+    outcome: &Result<CompletionResponse>,
+) {
+    let Ok(response) = outcome else { return };
+    if !response.citations.is_empty() {
+        if let Err(e) = store.record_citations(run_id, step, &response.citations) {
+            tracing::warn!("could not record the citations for step {step}: {e}");
+        }
+    }
+    if response.server_tools.is_empty() {
+        return;
+    }
+    if let Err(e) = store.record_server_tool_calls(run_id, step, &response.server_tools) {
+        tracing::warn!("could not record the server-tool calls for step {step}: {e}");
+    }
+    for call in &response.server_tools {
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            step,
+            depth,
+            EventKind::ServerToolUsed {
+                provider: call.provider.clone(),
+                tool: call.tool.clone(),
+                ok: call.succeeded(),
+            },
+        ));
     }
 }
 

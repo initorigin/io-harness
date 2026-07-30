@@ -141,6 +141,33 @@
 //! [`read_skill`](tools::READ_SKILL_TOOL) as an ordinary policy-checked read,
 //! with no Rust at all.
 //!
+//! **Provider-executed web search and fetch.** [`TaskContract::with_web`] takes a
+//! [`WebAccess`]: search, optionally fetch, a cap on provider-executed requests,
+//! and the hosts to allow or block. One declaration, three translations —
+//! Anthropic's dated server tools, OpenAI's `web_search_options`, OpenRouter's
+//! `web` plugin — and what a vendor cannot express is an [`Error::Config`] before
+//! the request is sent rather than a boundary quietly dropped.
+//! [`WebAccess::from_policy`] derives the domain lists from the run's own
+//! [`Act::Net`] rules. What the model drew on comes back as [`Citation`]s and is
+//! recorded in the trace ([`Store::citations`]), beside a [`ServerToolCall`] row
+//! per provider-executed call so a search that *broke* stays distinguishable from
+//! one that found nothing. The provider dials the URL, so this crate opens no
+//! socket for it: the domain filter is the vendor's and [`Act::Net`] never sees
+//! the connection.
+//!
+//! ```
+//! use io_harness::{TaskContract, Verification, WebAccess};
+//!
+//! let contract = TaskContract::workspace(
+//!     "update the install line to the current release",
+//!     "/path/to/repo",
+//!     Verification::None,
+//! )
+//! .with_web(WebAccess::search().max_uses(3).allow("crates.io"));
+//!
+//! assert!(contract.web.is_some());
+//! ```
+//!
 //! **Context that stays relevant.** Each turn is assembled to fit a stated share
 //! of the token budget ([`ContextBudget`]): superseded observations are
 //! compacted, and an observation a later write invalidated is re-read rather
@@ -189,9 +216,10 @@
 //! unreachable by construction.
 //!
 //! What none of it governs: a stdio MCP server and a registered [`Tool`] both
-//! run outside the sandbox with the privileges of whoever started them. The
-//! harness decides what may *start* and what may be *called* — not what a
-//! started thing then does.
+//! run outside the sandbox with the privileges of whoever started them, and a
+//! provider-executed search or fetch is dialled by the provider, so no
+//! [`Act::Net`] decision is taken for it at all. The harness decides what may
+//! *start* and what may be *called* — not what a started thing then does.
 //!
 //! # Feature flags
 //!
@@ -246,6 +274,7 @@
 //! - [Observability and replay](https://github.com/initorigin/io-harness/blob/main/docs/guide/observability.md)
 //! - [Sessions](https://github.com/initorigin/io-harness/blob/main/docs/guide/sessions.md)
 //! - [Agency](https://github.com/initorigin/io-harness/blob/main/docs/guide/agency.md)
+//! - [Web search and fetch](https://github.com/initorigin/io-harness/blob/main/docs/guide/web.md)
 //! - [Configuration](https://github.com/initorigin/io-harness/blob/main/docs/guide/configuration.md)
 //! - [Accounting](https://github.com/initorigin/io-harness/blob/main/docs/guide/accounting.md)
 //! - [Documents](https://github.com/initorigin/io-harness/blob/main/docs/guide/documents.md)
@@ -293,6 +322,7 @@ pub mod template;
 pub mod toolchain;
 pub mod tools;
 mod verify;
+pub mod web;
 
 pub use approve::{
     AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Question, Request,
@@ -357,3 +387,4 @@ pub use tools::{
     Tool, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, TODO_WRITE_TOOL,
 };
 pub use verify::{ExecGuard, Verification, TEST_BINARY};
+pub use web::{Citation, ServerToolCall, WebAccess};

@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use super::openai_wire::WebFlavor;
 use super::{openai_wire, CompletionRequest, CompletionResponse, Provider};
 use crate::error::{Error, Result};
 
@@ -133,6 +134,9 @@ impl OpenAi {
     ) -> Result<CompletionResponse> {
         #[cfg(feature = "media")]
         super::ensure_media_accepted(self.name(), self.accepts_images(), &request)?;
+        // 0.22.0 — a web declaration this vendor cannot carry is refused here,
+        // before anything is sent, rather than dropped on the way to the wire.
+        openai_wire::ensure_web_supported(self.name(), WebFlavor::OpenAi, &request)?;
         // The TTFT clock starts before the socket is opened, so it measures the
         // wait a caller actually experiences rather than only the model's part.
         let sent = std::time::Instant::now();
@@ -140,10 +144,16 @@ impl OpenAi {
             .client
             .post(&self.endpoint)
             .bearer_auth(&self.api_key)
-            .json(&openai_wire::body(&self.model, &request))
+            .json(&openai_wire::body(&self.model, &request, WebFlavor::OpenAi))
             .send()
             .await?;
 
-        openai_wire::parse_stream_with(super::ensure_success(resp).await?, sent, on_token).await
+        openai_wire::parse_stream_with(
+            super::ensure_success(resp).await?,
+            sent,
+            self.name(),
+            on_token,
+        )
+        .await
     }
 }

@@ -15,7 +15,11 @@ use crate::error::Result;
 /// Build the chat/completions request body for `model` from a neutral request.
 /// `stream_options.include_usage` asks for a usage summary in the final chunk so
 /// the cost budget can be enforced from real token counts.
-pub(crate) fn body(model: &str, request: &CompletionRequest) -> serde_json::Value {
+pub(crate) fn body(
+    model: &str,
+    request: &CompletionRequest,
+    flavor: WebFlavor,
+) -> serde_json::Value {
     // 0.21.0 — the request may name its own model, which is how a named agent
     // definition reaches the wire when a whole tree shares one provider instance.
     // `None` means the provider's configured model, which is every pre-0.21.0 call.
@@ -35,7 +39,7 @@ pub(crate) fn body(model: &str, request: &CompletionRequest) -> serde_json::Valu
         })
         .collect();
 
-    json!({
+    let mut body = json!({
         "model": model,
         "stream": true,
         "stream_options": { "include_usage": true },
@@ -44,6 +48,99 @@ pub(crate) fn body(model: &str, request: &CompletionRequest) -> serde_json::Valu
             { "role": "user", "content": user_content(request) },
         ],
         "tools": tools,
+    });
+    // 0.22.0 — the one key the two vendors spell differently. Added here rather
+    // than in each provider so the shared body stays the shared body, and absent
+    // entirely when nothing was declared.
+    if let Some((key, value)) = web_key(flavor, request.web.as_ref()) {
+        body[key] = value;
+    }
+    body
+}
+
+/// What each OpenAI-wire vendor can actually do with a
+/// [`WebAccess`](crate::WebAccess) declaration.
+///
+/// The two providers share this body builder and differ in exactly one key, and
+/// they differ again in what they support: OpenAI's Chat Completions takes an
+/// allow-list and no block-list and has no fetch tool; OpenRouter's `web` plugin
+/// takes neither list. What is *not* done here is quietly dropping the parts a
+/// vendor cannot express — a boundary silently discarded is worse than no
+/// boundary, because the caller believes in it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum WebFlavor {
+    /// `web_search_options`, with `filters.allowed_domains`.
+    OpenAi,
+    /// A `plugins` entry with the `web` id and its `max_results`.
+    OpenRouter,
+}
+
+/// Refuse a declaration this vendor cannot honour, before anything is sent.
+///
+/// An [`Error::Config`] rather than a provider error, for the same reason
+/// `ensure_media_accepted` is one: nothing went wrong on the wire, a declaration
+/// was paired with a provider that cannot carry it, and that is a decision the
+/// caller made and can fix.
+pub(crate) fn ensure_web_supported(
+    name: &str,
+    flavor: WebFlavor,
+    request: &CompletionRequest,
+) -> Result<()> {
+    let Some(web) = request.web.as_ref().filter(|w| w.enabled()) else {
+        return Ok(());
+    };
+    let refuse = |what: &str, instead: &str| {
+        Err(crate::error::Error::Config(format!(
+            "provider {name:?} cannot {what}; {instead}. No request was sent."
+        )))
+    };
+    if web.fetch {
+        return refuse(
+            "fetch a URL for the model — it has no provider-executed fetch tool",
+            "declare search alone, or run this task on a provider that has one",
+        );
+    }
+    let (allowed, blocked) = web.vendor_filter();
+    match flavor {
+        // OpenAI takes an allow-list and has no block-list, so a block-list that
+        // survived `vendor_filter` (i.e. there was no allow-list to narrow) is a
+        // boundary this vendor cannot enforce.
+        WebFlavor::OpenAi if !blocked.is_empty() => refuse(
+            "block individual domains — its web search filter is allow-list only",
+            "state the hosts to allow instead of the ones to block",
+        ),
+        WebFlavor::OpenRouter if !allowed.is_empty() || !blocked.is_empty() => refuse(
+            "restrict web search to particular domains — its web plugin has no domain filter",
+            "drop the domain lists, or run this task on a provider whose filter can carry them",
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// The vendor-specific key a declaration adds to the shared body, or `None` when
+/// nothing was declared — which is what keeps a non-searching request's body
+/// byte-identical to the one 0.21.0 sent.
+pub(crate) fn web_key(
+    flavor: WebFlavor,
+    web: Option<&crate::web::WebAccess>,
+) -> Option<(&'static str, serde_json::Value)> {
+    let web = web.filter(|w| w.enabled())?;
+    let (allowed, _) = web.vendor_filter();
+    Some(match flavor {
+        WebFlavor::OpenAi => {
+            let mut options = json!({});
+            if !allowed.is_empty() {
+                options["filters"] = json!({ "allowed_domains": allowed });
+            }
+            ("web_search_options", options)
+        }
+        WebFlavor::OpenRouter => {
+            let mut plugin = json!({ "id": "web" });
+            if let Some(uses) = web.max_uses {
+                plugin["max_results"] = json!(uses);
+            }
+            ("plugins", json!([plugin]))
+        }
     })
 }
 
@@ -82,9 +179,10 @@ fn user_content(request: &CompletionRequest) -> serde_json::Value {
 pub(crate) async fn parse_stream_with(
     resp: reqwest::Response,
     sent: std::time::Instant,
+    vendor: &str,
     on_token: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<CompletionResponse> {
-    let mut acc = Accumulator::since(sent);
+    let mut acc = Accumulator::since(sent).from(vendor);
     read_sse(resp, |data| {
         if data == "[DONE]" {
             return true;
@@ -129,6 +227,12 @@ struct Accumulator {
     /// zero.
     sent: Option<std::time::Instant>,
     ttft_ms: Option<u64>,
+    /// 0.22.0 — the sources the vendor annotated its answer with, and what its
+    /// own web plugin did. `vendor` is the provider's name, recorded on each
+    /// server-tool row so a trace says who ran the search.
+    vendor: String,
+    citations: Vec<crate::web::Citation>,
+    server_tools: Vec<crate::web::ServerToolCall>,
 }
 
 impl Accumulator {
@@ -138,6 +242,12 @@ impl Accumulator {
             sent: Some(sent),
             ..Default::default()
         }
+    }
+
+    /// Name the provider whose stream this is, for the server-tool rows.
+    fn from(mut self, vendor: &str) -> Self {
+        self.vendor = vendor.to_string();
+        self
     }
 
     /// The first content-bearing chunk stops the TTFT clock; later ones do not.
@@ -193,9 +303,42 @@ impl Accumulator {
             self.finish_reason = Some(r.to_string());
         }
 
+        // A failed search arrives inside an otherwise successful stream, as an
+        // error object rather than a transport failure. Recording it is what
+        // keeps "the search broke" and "the search found nothing" apart; the
+        // naive parse has no way to tell them apart at all.
+        if let Some(error) = value.get("error").filter(|e| e.is_object()) {
+            let code = error
+                .get("code")
+                .and_then(|c| {
+                    c.as_str()
+                        .map(str::to_string)
+                        .or_else(|| c.as_u64().map(|n| n.to_string()))
+                })
+                .or_else(|| {
+                    error
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "unknown".into());
+            self.server_tools.push(crate::web::ServerToolCall::failed(
+                &self.vendor,
+                "web_search",
+                code,
+            ));
+        }
+
         let Some(delta) = value.pointer("/choices/0/delta") else {
             return;
         };
+
+        // Both OpenAI-wire vendors annotate the message with what they cited.
+        if let Some(annotations) = delta.get("annotations").and_then(|a| a.as_array()) {
+            for annotation in annotations {
+                self.push_citation(annotation);
+            }
+        }
 
         if let Some(content) = delta.get("content").and_then(|c| c.as_str()) {
             self.mark_first_token();
@@ -216,6 +359,57 @@ impl Accumulator {
                     entry.1.push_str(args);
                 }
             }
+        }
+    }
+
+    /// One `url_citation` annotation, in the shape both vendors send it: the url
+    /// lives one level down, under a key named for the annotation's type.
+    ///
+    /// A page cited on five sentences is one source, so a url already recorded is
+    /// not recorded again — a trace repeating the same row is a trace nobody
+    /// reads.
+    fn push_citation(&mut self, annotation: &serde_json::Value) {
+        let cite = annotation.get("url_citation").unwrap_or(annotation);
+        let Some(url) = cite
+            .get("url")
+            .and_then(|u| u.as_str())
+            .filter(|u| !u.is_empty())
+        else {
+            return;
+        };
+        let text = |key: &str| {
+            cite.get(key)
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        // OpenRouter carries the quoted passage as `content`; OpenAI sends
+        // offsets into its own answer and no quote, which stays `None` rather
+        // than being reconstructed from indices into text that may have been
+        // truncated.
+        let found = crate::web::Citation {
+            url: url.to_string(),
+            title: text("title"),
+            cited_text: text("content"),
+        };
+        // One page is one source however many sentences cite it — and a later
+        // mention still fills in a title or a quote the first one lacked.
+        if let Some(seen) = self.citations.iter_mut().find(|c| c.url == found.url) {
+            seen.title = seen.title.take().or(found.title);
+            seen.cited_text = seen.cited_text.take().or(found.cited_text);
+            return;
+        }
+        self.citations.push(found);
+        // A vendor that annotated the answer ran a search to do it. Recording it
+        // here rather than from a usage counter means a provider that reports no
+        // counter still leaves a row saying a search happened.
+        if !self
+            .server_tools
+            .iter()
+            .any(|c| c.succeeded() && c.tool == "web_search")
+        {
+            self.server_tools
+                .push(crate::web::ServerToolCall::ok(&self.vendor, "web_search"));
         }
     }
 
@@ -241,6 +435,8 @@ impl Accumulator {
             model: self.model,
             finish_reason: self.finish_reason,
             ttft_ms: self.ttft_ms,
+            citations: self.citations,
+            server_tools: self.server_tools,
         }
     }
 }
@@ -331,12 +527,204 @@ mod tests {
             }],
             ..Default::default()
         };
-        let b = body("some/model", &req);
+        let b = body("some/model", &req, WebFlavor::OpenAi);
         assert_eq!(b["model"], "some/model");
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["content"], "hi");
         assert_eq!(b["tools"][0]["function"]["name"], "grep");
         assert_eq!(b["stream_options"]["include_usage"], true);
+    }
+}
+
+/// 0.22.0 — the two web keys these vendors spell differently, what each refuses,
+/// and the citations both annotate their answers with.
+#[cfg(test)]
+mod web_wire {
+    use super::*;
+    use crate::web::{Citation, ServerToolCall, WebAccess};
+
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn req(web: Option<WebAccess>) -> CompletionRequest {
+        CompletionRequest {
+            system: "sys".into(),
+            user: "what shipped this week".into(),
+            web,
+            ..Default::default()
+        }
+    }
+
+    /// F1 — OpenAI's half: `web_search_options`, with the allow-list as a filter.
+    #[test]
+    fn openai_gets_web_search_options_with_its_filter() {
+        let b = body(
+            "gpt-x",
+            &req(Some(WebAccess::search().allow("docs.rs"))),
+            WebFlavor::OpenAi,
+        );
+        assert_eq!(
+            b["web_search_options"],
+            json!({"filters": {"allowed_domains": ["docs.rs"]}})
+        );
+        assert!(b.get("plugins").is_none(), "that is OpenRouter's key");
+
+        // No filter declared is an empty options object, not an empty allow-list:
+        // an empty list would read to the vendor as allow-nothing.
+        let open = body("gpt-x", &req(Some(WebAccess::search())), WebFlavor::OpenAi);
+        assert_eq!(open["web_search_options"], json!({}));
+    }
+
+    /// F1 — OpenRouter's half: a `web` plugin carrying the cap.
+    #[test]
+    fn openrouter_gets_a_web_plugin_with_its_cap() {
+        let b = body(
+            "vendor/model",
+            &req(Some(WebAccess::search().max_uses(3))),
+            WebFlavor::OpenRouter,
+        );
+        assert_eq!(b["plugins"], json!([{"id": "web", "max_results": 3}]));
+        assert!(
+            b.get("web_search_options").is_none(),
+            "that is OpenAI's key"
+        );
+    }
+
+    /// NF3, the negative control: no declaration, no key, and the 0.21.0 body.
+    #[test]
+    fn no_declaration_adds_no_key_to_either_body() {
+        for flavor in [WebFlavor::OpenAi, WebFlavor::OpenRouter] {
+            let b = body("m", &req(None), flavor);
+            assert!(b.get("web_search_options").is_none());
+            assert!(b.get("plugins").is_none());
+            // And exactly the keys 0.21.0 sent, in case a future key is added
+            // without a thought for what an untouched request should look like.
+            let keys: Vec<&str> = b.as_object().unwrap().keys().map(String::as_str).collect();
+            assert_eq!(
+                keys,
+                ["messages", "model", "stream", "stream_options", "tools"]
+            );
+        }
+    }
+
+    /// A declaration a vendor cannot carry is refused before anything is sent,
+    /// rather than dropped on the way to the wire. The boundary a caller believes
+    /// in is the one thing that must not be silently discarded.
+    #[test]
+    fn a_declaration_a_vendor_cannot_carry_is_refused_by_name() {
+        let cases = [
+            (
+                WebFlavor::OpenAi,
+                WebAccess::search().with_fetch(),
+                "fetch a URL",
+            ),
+            (
+                WebFlavor::OpenAi,
+                WebAccess::search().block("evil.test"),
+                "allow-list only",
+            ),
+            (
+                WebFlavor::OpenRouter,
+                WebAccess::search().allow("docs.rs"),
+                "no domain filter",
+            ),
+            (
+                WebFlavor::OpenRouter,
+                WebAccess::search().block("evil.test"),
+                "no domain filter",
+            ),
+        ];
+        for (flavor, web, expected) in cases {
+            let err = ensure_web_supported("openai-ish", flavor, &req(Some(web)))
+                .expect_err("this vendor cannot carry that declaration");
+            let message = err.to_string();
+            assert!(
+                message.contains(expected) && message.contains("openai-ish"),
+                "the refusal must name the provider and what it cannot do, got: {message}"
+            );
+        }
+
+        // The controls: what each vendor CAN carry is not refused, and neither is
+        // a request that declares nothing.
+        ensure_web_supported("openai", WebFlavor::OpenAi, &req(Some(WebAccess::search())))
+            .expect("plain search is supported");
+        ensure_web_supported(
+            "openai",
+            WebFlavor::OpenAi,
+            &req(Some(WebAccess::search().allow("docs.rs"))),
+        )
+        .expect("an allow-list is supported");
+        ensure_web_supported(
+            "openrouter",
+            WebFlavor::OpenRouter,
+            &req(Some(WebAccess::search().max_uses(2))),
+        )
+        .expect("a capped search is supported");
+        ensure_web_supported("openai", WebFlavor::OpenAi, &req(None)).expect("nothing declared");
+    }
+
+    /// F3 — annotations become citations, deduplicated, and the search that
+    /// produced them is recorded even though this wire reports no counter for it.
+    #[test]
+    fn annotations_become_citations_and_a_recorded_search() {
+        let mut acc = Accumulator::default().from("openrouter");
+        acc.ingest(&json!({"choices":[{"delta":{"content":"0.22.0 adds web search"}}]}));
+        acc.ingest(&json!({"choices":[{"delta":{"annotations":[
+            {"type":"url_citation","url_citation":{"url":"https://docs.rs/io-harness",
+             "title":"io-harness","content":"provider-executed web search"}},
+            {"type":"url_citation","url_citation":{"url":"https://docs.rs/io-harness",
+             "title":"io-harness"}}]}}]}));
+        acc.ingest(&json!({"choices":[{"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":9,"completion_tokens":5,"total_tokens":14}}));
+
+        let out = acc.finish();
+        assert_eq!(
+            out.citations,
+            vec![Citation {
+                url: "https://docs.rs/io-harness".into(),
+                title: Some("io-harness".into()),
+                cited_text: Some("provider-executed web search".into()),
+            }],
+            "one page cited twice is one source"
+        );
+        assert_eq!(
+            out.server_tools,
+            vec![ServerToolCall::ok("openrouter", "web_search")]
+        );
+    }
+
+    /// F4 — the error object inside an otherwise successful stream.
+    #[test]
+    fn an_error_object_in_a_200_stream_is_a_failed_call() {
+        let mut acc = Accumulator::default().from("openrouter");
+        acc.ingest(&json!({"choices":[{"delta":{"content":"I could not search"}}]}));
+        acc.ingest(&json!({"error":{"code":"web_search_unavailable",
+                                    "message":"the search backend is down"}}));
+        acc.ingest(&json!({"usage":{"prompt_tokens":4,"completion_tokens":4,"total_tokens":8}}));
+
+        let out = acc.finish();
+        assert_eq!(
+            out.server_tools,
+            vec![ServerToolCall::failed(
+                "openrouter",
+                "web_search",
+                "web_search_unavailable"
+            )]
+        );
+        assert!(out.citations.is_empty());
+        // The stream still parsed: a failed search is a fact about the answer,
+        // not a transport failure, and the run keeps its text and its usage.
+        assert_eq!(out.text.as_deref(), Some("I could not search"));
+        assert_eq!(out.usage.unwrap().total_tokens, 8);
+    }
+
+    /// The negative control: a stream with no web activity reports none.
+    #[test]
+    fn a_stream_with_no_web_activity_reports_none() {
+        let mut acc = Accumulator::default().from("openai");
+        acc.ingest(&json!({"choices":[{"delta":{"content":"hello"}}]}));
+        acc.ingest(&json!({"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}));
+        let out = acc.finish();
+        assert!(out.citations.is_empty());
+        assert!(out.server_tools.is_empty());
     }
 }
 
@@ -356,7 +744,7 @@ mod media_wire {
             media: vec![Media::image("image/jpeg", &[1, 2, 3]).unwrap()],
             ..Default::default()
         };
-        let b = body("some/model", &req);
+        let b = body("some/model", &req, WebFlavor::OpenAi);
         let content = &b["messages"][1]["content"];
         assert!(content.is_array(), "content must be parts, got {content}");
         assert_eq!(content[0]["type"], "text");
@@ -382,6 +770,7 @@ mod media_wire {
                 user: "no picture".into(),
                 ..Default::default()
             },
+            WebFlavor::OpenAi,
         );
         assert_eq!(b["messages"][1]["content"], "no picture");
     }
@@ -397,7 +786,7 @@ mod media_wire {
             ],
             ..Default::default()
         };
-        let content = body("m", &req)["messages"][1]["content"].clone();
+        let content = body("m", &req, WebFlavor::OpenAi)["messages"][1]["content"].clone();
         assert_eq!(content.as_array().map(Vec::len), Some(3));
         assert_eq!(content[1]["image_url"]["url"], "data:image/png;base64,AQ==");
         assert_eq!(

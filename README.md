@@ -25,7 +25,7 @@ the language the project is written in is not the harness's business.
 
 ```toml
 [dependencies]
-io-harness = "0.20"
+io-harness = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -124,6 +124,14 @@ your program already does, or point the harness at MCP servers over stdio or
 streamable HTTP. Skills are markdown instruction files that shape how the agent
 approaches a class of task, with no Rust at all.
 
+**Provider-executed web search and fetch.** `TaskContract::with_web` declares what
+the provider may look up on the agent's behalf — search, optionally fetch, a cap on
+requests, and the hosts to allow or block — and each vendor translates that one
+declaration into its own shape, refusing outright what it cannot express. The
+sources an answer drew on are rows in the trace. The provider dials the URL, so
+this crate opens no socket for it and the domain filter is the vendor's, not the
+policy's: that bound is stated in full in the [web guide](docs/guide/web.md).
+
 **Context that stays relevant.** Each turn is assembled to fit a stated share of
 the token budget: superseded observations are compacted, and an observation a
 later write invalidated is re-read rather than trusted. Durable memory keyed to
@@ -176,6 +184,7 @@ the caller reads the file, before the run, once.
 | [Observability and replay](docs/guide/observability.md) | Observers, events, outcome records, deterministic replay |
 | [Sessions](docs/guide/sessions.md) | Durable conversations: a turn is a run, token streaming, steering, branching |
 | [Agency](docs/guide/agency.md) | A visible plan, a question about intent, named agents, prompt templates |
+| [Web search and fetch](docs/guide/web.md) | Provider-executed lookups, the three vendor translations, citations, and where the boundary is not |
 | [Configuration](docs/guide/configuration.md) | One `io.toml`, four layered scopes, projected onto the typed API |
 | [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |

@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 use crate::policy::Policy;
 use crate::pricing::{PriceTable, Spend};
 use crate::provider::Usage;
+use crate::web::{Citation, ServerToolCall};
 
 /// The group a call with no recorded model falls into. Named rather than
 /// silently merged into a neighbour, and counted as unpriced.
@@ -2295,6 +2296,43 @@ impl Store {
              );",
         )?;
 
+        // 0.22.0 — provider-executed web search and fetch. Two more additive
+        // tables and, for the same reasons as the two above, NOT a
+        // `CHECKPOINT_FORMAT` bump: no checkpoint layout changed and a 0.21.0
+        // binary never queries either of them.
+        //
+        // `citations` is what the provider said it drew on, per run and step. The
+        // crate does not fetch the url or check the page, so these rows are a
+        // record of what was returned rather than of what is true.
+        //
+        // `server_tool_calls` is what the provider *ran*, and exists because a
+        // failed search arrives inside an HTTP 200 as an error object: without a
+        // row carrying `error`, a search that broke and a search that found
+        // nothing are the same empty result set, which is the quiet failure this
+        // release exists to prevent.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS citations (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id     INTEGER NOT NULL,
+                 step       INTEGER NOT NULL,
+                 url        TEXT NOT NULL,
+                 title      TEXT,
+                 cited_text TEXT,
+                 cited_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS citations_run ON citations(run_id, step);
+             CREATE TABLE IF NOT EXISTS server_tool_calls (
+                 id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id   INTEGER NOT NULL,
+                 step     INTEGER NOT NULL,
+                 provider TEXT NOT NULL,
+                 tool     TEXT NOT NULL,
+                 error    TEXT,
+                 ran_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS server_tool_calls_run ON server_tool_calls(run_id, step);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -3604,6 +3642,183 @@ impl Store {
             if let Some(state) = TodoState::parse(&state) {
                 out.push(TodoItem { text, state });
             }
+        }
+        Ok(out)
+    }
+
+    // ---- 0.22.0: what the provider looked up ----
+
+    /// Record the sources a completion cited, at the step that made it.
+    ///
+    /// Verbatim, and without judgement: this crate never fetches the url, so a row
+    /// says the provider cited a page, not that the page says what the model
+    /// claimed. A url already recorded for the same run and step is not written
+    /// twice — a vendor repeats it on every sentence it supports.
+    ///
+    /// ```
+    /// use io_harness::{Citation, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("what shipped this week", "anthropic")?;
+    /// store.record_citations(run, 1, &[Citation {
+    ///     url: "https://docs.rs/io-harness".into(),
+    ///     title: Some("io-harness".into()),
+    ///     cited_text: None,
+    /// }])?;
+    ///
+    /// // Readable afterwards from the store alone, which is what makes "where did
+    /// // that claim come from" answerable once the process that ran it is gone.
+    /// let cited = store.citations(run)?;
+    /// assert_eq!(cited.len(), 1);
+    /// assert_eq!(cited[0].url, "https://docs.rs/io-harness");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn record_citations(&self, run_id: i64, step: u32, citations: &[Citation]) -> Result<()> {
+        if citations.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO citations (run_id, step, url, title, cited_text)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM citations WHERE run_id = ?1 AND step = ?2 AND url = ?3
+                 )",
+            )?;
+            for citation in citations {
+                stmt.execute(rusqlite::params![
+                    run_id,
+                    step,
+                    &citation.url,
+                    &citation.title,
+                    &citation.cited_text,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every source this run cited, in the order the steps ran.
+    ///
+    /// Empty for a run that never searched — which is every run before a
+    /// [`WebAccess`](crate::WebAccess) declaration, and every run whose model
+    /// answered without looking anything up.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("a task with no searching in it", "anthropic")?;
+    /// // Nothing cited is an empty list, not an error: a run that answered from
+    /// // what it already knew is a normal run.
+    /// assert!(store.citations(run)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn citations(&self, run_id: i64) -> Result<Vec<Citation>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT url, title, cited_text FROM citations WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(Citation {
+                url: r.get(0)?,
+                title: r.get(1)?,
+                cited_text: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Record the provider-executed calls a completion reported.
+    ///
+    /// Both kinds: the ones that worked and the ones that failed inside an
+    /// otherwise successful response. Keeping the failures is the point — a vendor
+    /// reports a broken search as an error object rather than an HTTP status, so a
+    /// trace without these rows cannot tell a search that broke from one that
+    /// found nothing.
+    ///
+    /// ```
+    /// use io_harness::{ServerToolCall, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("what shipped this week", "anthropic")?;
+    /// store.record_server_tool_calls(run, 1, &[
+    ///     ServerToolCall::ok("anthropic", "web_search"),
+    ///     ServerToolCall::failed("anthropic", "web_search", "max_uses_exceeded"),
+    /// ])?;
+    ///
+    /// let calls = store.server_tool_calls(run)?;
+    /// assert_eq!(calls.len(), 2);
+    /// assert!(calls[0].succeeded());
+    /// assert_eq!(calls[1].error.as_deref(), Some("max_uses_exceeded"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn record_server_tool_calls(
+        &self,
+        run_id: i64,
+        step: u32,
+        calls: &[ServerToolCall],
+    ) -> Result<()> {
+        if calls.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO server_tool_calls (run_id, step, provider, tool, error)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+            )?;
+            for call in calls {
+                stmt.execute(rusqlite::params![
+                    run_id,
+                    step,
+                    &call.provider,
+                    &call.tool,
+                    &call.error,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Every provider-executed call this run made, in the order they were made.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("a task with no searching in it", "openai")?;
+    /// assert!(store.server_tool_calls(run)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn server_tool_calls(&self, run_id: i64) -> Result<Vec<ServerToolCall>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT provider, tool, error FROM server_tool_calls WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(ServerToolCall {
+                provider: r.get(0)?,
+                tool: r.get(1)?,
+                error: r.get(2)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }
