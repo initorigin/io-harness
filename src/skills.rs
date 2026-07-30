@@ -331,7 +331,7 @@ fn default_name(file: &Path) -> String {
 ///
 /// Supports `key: value`, YAML block scalars (`key: >` / `key: |`), and plain
 /// continuation lines, since a `description:` long enough to wrap is common.
-fn split_front_matter(text: &str) -> (Option<String>, Option<String>, &str) {
+pub(crate) fn split_front_matter(text: &str) -> (Option<String>, Option<String>, &str) {
     let stripped = text
         .strip_prefix("---\n")
         .or_else(|| text.strip_prefix("---\r\n"));
@@ -426,7 +426,7 @@ fn split_front_matter(text: &str) -> (Option<String>, Option<String>, &str) {
 /// The first line of a body that reads as prose, for a file with no
 /// `description`. Markdown heading markers and blockquote markers are stripped
 /// so a body opening with `# Migrations` describes itself as "Migrations".
-fn first_prose_line(body: &str) -> Option<String> {
+pub(crate) fn first_prose_line(body: &str) -> Option<String> {
     body.lines()
         .map(|l| l.trim().trim_start_matches(['#', '>']).trim())
         .find(|l| !l.is_empty())
@@ -434,7 +434,7 @@ fn first_prose_line(body: &str) -> Option<String> {
 }
 
 /// Keep a description to one line's worth of characters, at a char boundary.
-fn clamp(s: &str, cap: usize) -> String {
+pub(crate) fn clamp(s: &str, cap: usize) -> String {
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.len() <= cap {
         return one_line;

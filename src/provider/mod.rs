@@ -347,6 +347,25 @@ pub struct CompletionRequest {
     pub user: String,
     /// Tools the model may call.
     pub tools: Vec<ToolSpec>,
+    /// (0.21.0) Override the model for this one request, or `None` to use the
+    /// model the provider was constructed with.
+    ///
+    /// This exists because a named agent definition
+    /// ([`AgentDef`](crate::AgentDef)) carries a model, and a whole tree of agents
+    /// shares one provider instance — so "search with the cheap model, write with
+    /// the strong one" had no way onto the wire. `None` is what every caller before
+    /// 0.21.0 meant and is what the run loop sends unless a definition says
+    /// otherwise.
+    ///
+    /// It is a *request*, not a fact. A vendor may substitute or alias what it
+    /// serves, so what actually answered is
+    /// [`CompletionResponse::model`](CompletionResponse::model) — read that, not
+    /// this, when the question is what you paid for.
+    ///
+    /// An out-of-tree [`Provider`] that ignores this field keeps working and is
+    /// honestly non-selecting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Images the model should see alongside `user`.
     ///
     /// A provider that does not accept images refuses a request carrying any,

@@ -1,0 +1,39 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.32s
+     Running `target/debug/examples/agency_live`
+
+=== a plan, and a question ===
+  the agent wrote a plan (3 items):
+    [active] Determine which text file the operator means
+    [pending] Append `reviewed` to the selected file
+    [pending] Verify the change and finish
+  the agent wrote a plan (3 items):
+    [active] Determine which text file the operator means
+    [pending] Append `reviewed` to the selected file
+    [pending] Verify the change and finish
+  [event] question asked: Which file should I append `reviewed` to?
+  the agent asked: Which file should I append `reviewed` to?
+  it offered: ["alpha.txt", "beta.txt"]
+  answering: beta.txt
+  the agent wrote a plan (3 items):
+    [done] Determine which text file the operator means
+    [done] Append `reviewed` to the selected file
+    [active] Verify the change and finish
+  the agent wrote a plan (3 items):
+    [done] Determine which text file the operator means
+    [done] Append `reviewed` to the selected file
+    [done] Verify the change and finish
+  outcome: StepCapReached { steps: 8 }
+  alpha.txt: "alpha\n"
+  beta.txt:  "beta\nreviewed\n"
+  OK — the question was asked and the answer decided the edit
+  read the plan from a second connection 4 time(s) mid-run
+  final plan in the store (3 items):
+    [done] Determine which text file the operator means
+    [done] Append `reviewed` to the selected file
+    [done] Verify the change and finish
+  OK — the plan and the question are both durable
+
+=== two named agents on two models ===
+  searcher -> anthropic/claude-haiku-4.5
+  author   -> anthropic/claude-sonnet-4
+Error: Provider { kind: Request, status: Some(402), retry_after: None, message: "{\"error\":{\"message\":\"This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 59266. To increase, visit https://openrouter.ai/settings/credits and add more credits\",\"code\":402,\"metadata\":{\"limit_source\":\"openrouter_credits\",\"remedy_hint\":\"Add credits at https://openrouter.ai/settings/credits, or lower max_tokens / prompt size to fit your remaining balance.\",\"provider_name\":null,\"previous_errors\":[{\"code\":402,\"message\":\"This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 59266. To increase, visit https://openrouter.ai/settings/credits and add more credits\"},{\"code\":402,\"message\":\"This request requires more credits, or fewer max_tokens. You requested up to 64000 tokens, but can only afford 59266. To increase, visit https://openrouter.ai/settings/credits and add more credits\"}]}},\"user_id\":\"user_3DDhZNhG1Phj9LiqoSSOwJnL7tz\"}" }

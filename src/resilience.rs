@@ -228,11 +228,44 @@ pub enum Progressing {
 
 /// Tracks whether an agent is getting anywhere across steps.
 ///
-/// A stall needs BOTH halves: no change to the workspace, AND a tool call this
-/// window has already seen. One alone is not enough — a legitimate exploration
-/// phase changes nothing either, and a run that greps four different patterns is
-/// working, not stuck. What distinguished the recorded failure is that it was doing
-/// the same thing over and over while nothing moved.
+/// Two signals, and either one is enough:
+///
+/// 1. **The window** (0.11.0): no change to the workspace AND a tool call this window
+///    has already seen. Both halves are needed — a legitimate exploration phase
+///    changes nothing either, and a run that greps four different patterns is
+///    working, not stuck.
+/// 2. **Bare repetition** (0.21.0): the *same* call `window` times in a row,
+///    whether or not the workspace moved.
+///
+/// The second exists because the first has a blind spot that a live run walked into.
+/// A workspace write resets the window completely, so an agent that repeats one
+/// useless call while anything at all lands on disk each step never trips signal 1 —
+/// it just spends its step budget. Repeating one identical call `window` times is not
+/// progress even if something moved, so it is now caught on its own.
+///
+/// Note what signal 2 does *not* widen: it counts **consecutive identical**
+/// signatures only. Two different calls alternating, or the same call with different
+/// arguments, are left alone, because both are shapes a working agent takes.
+///
+/// ```
+/// use io_harness::{Progress, Progressing, StallPolicy};
+///
+/// let policy = StallPolicy::default(); // window 3, one nudge
+/// let mut progress = Progress::new();
+///
+/// // 0.21.0's addition: the same call three times over, each of which wrote
+/// // something. Signal 1 never fires here — every `true` clears its window — and
+/// // before this release the run paid for the loop until its step cap.
+/// assert_eq!(progress.step(policy, true, "write out.txt"), Progressing::Fine);
+/// assert_eq!(progress.step(policy, true, "write out.txt"), Progressing::Fine);
+/// assert_eq!(progress.step(policy, true, "write out.txt"), Progressing::Replan);
+///
+/// // Different calls that each write are progress, and stay untouched.
+/// let mut working = Progress::new();
+/// for call in ["write a.txt", "write b.txt", "write c.txt", "write d.txt"] {
+///     assert_eq!(working.step(policy, true, call), Progressing::Fine);
+/// }
+/// ```
 ///
 /// ```
 /// use io_harness::{Progress, Progressing, StallPolicy};
@@ -263,6 +296,11 @@ pub struct Progress {
     seen: Vec<String>,
     unproductive: u32,
     replans: u32,
+    /// The previous step's signature, and how many times in a row it has now been
+    /// seen (0.21.0). Deliberately NOT cleared by a productive step: that is the
+    /// whole difference between this signal and the window above it.
+    last: Option<String>,
+    in_a_row: u32,
 }
 
 impl Progress {
@@ -286,6 +324,28 @@ impl Progress {
         if policy.window == 0 {
             return Progressing::Fine;
         }
+
+        // Signal 2 (0.21.0) — bare repetition, counted before `changed` is consulted,
+        // because a workspace write is exactly what used to hide this shape. The
+        // threshold is `window` rather than a field of its own: "the same call three
+        // times in a row" and "three unproductive steps" are one patience setting,
+        // and splitting them would add a knob whose only correct value is the other
+        // knob's.
+        if self.last.as_deref() == Some(signature) {
+            self.in_a_row += 1;
+        } else {
+            self.last = Some(signature.to_string());
+            self.in_a_row = 1;
+        }
+        if self.in_a_row >= policy.window {
+            // Reset both signals, for the reason the window resets below: an agent
+            // told to change approach gets a clean slate to do it in.
+            self.reset_window();
+            self.last = None;
+            self.in_a_row = 0;
+            return self.escalate(policy);
+        }
+
         if changed {
             // Progress resets everything. An agent that got somewhere is allowed to
             // repeat itself on the way to getting somewhere else.
@@ -305,8 +365,21 @@ impl Progress {
         // Stalled. Reset the window either way, so a replanned agent gets a clean
         // `window` steps to show it changed approach rather than being condemned by
         // the history it was just told to abandon.
+        self.reset_window();
+        self.escalate(policy)
+    }
+
+    /// Clear the window's state. Split out in 0.21.0 so the two signals reset
+    /// identically instead of by two copies of the same three lines.
+    fn reset_window(&mut self) {
         self.seen.clear();
         self.unproductive = 0;
+    }
+
+    /// Nudge once per `max_replans`, then end the run. One place, so both signals
+    /// escalate on the same terms — an agent that stalls twice will not be talked out
+    /// of it by a third message.
+    fn escalate(&mut self, policy: StallPolicy) -> Progressing {
         if self.replans < policy.max_replans {
             self.replans += 1;
             Progressing::Replan
@@ -322,9 +395,16 @@ impl Progress {
     /// the 0.10.0 ledger like any other, so it is subject to the same budget — and
     /// it carries no target, so nothing can supersede it away.
     pub fn replan_directive(&self, window: u32, tried: &[String]) -> String {
+        // One wording for both signals. The verdict does not say which of the two
+        // fired, and it should not have to: what the model needs to hear is that it is
+        // going in circles and what it has already tried, and `tried` below carries
+        // the specifics either way. Saying "changed nothing in the workspace"
+        // unconditionally was accurate until 0.21.0 and is not any more — bare
+        // repetition is now caught while the workspace does move.
         let mut out = format!(
-            "\n[no progress] The last {window} steps changed nothing in the workspace, and you have \
-             repeated a tool call you already made. Whatever you are doing is not working.\n"
+            "\n[no progress] You have made the same tool call {window} times over, or gone \
+             {window} steps repeating yourself without changing anything in the workspace. \
+             Whatever you are doing is not working.\n"
         );
         if !tried.is_empty() {
             out.push_str("Already tried, to no effect:\n");
@@ -466,7 +546,10 @@ mod tests {
     fn the_directive_names_what_was_tried() {
         let p = Progress::new();
         let d = p.replan_directive(3, &["read a".into(), "read b".into()]);
-        assert!(d.contains("last 3 steps changed nothing"));
+        // Reworded in 0.21.0 to cover both signals: bare repetition is caught while
+        // the workspace does move, so the old flat "changed nothing" opening was no
+        // longer true of every case that reaches here.
+        assert!(d.contains("same tool call 3 times over"));
         assert!(d.contains("- read a") && d.contains("- read b"));
         assert!(d.contains("Change approach"));
         // No target, so the assembler can never supersede it away.

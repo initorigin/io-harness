@@ -51,6 +51,11 @@ const GUIDES: &[(&str, bool)] = &[
     // authorization, a streamed delta is provisional until the completion returns,
     // and one session driven by two processes at once is unsupported.
     ("sessions.md", true),
+    // 0.21.0. It carries a limits block because every one of the four primitives is
+    // defined by what it cannot do: a plan is never enforced and not gated, an answer is
+    // not authorization, a definition can only narrow and never grant, and a template
+    // sets nothing.
+    ("agency.md", true),
     ("configuration.md", true),
     ("accounting.md", true),
     ("documents.md", true),

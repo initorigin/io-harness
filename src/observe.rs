@@ -390,6 +390,44 @@ pub enum EventKind {
         /// The note's key.
         key: String,
     },
+    /// The agent wrote down its plan (0.21.0).
+    ///
+    /// Carries the items rather than a count, so a UI renders the plan from the
+    /// event it just received instead of querying the store on every write. The
+    /// store holds the same list — [`Store::todos`](crate::Store::todos) — and is
+    /// the authority for a consumer that joined late.
+    ///
+    /// A plan is the agent's stated intent and nothing more. Nothing verifies it and
+    /// no outcome depends on it, so an item that says `Done` is a claim, not a fact.
+    TodoWrote {
+        /// The whole plan as it now stands, in the order the agent wrote it. A
+        /// write replaces the list, so this is never a delta.
+        items: Vec<crate::state::TodoItem>,
+    },
+    /// The agent asked the operator what they actually wanted (0.21.0).
+    ///
+    /// Not an approval request. [`ApprovalRequested`](EventKind::ApprovalRequested)
+    /// asks whether an act is permitted; this asks what was meant, and its answer
+    /// authorizes nothing.
+    QuestionAsked {
+        /// What the agent asked.
+        question: String,
+        /// Options the agent offered, if it offered any. A UI renders these as
+        /// choices; an answer is not obliged to be one of them.
+        choices: Vec<String>,
+    },
+    /// The question was answered and the run went on (0.21.0).
+    ///
+    /// Emitted whether a `Responder` in this process answered or a human did after a
+    /// pause; `by` says which, because "the machine decided" and "a person decided"
+    /// are different facts about a run.
+    QuestionAnswered {
+        /// The answer, as the model will read it.
+        answer: String,
+        /// `"responder"` for an in-process answer, `"human"` for one that arrived
+        /// through [`resume_with_answer`](crate::resume_with_answer) after a pause.
+        by: String,
+    },
     /// A chunk of assistant text arrived from the provider, while the model was
     /// still producing the rest of it.
     ///
@@ -731,6 +769,9 @@ mod tests {
                 | EventKind::Sandbox { .. }
                 | EventKind::Mcp { .. }
                 | EventKind::Token { .. }
+                | EventKind::TodoWrote { .. }
+                | EventKind::QuestionAsked { .. }
+                | EventKind::QuestionAnswered { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

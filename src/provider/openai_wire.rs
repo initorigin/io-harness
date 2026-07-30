@@ -16,6 +16,10 @@ use crate::error::Result;
 /// `stream_options.include_usage` asks for a usage summary in the final chunk so
 /// the cost budget can be enforced from real token counts.
 pub(crate) fn body(model: &str, request: &CompletionRequest) -> serde_json::Value {
+    // 0.21.0 — the request may name its own model, which is how a named agent
+    // definition reaches the wire when a whole tree shares one provider instance.
+    // `None` means the provider's configured model, which is every pre-0.21.0 call.
+    let model = request.model.as_deref().unwrap_or(model);
     let tools: Vec<serde_json::Value> = request
         .tools
         .iter()

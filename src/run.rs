@@ -16,7 +16,9 @@ use std::time::Duration;
 use serde_json::json;
 use tracing::info;
 
+use crate::agent::{AgentDef, Agents};
 use crate::approve::{ApproveAll, Approver, Decision, Request};
+use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
     assemble, bound, entry_cap_chars, Assembly, Ledger as ContextLedger, ObsKind, Observation,
@@ -31,7 +33,7 @@ use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall,
 use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
-use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store};
+use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store, TodoItem, TodoState};
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
 use crate::tools::git::{Git, GitCmd, GitOutcome};
@@ -48,8 +50,8 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    FsTool, Toolbox, Workspace, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL, GREP_TOOL, READ_FILE_TOOL,
-    READ_SKILL_TOOL, REMEMBER_TOOL, WRITE_FILE_TOOL,
+    FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL, GREP_TOOL,
+    READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -133,6 +135,11 @@ const OBS_GREP_CAP: usize = 50;
 ///     // `resume_with_decision` with that id. Never retry the run from scratch.
 ///     RunOutcome::AwaitingApproval { request_id: _, .. } => "ask a human, then resume",
 ///
+///     // (0.21.0) Also paused, and a different question: the agent asked what you
+///     // MEANT, not whether it may act. `resume_with_answer` continues it with the
+///     // answer, which reaches the model as text and authorizes nothing.
+///     RunOutcome::AwaitingAnswer { question_id: _, .. } => "answer it, then resume",
+///
 ///     // Ceilings, and they mean different things. More steps or more time is a
 ///     // knob; a token ceiling that keeps being hit is usually a task too big
 ///     // for one contract.
@@ -184,6 +191,16 @@ pub enum RunOutcome {
     /// process, so [`resume_with_decision`] can continue it once a human
     /// decides. `steps` is how many steps completed.
     AwaitingApproval { request_id: i64, steps: u32 },
+    /// (0.21.0) The agent asked the operator about *intent* and nothing in this
+    /// process would answer. The run is paused, not finished: the question is
+    /// persisted under `question_id` and survives this process, so
+    /// [`resume_with_answer`] continues it once a human answers. `steps` is how many
+    /// steps completed.
+    ///
+    /// Distinct from [`AwaitingApproval`](RunOutcome::AwaitingApproval) because the
+    /// two questions differ: that one asks whether an action is permitted, this one
+    /// asks what was wanted. An answer to this one authorizes nothing.
+    AwaitingAnswer { question_id: i64, steps: u32 },
     /// The agent stopped making progress: for `StallPolicy::window` consecutive
     /// steps it changed nothing in the workspace while repeating a tool call it had
     /// already made, and it had already been told once. The run stops here rather
@@ -847,6 +864,266 @@ pub async fn resume_with<P: Provider>(
     approver: &dyn Approver,
 ) -> Result<RunResult> {
     resume_with_observed(contract, provider, store, run_id, policy, approver, &Ignore).await
+}
+
+/// Continue a run that paused on a question, with the answer a human gave.
+///
+/// The counterpart to [`resume_with_decision`], for the other channel. `answer` is
+/// text the model reads and it authorizes **nothing**: every tool call it leads to is
+/// checked against the same [`Policy`] by the same code. A human answering "just write
+/// the file" does not make a denied write permitted.
+///
+/// This is deliberately thin, and the thinness is the design: recording the answer and
+/// resuming normally is enough, so there is no second resume path for the ledger, the
+/// checkpoint and the policy to be got wrong in.
+///
+/// The step that asked **was** committed — a paused step commits and the resume starts
+/// after it — so the `ask_question` call is not replayed and cannot be handed its own
+/// answer. The answer is delivered instead as an observation on the run's ledger, which
+/// is what puts it in the next assembled prompt. This is the same mechanism 0.20.0 uses
+/// to deliver a steer.
+///
+/// Answering a question that was already answered is an [`Error::Resume`] rather than a
+/// second run — see [`Store::answer_question`].
+///
+/// ```no_run
+/// use io_harness::{resume_with_answer, ApproveAll, OpenRouter, Policy, RunOutcome,
+///                  Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// let store = Store::open("runs.db")?;
+/// let provider = OpenRouter::from_env()?;
+/// let policy = Policy::permissive();
+///
+/// // Some earlier process left this run waiting on a question.
+/// let run_id = 7;
+/// let question_id = 3;
+/// let q = store.question(question_id)?.expect("asked earlier");
+/// println!("the agent asked: {}", q.question);
+///
+/// let result = resume_with_answer(
+///     &contract, &provider, &store, run_id, question_id,
+///     "io.local.toml — the committed one is the template",
+///     &policy, &ApproveAll,
+/// ).await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_answer<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    question_id: i64,
+    answer: &str,
+    policy: &Policy,
+    approver: &dyn Approver,
+) -> Result<RunResult> {
+    resume_with_answer_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        question_id,
+        answer,
+        policy,
+        approver,
+        &Ignore,
+    )
+    .await
+}
+
+/// [`resume_with_answer`] with an [`Observer`].
+///
+/// ```no_run
+/// use io_harness::{resume_with_answer_observed, ApproveAll, Ignore, OpenRouter, Policy,
+///                  Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// let result = resume_with_answer_observed(
+///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?,
+///     7, 3, "io.local.toml", &Policy::permissive(), &ApproveAll, &Ignore,
+/// ).await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_answer_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    question_id: i64,
+    answer: &str,
+    policy: &Policy,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    record_answer(store, run_id, question_id, answer)?;
+    resume_with_observed(
+        contract, provider, store, run_id, policy, approver, observer,
+    )
+    .await
+}
+
+/// Continue a tree that paused on a child's question.
+///
+/// A child's question pauses the whole tree, exactly as a child's deferred approval
+/// does, so this is the tree's counterpart to [`resume_tree_with_decision`]. `run_id`
+/// is the ROOT's run id and `question_id` identifies the question, which may belong to
+/// any agent in the tree — the resume walks the tree and every agent continues from its
+/// own last committed step.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_answer, ApproveAll, Containment, OpenRouter, Policy,
+///                  Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// let store = Store::open("runs.db")?;
+///
+/// // The question belongs to whichever agent asked it — often a child — but the run id
+/// // passed here is the root's, because what resumes is the tree.
+/// let root_run_id = 7;
+/// let question_id = 4;
+/// let asked_by = store.question(question_id)?.map(|q| q.run_id);
+/// println!("the question came from run {asked_by:?}");
+///
+/// let result = resume_tree_with_answer(
+///     &contract, &OpenRouter::from_env()?, &store, root_run_id, question_id,
+///     "keep the old column", &Policy::permissive(), &ApproveAll,
+///     &Containment::new(10, 4, 3, 1_000_000),
+/// ).await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_with_answer<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    question_id: i64,
+    answer: &str,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+) -> Result<RunResult> {
+    resume_tree_with_answer_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        question_id,
+        answer,
+        policy,
+        approver,
+        containment,
+        &Ignore,
+    )
+    .await
+}
+
+/// [`resume_tree_with_answer`] with an [`Observer`].
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_answer_observed, ApproveAll, Containment, Ignore,
+///                  OpenRouter, Policy, Store, TaskContract, Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// let result = resume_tree_with_answer_observed(
+///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, 7, 4,
+///     "keep the old column", &Policy::permissive(), &ApproveAll,
+///     &Containment::new(10, 4, 3, 1_000_000), &Ignore,
+/// ).await?;
+/// # let _ = result;
+/// # Ok(())
+/// # }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_with_answer_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    question_id: i64,
+    answer: &str,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    // The question may belong to a child, so it is resolved against its own run id
+    // rather than the root's.
+    let owner = store
+        .question(question_id)?
+        .map(|q| q.run_id)
+        .unwrap_or(run_id);
+    record_answer(store, owner, question_id, answer)?;
+    resume_tree_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        policy,
+        approver,
+        containment,
+        observer,
+    )
+    .await
+}
+
+/// Record a human's answer against the question that paused a run.
+///
+/// One place, so the four entry points above cannot drift in what they check. The
+/// question must exist, must belong to this run, and must not already be answered —
+/// resuming a run with an answer to somebody else's question would replay a step that
+/// then asked again and paused again, which reads as a hang rather than an error.
+fn record_answer(store: &Store, run_id: i64, question_id: i64, answer: &str) -> Result<()> {
+    let question = store.question(question_id)?.ok_or_else(|| Error::Resume {
+        reason: format!("no question {question_id} to answer"),
+    })?;
+    if question.run_id != run_id {
+        return Err(Error::Resume {
+            reason: format!(
+                "question {question_id} belongs to run {}, not {run_id}",
+                question.run_id
+            ),
+        });
+    }
+    store.answer_question(question_id, answer, "human")?;
+
+    // The answer has to reach the model, and an observation is the only thing that
+    // does. The step that asked WAS committed — a paused step is committed and the
+    // resume starts after it — so there is no replay of the `ask_question` call to
+    // hand the answer back to. Appending it to the run's observation ledger is what
+    // puts it in the next assembled prompt, which is exactly how 0.20.0 delivers a
+    // steer.
+    //
+    // `ObsKind::Message` and no target, so nothing can supersede it away: an answer
+    // is not an observation *of* anything, and the assembler must not stub it as
+    // stale when a later read touches the same path.
+    store.record_observations(
+        run_id,
+        &[Observation::new(
+            question.step,
+            ObsKind::Message,
+            None,
+            format!(
+                "\n[answer] {answer}\n(This is what the operator wanted, in reply to: \
+                 {}. It is not permission for anything.)\n",
+                question.question
+            ),
+        )],
+    )?;
+    Ok(())
 }
 
 /// Resume a run under the policy it was started with, read back from the store.
@@ -1599,16 +1876,18 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 mcp: &mcp,
                 tools: &contract.tools,
                 skills: &skills,
+                agents: &contract.agents,
                 provider,
                 store,
                 approver,
+                responder: responder_of(contract),
                 watch,
                 ledger,
                 containment,
                 root,
                 root_run_id: run_id,
             };
-            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
+            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember.clone()))
         }
@@ -1675,16 +1954,18 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 mcp: &mcp,
                 tools: &contract.tools,
                 skills: &skills,
+                agents: &contract.agents,
                 provider,
                 store,
                 approver,
+                responder: responder_of(contract),
                 watch,
                 ledger,
                 containment,
                 root,
                 root_run_id: run_id,
             };
-            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step).await;
+            let outcome = run_agent(&tree, contract, run_id, 0, &effective, start_step, None).await;
             mcp.shutdown(store, run_id, watch).await;
             Ok(RunResult::new(outcome?, run_id).with_remembered(remember))
         }
@@ -2395,6 +2676,10 @@ async fn run_workspace_from<P: Provider>(
             decisions.push("no tool call".into());
         }
         let mut paused: Option<i64> = None;
+        // 0.21.0 — the other reason a step can stop short: a question nobody here
+        // would answer. Kept separate from `paused` so the two pauses cannot be
+        // confused for one another in the outcome.
+        let mut asked: Option<i64> = None;
         let mut new_rules: Vec<Rule> = Vec::new();
         for call in &response.tool_calls {
             calls_json.push(format!("{}:{}", call.name, call.arguments));
@@ -2402,6 +2687,7 @@ async fn run_workspace_from<P: Provider>(
                 &ws,
                 call,
                 approver,
+                responder_of(contract),
                 store,
                 run_id,
                 step,
@@ -2434,6 +2720,11 @@ async fn run_workspace_from<P: Provider>(
                 Dispatched::Pause { request_id } => {
                     decisions.push(format!("awaiting approval (request {request_id})"));
                     paused = Some(request_id);
+                    break;
+                }
+                Dispatched::Ask { question_id } => {
+                    decisions.push(format!("awaiting answer (question {question_id})"));
+                    asked = Some(question_id);
                     break;
                 }
             }
@@ -2525,6 +2816,18 @@ async fn run_workspace_from<P: Provider>(
 
         // An approver deferred: persist nothing further, stop, and let the
         // caller resume once a human has decided.
+        if let Some(question_id) = asked {
+            finish(store, watch, run_id, 0, step, "awaiting_answer")?;
+            return Ok(RunResult::new(
+                RunOutcome::AwaitingAnswer {
+                    question_id,
+                    steps: step,
+                },
+                run_id,
+            )
+            .with_remembered(remembered));
+        }
+
         if let Some(request_id) = paused {
             finish(store, watch, run_id, 0, step, "awaiting_approval")?;
             return Ok(RunResult::new(
@@ -2619,9 +2922,16 @@ struct Tree<'a, P: Provider> {
     /// for the same reason `tools` is: a child contract the *model* wrote must
     /// not be able to conjure skills its parent was never offered.
     skills: &'a Skills,
+    /// The roster a spawn may name (0.21.0). Shared tree-wide for the same reason
+    /// `skills` is: a definition is the operator's, so a child cannot conjure one
+    /// its parent's contract never registered.
+    agents: &'a Agents,
     provider: &'a P,
     store: &'a Store,
     approver: &'a dyn Approver,
+    /// Who answers a question about intent, for the whole tree (0.21.0) — one
+    /// responder, exactly as there is one approver.
+    responder: &'a dyn Responder,
     /// One observer for the whole tree, exactly as there is one approver: every
     /// event carries the agent's own `run_id` and `depth`, so a consumer routes on
     /// those rather than being handed an observer per child. It also carries the
@@ -2819,16 +3129,18 @@ pub async fn run_tree_observed<P: Provider>(
         mcp: &mcp,
         tools: &contract.tools,
         skills: &skills,
+        agents: &contract.agents,
         provider,
         store,
         approver,
+        responder: responder_of(contract),
         watch,
         ledger,
         containment,
         root,
         root_run_id: run_id,
     };
-    let outcome = run_agent(&tree, contract, run_id, 0, policy, 1).await;
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, 1, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
@@ -3006,16 +3318,18 @@ pub async fn resume_tree_observed<P: Provider>(
         mcp: &mcp,
         tools: &contract.tools,
         skills: &skills,
+        agents: &contract.agents,
         provider,
         store,
         approver,
+        responder: responder_of(contract),
         watch,
         ledger,
         containment,
         root,
         root_run_id: run_id,
     };
-    let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step).await;
+    let outcome = run_agent(&tree, contract, run_id, 0, policy, start_step, None).await;
     mcp.shutdown(store, run_id, watch).await;
     Ok(RunResult::new(outcome?, run_id))
 }
@@ -3165,6 +3479,7 @@ pub async fn resume_tree_from_stored_policy_observed<P: Provider>(
 /// `depth` is 0 at the root; a child's depth is its parent's + 1. Returns the
 /// agent's [`RunOutcome`]; a tree-wide budget halt propagates up as
 /// [`RunOutcome::BudgetCeilingReached`].
+#[allow(clippy::too_many_arguments)]
 fn run_agent<'f, P: Provider>(
     tree: &'f Tree<'_, P>,
     contract: &'f TaskContract,
@@ -3172,6 +3487,11 @@ fn run_agent<'f, P: Provider>(
     depth: u32,
     policy: &'f Policy,
     start_step: u32,
+    // 0.21.0 — the definition this agent was spawned from, if it was spawned from
+    // one. Crate-internal rather than a `TaskContract` field: a run-level model
+    // override is a separate decision about whether a conversation may change models
+    // mid-thread, and 0.20.0 deliberately left that shut.
+    identity: Option<&'f AgentDef>,
 ) -> Pin<Box<dyn Future<Output = Result<RunOutcome>> + 'f>> {
     // Boxed so the loop can recurse into itself when an agent spawns a child.
     Box::pin(async move {
@@ -3185,7 +3505,15 @@ fn run_agent<'f, P: Provider>(
         extra.extend(skill_tool(tree.skills));
         let system =
             with_skill_catalog(with_extra_tools(tree_system_prompt(), &extra), tree.skills);
-        let mut tools = tree_tools();
+        // A role is PREPENDED, never a replacement: the tree prompt is what tells an
+        // agent how to use its tools and that its result composes back into its
+        // parent, and a role that replaced it would produce an agent that did not
+        // know how to be one.
+        let system = match identity.and_then(|d| d.role.as_deref()) {
+            Some(role) => format!("{}\n\n{system}", role.trim()),
+            None => system,
+        };
+        let mut tools = tree_tools(tree.agents);
         tools.extend(extra);
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
@@ -3252,6 +3580,10 @@ fn run_agent<'f, P: Provider>(
                 system: system.clone(),
                 user: user.clone(),
                 tools: tools.clone(),
+                // 0.21.0 — a named agent's model. `None` for the root and for any
+                // child spawned without a definition, which is what every provider
+                // reads as "the model you were built with".
+                model: identity.and_then(|d| d.model.clone()),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -3310,6 +3642,10 @@ fn run_agent<'f, P: Provider>(
             // they run in order. Spawn calls are independent sub-agents, so they
             // fan out concurrently, bounded by the tree's `max_concurrent`.
             let mut paused: Option<i64> = None;
+            // 0.21.0 — the other reason a step can stop short: a question nobody here
+            // would answer. Kept separate from `paused` so the two pauses cannot be
+            // confused for one another in the outcome.
+            let mut asked: Option<i64> = None;
             let mut paused_by_child = false;
             let mut spawn_calls: Vec<&ToolCall> = Vec::new();
             for call in &response.tool_calls {
@@ -3322,6 +3658,7 @@ fn run_agent<'f, P: Provider>(
                     &ws,
                     call,
                     tree.approver,
+                    tree.responder,
                     tree.store,
                     run_id,
                     step,
@@ -3353,6 +3690,11 @@ fn run_agent<'f, P: Provider>(
                     Dispatched::Pause { request_id } => {
                         decisions.push(format!("awaiting approval (request {request_id})"));
                         paused = Some(request_id);
+                        break;
+                    }
+                    Dispatched::Ask { question_id } => {
+                        decisions.push(format!("awaiting answer (question {question_id})"));
+                        asked = Some(question_id);
                         break;
                     }
                 }
@@ -3407,6 +3749,14 @@ fn run_agent<'f, P: Provider>(
                             paused = Some(request_id);
                             paused_by_child = true;
                         }
+                        // A child asked the operator something; pause the tree with its
+                        // question_id, the same way.
+                        SpawnResult::Asked { question_id } => {
+                            decisions
+                                .push(format!("child awaiting answer (question {question_id})"));
+                            asked = Some(question_id);
+                            paused_by_child = true;
+                        }
                     }
                 }
             }
@@ -3423,7 +3773,11 @@ fn run_agent<'f, P: Provider>(
             // change could forget about. `commit_step` emits no `EventKind::Step`
             // for it either: there is no committed step to report, and a resume is
             // going to run this step again.
-            let committed = !(paused.is_some() && paused_by_child);
+            // 0.21.0 — `asked` counts the same as `paused` here. A parent step whose
+            // child stopped for a human must be replayed on resume so the parent
+            // re-adopts that child; committing it would leave the child stranded and
+            // the parent believing the spawn was done.
+            let committed = !((paused.is_some() || asked.is_some()) && paused_by_child);
             commit_step(
                 tree.store,
                 tree.watch,
@@ -3492,6 +3846,21 @@ fn run_agent<'f, P: Provider>(
                     finish(tree.store, tree.watch, run_id, depth, step, "stalled")?;
                     return Ok(RunOutcome::Stalled { steps: step });
                 }
+            }
+
+            if let Some(question_id) = asked {
+                finish(
+                    tree.store,
+                    tree.watch,
+                    run_id,
+                    depth,
+                    step,
+                    "awaiting_answer",
+                )?;
+                return Ok(RunOutcome::AwaitingAnswer {
+                    question_id,
+                    steps: step,
+                });
             }
 
             if let Some(request_id) = paused {
@@ -3626,6 +3995,11 @@ enum SpawnResult {
     /// persisted under `request_id`; the whole tree pauses so the caller can
     /// resume it with [`resume_with_decision`], exactly as a single run does.
     Paused { request_id: i64 },
+    /// (0.21.0) The child asked the operator about intent and nobody in this process
+    /// answered. The question is persisted under `question_id`; the whole tree pauses
+    /// so the caller can resume it with [`resume_tree_with_answer`], exactly as a
+    /// deferred approval does.
+    Asked { question_id: i64 },
 }
 
 /// Handle one [`SPAWN_TOOL`] call: enforce the containment caps, derive the
@@ -3660,9 +4034,43 @@ async fn spawn_child<P: Provider>(
 
     let child_depth = depth + 1;
 
+    // 0.21.0 — an optional named definition. Unknown is an error observation and no
+    // child: a spawn that silently became an unnarrowed agent because its definition
+    // was misspelled is exactly the failure a roster must not have.
+    let named = a
+        .get("agent")
+        .and_then(|v| v.as_str())
+        .filter(|n| !n.is_empty());
+    let def = match named {
+        Some(name) => match tree.agents.get(name) {
+            Some(def) => Some(def),
+            None => {
+                let known = tree.agents.names().join(", ");
+                return Ok(SpawnResult::Composed {
+                    decision: format!("unknown agent {name}"),
+                    obs: format!(
+                        "\n[spawn error] no agent named `{name}`. Available: {}\n",
+                        if known.is_empty() { "none" } else { &known }
+                    ),
+                });
+            }
+        },
+        None => None,
+    };
+
     // A child inherits the parent policy and may only narrow it. Optional
-    // `deny_write` globs let the parent tighten the child further.
+    // `deny_write` globs let the parent tighten the child further, and a definition
+    // narrows it again — both through `Policy::contain`, which is why neither can
+    // widen anything. There is no path here that adds an allow.
     let mut overlay = Policy::permissive().layer("child");
+    if let Some(def) = def {
+        if def.deny_write {
+            overlay = overlay.deny_write("*");
+        }
+        if def.deny_net {
+            overlay = overlay.deny_net("*");
+        }
+    }
     if let Some(denies) = a.get("deny_write").and_then(|v| v.as_array()) {
         for d in denies.iter().filter_map(|v| v.as_str()) {
             overlay = overlay.deny_write(d);
@@ -3682,6 +4090,10 @@ async fn spawn_child<P: Provider>(
     let mut child_contract = TaskContract::workspace(goal, &tree.root, verify);
     if let Some(n) = a.get("max_steps").and_then(|v| v.as_u64()) {
         child_contract = child_contract.with_max_steps(n as u32);
+    }
+    // A definition's cap is the operator's and outranks the model's own request.
+    if let Some(n) = def.and_then(|d| d.max_steps) {
+        child_contract = child_contract.with_max_steps(n);
     }
 
     // Spawn-or-adopt. On a fresh run this spawn has no persisted record, so a new
@@ -3736,11 +4148,18 @@ async fn spawn_child<P: Provider>(
                 parent_run_id,
                 child_depth,
             )?;
+            // `detail` is free-form and documented as the child's goal; a child
+            // spawned from a definition records that too, so the trace says which
+            // role ran without the `spawns` table gaining a column (and this
+            // release alters no table).
             tree.store.record_agent_event(&AgentEvent::spawn(
                 parent_run_id,
                 step,
                 child_run,
-                goal,
+                match def {
+                    Some(d) => format!("as {}: {goal}", d.name),
+                    None => goal.to_string(),
+                },
             ))?;
             // Attributed to the PARENT's run and depth: the parent is what spawned
             // it, and the child's own events (which carry `child_depth`) start
@@ -3781,6 +4200,7 @@ async fn spawn_child<P: Provider>(
         child_depth,
         &child_policy,
         child_start,
+        def,
     )
     .await?;
 
@@ -3788,6 +4208,14 @@ async fn spawn_child<P: Provider>(
     // the caller can resume that child once a human decides.
     if let RunOutcome::AwaitingApproval { request_id, .. } = outcome {
         return Ok(SpawnResult::Paused { request_id });
+    }
+
+    // And a child that asked the operator something pauses it the same way. Without
+    // this the child's `AwaitingAnswer` would fall through to `compose_child` and read
+    // as a child that had finished, so the tree would carry on having never heard the
+    // question — which is how this was found.
+    if let RunOutcome::AwaitingAnswer { question_id, .. } = outcome {
+        return Ok(SpawnResult::Asked { question_id });
     }
 
     Ok(compose_child(child_run, goal, outcome))
@@ -3928,6 +4356,21 @@ async fn authorize_provider<P: Provider>(
     }
 }
 
+/// The responder a contract carries, or one that answers nothing.
+///
+/// A `static` rather than a local, so the "nobody answers" case is a reference to one
+/// value instead of a temporary every call site has to keep alive. Answering nothing
+/// is the default and the honest one for unattended work: the question persists and
+/// the run pauses, so waiting costs nothing.
+static NO_RESPONDER: ResponderNone = ResponderNone;
+
+fn responder_of(contract: &TaskContract) -> &dyn Responder {
+    match &contract.responder {
+        Some(r) => r.as_ref(),
+        None => &NO_RESPONDER,
+    }
+}
+
 /// The result of dispatching one tool call.
 enum Dispatched {
     /// The call resolved; fold `obs` into the observation log and carry any
@@ -3950,6 +4393,10 @@ enum Dispatched {
     /// An approver deferred; the action is persisted under `request_id` and the
     /// run stops until a human decides.
     Pause { request_id: i64 },
+    /// (0.21.0) The agent asked the operator about intent and no `Responder` in this
+    /// process would answer. The question is persisted under `question_id` and the
+    /// run stops until a human answers it.
+    Ask { question_id: i64 },
 }
 
 impl Dispatched {
@@ -4027,6 +4474,46 @@ pub(crate) type PendingMedia = Vec<crate::provider::Media>;
 #[cfg(not(feature = "media"))]
 pub(crate) type PendingMedia = ();
 
+/// Read a `todo_write` argument object into a plan, or say what was wrong with it.
+///
+/// Strict on purpose, and the error goes back to the model as an observation rather
+/// than out of the run: an item whose state the crate does not understand is an item
+/// whose state nobody knows, and guessing `pending` would show an operator a plan the
+/// agent did not write. The message names the three legal states, so the correction
+/// costs one step and needs no documentation.
+fn parse_todo_items(args: &serde_json::Value) -> std::result::Result<Vec<TodoItem>, String> {
+    let list = args
+        .get("items")
+        .ok_or_else(|| "`items` is required: send the whole plan as a list".to_string())?
+        .as_array()
+        .ok_or_else(|| {
+            "`items` must be a list of {text, state} objects, and the whole plan is sent \
+             every time"
+                .to_string()
+        })?;
+    let mut out = Vec::with_capacity(list.len());
+    for (i, raw) in list.iter().enumerate() {
+        let text = raw
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| format!("item {} needs a non-empty `text`", i + 1))?;
+        let state = raw
+            .get("state")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("item {} (`{text}`) needs a `state`", i + 1))?;
+        let state = TodoState::parse(state).ok_or_else(|| {
+            format!(
+                "item {} (`{text}`) has state `{state}`; use pending, active or done",
+                i + 1
+            )
+        })?;
+        out.push(TodoItem::new(text, state));
+    }
+    Ok(out)
+}
+
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
@@ -4036,6 +4523,9 @@ async fn dispatch(
     ws: &Workspace,
     call: &ToolCall,
     approver: &dyn Approver,
+    // 0.21.0 — who answers a question about intent. Separate from `approver` on
+    // purpose: one decides whether an act is permitted, the other what was wanted.
+    responder: &dyn Responder,
     store: &Store,
     run_id: i64,
     step: u32,
@@ -4155,6 +4645,154 @@ async fn dispatch(
                 ObsKind::Tool,
                 None,
             )
+        }
+        TODO_WRITE_TOOL => {
+            // Not gated, and deliberately so: this writes into the harness's own
+            // store, not into the workspace, the network or a binary, so there is no
+            // `Act` it could be checked against. Inventing one would put a permission
+            // rule in front of the agent stating its intentions. See the plan section
+            // of `docs/CONTRACT.md`.
+            let items = match parse_todo_items(a) {
+                Ok(items) => items,
+                Err(why) => {
+                    return Ok(Dispatched::go(
+                        "todo error",
+                        format!("\n[todo error] {why}\n"),
+                    ))
+                }
+            };
+            // The store caps the list and reports what it dropped; it writes no trace
+            // row of its own, so both are recorded here, where the step is known.
+            let dropped = store.write_todos(run_id, &items)?;
+            let done = items
+                .iter()
+                .filter(|i| i.state == crate::state::TodoState::Done)
+                .count();
+            store.record_context_event(
+                run_id,
+                &ContextEvent::todo_write(step, format!("{} items, {done} done", items.len())),
+            )?;
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::TodoWrote {
+                    items: items.clone(),
+                },
+            ));
+            info!(run_id, step, items = items.len(), done, dropped, "plan");
+            // The plan back in one line, so the model sees what was actually recorded
+            // rather than assuming its write landed verbatim — the cap is visible.
+            let mut obs = format!("\n[plan {} items, {done} done]\n", items.len());
+            for item in &items {
+                obs.push_str(&format!("- [{}] {}\n", item.state.as_str(), item.text));
+            }
+            if dropped > 0 {
+                obs.push_str(&format!(
+                    "({dropped} item(s) past the {} the plan holds were dropped)\n",
+                    crate::state::TODO_MAX_ITEMS
+                ));
+            }
+            // No target: a plan supersedes nothing and cannot go stale — the next
+            // write replaces it wholesale.
+            Dispatched::seen(
+                format!("plan: {} items, {done} done", items.len()),
+                obs,
+                ObsKind::Tool,
+                None,
+            )
+        }
+        ASK_QUESTION_TOOL => {
+            // Not gated, and for a sharper reason than the todo tool's: this asks a
+            // human something. Putting a permission rule in front of the channel
+            // whose whole purpose is to ask would be a category error, and there is
+            // no `Act` that means "ask about intent" — see `docs/CONTRACT.md`.
+            let Some(text) = s("question").map(str::trim).filter(|q| !q.is_empty()) else {
+                return Ok(Dispatched::go(
+                    "question error",
+                    "\n[question error] `question` is required and must not be empty\n",
+                ));
+            };
+            let mut question = Question::new(text);
+            if let Some(context) = s("context").map(str::trim).filter(|c| !c.is_empty()) {
+                question = question.with_context(context);
+            }
+            if let Some(choices) = a.get("choices").and_then(|v| v.as_array()) {
+                question = question.with_choices(
+                    choices
+                        .iter()
+                        .filter_map(|v| v.as_str())
+                        .map(str::to_string)
+                        .collect::<Vec<_>>(),
+                );
+            }
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::QuestionAsked {
+                    question: question.question.clone(),
+                    choices: question.choices.clone(),
+                },
+            ));
+            store.record_context_event(
+                run_id,
+                &ContextEvent::question_asked(step, question.question.clone()),
+            )?;
+
+            // Only the in-process responder is consulted here. A human's answer does
+            // NOT arrive through this path: the step that asks is committed before the
+            // run pauses, so a resume starts at the step *after* it and this call is
+            // never replayed. `resume_with_answer` therefore delivers the answer as an
+            // observation instead, the way a steer is delivered.
+            let answered = match responder.answer(&question).await {
+                Some(answer) => {
+                    // Recorded even though nothing paused: "the machine decided" is a
+                    // fact about the run worth keeping.
+                    let id = store.put_question(run_id, step, &question)?;
+                    store.answer_question(id, &answer, "responder")?;
+                    Some((answer, "responder".to_string()))
+                }
+                None => None,
+            };
+
+            match answered {
+                Some((answer, by)) => {
+                    watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::QuestionAnswered {
+                            answer: answer.clone(),
+                            by: by.clone(),
+                        },
+                    ));
+                    store.record_context_event(
+                        run_id,
+                        &ContextEvent::question_answered(step, format!("{by}: {answer}")),
+                    )?;
+                    info!(run_id, step, %by, "question answered");
+                    // The answer is an observation. It is text the model reads, and it
+                    // authorizes nothing: every tool call it leads to is checked
+                    // against the same policy by the same code.
+                    Dispatched::seen(
+                        format!("asked, answered by {by}"),
+                        format!(
+                            "\n[answer] {answer}\n(This is what the operator wanted. It is not \
+                             permission for anything.)\n"
+                        ),
+                        ObsKind::Tool,
+                        None,
+                    )
+                }
+                None => {
+                    // Nobody here can answer. Persist it and pause: a run that had to
+                    // guess would spend its budget pursuing something nobody asked for.
+                    let question_id = store.put_question(run_id, step, &question)?;
+                    info!(run_id, step, question_id, "run paused for an answer");
+                    Dispatched::Ask { question_id }
+                }
+            }
         }
         READ_FILE_TOOL => {
             let path = s("path").unwrap_or_default();
@@ -4942,7 +5580,49 @@ async fn dispatch(
             };
 
             let git = Git::new(ws.policy(), ws.root(), cap);
-            match git.run(&cmd).await? {
+            // 0.21.0 — a refused git built-in costs a step, not the run.
+            //
+            // Until here, `Git::run`'s refusal left the loop as `Error::Refused`, so
+            // one speculative `git status` under a policy denying `Act::Exec` for
+            // `git` escalated the whole run. Found while running the 0.20.0 live
+            // session and recorded in `docs/CONTRACT.md`; not fixed there because
+            // that release touched no tool. Every other refusal in this crate is an
+            // observation the model reads and adapts to, and this is now one too.
+            //
+            // Both of `Git::run`'s refusals land here — the policy denying the `git`
+            // program, and a path that would be read as an option — and the row is
+            // written exactly as `gate` writes one, so a reader cannot tell a git
+            // refusal from any other and does not have to.
+            let outcome = match git.run(&cmd).await {
+                Ok(out) => out,
+                Err(Error::Refused {
+                    act,
+                    target,
+                    rule,
+                    layer,
+                }) => {
+                    let mut ev = PolicyEvent::refusal(step, act.clone(), target.clone());
+                    ev.rule = rule.clone();
+                    ev.layer = layer.clone();
+                    store.record_event(run_id, &ev)?;
+                    // Qualified: this arm has a local `refused` holding the gate's
+                    // verdict for the paths, which shadows the function.
+                    crate::run::refused(watch, run_id, depth, &ev);
+                    let why = rule
+                        .as_deref()
+                        .map(|r| format!(" (rule {r})"))
+                        .unwrap_or_default();
+                    return Ok(Dispatched::go(
+                        format!("{name} refused"),
+                        format!(
+                            "\n[{act} refused] {target}{why} — the policy forbids this; carry on \
+                             without git\n"
+                        ),
+                    ));
+                }
+                Err(e) => return Err(e),
+            };
+            match outcome {
                 GitOutcome::Unavailable { reason } => Dispatched::go(
                     "git unavailable",
                     format!(
@@ -5701,18 +6381,33 @@ fn tree_system_prompt() -> String {
 }
 
 /// Workspace tools plus [`SPAWN_TOOL`] — offered only inside an agent tree.
-fn tree_tools() -> Vec<ToolSpec> {
+fn tree_tools(agents: &Agents) -> Vec<ToolSpec> {
     let mut tools = workspace_tools();
+    // 0.21.0 — the roster is named in the description rather than as a schema `enum`,
+    // because a model that asks for a name nobody registered gets a plain error
+    // observation naming what IS available, and that recovers in one step. An `enum`
+    // would instead make the whole call malformed at the provider.
+    let roster = if agents.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Named agents you may spawn with \"agent\", each with its own role, model and \
+             (possibly narrower) permissions:\n{}",
+            agents.catalog()
+        )
+    };
     tools.push(ToolSpec {
         name: SPAWN_TOOL.to_string(),
-        description: "Spawn a contained sub-agent to pursue a smaller goal over the same \
-                      workspace. The sub-agent inherits your permissions (it can only be \
-                      further restricted) and its outcome is reported back to you."
-            .to_string(),
+        description: format!(
+            "Spawn a contained sub-agent to pursue a smaller goal over the same \
+             workspace. The sub-agent inherits your permissions (it can only be \
+             further restricted) and its outcome is reported back to you.{roster}"
+        ),
         parameters: json!({
             "type": "object",
             "properties": {
                 "goal": { "type": "string", "description": "The sub-agent's goal." },
+                "agent": { "type": "string", "description": "Optional name of a configured agent to spawn, which gives the sub-agent that agent's role, model and permissions." },
                 "verify_file": { "type": "string", "description": "File (relative to the workspace root) whose contents decide the sub-agent's success." },
                 "verify_contains": { "type": "string", "description": "Text that file must contain for the sub-agent to succeed." },
                 "deny_write": { "type": "array", "items": { "type": "string" }, "description": "Optional globs the sub-agent must not write — tightens its inherited policy." },
@@ -6013,6 +6708,53 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "value": { "type": "string", "description": "The fact, in one or two sentences." }
                 },
                 "required": ["key", "value"]
+            }),
+        },
+        ToolSpec {
+            name: TODO_WRITE_TOOL.to_string(),
+            description: "Write down your plan so the operator can see where you are. Send the \
+                          WHOLE list every time — it replaces the previous one, so include the items \
+                          already done with state \"done\". Keep one item \"active\". This is for the \
+                          human watching; nothing here is checked, and writing a plan does not do \
+                          any of the work in it."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "items": {
+                        "type": "array",
+                        "description": "The whole plan, in order. Replaces any previous plan.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "text": { "type": "string", "description": "One step of the plan, in a short phrase." },
+                                "state": { "type": "string", "enum": ["pending", "active", "done"], "description": "Where this step has got to." }
+                            },
+                            "required": ["text", "state"]
+                        }
+                    }
+                },
+                "required": ["items"]
+            }),
+        },
+        ToolSpec {
+            name: ASK_QUESTION_TOOL.to_string(),
+            description: "Ask the operator what they actually want, when the task is genuinely \
+                          ambiguous and guessing would waste the run. This is NOT for permission — \
+                          you never need permission, the policy decides that and will refuse you if \
+                          the answer is no. Use it for intent: which of two files they meant, \
+                          whether to keep or drop something, which behaviour is correct. Offer \
+                          choices when you have them. Do not ask what you could find out by \
+                          looking."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "question": { "type": "string", "description": "The question, in one sentence." },
+                    "context": { "type": "string", "description": "Optional: what you already established, so they can answer without re-deriving it." },
+                    "choices": { "type": "array", "items": { "type": "string" }, "description": "Optional options you are offering. The answer need not be one of them." }
+                },
+                "required": ["question"]
             }),
         },
         ToolSpec {

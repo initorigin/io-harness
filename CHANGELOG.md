@@ -26,6 +26,169 @@ notes are produced from it.
 
 ### Security
 
+## [0.21.0] - 2026-07-30
+
+The agency release. The agent can plan where you can watch it, and it can ask you
+what you actually meant instead of guessing.
+
+Two things were missing and they are the same shape. An operator could see every
+step a long run *took* and nothing about what it *intended*, so a run going the
+wrong way was only recognisable once it ended. And the only channel back to a human
+asked one question — *may I do this?* — so an ambiguous goal was resolved by the
+model guessing, and a wrong guess spends a whole run.
+
+A sub-agent also gets an identity. Before this release a spawned child was its
+parent with a different goal string: same model, same prompt, so "search with the
+cheap model, write with the strong one" — the largest cost lever the crate has —
+could not be expressed at all.
+
+### Breaking changes
+
+- **BREAKING** — `EventKind` gains three variants, `TodoWrote`, `QuestionAsked`
+  and `QuestionAnswered`, so an exhaustive `match` over it no longer compiles.
+  Runtime behaviour is untouched for every existing entry point: a run whose agent
+  never writes a plan and never asks a question emits none of them.
+  *Migration:* add arms, or a `_` arm.
+
+  ```rust
+  match &event.kind {
+      EventKind::Step { .. } => { /* … */ }
+      EventKind::TodoWrote { items } => render_plan(items),
+      // …or ignore them, which is what a consumer that renders neither wants.
+      _ => {}
+  }
+  ```
+
+- **BREAKING** — `RunOutcome` gains `AwaitingAnswer { question_id, steps }`, so an
+  exhaustive `match` over it no longer compiles. A run that never asks a question
+  never produces it. *Migration:* add an arm. It is a *pause*, not a failure —
+  treat it as you treat `AwaitingApproval` and resume with the answer rather than
+  retrying the run from scratch.
+
+  ```rust
+  match result.outcome {
+      RunOutcome::AwaitingApproval { request_id, .. } => ask_permission(request_id),
+      RunOutcome::AwaitingAnswer { question_id, .. } => ask_what_was_meant(question_id),
+      _ => {}
+  }
+  ```
+
+- **BREAKING** — `CompletionRequest` gains `model: Option<String>`, a per-request
+  model override. Every existing caller meant `None`, which is "use the model the
+  provider was constructed with". This only affects code that builds a
+  `CompletionRequest` with a struct literal listing every field; the crate's own
+  call sites already used `..Default::default()`.
+  *Migration:* add the field, or spread the default.
+
+  ```rust
+  let request = CompletionRequest {
+      system: system.into(),
+      user: user.into(),
+      tools,
+      ..Default::default() // or: model: None,
+  };
+  ```
+
+  An out-of-tree `Provider` that ignores the field keeps compiling and keeps
+  working, and is honestly non-selecting.
+
+### Added
+
+- `io_harness::TODO_WRITE_TOOL` (`todo_write`) and the `todos` table: the agent
+  writes down its plan and an operator reads it **while the run is still going**.
+  The whole list is replaced on every call, so there is no item id for a model to
+  mis-address, and the write is one transaction, so a reader on another connection
+  sees the previous plan or the next one and never half of each. `Store::todos`
+  reads it back, with `TodoItem`, `TodoState`, `TODO_MAX_ITEMS` and
+  `TODO_TEXT_CAP`.
+
+  A plan is the agent's stated intent and nothing more: nothing verifies it, no
+  outcome depends on it, and it is not gated — it writes the harness's own store,
+  not your workspace.
+- `io_harness::ASK_QUESTION_TOOL` (`ask_question`), with `Question`, `Responder`,
+  `ResponderNone`, `FixedResponder`, `StdinResponder` and `AnswerFuture`. The agent
+  asks the operator about **intent**, which is a different question from the one
+  the approval path asks about **permission**. Register who answers with
+  `TaskContract::with_responder`.
+
+  An answer is text the model reads and it authorizes nothing: every tool call that
+  follows one is checked against the same `Policy` by the same code.
+- `RunOutcome::AwaitingAnswer` and `resume_with_answer`,
+  `resume_with_answer_observed`, `resume_tree_with_answer` and
+  `resume_tree_with_answer_observed`: a question nobody can answer in this process
+  is persisted to `pending_questions` and pauses the run, so a human can answer it
+  after the process has exited. `PendingQuestion`, `Store::put_question`,
+  `question`, `questions`, `answer_question` and `answered_question` are the read
+  and write surface. `answered_by` says whether a machine or a person answered — a
+  distinction worth keeping.
+
+  A child's question pauses the whole tree, as a child's deferred approval does,
+  and the tree resumes with every agent continuing from its own last committed step.
+- `AgentDef` and `Agents`, plus `TaskContract::with_agents` and an optional `agent`
+  argument on `spawn_agent`: a spawned child gets a role prepended to its system
+  prompt, a model on the wire, a step cap, and a *narrower* boundary — declared in
+  Rust or as `[[agent]]` tables in `io.toml`.
+
+  A definition can only narrow. `deny_write` and `deny_net` compose through
+  `Policy::contain`, unchanged since 0.5.0, and there is deliberately no
+  `allow_write`: a roster in a config file that could grant would be a
+  privilege-escalation path.
+- `Template` and `Templates`: a directory of markdown prompt templates, discovered
+  the way skills are, with `{{placeholder}}` substitution and `$ARGUMENTS` for the
+  remainder. A placeholder with no argument is an error rather than an empty
+  string — the rule 0.19.0 set for `${env:}`. Rendering returns a `String`, so a
+  template can set no policy, budget, tool or model. `[run] templates` points at
+  the directory.
+- [The agency guide](docs/guide/agency.md), and an `agency_live` example that
+  writes a plan, asks a question and spawns two named agents on two models,
+  asserting each itself.
+
+### Changed
+
+- Stall detection has a second signal. The window added in 0.11.0 needs the
+  workspace to have stayed still, and a spawned child that ran marks the parent's
+  step as progress unconditionally — so a parent respawning the *same* child reset
+  its own window every step and simply spent its budget. The same call `window`
+  times in a row is now caught whether or not the workspace moved.
+
+  No new setting: the threshold is the existing `StallPolicy::window`, because "the
+  same call three times in a row" and "three unproductive steps" are one patience
+  setting. `window = 0` still disables both. Three *different* calls that each get
+  somewhere are untouched.
+- The replan directive is reworded to cover both signals. It used to state flatly
+  that the workspace had not changed, which is no longer true of every case that
+  reaches it.
+- Two new tables, `todos` and `pending_questions`, created on open like every
+  addition since 0.13.0. `CHECKPOINT_FORMAT` stays 7, no existing table is altered,
+  and a 0.20.0 database opens, resumes and is queried unchanged.
+- No new dependency: the default `cargo tree` is unchanged at 407 lines.
+
+### Fixed
+
+- **A refused git built-in no longer ends the run.** A policy denying `Act::Exec`
+  for `git` made `git_status`, `git_diff`, `git_log`, `git_add` and `git_commit`
+  return `Error::Refused` out of the run loop, so one speculative `git status`
+  escalated a whole run instead of costing a step. It is now an observation the
+  model reads and adapts to, with a `policy_events` row attributed to the rule and
+  layer — which is what every other refusal in the crate already was. Found while
+  running the 0.20.0 live session, and fixed here because this is the release that
+  touches the tool layer.
+
+- **The test suite passes on a Windows clone.** A `.gitattributes` pins
+  `tests/fixtures/**` to LF. Without it, a checkout with `core.autocrlf=true` —
+  the default for Git for Windows and for the GitHub Windows runner — rewrote
+  every fixture's line endings, and the template test that compares a rendered
+  body byte for byte failed on Windows and nowhere else. Nothing in the crate
+  changed: the frontmatter parser returns a body verbatim on purpose, so the
+  fixture's bytes were the thing that had to be made the same everywhere.
+
+### Security
+
+- Nothing in this release widens what an agent may do. Both new tools are
+  ungated because neither touches the workspace, the network or a binary; an
+  answer to a question is an observation and not an authorization; and a named
+  agent definition has no syntax for granting a permission, only for removing one.
+
 ## [0.20.0] - 2026-07-30
 
 The session release. The crate stops being one-shot: an operator opens a durable

@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_with, ApproveAll, Policy, Provider, RunOutcome, StallPolicy, Store, TaskContract,
-    Verification,
+    run_tree, run_with, ApproveAll, Containment, Policy, Provider, RunOutcome, StallPolicy, Store,
+    TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -197,8 +197,13 @@ async fn the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the
         fourth.contains(DIRECTIVE),
         "the step after the window must carry the replan directive, got:\n{fourth}"
     );
+    // Amended in 0.21.0. The directive used to open by asserting flatly that the
+    // workspace had not changed, which was true while that was the only way to be
+    // caught. Bare repetition is now caught while the workspace *does* move, so one
+    // wording has to cover both signals — the window it measured is still named,
+    // which is what this assertion was always about.
     assert!(
-        fourth.contains("The last 3 steps changed nothing in the workspace"),
+        fourth.contains("3 times over") && fourth.contains("without changing anything"),
         "the directive must say what it observed, got:\n{fourth}"
     );
     assert!(
@@ -238,8 +243,13 @@ async fn the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the
 // ------------------------------------------------- F8: healthy runs are left alone
 
 /// F8, the other half — an agent that keeps changing the workspace is working, and
-/// is never flagged however long it runs. Progress resets the window, so even a
-/// repeated call is fine as long as something moves.
+/// is never flagged however long it runs. Progress resets the window.
+///
+/// Amended in 0.21.0: this used to say "even a repeated call is fine as long as
+/// something moves", and that is no longer true of an *identical* call — bare
+/// repetition is now caught on its own. It stays true of this test, whose eight
+/// writes each carry different content and are therefore eight different
+/// signatures, which is what a working agent looks like.
 #[tokio::test]
 async fn an_agent_that_changes_the_workspace_is_never_flagged() {
     let dir = ws();
@@ -524,5 +534,158 @@ async fn a_stalled_root_agent_ends_the_tree_as_stalled() {
     assert_eq!(
         store.outcome(result.run_id).unwrap().as_deref(),
         Some("stalled")
+    );
+}
+
+// ------------------------------- F11 (0.21.0): repetition, even when work lands
+
+// The blind spot 0.21.0 closes, and where it came from.
+//
+// Signal 1 needs the workspace to have stayed still, and a spawned child that ran
+// sets `step_changed = true` unconditionally (src/run.rs:3403 — "a child that ran
+// did work the parent did not have to"). So a parent that spawns the *same* child
+// over and over resets its own window on every step and is never flagged: before
+// this release it simply spent its whole step budget doing it.
+//
+// Note what the other tools do here, because it decides what this test can be
+// made of: `exec` reports `changed: false` deliberately, and an identical
+// `write_file` becomes `Wrote::Unchanged` after the first one, so neither can hold
+// `changed == true` across an identical repeat. A repeated spawn is the reachable
+// shape, which is also the expensive one — every loop of it pays for a whole child.
+
+/// One spawn call, identical every time it is played.
+fn spawn_same() -> ToolCall {
+    call(
+        "spawn_agent",
+        json!({
+            "goal": "look into the failing test",
+            "verify_file": "notes.txt",
+            "verify_contains": "cause",
+            "max_steps": 1
+        }),
+    )
+}
+
+/// F11 — the same spawn three times over, each of which counts as progress, is
+/// caught. Signal 1 cannot see this; signal 2 is why the run stops.
+#[tokio::test]
+async fn the_same_spawn_repeated_is_caught_even_though_every_step_counts_as_progress() {
+    let dir = ws();
+    let contract = never_passes(dir.path(), 8);
+
+    // The script is global across the tree: a parent turn, then the child's turn,
+    // alternating. Each child does nothing and ends at its own one-step cap — it
+    // still *ran*, which is what sets the parent's `changed` and hides the loop.
+    let provider = MockScript::new(vec![
+        vec![spawn_same()], // parent step 1
+        vec![],             // child 1 does nothing
+        vec![spawn_same()], // parent step 2 — identical
+        vec![],             // child 2
+        vec![spawn_same()], // parent step 3 — identical again
+        vec![],             // child 3
+        vec![spawn_same()], // parent step 4, if it ever gets one
+        vec![],
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &Containment::new(10, 4, 3, 1_000_000),
+    )
+    .await
+    .unwrap();
+
+    // Nudged, and the trace says so at the step it happened.
+    let rows = replans(&store, result.run_id);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the repeated spawn must be nudged exactly once, got {rows:?}"
+    );
+    assert!(
+        provider.any_prompt_carries_the_directive(),
+        "the parent must actually have been told; the verdict alone changes nothing"
+    );
+    // The whole point: it stopped short of the budget it would have spent before.
+    let steps = match result.outcome {
+        RunOutcome::Stalled { steps } | RunOutcome::StepCapReached { steps } => steps,
+        ref other => panic!("expected the loop to be caught, got {other:?}"),
+    };
+    assert!(
+        steps < 8,
+        "before 0.21.0 this ran its whole 8-step budget; it took {steps}"
+    );
+}
+
+/// F11's negative control, and the one that matters most: three *different* spawns
+/// that each get somewhere are working, and must be left entirely alone. A
+/// resilience feature that stops productive runs is worse than the loop it fixes.
+#[tokio::test]
+async fn three_different_spawns_that_each_do_work_are_never_flagged() {
+    let dir = ws();
+    let contract = TaskContract::workspace(
+        "split the work three ways",
+        dir.path(),
+        Verification::WorkspaceFileContains {
+            file: "c.txt".into(),
+            needle: "C".into(),
+        },
+    )
+    .with_max_steps(8);
+
+    let spawn_for = |goal: &str, file: &str, needle: &str| {
+        call(
+            "spawn_agent",
+            json!({ "goal": goal, "verify_file": file, "verify_contains": needle }),
+        )
+    };
+    let provider = MockScript::new(vec![
+        vec![spawn_for("write a", "a.txt", "A")],
+        vec![call(
+            "write_file",
+            json!({ "path": "a.txt", "content": "A" }),
+        )],
+        vec![spawn_for("write b", "b.txt", "B")],
+        vec![call(
+            "write_file",
+            json!({ "path": "b.txt", "content": "B" }),
+        )],
+        vec![spawn_for("write c", "c.txt", "C")],
+        vec![call(
+            "write_file",
+            json!({ "path": "c.txt", "content": "C" }),
+        )],
+    ]);
+    let store = Store::memory().unwrap();
+
+    let result = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &Containment::new(10, 4, 3, 1_000_000),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !provider.any_prompt_carries_the_directive(),
+        "an agent delegating three different pieces of work is not stuck"
+    );
+    assert!(
+        replans(&store, result.run_id).is_empty() && stalls(&store, result.run_id).is_empty(),
+        "no replan and no stall row for a working agent; got {:?} / {:?}",
+        replans(&store, result.run_id),
+        stalls(&store, result.run_id)
+    );
+    assert!(
+        matches!(result.outcome, RunOutcome::Success { .. }),
+        "the delegating run should have succeeded, got {:?}",
+        result.outcome
     );
 }

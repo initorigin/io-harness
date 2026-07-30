@@ -457,3 +457,174 @@ async fn a_commit_interrupted_before_its_checkpoint_is_not_taken_twice() {
         "exactly one commit carries the message: {log}"
     );
 }
+
+// ----------------------------- F12 (0.21.0): a refusal costs a step, not the run
+
+/// F12 — the 0.20.0 live-run defect, fixed.
+///
+/// Recorded in that release's `known_limitations` and in `docs/CONTRACT.md`: a policy
+/// denying `Act::Exec` for `git` made all five git built-ins return `Error::Refused`
+/// *out of the run loop*, so one speculative `git status` escalated a whole run
+/// instead of costing a step. The live session had to allow `git*` to work around it.
+///
+/// Every other refusal in this crate is an observation the model reads and adapts to.
+/// This test is the proof that git is no longer the exception, and it fails on 0.20.0.
+#[tokio::test]
+async fn a_git_builtin_refused_by_the_exec_policy_is_an_observation_and_the_run_goes_on() {
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    // Reads and writes are fine; running `git` is not. This is the shape an operator
+    // reaches for when they want an agent that edits but never touches history.
+    let policy = Policy::default()
+        .layer("no-git")
+        .allow_read("*")
+        .allow_write("*")
+        .deny_exec("git");
+    let st = store(&dir);
+
+    let result = drive(
+        &dir,
+        vec![
+            // The speculative call that used to end the run.
+            vec![call("git_status", json!({}))],
+            // The agent carries on and does its real work.
+            vec![call(
+                "write_file",
+                json!({ "path": "NOTES.md", "content": "worked without git\n" }),
+            )],
+        ],
+        &policy,
+        &st,
+    )
+    .await;
+
+    // 1 — the run survived the refusal and reached the step after it.
+    let steps = st.steps(result.run_id).unwrap();
+    assert!(
+        steps.len() >= 2,
+        "the run must continue past a refused git call; it took {} step(s): {:?}",
+        steps.len(),
+        steps.iter().map(|s| &s.tool_call).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("NOTES.md")).unwrap(),
+        "worked without git\n",
+        "the work after the refusal must have happened"
+    );
+
+    // 2 — the refusal is in the trace, attributed to the rule and layer, exactly as
+    // any other refusal is.
+    let refusals: Vec<_> = st
+        .events(result.run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "refusal")
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "exactly one refusal row, got {refusals:?}"
+    );
+    assert_eq!(refusals[0].act, "exec");
+    assert_eq!(refusals[0].target, "git");
+    assert_eq!(refusals[0].layer.as_deref(), Some("no-git"));
+    assert!(
+        refusals[0].rule.is_some(),
+        "the row must name the rule that refused it, got {:?}",
+        refusals[0]
+    );
+
+    // 3 — and the model was told, in terms it can act on.
+    let told = steps
+        .iter()
+        .any(|s| s.result.contains("refused") || s.decision.contains("refused"));
+    assert!(
+        told,
+        "the refusal must reach the model as an observation, steps were {:?}",
+        steps
+            .iter()
+            .map(|s| (&s.decision, &s.result))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// F12's other half: the argv guard refuses the same way. A path beginning with `-`
+/// would be read by `git` as an option, so it is refused rather than escaped — and
+/// that refusal is now also an observation instead of the end of the run.
+#[tokio::test]
+async fn a_path_that_would_be_read_as_an_option_is_refused_without_ending_the_run() {
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    let policy = Policy::default()
+        .layer("open")
+        .allow_read("*")
+        .allow_write("*")
+        .allow_exec("git");
+    let st = store(&dir);
+
+    let result = drive(
+        &dir,
+        vec![
+            vec![call("git_add", json!({ "paths": ["--all"] }))],
+            vec![call(
+                "write_file",
+                json!({ "path": "AFTER.md", "content": "still going\n" }),
+            )],
+        ],
+        &policy,
+        &st,
+    )
+    .await;
+
+    assert!(
+        st.steps(result.run_id).unwrap().len() >= 2,
+        "an option-shaped path must not end the run"
+    );
+    assert!(
+        dir.path().join("AFTER.md").exists(),
+        "the step after the refusal must have run"
+    );
+}
+
+/// F12's negative control: the identical run under a policy that allows `git` runs
+/// the command. Without this, the two tests above would pass against a build that
+/// had simply stopped calling git at all.
+#[tokio::test]
+async fn the_same_call_under_a_policy_that_allows_git_actually_runs_it() {
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    let policy = Policy::default()
+        .layer("with-git")
+        .allow_read("*")
+        .allow_write("*")
+        .allow_exec("git");
+    let st = store(&dir);
+
+    let result = drive(
+        &dir,
+        vec![vec![call("git_status", json!({}))]],
+        &policy,
+        &st,
+    )
+    .await;
+
+    let refusals = st
+        .events(result.run_id)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "refusal")
+        .count();
+    assert_eq!(refusals, 0, "nothing should have been refused here");
+    let steps = st.steps(result.run_id).unwrap();
+    assert!(
+        !steps[0].result.contains("refused"),
+        "git_status should have run, got {:?}",
+        steps[0].result
+    );
+}

@@ -175,6 +175,7 @@ the caller reads the file, before the run, once.
 | [Resilience](docs/guide/resilience.md) | Failure classification, retry, provider fallback, stall detection |
 | [Observability and replay](docs/guide/observability.md) | Observers, events, outcome records, deterministic replay |
 | [Sessions](docs/guide/sessions.md) | Durable conversations: a turn is a run, token streaming, steering, branching |
+| [Agency](docs/guide/agency.md) | A visible plan, a question about intent, named agents, prompt templates |
 | [Configuration](docs/guide/configuration.md) | One `io.toml`, four layered scopes, projected onto the typed API |
 | [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
