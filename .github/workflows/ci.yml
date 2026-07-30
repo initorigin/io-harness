@@ -113,7 +113,21 @@ jobs:
       # isolation* — `documents` without `media`, and so on. That coverage moved
       # to the `lint` job, which clippy-compiles each feature set separately in
       # 6-10 seconds each on a warm cache, rather than costing minutes per OS here.
-      - run: cargo test --all-features
+      #
+      # `--lib --tests`, so this leg does not re-run the 251 doctests the default
+      # leg above already ran on this same OS. A doctest is its own rustc
+      # invocation and its own link, which is the slow part on Windows: the first
+      # `--all-features` leg written without this flag cost 612s there, against
+      # 146s for the whole default `cargo test`.
+      - run: cargo test --all-features --lib --tests
+      # The doctests that only exist with a feature on — two public items are
+      # gated on `media` and their examples only compile with it. Linux only, and
+      # once: a doctest is a compile-and-link of an example, and nothing about
+      # these two is platform-specific. The cross-platform doctest proof is the
+      # default `cargo test` leg above, which runs all 251 on all three OSes.
+      # This step reuses the artifacts the step above just built.
+      - run: cargo test --all-features --doc
+        if: matrix.os == 'ubuntu-latest'
 
   # The MSRV is read from Cargo.toml rather than hardcoded, so the declared
   # rust-version and the version actually proven to build cannot drift apart.
