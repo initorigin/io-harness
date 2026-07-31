@@ -147,6 +147,54 @@ fn assert_same_schema(left: &[String], right: &[String], what: &str) {
     );
 }
 
+/// The objects 0.25.0 adds, and the only ones any comparison below may find on
+/// the new side.
+///
+/// Named individually rather than matched by prefix. A prefix rule would quietly
+/// absorb the next table someone adds, and absorbing the next one is precisely
+/// what these tests exist to prevent — the point is not that the schema may grow,
+/// it is that it may grow only by what a release documented.
+const ADDED_SINCE_0_22_0: &[&str] = &[
+    "process_handles",
+    "process_handles_run",
+    "handle_output",
+    "handle_output_run",
+];
+
+/// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
+fn is_added_since_0_22_0(stmt: &str) -> bool {
+    ADDED_SINCE_0_22_0.iter().any(|name| {
+        stmt.contains(&format!(" {name} ")) || stmt.contains(&format!(" {name}("))
+    })
+}
+
+/// Assert that `new` contains everything `old` had, unchanged, and that whatever
+/// it adds is documented.
+///
+/// This replaces a plain equality as of 0.25.0, which adds two tables and their
+/// indexes. The claim being checked is not weaker for it, it is more specific:
+/// no statement 0.22.0 wrote may be missing or altered, and no statement may
+/// appear that this release did not declare. An equality could only say "nothing
+/// changed", which stopped being true; this says "nothing changed except these
+/// four things", which is what the contract actually promises.
+fn assert_additive_only(new: &[String], old: &[String], what: &str) {
+    let missing: Vec<&String> = old.iter().filter(|s| !new.contains(s)).collect();
+    let extra: Vec<&String> = new
+        .iter()
+        .filter(|s| !old.contains(*s) && !is_added_since_0_22_0(s))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{what}\n  a statement 0.22.0 wrote is gone or altered: {missing:#?}"
+    );
+    assert!(
+        extra.is_empty(),
+        "{what}\n  an undeclared object appeared: {extra:#?}\n  \
+         if this release adds it deliberately, add it to ADDED_SINCE_0_22_0 and \
+         say so in the changelog"
+    );
+}
+
 /// `PRAGMA user_version` — the checkpoint format stamped into the file itself.
 fn user_version(db: &Path) -> i64 {
     sqlite(db)
@@ -435,7 +483,7 @@ fn a_0_22_0_store_reads_back_row_for_row_through_the_public_api() {
 /// versions in this upgrade, and the DDL a 3.53.2 engine stores is compared here
 /// against the DDL a 3.46.0 engine stored.
 #[test]
-fn the_schema_this_release_creates_is_identical_to_the_one_0_22_0_created() {
+fn the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it() {
     let dir = tempfile::tempdir().unwrap();
     let fresh = dir.path().join("fresh.sqlite3");
     drop(Store::open(&fresh).expect("0.23.0 creates a store"));
@@ -445,13 +493,22 @@ fn the_schema_this_release_creates_is_identical_to_the_one_0_22_0_created() {
     let (_fixture_dir, old, _) = working_copy("populated", false);
 
     let (new_schema, old_schema) = (schema(&fresh), schema(&old));
-    assert_same_schema(
+    assert_additive_only(
         &new_schema,
         &old_schema,
-        "0.23.0 creates a different schema than 0.22.0 did — this release is \
-         documented as changing no table, and a divergence here means databases \
-         written from now on are not the ones the previous release can read",
+        "0.25.0 changed a table 0.22.0 created — this release is documented as \
+         adding tables and altering none, and a divergence here means databases \
+         written from now on are not the ones a previous release can read",
     );
+    // The additions are asserted to be present as well as permitted: a typo in
+    // the schema that dropped both new tables would otherwise pass, since
+    // "nothing unexpected appeared" is also true of nothing appearing.
+    for name in ADDED_SINCE_0_22_0 {
+        assert!(
+            new_schema.iter().any(|s| is_added_since_0_22_0(s) && s.contains(name)),
+            "0.25.0 declares {name} and a fresh store does not have it"
+        );
+    }
     assert!(
         new_schema.len() > 20,
         "the comparison is vacuous unless it actually found the schema (got {} statements)",
@@ -794,10 +851,17 @@ async fn a_0_22_0_deferred_approval_is_resolved_here_and_the_run_continues() {
 /// database written before it — an unattended run that crashed under 0.22.0 could
 /// never be finished. And `Store::open` stamps the pragma whenever the file reads
 /// back *lower*, so "no migration ran" is the pair of facts checked here: the
-/// version is 7 before the open and still 7 after it, and the schema is byte-equal
-/// across the open. A store the open had to alter would fail the second.
+/// version is 7 before the open and still 7 after it, and no statement the file
+/// already had changes across the open. A store the open had to alter would fail
+/// the second.
+///
+/// Renamed in 0.25.0 from "migrates nothing", which stopped being true: opening
+/// an older store now creates the two tables this release adds, because
+/// `from_conn` runs `CREATE TABLE IF NOT EXISTS` for every table it knows. That
+/// is additive and safe, and calling it "nothing" would have been the same kind
+/// of overstatement this suite exists to catch.
 #[test]
-fn the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_migrates_nothing() {
+fn the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing() {
     assert_eq!(
         CHECKPOINT_FORMAT, 7,
         "0.23.0 upgrades a driver and changes no layout; bumping the format would \
@@ -821,12 +885,19 @@ fn the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_migrates_nothing(
             before_version,
             "opening {name}.sqlite3 changed its checkpoint format — a migration ran"
         );
-        assert_same_schema(
+        // As of 0.25.0 opening an older store DOES change its schema: `from_conn`
+        // runs `CREATE TABLE IF NOT EXISTS` for every table, so the two tables
+        // this release adds appear in a file written before them. That is safe
+        // and is not a migration in the sense this test guards against — no
+        // existing table is touched, the format pragma does not move, and a
+        // 0.22.0 binary reading this file simply never queries them. What must
+        // still be impossible is an existing statement changing.
+        assert_additive_only(
             &schema(&db),
             &before_schema,
             &format!(
-                "opening {name}.sqlite3 changed its schema — a migration ran, and a \
-                 0.22.0 binary may no longer read this file"
+                "opening {name}.sqlite3 altered a table it already had — a real \
+                 migration ran, and a 0.22.0 binary may no longer read this file"
             ),
         );
     }
