@@ -317,7 +317,7 @@ tasks:
     `cargo package --locked` verified by listing the tarball.'
   why_required: 'The release cannot be cut without them: `release.yml` refuses a version the manifest
     does not declare or that has no changelog section, and `cargo publish` is irreversible.'
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T08
   acceptance_criteria:
@@ -345,12 +345,13 @@ tasks:
   - Cargo.toml
   - docs/public-api.txt
   evidence:
-  - Cargo.toml at 0.25.0; CHANGELOG 0.25.0 section written; docs/public-api.txt updated by hand for ProcessHandle
-    (the suite deliberately has no bless flag).
-  - clippy --all-features --all-targets clean; cargo doc --all-features warning-free; full suite 1074
-    passed 0 failed on macOS.
-  - 'REMAINING: cargo tree line counts per platform, MSRV re-check by hand, cargo package --locked tarball
-    listing.'
+  - Cargo.toml 0.25.0; CHANGELOG 0.25.0 written; docs/public-api.txt updated by hand for ProcessHandle.
+  - cargo tree 402 default / 842 all-features — unchanged, measured not assumed.
+  - 'MSRV 1.95 checked by hand BOTH directions: 1.94 --ignore-rust-version fails inside libsqlite3-sys
+    build.rs on cfg_select; 1.95 builds. README and docs/CONTRACT.md agree and say nothing else.'
+  - cargo package --locked exit 0; tarball 178 files; verified by listing that no .env, .ultraship, .github
+    or target is present. description 461 chars against the 1000 cap.
+  - clippy --all-features --all-targets clean; cargo doc --all-features warning-free; cargo fmt clean.
 - id: US-IO-HARNESS-0.25.0-T10
   summary: 'Full-suite verification on all three platforms via CI, and the live provider run that is OP1:
     the model itself starts a long-running process, polls it, does other work between polls, and kills
@@ -358,7 +359,7 @@ tasks:
   why_required: F2's negative control is Windows-only and cannot be verified on the development machine,
     and a handle that works in a test but not against a real model is not the capability the contract
     promises.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.25.0-T09
   acceptance_criteria:
@@ -377,4 +378,14 @@ tasks:
   - tests/shell.rs
   - tests/handles.rs
   - examples/
-  evidence: []
+  evidence:
+  - 'NF1 MET: CI run 30650243218 green on all three platforms — test (windows-latest), test (macos-latest),
+    test (ubuntu-latest), plus lint, msrv, docs.rs and links-consumer.'
+  - 'OP1 MET: live OpenRouter run via examples/handles_live.rs on openai/gpt-5.6-luna. Unscripted, 10
+    steps, 24160 tokens. The model chose shell_start over shell, polled it for 82 bytes, killed it, and
+    wrote the port it read from the running process own output. Handle state=killed, pids recorded, nothing
+    left running.'
+  - 'Windows CI first failed and found two real defects: an unquoted Windows path in the fixture was destroyed
+    by the shell escape rule, and a handle that exits on its own never had its ending carried to the store.
+    Both fixed; the second was a defect in this release code, not in the test.'
+  - 'REMAINING: NF3 and NF4 end-to-end assertions.'
