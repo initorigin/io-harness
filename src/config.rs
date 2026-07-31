@@ -125,6 +125,17 @@ pub const LOCAL_FILE: &str = "io.local.toml";
 /// ahead of every platform convention.
 pub const CONFIG_HOME_VAR: &str = "IO_CONFIG_HOME";
 
+/// Environment variable that names the user-scope config *file* outright (0.27.0),
+/// ahead of [`CONFIG_HOME_VAR`] and every platform convention.
+///
+/// It names a scope; it does not bypass the merge. A project file still wins the
+/// keys it names, which is why the scopes stay four and [`Scope`] gains no variant.
+pub const CONFIG_VAR: &str = "IO_CONFIG";
+
+/// The instruction files [`Config::discover`] looks for when `[instructions]` is
+/// present and names none itself.
+const DEFAULT_INSTRUCTIONS: &[&str] = &["AGENTS.md"];
+
 /// Which file a value came from.
 ///
 /// Reported by [`Config::sources`] so an operator whose setting did not take
@@ -188,6 +199,100 @@ struct File {
     // drift this module's "the typed API is the authority" rule exists to prevent.
     #[serde(default)]
     web: Option<WebAccess>,
+    // 0.27.0. The first entry is the provider a run uses; each later one is the
+    // next link in the fallback chain. Deliberately *not* in `APPENDING`: a later
+    // scope replaces the chain whole, because a half-appended fallback chain is
+    // not a chain.
+    #[serde(default)]
+    provider: Vec<ProviderSpec>,
+    // 0.27.0. The one section this crate stores and never validates, so io-cli and
+    // io-studio keep their own settings in the same file. A `toml::value::Table`
+    // rather than a typed section is the whole feature; `Config::app` is generic
+    // so no `toml` type reaches the public API.
+    #[serde(default)]
+    app: Option<toml::value::Table>,
+    // 0.27.0. A profile body is the file format again, so a typo inside a profile
+    // that is never selected is still rejected at load. The recursion is bounded
+    // by `refuse_nested_profiles` rather than by the type.
+    #[serde(default)]
+    profile: BTreeMap<String, File>,
+    #[serde(default)]
+    instructions: Option<InstructionsSection>,
+}
+
+/// Which provider a run uses, as a value a configuration can carry (0.27.0).
+///
+/// A **spec**, never a constructed provider: [`Provider::complete`](crate::Provider::complete)
+/// returns `impl Future`, so the trait is not dyn-compatible and there is no
+/// `Box<dyn Provider>` for an accessor to return. The application reads the spec and
+/// builds from it, which is three lines and keeps every entry point generic.
+///
+/// ```
+/// use io_harness::{Config, ProviderSpec};
+///
+/// let config = Config::from_toml(r#"
+///     [[provider]]
+///     kind = "openrouter"
+///     model = "anthropic/claude-sonnet-4"
+///
+///     [[provider]]
+///     kind = "anthropic"
+///     model = "claude-sonnet-4"
+/// "#).unwrap();
+///
+/// // The first entry is the provider; the rest are the chain behind it, in order.
+/// let ProviderSpec::OpenRouter { model, api_key } = config.provider_spec().unwrap() else {
+///     panic!("the file named openrouter");
+/// };
+/// assert_eq!(model, "anthropic/claude-sonnet-4");
+/// assert_eq!(*api_key, None, "no key written means the provider's own environment variable");
+/// assert_eq!(config.fallback_specs().len(), 1);
+/// ```
+///
+/// It is `#[non_exhaustive]` from the first release it exists, because a later one
+/// adds a variant: a consumer matching it needs a `_ =>` arm, and paying that once
+/// now is what keeps the addition from being a break.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+#[non_exhaustive]
+pub enum ProviderSpec {
+    /// [`OpenRouter`](crate::OpenRouter). `api_key` unset means `OPENROUTER_API_KEY`.
+    #[serde(rename = "openrouter")]
+    OpenRouter {
+        /// The model id, as OpenRouter spells it.
+        model: String,
+        /// The key, or `None` to read the provider's own environment variable.
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+    /// [`Anthropic`](crate::Anthropic). `api_key` unset means `ANTHROPIC_API_KEY`.
+    #[serde(rename = "anthropic")]
+    Anthropic {
+        /// The model id, as Anthropic spells it.
+        model: String,
+        /// The key, or `None` to read the provider's own environment variable.
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+    /// [`OpenAi`](crate::OpenAi). `api_key` unset means `OPENAI_API_KEY`.
+    #[serde(rename = "openai")]
+    OpenAi {
+        /// The model id, as OpenAI spells it.
+        model: String,
+        /// The key, or `None` to read the provider's own environment variable.
+        #[serde(default)]
+        api_key: Option<String>,
+    },
+}
+
+/// Which files carry a repository's own instructions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InstructionsSection {
+    /// Relative to the discovery root. Absent means [`DEFAULT_INSTRUCTIONS`]. A
+    /// named file that does not exist is skipped: this is discovery, not
+    /// substitution.
+    files: Option<Vec<PathBuf>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -289,6 +394,14 @@ struct PricesSection {
 pub struct Config {
     file: File,
     sources: Vec<(Scope, PathBuf)>,
+    /// The merged table the typed `file` was deserialized from, kept so
+    /// [`Config::with_profile`] can overlay through the same [`merge`] the scopes
+    /// use rather than inventing a second set of merge semantics.
+    raw: toml::value::Table,
+    /// What `[instructions]` found, already worded as constraints. Read once, in
+    /// [`Config::discover`], which is the caller's own call — the run loop never
+    /// reads a file.
+    instructions: Vec<String>,
 }
 
 impl Config {
@@ -324,14 +437,18 @@ impl Config {
             if !path.is_file() {
                 continue;
             }
-            let table = read_scope(&path)?;
+            let table = read_scope(scope, &path)?;
             merge(&mut merged, table, &mut Vec::new());
             sources.push((scope, path));
         }
 
+        let file: File = deserialize(toml::Value::Table(merged.clone()), Path::new("<merged>"))?;
+        let instructions = read_instructions(&file, root)?;
         Ok(Self {
-            file: deserialize(toml::Value::Table(merged), Path::new("<merged>"))?,
+            file,
             sources,
+            raw: merged,
+            instructions,
         })
     }
 
@@ -341,18 +458,86 @@ impl Config {
     /// know about, and for tests. `${file:...}` resolves against the current
     /// directory, since there is no file to resolve against.
     ///
+    /// **It is the project scope**, so the 0.27.0 rules that bound that scope apply:
+    /// `${cmd:...}` is refused here, and a key whose value would widen a boundary is
+    /// refused here. `[instructions]` finds nothing, because there is no root to
+    /// discover against.
+    ///
     /// ```
     /// use io_harness::Config;
     ///
-    /// let config = Config::from_toml("[sandbox]\nallow_network = true\n").unwrap();
-    /// assert!(config.sandbox().unwrap().allow_network);
+    /// let config = Config::from_toml("[sandbox]\nforce_floor = true\n").unwrap();
+    /// assert!(config.sandbox().unwrap().force_floor);
+    ///
+    /// // The same key set the other way is refused: this is the project scope.
+    /// let err = Config::from_toml("[sandbox]\nforce_floor = false\n").unwrap_err();
+    /// assert!(err.to_string().contains("widens"), "{err}");
     /// ```
     pub fn from_toml(text: &str) -> Result<Self> {
         let path = Path::new(PROJECT_FILE);
-        let table = parse(text, path)?;
+        let table = parse(Scope::Project, text, path)?;
+        refuse_widening(&table, path)?;
         Ok(Self {
-            file: deserialize(toml::Value::Table(table), path)?,
+            file: deserialize(toml::Value::Table(table.clone()), path)?,
             sources: Vec::new(),
+            raw: table,
+            instructions: Vec::new(),
+        })
+    }
+
+    /// This configuration with `[profile.<name>]` overlaid on it (0.27.0).
+    ///
+    /// The overlay uses the same [`merge`] the scopes use, so a profile has no merge
+    /// semantics of its own: a scalar replaces, a table merges key by key, an array
+    /// replaces whole. Scopes merge first and the profile applies to the result, so a
+    /// profile in any scope beats a base key in every scope.
+    ///
+    /// A name the file does not carry is an error naming it — a `--profile` argument
+    /// that silently does nothing is the same failure class as an unknown key.
+    /// Profiles do not compose: the returned configuration carries no `[profile]`
+    /// section, so a second call fails.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// let config = Config::from_toml(r#"
+    ///     [run]
+    ///     max_steps = 30
+    ///     max_retries = 4
+    ///
+    ///     [profile.cheap]
+    ///     run = { max_steps = 5 }
+    /// "#).unwrap();
+    ///
+    /// let cheap = config.with_profile("cheap").unwrap();
+    /// let base = |c: &Config| c.apply_to(io_harness::TaskContract::new(
+    ///     "x", "src/lib.rs", io_harness::Verification::None));
+    /// assert_eq!(base(&cheap).max_steps, 5);
+    /// assert_eq!(base(&cheap).max_retries, 4, "a key the profile never named is untouched");
+    /// assert_eq!(base(&config).max_steps, 30, "and the configuration it came from is unchanged");
+    ///
+    /// let err = config.with_profile("careful").unwrap_err();
+    /// assert!(err.to_string().contains("careful"), "{err}");
+    /// ```
+    pub fn with_profile(&self, name: &str) -> Result<Self> {
+        let overlay = self
+            .raw
+            .get("profile")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get(name))
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| Error::Config(format!("no `[profile.{name}]` in this configuration")))?
+            .clone();
+
+        let mut merged = self.raw.clone();
+        merged.remove("profile");
+        merge(&mut merged, overlay, &mut Vec::new());
+
+        Ok(Self {
+            file: deserialize(toml::Value::Table(merged.clone()), Path::new("<profile>"))?,
+            sources: self.sources.clone(),
+            raw: merged,
+            instructions: self.instructions.clone(),
         })
     }
 
@@ -386,6 +571,131 @@ impl Config {
             && self.file.mcp.is_empty()
             && self.file.agent.is_empty()
             && self.file.web.is_none()
+            && self.file.provider.is_empty()
+            && self.file.app.is_none()
+            && self.file.profile.is_empty()
+            && self.file.instructions.is_none()
+    }
+
+    /// The provider this configuration says to run, or `None` where it declares no
+    /// `[[provider]]` (0.27.0).
+    ///
+    /// `None` means the file said nothing — never that the crate picked a default.
+    /// This is the rule every accessor in this module holds, and it matters most
+    /// here: a defaulted provider would be a vendor the operator never named.
+    ///
+    /// ```
+    /// use io_harness::{Config, ProviderSpec};
+    ///
+    /// let config = Config::from_toml(r#"
+    ///     [[provider]]
+    ///     kind = "anthropic"
+    ///     model = "claude-sonnet-4"
+    ///     api_key = "${env:HOME}"
+    /// "#).unwrap();
+    ///
+    /// assert!(matches!(config.provider_spec(), Some(ProviderSpec::Anthropic { .. })));
+    /// assert!(Config::from_toml("").unwrap().provider_spec().is_none());
+    /// ```
+    pub fn provider_spec(&self) -> Option<&ProviderSpec> {
+        self.file.provider.first()
+    }
+
+    /// The chain standing behind [`Config::provider_spec`], in the order written
+    /// (0.27.0).
+    ///
+    /// Empty where the file names one provider or none. The application nests them:
+    /// [`Fallback`](crate::provider::Fallback) is generic over two type parameters and
+    /// composes — `Fallback::new(a, Fallback::new(b, c))` — so a chain of three is
+    /// three lines of the caller's own code rather than a `dyn` the trait cannot have.
+    ///
+    /// ```
+    /// use io_harness::{Config, ProviderSpec};
+    ///
+    /// let config = Config::from_toml(r#"
+    ///     [[provider]]
+    ///     kind = "openrouter"
+    ///     model = "primary"
+    ///
+    ///     [[provider]]
+    ///     kind = "anthropic"
+    ///     model = "second"
+    ///
+    ///     [[provider]]
+    ///     kind = "openai"
+    ///     model = "third"
+    /// "#).unwrap();
+    ///
+    /// // Order is the configuration, not a detail of it.
+    /// let models: Vec<&str> = config.fallback_specs().iter().map(|s| match s {
+    ///     ProviderSpec::Anthropic { model, .. }
+    ///     | ProviderSpec::OpenAi { model, .. }
+    ///     | ProviderSpec::OpenRouter { model, .. } => model.as_str(),
+    ///     _ => "unknown",
+    /// }).collect();
+    /// assert_eq!(models, ["second", "third"]);
+    /// ```
+    pub fn fallback_specs(&self) -> &[ProviderSpec] {
+        self.file.provider.get(1..).unwrap_or_default()
+    }
+
+    /// The application's own settings under `[app.<key>]`, deserialized into the
+    /// application's own type (0.27.0).
+    ///
+    /// This crate stores `[app]` and **never validates it**. That is the whole
+    /// feature: io-cli and io-studio keep their settings in the same file without the
+    /// harness pretending to understand them, and an unknown key here is the caller's
+    /// business rather than an error. Every other section still rejects what it does
+    /// not know — this is one hole with a wall around it, not the wall coming down.
+    ///
+    /// Generic rather than returning a `toml::Value`, so no `toml` type reaches this
+    /// crate's public API and no version of it becomes a semver commitment.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// #[derive(serde::Deserialize)]
+    /// struct Cli { theme: String, width: u32 }
+    ///
+    /// let config = Config::from_toml(r#"
+    ///     [app.cli]
+    ///     theme = "dark"
+    ///     width = 100
+    /// "#).unwrap();
+    ///
+    /// let cli: Cli = config.app("cli").unwrap().expect("the file carries [app.cli]");
+    /// assert_eq!(cli.theme, "dark");
+    /// // A key the file does not carry is absent, not an error and not a default.
+    /// assert!(config.app::<Cli>("studio").unwrap().is_none());
+    /// ```
+    pub fn app<T: serde::de::DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        let Some(value) = self.file.app.as_ref().and_then(|t| t.get(key)) else {
+            return Ok(None);
+        };
+        value
+            .clone()
+            .try_into()
+            .map(Some)
+            .map_err(|e: toml::de::Error| {
+                Error::Config(format!("`[app.{key}]`: {}", e.message()))
+            })
+    }
+
+    /// What `[instructions]` discovered, worded as constraints (0.27.0).
+    ///
+    /// One entry per file that existed and carried text, each naming the file it came
+    /// from, and applied to a contract by [`Config::apply_to`]. Empty where the file
+    /// has no `[instructions]` section, where no named file exists, and always for
+    /// [`Config::from_toml`], which has no root to discover against.
+    ///
+    /// The files are read inside [`Config::discover`] — the caller's own call, before
+    /// the run — so "nothing is loaded implicitly" still holds exactly.
+    ///
+    /// **They are untrusted text.** A discovered `AGENTS.md` reaches the model
+    /// verbatim and grants nothing: the boundary is still the [`Policy`] the caller
+    /// loaded.
+    pub fn instructions(&self) -> &[String] {
+        &self.instructions
     }
 
     // -----------------------------------------------------------------------
@@ -713,6 +1023,13 @@ impl Config {
         if let Some(web) = &self.file.web {
             out = out.with_web(web.clone());
         }
+        // 0.27.0 — discovered project instructions land in `constraints`, the field
+        // that already exists to carry "extra rules the agent must respect, surfaced
+        // to the model verbatim". A new `TaskContract` field would be a break, and
+        // this release carries none.
+        for instruction in &self.instructions {
+            out = out.with_constraint(instruction.clone());
+        }
 
         let Some(run) = &self.file.run else {
             return out;
@@ -754,8 +1071,12 @@ impl Config {
 /// Where the user-scope file lives on this platform, or `None` where no home
 /// directory could be determined.
 ///
-/// `$IO_CONFIG_HOME` wins outright, then `$XDG_CONFIG_HOME/io` or `~/.config/io`
-/// on unix and `%APPDATA%\io` on Windows.
+/// `$IO_CONFIG` names the file itself and wins outright (0.27.0), then
+/// `$IO_CONFIG_HOME` names its directory, then `$XDG_CONFIG_HOME/io` or
+/// `~/.config/io` on unix and `%APPDATA%\io` on Windows.
+///
+/// `$IO_CONFIG` names the **user scope**. It does not bypass the merge, so a project
+/// file still wins the keys it names — which is what keeps the scopes at four.
 ///
 /// ```
 /// // Whatever it resolves to, it is the same answer twice — a config path that
@@ -764,6 +1085,9 @@ impl Config {
 /// ```
 #[must_use]
 pub fn user_path() -> Option<PathBuf> {
+    if let Some(file) = env_dir(CONFIG_VAR) {
+        return Some(file);
+    }
     if let Some(dir) = env_dir(CONFIG_HOME_VAR) {
         return Some(dir.join(PROJECT_FILE));
     }
@@ -793,28 +1117,141 @@ fn env_dir(var: &str) -> Option<PathBuf> {
 
 /// Read one scope: parse it, substitute against its own directory, and validate
 /// it on its own so an error can name the file it came from.
-fn read_scope(path: &Path) -> Result<toml::value::Table> {
+fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
-    let table = parse(&text, path)?;
+    let table = parse(scope, &text, path)?;
+    if scope == Scope::Project {
+        refuse_widening(&table, path)?;
+    }
     // Validated here and discarded: the value that is kept is the merged one,
     // but an error found now can name this file rather than "<merged>".
-    let _: File = deserialize(toml::Value::Table(table.clone()), path)?;
+    let file: File = deserialize(toml::Value::Table(table.clone()), path)?;
+    refuse_nested_profiles(&file, path)?;
     Ok(table)
 }
 
 /// Parse and substitute, in that order — a substitution is a value, not syntax.
-fn parse(text: &str, path: &Path) -> Result<toml::value::Table> {
+///
+/// `scope` reaches all the way down to [`expand`] because one substitution —
+/// `${cmd:...}` — is refused in the project scope, and the project scope is the one
+/// a `git clone` delivers.
+fn parse(scope: Scope, text: &str, path: &Path) -> Result<toml::value::Table> {
     let mut table: toml::value::Table = toml::from_str(text)
         .map_err(|e| Error::Config(format!("{}: {}", path.display(), e.message())))?;
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
     let mut key = Vec::new();
     for (k, v) in table.iter_mut() {
         key.push(k.clone());
-        substitute(v, &dir, &mut key, path)?;
+        substitute(scope, v, &dir, &mut key, path)?;
         key.pop();
     }
     Ok(table)
+}
+
+/// The keys a project-scoped file may not set to the value that *widens* a boundary,
+/// paired with that value (0.27.0).
+///
+/// `io.toml` is committed and arrives with a `git clone`. These four are the keys
+/// that turn reading a stranger's configuration into a risk: two that default an act
+/// to `allow`, one that re-opens egress inside the sandbox, and one that switches the
+/// portable floor off. The *narrowing* value of each is still legal in a project
+/// file, because a project file denying `exec` is exactly what the scope is for.
+const PROJECT_WIDENING: &[(&[&str], &str)] = &[
+    (&["policy", "defaults", "exec"], "allow"),
+    (&["policy", "defaults", "net"], "allow"),
+    (&["sandbox", "allow_network"], "true"),
+    (&["sandbox", "force_floor"], "false"),
+];
+
+/// A project-scoped file may narrow the boundary and may never widen it.
+///
+/// What this does **not** claim: that a cloned repository is safe. `[[mcp]]` still
+/// names a command and `[toolchain]` still names an argv, and the boundary against
+/// the agent is still the [`Policy`] the caller loaded. This is a specific narrowing
+/// of a specific hazard — four keys and `${cmd:}`, no more.
+///
+/// Profile bodies are checked too. A widening key hidden in `[profile.x.sandbox]`
+/// would otherwise reach the same place by a different path.
+fn refuse_widening(table: &toml::value::Table, path: &Path) -> Result<()> {
+    for (keys, widening) in PROJECT_WIDENING {
+        let mut node = table.get(keys[0]);
+        for key in &keys[1..] {
+            node = node.and_then(toml::Value::as_table).and_then(|t| t.get(*key));
+        }
+        let Some(value) = node else { continue };
+        let written = match value {
+            toml::Value::String(s) => s.as_str(),
+            toml::Value::Boolean(true) => "true",
+            toml::Value::Boolean(false) => "false",
+            _ => continue,
+        };
+        if written == *widening {
+            return Err(Error::Config(format!(
+                "{}: key `{}`: `{written}` widens the boundary, and a project-scoped \
+                 file may narrow it and never widen it. Write it in `{LOCAL_FILE}` or \
+                 the user-scope file instead.",
+                path.display(),
+                keys.join(".")
+            )));
+        }
+    }
+    if let Some(profiles) = table.get("profile").and_then(toml::Value::as_table) {
+        for body in profiles.values().filter_map(toml::Value::as_table) {
+            refuse_widening(body, path)?;
+        }
+    }
+    Ok(())
+}
+
+/// A profile is an overlay, not a tree. Nesting one is rejected rather than ignored,
+/// for the same reason an unknown key is: a section that silently does nothing is a
+/// setting an operator believes in.
+fn refuse_nested_profiles(file: &File, path: &Path) -> Result<()> {
+    for (name, body) in &file.profile {
+        if !body.profile.is_empty() {
+            return Err(Error::Config(format!(
+                "{}: key `profile.{name}.profile`: a profile may not contain profiles",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Read what `[instructions]` names, relative to the discovery root, and word each
+/// as a constraint.
+///
+/// A named file that does not exist is skipped, and one that holds only whitespace is
+/// skipped: this is discovery, not substitution, and the "resolve or fail" rule that
+/// governs `${...}` deliberately does not apply. The file name rides in the text so a
+/// reader of the constraint — or of the trace — can see where it came from.
+fn read_instructions(file: &File, root: &Path) -> Result<Vec<String>> {
+    let Some(section) = &file.instructions else {
+        return Ok(Vec::new());
+    };
+    let names = match &section.files {
+        Some(files) => files.clone(),
+        None => DEFAULT_INSTRUCTIONS.iter().map(PathBuf::from).collect(),
+    };
+    let mut out = Vec::new();
+    for name in names {
+        let at = root.join(&name);
+        if !at.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&at)
+            .map_err(|e| Error::Config(format!("{}: {e}", at.display())))?;
+        let text = text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        out.push(format!(
+            "Project instructions from `{}`:\n{text}",
+            name.display()
+        ));
+    }
+    Ok(out)
 }
 
 fn deserialize(value: toml::Value, path: &Path) -> Result<File> {
@@ -823,26 +1260,28 @@ fn deserialize(value: toml::Value, path: &Path) -> Result<File> {
         .map_err(|e: toml::de::Error| Error::Config(format!("{}: {}", path.display(), e.message())))
 }
 
-/// Expand `${env:...}` and `${file:...}` in every string this value contains.
+/// Expand `${env:...}`, `${file:...}` and `${cmd:...}` in every string this value
+/// contains.
 fn substitute(
+    scope: Scope,
     value: &mut toml::Value,
     dir: &Path,
     key: &mut Vec<String>,
     path: &Path,
 ) -> Result<()> {
     match value {
-        toml::Value::String(s) => *s = expand(s, dir, key, path)?,
+        toml::Value::String(s) => *s = expand(scope, s, dir, key, path)?,
         toml::Value::Array(items) => {
             for (i, item) in items.iter_mut().enumerate() {
                 key.push(format!("[{i}]"));
-                substitute(item, dir, key, path)?;
+                substitute(scope, item, dir, key, path)?;
                 key.pop();
             }
         }
         toml::Value::Table(table) => {
             for (k, v) in table.iter_mut() {
                 key.push(k.clone());
-                substitute(v, dir, key, path)?;
+                substitute(scope, v, dir, key, path)?;
                 key.pop();
             }
         }
@@ -851,12 +1290,33 @@ fn substitute(
     Ok(())
 }
 
+/// Run `argv` with no shell and return its trimmed stdout.
+///
+/// Split on whitespace, `argv[0]` is the program: there is no shell between the
+/// string and the process, so a value carrying `;` or `|` or a backtick is an
+/// argument rather than a second command. A non-zero exit is a failure, because a
+/// credential helper that failed did not produce a credential.
+fn run_command(argv: &str) -> std::result::Result<String, String> {
+    let mut parts = argv.split_whitespace();
+    let Some(program) = parts.next() else {
+        return Err("`${cmd:}` names no program".to_string());
+    };
+    let output = std::process::Command::new(program)
+        .args(parts)
+        .output()
+        .map_err(|e| format!("cannot run `{program}`: {e}"))?;
+    if !output.status.success() {
+        return Err(format!("`{program}` exited with {}", output.status));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// One string's worth of substitution.
 ///
 /// Every failure is an error naming the key. None of them is an empty string: a
 /// config that silently disarms itself is the worst outcome this feature can
 /// produce.
-fn expand(raw: &str, dir: &Path, key: &[String], path: &Path) -> Result<String> {
+fn expand(scope: Scope, raw: &str, dir: &Path, key: &[String], path: &Path) -> Result<String> {
     let mut out = String::new();
     let mut rest = raw;
     while let Some(at) = rest.find("${") {
@@ -889,6 +1349,23 @@ fn expand(raw: &str, dir: &Path, key: &[String], path: &Path) -> Result<String> 
                     })?
                     .trim()
                     .to_string()
+            }
+            // 0.27.0. Parsing has never run anything before, and `io.toml` is the
+            // file a `git clone` delivers — so the one scope that cannot use this is
+            // the one an operator did not write.
+            "cmd" => {
+                if scope == Scope::Project {
+                    return Err(bad_key(
+                        path,
+                        key,
+                        format!(
+                            "`${{cmd:}}` is refused in the project scope, because `{PROJECT_FILE}` \
+                             travels with a clone. Write it in `{LOCAL_FILE}` or the user-scope \
+                             file instead."
+                        ),
+                    ));
+                }
+                run_command(arg).map_err(|e| bad_key(path, key, e))?
             }
             other => {
                 return Err(bad_key(
@@ -1002,12 +1479,13 @@ mod tests {
 
         let key = ["run".to_string()];
         let path = Path::new("io.toml");
+        let at = Scope::Local;
         assert_eq!(
-            expand("${env:IO_HARNESS_TEST_SET}", dir.path(), &key, path).unwrap(),
+            expand(at, "${env:IO_HARNESS_TEST_SET}", dir.path(), &key, path).unwrap(),
             "from-the-environment"
         );
         assert_eq!(
-            expand("Bearer ${file:token}", dir.path(), &key, path).unwrap(),
+            expand(at, "Bearer ${file:token}", dir.path(), &key, path).unwrap(),
             "Bearer s3cret",
             "a file's value is trimmed, and substitution is inside a larger string"
         );
@@ -1018,7 +1496,7 @@ mod tests {
             ("${nope:x}", "not a substitution"),
             ("${env:X", "unterminated"),
         ] {
-            let err = expand(input, dir.path(), &key, path)
+            let err = expand(at, input, dir.path(), &key, path)
                 .unwrap_err()
                 .to_string();
             assert!(err.contains(expect), "{input}: {err}");
@@ -1027,8 +1505,76 @@ mod tests {
         // The negative control for the whole set: a string with no substitution
         // in it is returned unchanged rather than being parsed at all.
         assert_eq!(
-            expand("plain $HOME value", dir.path(), &key, path).unwrap(),
+            expand(at, "plain $HOME value", dir.path(), &key, path).unwrap(),
             "plain $HOME value"
+        );
+    }
+
+    #[test]
+    fn a_command_substitution_runs_outside_the_project_scope_and_never_inside_it() {
+        // Each platform's own spelling of "print this", "succeed silently" and
+        // "fail". Named rather than skipped: `${cmd:}` is a real feature on Windows
+        // and a test that ran on two platforms out of three would prove it there.
+        #[cfg(windows)]
+        let (echo, quiet, fail) = ("cmd /c echo s3cret", "cmd /c rem", "cmd /c exit 1");
+        #[cfg(not(windows))]
+        let (echo, quiet, fail) = ("printf s3cret", "true", "false");
+
+        let dir = tempfile::tempdir().unwrap();
+        let key = ["mcp".to_string()];
+        let path = Path::new("io.local.toml");
+
+        // A trailing newline is trimmed, and the value composes inside a larger string.
+        assert_eq!(
+            expand(
+                Scope::Local,
+                &format!("Bearer ${{cmd:{echo}}}"),
+                dir.path(),
+                &key,
+                path
+            )
+            .unwrap(),
+            "Bearer s3cret"
+        );
+
+        // The three ways a helper fails, each named separately.
+        for (input, expect) in [
+            (format!("${{cmd:{fail}}}"), "exited with"),
+            ("${cmd:io-harness-no-such-program}".to_string(), "cannot run"),
+            (format!("${{cmd:{quiet}}}"), "resolved to nothing"),
+        ] {
+            let input = input.as_str();
+            let err = expand(Scope::Local, input, dir.path(), &key, path)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(expect), "{input}: {err}");
+        }
+
+        // The project scope refuses it outright, before running anything.
+        let err = expand(
+            Scope::Project,
+            &format!("${{cmd:{echo}}}"),
+            dir.path(),
+            &key,
+            Path::new(PROJECT_FILE),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("refused in the project scope"), "{err}");
+        // The negative control: it is `cmd:` that is refused there, not substitution.
+        // A rule that disarmed `${env:}` in the project scope would be a much worse
+        // feature that this test would otherwise pass.
+        std::env::set_var("IO_HARNESS_TEST_SET", "from-the-environment");
+        assert_eq!(
+            expand(
+                Scope::Project,
+                "${env:IO_HARNESS_TEST_SET}",
+                dir.path(),
+                &key,
+                Path::new(PROJECT_FILE),
+            )
+            .unwrap(),
+            "from-the-environment"
         );
     }
 }
