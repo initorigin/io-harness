@@ -83,10 +83,11 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
         );
     }
 
-    // Windows: the Job Object is unimplemented, so the floor *is* the strongest
-    // available backend and naming `WindowsJobObject` would be a lie.
+    // Windows: since 0.24.0 the Job Object is implemented, so it *is* the
+    // strongest available backend and reporting the floor would now be the lie.
+    // Before 0.24.0 this asserted `PortableFloor`, and that was correct then.
     #[cfg(target_os = "windows")]
-    assert_eq!(native.backend(), Backend::PortableFloor);
+    assert_eq!(native.backend(), Backend::WindowsJobObject);
 
     // ...and forcing the floor selects the portable backend, recorded so the
     // selection ladder is observable.
@@ -185,12 +186,26 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         // *not* a kernel boundary — documented in the module, and the reason it
         // must never claim to be one. So the invariant asserted on this host is
         // the contrapositive, which is what keeps the claim honest: a run that
-        // could reach the network is a run that reported the floor. A kernel
-        // whose unprivileged user namespaces are restricted lands here.
-        assert_eq!(
-            out.backend,
-            Backend::PortableFloor,
-            "only the floor may run without a network boundary"
+        // could reach the network is a run that reported a backend which never
+        // claimed to stop it. A kernel whose unprivileged user namespaces are
+        // restricted lands here.
+        //
+        // `WindowsJobObject` joins the floor here in 0.24.0, and it is the whole
+        // reason the platform table's Windows row is not shortened to "Native".
+        // A Job Object contains *resources* — memory, CPU, process count, tree
+        // kill — and there is no network facility and no filesystem facility in
+        // one. It is a real backend that really bounds a run, and it still has
+        // nothing to say about egress. Keeping the assertion strict for the two
+        // backends that do claim a network boundary is what stops this from
+        // becoming a test that permits anything.
+        assert!(
+            matches!(
+                out.backend,
+                Backend::PortableFloor | Backend::WindowsJobObject
+            ),
+            "only a backend that never claimed a network boundary may run without \
+             one, got {:?}",
+            out.backend
         );
     }
 }
