@@ -22,6 +22,15 @@ do compile, but they are not individually snapshotted. Treat them as public and
 stable in the same way, and expect the snapshot to grow to cover them rather than
 the items to be withdrawn.
 
+There is a third half the snapshot cannot show, because it enumerates re-exported
+*names* and this is a *type*: **`rusqlite` is a public dependency of this crate.**
+`Error::State(#[from] rusqlite::Error)` carries that crate's own error type, so a
+`rusqlite` major bump changes this crate's public API whether or not anything here
+behaves differently — which is exactly what 0.23.0 was. It is written down here
+because `public-api.txt` lists `enum Error src/error.rs` and stops there: the
+variant's payload is not a line in that file and never will be. The intent to
+wrap it is under [Limits that hold today](#limits-that-hold-today).
+
 Not public, and free to change without any notice:
 
 - Anything not reachable from the crate root — private modules, `pub(crate)`

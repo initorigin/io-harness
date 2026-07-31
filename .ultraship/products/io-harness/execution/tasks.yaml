@@ -61,7 +61,7 @@ tasks:
     why_required: >
       The engine moves seven point releases and the compiler cannot check any of it. Reading back a
       previous release's stored rows is the only evidence that the move preserved what is on disk.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T01]
     acceptance_criteria:
       - >
@@ -73,7 +73,33 @@ tasks:
     files:
       - tests/cross_version.rs
       - tests/fixtures/store-0.22.0/
-    evidence: []
+    evidence:
+      - >
+        The fixtures are genuinely the previous release's. `tests/fixtures/gen-0.22.0` is pinned
+        `io-harness =0.22.0` and its committed lockfile resolves `rusqlite` 0.32.1 and `libsqlite3-sys`
+        0.30.1. All three `.sqlite3` headers read `SQLite version 3046000` — 3.46.0, the old engine,
+        not the 3.53.2 this release links. `PRAGMA integrity_check` is `ok` on all three and no WAL
+        sidecar was left behind.
+      - >
+        F2 — `a_0_22_0_store_reads_back_row_for_row_through_the_public_api` passes. It builds a value
+        from the public `Store` readers alone and compares key-by-key against the sidecar 0.22.0 wrote:
+        outcome, status, step count, last step, spent tokens, checkpoint events, every step
+        (number/decision/tokens), every provider call (step, attempt, provider, model, finish reason,
+        failure and all seven `Usage` counters), every observation, the edit, both policy events
+        including the refusal, the resolved pending approval, both citations — including the one with
+        two NULL columns — and both server-tool calls. The comparison is driven by the sidecar's own
+        key set and counts are checked both ways, so a table added later fails the test rather than
+        going unread.
+      - >
+        F2 negative control — `the_schema_this_release_creates_is_identical_to_the_one_0_22_0_created`
+        passes. `sqlite_master` from a store this release creates equals the fixture's normalised
+        `CREATE TABLE`/`CREATE INDEX` set, with a length guard so an empty set cannot match an empty
+        set.
+      - >
+        Two values are not asserted and the omission is checked rather than silent: `runs.goal` has no
+        public reader and `RunSummary` carries no `goal`, and the sidecar's `workspace` is the
+        generator's own relative directory, which is not where the test's copy lives. Both sit in a
+        named constant in the test so they cannot be forgotten.
 
   - id: US-IO-HARNESS-0.23.0-T03
     summary: >
@@ -83,7 +109,7 @@ tasks:
     why_required: >
       This is the one failure shape the release can produce that compiles, passes the unit tests, and
       still damages a user's data. Review cannot catch it; only this can.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T02]
     acceptance_criteria:
       - >
@@ -96,7 +122,33 @@ tasks:
     files:
       - tests/cross_version.rs
       - examples/crash_fixture.rs
-    evidence: []
+    evidence:
+      - >
+        F3 — `a_0_22_0_interrupted_tree_resumes_without_re_running_or_double_charging` passes. The
+        pre-resume state is asserted against `interrupted.json` first (tree ids 1/2/3, agent count 3,
+        root step-capped at step 1, child 2 completed at 80 tokens, child 3 step-capped at 160, tree
+        total 400, and both workspace file contents), so the test is anchored to what 0.22.0 stored
+        rather than to whatever it finds.
+      - >
+        After `resume_tree`: verified success; no run in the tree has a duplicate step number; the
+        child that had already finished gained neither a step nor a token; the tree total equals
+        `400 + served * 25`, where `served` is the resume provider's own call counter living outside
+        the database, so the ledger is checked against an external witness rather than against itself;
+        `a.txt` still holds exactly one copy of `ALPHA`; `b.txt` reaches `BETA`; and a `resume`
+        checkpoint event exists.
+      - >
+        Non-vacuity proven, not assumed. A provider rewired to report double tokens fired
+        `the tree's total must be what 0.22.0 drew plus exactly what this release drew` (500 against
+        450), and bumping the finished child's step baseline fired
+        `the child that had already finished gained a step on resume`. Both were reverted and the file
+        re-confirmed green.
+      - >
+        Gap recorded rather than glossed: 0.22.0 committed the step-capped root step, so on resume the
+        coordinator replans instead of replaying the fan-out, and `Store::find_spawn` has nothing to
+        adopt at that step. This fixture therefore does NOT exercise the adopt-a-completed-child path.
+        It makes the no-re-run assertions stronger — the finished child is proven untouched by its own
+        rows and its own file rather than by trusting adoption to skip it — but it is a different
+        proof. `tests/checkpoint.rs` covers adoption within a single release.
 
   - id: US-IO-HARNESS-0.23.0-T04
     summary: >
@@ -105,7 +157,7 @@ tasks:
     why_required: >
       The approval record is the crate's one durable human decision. If it does not survive a dependency
       upgrade the permission boundary is not durable, whatever the trace says.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T02]
     acceptance_criteria:
       - >
@@ -114,7 +166,19 @@ tasks:
         survive a dependency upgrade is not durable.
     files:
       - tests/cross_version.rs
-    evidence: []
+    evidence:
+      - >
+        F4 — `a_0_22_0_deferred_approval_is_resolved_here_and_the_run_continues` passes. Before the
+        resume, `Store::pending(1)` returns the row 0.22.0 left behind with `resolved == None` and the
+        act, target, content and step from the sidecar, and `out.txt` does not exist — the deferred
+        write genuinely did not happen. It is then resolved through `resume_with_decision` with
+        `Decision::Approve` under the generator's own `ask_write("out.txt")` policy: the run reaches
+        `Success`, the pending row reads `resolved == Some("approve")`, `out.txt` holds `DONE\n`, and
+        the run's status is `completed`.
+      - >
+        Non-vacuity proven: flipping the decision to `Decision::deny(...)` fired
+        `the run must continue to a terminal outcome once the approval is resolved: Denied { steps: 1 }`.
+        Reverted and re-confirmed green.
 
   - id: US-IO-HARNESS-0.23.0-T05
     summary: >
@@ -170,7 +234,7 @@ tasks:
     why_required: >
       A silent format bump would let a broken upgrade present itself as a successful one. The existing
       assertion covers a fresh store; this release needs it against a 0.22.0 store.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T02]
     acceptance_criteria:
       - >
@@ -179,7 +243,22 @@ tasks:
     files:
       - tests/cross_version.rs
       - tests/checkpoint.rs
-    evidence: []
+    evidence:
+      - >
+        F5 — `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_migrates_nothing` passes.
+        `CHECKPOINT_FORMAT == 7`, and for each of the three 0.22.0 fixtures `PRAGMA user_version` reads
+        7 before `Store::open` and 7 after, with `sqlite_master` captured either side of the open and
+        required to be unchanged. That pair is what "no migration ran" has to mean here: not that the
+        constant is still 7, but that opening an old store did not quietly rewrite it.
+      - >
+        No schema change anywhere in the release. `from_conn`'s `CREATE TABLE IF NOT EXISTS` batches
+        are untouched, and the F2 negative control independently requires the schema this release
+        creates to equal 0.22.0's.
+      - >
+        Non-vacuity proven twice. Stamping a fixture copy to `user_version = 6` fired the pre-check
+        (`populated.sqlite3 was stamped at 6 by 0.22.0`); stamping it to 6 *and* relaxing the pre-check
+        so the open really would migrate fired
+        `opening populated.sqlite3 changed its checkpoint format — a migration ran`. Both reverted.
 
   - id: US-IO-HARNESS-0.23.0-T07
     summary: >
@@ -190,7 +269,7 @@ tasks:
     why_required: >
       The break is real for any consumer matching `Error::State(e)`, and the release notes are taken
       verbatim from the changelog. An undocumented break is the same thing as an unannounced one.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T05]
     acceptance_criteria:
       - >
@@ -203,7 +282,31 @@ tasks:
       - CHANGELOG.md
       - docs/CONTRACT.md
       - docs/public-api.txt
-    evidence: []
+    evidence:
+      - >
+        F6 — the break is exactly one, and it is the one the contract predicted: `Error::State` carries
+        `rusqlite` 0.40's error type. No second break was discovered. The 28 compile errors were all
+        the `fallible_uint` feature move and none of them reached a public signature; `src/` is
+        unchanged apart from the MSRV sentence in the crate-root docs, and `tests/public_api.rs` passes
+        against an unedited `docs/public-api.txt`.
+      - >
+        The changelog carries the `**BREAKING**` entry with a `*Migration:*` note showing both the
+        manifest change and the two match shapes — the one that is unaffected and the one that is not —
+        plus a second `**BREAKING (MSRV)**` entry for the 1.88 to 1.95 move with its own migration note
+        saying plainly that there is no opt-out and no version of the dependency that avoids it.
+        `tests/changelog.rs` passes, which is what enforces that every marked break carries a note.
+      - >
+        `docs/public-api.txt` needed no edit, and the reason is recorded rather than left as an
+        apparent omission: the snapshot enumerates re-exported *names* as `<kind> <name> <file>`, so it
+        holds `enum Error src/error.rs` and stops there. A variant's payload type is not a line in that
+        file and never will be. Writing one in would have corrupted the format the drift test checks.
+      - >
+        So the fact went where it can actually be read. `docs/CONTRACT.md`'s "What is public" now
+        states outright that `rusqlite` is a **public dependency** of this crate and that a `rusqlite`
+        major bump is therefore a public API change here whether or not behaviour moves — which is
+        exactly what 0.23.0 was. "Limits that hold today" carries the intent to wrap the type in a
+        later release, with the two match shapes spelled out so a consumer writing code today knows
+        which one survives.
 
   - id: US-IO-HARNESS-0.23.0-T08
     summary: >
@@ -212,7 +315,7 @@ tasks:
     why_required: >
       Windows is where the bundled SQLite is a C compile and the runner is slowest, and docs.rs failing
       after publication cannot be fixed without another version.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T03, US-IO-HARNESS-0.23.0-T04, US-IO-HARNESS-0.23.0-T06]
     acceptance_criteria:
       - >
@@ -223,7 +326,31 @@ tasks:
         job before publication rather than after.
     files:
       - .github/workflows/ci.yml
-    evidence: []
+    evidence:
+      - >
+        NF1 locally on macOS (arm64, rustc 1.95.0): `cargo test` green — 45 test binaries plus 237
+        doctests, 0 failed, 0 ignored — including the real-SIGKILL crash-resume test and the five new
+        cross-version tests. `cargo test --all-features --lib --tests` green; `cargo test --all-features
+        --doc` green at 239. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean.
+        No test was skipped, ignored or made conditional to get there.
+      - >
+        NF3 — `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`
+        builds clean, which is the exact command and flags the nightly `docs` job runs. The job's
+        second assertion was checked too: the rendered pages under `target/doc/io_harness/` carry
+        `Available on crate feature`, so the feature labelling that job exists to protect is intact.
+        Checked before publication, as the criterion requires, not after.
+      - >
+        Linux and Windows are CI's to confirm on the pull request. Windows is the one to watch: the
+        bundled SQLite is a C compile there, 3.53.2 is a larger translation unit than 3.46.0, and the
+        runner is the slowest of the three, so a timeout there is a delay rather than a break. The
+        `skills::discovery_over_a_32_skill_directory_is_under_50ms` wall-clock test is also a known
+        intermittent on that runner — re-run before investigating, and check the failing test name
+        first.
+      - >
+        Machine note acted on rather than rediscovered: `target/` plus the three fixture crates' own
+        target directories took the disk to 10 GiB free, which is the condition that has twice
+        surfaced as a linker error reading like a toolchain bug. Cleaned before the release steps —
+        35.2 GiB freed, 38 GiB available.
 
   - id: US-IO-HARNESS-0.23.0-T09
     summary: >
