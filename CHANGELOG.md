@@ -26,6 +26,98 @@ notes are produced from it.
 
 ### Security
 
+## [0.26.0] - 2026-08-01
+
+The release that closes the Windows tree kill. Killing a process handle now ends
+every process it produced, including a grandchild whose own parent has already
+exited — the shape a real dev server has, and the one no kill built on walking
+the process table can reach. macOS and Linux got that guarantee in 0.25.0 through
+process groups; Windows has no process group, so it gets a Job Object, and the
+clause `US-IO-HARNESS-0.25.0-I01` withdrew from the previous release is met here.
+
+Beside it, the crate gains the machinery for a Windows **access** boundary — an
+AppContainer, which is the analogue of the macOS sandbox profile and the Linux
+network namespace that the platform table has been missing. What shipped of it,
+and what it does not yet default to, is stated exactly below rather than implied.
+
+### Added
+
+- **A process handle's processes are contained on Windows, so `shell_kill` takes
+  the whole tree.** Each stage of a handle's line is created suspended, assigned
+  to a Job Object belonging to that handle, and only then resumed; the kill closes
+  the job. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` walks nothing, so membership
+  cannot be escaped by a process whose parent died or outlived by one that was
+  spawned later. The suspend is the correctness argument rather than caution: a
+  process that runs even briefly outside the job can spawn a descendant that never
+  joins it, and every call involved still returns success.
+
+  The mechanism is the one the sandbox backend already had — `Job::create`,
+  `Job::adopt` and its resume — reused rather than copied, so the crate still
+  contains exactly one `AssignProcessToJobObject`. A handle's job carries the
+  teardown guarantee and **no resource limits**, because a handle is a lifetime
+  rather than a boundary and a twenty-minute build is exactly what the sandbox's
+  caps exist to kill.
+
+- **`io_harness::sandbox::appcontainer`**, the Windows AppContainer half: creating
+  and deleting a container profile, deriving its SID, granting a path to it with an
+  explicit ACE, and spawning a process into it through `CreateProcessW` with a
+  `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list. The crate owns that
+  spawn because it has no choice — the attribute list is the only documented route
+  a container SID has to a child, and neither `tokio`'s `Command` nor `std`'s can
+  carry one on stable Rust, where `raw_attribute` is still gated behind
+  `windows_process_extensions_raw_attribute`.
+
+  **The capability array is empty**, which is the network boundary: `internetClient`
+  is the capability that buys a socket to the outside and it is not requested, so
+  the denial is the token's own rather than a filter's — the same shape as an empty
+  network namespace on Linux.
+
+### Changed
+
+- Two more `windows-sys` features (`Win32_Security_Isolation`,
+  `Win32_Security_Authorization`) and **no new crate on any platform**. `cargo tree`
+  on the default feature set is unchanged on macOS and Linux, where this dependency
+  is not resolved at all.
+
+- `examples/orphan.rs` — the grandchild fixture — now runs on Windows as well as
+  unix. The chain is identical and only the leaf's definition of "my parent is
+  gone" differs, because the platforms do: unix reparents to init and the leaf
+  watches `getppid`, while Windows never reparents at all — a process keeps its
+  creator's pid forever, which is precisely the stale link that makes `taskkill /T`
+  miss the leaf — so there the leaf waits for the middle to leave the process table.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **`docs/CONTRACT.md` said tree kill on a handle was best-effort on every
+  platform. It was not, and had not been since 0.25.0.** Process groups closed the
+  unix half in that release, with a test and a named negative control for it, and
+  this document was written from the plan rather than from the code.
+  `docs/guide/command-execution.md` carried the same claim and then contradicted
+  itself two sentences later by scoping the gap to Windows. Both now state one
+  guarantee with a mechanism per platform.
+
+  Under-claiming a shipped boundary is the same defect as over-claiming one —
+  either way the file cannot be trusted — and 0.25.0's own notes record that exact
+  sentence about a different paragraph, so this document has now done it in two
+  consecutive releases. Recorded rather than quietly corrected.
+
+- The `src/tools/handles.rs` module documentation had the opposite error: it
+  described a handle's processes as "a process group" with no platform caveat, on a
+  platform that has none.
+
+### Security
+
+- **A Windows handle no longer leaks a grandchild when it is killed.** Before this
+  release `shell_kill` fell back to `taskkill /F /T`, which walks parent/child
+  links in the process table; a descendant whose parent had already exited was
+  reachable from nothing the handle recorded and survived. A process the operator
+  did not ask for and cannot see is the failure that reaches their machine rather
+  than their run, which is why this is here rather than under Fixed.
+
 ## [0.25.0] - 2026-07-31
 
 The release that lets a run start something that does not finish. Every tool this

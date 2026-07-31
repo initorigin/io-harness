@@ -10,7 +10,11 @@
 //! Two columns close for the price of one mechanism:
 //!
 //! - **Filesystem** — default-deny. A path the payload may touch is a path
-//!   something granted, by name, with an explicit ACE. See [`grant`].
+//!   something granted, by name, with an explicit ACE — see `grant` below, which
+//!   is deliberately named in plain text rather than linked: everything in this
+//!   module is `cfg(windows)`, docs.rs renders on Linux, and an intra-doc link
+//!   into code that does not exist on the rendering host is a broken link on the
+//!   only page a reader actually sees.
 //! - **Network** — the capability array is **empty**. `internetClient` is the
 //!   capability that buys a socket to the outside, and it is not requested, so
 //!   there is no route off the machine. This is the absence of a permission
@@ -547,6 +551,7 @@ mod win {
 mod tests {
     use super::win::{grant, Access, Profile, Spawned};
     use std::io::Read;
+    use std::os::windows::process::CommandExt;
 
     /// A profile name unique to this test process and this call site. Deleted by
     /// `Profile`'s `Drop`, and re-enterable if a crash ever leaves one behind.
@@ -585,7 +590,15 @@ mod tests {
     /// and it is what makes every denial below mean something.
     fn outside(cmdline: &str, cwd: &std::path::Path) -> Option<i32> {
         std::process::Command::new("cmd.exe")
-            .args(["/c", cmdline])
+            // `raw_arg`, not `args`. `Command` escapes each argument for the
+            // *C runtime's* rules, and `cmd.exe` does not follow them: a single
+            // argument of `type "C:\...\x.txt"` comes back out re-quoted as
+            // `"type \"C:\...\x.txt\""`, which cmd parses as a program called
+            // `type "C:\` and reports as a failure. The container runs its line
+            // through `CreateProcessW` verbatim, so the control has to be
+            // verbatim too — otherwise the two halves are not the same command
+            // and the comparison between them means nothing.
+            .raw_arg(format!("/c {cmdline}"))
             .current_dir(cwd)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -688,10 +701,20 @@ mod tests {
         grant(dir.path(), profile.sid(), Access::Full).expect("grant");
         let file = std::fs::File::create(dir.path().join("o.txt")).expect("capture");
 
-        // `ping` to a routable-but-silent address is the portable Windows sleep;
-        // `timeout` needs a console and fails when stdin is redirected.
+        // A `cmd` builtin loop, and every obvious alternative is wrong here:
+        //
+        // - `ping -n 30 127.0.0.1`, the usual Windows sleep, exits *immediately*
+        //   inside a container. An AppContainer blocks loopback as well as
+        //   egress, so the ping fails rather than waits. That is the boundary
+        //   working, and it makes ping useless as a clock.
+        // - `timeout /t 30` refuses to run at all when stdin is redirected, and
+        //   this spawn always redirects it.
+        // - `waitfor` would work but is one more binary to have to be present.
+        //
+        // A `for /L` loop over a builtin needs no file, no socket and no console,
+        // so it is the one sleep that is unaffected by the thing being tested.
         let mut slow = Spawned::start(
-            "cmd.exe /c ping -n 30 127.0.0.1",
+            "cmd.exe /c for /L %i in (1,1,2000000000) do @rem",
             dir.path(),
             profile.sid(),
             &file,
