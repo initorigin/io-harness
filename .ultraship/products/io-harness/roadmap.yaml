@@ -539,34 +539,57 @@ versions:
   - version: 0.25.0
     outcome: >
       Long-running work stops being unrepresentable. A dev server, a log tail or a twenty-minute
-      build is started through a process handle, polled for incremental output, and killed — instead
-      of blocking one step of the loop until a 900-second timeout decides for it. A handle recorded
-      by a previous process is orphaned on resume and never re-attached, polled or signalled,
-      because a recorded PID may since have been reused by something unrelated and signalling it is
-      the one way this crate could damage something outside its workspace. Moved here from 0.24.0 by
-      `US-IO-HARNESS-0.24.0-I01`; the Windows Job Object they need already shipped in 0.24.0, so
-      they arrive on a platform that can contain them.
+      build is started through a process handle, polled for the output produced since the last poll,
+      and killed — instead of blocking one step of the loop until a 900-second timeout decides for
+      it. A handle recorded by a previous process is orphaned on resume and never re-attached,
+      polled or signalled, because a recorded PID may since have been reused by something unrelated
+      and signalling it is the one way this crate could damage something outside its workspace.
+      Moved here from 0.24.0 by `US-IO-HARNESS-0.24.0-I01`. The Job Object they need shipped in
+      0.24.0 — but on the sandbox path, and `src/tools/shell.rs` never reaches it, so this release
+      routes the handle spawn into containment rather than inheriting it.
 
-      The agent stops guessing at symbol names in a large repository. An LSP client gives it
-      goto-definition, references and diagnostics from the same language server a human's editor
-      talks to, so "where is this defined" and "what breaks if I change it" are answered by the
-      toolchain rather than inferred from a grep — and a diagnostic produced by an edit comes back
-      attached to that edit, so the agent sees the type error it just wrote without spending a step
-      on a build to discover it.
+      And the agent stops paying a step to find out what it just broke. When an edit changes a file
+      in a project whose toolchain the crate already detects, the project's own checker runs against
+      it and its diagnostics come back attached to the edit — the exact rendered error, with line,
+      span and code. Today a type error costs a step, a build and a provider call to discover.
 
-      And the platform table finally reads the same on all three rows. AppContainer is the access
-      half 0.24.0's Job Object deliberately left: the actual analogue of macOS's `sandbox-exec`
-      profile and Linux's mount and network namespaces, confining what model-produced code may reach
-      on disk. It closes both missing columns at once rather than one, because an AppContainer
-      granted no `internetClient` capability has no route out by construction — the same shape as an
-      empty network namespace, which is what makes it the right mechanism instead of a filesystem
-      ACL scheme with a separate network story bolted beside it. Only with this does Windows say
-      *native* and mean by it what the other two rows mean. It sits beside the LSP client rather
-      than inside 0.24.0 because nothing forces it, and an unforced access-control subsystem does
-      not belong in a release that is already the largest on this roadmap.
-    detail: outline
+      This is deliberately not the LSP client the roadmap named, and the change is on evidence.
+      `publishDiagnostics` is a push notification with no completion signal, so a push server can
+      only be waited on by guessing; the 3.17 pull model is implemented by rust-analyzer and an
+      opt-in gopls and by none of typescript-language-server, pyright or clangd; and rust-analyzer's
+      pull handler never consults flycheck, so it returns type-inference diagnostics but not
+      borrow-check errors and not clippy — which is precisely what "the type error it just wrote"
+      means. The compiler's own machine-readable output is what a language server forwards anyway,
+      and taking it directly costs no new dependency and carries more. Goto-definition and
+      find-references are the queries a language server genuinely answers better than a grep; when
+      they are wanted they should be argued on their own terms, not smuggled in behind diagnostics.
+    detail: specified
     status: planned
   - version: 0.26.0
+    outcome: >
+      The platform table finally reads the same on all three rows. AppContainer is the access half
+      0.24.0's Job Object deliberately left: the analogue of macOS's `sandbox-exec` profile and
+      Linux's mount and network namespaces, confining what model-produced code may reach on disk and
+      off the machine. It closes both missing columns at once, because an AppContainer granted no
+      `internetClient` capability has no route out by construction — the same shape as an empty
+      network namespace, which is what makes it the right mechanism rather than a filesystem ACL
+      scheme with a separate network story bolted beside it. Only with this does Windows say
+      *native* and mean by it what the other two rows mean.
+
+      It is a release of its own, and 0.25.0's research is why. The security capabilities reach a
+      child through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` on an attribute list, and
+      `tokio::process::Command` cannot carry one on stable Rust — `raw_attribute` is still gated
+      behind `windows_process_extensions_raw_attribute`. So any AppContainer at all, network-only
+      included, means owning `CreateProcessAsUserW` here and re-implementing what the shared runner
+      gives free today: inheritable pipes, async draining, kill-on-drop, exit collection and the
+      wall-clock timeout. That rewrite is the release, and the filesystem half compounds it — an
+      AppContainer is default-deny for reads, so the workspace grant is the easy part and the
+      toolchain, the executed binary, the redirected temp directory and every language's install
+      tree are the rest. First work is a `windows-latest` smoke test, because viability on the CI
+      runner and on Server SKUs is unverified and everything else depends on it.
+    detail: outline
+    status: planned
+  - version: 0.27.0
     outcome: >
       One file is the whole configuration, for the crate and for the applications built on it.
       `io.toml` gains the piece it is missing — which provider and model to run, and its fallback
@@ -579,7 +602,7 @@ versions:
       repository dangerous.
     detail: outline
     status: planned
-  - version: 0.27.0
+  - version: 0.28.0
     outcome: >
       An operator shapes a run without writing Rust. Lifecycle hooks declared in `io.toml` fire on
       the events the observer channel already emits, so an audit log, a formatter, a notification or
