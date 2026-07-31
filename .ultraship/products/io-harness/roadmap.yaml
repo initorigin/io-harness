@@ -684,6 +684,37 @@ versions:
       late upgrader gets a wrong answer. A number fetched from the vendor at run time has no such
       shelf life, and it carries the vendor's own effective date rather than one a human typed.
 
+      For the vendors that publish nothing, a **reference catalogue** fills the gap without a table
+      anybody has to maintain. `https://openrouter.ai/api/v1/models` needs no API key, is free to
+      read, and lists most models these vendors serve with per-token prompt, completion and cache
+      pricing and a context length. One request, parsed into the same `ModelInfo` the provider path
+      produces, cached in the store with the instant it was fetched. Nothing is baked into this
+      repository: no price constants, no per-vendor mapping file, no list to update when a vendor
+      moves a number. That is the whole argument for it — the maintenance cost is zero because the
+      data never lives here, which is the same reason `src/pricing.rs` refuses to ship prices at
+      all. The source is a URL with a default, so a different catalogue, an internal mirror or an
+      air-gapped copy is configuration rather than a code change.
+
+      Three bounds on it, each of which has to be built in rather than discovered later:
+
+      A reference price is **not the vendor's price**. It is what the aggregator charges to serve
+      that model, which tracks the vendor's rate closely and is not identical to it. So a price
+      carries its provenance — stated by the vendor, or taken from a named reference — and an
+      operator reading a cost can tell which they have. A number whose origin is unrecoverable is
+      the thing that makes an invoice unarguable.
+
+      Matching is a **heuristic across naming schemes**: the reference says `deepseek/deepseek-chat`
+      where DeepSeek's own API says `deepseek-v4-flash`. Exact slug and one documented
+      normalisation, and **a miss stays `None`** — never a nearest guess, because a wrong match is a
+      wrong invoice and is worse than the gap it filled. `Spend::unpriced_calls` already reports the
+      gap honestly.
+
+      It is **an outbound request to a host the caller did not name**, and this crate authorises
+      egress against `Provider::endpoints()` before a run starts. A provider silently dialling a
+      third host would walk straight through that boundary. So the lookup is **opt-in**, and when it
+      is on the reference host appears in `endpoints()` like every other endpoint, governed by the
+      same `Act::Net` rules. Off by default, refused rather than skipped when the policy denies it.
+
       Excluded and argued rather than omitted: AWS Bedrock's SigV4 path, Google Vertex's
       service-account JWT, Gemini's native `interactions` API, and Azure's `api-key` header with
       its deployment-in-path and `api-version` query param. The first three are reachable today by
