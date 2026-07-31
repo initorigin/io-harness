@@ -38,15 +38,25 @@ the CHANGELOG. The public surface governed by this is defined in
 ## Steps 4–5, by workflow
 
 [`.github/workflows/release.yml`](../.github/workflows/release.yml) does steps 4
-and 5. Run it from the **Actions** tab, on `main`, with the version (no leading
-`v`). That is its only input.
+and 5. There are two ways to start it, and they differ only in which one creates
+the tag:
 
-It runs the same gate CI runs — `fmt`, `clippy --all-features`, the three test
-invocations, `cargo package --locked` — against the exact commit being released,
-then tags and cuts the Release with the CHANGELOG section as its notes. It
-refuses to start when the ref is not `main`, when `Cargo.toml` declares a
-different version, when the tag already exists, or when the CHANGELOG has no
-section to quote.
+- **Push a `v*` tag.** The tag names the version and the Release is cut from the
+  commit it points at. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+- **Run it from the Actions tab** (or `gh workflow run release.yml --ref main -f
+  version=X.Y.Z`), giving the version with no leading `v`. The workflow creates
+  the tag itself, pinned to the commit that passed the gate.
+
+Either way the same checks run first. It runs the gate CI runs — `fmt`,
+`clippy --all-features`, the three test invocations, `cargo package --locked` —
+against the exact commit being released, then cuts the Release with the CHANGELOG
+section as its notes. It refuses to start when the commit is not on `main`, when
+`Cargo.toml` declares a different version, when the Release already exists, or
+when the CHANGELOG has no section to quote.
+
+The "must be on `main`" check asks whether the *commit* is an ancestor of
+`main`, not whether the ref is `main` — the same question, and the only form of
+it that can be asked of a tag.
 
 **Step 6 is not in the workflow and must not be added to it.** `cargo publish`
 is run by hand, from a checkout of `main`, after the Release exists — always the

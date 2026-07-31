@@ -1,18 +1,33 @@
-name: Release
+name: release
 
 # Cuts the GitHub Release for a version. It does NOT publish to crates.io.
 #
-# This exists to remove the typing from the Release step of
-# docs/RELEASE_PROCESS.md, not to remove the judgement. It is
-# `workflow_dispatch` only: nothing here fires on a push, a merge or a tag,
-# because a tag is too easy to create by accident to be the trigger for cutting
-# a public Release. A human decides a version is ready, presses the button on
-# `main`, and the workflow does the same steps in the same order a human would.
+# Built to the same shape as the other initorigin repos' release workflows, with
+# one difference that follows from what this repo is: semlith ships a binary, so
+# its build matrix cross-compiles executables and attaches the archives. This is
+# a library — no `[[bin]]`, nothing to cross-compile — so the artifact it
+# attaches is the crate tarball `cargo package` already produces, with the same
+# `SHA256SUMS` beside it. A reader can verify what was released without trusting
+# the registry, which is the point of attaching anything at all.
+#
+# Two ways in. They differ only in which one creates the tag:
+#
+#   * push a `v*` tag  — the tag names the version, and the Release is cut from
+#     the commit the tag points at
+#   * workflow_dispatch — give the version as an input, and the workflow creates
+#     the tag itself, pinned to the commit that passed the gate
+#
+# Either way the same `verify` job has to pass first. A tag trigger used to be
+# refused here on the grounds that a tag is too easy to create by accident to be
+# the trigger for something irreversible. That reasoning applied to
+# `cargo publish`, which this workflow no longer does — a tag and a Release are
+# both deletable, so the objection went with the publish job.
 #
 # The order is the point and it is preserved exactly:
 #
-#   1. verify   — the version, the branch, the tag, the changelog, and the gate
-#   2. release  — tag `main` and publish the GitHub Release, notes from CHANGELOG
+#   1. verify   — the version, the commit's branch, the Release, the changelog,
+#                 the full gate, and the packaged crate
+#   2. release  — checksums, then the Release, notes verbatim from the CHANGELOG
 #
 # **`cargo publish` is deliberately not here, and must not be added.** The
 # owner's standing decision: the Release is automated, the publish stays in a
@@ -29,6 +44,8 @@ name: Release
 # the above, not an oversight: nothing here talks to a registry.
 
 on:
+  push:
+    tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
@@ -44,9 +61,10 @@ permissions:
 
 # Two releases of the same version at once is not a thing anyone wants halfway
 # through. Never cancel in progress: an interrupted tag-and-Release is worse
-# than a queued one.
+# than a queued one. Keyed on the ref rather than the version input, because on
+# a tag push there is no input to key on.
 concurrency:
-  group: release-${{ inputs.version }}
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -63,66 +81,129 @@ jobs:
   # 1. Everything that can say no, before anything has happened.
   # ---------------------------------------------------------------------------
   verify:
-    name: verify ${{ inputs.version }}
+    name: verify
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    outputs:
+      version: ${{ steps.resolve.outputs.number }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # The changelog section is read from the checkout, and the tag check
-          # below needs the tags themselves.
+          # The changelog section is read from the checkout, and the branch and
+          # release checks below need the history and the tags themselves.
           fetch-depth: 0
 
-      - name: The ref must be main
+      # One number, derived once, used by every step after this and by the
+      # release job. On a tag push the tag IS the statement of which version this
+      # is; on a dispatch the input is. Nothing else in the file re-derives it.
+      - name: Resolve the version
+        id: resolve
         run: |
-          if [ "${GITHUB_REF}" != "refs/heads/main" ]; then
-            echo "::error::this workflow runs on main only; got ${GITHUB_REF}."
-            echo "::error::main takes nothing but a develop -> main release PR, so a"
-            echo "::error::release cut from anywhere else is a release of something"
-            echo "::error::that was never reviewed as one."
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            number="${{ inputs.version }}"
+          else
+            number="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$number" ]; then
+            echo "::error::could not determine a version to release."
             exit 1
           fi
+          echo "number=$number" >> "$GITHUB_OUTPUT"
+          echo "releasing $number"
 
-      - name: The manifest must declare this version
+      # A tag is the only thing that says which version a tag-triggered release
+      # is, and nothing else checks it against the crate. Without this, a v0.24.0
+      # tag on a tree still declaring 0.23.0 would cut a Release labelled with a
+      # version it was not built from.
+      - name: Version matches Cargo.toml
+        env:
+          VERSION: ${{ steps.resolve.outputs.number }}
         run: |
           declared=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "$declared" != "${{ inputs.version }}" ]; then
-            echo "::error::Cargo.toml declares $declared, the run asked for ${{ inputs.version }}."
+          echo "Cargo.toml: $declared"
+          echo "release:    $VERSION"
+          if [ "$declared" != "$VERSION" ]; then
+            echo "::error::Cargo.toml declares $declared, this release is $VERSION."
             exit 1
           fi
 
-      - name: The tag must not exist yet
+      # Replaces an older "the ref must be main" check, which could only ever
+      # work on a dispatch: a tag push arrives as refs/tags/vX.Y.Z. Asking
+      # whether the COMMIT is on main is the same question and it can be asked
+      # either way round. main takes nothing but a develop -> main release PR, so
+      # a release cut from a commit that never landed there is a release of
+      # something that was never reviewed as one.
+      - name: The commit must be on main
         run: |
-          if git rev-parse "v${{ inputs.version }}" >/dev/null 2>&1; then
-            echo "::error::tag v${{ inputs.version }} already exists. A published version"
-            echo "::error::cannot be replaced; the forward fix is the next patch."
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::$GITHUB_SHA is not an ancestor of origin/main."
+            echo "::error::Releases are cut from commits that reached main through a"
+            echo "::error::develop -> main pull request, and nothing else."
             exit 1
+          fi
+
+      # On a dispatch the tag must not exist, because the release job is about to
+      # create it. On a tag push it necessarily exists — the push is what started
+      # this — so the equivalent question is whether a Release has already been
+      # cut for it.
+      - name: The release must not exist yet
+        env:
+          VERSION: ${{ steps.resolve.outputs.number }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+              echo "::error::tag v$VERSION already exists. Re-run this workflow from the"
+              echo "::error::tag instead, or pick the next version — a published version"
+              echo "::error::cannot be replaced; the forward fix is the next patch."
+              exit 1
+            fi
+          else
+            if gh release view "v$VERSION" >/dev/null 2>&1; then
+              echo "::error::a Release for v$VERSION already exists."
+              echo "::error::Delete it first if you meant to re-cut it."
+              exit 1
+            fi
           fi
 
       # The notes are taken verbatim from the changelog, so a missing section is
       # a release with nothing to say — caught here rather than after the tag.
-      - name: The changelog must carry this version's section
-        id: notes
-        run: |
-          python3 - <<'PY'
-          import os, re, sys
-          version = os.environ["VERSION"]
-          body = open("CHANGELOG.md", encoding="utf-8").read()
-          # From this version's heading to the next `## ` heading, exclusive.
-          match = re.search(
-              rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## |\Z)",
-              body,
-              re.S | re.M,
-          )
-          if not match or not match.group(1).strip():
-              sys.exit(f"CHANGELOG.md has no non-empty '## [{version}]' section")
-          notes = match.group(1).strip()
-          with open("release-notes.md", "w", encoding="utf-8") as f:
-              f.write(notes + "\n")
-          print(f"{len(notes.splitlines())} lines of notes")
-          PY
+      # Link-reference definitions are dropped: they resolve inside the file and
+      # render as stray `[x]: url` lines in a Release body.
+      - name: Notes
         env:
-          VERSION: ${{ inputs.version }}
+          VERSION: ${{ steps.resolve.outputs.number }}
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on && !/^\[[^]]*\]:/ { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ] || ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "::error::CHANGELOG.md has no non-empty '## [$VERSION]' section."
+            exit 1
+          fi
+          # The install footer is generated, not typed: the MSRV comes from the
+          # manifest so it cannot drift from what the crate actually requires.
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          cat >> release-notes.md <<EOF
+
+          ### Install
+
+          \`\`\`toml
+          [dependencies]
+          io-harness = "$VERSION"
+          \`\`\`
+
+          Or \`cargo add io-harness@$VERSION\`. Requires Rust $msrv or later.
+
+          The \`.crate\` tarball attached below is the exact artifact published to
+          crates.io for this version. Verify a download against \`SHA256SUMS\`
+          before trusting it.
+          EOF
+          echo "--- release notes ---"
+          cat release-notes.md
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -145,7 +226,9 @@ jobs:
       - run: cargo test --all-features --lib --tests
 
       # The package, built and compiled standalone from its own sources — the
-      # one check that catches a file the manifest forgot to include.
+      # one check that catches a file the manifest forgot to include. Its output
+      # is also the artifact the Release attaches, so this step is doing two jobs
+      # and neither is a rebuild of the other.
       - run: cargo package --locked
 
       - name: Keep the notes for the release job
@@ -155,40 +238,69 @@ jobs:
           path: release-notes.md
           retention-days: 7
 
+      - name: Keep the packaged crate for the release job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: package
+          path: target/package/io-harness-${{ steps.resolve.outputs.number }}.crate
+          retention-days: 7
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # 2. The tag and the GitHub Release. Reversible: both can be deleted.
   # ---------------------------------------------------------------------------
   release:
-    name: release ${{ inputs.version }}
+    name: release ${{ needs.verify.outputs.version }}
     needs: verify
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Two downloads to two places on purpose: everything under `dist/` is
+      # attached to the Release, and the notes are the Release body rather than a
+      # file hanging off it.
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-notes
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: package
+          path: dist
+
+      # `*.crate` rather than `*`: globbing over everything would race with the
+      # redirect that creates SHA256SUMS, and a checksum file listing itself is
+      # a puzzle nobody needs at 3am.
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.crate > SHA256SUMS
+          cat SHA256SUMS
 
       # Title is the bare `<repo> X.Y.Z`, no tagline — the house format across
-      # every initorigin repo. `--target` pins the Release to the commit that
-      # passed the gate rather than to whatever main points at by then.
-      - name: Cut the Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "v${{ inputs.version }}" \
-            --title "io-harness ${{ inputs.version }}" \
-            --notes-file release-notes.md \
-            --target "${{ github.sha }}"
+      # every initorigin repo.
+      #
+      # `target_commitish` only on a dispatch, where the tag does not exist yet
+      # and this is what pins it to the commit that passed the gate rather than
+      # to whatever main points at by then. On a tag push the tag already names
+      # its commit and the field is left unset.
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
+        with:
+          tag_name: v${{ needs.verify.outputs.version }}
+          name: io-harness ${{ needs.verify.outputs.version }}
+          body_path: release-notes.md
+          files: dist/*
+          target_commitish: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
+          fail_on_unmatched_files: true
 
       # The workflow stops here on purpose. What follows is a human's, and the
       # order below is not a suggestion — publishing before the Release exists
       # is a mistake this repository has actually made.
       - name: What is left for a human
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          echo "::notice::Released io-harness ${{ inputs.version }}. Remaining by hand, in this order:"
+          echo "::notice::Released io-harness $VERSION. Remaining by hand, in this order:"
           echo "::notice::  1. cargo publish --locked   (from a checkout of main; IRREVERSIBLE, and always last)"
           echo "::notice::  2. sync develop with main   (git merge --ff-only main, then push)"
           echo "::notice::  3. check docs.rs built the page"
