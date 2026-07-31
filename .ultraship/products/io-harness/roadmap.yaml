@@ -608,6 +608,11 @@ versions:
       project instructions a repository already carries are discovered rather than pasted into a
       goal string. A project-scoped file stops being able to set the keys that would make cloning a
       repository dangerous.
+
+      The spec this release introduces must be `#[non_exhaustive]` from the first line it exists,
+      because 0.29.0 adds a variant to it. One attribute here is the difference between that being
+      additive and it being a break, and it costs nothing to decide now while the type has no
+      consumers at all.
     detail: outline
     status: planned
   - version: 0.28.0
@@ -617,4 +622,45 @@ versions:
       a local policy check is a line of configuration rather than a trait implementation. A file the
       agent changed can be put back the way it was.
     detail: hypothesis
+    status: planned
+  - version: 0.29.0
+    outcome: >
+      The model a run uses stops being a choice between three vendors. A provider is a base URL, a
+      key and a model name, so the OpenAI-shaped endpoints — Groq, xAI, Mistral, DeepSeek, Together,
+      Fireworks, Cerebras, Perplexity, Gemini through its compatibility endpoint, Moonshot, Zhipu,
+      Qwen and MiniMax — and the runtimes a developer starts on their own machine — Ollama,
+      llama.cpp, vLLM, LM Studio, LocalAI, Jan, SGLang, KoboldCpp — are all reachable without
+      writing a provider. A model running on the developer's laptop is the half that has no
+      equivalent today, and it is the half that costs nothing to run.
+
+      It is one type, not twenty. `openai.rs` and `openrouter.rs` differ by four strings — an
+      endpoint, a name, a web flavor and two environment variable names — over a wire module that
+      is already shared and already `pub(crate)`. So the shape is a single `Compatible` provider
+      carrying a base URL and an auth style, with a table of vendor presets behind named
+      constructors, reusing `openai_wire` verbatim. Twenty structs would be twenty copies of a
+      constructor and twenty entries in `docs/public-api.txt`, each needing a worked doc example,
+      to express what a constant already expresses. A vendor added later is then a row in a table
+      rather than a file, and the crate keeps its "no dependency per vendor" property by
+      construction rather than by vigilance.
+
+      What it deliberately is not is a compatibility layer. Every vendor here diverges from the
+      OpenAI wire somewhere, and the divergences are known rather than guessed: Zhipu returns
+      `finish_reason` values outside the OpenAI set, Groq rejects `messages[].name` outright,
+      Mistral requires a nine-character alphanumeric tool-call id and names its schema field
+      `schema_definition`, DeepSeek returns 400 if `reasoning_content` is dropped from a request
+      carrying tools, Ollama ignores `tool_choice` entirely, and vLLM and SGLang emit no tool calls
+      at all unless the server was started with a parser flag this crate cannot set. The crate
+      already parses `finish_reason` as a string and already tolerates unknown response fields, so
+      the divergences that matter are the ones a caller must be told about — and they are stated in
+      the contract rather than papered over, because a boundary the caller believes in and nobody
+      enforces is worse than none.
+
+      Excluded and argued rather than omitted: AWS Bedrock's SigV4 path, Google Vertex's
+      service-account JWT, Gemini's native `interactions` API, and Azure's `api-key` header with
+      its deployment-in-path and `api-version` query param. The first three are reachable today by
+      an application that mints a bearer token itself and passes it as the key, which is where
+      OAuth has always belonged. Azure is the closest call — it costs one auth-style variant and no
+      dependency — and it is left out only because no consumer has asked for it; the shape admits
+      it later without a break.
+    detail: outline
     status: planned
