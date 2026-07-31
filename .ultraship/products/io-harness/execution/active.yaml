@@ -1,0 +1,41 @@
+product: io-harness
+version: 0.26.0
+release_fit:
+  assessment: uncertain
+  reasons:
+  - >
+    The release's central mechanism may simply not be available where it has to run. AppContainer
+    viability on `windows-latest` and on Server SKUs is unverified, and the contract makes that the
+    first task rather than an assumption. `uncertain` is the honest word for a release whose premise
+    is a question.
+  - >
+    No machine this work can reach runs Windows, so every Win32 claim costs a CI round trip. The
+    developer's recorded constraint is budget and wall clock — their own estimate, not anything
+    measured here — and a round-trip-bound release is exactly the shape that constraint bites. The
+    mitigation is `cargo check --target x86_64-pc-windows-msvc` locally, which removes compile
+    errors from the set of things a runner has to discover.
+  - >
+    The half that does not depend on AppContainer is small, well understood, and reuses code that
+    already exists and is already tested on the sandbox path. `Job::create`, `Job::adopt` and
+    `resume` (`src/sandbox/windows.rs:249`, `:308`, `:441`) need visibility and a longer lifetime,
+    not a rewrite. That half is `probable` on its own and it is in every version of this release.
+  major_cost_drivers:
+  - CI round trips as the only way to verify unsafe Win32 behaviour
+  - Re-implementing five things the shared runner already gives free, each of which fails silently
+    rather than loudly when written wrong
+  - The default-deny grant set, whose failure mode reads as a broken payload rather than a missing
+    grant
+  recommended_scope_change: null
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  source: user-estimate
+  time: >
+    About 4h18m left in the current 5-hour window, per the developer. Nothing here measured it.
+  budget: >
+    Roughly $67/hour, per the developer. The effect on this release is that parallelism is spent
+    only where it replaces work that would otherwise be done serially.
+  capacity: >
+    At most two concurrent subagents, no speculative research, and the full suite run once before
+    the record is sealed rather than at every checkpoint.
