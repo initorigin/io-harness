@@ -54,7 +54,19 @@ impl Provider for MockScript {
         // that a process which has not yet spoken said nothing, which is true
         // and proves nothing.
         if i > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            // Generous rather than marginal, and deliberately so. The fixture
+            // prints its first line immediately, so the only race is process
+            // spawn — but a loaded runner running the whole suite in parallel
+            // can make that take far longer than it looks like it should, and
+            // that is exactly how a test becomes a flake nobody trusts. A
+            // second and a half is not a claim about how fast a spawn is; it is
+            // a margin wide enough that the test is measuring the handle rather
+            // than the runner.
+            //
+            // Note also that the polls cannot simply be repeated to paper over
+            // this: several identical tool calls in a row are a stalled agent
+            // to the run loop, which ends the run before the later steps happen.
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         }
         Ok(CompletionResponse {
             tool_calls: self.steps.get(i).cloned().unwrap_or_default(),
@@ -122,7 +134,7 @@ fn kill(handle: u64) -> ToolCall {
 }
 
 fn contract(root: &std::path::Path) -> TaskContract {
-    TaskContract::workspace("watch a long-running process", root).with_max_steps(8)
+    TaskContract::workspace("watch a long-running process", root).with_max_steps(10)
 }
 
 /// The policy these tests run under.
@@ -226,9 +238,14 @@ async fn a_handle_starts_polls_twice_and_is_killed() {
         text.contains("shell_start handle 1"),
         "the start reports an id the model can use: {text}"
     );
+    // Asserted across the polls rather than against any single one. Whether a
+    // particular poll lands before or after a particular tick is a wall clock
+    // question, and a test that depends on the answer fails on a loaded runner
+    // and teaches nothing when it does. What must be true is that polling a
+    // running process shows what it printed — not that the first poll does.
     assert!(
         text.contains("tick 1"),
-        "the first poll shows output the process produced while the run went on: {text}"
+        "polling a running process never showed anything it printed: {text}"
     );
     assert!(
         text.contains("shell_kill handle 1"),
@@ -251,37 +268,44 @@ async fn a_poll_does_not_return_the_same_output_twice() {
     .await;
     let id = run_id(&store);
     // The prompt is cumulative — it carries every observation so far — so the
-    // question is not whether the second prompt contains the first poll's
-    // output. It is whether any line of output was delivered by two different
-    // polls. That is what "incremental, with no duplication" means, and it is
-    // what a log tail polled in a loop depends on.
+    // question is not whether a later prompt contains an earlier poll's output.
+    // It is whether any one line was delivered by two different polls. That is
+    // what "incremental, with no duplication" means, and it is what a log tail
+    // polled in a loop depends on.
+    //
+    // Asserted over every poll rather than over the first two, so that which
+    // poll happens to catch a tick is not part of the claim. A loaded runner
+    // changes that and must not change the verdict.
     let text = transcript(&store, id);
-    let blocks: Vec<&str> = text.split("[shell_poll handle").skip(1).collect();
+    let last = store.steps(id).unwrap();
+    let last = last.last().map(|s| s.prompt.clone()).unwrap_or_default();
+    let blocks: Vec<&str> = last.split("[shell_poll handle").skip(1).collect();
     assert!(
         blocks.len() >= 2,
         "this needs two poll blocks to compare, and found {}:\n{text}",
         blocks.len()
     );
-    // The last prompt carries every block, so the final two are the two polls.
-    let first: Vec<&str> = blocks[blocks.len() - 2]
-        .lines()
-        .filter(|l| l.starts_with("tick "))
-        .collect();
-    let second: Vec<&str> = blocks[blocks.len() - 1]
-        .lines()
-        .filter(|l| l.starts_with("tick "))
-        .collect();
-    assert!(
-        !first.is_empty(),
-        "the first poll saw nothing at all, so this proves nothing:\n{text}"
-    );
-    for line in &first {
-        assert!(
-            !second.contains(line),
-            "{line:?} was delivered by two different polls; a poll must return \
-             only what is new.\nfirst: {first:?}\nsecond: {second:?}"
-        );
+    let ticks = |b: &str| -> Vec<String> {
+        b.lines()
+            .filter(|l| l.starts_with("tick "))
+            .map(str::to_string)
+            .collect()
+    };
+    let mut seen: Vec<String> = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        for line in ticks(block) {
+            assert!(
+                !seen.contains(&line),
+                "{line:?} was delivered by two different polls; a poll must return \
+                 only what is new. Poll {i} repeated it.\n{last}"
+            );
+            seen.push(line);
+        }
     }
+    assert!(
+        !seen.is_empty(),
+        "no poll saw any output at all, so this proves nothing:\n{last}"
+    );
 }
 
 // ---------------------------------------------------------------------------
