@@ -39,7 +39,7 @@
 //! also how job control has always worked, which is a good sign for a design
 //! rather than a coincidence.
 //!
-//! ## A handle's processes are a process group
+//! ## A handle's processes are contained, so the kill does not have to chase them
 //!
 //! Killing a handle by pid, or by pid and whatever the process table still says
 //! descends from it, is not enough and cannot be made enough. A dev server
@@ -48,15 +48,26 @@
 //! programs this tool exists to run. The runtime and the watcher are still
 //! there, they are still the run's responsibility, and the parent/child links
 //! that would have led to them are gone. Nothing about walking the table
-//! recovers them; they have been reparented to init and are indistinguishable
-//! from anything else on the machine.
+//! recovers them.
 //!
-//! So each stage of a handle's line is spawned as the leader of its own process
-//! group (see [`own_process_group`](crate::sandbox::own_process_group)), and the
-//! kill signals the group. Membership is inherited across `fork` and outlives
-//! every parent in the chain, so one signal reaches the whole tree no matter
-//! what shape it has grown into or which of its middles are already dead. The
-//! foreground `shell` and `exec` tools keep their old spawn exactly: they are
+//! So each stage of a handle's line is put into containment as it is spawned,
+//! and the kill ends the containment rather than chasing what is inside it. The
+//! mechanism is per platform because the platforms have nothing in common here
+//! beyond the problem — see [`Containment`]:
+//!
+//! - **macOS and Linux** — the stage becomes the leader of its own process group
+//!   (see [`own_process_group`](crate::sandbox::own_process_group)) and the kill
+//!   signals the group. Membership is inherited across `fork`, outlives every
+//!   parent in the chain, and a process that never asks to leave never leaves.
+//! - **Windows** — there is no process group. The stage is created suspended,
+//!   assigned to this handle's Job Object, and only then resumed; the kill closes
+//!   the job, and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` takes down every member
+//!   without walking anything. The suspend is not caution, it is the correctness
+//!   argument: a process that runs even briefly outside the job can spawn a
+//!   descendant that never joins it, and every call involved still returns
+//!   success.
+//!
+//! The foreground `shell` and `exec` tools keep their old spawn exactly: they are
 //! awaited and dropped inside the call that made them, so they never have the
 //! problem this solves.
 
