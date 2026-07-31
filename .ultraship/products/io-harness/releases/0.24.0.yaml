@@ -520,4 +520,192 @@ open_questions:
   deprecated in the changelog now that a tool exists which does not have it. Documenting a known
   weakness while shipping its replacement is honest; doing it in this release's notes may read as
   fixing it, which this release does not.
-status: planned
+status: released
+released_at: 2026-07-31T13:17:32Z
+mode: published
+delivered: >
+  A model can write a command line and the boundary holds against what it wrote. `shell` parses the
+  line in this crate, checks every sub-command's program and joined argv against `Act::Exec` and
+  every redirect target against `Act::Write` or `Act::Read` by path, and does all of it before the
+  first spawn — so a line whose second stage is denied does not run its first. Each stage is then
+  spawned as argv the way `exec` spawns one, with this crate wiring the pipes. There is no `sh -c`
+  and no `cmd /c` after the parse, verified by inspection rather than asserted.
+
+  The admitted grammar is a conservative subset of POSIX and everything outside it is refused by
+  name with a reason. The mechanism is an allowlist at the lexer rather than a blocklist, so a
+  construct nobody anticipated fails closed. `list_dir` lists one directory one level deep through
+  the same path-resolved read check `read_file` uses.
+
+  Windows gained the containment designed in 0.6.0 and never built. `Backend::WindowsJobObject` is
+  what the sandbox reports there, memory, CPU and active process count are real bounds, the process
+  tree dies with the job, and `SandboxLimits::max_processes` is enforced for the first time on any
+  platform. It is resource containment only: a Job Object has no filesystem facility and no network
+  facility, and the platform table says exactly that rather than "Native".
+
+  `TaskContract::workspace` lost its positional `Verification` and defaults to `Verification::None`,
+  with `with_verification` for projects that have a criterion. `EventKind`, `Backend` and `Cap` are
+  `#[non_exhaustive]`.
+evidence:
+  tests:
+  - >
+    `cargo test --all-targets` on macOS — 721 passed, 0 failed, 0 ignored. `cargo test --doc` — 239
+    passed, 0 failed.
+  - >
+    `cargo test --lib tools::shell` — 19 passed. Two of them sweep the **entire ASCII range**: every
+    character outside the permitted set is refused, and no character silently creates a sub-command.
+    The second is the security property stated precisely, because the set of commands the policy
+    checks is the set the parser reports.
+  - >
+    Non-vacuity proven by eight sabotage runs, each caught by a NAMED test rather than by a compile
+    error — glob metacharacters passed through, a lone `&` read as a separator, an unrecognised
+    character absorbed into a word, the reserved-word refusal dropped, control characters permitted
+    inside quotes, a quoted digit treated as a descriptor prefix, a pipeline stage with no command
+    accepted, and a pipeline reporting only its first stage. Evidence in
+    `evidence/0.24.0/shell-parser-sabotage.txt`.
+  - >
+    Two of those sabotages found defects in the TESTS rather than in the parser, which is the
+    finding worth carrying forward. The property test's oracle was originally written as
+    `is_bare_word_char(c)` — the function under test — so widening the allowlist widened the
+    expectation with it, and a parser that permitted an unquoted `$` passed every test. The oracle
+    is now a literal character list that does not move when the parser moves. Two others initially
+    "passed" only by tripping a compile error, which is no evidence at all about test strength.
+  - >
+    `cargo test --test shell` — 11 passed, covering F1, F2, F3 and the trace clause. F2's negative
+    control is the load-bearing one: a first stage with a side effect on disk leaves no file behind
+    when a later stage is denied, and the same line under a permissive policy does create it.
+  - >
+    `cargo test --test list_dir` — 12 passed, covering all three clauses of F10 at both the
+    `Workspace` level and through a real run.
+  - >
+    NF1 — CI green on all three runners on PR #78: `test (macos-latest)` 5m9s,
+    `test (ubuntu-latest)` 5m40s, `test (windows-latest)` pass. No test skipped, ignored or made
+    conditional.
+  - >
+    **F6, F8 and F9 executed for the first time on the Windows runner and all passed.**
+    `tests/sandbox_job_object.rs` — 6 passed, 0 failed, 10.18s:
+    `windows_reports_the_job_object_and_not_the_floor`,
+    `the_process_limit_stops_the_run_and_the_job_is_what_says_so` (F8),
+    `the_memory_limit_is_a_real_bound_and_is_named_as_one` and
+    `the_cpu_limit_is_a_real_bound_and_is_named_as_one` (F9),
+    `closing_the_job_kills_the_grandchild` and `without_the_job_the_grandchild_survives` (F6 and its
+    negative control, which is what makes it proof of containment rather than coincidence).
+  - >
+    `msrv` job pass against the declared `rust-version = "1.95"`, unchanged. `windows-sys` 0.61.2
+    declares `rust-version = 1.71`, so the release's one new dependency does not move the floor.
+  builds:
+  - >
+    `cargo package --locked` exit 0. 174 files, 922,399 bytes. Verified by listing the tarball
+    rather than by trusting the `exclude` list: no `.ultraship`, no `.github`, no file whose
+    basename is `.env`, and none of the three excluded fixture crates; `src/tools/shell.rs`,
+    `tests/shell.rs`, `tests/list_dir.rs`, `examples/shell_live.rs` and the nine `store-0.22.0`
+    fixtures all present.
+  - >
+    `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `lint` job pass.
+  - >
+    NF3 — `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`
+    clean, and the `docs.rs (nightly)` job pass. It failed first: `list_dir`'s documentation linked
+    to the private `IGNORE_DIRS`, which is an error under `-D warnings` because a reader of the
+    public docs cannot follow it.
+  - >
+    NF2 — **`cargo tree` on the macOS host is 402 lines, identical to 0.23.0, and contains no crate
+    matching `windows`.** The shell parser adds nothing because it is written in this crate;
+    `windows-sys` is declared under `[target.'cfg(windows)'.dependencies]` as `libc` already is for
+    unix. This is the release's strongest single claim and it is measured rather than asserted.
+  reviews:
+  - >
+    The parser is in-crate because the roadmap's choice was unusable and the alternatives were
+    measured. `yash-syntax` is GPL-3.0-or-later and this crate is Apache-2.0 designed to be linked
+    into someone else's program, so copyleft would propagate to every consumer — a bar, not a
+    friction. `brush-parser` 0.4.0 is MIT and maintained but costs **37 new crates** on the default
+    feature set, including `insta`, `similar`, `console`, `pest`, `peg` and `cached` in a runtime
+    tree, measured by `cargo tree` diff. `conch-parser` has not been published since 2019. The
+    deciding argument is none of those: a complete bash parser accepts a superset of what this tool
+    permits, so its accept-set becomes a second surface to audit against the permit-set forever.
+  - >
+    Scope discipline verified by inspection rather than claimed, and it caught a real defect. The
+    background-`&` refusal told the model to use `shell_start` — a tool this release defers to
+    0.25.0 — which would have sent it to something that does not exist. Fixed. Also confirmed: no
+    host shell after the parse, the `exec` tool unchanged including its joined-argv looseness,
+    `rusqlite::Error` still unwrapped, no AppContainer, no seccomp, no LSP, and the macOS and Linux
+    sandbox backends untouched. Evidence in `evidence/0.24.0/scope-check.txt`.
+  - >
+    Two pre-existing tests in `tests/sandbox.rs` failed on the Windows runner and were correct to.
+    One asserted that Windows reports `PortableFloor` on the stated grounds that the Job Object was
+    unimplemented; the other asserts that only a backend which never claimed a network boundary may
+    run without one. `WindowsJobObject` is a real backend that really bounds a run and still has
+    nothing to say about egress, which is precisely why the platform row is not shortened to
+    "Native". Both updated; the invariant stays strict for the two backends that do claim a network
+    boundary.
+  - >
+    Security gate — the real `CARGO_REGISTRY_TOKEN` and `OPENROUTER_API_KEY` values were searched
+    for across every tracked file and every file inside the package tarball, and appear in neither.
+    `.env` is gitignored, untracked and absent from the tarball; `.env.example` ships deliberately
+    and every value in it is an empty placeholder.
+  deployments: []
+  health_checks:
+  - >
+    OP1 — `cargo run --example shell_live` against OpenRouter. The model composed
+    `grep -c 'ERROR' notes.txt > count.txt` itself: a real command line with a redirect, which no
+    single `exec` argv could express. The crate parsed it, and the trace read back from the store
+    carries the per-stage authorisations — exec `grep` and exec `grep -c ERROR notes.txt` under rule
+    `grep*` layer `live`, and write `count.txt` under rule `count.txt` layer `live`. Outcome
+    `Success`, `count.txt` = "3\n", verification passed. Evidence in
+    `evidence/0.24.0/live-shell-run.txt`.
+known_limitations:
+- >
+  This record is sealed before the crates.io upload, which follows the develop-to-main merge and the
+  GitHub Release. `mode: published` states the authorized target; the delivery sequence makes it true.
+- >
+  Process handles — `shell_start`, `shell_poll`, `shell_kill` — are deferred to 0.25.0 by
+  `US-IO-HARNESS-0.24.0-I01`, with acceptance criteria F5, F7 and the handle half of F6. Long-running
+  work is therefore still unrepresentable: a dev server or a twenty-minute build blocks one step of
+  the loop until the exec timeout decides for it. The Job Object they need shipped here, so they
+  arrive in 0.25.0 on a platform that can already contain them.
+- >
+  `2>&1` on a stage whose stdout is piped is refused rather than supported. Merging the two streams
+  into a pipe needs a descriptor duplication this crate does not perform; on a final stage the merge
+  happens in the captured output. `cmd 2>&1 | grep x` is therefore not expressible.
+- >
+  Glob metacharacters are refused outside quotes rather than expanded. This is deliberate — expanding
+  would let the argv the policy checked differ from the argv that ran — but it is a real usability
+  cost: `ls *.rs` does not work, and the model has to use `find` or `list_dir` and then name paths.
+- >
+  `cd` is applied when the line is planned rather than when it runs, so in `cd nope && ls > out.txt`
+  the redirect resolves under `nope/` where a real shell would have failed the `cd` and written in
+  the original directory. Both paths are checked and neither escapes the root. It is the safe
+  direction, and it is a difference from a shell rather than a match.
+- >
+  The Windows job's CPU limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time
+  as well, so the cap is genuinely weaker there for a kernel-heavy workload. And
+  `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes an allocation *fail* rather than terminating the process,
+  so a payload over the cap typically dies of its own failed allocation. The memory detection is a
+  90%-of-cap heuristic, because the job reports the peak a process reached and never the allocation
+  it was refused; the exact mechanism would need a job completion port and a parked thread per run.
+- >
+  Windows has resource containment and no access containment. There is no filesystem boundary and no
+  network boundary, because a Job Object contains neither. AppContainer is 0.25.0's.
+- >
+  `CompletionRequest` and `CompletionResponse` are deliberately NOT `#[non_exhaustive]`, so adding a
+  field to either remains a break. Recorded in `docs/CONTRACT.md` rather than left to be discovered.
+  The attribute forbids struct-literal construction including `..Default::default()` from outside the
+  crate, and `Provider::complete` must return a `CompletionResponse` — measured at 11 `E0639` errors
+  across 10 files in `tests/`.
+- >
+  The `exec` tool's gate still checks `argv.join(" ")` as a second target, which cannot distinguish
+  one argument containing a space from two arguments. Left deliberately untouched: changing an
+  existing tool's permission decisions does not belong in the same diff as a new tool. `shell` does
+  not have this looseness, because it checks each stage's argv separately.
+- >
+  Live evidence is OpenRouter-only. The `.env` here carries real credentials for no other vendor, so
+  the Anthropic and OpenAI paths rest on their wire tests — unchanged by this release, which touched
+  no provider code.
+- >
+  Carried forward unchanged, none of them touched by this release: `resume_tree` never calls
+  `record_run_policy`; there is no seccomp filter on Linux; `git_status` lacks `-z`;
+  `pdf::read_text`'s `catch_unwind` is a no-op under `panic = "abort"`; `TEST_BINARY` is inert;
+  `Containment::max_total_cost` is inert; there is no `Session::resume_turn`; `Session::history` is
+  linear per hop; the stall window still does not survive a resume; and `rusqlite::Error` remains in
+  the public API.
+supersedes: 0.23.0
+next_recommended_version: 0.25.0
+immutable: true
