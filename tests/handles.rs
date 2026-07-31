@@ -715,10 +715,10 @@ async fn a_handle_flooding_faster_than_anything_polls_it_keeps_its_process_and_s
     let flood = example_binary("flood");
     // Start, then poll once, then kill. Nothing polls during the flood itself:
     // the mock's pause between turns is far longer than the fixture needs to
-    // write its two and a half megabytes, so by the time anything reads the
-    // handle the whole flood is already sitting in the capture file with no
-    // reader having consumed a byte of it. That is the scenario the criterion
-    // names — output accumulating while nobody is looking.
+    // write its megabyte and a bit, so by the time anything reads the handle the
+    // whole flood is already sitting in the capture file with no reader having
+    // consumed a byte of it. That is the scenario the criterion names — output
+    // accumulating while nobody is looking.
     let (store, _dir) = run(
         vec![
             vec![start(&format!("{} {FLOOD_LINES}", word(&flood)))],
