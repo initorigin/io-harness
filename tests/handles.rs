@@ -308,6 +308,57 @@ async fn a_poll_does_not_return_the_same_output_twice() {
     );
 }
 
+#[tokio::test]
+async fn a_handle_left_running_is_killed_when_the_run_ends() {
+    let tick = tick_binary();
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    // Started and deliberately never killed, so the run ends with it live. That
+    // is the leak this asserts against: a handle the model forgot about must not
+    // outlive the run that made it.
+    let provider = MockScript::new(vec![vec![start(&tick.display().to_string())]]);
+    run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &allow_tick(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let id = run_id(&store);
+    let handles = store
+        .process_handles(id)
+        .expect("the run recorded its handle");
+    assert_eq!(handles.len(), 1, "one handle was started: {handles:?}");
+    let pids = handles[0].pids.clone();
+    assert!(
+        !pids.is_empty(),
+        "no pid was recorded for the handle, so this test cannot check anything: {handles:?}"
+    );
+
+    // Asked of the operating system rather than of the registry. The registry
+    // believing it killed something is precisely the failure this exists to
+    // catch, so asking it whether it succeeded would be asking the defendant for
+    // the verdict.
+    for pid in pids {
+        let mut gone = false;
+        for _ in 0..100 {
+            if !alive(pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "pid {pid} outlived the run that started it; a handle left live must be \
+             killed, not leaked"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // F4 — the handle path is checked by the same machinery as the foreground path
 // ---------------------------------------------------------------------------

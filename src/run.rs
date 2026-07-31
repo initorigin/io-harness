@@ -5567,11 +5567,29 @@ async fn dispatch(
                 },
             ));
 
-            let registry = std::sync::Arc::clone(handles);
+            // WEAK, not strong, and this is load-bearing rather than tidy.
+            //
+            // The registry kills whatever is still live when it drops, and that
+            // backstop is what covers the paths this loop leaves by `?` or by a
+            // panic. A strong reference held by the reaping task below defeats
+            // it completely: the task lives exactly as long as the process it is
+            // waiting on, so a handle that never exits keeps the registry's
+            // refcount above zero forever, `Drop` never runs, and the process
+            // outlives the run that started it. That is the leak the whole
+            // module exists to prevent, reintroduced by the thing meant to
+            // observe it.
+            //
+            // With a weak reference the registry's only owner is the run loop.
+            // When the loop returns, it drops, it kills, and these tasks find
+            // nothing to upgrade to — which is correct, because by then there is
+            // no run left to record anything for.
+            let registry = std::sync::Arc::downgrade(handles);
             let on_spawn = {
-                let registry = std::sync::Arc::clone(&registry);
+                let registry = registry.clone();
                 std::sync::Arc::new(move |pid: u32| {
-                    registry.add_pid(id, pid);
+                    if let Some(r) = registry.upgrade() {
+                        r.add_pid(id, pid);
+                    }
                 }) as std::sync::Arc<dyn Fn(u32) + Send + Sync>
             };
             let runner = Shell::detached(
@@ -5585,9 +5603,15 @@ async fn dispatch(
             // dispatch. The task reaps, so a process that ends on its own is
             // recorded as ended rather than left looking live to every later
             // poll — one of the four ways a handle could otherwise leak.
-            let reaper = std::sync::Arc::clone(&registry);
+            let reaper = registry.clone();
             tokio::spawn(async move {
                 let outcome = runner.run(&parsed, &plan).await;
+                // Upgraded only to record. If the run has already ended, the
+                // registry is gone, it killed this process on its way out, and
+                // there is nothing left to tell.
+                let Some(reaper) = reaper.upgrade() else {
+                    return;
+                };
                 match outcome {
                     Ok(crate::tools::shell::ShellOutcome::Ran { code, .. }) => {
                         reaper.finished(id, code)
@@ -5598,6 +5622,32 @@ async fn dispatch(
                     _ => reaper.finished(id, None),
                 }
             });
+
+            // Wait briefly for the first process to appear, then record what
+            // was spawned.
+            //
+            // The pids are only knowable after the spawn, which happens in the
+            // task above, so there is a short window in which the trace knows a
+            // handle exists and not what it owns. Closing it matters because a
+            // run that starts a handle and then ends — the model never polls,
+            // never kills — would otherwise record a handle with no processes,
+            // and "what did that run leave running" is exactly the question the
+            // row exists to answer.
+            //
+            // Bounded and best-effort on purpose: this is a trace concern, not a
+            // safety one. Whatever is not recorded here is recorded by the next
+            // poll, by the kill, or by the per-step refresh, and the killing
+            // itself never depended on this — `Handles` kills what it knows on
+            // drop regardless of what reached the store.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let pids = loop {
+                let pids = handles.pids(id);
+                if !pids.is_empty() || std::time::Instant::now() >= deadline {
+                    break pids;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            store.record_handle_pids(run_id, id, &pids)?;
 
             Dispatched::Continue {
                 decision: format!("shell_start handle {id}"),
