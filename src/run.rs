@@ -52,7 +52,8 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
-    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_TOOL,
+    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL,
+    SHELL_KILL_TOOL, SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL,
     TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
@@ -2588,6 +2589,15 @@ async fn run_workspace_from<P: Provider>(
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
+    // The run's live process handles, created before the first turn and killed
+    // when the run ends however it ends. `Arc` because the reaping task for each
+    // handle outlives the dispatch that started it and has to be able to record
+    // the exit; `Handles` also kills whatever is still live when it drops, which
+    // is the backstop for the paths that leave this function by `?`.
+    let handles = std::sync::Arc::new(crate::tools::handles::Handles::new(
+        crate::tools::handles::MAX_LIVE_HANDLES,
+    ));
+    let handles = &handles;
     // Detected once, before the first turn. The marker files do not change under
     // a run often enough to be worth a filesystem walk every step, and a run that
     // creates its own `package.json` is creating a project rather than working in
@@ -2787,6 +2797,7 @@ async fn run_workspace_from<P: Provider>(
                 pending_media,
                 &contract.commit_identity,
                 contract.exec_timeout,
+                handles,
             )
             .await?
             {
@@ -3625,6 +3636,14 @@ fn run_agent<'f, P: Provider>(
         // is the same child, at whatever depth it sits.
         let (mut ledger, mut written) = restore_ledger(tree.store, run_id)?;
         let mut progress = Progress::new();
+        // Per agent, not per tree. A child's handles are the child's: it is the
+        // one that knows when they are finished with, and a shared registry
+        // would let one agent kill a sibling's dev server. The cap is therefore
+        // also per agent, which is the same rule the ledger's budgets follow.
+        let handles = std::sync::Arc::new(crate::tools::handles::Handles::new(
+            crate::tools::handles::MAX_LIVE_HANDLES,
+        ));
+        let handles = &handles;
         // Children share their parent's workspace, so they share its detection too.
         let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its memory: one
@@ -3788,6 +3807,7 @@ fn run_agent<'f, P: Provider>(
                     pending_media,
                     &contract.commit_identity,
                     contract.exec_timeout,
+                    handles,
                 )
                 .await?
                 {
@@ -4660,6 +4680,10 @@ async fn dispatch(
     pending_media: &mut PendingMedia,
     identity: &crate::tools::git::Identity,
     exec_timeout: Duration,
+    // The run's live process handles. Shared rather than owned by the dispatch
+    // because a handle outlives the call that started it — which is the whole
+    // point of one, and the reason every guard in `handles` exists.
+    handles: &std::sync::Arc<crate::tools::handles::Handles>,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -5375,6 +5399,218 @@ async fn dispatch(
                 target: Some(line_src.to_string()),
                 changed: false,
                 remember: remembered,
+            }
+        }
+        SHELL_START_TOOL => {
+            let line_src = s("line").unwrap_or_default();
+            if line_src.trim().is_empty() {
+                return Ok(Dispatched::go(
+                    "shell_start missing line",
+                    "\n[shell_start error] shell_start needs a non-empty \"line\" string holding \
+                     the command line to start\n",
+                ));
+            }
+            // Parsed and refused by the same functions the foreground tool uses.
+            // The refusal wording names this tool so the model knows which call
+            // was rejected, but the decision is the same decision.
+            let parsed = match crate::tools::shell::parse(line_src) {
+                Ok(l) => l,
+                Err(r) => {
+                    return Ok(Dispatched::go(
+                        format!("shell_start refused: {}", r.construct),
+                        format!("\n[shell_start refused] {r}\n"),
+                    ))
+                }
+            };
+            let plan = match crate::tools::shell::plan(&parsed, ws.root()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(Dispatched::go(
+                        "shell_start refused: a path outside the workspace",
+                        format!("\n[shell_start refused] {e}\n"),
+                    ))
+                }
+            };
+            let remembered = match check_shell_line(
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+            )
+            .await?
+            {
+                ShellCheck::Go(remember) => remember,
+                ShellCheck::Stop(d) => return Ok(d),
+            };
+
+            // Reserved only after the whole line has cleared. A refused line
+            // must not consume a slot, and a reservation is the first thing that
+            // could leak if it did.
+            let (id, capture) = match handles.reserve(line_src) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    return Ok(Dispatched::go(
+                        "shell_start refused: the handle cap",
+                        format!("\n[shell_start refused] {reason}\n"),
+                    ))
+                }
+            };
+
+            let registry = std::sync::Arc::clone(handles);
+            let on_spawn = {
+                let registry = std::sync::Arc::clone(&registry);
+                std::sync::Arc::new(move |pid: u32| {
+                    registry.add_pid(id, pid);
+                }) as std::sync::Arc<dyn Fn(u32) + Send + Sync>
+            };
+            let runner = Shell::detached(
+                cap,
+                crate::tools::shell::Capture {
+                    path: capture,
+                    on_spawn,
+                },
+            );
+            // Detached on purpose: this is the one tool whose work outlives its
+            // dispatch. The task reaps, so a process that ends on its own is
+            // recorded as ended rather than left looking live to every later
+            // poll — one of the four ways a handle could otherwise leak.
+            let reaper = std::sync::Arc::clone(&registry);
+            tokio::spawn(async move {
+                let outcome = runner.run(&parsed, &plan).await;
+                match outcome {
+                    Ok(crate::tools::shell::ShellOutcome::Ran { code, .. }) => {
+                        reaper.finished(id, code)
+                    }
+                    // `Unavailable` is a line whose program is not on this
+                    // machine, and a timeout cannot happen without a ceiling.
+                    // Either way the handle is over and must not read as live.
+                    _ => reaper.finished(id, None),
+                }
+            });
+
+            Dispatched::Continue {
+                decision: format!("shell_start handle {id}"),
+                obs: bound(
+                    &format!(
+                        "\n[shell_start handle {id}] `{line_src}` is running. Read what it \
+                         prints with shell_poll {id}, and end it with shell_kill {id}. It is \
+                         killed automatically when this run ends.\n"
+                    ),
+                    cap,
+                    ObsKind::Tool,
+                ),
+                kind: ObsKind::Tool,
+                target: Some(line_src.to_string()),
+                changed: false,
+                remember: remembered,
+            }
+        }
+        SHELL_POLL_TOOL => {
+            let Some(id) = a.get("handle").and_then(|v| v.as_u64()) else {
+                return Ok(Dispatched::go(
+                    "shell_poll missing handle",
+                    "\n[shell_poll error] shell_poll needs a \"handle\" number, the id \
+                     shell_start returned\n",
+                ));
+            };
+            let Some(state) = handles.state(id) else {
+                return Ok(Dispatched::go(
+                    "shell_poll unknown handle",
+                    format!(
+                        "\n[shell_poll error] no process handle {id} in this run; shell_start \
+                         returns the id to poll\n"
+                    ),
+                ));
+            };
+            // An orphan is answered from what was recorded, never by touching
+            // anything. There is no process here to read from and the pid that
+            // was recorded may belong to something else entirely.
+            if let crate::tools::handles::HandleState::Orphaned(reason) = &state {
+                return Ok(Dispatched::seen(
+                    format!("shell_poll handle {id} orphaned"),
+                    format!(
+                        "\n[shell_poll handle {id}] orphaned: {reason}. It was started before \
+                         this run was resumed and cannot be read or signalled. Start what you \
+                         need again.\n"
+                    ),
+                    ObsKind::Tool,
+                    None,
+                ));
+            }
+            let (text, skipped) = handles.poll(id)?;
+            let line_src = handles.line(id).unwrap_or_default();
+            Dispatched::seen(
+                format!("shell_poll handle {id} ({} bytes)", text.len()),
+                bound(
+                    &format!(
+                        "\n[shell_poll handle {id} `{line_src}` {}]{}\n{}\n",
+                        match &state {
+                            crate::tools::handles::HandleState::Running => "running".to_string(),
+                            crate::tools::handles::HandleState::Exited(Some(c)) =>
+                                format!("exited {c}"),
+                            crate::tools::handles::HandleState::Exited(None) =>
+                                "killed by a signal".to_string(),
+                            other => other.as_str().to_string(),
+                        },
+                        if skipped > 0 {
+                            format!(
+                                " ({skipped} bytes of older output skipped; the newest is here \
+                                 and the whole of it is in the run's trace)"
+                            )
+                        } else {
+                            String::new()
+                        },
+                        if text.trim().is_empty() {
+                            "(nothing new)"
+                        } else {
+                            text.trim_end()
+                        }
+                    ),
+                    cap,
+                    ObsKind::Tool,
+                ),
+                ObsKind::Tool,
+                None,
+            )
+        }
+        SHELL_KILL_TOOL => {
+            let Some(id) = a.get("handle").and_then(|v| v.as_u64()) else {
+                return Ok(Dispatched::go(
+                    "shell_kill missing handle",
+                    "\n[shell_kill error] shell_kill needs a \"handle\" number, the id \
+                     shell_start returned\n",
+                ));
+            };
+            let line_src = handles.line(id).unwrap_or_default();
+            match handles.kill(id) {
+                // Killing something already over is not a mistake worth failing
+                // a step for: a model that lost track of a handle should be told
+                // how it ended and carry on.
+                Ok(was) => Dispatched::seen(
+                    format!("shell_kill handle {id}"),
+                    bound(
+                        &format!(
+                            "\n[shell_kill handle {id} `{line_src}`] {}\n",
+                            match was {
+                                crate::tools::handles::HandleState::Running =>
+                                    "killed, with every process it spawned".to_string(),
+                                crate::tools::handles::HandleState::Exited(Some(c)) =>
+                                    format!("had already exited {c}; nothing to kill"),
+                                crate::tools::handles::HandleState::Exited(None) =>
+                                    "had already been killed by a signal; nothing to kill"
+                                        .to_string(),
+                                crate::tools::handles::HandleState::Killed =>
+                                    "had already been killed; nothing to kill".to_string(),
+                                crate::tools::handles::HandleState::Orphaned(r) => r,
+                            }
+                        ),
+                        cap,
+                        ObsKind::Tool,
+                    ),
+                    ObsKind::Tool,
+                    None,
+                ),
+                Err(reason) => Dispatched::go(
+                    format!("shell_kill refused handle {id}"),
+                    format!("\n[shell_kill error] {reason}\n"),
+                ),
             }
         }
         EXEC_TOOL => {
@@ -7427,6 +7663,68 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["line"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_START_TOOL.to_string(),
+            description: "Start a command line and LEAVE IT RUNNING, returning a handle id \
+                          instead of a result — use this for a dev server, a log tail, a watch \
+                          build or anything else that does not finish on its own. `shell` blocks \
+                          the step until the command ends or times out, which is the wrong shape \
+                          for these. The line is parsed and checked exactly as `shell` parses and \
+                          checks it, with the same grammar and the same refusals, and nothing \
+                          runs if any stage is denied. Read what it has printed with \
+                          `shell_poll`, and end it with `shell_kill`. A handle does not survive \
+                          past this run: if the run is resumed in a new process the handle is \
+                          reported orphaned and is never signalled."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "line": {
+                        "type": "string",
+                        "description": "The command line to start, e.g. \"npm run dev\" or \"tail -f logs/app.log\".",
+                    }
+                },
+                "required": ["line"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_POLL_TOOL.to_string(),
+            description: "Read what a handle started by `shell_start` has printed SINCE THE LAST \
+                          POLL, and whether it is still running. Output already returned by an \
+                          earlier poll is not returned again, so polling in a loop shows progress \
+                          rather than repeating the log. A handle that has printed nothing yet \
+                          returns empty, which is not an error."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "integer",
+                        "description": "The handle id `shell_start` returned.",
+                    }
+                },
+                "required": ["handle"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_KILL_TOOL.to_string(),
+            description: "End a handle started by `shell_start`, together with every process it \
+                          spawned. Killing a handle that has already ended is not an error and \
+                          reports how it ended. Every handle still running is killed when the run \
+                          ends, so this is for finishing with something early rather than for \
+                          tidying up at the end."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "integer",
+                        "description": "The handle id `shell_start` returned.",
+                    }
+                },
+                "required": ["handle"]
             }),
         },
     ];

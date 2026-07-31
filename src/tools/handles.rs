@@ -46,6 +46,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 
+/// How many handles one run may have live at once.
+///
+/// A bound rather than a setting, for now. The number exists to stop a model in
+/// a loop filling the host with dev servers, and any value that does that is as
+/// good as any other — what matters is that going over it is a refusal rather
+/// than a queue. A run that genuinely needs more than this is doing something
+/// the crate should be asked about rather than quietly accommodated.
+pub(crate) const MAX_LIVE_HANDLES: usize = 8;
+
 /// How much of one poll's output is returned to the model at most.
 ///
 /// The file keeps everything; this bounds the window. A log tail polled once
@@ -177,10 +186,17 @@ impl Handles {
         Ok((id, capture))
     }
 
-    /// Record the processes a started handle spawned.
-    pub(crate) fn attach(&self, id: u64, pids: Vec<u32>) {
+    /// Record one process a started handle spawned.
+    ///
+    /// Called per stage as the pipeline is built rather than once at the end,
+    /// so a line that fails to spawn its third stage still leaves the first two
+    /// killable. Ignores an unknown id: a handle killed while its own pipeline
+    /// was still spawning is a race that ends in the right place either way,
+    /// because `kill` walked what had been recorded by then and the rest die
+    /// with the dropped `Child`.
+    pub(crate) fn add_pid(&self, id: u64, pid: u32) {
         if let Some(r) = self.lock().get_mut(&id) {
-            r.pids = pids;
+            r.pids.push(pid);
         }
     }
 
