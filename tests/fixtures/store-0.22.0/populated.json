@@ -1,0 +1,196 @@
+{
+  "checkpoint_event_count": 4,
+  "citations": [
+    {
+      "cited_text": "a quoted passage",
+      "title": "The first source",
+      "url": "https://example.invalid/one"
+    },
+    {
+      "cited_text": null,
+      "title": null,
+      "url": "https://example.invalid/two"
+    }
+  ],
+  "edits": [
+    {
+      "lines_added": 1,
+      "lines_removed": 0,
+      "path": "out.txt",
+      "step": 4,
+      "tool": "write_file"
+    }
+  ],
+  "goal": "write out.txt",
+  "last_step": 4,
+  "observations": [
+    {
+      "kind": "read",
+      "step": 1,
+      "target": "notes.txt"
+    },
+    {
+      "kind": "error",
+      "step": 2,
+      "target": null
+    },
+    {
+      "kind": "grep",
+      "step": 3,
+      "target": "seed"
+    },
+    {
+      "kind": "message",
+      "step": 4,
+      "target": null
+    },
+    {
+      "kind": "write",
+      "step": 4,
+      "target": "out.txt"
+    }
+  ],
+  "outcome": "success",
+  "pending": {
+    "act": "write",
+    "content": "replicas: 4\n",
+    "request_id": 1,
+    "resolved": "approve",
+    "run_id": 1,
+    "step": 4,
+    "target": "deploy/prod.yaml"
+  },
+  "policy_events": [
+    {
+      "act": "write",
+      "decision": null,
+      "kind": "refusal",
+      "layer": "base",
+      "performed": null,
+      "rule": "secrets/*",
+      "source": null,
+      "step": 2,
+      "target": "secrets/key.txt"
+    },
+    {
+      "act": "write",
+      "decision": "approve",
+      "kind": "decision",
+      "layer": null,
+      "performed": null,
+      "rule": null,
+      "source": "approver",
+      "step": 4,
+      "target": "out.txt"
+    }
+  ],
+  "provider_calls": [
+    {
+      "attempt": 0,
+      "failure": null,
+      "finish_reason": "tool_use",
+      "model": "fixture-model",
+      "provider": "fixture",
+      "step": 1,
+      "usage": {
+        "cache_read_tokens": 7,
+        "cache_write_tokens": 3,
+        "completion_tokens": 20,
+        "prompt_tokens": 100,
+        "reasoning_tokens": 5,
+        "server_tool_requests": 1,
+        "total_tokens": 120
+      }
+    },
+    {
+      "attempt": 0,
+      "failure": null,
+      "finish_reason": "tool_use",
+      "model": "fixture-model",
+      "provider": "fixture",
+      "step": 2,
+      "usage": {
+        "cache_read_tokens": 7,
+        "cache_write_tokens": 3,
+        "completion_tokens": 30,
+        "prompt_tokens": 200,
+        "reasoning_tokens": 5,
+        "server_tool_requests": 1,
+        "total_tokens": 230
+      }
+    },
+    {
+      "attempt": 0,
+      "failure": null,
+      "finish_reason": "tool_use",
+      "model": "fixture-model",
+      "provider": "fixture",
+      "step": 3,
+      "usage": {
+        "cache_read_tokens": 7,
+        "cache_write_tokens": 3,
+        "completion_tokens": 40,
+        "prompt_tokens": 300,
+        "reasoning_tokens": 5,
+        "server_tool_requests": 1,
+        "total_tokens": 340
+      }
+    },
+    {
+      "attempt": 0,
+      "failure": null,
+      "finish_reason": "end_turn",
+      "model": "fixture-model",
+      "provider": "fixture",
+      "step": 4,
+      "usage": {
+        "cache_read_tokens": 7,
+        "cache_write_tokens": 3,
+        "completion_tokens": 50,
+        "prompt_tokens": 400,
+        "reasoning_tokens": 5,
+        "server_tool_requests": 1,
+        "total_tokens": 450
+      }
+    }
+  ],
+  "run_id": 1,
+  "server_tool_calls": [
+    {
+      "error": null,
+      "provider": "anthropic",
+      "tool": "web_search"
+    },
+    {
+      "error": "max_uses_exceeded",
+      "provider": "anthropic",
+      "tool": "web_search"
+    }
+  ],
+  "spent_tokens": 1140,
+  "status": "completed",
+  "step_count": 4,
+  "steps": [
+    {
+      "decision": "read notes.txt",
+      "step": 1,
+      "tokens": 120
+    },
+    {
+      "decision": "write refused",
+      "step": 2,
+      "tokens": 230
+    },
+    {
+      "decision": "grep \"seed\" (2 hits)",
+      "step": 3,
+      "tokens": 340
+    },
+    {
+      "decision": "wrote out.txt",
+      "step": 4,
+      "tokens": 450
+    }
+  ],
+  "workspace": "populated-workspace"
+}

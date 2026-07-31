@@ -1,0 +1,30 @@
+# Pinned to io-harness 0.22.0 — the PREVIOUS release — on purpose, with an `=`
+# requirement so cargo cannot drift it forward. Never bump this. The whole job of
+# this crate is to write SQLite databases exactly the way 0.22.0 wrote them, on
+# 0.22.0's `rusqlite` 0.32 line, so that `tests/cross_version.rs` in the main
+# crate can prove the 0.23.0 upgrade to `rusqlite` 0.40 still reads and resumes
+# them. A fixture written by the current tree and labelled "0.22.0" would prove
+# nothing; bumping this dependency turns the evidence back into a label.
+#
+# It is listed in the root manifest's `exclude`, so it is never packaged, and it
+# is built with its own `target/` (run it from this directory) so it never drags
+# a second `libsqlite3-sys` into the main crate's build.
+[package]
+name = "gen-0-22-0"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty on purpose: without it cargo walks up and tries to join the io-harness
+# package as a workspace member, which fails because the root manifest excludes
+# this directory.
+[workspace]
+
+[dependencies]
+io-harness = "=0.22.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "sync"] }
+serde_json = "1"
+# No `tempfile` here on purpose. The workspaces have to be relative paths under
+# the output directory, so that no machine-specific absolute path is baked into
+# `runs.file` in a committed fixture — and a temp directory is by definition
+# neither relative nor committed.
