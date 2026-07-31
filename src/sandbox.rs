@@ -881,6 +881,88 @@ fn set_rlimit(resource: u32, value: Option<u64>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Make the process this command spawns the leader of a process group of its
+/// own, so that [`kill_tree_and_group`] can signal the whole group later.
+///
+/// This is the containment a *process handle* needs and a foreground call does
+/// not. A foreground line is awaited, held in a `Vec` with `kill_on_drop(true)`,
+/// and gone before the dispatch that started it returns; a handle outlives its
+/// call by design, and by the time anything kills it the tree it built has had
+/// minutes to rearrange itself. Killing by parent/child links — which is all
+/// [`kill_tree`] can do — misses a grandchild whose parent has already exited,
+/// because the link it would have walked no longer exists. Group membership has
+/// no such gap: it is inherited across `fork`, it survives the parent's death,
+/// and a process that never asks to leave never leaves. One `killpg` therefore
+/// reaches exactly the processes this handle is responsible for, however deep
+/// they are and whoever their parent is by then.
+///
+/// `setpgid(0, 0)` rather than `setsid()` on purpose. Both would give the child
+/// its own group; `setsid` would additionally put it in a new session and drop
+/// the controlling terminal, which is a second behaviour change nothing here
+/// needs and one that changes how the payload sees its own tty. The narrower
+/// call is the one whose effects are all wanted.
+///
+/// A failure fails the spawn, exactly as an rlimit that could not be applied
+/// does: a handle whose processes are not contained is a handle whose kill
+/// cannot be relied on, and the crate promises the kill.
+#[cfg(unix)]
+pub(crate) fn own_process_group(cmd: &mut tokio::process::Command) {
+    // SAFETY: `pre_exec` runs in the forked child, after `fork` and before
+    // `exec`, where the only calls that are legal are async-signal-safe ones —
+    // the child shares the parent's address space locks and must not allocate,
+    // take a lock, or call back into arbitrary Rust. The closure below calls
+    // `setpgid` and, on failure, `last_os_error`, which only reads `errno`.
+    // Nothing here allocates and nothing captures a destructor.
+    unsafe {
+        cmd.pre_exec(|| {
+            // Both zeros mean "this process, its own pid as the group", which is
+            // what makes the child a group leader whose group id equals its pid
+            // — the equality `kill_tree_and_group` checks before it signals.
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Kill the process group `pid` leads, and its tree, and `pid` itself.
+///
+/// The counterpart to [`own_process_group`] and the only kill that closes the
+/// grandchild gap: the group reaches every descendant the spawn ever produced,
+/// including the ones whose parents are already gone, which is precisely what
+/// walking the process table cannot do.
+///
+/// The group signal is sent **only** when `pid` really is a group leader — when
+/// `getpgid(pid)` answers with `pid` itself. That check is not a formality. For
+/// a process this crate did not put in its own group, `getpgid` answers with the
+/// group it happens to be *in*, which is the harness's own group, and signalling
+/// that would kill the harness and everything it is running. So the check is
+/// what makes this function safe to call on any pid at all, including one
+/// spawned before this containment existed.
+///
+/// [`kill_tree`] still runs afterwards, because the two mechanisms fail in
+/// different directions: a process that left the group by calling `setpgid` on
+/// itself is invisible to the group kill and still reachable by the walk, and a
+/// pid whose group could not be read is still reachable directly.
+pub(crate) fn kill_tree_and_group(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    #[cfg(unix)]
+    {
+        let pid = pid as libc::pid_t;
+        // SAFETY: both calls take a pid by value and return a status; neither
+        // dereferences anything and neither can touch memory this process owns.
+        // A pid that is already gone answers with an error, which is the
+        // best-effort contract this shares with `kill_tree`.
+        unsafe {
+            if libc::getpgid(pid) == pid {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+    }
+    kill_tree(Some(pid));
+}
+
 /// Kill `pid` and everything it spawned, on whatever OS this is.
 ///
 /// Killing only `pid` is not enough anywhere: a payload run through a shell puts

@@ -38,12 +38,33 @@
 //! memory cost is the size of one poll rather than the size of the output. It is
 //! also how job control has always worked, which is a good sign for a design
 //! rather than a coincidence.
+//!
+//! ## A handle's processes are a process group
+//!
+//! Killing a handle by pid, or by pid and whatever the process table still says
+//! descends from it, is not enough and cannot be made enough. A dev server
+//! starts a package manager which starts a runtime which starts a watcher, and
+//! then the package manager exits — a completely ordinary shape for the exact
+//! programs this tool exists to run. The runtime and the watcher are still
+//! there, they are still the run's responsibility, and the parent/child links
+//! that would have led to them are gone. Nothing about walking the table
+//! recovers them; they have been reparented to init and are indistinguishable
+//! from anything else on the machine.
+//!
+//! So each stage of a handle's line is spawned as the leader of its own process
+//! group (see [`own_process_group`](crate::sandbox::own_process_group)), and the
+//! kill signals the group. Membership is inherited across `fork` and outlives
+//! every parent in the chain, so one signal reaches the whole tree no matter
+//! what shape it has grown into or which of its middles are already dead. The
+//! foreground `shell` and `exec` tools keep their old spawn exactly: they are
+//! awaited and dropped inside the call that made them, so they never have the
+//! problem this solves.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 use crate::error::{Error, Result};
 
@@ -61,7 +82,8 @@ use crate::error::{Error, Result};
 /// So the handle is marked, kept readable, and left alone. This is the one way
 /// this crate could damage something outside its own workspace, and the cost of
 /// being wrong is not a failed run, it is somebody else's process.
-pub(crate) const ORPHAN_REASON: &str = "started by a previous process; its pid may since have been reused";
+pub(crate) const ORPHAN_REASON: &str =
+    "started by a previous process; its pid may since have been reused";
 
 /// How many handles one run may have live at once.
 ///
@@ -160,10 +182,7 @@ impl Handles {
 
     /// How many handles are live — started here, not yet ended.
     pub(crate) fn live(&self) -> usize {
-        self.lock()
-            .values()
-            .filter(|r| !r.state.is_over())
-            .count()
+        self.lock().values().filter(|r| !r.state.is_over()).count()
     }
 
     /// Reserve an id and a capture path, refusing if the cap is already reached.
@@ -219,7 +238,10 @@ impl Handles {
     /// from here, and the resume path in particular must not: see
     /// [`ORPHAN_REASON`].
     pub(crate) fn pids(&self, id: u64) -> Vec<u32> {
-        self.lock().get(&id).map(|r| r.pids.clone()).unwrap_or_default()
+        self.lock()
+            .get(&id)
+            .map(|r| r.pids.clone())
+            .unwrap_or_default()
     }
 
     /// Every handle that is still live, with its processes — for the run-ending
@@ -294,9 +316,11 @@ impl Handles {
     /// End a handle and everything it spawned.
     ///
     /// Walks the recorded pids in reverse, so a pipeline's later stages go
-    /// before the ones feeding them, and each goes through the platform's
-    /// tree kill rather than a bare signal — a package manager that spawned a
-    /// runtime leaves grandchildren otherwise.
+    /// before the ones feeding them, and each goes through
+    /// [`kill_tree_and_group`](crate::sandbox::kill_tree_and_group) rather than
+    /// a bare signal — a package manager that spawned a runtime leaves
+    /// grandchildren otherwise, and a grandchild whose parent has already
+    /// exited is reachable by nothing but its process group.
     pub(crate) fn kill(&self, id: u64) -> std::result::Result<HandleState, String> {
         let (pids, was) = {
             let mut guard = self.lock();
@@ -321,7 +345,7 @@ impl Handles {
         };
         if !was.is_over() {
             for pid in pids.into_iter().rev() {
-                crate::sandbox::kill_tree(Some(pid));
+                crate::sandbox::kill_tree_and_group(Some(pid));
             }
         }
         Ok(was)
@@ -411,9 +435,7 @@ mod tests {
         assert!(err.contains("may since belong to something else"), "{err}");
         assert_eq!(
             h.state(7),
-            Some(HandleState::Orphaned(
-                ORPHAN_REASON.to_string()
-            ))
+            Some(HandleState::Orphaned(ORPHAN_REASON.to_string()))
         );
     }
 
@@ -422,7 +444,10 @@ mod tests {
         let h = Handles::new(4);
         h.adopt_orphan(3, "old");
         let (id, _) = h.reserve("new").expect("reserve");
-        assert!(id > 3, "a new handle must not take an orphan's id: got {id}");
+        assert!(
+            id > 3,
+            "a new handle must not take an orphan's id: got {id}"
+        );
     }
 
     #[test]

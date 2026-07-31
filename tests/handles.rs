@@ -16,12 +16,12 @@
 //! tests exist to catch, so asking it whether it succeeded would be asking the
 //! defendant for the verdict.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use io_harness::policy::Policy;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, ToolSpec};
-use io_harness::{ApproveAll, Provider, Store, TaskContract, run_with};
+use io_harness::{run_with, ApproveAll, Provider, Store, TaskContract};
 use serde_json::json;
 
 // ---------------------------------------------------------------------------
@@ -76,11 +76,16 @@ impl Provider for MockScript {
 }
 
 /// The `tick` example, as an absolute path.
+fn tick_binary() -> std::path::PathBuf {
+    example_binary("tick")
+}
+
+/// One of this crate's example fixtures, as an absolute path.
 ///
 /// Integration test binaries live in `target/<profile>/deps/`, so the examples
 /// built alongside them are one directory over. Located rather than hard-coded
 /// so this works under any profile and any `CARGO_TARGET_DIR`.
-fn tick_binary() -> std::path::PathBuf {
+fn example_binary(name: &str) -> std::path::PathBuf {
     let mut dir = std::env::current_exe().expect("the test binary knows where it is");
     dir.pop(); // deps/
     if dir.ends_with("deps") {
@@ -88,7 +93,7 @@ fn tick_binary() -> std::path::PathBuf {
     }
     let exe = dir
         .join("examples")
-        .join(format!("tick{}", std::env::consts::EXE_SUFFIX));
+        .join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     if !exe.exists() {
         // A full `cargo test` builds every example, so this is already there.
         // `cargo test --test handles` does not, and a test that only passes
@@ -96,17 +101,17 @@ fn tick_binary() -> std::path::PathBuf {
         // whoever runs the other one. Building it here costs nothing when it is
         // already built and removes the footgun entirely.
         let built = std::process::Command::new(env!("CARGO"))
-            .args(["build", "--example", "tick"])
+            .args(["build", "--example", name])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status();
         assert!(
             matches!(built, Ok(s) if s.success()),
-            "could not build the tick fixture: {built:?}"
+            "could not build the {name} fixture: {built:?}"
         );
     }
     assert!(
         exe.exists(),
-        "the tick fixture is missing at {}; it is an [[example]] and `cargo test` builds it",
+        "the {name} fixture is missing at {}; it is an example and `cargo test` builds it",
         exe.display()
     );
     exe
@@ -457,4 +462,146 @@ async fn starting_past_the_cap_is_refused_and_spawns_nothing() {
         text.contains("shell_start handle 8"),
         "the eight before the cap must all have started:\n{text}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F2 — a kill takes the whole tree, including a grandchild whose parent is gone
+// ---------------------------------------------------------------------------
+
+/// Wait for the `orphan` fixture's leaf to announce its pid, and return it.
+///
+/// The file appearing is the fixture's signal that the leaf has been reparented
+/// — that the middle process is gone and the parent/child link from the handle
+/// to the leaf no longer exists. So this is not only how the test learns the
+/// pid, it is how the test knows the scenario it wanted has actually happened
+/// before it kills anything.
+#[cfg(unix)]
+async fn leaf_pid(pidfile: &std::path::Path) -> u32 {
+    for _ in 0..200 {
+        if let Ok(text) = std::fs::read_to_string(pidfile) {
+            if let Ok(pid) = text.trim().parse::<u32>() {
+                return pid;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!(
+        "the orphan fixture never wrote {}; without a grandchild pid this test proves nothing",
+        pidfile.display()
+    );
+}
+
+/// Give a signal time to be delivered before asking whether it worked.
+///
+/// `SIGKILL` is not synchronous with the `kill` that sent it, and a test that
+/// checks immediately is a test that fails on a loaded runner for a reason that
+/// has nothing to do with the code. Polls rather than sleeps a fixed time, so
+/// the usual case costs one poll.
+#[cfg(unix)]
+async fn gone_within(pid: u32, tries: u32) -> bool {
+    for _ in 0..tries {
+        if !alive(pid) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    false
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn killing_a_handle_kills_a_grandchild_whose_parent_already_exited() {
+    let orphan = example_binary("orphan");
+    // Outside the workspace on purpose: the fixture writes this file itself,
+    // and putting it in the run's own directory would make the test also a test
+    // of what a payload may write where.
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaf.pid");
+    let line = format!("{} {}", orphan.display(), pidfile.display());
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    // Start, then kill. The mock's pause between turns is far longer than the
+    // fixture needs to build its chain, so the kill lands on a tree that has
+    // already lost its middle.
+    let provider = MockScript::new(vec![vec![start(&line)], vec![kill(1)]]);
+    run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &allow_tick(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    // Read after the run rather than during it: the file outlives the process
+    // that wrote it, and reading it here keeps the test out of the run loop's
+    // way. If it is missing the fixture never got as far as a grandchild, which
+    // is a failure of the test rather than a pass.
+    let leaf = leaf_pid(&pidfile).await;
+    assert!(
+        gone_within(leaf, 100).await,
+        "the grandchild {leaf} survived the kill; its parent had already exited, so a \
+         parent/child walk could not reach it and only the process group can"
+    );
+
+    let handles = store
+        .process_handles(run_id(&store))
+        .expect("the run recorded its handle");
+    let top = *handles
+        .first()
+        .and_then(|h| h.pids.first())
+        .expect("the handle recorded the process it started");
+    assert!(
+        gone_within(top, 100).await,
+        "the handle's own process {top} survived the kill"
+    );
+}
+
+/// The negative control, without which the test above proves nothing.
+///
+/// It runs the identical fixture with the containment switched off — spawned
+/// straight from here, so nothing puts it in a process group of its own — and
+/// kills it the way the crate killed handles before this release: the recorded
+/// pid, plus whatever the process table still says descends from it. The middle
+/// is already gone by the time the pid file exists, so that walk finds nothing
+/// and the grandchild lives. That is the gap, demonstrated rather than asserted.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_a_process_group_the_grandchild_survives() {
+    let orphan = example_binary("orphan");
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaf.pid");
+
+    let mut top = std::process::Command::new(&orphan)
+        .arg(&pidfile)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the orphan fixture starts");
+    let leaf = leaf_pid(&pidfile).await;
+
+    // The old kill, in full. `kill_tree` walks `ps` for descendants and then
+    // signals the root; with the middle already exited the walk returns nothing
+    // for this tree, so signalling the root is all of it. Reproduced here rather
+    // than called because it is crate-private, and it is faithful because the
+    // fixture guarantees the walk has nothing left to find.
+    //
+    // SAFETY: `kill` takes a pid and a signal by value and dereferences
+    // nothing. The pid is this test's own child, which has not been reaped, so
+    // it cannot have been reused by an unrelated process.
+    unsafe { libc::kill(top.id() as i32, libc::SIGKILL) };
+    let _ = top.wait();
+
+    assert!(
+        !gone_within(leaf, 6).await,
+        "the grandchild {leaf} died without any containment, so the test above would \
+         pass even with the process group removed and is not evidence of anything"
+    );
+
+    // Do not leave the thing this test just proved is unkillable-by-pid running.
+    // SAFETY: as above; the leaf pid was published by the fixture moments ago
+    // and was still alive at the assertion.
+    unsafe { libc::kill(leaf as i32, libc::SIGKILL) };
 }

@@ -1249,6 +1249,20 @@ impl Shell {
                 .current_dir(&planned.cwd)
                 .kill_on_drop(true);
 
+            // A detached line's stages go in a process group of their own, and a
+            // foreground line's stages deliberately do not. The foreground case
+            // is awaited and dropped inside the call that made it, so
+            // `kill_on_drop` and the process table between them already reach
+            // everything; the handle case outlives its call, and by the time it
+            // is killed the parent/child links a table walk would follow have
+            // had time to disappear. The group is what survives that. Nothing
+            // else about the two spawns differs, which is the property this
+            // shared runner exists to keep.
+            #[cfg(unix)]
+            if self.capture.is_some() {
+                crate::sandbox::own_process_group(&mut cmd);
+            }
+
             match prev_stdout.take() {
                 Some(s) => cmd.stdin(s),
                 None => cmd.stdin(Stdio::null()),
@@ -1259,7 +1273,21 @@ impl Shell {
                 // fill and block the payload rather than buffer it — the one
                 // failure mode that would make a handle worse than no handle.
                 (Some(c), true) => {
-                    cmd.stdout(append_to(&c.path)?).stderr(append_to(&c.path)?);
+                    // Opened ONCE and cloned, never opened twice.
+                    //
+                    // Two independent opens of the same path work on unix and
+                    // fail on Windows, where the second one hits a sharing
+                    // violation and takes the whole spawn down with it — the
+                    // handle then exists, reports itself running, and produces
+                    // nothing forever, which is the worst of the available
+                    // failures because it looks like a quiet process rather than
+                    // a broken one. Cloning the descriptor also gives the two
+                    // streams one shared file offset, so stdout and stderr
+                    // interleave the way a terminal shows them instead of
+                    // overwriting each other at independent positions.
+                    let out = append_to(&c.path)?;
+                    let err = out.try_clone().map_err(Error::Io)?;
+                    cmd.stdout(out).stderr(err);
                 }
                 _ => {
                     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());

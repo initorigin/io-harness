@@ -61,7 +61,7 @@ use std::time::Duration;
 
 use crate::toolchain::Toolchain;
 
-use super::exec::{Exec, ExecOutcome, head_and_tail};
+use super::exec::{head_and_tail, Exec, ExecOutcome};
 
 /// What running the project's checker after an edit produced.
 ///
@@ -384,7 +384,11 @@ mod tests {
             panic!("a missing checker is a Failed outcome: {out:?}");
         };
         assert!(reason.contains("io-harness-no-such-checker"), "{reason}");
-        assert_ne!(out, Outcome::Clean, "F9: unchecked is not the same as clean");
+        assert_ne!(
+            out,
+            Outcome::Clean,
+            "F9: unchecked is not the same as clean"
+        );
     }
 
     /// The other half of F9, and the reason [`Outcome`] has four variants: a checker
@@ -471,8 +475,18 @@ mod tests {
     #[tokio::test]
     async fn the_findings_are_capped_and_say_what_they_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let argv = vec!["rustc".to_string(), "io-harness-no-such-file.rs".to_string()];
-        let out = run(dir.path(), &argv, Format::Rendered, Duration::from_secs(60), 20).await;
+        let argv = vec![
+            "rustc".to_string(),
+            "io-harness-no-such-file.rs".to_string(),
+        ];
+        let out = run(
+            dir.path(),
+            &argv,
+            Format::Rendered,
+            Duration::from_secs(60),
+            20,
+        )
+        .await;
 
         let Outcome::Found(text) = &out else {
             panic!("rustc reports a missing input on stderr: {out:?}");
@@ -506,7 +520,10 @@ mod tests {
         // Exits non-zero and writes its complaint to stderr, which the JSON parser
         // does not read — so this is the "said nothing" case as far as the format is
         // concerned.
-        let argv = vec!["rustc".to_string(), "io-harness-no-such-file.rs".to_string()];
+        let argv = vec![
+            "rustc".to_string(),
+            "io-harness-no-such-file.rs".to_string(),
+        ];
         let out = run(
             dir.path(),
             &argv,

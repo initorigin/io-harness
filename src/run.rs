@@ -52,9 +52,8 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
-    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL,
-    SHELL_KILL_TOOL, SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL,
-    TODO_WRITE_TOOL, WRITE_FILE_TOOL,
+    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL,
+    SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -5241,13 +5240,9 @@ async fn dispatch(
                             // a type error in a file the model just created is
                             // worth exactly as much to know about as one it
                             // edited into an existing file.
-                            let diagnostics = diagnostics_after_write(
-                                ws.root(),
-                                toolchain,
-                                exec_timeout,
-                                cap,
-                            )
-                            .await;
+                            let diagnostics =
+                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                    .await;
                             Dispatched::Continue {
                                 decision: format!("wrote {target}"),
                                 // A write that changed nothing says so, to the model as
@@ -5337,13 +5332,9 @@ async fn dispatch(
                             // write is already on disk by the time this runs, so
                             // a checker that is missing, slow or broken costs
                             // the model a note and nothing else.
-                            let diagnostics = diagnostics_after_write(
-                                ws.root(),
-                                toolchain,
-                                exec_timeout,
-                                cap,
-                            )
-                            .await;
+                            let diagnostics =
+                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                    .await;
                             Dispatched::Continue {
                                 decision: format!("edited {target}"),
                                 obs: bound(
@@ -5786,29 +5777,29 @@ async fn dispatch(
                         EventKind::HandleKilled { handle: id },
                     ));
                     Dispatched::seen(
-                    format!("shell_kill handle {id}"),
-                    bound(
-                        &format!(
-                            "\n[shell_kill handle {id} `{line_src}`] {}\n",
-                            match was {
-                                crate::tools::handles::HandleState::Running =>
-                                    "killed, with every process it spawned".to_string(),
-                                crate::tools::handles::HandleState::Exited(Some(c)) =>
-                                    format!("had already exited {c}; nothing to kill"),
-                                crate::tools::handles::HandleState::Exited(None) =>
-                                    "had already been killed by a signal; nothing to kill"
-                                        .to_string(),
-                                crate::tools::handles::HandleState::Killed =>
-                                    "had already been killed; nothing to kill".to_string(),
-                                crate::tools::handles::HandleState::Orphaned(r) => r,
-                            }
+                        format!("shell_kill handle {id}"),
+                        bound(
+                            &format!(
+                                "\n[shell_kill handle {id} `{line_src}`] {}\n",
+                                match was {
+                                    crate::tools::handles::HandleState::Running =>
+                                        "killed, with every process it spawned".to_string(),
+                                    crate::tools::handles::HandleState::Exited(Some(c)) =>
+                                        format!("had already exited {c}; nothing to kill"),
+                                    crate::tools::handles::HandleState::Exited(None) =>
+                                        "had already been killed by a signal; nothing to kill"
+                                            .to_string(),
+                                    crate::tools::handles::HandleState::Killed =>
+                                        "had already been killed; nothing to kill".to_string(),
+                                    crate::tools::handles::HandleState::Orphaned(r) => r,
+                                }
+                            ),
+                            cap,
+                            ObsKind::Tool,
                         ),
-                        cap,
                         ObsKind::Tool,
-                    ),
-                    ObsKind::Tool,
-                    None,
-                )
+                        None,
+                    )
                 }
                 Err(reason) => Dispatched::go(
                     format!("shell_kill refused handle {id}"),
