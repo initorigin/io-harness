@@ -46,7 +46,7 @@ tasks:
   why_required: 'A handle outlives its poll and must outlive its step: the trace has to answer what a
     dev server did after the process that started it is gone. It is also what makes the incremental-poll
     decision safe, since the whole stream is recoverable from the store when a poll result is lost.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T01
   acceptance_criteria:
@@ -57,7 +57,14 @@ tasks:
     '
   files:
   - src/state.rs
-  evidence: []
+  evidence:
+  - process_handles and handle_output added to Store::from_conn with the citations pattern; 7 Store methods
+    and a public ProcessHandle row struct; 9 unit tests. CHECKPOINT_FORMAT stays 7. record_handle_started
+    uses INSERT OR IGNORE so a replayed step cannot clobber a live row; record_handle_ended will not re-end
+    an already-ended row.
+  - tests/cross_version.rs updated from a schema equality to an additive-only assertion naming the four
+    permitted new objects, and both tests renamed — "migrates nothing" had become an overstatement. The
+    suite caught the schema change unprompted, which is what 0.23.0 built it for.
 - id: US-IO-HARNESS-0.25.0-T03
   summary: Add `shell_poll` and `shell_kill`. `shell_poll` returns output produced since the last poll
     from a per-stream byte cursor, bounded by the existing `head_and_tail` elision, while every byte read
@@ -66,7 +73,7 @@ tasks:
   why_required: 'A handle that cannot be read or ended is not a capability, it is a leak. The cap and
     the kill-on-run-end are not extras: they are two of the four ways the registry can leak a process
     onto the operator''s machine.'
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T01
   - US-IO-HARNESS-0.25.0-T02
@@ -88,12 +95,14 @@ tasks:
   - src/run.rs
   - src/state.rs
   evidence:
-  - shell_poll and shell_kill are implemented and tested end to end, including the incremental-output
-    claim and killing an already-ended handle being reported rather than failed.
-  - 'INCOMPLETE: the other half of F1 — that a handle still live when the run ends is killed rather than
-    leaked — is implemented (Handles::kill_all plus a Drop backstop) but NOT yet asserted against the
-    operating system. The assertion needs the pid, which the store tables in T02 record; there is no route
-    from an integration test to it until those land. Noted in tests/handles.rs rather than dropped.'
+  - shell_poll and shell_kill implemented and tested end to end, including incremental output and killing
+    an already-ended handle being reported rather than failed.
+  - 'F1 is now closed: a_handle_left_running_is_killed_when_the_run_ends asserts against the operating
+    system via the recorded pids, not against the registry.'
+  - 'That assertion found a real bug that would have shipped: the reaping task held a strong Arc to the
+    registry, so a handle that never exits kept the refcount above zero, Drop never ran, and the process
+    outlived the run. Both the reaper and the pid callback now hold Weak.'
+  - Killing a handle flushes output nobody polled, which was otherwise recorded nowhere durable.
 - id: US-IO-HARNESS-0.25.0-T04
   summary: Route the handle spawn into the platform's containment — `Job::create`/`Job::adopt` on Windows,
     the recorded containment and `kill_tree` on unix — so `shell_kill` ends a tree rather than a parent.
@@ -134,7 +143,7 @@ tasks:
     recorded before a crash may have been reused, and signalling it kills a stranger's program. It goes
     at the single funnel rather than per path because being right on three of four paths is the same as
     being wrong.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T03
   acceptance_criteria:
@@ -149,14 +158,17 @@ tasks:
   files:
   - src/run.rs
   - src/state.rs
-  evidence: []
+  evidence:
+  - Orphaning lives in record_resume_markers, the single function every resume path passes through. Store::orphan_live_handles
+    marks only rows still running, is idempotent, and never signals. The fresh registry adopts the orphaned
+    rows so a poll of an old id reports orphaned rather than unknown.
 - id: US-IO-HARNESS-0.25.0-T06
   summary: Add the `EventKind` variants for a started handle, a poll, a kill, an orphaning and a diagnostics
     pass, so both features are visible on the observer channel. Additive under the `#[non_exhaustive]`
     that shipped in 0.24.0.
   why_required: An orphaning that is only a database row is a silent drop to every operator watching the
     channel, and the whole argument for orphaning over re-attaching is that it is visible.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T05
   acceptance_criteria:
@@ -171,7 +183,10 @@ tasks:
   files:
   - src/observe.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - 'Five EventKind variants added (HandleStarted, HandlePolled, HandleKilled, HandleExited, HandleOrphaned),
+    placed deliberately in the exhaustiveness census rather than behind a wildcard, and emitted from the
+    three dispatch arms. Additive under the #[non_exhaustive] that shipped in 0.24.0.'
 - id: US-IO-HARNESS-0.25.0-T07
   summary: Run the project's own checker after a successful edit and attach its diagnostics to the observation.
     Ecosystem comes from `toolchain::detect`; for cargo the command is `cargo check --message-format=json`
@@ -181,7 +196,7 @@ tasks:
     where those compound. This is the feature that replaces the roadmap's LSP client, and it delivers
     more for Rust because it carries borrow-check and clippy diagnostics that rust-analyzer's pull path
     does not.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T01
   acceptance_criteria:
@@ -212,7 +227,13 @@ tasks:
   - src/run.rs
   - src/toolchain.rs
   - src/config.rs
-  evidence: []
+  evidence:
+  - 'src/tools/diagnostics.rs: after_edit returns Found/Clean/Skipped/Failed, so "ran and found nothing"
+    is distinguishable from "never ran" (F9). Reuses toolchain::detect and the existing Exec timeout and
+    head_and_tail cap. Cargo parses --message-format=json for the rendered error; five ecosystems have
+    checkers and the rest are skipped because their type-check step is their build. 8 unit tests, no test
+    compiles a crate. ZERO new dependencies.'
+  - Wired after both edit_file and write_file through one shared helper.
 - id: US-IO-HARNESS-0.25.0-T08
   summary: 'Correct the two stale documentation claims 0.24.0 left behind — `docs/CONTRACT.md` and `docs/guide/sandbox.md`
     both still say `SandboxLimits::max_processes` is enforced by nothing and that the Windows Job Object
@@ -223,7 +244,7 @@ tasks:
     as one that over-claims it: either way a consumer cannot trust the file. The orphaning rule in particular
     is a contract, not an implementation detail — it is the difference between this crate and one that
     would re-attach to a recorded PID.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T05
   - US-IO-HARNESS-0.25.0-T07
@@ -252,7 +273,14 @@ tasks:
   - docs/guide/language-support.md
   - README.md
   - src/lib.rs
-  evidence: []
+  evidence:
+  - README, docs/CONTRACT.md, docs/guide/command-execution.md and docs/guide/language-support.md updated
+    for the three tools and the diagnostics pass; the orphaning rule is stated as a contract.
+  - The two stale max_processes claims 0.24.0 left behind are corrected, plus three further stale Windows
+    claims found in docs/guide/sandbox.md (a table row reading "no native backend yet" and a note calling
+    the Job Object unimplemented).
+  - 'The Windows containment gap is stated rather than glossed: tree kill on a handle is best-effort until
+    T04 routes the spawn through the Job Object.'
 - id: US-IO-HARNESS-0.25.0-T09
   summary: 'Release mechanics: the changelog entry with a migration note per change, `docs/public-api.txt`
     regenerated and `tests/public_api.rs` green, the manifest at 0.25.0, MSRV re-checked by hand, `cargo
@@ -260,7 +288,7 @@ tasks:
     `cargo package --locked` verified by listing the tarball.'
   why_required: 'The release cannot be cut without them: `release.yml` refuses a version the manifest
     does not declare or that has no changelog section, and `cargo publish` is irreversible.'
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.25.0-T08
   acceptance_criteria:
@@ -287,7 +315,13 @@ tasks:
   - CHANGELOG.md
   - Cargo.toml
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - Cargo.toml at 0.25.0; CHANGELOG 0.25.0 section written; docs/public-api.txt updated by hand for ProcessHandle
+    (the suite deliberately has no bless flag).
+  - clippy --all-features --all-targets clean; cargo doc --all-features warning-free; full suite 1074
+    passed 0 failed on macOS.
+  - 'REMAINING: cargo tree line counts per platform, MSRV re-check by hand, cargo package --locked tarball
+    listing.'
 - id: US-IO-HARNESS-0.25.0-T10
   summary: 'Full-suite verification on all three platforms via CI, and the live provider run that is OP1:
     the model itself starts a long-running process, polls it, does other work between polls, and kills
