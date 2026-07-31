@@ -200,16 +200,13 @@ mod live {
     }
 
     fn never_passes(root: &Path, steps: u32) -> TaskContract {
-        TaskContract::workspace(
-            "exercise durable memory",
-            root,
-            Verification::WorkspaceFileContains {
+        TaskContract::workspace("exercise durable memory", root)
+            .with_verification(Verification::WorkspaceFileContains {
                 file: "unreachable.txt".into(),
                 needle: "never".into(),
-            },
-        )
-        .with_max_steps(steps)
-        .with_context_budget(ContextBudget::default())
+            })
+            .with_max_steps(steps)
+            .with_context_budget(ContextBudget::default())
     }
 
     fn remember(key: &str, value: &str) -> Vec<ToolCall> {

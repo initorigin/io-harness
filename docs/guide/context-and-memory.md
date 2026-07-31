@@ -11,9 +11,9 @@ earlier read wrong. A long run spends most of every request re-sending stale
 text: the token budget is still enforced, it is just being spent on repetition.
 
 ```rust
-use io_harness::{context::ContextBudget, TaskContract, Verification};
+use io_harness::{context::ContextBudget, TaskContract};
 
-let contract = TaskContract::workspace("Refactor the parser.", &root, verify)
+let contract = TaskContract::workspace("Refactor the parser.", &root)
     .with_token_budget(400_000)
     // Absolute ceiling per request, and the share of the *unspent* token
     // budget a request may carry of what the run has already observed.

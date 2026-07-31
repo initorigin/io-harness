@@ -135,15 +135,12 @@ fn workspace() -> tempfile::TempDir {
 }
 
 fn contract(root: &std::path::Path) -> TaskContract {
-    TaskContract::workspace(
-        "add a hello function",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("add a hello function", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "src/a.rs".into(),
             needle: "fn hello".into(),
-        },
-    )
-    .with_max_steps(2)
+        })
+        .with_max_steps(2)
 }
 
 /// F4 — the refusal is in the trace, attributed to what decided it.

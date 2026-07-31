@@ -74,16 +74,13 @@ fn write(path: &std::path::Path, body: &str) {
 /// A contract that can never be satisfied, so a run that gets past discovery
 /// reaches the provider.
 fn never_passes(root: &std::path::Path, skills: &std::path::Path) -> TaskContract {
-    TaskContract::workspace(
-        "exercise the skills directory",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("exercise the skills directory", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(1)
-    .with_skills(skills)
+        })
+        .with_max_steps(1)
+        .with_skills(skills)
 }
 
 /// Two skills, one per layout, each with a body no prompt may ever carry.
@@ -430,15 +427,12 @@ async fn the_catalog_reaches_the_system_prompt_and_no_body_does() {
 #[tokio::test]
 async fn read_skill_is_not_offered_when_no_skills_are_configured() {
     let root = tmp();
-    let contract = TaskContract::workspace(
-        "no skills here",
-        root.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("no skills here", root.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(1);
+        })
+        .with_max_steps(1);
     let provider = MockScript::default();
 
     run_with(

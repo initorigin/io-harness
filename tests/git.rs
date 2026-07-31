@@ -84,15 +84,12 @@ fn repo() -> tempfile::TempDir {
 }
 
 fn contract(dir: &tempfile::TempDir, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "record your work as a commit",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("record your work as a commit", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "README.md".into(),
             needle: "never satisfied".into(),
-        },
-    )
-    .with_max_steps(steps)
+        })
+        .with_max_steps(steps)
 }
 
 fn store(dir: &tempfile::TempDir) -> Store {

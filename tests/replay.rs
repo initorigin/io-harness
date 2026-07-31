@@ -455,15 +455,12 @@ async fn a_real_run_replays_from_its_recording_without_a_provider() {
     std::fs::write(dir.path().join("src/a.rs"), "pub fn a() -> u32 { 0 }\n").unwrap();
     let path = recording_path(&dir);
 
-    let contract = TaskContract::workspace(
-        "write out.txt after looking at src/a.rs",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("write out.txt after looking at src/a.rs", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "DONE".into(),
-        },
-    )
-    .with_max_steps(3);
+        })
+        .with_max_steps(3);
 
     let script = Canned::new(vec![
         CompletionResponse {

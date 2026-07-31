@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use io_harness::policy::Policy;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, ToolSpec};
-use io_harness::{run_with, ApproveAll, Provider, RunOutcome, Store, TaskContract, Verification};
+use io_harness::{run_with, ApproveAll, Provider, RunOutcome, Store, TaskContract};
 use serde_json::json;
 
 /// Plays a fixed script of tool calls, and keeps the tool list it was offered on
@@ -82,7 +82,7 @@ fn fixture() -> tempfile::TempDir {
 /// A contract with no gate, so a script that runs out ends the run rather than
 /// burning the step budget. The criterion is not what these tests are about.
 fn contract(root: &std::path::Path) -> TaskContract {
-    TaskContract::workspace("build the project", root, Verification::None).with_max_steps(6)
+    TaskContract::workspace("build the project", root).with_max_steps(6)
 }
 
 /// Every command allowed, nothing else changed. The base for the tests that are

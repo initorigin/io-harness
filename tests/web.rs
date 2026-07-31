@@ -108,8 +108,7 @@ fn open_policy() -> Policy {
 /// is the shape a "look this up and tell me" task actually has — and the shape a
 /// paused turn is indistinguishable from unless the loop looks at the stop reason.
 fn asking(root: &std::path::Path, web: Option<WebAccess>) -> TaskContract {
-    let contract = TaskContract::workspace("what shipped this week", root, Verification::None)
-        .with_max_steps(4);
+    let contract = TaskContract::workspace("what shipped this week", root).with_max_steps(4);
     match web {
         Some(web) => contract.with_web(web),
         None => contract,
@@ -555,16 +554,13 @@ async fn a_spawned_child_inherits_the_declaration_and_cannot_ask_for_its_own() {
     let dir = ws();
     let store = Store::memory().unwrap();
     let declared = WebAccess::search().max_uses(2).allow("docs.rs");
-    let contract = TaskContract::workspace(
-        "delegate the lookup",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate the lookup", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "root.txt".into(),
             needle: "done".into(),
-        },
-    )
-    .with_max_steps(4)
-    .with_web(declared.clone());
+        })
+        .with_max_steps(4)
+        .with_web(declared.clone());
 
     let provider = Spawning {
         at: AtomicUsize::new(0),

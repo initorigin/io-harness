@@ -251,20 +251,17 @@ async fn main() -> io_harness::Result<()> {
         println!("\n=== run 1: the full contract (tool + skill) ===");
         let dir = workspace(&test_src)?;
         let asked = Arc::new(Mutex::new(Vec::new()));
-        let contract = TaskContract::workspace(
-            GOAL,
-            dir.path(),
-            Verification::Command {
+        let contract = TaskContract::workspace(GOAL, dir.path())
+            .with_verification(Verification::Command {
                 argv: vec!["cargo".into(), "test".into(), "--offline".into()],
                 expect_exit: 0,
-            },
-        )
-        .with_tools(Toolbox::new().with(BerthTable {
-            asked: Arc::clone(&asked),
-        }))
-        .with_skills(skills.path())
-        .with_max_steps(6)
-        .with_token_budget(200_000);
+            })
+            .with_tools(Toolbox::new().with(BerthTable {
+                asked: Arc::clone(&asked),
+            }))
+            .with_skills(skills.path())
+            .with_max_steps(6)
+            .with_token_budget(200_000);
 
         let store = Store::open(dir.path().join("runs.db"))?;
         let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
@@ -281,16 +278,13 @@ async fn main() -> io_harness::Result<()> {
     if only != "positive" {
         println!("\n=== run 2: the same contract, with_tools and with_skills removed ===");
         let dir = workspace(&test_src)?;
-        let contract = TaskContract::workspace(
-            GOAL,
-            dir.path(),
-            Verification::Command {
+        let contract = TaskContract::workspace(GOAL, dir.path())
+            .with_verification(Verification::Command {
                 argv: vec!["cargo".into(), "test".into(), "--offline".into()],
                 expect_exit: 0,
-            },
-        )
-        .with_max_steps(6)
-        .with_token_budget(200_000);
+            })
+            .with_max_steps(6)
+            .with_token_budget(200_000);
 
         let store = Store::open(dir.path().join("runs.db"))?;
         let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;

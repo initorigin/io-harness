@@ -324,12 +324,7 @@ async fn an_interrupt_ends_the_turn_at_a_step_boundary_and_the_session_continues
     let next = Insistent::default();
     let after = session
         .turn_bounded(
-            &io_harness::TaskContract::workspace(
-                "stop there",
-                ws.path(),
-                io_harness::Verification::None,
-            )
-            .with_max_steps(1),
+            &io_harness::TaskContract::workspace("stop there", ws.path()).with_max_steps(1),
             &next,
             &store,
             &guarded(),

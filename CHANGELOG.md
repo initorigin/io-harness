@@ -26,6 +26,102 @@ notes are produced from it.
 
 ### Security
 
+## [0.24.0] - 2026-07-31
+
+The release that gives the agent hands. A command line becomes something it can
+write and the harness can check, and a Windows run becomes something the kernel
+actually bounds.
+
+### Breaking changes
+
+- **BREAKING** `TaskContract::workspace` takes two arguments instead of three.
+  The success criterion is no longer positional and defaults to
+  `Verification::None`. A harness whose primary signature demands a checkable
+  criterion reads as a verified-task runner whatever its prose says, and the
+  `shell` tool in this release is precisely the capability that makes
+  uncheckable work real.
+  *Migration:* drop the third argument, and add `.with_verification(v)` where
+  the project has a criterion.
+  ```rust,ignore
+  // before
+  TaskContract::workspace("fix the build", "/repo", Verification::Command {
+      argv: vec!["npm".into(), "test".into()], expect_exit: 0 })
+  // after
+  TaskContract::workspace("fix the build", "/repo")
+      .with_verification(Verification::Command {
+          argv: vec!["npm".into(), "test".into()], expect_exit: 0 })
+  ```
+- **BREAKING** `EventKind`, `Backend` and `Cap` are now `#[non_exhaustive]`.
+  This release adds variants to all three, and 0.25.0's AppContainer backend
+  will add another; marking them now means this is the last release in which
+  adding one breaks a caller.
+  *Migration:* add a wildcard arm to any exhaustive `match` on them —
+  `_ => { /* a variant added after you compiled */ }`.
+- **BREAKING** `Cap::Processes` is a new variant, reported when a Windows job
+  stops a run for exceeding its active process limit.
+  *Migration:* covered by the wildcard arm above. There is nothing else to
+  write: no previous release could produce this value, so no existing branch is
+  wrong, and code that does not care about Windows process limits needs no
+  change.
+
+### Added
+
+- A `shell` tool that runs a command *line* — pipelines, sequences, conditionals
+  and redirects — under the same boundary a fixed argv has always had. The line
+  is parsed by this crate, not by a shell: every sub-command's program and argv
+  is checked against `Act::Exec` and every redirect target against `Act::Write`
+  or `Act::Read`, **all of it before the first spawn**, so a line whose second
+  stage is denied does not run its first. Each stage is then spawned as argv the
+  way `exec` spawns one, with this crate wiring the pipes. There is no `sh -c`
+  and no `cmd /c` anywhere after the parse.
+- Supported grammar: single and double quotes, backslash escapes, `|`, `;`,
+  `&&`, `||`, the redirects `>` `>>` `<` `2>` `2>>` `2>&1`, and `cd`, which
+  applies to the rest of the line. Everything else is refused **by name** with a
+  reason the model can act on: command substitution, parameter and arithmetic
+  expansion, process substitution, subshells, brace groups, here-documents,
+  background `&`, the `if`/`for`/`while`/`case` keywords, and glob
+  metacharacters outside quotes.
+- `list_dir`, which lists one directory one level deep with each entry's kind
+  and each file's size, checked as the read it is. `find` is unchanged: a
+  whole-tree glob answers a different question.
+- `TaskContract::with_verification`, the builder that replaces the constructor's
+  third argument.
+- **The Windows Job Object backend**, designed in 0.6.0 and implemented here.
+  `Backend::WindowsJobObject` is now what the sandbox reports on Windows; memory,
+  CPU and active process count are real bounds; closing the job handle kills the
+  whole process tree; and Windows becomes the first backend on any platform to
+  enforce `SandboxLimits::max_processes`.
+
+### Changed
+
+- The README and `docs/guide/permissions.md` lead with `Session`, the durable
+  conversation, rather than `run_with`, the one-shot verified run. `run_with` is
+  unchanged and still documented as the one-shot form.
+- The platform table's Windows row now reads "native resource containment
+  (memory, CPU, process count, tree kill); no filesystem or network boundary"
+  rather than "portable floor only". It is deliberately not shortened to
+  "Native": **a Job Object contains resources and nothing else**, so unlike the
+  macOS and Linux rows it is not an access boundary. The access half is
+  AppContainer and it is not written yet.
+- Glob expansion is refused rather than performed or passed through. Expanding
+  one would let the argv the policy checked differ from the argv that ran, since
+  the filesystem can change in between; passing it through would hand the model
+  a `*` that a real shell would have expanded. Use `find` or `list_dir` to
+  choose paths, or quote the character to pass it literally.
+
+### Security
+
+- The shell parser's refusal set is enforced by an **allowlist at the lexer**
+  rather than a blocklist of known-bad constructs: any character outside the
+  permitted set for the current state is refused, so a construct nobody
+  anticipated fails closed instead of being absorbed into a word. Two tests
+  sweep the entire ASCII range against that claim, and eight sabotage runs
+  demonstrate the tests are not vacuous.
+- No new dependency reaches macOS or Linux. The shell parser is written in this
+  crate, and `cargo tree` on those platforms is unchanged at 402 lines.
+  `windows-sys` is declared under `[target.'cfg(windows)'.dependencies]`, as
+  `libc` already is for unix.
+
 ## [0.23.0] - 2026-07-31
 
 The dependency release. Nothing this crate does changes; who is allowed to call

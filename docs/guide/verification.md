@@ -58,11 +58,11 @@ use io_harness::{TaskContract, Verification};
 let contract = TaskContract::workspace(
     "make `parse` reject an empty input instead of panicking",
     "/path/to/repo",
-    Verification::Command {
-        argv: vec!["cargo".into(), "test".into()],
-        expect_exit: 0,
-    },
-);
+)
+   .with_verification(Verification::Command {
+       argv: vec!["cargo".into(), "test".into()],
+       expect_exit: 0,
+   });
 ```
 
 `argv` is an array, program first. **There is no shell**: `;`, `&&`, `$( )` and a

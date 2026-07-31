@@ -101,15 +101,12 @@ fn guarded() -> Policy {
 }
 
 fn contract(dir: &tempfile::TempDir) -> TaskContract {
-    TaskContract::workspace(
-        "look at the picture",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("look at the picture", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "notes.txt".into(),
             needle: "never satisfied".into(),
-        },
-    )
-    .with_max_steps(2)
+        })
+        .with_max_steps(2)
 }
 
 /// A store in a temp dir. Returned with its dir so the dir outlives the store.

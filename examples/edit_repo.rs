@@ -32,16 +32,13 @@ async fn main() -> io_harness::Result<()> {
         "pub mod a;\npub mod b;\n#[test] fn t() { assert_eq!(a::a() + b::b(), 42); }\n",
     )?;
 
-    let contract = TaskContract::workspace(
-        "Edit the two source files so a() + b() == 42.",
-        &root,
-        Verification::Command {
+    let contract = TaskContract::workspace("Edit the two source files so a() + b() == 42.", &root)
+        .with_verification(Verification::Command {
             argv: vec!["cargo".into(), "test".into(), "--offline".into()],
             expect_exit: 0,
-        },
-    )
-    .with_max_steps(12)
-    .with_token_budget(400_000);
+        })
+        .with_max_steps(12)
+        .with_token_budget(400_000);
 
     let provider = OpenRouter::from_env()?;
     let store = Store::open(root.join("runs.db"))?;

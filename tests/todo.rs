@@ -81,15 +81,12 @@ fn open_policy() -> Policy {
 /// A contract that can never be satisfied, so the loop runs its whole step budget
 /// and the plan's state at the end is the agent's, not the verifier's.
 fn never_passes(root: &Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "exercise the todo tool",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("exercise the todo tool", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(steps)
+        })
+        .with_max_steps(steps)
 }
 
 /// One `todo_write` argument list, as the model would send it.

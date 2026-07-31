@@ -48,8 +48,11 @@ const MAX_TOKENS: u64 = 8192;
 /// let contract = TaskContract::workspace(
 ///     "summarise the repo's README into NOTES.md",
 ///     "/path/to/repo",
-///     Verification::WorkspaceFileContains { file: "NOTES.md".into(), needle: "#".into() },
-/// );
+/// )
+///     .with_verification(Verification::WorkspaceFileContains {
+///         file: "NOTES.md".into(),
+///         needle: "#".into(),
+///     });
 /// let policy = Policy::default().layer("app").allow_read("*").allow_write("NOTES.md");
 /// let result = run_with(&contract, &provider, &Store::memory()?, &policy, &ApproveAll).await?;
 /// println!("{:?}", result.outcome);

@@ -108,13 +108,13 @@ async fn main() -> io_harness::Result<()> {
          tool to get the current status of SHP-4417, then write the line it \
          returns, verbatim, into status.txt with write_file.",
         dir.path(),
-        // The needle is only the shape: it is in the prompt, so it proves
-        // nothing on its own. The datum check after the run is the real one.
-        Verification::WorkspaceFileContains {
-            file: "status.txt".into(),
-            needle: ID.into(),
-        },
     )
+    // The needle is only the shape: it is in the prompt, so it proves
+    // nothing on its own. The datum check after the run is the real one.
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "status.txt".into(),
+        needle: ID.into(),
+    })
     .with_tools(toolbox)
     .with_max_steps(6);
 

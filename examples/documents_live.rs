@@ -219,16 +219,13 @@ async fn main() -> io_harness::Result<()> {
     if only != "control" {
         println!("\n=== run 1: edit the workbook, under a policy that allows it ===");
         let dir = workspace()?;
-        let contract = TaskContract::workspace(
-            goal(),
-            dir.path(),
-            Verification::DocumentContains {
+        let contract = TaskContract::workspace(goal(), dir.path())
+            .with_verification(Verification::DocumentContains {
                 file: BOOK.into(),
                 needle: total.clone(),
-            },
-        )
-        .with_max_steps(6)
-        .with_token_budget(200_000);
+            })
+            .with_max_steps(6)
+            .with_token_budget(200_000);
 
         let policy = Policy::default()
             .layer("app")
@@ -245,16 +242,13 @@ async fn main() -> io_harness::Result<()> {
         println!("\n=== run 2: the same contract, with the workbook denied to writes ===");
         let dir = workspace()?;
         let before = fingerprint(dir.path());
-        let contract = TaskContract::workspace(
-            goal(),
-            dir.path(),
-            Verification::DocumentContains {
+        let contract = TaskContract::workspace(goal(), dir.path())
+            .with_verification(Verification::DocumentContains {
                 file: BOOK.into(),
                 needle: total,
-            },
-        )
-        .with_max_steps(4)
-        .with_token_budget(200_000);
+            })
+            .with_max_steps(4)
+            .with_token_budget(200_000);
 
         // Read is still allowed: a run that could not open the workbook would
         // stop for the wrong reason and prove nothing about the write boundary.

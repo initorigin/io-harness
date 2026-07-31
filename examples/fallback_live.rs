@@ -49,16 +49,13 @@ async fn main() -> io_harness::Result<()> {
         "pub mod a;\n#[test] fn t() { assert_eq!(a::a(), 7); }\n",
     )?;
 
-    let contract = TaskContract::workspace(
-        "Edit src/a.rs so a() == 7.",
-        &root,
-        Verification::Command {
+    let contract = TaskContract::workspace("Edit src/a.rs so a() == 7.", &root)
+        .with_verification(Verification::Command {
             argv: vec!["cargo".into(), "test".into(), "--offline".into()],
             expect_exit: 0,
-        },
-    )
-    .with_max_steps(6)
-    .with_token_budget(200_000);
+        })
+        .with_max_steps(6)
+        .with_token_budget(200_000);
 
     let provider = Fallback::new(Down, OpenRouter::from_env()?);
     let store = Store::open(root.join("runs.db"))?;

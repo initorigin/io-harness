@@ -1,0 +1,67 @@
+product: io-harness
+version: 0.24.0
+execution_state: COMPLETING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+  - 'No constraints are recorded for this release — `ultraship constraints` had no active release to
+    attach them to at plan time and the owner has supplied no time, budget or capacity figure. The assessment
+    is therefore grounded in the contract''s own `resource_profile` (complexity `large`, uncertainty
+    `high`) and in what the repository actually contains, not in a limit the framework was given.
+
+    '
+  - 'Four largely independent subsystems in one release: a shell lexer and parser with a proven-closed
+    refusal set, a process-handle registry that crosses the checkpoint boundary, a Win32 Job Object
+    backend in a crate with no existing Windows FFI, and four public API breaks. Each is tractable;
+    the uncertainty is that they compound rather than that any one is hard.
+
+    '
+  - 'Two of the four cannot be verified on the development machine. The Job Object criteria (F6''s negative
+    control, F8, F9) run on Windows only, so the feedback loop for the most unsafe code in the release
+    is a CI round trip rather than a local test run. That is the single largest reason this is not `probable`.
+
+    '
+  - 'The parts that are well understood are genuinely well understood, which is what keeps this above
+    `unlikely`. The positioning fix is mechanical and compiler-guided. `list_dir` is a small tool beside
+    `find`, which already walks the tree. The `#[non_exhaustive]` rider is four attributes and a changelog
+    entry. `JobLimits` at `src/sandbox/windows.rs:63` already maps `SandboxLimits` onto the job''s flags
+    with a test, so the Windows work is Win32 calls against a mapping that exists rather than a design.
+
+    '
+  - 'The contract''s `fallback_scope` was written for exactly this shape and its trigger is named: the
+    parser''s refusal proof not closing, or the Job Object''s negative control not reproducing. Either
+    means the remaining work is unbounded rather than large, and the response is `/ultraship:iterate`,
+    not a quiet trim.
+
+    '
+  - 'Reassessed to `probable` after `US-IO-HARNESS-0.24.0-I01`. The two subsystems that made this `uncertain`
+    have resolved in opposite directions: the Job Object is built and type-checked under the Windows
+    target, and the process-handle registry — the riskiest remaining work, where PID reuse makes the
+    naive implementation dangerous rather than merely wrong — is deferred. What is left to finish is
+    documentation, a live provider run and the three-OS CI round trip. It is not `high` because F6,
+    F8 and F9 have still never executed: no Win32 path has run on any machine, and the first Windows
+    CI run is their only verification.'
+  major_cost_drivers:
+  - 'Proving the shell parser''s refusal set closed rather than writing it. The allowlist lexer is a
+    few hundred lines; the property test over generated input, and the sabotage runs that prove it non-vacuous,
+    are the work.
+
+    '
+  - 'Win32 job creation, assignment and limit-setting, whose failure mode is a limit that returns success
+    and does not apply — indistinguishable from one that does until something exceeds it, and only observable
+    on a Windows runner.
+
+    '
+  - 'Process handles crossing a checkpoint boundary, where PID reuse turns the naive implementation
+    from wrong into dangerous.
+
+    '
+  - 'The blast radius of the `TaskContract::workspace` signature change across `src/`, `tests/`, `examples/`
+    and the compiled doctests in `docs/`.
+
+    '
+  recommended_scope_change: 'Adopted. `US-IO-HARNESS-0.24.0-I01` defers process handles to 0.25.0, which
+    is a restatement of the recorded fallback rather than the fallback as written: the Job Object stays,
+    because handles need it and it does not need them.'

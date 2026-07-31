@@ -158,8 +158,11 @@ pub(crate) enum GitCmd {
 /// let contract = TaskContract::workspace(
 ///     "fix the failing test and commit the fix",
 ///     "/path/to/repo",
-///     Verification::WorkspaceFileContains { file: "src/lib.rs".into(), needle: "fn".into() },
 /// )
+/// .with_verification(Verification::WorkspaceFileContains {
+///     file: "src/lib.rs".into(),
+///     needle: "fn".into(),
+/// })
 /// .with_commit_identity("nightly-agent", "nightly-agent@example.com");
 /// # let _ = contract;
 /// ```

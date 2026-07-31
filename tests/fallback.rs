@@ -133,15 +133,12 @@ fn ws() -> tempfile::TempDir {
 /// A contract one `write_file` satisfies, so a run that reaches a working provider
 /// finishes in one step and a run that does not, does not.
 fn writes_out_txt(root: &std::path::Path) -> TaskContract {
-    TaskContract::workspace(
-        "write out.txt",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("write out.txt", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "DONE".into(),
-        },
-    )
-    .with_max_steps(3)
+        })
+        .with_max_steps(3)
 }
 
 fn open_policy() -> Policy {
@@ -357,16 +354,13 @@ async fn falling_over_costs_the_primary_one_attempt_per_step_not_a_retry_budget(
     );
     let store = Store::memory().unwrap();
 
-    let contract = TaskContract::workspace(
-        "never satisfied",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("never satisfied", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(3)
-    .with_max_retries(5);
+        })
+        .with_max_steps(3)
+        .with_max_retries(5);
 
     let result = run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
         .await

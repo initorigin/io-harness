@@ -180,11 +180,11 @@ pub enum McpTransport {
 /// let contract = TaskContract::workspace(
 ///     "read the open issues and summarise them into NOTES.md",
 ///     "/path/to/repo",
-///     Verification::WorkspaceFileContains {
-///         file: "NOTES.md".into(),
-///         needle: "#".into(),
-///     },
 /// )
+/// .with_verification(Verification::WorkspaceFileContains {
+///     file: "NOTES.md".into(),
+///     needle: "#".into(),
+/// })
 /// .with_mcp([McpServer::stdio("github", "github-mcp-server")
 ///     .with_args(["stdio"])
 ///     // A third-party tool that never returns must not become a run that

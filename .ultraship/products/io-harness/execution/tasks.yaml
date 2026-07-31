@@ -1,433 +1,355 @@
 product: io-harness
-version: 0.23.0
+version: 0.24.0
 tasks:
-  - id: US-IO-HARNESS-0.23.0-T01
-    summary: >
-      Move the dependency: `rusqlite` 0.32 to 0.40.1 with `bundled`, plus the `fallible_uint` feature
-      that carries the `u64` `ToSql`/`FromSql` impls from 0.38.0 onward. Record the `cargo tree` line
-      count either side and re-check the MSRV against the 1.88 floor.
-    why_required: >
-      This is the release. Everything else in it exists to prove this move changed no behaviour, and
-      nothing else can be attempted until the crate compiles against the new line.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        NF2 — no new direct dependency. Whatever the tree gains transitively through `rusqlite` is
-        recorded as a `cargo tree` line count before and after, in the changelog, per the discipline this
-        project has kept since 0.1.0.
-      - >
-        OP1 — MSRV is re-checked and stated. If `rusqlite` 0.40 or anything it pulls raises the floor
-        above 1.88, the new number goes in `Cargo.toml` with the same honest comment the existing floor
-        carries, naming which dependency set it.
-    files:
-      - Cargo.toml
-      - Cargo.lock
-    evidence:
-      - >
-        `rusqlite` 0.32 to 0.40.1, `libsqlite3-sys` 0.30.1 to 0.38.1, bundled SQLite 3.46.0 to 3.53.2.
-        0.40.1 was the newest published when development started, per the owner's newest-at-development
-        decision; 0.40 was the floor, not the target.
-      - >
-        The migration is two manifest lines and **no change in `src/state.rs`**. The bump produced 28
-        compile errors, all one root cause: `u64`'s `ToSql`/`FromSql` impls moved behind a new
-        `fallible_uint` feature in `rusqlite` 0.38.0. Enabling it restores the same macro-generated
-        impls, so the checked conversions are preserved exactly rather than replaced by a cast.
-        `cargo check --all-targets` is clean.
-      - >
-        NF2 — no new direct dependency. `cargo tree` 407 lines before, **402 after**. `ahash`,
-        `hashbrown` 0.14.5, `zerocopy` and the `version_check` build dependency drop out; `foldhash`
-        0.2.0 arrives; `hashlink` 0.9.1 to 0.12.1. Measured on the same machine by stashing the
-        manifest, not quoted from a previous release.
-      - >
-        OP1 — the MSRV moved and is stated. `libsqlite3-sys` 0.38.1's build script and `rusqlite`
-        0.40's source call the std `cfg_select!` macro, stabilised in 1.95.0, and neither crate
-        publishes a `rust-version`. Verified by hand rather than assumed: `cargo +1.93` and
-        `cargo +1.94` both fail inside the build script with
-        `cannot find macro cfg_select in this scope`, `cargo +1.95` builds. `rust-version = "1.95"` in
-        `Cargo.toml` with the reason and the dependency that set it, and matching text in `README.md`,
-        `src/lib.rs` crate-root docs and `docs/CONTRACT.md` — all three checked by
-        `tests/docs_drift.rs::msrv_is_stated_and_matches_cargo_toml`, which passes.
-      - >
-        No `rusqlite` at or above the contract's 0.40 floor avoids the MSRV move, so the choice was the
-        floor or the release. Recorded because it is the one place this release makes a consumer's life
-        harder, and the contract's `risks` anticipated it.
+- id: US-IO-HARNESS-0.24.0-T01
+  summary: Make the task contract's success criterion optional. `TaskContract::workspace` drops its
+    third positional `Verification` and defaults to `Verification::None`; a `with_verification` builder
+    joins the seventeen already on the type. Every call site in `src/`, `tests/`, `examples/` and the
+    compiled doctests moves. README's first example and `docs/guide/permissions.md`'s first example
+    lead with `Session` rather than `run_with`.
+  why_required: 'The positioning fix is the one piece of this release whose cost doubles if it moves:
+    shipping an API break now and this break later makes every consumer migrate twice. It is also the
+    smallest and most mechanical task in the release, so it goes first and is never what drops.'
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - 'F11 — the positioning fix compiles and defaults correctly. `TaskContract::workspace(goal, root)`
+    takes two arguments and yields `Verification::None`; `.with_verification(v)` sets it; the README''s
+    first example and `docs/guide/permissions.md`''s first example both lead with `Session`. **Amended
+    by `US-IO-HARNESS-0.24.0-I01`:** the original clause also required both to "compile as doctests",
+    which is false of this repository — there is no `include_str!` of the README into the crate root
+    and `cargo test --doc` compiles only `///` and `//!` comments under `src/`. The markdown is checked
+    as text by `tests/readme.rs`, `tests/guide_pages.rs` and `tests/docs_drift.rs`. Making the clause
+    true would mean changing how the crate documents itself, which is not this release''s work.
 
-  - id: US-IO-HARNESS-0.23.0-T02
-    summary: >
-      Prove a database written by 0.22.0 is fully readable by 0.23.0, through the public `Store` API,
-      with a fixture generated by a genuinely pinned 0.22.0 build rather than written by this release
-      and labelled.
-    why_required: >
-      The engine moves seven point releases and the compiler cannot check any of it. Reading back a
-      previous release's stored rows is the only evidence that the move preserved what is on disk.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T01]
-    acceptance_criteria:
-      - >
-        F2 — a database written by the previous release is fully readable by this one. A store populated
-        by 0.22.0 with runs, steps, refusals, approvals, budget draws, citations and server-tool calls is
-        opened by 0.23.0 and every row read back identical, through the public `Store` API rather than by
-        inspecting the file. The negative control is a store this release creates from scratch, which
-        must be byte-comparable in schema to one 0.22.0 creates.
-    files:
-      - tests/cross_version.rs
-      - tests/fixtures/store-0.22.0/
-    evidence:
-      - >
-        The fixtures are genuinely the previous release's. `tests/fixtures/gen-0.22.0` is pinned
-        `io-harness =0.22.0` and its committed lockfile resolves `rusqlite` 0.32.1 and `libsqlite3-sys`
-        0.30.1. All three `.sqlite3` headers read `SQLite version 3046000` — 3.46.0, the old engine,
-        not the 3.53.2 this release links. `PRAGMA integrity_check` is `ok` on all three and no WAL
-        sidecar was left behind.
-      - >
-        F2 — `a_0_22_0_store_reads_back_row_for_row_through_the_public_api` passes. It builds a value
-        from the public `Store` readers alone and compares key-by-key against the sidecar 0.22.0 wrote:
-        outcome, status, step count, last step, spent tokens, checkpoint events, every step
-        (number/decision/tokens), every provider call (step, attempt, provider, model, finish reason,
-        failure and all seven `Usage` counters), every observation, the edit, both policy events
-        including the refusal, the resolved pending approval, both citations — including the one with
-        two NULL columns — and both server-tool calls. The comparison is driven by the sidecar's own
-        key set and counts are checked both ways, so a table added later fails the test rather than
-        going unread.
-      - >
-        F2 negative control — `the_schema_this_release_creates_is_identical_to_the_one_0_22_0_created`
-        passes. `sqlite_master` from a store this release creates equals the fixture's normalised
-        `CREATE TABLE`/`CREATE INDEX` set, with a length guard so an empty set cannot match an empty
-        set.
-      - >
-        Two values are not asserted and the omission is checked rather than silent: `runs.goal` has no
-        public reader and `RunSummary` carries no `goal`, and the sidecar's `workspace` is the
-        generator's own relative directory, which is not where the test's copy lives. Both sit in a
-        named constant in the test so they cannot be forgotten.
+    '
+  files:
+  - src/contract.rs
+  - README.md
+  - docs/guide/permissions.md
+  - docs/guide/sessions.md
+  evidence:
+  - '`TaskContract::workspace(goal, root)` is two-argument and defaults to `Verification::None`; `with_verification`
+    added. 173 call sites converted across src/, tests/, examples/, docs/ and README.md; zero three-argument
+    call sites remain outside the pinned 0.22.0 fixture and the changelog''s own history.'
+  - README.md and docs/guide/permissions.md both lead with `Session`; `run_with` kept and documented
+    as the one-shot form.
+  - 'F11 is only PARTLY met: its clause ''both compile as doctests'' cannot be satisfied — the README
+    and guide fences are not compiled doctests in this crate (no `include_str!` of README into the crate
+    root; `cargo test --doc` covers only `///` and `//!` in src/). Both examples were made correct Rust
+    and verified by the text-level tests that do exist. Raised for /ultraship:iterate.'
+- id: US-IO-HARNESS-0.24.0-T02
+  summary: 'Add the `list_dir` tool: one directory, one level, entries with type and size, path-resolved
+    and checked against `Act::Read` through `Workspace::check_path`. Registered in `workspace_tools()`,
+    dispatched in `run.rs`, and added to `RESERVED_TOOL_NAMES`.'
+  why_required: Without it there is no way to ask what is in a directory — `find` walks the whole tree
+    against a glob, which is a different question. It is the first thing anyone does in an unfamiliar
+    repository and the release's outcome names it.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - 'F10 — `list_dir` lists one level and no more. A directory containing a subdirectory containing
+    a file returns the subdirectory and not the file; a path outside the workspace is refused; a directory
+    the policy denies reading is refused by path.
 
-  - id: US-IO-HARNESS-0.23.0-T03
-    summary: >
-      Resume a run across the version boundary: interrupted under 0.22.0 mid-tree, finished under
-      0.23.0, with no completed step re-run, the ledger totalling what the two halves drew, and no
-      irreversible action taken twice. The 0.7.0 kill-9 test re-pointed, not rewritten.
-    why_required: >
-      This is the one failure shape the release can produce that compiles, passes the unit tests, and
-      still damages a user's data. Review cannot catch it; only this can.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T02]
-    acceptance_criteria:
-      - >
-        F3 — a run checkpointed by the previous release resumes across the boundary. A run interrupted
-        under 0.22.0 mid-tree, with a completed sub-agent, an in-flight step and a partially drawn
-        budget, is resumed by 0.23.0 to completion: no completed step re-runs, the ledger's total matches
-        what the two halves drew between them, and an irreversible action already taken is not taken
-        twice. This is the 0.7.0 crash test with the two halves on either side of the version boundary,
-        which is the only form of it that proves anything here.
-    files:
-      - tests/cross_version.rs
-      - examples/crash_fixture.rs
-    evidence:
-      - >
-        F3 — `a_0_22_0_interrupted_tree_resumes_without_re_running_or_double_charging` passes. The
-        pre-resume state is asserted against `interrupted.json` first (tree ids 1/2/3, agent count 3,
-        root step-capped at step 1, child 2 completed at 80 tokens, child 3 step-capped at 160, tree
-        total 400, and both workspace file contents), so the test is anchored to what 0.22.0 stored
-        rather than to whatever it finds.
-      - >
-        After `resume_tree`: verified success; no run in the tree has a duplicate step number; the
-        child that had already finished gained neither a step nor a token; the tree total equals
-        `400 + served * 25`, where `served` is the resume provider's own call counter living outside
-        the database, so the ledger is checked against an external witness rather than against itself;
-        `a.txt` still holds exactly one copy of `ALPHA`; `b.txt` reaches `BETA`; and a `resume`
-        checkpoint event exists.
-      - >
-        Non-vacuity proven, not assumed. A provider rewired to report double tokens fired
-        `the tree's total must be what 0.22.0 drew plus exactly what this release drew` (500 against
-        450), and bumping the finished child's step baseline fired
-        `the child that had already finished gained a step on resume`. Both were reverted and the file
-        re-confirmed green.
-      - >
-        Gap recorded rather than glossed: 0.22.0 committed the step-capped root step, so on resume the
-        coordinator replans instead of replaying the fan-out, and `Store::find_spawn` has nothing to
-        adopt at that step. This fixture therefore does NOT exercise the adopt-a-completed-child path.
-        It makes the no-re-run assertions stronger — the finished child is proven untouched by its own
-        rows and its own file rather than by trusting adoption to skip it — but it is a different
-        proof. `tests/checkpoint.rs` covers adoption within a single release.
+    '
+  files:
+  - src/tools/workspace.rs
+  - src/tools/mod.rs
+  - src/run.rs
+  - tests/
+  evidence:
+  - '`list_dir` lists one directory one level deep, path-resolved through the same `Act::Read` check
+    `read_file` uses; `find` unchanged.'
+  - '`cargo test --test list_dir` — 12 passed, 0 failed, covering all three clauses of F10 at both the
+    `Workspace` level and through a real run, plus symlink-not-followed, deterministic ordering and
+    the truncation bound.'
+- id: US-IO-HARNESS-0.24.0-T03
+  summary: 'The shell lexer and parser, pure — no execution. An allowlist lexer where any byte outside
+    the permitted set for the current state is a refusal, over a conservative POSIX subset: quoted and
+    escaped words, `|`, `;`, `&&`, `||`, and the `>` `>>` `<` `2>` `2>>` `2>&1` redirects. Every excluded
+    construct refused by name with a reason. Depth and length caps. Property test over generated input
+    plus the sabotage runs that prove it non-vacuous.'
+  why_required: This is the release's entire security argument. A line that parses to a different set
+    of sub-commands than it executes means the harness checked something other than what ran, which
+    is worse than having no shell at all because the trace would assert a boundary that was never applied.
+    Nothing downstream can be trusted until this is closed.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - 'F4 — the refusal set is complete and fails closed, and this is the load-bearing criterion of the
+    release. Every construct in the excluded grammar has a test asserting it is refused, that the reason
+    names the construct, and that no process was spawned. Beyond the enumerated list, a property test
+    over generated input asserts the invariant directly: **any input containing a byte outside the lexer''s
+    permitted set for its state is refused**. Non-vacuity is proven the way 0.23.0 proved its cross-version
+    tests — by sabotage: the allowlist is widened by one byte, the property test must fail, and the
+    change is reverted.
 
-  - id: US-IO-HARNESS-0.23.0-T04
-    summary: >
-      Resolve, under 0.23.0, an approval that 0.22.0 deferred past process exit, and let the run
-      continue.
-    why_required: >
-      The approval record is the crate's one durable human decision. If it does not survive a dependency
-      upgrade the permission boundary is not durable, whatever the trace says.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T02]
-    acceptance_criteria:
-      - >
-        F4 — a pending approval survives the boundary. An approval deferred past process exit under
-        0.22.0 is resolved under 0.23.0 and the run continues, because a durable decision that does not
-        survive a dependency upgrade is not durable.
-    files:
-      - tests/cross_version.rs
-    evidence:
-      - >
-        F4 — `a_0_22_0_deferred_approval_is_resolved_here_and_the_run_continues` passes. Before the
-        resume, `Store::pending(1)` returns the row 0.22.0 left behind with `resolved == None` and the
-        act, target, content and step from the sidecar, and `out.txt` does not exist — the deferred
-        write genuinely did not happen. It is then resolved through `resume_with_decision` with
-        `Decision::Approve` under the generator's own `ask_write("out.txt")` policy: the run reaches
-        `Success`, the pending row reads `resolved == Some("approve")`, `out.txt` holds `DONE\n`, and
-        the run's status is `completed`.
-      - >
-        Non-vacuity proven: flipping the decision to `Decision::deny(...)` fired
-        `the run must continue to a terminal outcome once the approval is resolved: Denied { steps: 1 }`.
-        Reverted and re-confirmed green.
+    '
+  - 'NF3 — the parser terminates on adversarial input within a bound. Nesting depth is capped, input
+    length is capped, and both refusals are ordinary refusals with reasons. No input causes unbounded
+    recursion, unbounded allocation, or a stack overflow — asserted by the property test in F4 running
+    against deeply nested and pathologically long inputs.
 
-  - id: US-IO-HARNESS-0.23.0-T05
-    summary: >
-      The consumer-side build check: a fixture crate depending on both `io-harness` and `rusqlite` 0.40
-      that must build against 0.23.0 and must fail against 0.22.0 with cargo's `links` diagnostic, kept
-      in the repository and run in CI.
-    why_required: >
-      The wall this release exists to remove is a resolver error in someone else's build, which nothing
-      inside this crate's own test suite can observe. Without this the release's central claim is
-      asserted rather than checked.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T01]
-    acceptance_criteria:
-      - >
-        F1 — the collision is gone, and its absence is checkable rather than asserted. A fixture crate
-        declaring both `io-harness 0.23.0` and `rusqlite 0.40` builds and runs a trivial harness call.
-        The negative control is the same fixture against `io-harness 0.22.0`, which must fail with
-        cargo's own `links` diagnostic naming `sqlite3`, and that diagnostic is quoted verbatim in the
-        changelog so a reader knows the exact error this release retires.
-      - >
-        OP3 — the fixture crate from F1 is committed and runs in CI, so the property survives the next
-        dependency bump instead of being re-discovered by a consumer.
-    files:
-      - tests/fixtures/links-consumer/
-      - .github/workflows/ci.yml
-      - Cargo.toml
-    evidence:
-      - >
-        F1 positive — `tests/fixtures/links-consumer` declares `rusqlite = "0.40"` with `bundled` AND
-        `io-harness` by path. `cargo run` in it prints
-        `links-consumer OK: rusqlite 0.40 and io-harness share one libsqlite3-sys (sqlite 3.53.2)`.
-        It is run rather than only built, because coexistence is a claim about one process: the binary
-        opens a connection through its own `rusqlite` and a `Store` through the crate's, over the same
-        linked `libsqlite3-sys`.
-      - >
-        F1 negative control — the same fixture against `io-harness = "=0.22.0"` fails at resolution,
-        exit 101, before anything compiles, with cargo naming `libsqlite3-sys` links to the native
-        library `sqlite3`, but it conflicts with a previous package which links to `sqlite3` as well.
-        The diagnostic is quoted verbatim in the 0.23.0 changelog entry, as the contract requires.
-      - >
-        OP3 — a `links-consumer` job added to `.github/workflows/ci.yml`, ubuntu-latest, 20 minutes.
-        It runs the positive control, then rebuilds the fixture against 0.22.0 in `RUNNER_TEMP` and
-        **fails the job if that build succeeds**. It also refuses to accept any failure: cargo's output
-        must name both `links` and `sqlite3`, so a network blip or a yanked version cannot pass as the
-        expected failure. YAML parses; jobs are test, msrv, lint, links-consumer, docs. All 15 `uses:`
-        lines resolve to the three full 40-character SHAs already present in the file — no new action
-        and no new SHA was introduced.
+    '
+  files:
+  - src/tools/shell.rs
+  - tests/
+  evidence:
+  - '`cargo test --lib tools::shell` — 19 passed, 0 failed. Two sweep the entire ASCII range: every
+    character outside the permitted set is refused, and no character silently creates a sub-command.'
+  - 'Non-vacuity proven by eight sabotage runs, each caught by a NAMED test, evidence in `.ultraship/evidence/0.24.0/shell-parser-sabotage.txt`.
+    Two of them found defects in the TESTS rather than the parser: the property test''s oracle was written
+    as `is_bare_word_char(c)` — the function under test — so widening the allowlist widened the expectation
+    with it and a parser permitting an unquoted `$` passed everything. The oracle is now a literal character
+    list.'
+  - 'Zero new dependencies: the parser is written in-crate. `yash-syntax` from the roadmap is GPL-3.0-or-later
+    and unusable in an Apache-2.0 crate designed to be linked into another program; `brush-parser` measured
+    at +37 crates on the default feature set.'
+- id: US-IO-HARNESS-0.24.0-T04
+  summary: 'The `shell` tool: parse, then check every sub-command''s resolved program and argv against
+    `Act::Exec` and every redirect target against `Act::Write` or `Act::Read` — all before any spawn
+    — then execute, wiring the pipeline between argv-spawned children with no host shell anywhere. `cd`
+    handled as the one builtin, path-resolved and unable to escape the root.'
+  why_required: This is the outcome the release is named for. Without it the parser is unreachable and
+    the capability gap that blocks non-coding work stays open.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.24.0-T03
+  acceptance_criteria:
+  - 'F1 — a real command line runs under a checked boundary. `cd infra && kubectl get pods | grep CrashLoop`
+    executes under a policy allowing `kubectl*` and `grep*`, and the trace afterwards carries one policy
+    decision per sub-command naming the rule and layer that allowed it — read back through the public
+    `Store` API, not from logs.
 
-  - id: US-IO-HARNESS-0.23.0-T06
-    summary: >
-      Assert directly that `CHECKPOINT_FORMAT` is still 7 and that no migration runs on a store the
-      previous release wrote.
-    why_required: >
-      A silent format bump would let a broken upgrade present itself as a successful one. The existing
-      assertion covers a fresh store; this release needs it against a 0.22.0 store.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T02]
-    acceptance_criteria:
-      - >
-        F5 — `CHECKPOINT_FORMAT` is still 7 and no migration runs. Asserted directly, so that a silent
-        format bump cannot pass as a successful upgrade.
-    files:
-      - tests/cross_version.rs
-      - tests/checkpoint.rs
-    evidence:
-      - >
-        F5 — `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_migrates_nothing` passes.
-        `CHECKPOINT_FORMAT == 7`, and for each of the three 0.22.0 fixtures `PRAGMA user_version` reads
-        7 before `Store::open` and 7 after, with `sqlite_master` captured either side of the open and
-        required to be unchanged. That pair is what "no migration ran" has to mean here: not that the
-        constant is still 7, but that opening an old store did not quietly rewrite it.
-      - >
-        No schema change anywhere in the release. `from_conn`'s `CREATE TABLE IF NOT EXISTS` batches
-        are untouched, and the F2 negative control independently requires the schema this release
-        creates to equal 0.22.0's.
-      - >
-        Non-vacuity proven twice. Stamping a fixture copy to `user_version = 6` fired the pre-check
-        (`populated.sqlite3 was stamped at 6 by 0.22.0`); stamping it to 6 *and* relaxing the pre-check
-        so the open really would migrate fired
-        `opening populated.sqlite3 changed its checkpoint format — a migration ran`. Both reverted.
+    '
+  - 'F2 — a denied stage refuses the whole line and nothing executes. The same pipeline under a policy
+    that denies `grep*` is refused before any process is spawned, the refusal names the stage and the
+    rule, and the negative control is observable rather than argued: a first stage with a side effect
+    on disk — `kubectl get pods > out.txt | grep x` shaped so the first stage would write — leaves no
+    file behind. Every check happens before any spawn.
 
-  - id: US-IO-HARNESS-0.23.0-T07
-    summary: >
-      Document the one break: the `BREAKING` changelog entry with a migration note for
-      `Error::State(#[from] rusqlite::Error)`, the `docs/public-api.txt` check, the `CONTRACT.md` entry
-      stating the intent to wrap `rusqlite::Error` in a later release, and the quoted `links`
-      diagnostic.
-    why_required: >
-      The break is real for any consumer matching `Error::State(e)`, and the release notes are taken
-      verbatim from the changelog. An undocumented break is the same thing as an unannounced one.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T05]
-    acceptance_criteria:
-      - >
-        F6 — the break is exactly one and it is documented. `Error::State` carries the 0.40 error type;
-        the changelog carries a `BREAKING` entry with a migration note saying what to write instead; and
-        the enumerated public API in `docs/public-api.txt` reflects it. Any second break discovered
-        during development is either eliminated or documented to the same standard — not absorbed
-        quietly.
-    files:
-      - CHANGELOG.md
-      - docs/CONTRACT.md
-      - docs/public-api.txt
-    evidence:
-      - >
-        F6 — the break is exactly one, and it is the one the contract predicted: `Error::State` carries
-        `rusqlite` 0.40's error type. No second break was discovered. The 28 compile errors were all
-        the `fallible_uint` feature move and none of them reached a public signature; `src/` is
-        unchanged apart from the MSRV sentence in the crate-root docs, and `tests/public_api.rs` passes
-        against an unedited `docs/public-api.txt`.
-      - >
-        The changelog carries the `**BREAKING**` entry with a `*Migration:*` note showing both the
-        manifest change and the two match shapes — the one that is unaffected and the one that is not —
-        plus a second `**BREAKING (MSRV)**` entry for the 1.88 to 1.95 move with its own migration note
-        saying plainly that there is no opt-out and no version of the dependency that avoids it.
-        `tests/changelog.rs` passes, which is what enforces that every marked break carries a note.
-      - >
-        `docs/public-api.txt` needed no edit, and the reason is recorded rather than left as an
-        apparent omission: the snapshot enumerates re-exported *names* as `<kind> <name> <file>`, so it
-        holds `enum Error src/error.rs` and stops there. A variant's payload type is not a line in that
-        file and never will be. Writing one in would have corrupted the format the drift test checks.
-      - >
-        So the fact went where it can actually be read. `docs/CONTRACT.md`'s "What is public" now
-        states outright that `rusqlite` is a **public dependency** of this crate and that a `rusqlite`
-        major bump is therefore a public API change here whether or not behaviour moves — which is
-        exactly what 0.23.0 was. "Limits that hold today" carries the intent to wrap the type in a
-        later release, with the two match shapes spelled out so a consumer writing code today knows
-        which one survives.
+    '
+  - 'F3 — redirect targets are checked by path, not by name. `cmd > ../outside.txt` is refused by the
+    workspace path rules even when `cmd` is allowed; `cmd > allowed/out.txt` succeeds; `cmd < secrets/key`
+    is refused as a read. Each goes through `Workspace::check_path`, proven by a policy whose deny rule
+    is a path pattern that no name match would catch.
 
-  - id: US-IO-HARNESS-0.23.0-T08
-    summary: >
-      The full suite green on macOS, Linux and Windows including the bundled compile, and the nightly
-      docs.rs job warning-free with all features, both before publication.
-    why_required: >
-      Windows is where the bundled SQLite is a C compile and the runner is slowest, and docs.rs failing
-      after publication cannot be fixed without another version.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T03, US-IO-HARNESS-0.23.0-T04, US-IO-HARNESS-0.23.0-T06]
-    acceptance_criteria:
-      - >
-        NF1 — the full suite passes on macOS, Linux and Windows, including the bundled SQLite compile on
-        each. No test is skipped, marked ignored or made conditional to get there.
-      - >
-        NF3 — `cargo doc` is warning-free and docs.rs builds with all features, checked by the nightly
-        job before publication rather than after.
-    files:
-      - .github/workflows/ci.yml
-    evidence:
-      - >
-        NF1 locally on macOS (arm64, rustc 1.95.0): `cargo test` green — 45 test binaries plus 237
-        doctests, 0 failed, 0 ignored — including the real-SIGKILL crash-resume test and the five new
-        cross-version tests. `cargo test --all-features --lib --tests` green; `cargo test --all-features
-        --doc` green at 239. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean.
-        No test was skipped, ignored or made conditional to get there.
-      - >
-        NF3 — `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`
-        builds clean, which is the exact command and flags the nightly `docs` job runs. The job's
-        second assertion was checked too: the rendered pages under `target/doc/io_harness/` carry
-        `Available on crate feature`, so the feature labelling that job exists to protect is intact.
-        Checked before publication, as the criterion requires, not after.
-      - >
-        Linux and Windows are CI's to confirm on the pull request. Windows is the one to watch: the
-        bundled SQLite is a C compile there, 3.53.2 is a larger translation unit than 3.46.0, and the
-        runner is the slowest of the three, so a timeout there is a delay rather than a break. The
-        `skills::discovery_over_a_32_skill_directory_is_under_50ms` wall-clock test is also a known
-        intermittent on that runner — re-run before investigating, and check the failing test name
-        first.
-      - >
-        Machine note acted on rather than rediscovered: `target/` plus the three fixture crates' own
-        target directories took the disk to 10 GiB free, which is the condition that has twice
-        surfaced as a linker error reading like a toolchain bug. Cleaned before the release steps —
-        35.2 GiB freed, 38 GiB available.
+    '
+  files:
+  - src/tools/shell.rs
+  - src/run.rs
+  - src/tools/mod.rs
+  - tests/
+  evidence:
+  - '`cargo test --test shell` — 10 passed, 0 failed, covering F1, F2 and F3.'
+  - 'F2''s negative control is the load-bearing one: a first stage with a side effect on disk leaves
+    no file when a later stage is denied, and the same line under a permissive policy does create it.'
+  - Paths are resolved once into a plan and the runner opens exactly what was checked. Resolving at
+    run time would have had the policy check `out.txt` while the process wrote `src/out.txt` after a
+    `cd`.
+- id: US-IO-HARNESS-0.24.0-T05
+  summary: The `#[non_exhaustive]` rider on `CompletionRequest`, `CompletionResponse`, `EventKind` and
+    `Backend`, none of which carries it and none of which has any use of the attribute in `src/` today.
+    Regenerate `docs/public-api.txt`; add a `BREAKING` entry with a `*Migration:*` note per break, the
+    pairing enforced by the existing `tests/changelog.rs`.
+  why_required: 0.22.0 already broke literals of three of these and this release adds `EventKind` variants
+    and gives `Backend` a value it has never returned. This is the cheapest moment the attribute will
+    ever cost, and 0.25.0's AppContainer variant is the next thing that would otherwise break an exhaustive
+    match.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.24.0-T01
+  acceptance_criteria:
+  - 'F12 — the four types carry `#[non_exhaustive]` and the breaks are documented to the same standard
+    0.23.0 held. `docs/public-api.txt` reflects the surface, `tests/public_api.rs` passes against it,
+    and the changelog carries a `BREAKING` entry with a `*Migration:*` note per break — pairing enforced
+    by the existing `tests/changelog.rs`.
 
-  - id: US-IO-HARNESS-0.23.0-T09
-    summary: >
-      Measure store write throughput either side of the boundary and record the numbers in the
-      changelog.
-    why_required: >
-      The engine moved seven point releases and the contract asks for the number rather than an
-      assumption. Recording it is also how a later regression gets a baseline to fail against.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T01]
-    acceptance_criteria:
-      - >
-        NF4 — no measurable regression in store write throughput on the existing benchmark path. The
-        engine moved seven point releases; the expectation is neutral-to-better, and a regression is a
-        finding to record, not a reason to stop.
-    files:
-      - CHANGELOG.md
-    evidence:
-      - >
-        NF4 — measured, not assumed, and the criterion's premise was wrong: there is no "existing
-        benchmark path" in this repository. No `benches/`, no criterion, no `[[bench]]`. Both sides
-        were built instead — `examples/store_throughput.rs` on the new line and
-        `tests/fixtures/throughput-0.22.0/` pinned `io-harness =0.22.0` on the old one, running a
-        workload whose executable code is byte-identical between the two.
-      - >
-        `Store::checkpoint_step` is the timed call: the hot durable path, two inserts inside a
-        committed transaction, so every iteration pays the WAL commit the resume path depends on.
-        `record` was rejected as the subject because it writes one row without committing a
-        transaction of its own, which would flatter the engine. File-backed store, release profile,
-        20,000 and 100,000 iterations, 33 samples per side.
-      - >
-        Result: **within noise, no regression.** Order-balanced batch medians differ by +0.06%, -0.99%
-        and +1.65% — the sign flips across batches, which is what rules out a systematic effect —
-        against a paired per-round spread of 11 to 21%. The measurement rules out a regression above
-        roughly 5% and does not claim to resolve anything smaller.
-      - >
-        Recorded rather than buried: an earlier unbalanced batch that ran the new side first in every
-        round produced an apparent 18% regression from scheduling alone. It is reported because
-        discarding the one batch that looked bad without saying so would be dishonest, and because it
-        is the reason the reported batches alternate order.
-      - >
-        No CI job for it. On shared runners the noise floor is worse than the one measured here, and a
-        throughput gate against a 20% noise floor is a flake generator rather than a guard.
+    '
+  files:
+  - src/provider/mod.rs
+  - src/observe.rs
+  - src/sandbox.rs
+  - docs/public-api.txt
+  - CHANGELOG.md
+  evidence:
+  - 'DONE: `#[non_exhaustive]` on `EventKind`, `Backend` and `Cap` (the enums), which applied with zero
+    breakage inside the crate. The `Cap` doctest carries the wildcard arm the change requires.'
+  - '`CompletionRequest` and `CompletionResponse` removed from the rider by `US-IO-HARNESS-0.24.0-I01`,
+    owner-approved, with the measured evidence recorded there. `Cap` added to it in their place, since
+    `Cap::Processes` breaks it this release anyway.'
+  - '`cargo test --doc` — 239 passed, 0 failed. The `Cap` doctest carries the wildcard arm the attribute
+    requires, so it is the migration note as well as the test.'
+- id: US-IO-HARNESS-0.24.0-T08
+  summary: The Windows Job Object resource backend. `windows-sys` under `[target.'cfg(windows)'.dependencies]`,
+    job creation, child assignment before the child runs, memory / CPU / active-process limits from
+    the existing `JobLimits` mapping, kill-on-close, and `Backend::WindowsJobObject` reported where
+    `PortableFloor` is reported today. Every `unsafe` block carries a safety comment.
+  why_required: '`shell_kill` on Windows without a job leaks grandchildren, so the handle feature from
+    T06 is not correct on that platform without this — which is why the two are one release rather than
+    two. It also makes Windows the first backend anywhere to enforce `SandboxLimits::max_processes`.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.24.0-T06
+  acceptance_criteria:
+  - 'F6 — killing kills the tree, including on Windows. A sandboxed run whose command spawns a child
+    that spawns a grandchild is stopped, and all three are gone. The negative control is the one that
+    makes the Job Object worth its cost: the same test with the job disabled must leave the grandchild
+    running on Windows, so the criterion proves containment rather than coincidence. **Amended by `US-IO-HARNESS-0.24.0-I01`:**
+    originally written in terms of killing a process *handle*; handles are deferred to 0.25.0, so this
+    is asserted through the sandbox''s own spawn path, which closes the same job handle by the same
+    mechanism. The handle-initiated form of this criterion goes to 0.25.0 with the handles.
 
-  - id: US-IO-HARNESS-0.23.0-T10
-    summary: >
-      One real end-to-end run against a live provider, on a store already upgraded, with the trace read
-      back afterwards.
-    why_required: >
-      Every other check in this release is offline. A store that satisfies the unit tests and fails a
-      real run would still be a broken release.
-    status: done
-    depends_on: [US-IO-HARNESS-0.23.0-T08]
-    acceptance_criteria:
-      - >
-        OP2 — a real end-to-end run against a live provider completes on the upgraded store, so the
-        release is not accepted on unit tests alone. One run, one workspace, one verified outcome, with
-        the trace read back afterwards.
-    files:
-      - examples/durable_run.rs
-      - examples/live_accounting.rs
-    evidence:
-      - >
-        OP2 — `cargo run --example durable_run` against OpenRouter on the upgraded store: one run, one
-        workspace, a verified outcome under the `rustc` gate, and the trace read back from a reopened
-        file-backed `Store`. Output: `[process 1] stopped: Success { steps: 1 }`,
-        `[process 2] resumed to: Success { steps: 1 }`, `[process 2] final status = Completed`.
-      - >
-        `cargo run --example live_accounting` was run as well, because it is the example that exercises
-        the exact surface this release changed. Three live provider calls, and all seven `u64` `Usage`
-        counters written and read back through the `fallible_uint` path against real vendor numbers:
-        prompt 1345/1355/3086, completion 51/118/55, reasoning 29/45/29, cache-read 0/1250/1250,
-        totals 1396/1473/3141, 6010 tokens across the run. The edit is recorded (`step 3 write_file
-        NOTES.md (+1 -0)`) and spend prices correctly at two different rates from the same stored
-        trace, confirming no cost is stored. This is the strongest single piece of live evidence in the
-        release: the one code path the migration touched, exercised end to end against a real provider.
-      - >
-        The `.env` here carries real credentials for OpenRouter only, so the live evidence is
-        OpenRouter-only. The Anthropic and OpenAI paths rest on their wire tests, unchanged by this
-        release.
+    '
+  - 'F8 — `max_processes` is enforced on Windows, for the first time on any platform. A command that
+    attempts to exceed the configured active-process limit is stopped by the job rather than by the
+    wall clock, and the failure is attributed to the process limit in the trace. `Backend:: WindowsJobObject`
+    is what the sandbox reports on that platform, replacing `PortableFloor`.
+
+    '
+  - 'F9 — memory and CPU are real bounds on Windows. A child exceeding its CPU allotment is terminated
+    by the job. A child exceeding the job''s memory limit is refused the memory: **amended by `US-IO-HARNESS-0.24.0-I01`**,
+    because `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes the offending allocation fail rather than terminating
+    the process, and the original wording described something the Win32 API does not do. What must be
+    shown is unchanged in force — the process is never permitted to hold more than the cap, and the
+    outcome is asserted against the recorded cap reason so a wall-clock timeout cannot pass as either.
+
+    '
+  files:
+  - Cargo.toml
+  - src/sandbox/windows.rs
+  - src/sandbox.rs
+  - tests/
+  evidence:
+  - Job created, child assigned while `CREATE_SUSPENDED` then resumed, limits set from the existing
+    `JobLimits`, `Backend::WindowsJobObject` reported. Every `unsafe` block carries a SAFETY comment.
+  - 'NF2 verified on the host: `cargo tree` is 402 lines and contains no `windows` crate at all. `windows-sys`
+    is under `[target.''cfg(windows)''.dependencies]`.'
+  - 'NOT VERIFIED BY EXECUTION: no Win32 path has run. `cargo check --target x86_64-pc-windows-msvc`
+    cannot pass `libsqlite3-sys`''s build script on macOS, so the sandbox module was mirrored into a
+    scratch crate to type-check every Win32 signature, the feature set and the `Send` bound under that
+    target. F6, F8 and F9 rest on the first CI Windows run.'
+  - 'F9''s memory clause does not match Windows semantics: `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes an
+    allocation FAIL rather than terminating the process. Documented as such rather than claimed as a
+    kill. Raised for /ultraship:iterate.'
+- id: US-IO-HARNESS-0.24.0-T09
+  summary: 'Documentation and dependency accounting. The README platform table''s Windows row states
+    native resource containment — memory, CPU, process count, tree kill — and no filesystem or network
+    boundary, in the same row. `docs/CONTRACT.md` updated in both directions: `max_processes` is no
+    longer enforced by nothing, and the shell''s refusal set becomes part of the public contract. `cargo
+    tree` line counts recorded per platform.'
+  why_required: The Windows row is a claim about a security boundary that does not exist; shortened
+    to "Native" it says the opposite of the truth. And the refusal set is something a consumer needs
+    before they write a policy, so it is contract rather than implementation detail.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.24.0-T04
+  - US-IO-HARNESS-0.24.0-T08
+  acceptance_criteria:
+  - 'OP3 — the README platform table''s Windows row states native resource containment (memory, CPU,
+    process count, tree kill) **and** no filesystem or network boundary, in the same row. Reviewed as
+    a criterion because the shortened version — "Native" — is the failure mode, and it is a claim about
+    a security boundary that does not exist.
+
+    '
+  - 'OP4 — `docs/CONTRACT.md` updated in both directions: `SandboxLimits::max_processes` is no longer
+    "enforced by nothing" and says which platform enforces it, and the shell tool''s refusal set is
+    documented as part of the public contract rather than as an implementation detail, because a consumer
+    needs to know what their agent cannot express.
+
+    '
+  - 'NF2 — **the macOS and Linux dependency trees do not move.** `cargo tree` on the default feature
+    set reads the same 402 lines after this release as before it. The only new dependency is `windows-sys`
+    under `[target.''cfg(windows)''.dependencies]`, and its transitive cost is reported separately as
+    a Windows-only figure. This is checkable and it is the strongest single argument for the in-crate
+    parser, so it is a criterion rather than a note.
+
+    '
+  files:
+  - README.md
+  - docs/CONTRACT.md
+  - CHANGELOG.md
+  evidence:
+  - Platform table corrected in all three places it appears — crate root, README.md, docs/CONTRACT.md
+    — each stating resource containment only, with no filesystem or network boundary.
+  - '`docs/guide/command-execution.md` documents the `shell` tool; `docs/guide/tools-and-skills.md`
+    reserved-name list updated.'
+  - CHANGELOG 0.24.0 section written with a BREAKING entry and a `*Migration:*` note per break; `cargo
+    test --test changelog` passes.
+  - 'OP4 complete: `docs/CONTRACT.md` records the shell refusal set as public contract — stated as a
+    set that may widen and will not silently narrow — plus the `cd`-at-plan-time and `2>&1`-in-a-pipe
+    limitations, and the position that `CompletionRequest` and `CompletionResponse` are deliberately
+    not `#[non_exhaustive]`.'
+  - 'NF2 verified: `cargo tree` on the macOS host is 402 lines, identical to 0.23.0, and contains no
+    crate matching `windows`. Evidence in `evidence/0.24.0/dependency-and-msrv.txt`.'
+- id: US-IO-HARNESS-0.24.0-T10
+  summary: 'The release gates: full suite on macOS, Linux and Windows; `cargo fmt --check`; `cargo clippy
+    --all-targets -- -D warnings` with `unsafe_op_in_unsafe_fn` denied; the nightly all-features doc
+    build; `cargo package --locked` with the tarball listed rather than assumed; the MSRV re-checked
+    by hand against whatever `windows-sys` requires; and the live provider run in which the model composes
+    a shell line itself.'
+  why_required: The release is `published` mode. Every one of these is a refusal `release.yml` will
+    make on `main` anyway, and the live run is the only evidence that the feature works against a real
+    model rather than against tests written by the same hand that wrote the code.
+  status: in-progress
+  depends_on:
+  - US-IO-HARNESS-0.24.0-T05
+  - US-IO-HARNESS-0.24.0-T07
+  - US-IO-HARNESS-0.24.0-T09
+  acceptance_criteria:
+  - 'NF1 — the full suite passes on macOS, Linux and Windows. No test skipped, ignored or made conditional
+    to get there. Windows carries more new code than either other platform in this release and is where
+    the Job Object tests live, so a Windows-only failure is a release blocker rather than a flake to
+    re-run — with the standing exception of `skills::discovery_over_a_32_skill_directory_is_under_50ms`,
+    a known wall-clock assertion.
+
+    '
+  - 'NF4 — `cargo doc` is warning-free and docs.rs builds with all features, checked by the existing
+    nightly job before publication rather than after.
+
+    '
+  - 'NF5 — every `unsafe` block added for the Win32 calls carries a safety comment stating the invariant
+    it relies on, and `cargo clippy --all-targets -- -D warnings` is clean with `unsafe_op_in_unsafe_fn`
+    denied. This crate has no Win32 FFI today; the standard it enters at is set here.
+
+    '
+  - 'OP1 — a real end-to-end run against a live provider in which the model composes a shell line itself,
+    it is parsed, checked and executed, and the trace is read back afterwards. One run, one workspace,
+    one verified outcome. Evidence is OpenRouter unless another key exists, per the standing credential
+    position.
+
+    '
+  - 'OP2 — MSRV re-checked and stated. If `windows-sys` or anything it pulls raises the floor above
+    1.95, the new number goes in `Cargo.toml` with the same honest comment the existing floor carries,
+    naming the dependency that set it — and it is checked by hand rather than trusted from a manifest,
+    which is the lesson 0.23.0 paid for.
+
+    '
+  - 'OP5 — `cargo package --locked` exits 0 and the tarball carries no `.env`, no `.ultraship` and no
+    `.github`, verified by listing rather than assumed from the `exclude` list.
+
+    '
+  files:
+  - .github/workflows/
+  - Cargo.toml
+  - examples/
+  evidence:
+  - 'Local gates all green: fmt clean, `clippy --all-targets -- -D warnings` clean, 721 tests passed
+    / 0 failed, 239 doctests passed / 0 failed. Evidence in `evidence/0.24.0/gates.txt`.'
+  - 'OP5: `cargo package --locked` exit 0, 174 files, 922,399 bytes. No `.ultraship`, no `.github`,
+    no exact `.env`, none of the three excluded fixture crates; `src/tools/shell.rs`, `tests/shell.rs`,
+    `tests/list_dir.rs` and the nine `store-0.22.0` fixtures all present. Verified by listing the tarball
+    rather than trusting the exclude list. Security sweep: the real registry token and API key appear
+    in no tracked file and not in the tarball.'
+  - 'OP2: MSRV re-checked and unchanged at 1.95. `windows-sys` 0.61.2 declares `rust-version = 1.71`,
+    well below the floor `libsqlite3-sys` already sets, so the new dependency does not move it. Licence
+    MIT OR Apache-2.0.'
+  - 'OP1 satisfied: `cargo run --example shell_live` against OpenRouter. The model composed `grep -c
+    ''ERROR'' notes.txt > count.txt` itself — a real command line with a redirect — the crate parsed
+    it, and the trace read back from the store carries the per-stage authorisations: exec `grep` and
+    exec `grep -c ERROR notes.txt` under rule `grep*` layer `live`, and write `count.txt` under rule
+    `count.txt` layer `live`. Outcome Success, `count.txt` = "3\n", verification passed. Evidence in
+    `evidence/0.24.0/live-shell-run.txt`.'
+  - 'REMAINING: NF1 (full suite on macOS, Linux and Windows) and NF3 (nightly docs.rs job) complete
+    on the pull request''s CI run. F6, F8 and F9 are verified there and nowhere else.'

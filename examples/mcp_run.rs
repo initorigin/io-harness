@@ -75,7 +75,8 @@ async fn main() -> io_harness::Result<()> {
 
     // ---- 1. The capability, under deny-by-default egress -------------------
 
-    let contract = TaskContract::workspace(goal, dir.path(), verify.clone())
+    let contract = TaskContract::workspace(goal, dir.path())
+        .with_verification(verify.clone())
         .with_max_steps(6)
         .with_mcp([McpServer::stdio("fix", server_bin.display().to_string())]);
 
@@ -147,7 +148,8 @@ async fn main() -> io_harness::Result<()> {
     // ---- 2. The boundary ---------------------------------------------------
 
     println!("\nrun 2: the same task against an MCP host no rule allows");
-    let denied = TaskContract::workspace(goal, dir.path(), verify)
+    let denied = TaskContract::workspace(goal, dir.path())
+        .with_verification(verify)
         .with_max_steps(6)
         .with_mcp([McpServer::http("remote", "https://mcp.example.com/mcp")]);
 

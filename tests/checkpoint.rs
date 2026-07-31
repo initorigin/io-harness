@@ -179,11 +179,11 @@ fn tree_contract(root: &std::path::Path) -> TaskContract {
     TaskContract::workspace(
         "COORDINATOR: delegate to sub-agents; do not write files yourself.",
         root,
-        Verification::WorkspaceFileContains {
-            file: "b.txt".into(),
-            needle: "BETA".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "b.txt".into(),
+        needle: "BETA".into(),
+    })
 }
 fn containment() -> Containment {
     Containment::new(10, 4, 3, 1_000_000)
@@ -194,15 +194,12 @@ fn containment() -> Containment {
 /// exist on that path, so a single-file contract would prove nothing about
 /// either.
 fn out_contract(root: &std::path::Path, needle: &str, max_steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "write out.txt",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("write out.txt", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: needle.into(),
-        },
-    )
-    .with_max_steps(max_steps)
+        })
+        .with_max_steps(max_steps)
 }
 
 /// The store as a plain SQLite file, for reaching past the public API to make a

@@ -152,11 +152,11 @@ pub struct Skill {
 /// let contract = TaskContract::workspace(
 ///     "add a migration for the new column",
 ///     "/path/to/repo",
-///     Verification::WorkspaceFileContains {
-///         file: "migrations/latest.sql".into(),
-///         needle: "DROP".into(),
-///     },
 /// )
+/// .with_verification(Verification::WorkspaceFileContains {
+///     file: "migrations/latest.sql".into(),
+///     needle: "DROP".into(),
+/// })
 /// .with_skills("./skills");
 /// # let _ = contract;
 /// ```
