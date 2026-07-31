@@ -106,15 +106,12 @@ fn ws() -> tempfile::TempDir {
 /// A contract that can never be satisfied, so the loop runs its whole step budget
 /// unless something else stops it — which is the thing under test.
 fn never_passes(root: &Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "exercise stall detection",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("exercise stall detection", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(steps)
+        })
+        .with_max_steps(steps)
 }
 
 fn open_policy() -> Policy {
@@ -627,15 +624,12 @@ async fn the_same_spawn_repeated_is_caught_even_though_every_step_counts_as_prog
 #[tokio::test]
 async fn three_different_spawns_that_each_do_work_are_never_flagged() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "split the work three ways",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("split the work three ways", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "c.txt".into(),
             needle: "C".into(),
-        },
-    )
-    .with_max_steps(8);
+        })
+        .with_max_steps(8);
 
     let spawn_for = |goal: &str, file: &str, needle: &str| {
         call(

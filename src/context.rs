@@ -231,11 +231,11 @@ pub fn estimate_tokens(text: &str) -> u64 {
 /// ```
 /// use io_harness::{ContextBudget, TaskContract, Verification};
 ///
-/// let contract = TaskContract::workspace(
-///     "make the failing test pass",
-///     "/path/to/repo",
-///     Verification::WorkspaceFileContains { file: "OK".into(), needle: "ok".into() },
-/// )
+/// let contract = TaskContract::workspace("make the failing test pass", "/path/to/repo")
+/// .with_verification(Verification::WorkspaceFileContains {
+///     file: "OK".into(),
+///     needle: "ok".into(),
+/// })
 /// .with_token_budget(200_000)
 /// .with_context_budget(ContextBudget { max_tokens: 8_000, share: 0.25 });
 /// # let _ = contract;

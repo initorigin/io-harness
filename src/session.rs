@@ -37,7 +37,6 @@ use crate::policy::Policy;
 use crate::provider::Provider;
 use crate::run::{RunOutcome, TurnExtras, NO_TOOL_CALL};
 use crate::state::{Store, Turn};
-use crate::verify::Verification;
 use crate::TaskContract;
 
 /// A durable conversation over one workspace.
@@ -395,11 +394,11 @@ impl Session {
     /// // This turn has a checkable definition of done, so it gets a gate: the
     /// // project's own command decides, and the turn reports `Success` only if it
     /// // passes.
-    /// let contract = TaskContract::workspace(
-    ///     "fix it",
-    ///     "/repo",
-    ///     Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
-    /// )
+    /// let contract = TaskContract::workspace("fix it", "/repo")
+    /// .with_verification(Verification::Command {
+    ///     argv: vec!["cargo".into(), "test".into()],
+    ///     expect_exit: 0,
+    /// })
     /// .with_max_steps(20);
     /// let result = session.turn_bounded(&contract, &OpenRouter::from_env()?, store, policy,
     ///                                   &ApproveAll).await?;
@@ -457,7 +456,7 @@ impl Session {
     /// What an unbounded turn runs under: the session's workspace, no criterion,
     /// and the crate's own defaults for everything else.
     fn default_contract(&self, text: impl Into<String>) -> TaskContract {
-        TaskContract::workspace(text, self.root.clone(), Verification::None)
+        TaskContract::workspace(text, self.root.clone())
     }
 
     /// The caller's contract, over the session's workspace.

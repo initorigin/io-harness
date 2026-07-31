@@ -24,16 +24,13 @@ async fn main() -> io_harness::Result<()> {
     std::fs::create_dir_all(&src)?;
     std::fs::write(src.join("a.rs"), "pub fn a() -> u32 { 0 }\n")?;
 
-    let contract = TaskContract::workspace(
-        "Edit src/a.rs so a() == 7.",
-        &root,
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("Edit src/a.rs so a() == 7.", &root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "src/a.rs".into(),
             needle: "7".into(),
-        },
-    )
-    .with_max_steps(20)
-    .with_token_budget(200_000);
+        })
+        .with_max_steps(20)
+        .with_token_budget(200_000);
 
     // Reads allowed, writes denied. The agent can look all it likes and can never
     // move the workspace, which is the condition stall detection exists for.

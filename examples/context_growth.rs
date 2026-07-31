@@ -54,11 +54,11 @@ async fn main() -> io_harness::Result<()> {
          before you change it, and read a file again after you have written it to \
          confirm what it now contains.",
         &root,
-        Verification::Command {
-            argv: vec!["cargo".into(), "test".into(), "--offline".into()],
-            expect_exit: 0,
-        },
     )
+    .with_verification(Verification::Command {
+        argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+        expect_exit: 0,
+    })
     .with_max_steps(20)
     .with_token_budget(400_000);
 

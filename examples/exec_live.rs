@@ -79,13 +79,13 @@ async fn main() -> io_harness::Result<()> {
          the suite, work out what is wrong from the failure, and fix it. Change as little as \
          possible: use edit_file rather than rewriting a whole file, and do not edit test.js.",
         &root,
-        // The project's own command is the definition of done. Nothing about this
-        // criterion knows what language the project is written in.
-        Verification::Command {
-            argv: vec!["npm".into(), "test".into()],
-            expect_exit: 0,
-        },
     )
+    // The project's own command is the definition of done. Nothing about this
+    // criterion knows what language the project is written in.
+    .with_verification(Verification::Command {
+        argv: vec!["npm".into(), "test".into()],
+        expect_exit: 0,
+    })
     .with_max_steps(20)
     .with_token_budget(400_000)
     // A cold `npm install` on a slow link is the case the default is sized for;

@@ -367,11 +367,11 @@ async fn a_turn_is_unbounded_unless_the_caller_bounds_that_one_turn() {
         // Deliberately the wrong root: the session's own root must win, because a
         // turn is about the conversation's workspace.
         "/nonexistent",
-        Verification::Command {
-            argv: vec!["cargo".into(), "--version".into()],
-            expect_exit: 0,
-        },
     )
+    .with_verification(Verification::Command {
+        argv: vec!["cargo".into(), "--version".into()],
+        expect_exit: 0,
+    })
     .with_max_steps(3);
     let bounded = session
         .turn_bounded(&contract, &provider, &store, &policy(), &ApproveAll)

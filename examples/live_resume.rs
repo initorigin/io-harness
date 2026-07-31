@@ -67,7 +67,9 @@ async fn main() -> io_harness::Result<()> {
         expect_exit: 0,
     };
     let contract = |steps: u32| {
-        TaskContract::workspace(goal, dir.path(), verify.clone()).with_max_steps(steps)
+        TaskContract::workspace(goal, dir.path())
+            .with_verification(verify.clone())
+            .with_max_steps(steps)
     };
 
     // ---- process 1: start under the policy, stop with work left ------------

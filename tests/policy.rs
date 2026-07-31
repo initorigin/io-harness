@@ -130,7 +130,7 @@ const GOOD_B: &str = "pub fn b() -> u32 { 22 }\n";
 #[tokio::test]
 async fn a_denied_write_is_refused_and_the_run_still_reaches_its_goal() {
     let dir = fixture();
-    let contract = TaskContract::workspace("make a+b 42", dir.path(), verify());
+    let contract = TaskContract::workspace("make a+b 42", dir.path()).with_verification(verify());
     // The model tries the secret first, then does the real work.
     let script = MockScript::new(vec![
         vec![write("secrets/key.txt", "exfiltrated")],
@@ -164,8 +164,9 @@ async fn a_denied_write_is_refused_and_the_run_still_reaches_its_goal() {
 #[tokio::test]
 async fn a_denied_action_never_reaches_the_approver() {
     let dir = fixture();
-    let contract =
-        TaskContract::workspace("touch the secret", dir.path(), verify()).with_max_steps(1);
+    let contract = TaskContract::workspace("touch the secret", dir.path())
+        .with_verification(verify())
+        .with_max_steps(1);
     let script = MockScript::new(vec![vec![write("secrets/key.txt", "x")]]);
     let store = Store::memory().unwrap();
     let approver = Counting::new(Decision::approve());
@@ -187,7 +188,9 @@ async fn approve_all_proceeds_where_deny_all_does_not() {
     for (decision, expect_written) in [(Decision::approve(), true), (Decision::deny("nope"), false)]
     {
         let dir = fixture();
-        let contract = TaskContract::workspace("edit a", dir.path(), verify()).with_max_steps(1);
+        let contract = TaskContract::workspace("edit a", dir.path())
+            .with_verification(verify())
+            .with_max_steps(1);
         let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
         let store = Store::memory().unwrap();
         let approver = Counting::new(decision);
@@ -205,8 +208,9 @@ async fn approve_all_proceeds_where_deny_all_does_not() {
 #[tokio::test]
 async fn reads_do_not_prompt_but_every_write_does_including_an_allowed_overwrite() {
     let dir = fixture();
-    let contract =
-        TaskContract::workspace("read then write", dir.path(), verify()).with_max_steps(2);
+    let contract = TaskContract::workspace("read then write", dir.path())
+        .with_verification(verify())
+        .with_max_steps(2);
     let script = MockScript::new(vec![
         vec![call("read_file", json!({ "path": "src/a.rs" }))],
         // src/a.rs already exists and the path rules allow it — it still asks.
@@ -229,7 +233,9 @@ async fn reads_do_not_prompt_but_every_write_does_including_an_allowed_overwrite
 #[tokio::test]
 async fn an_approver_can_redirect_the_write_and_the_trace_shows_both_forms() {
     let dir = fixture();
-    let contract = TaskContract::workspace("edit a", dir.path(), verify()).with_max_steps(1);
+    let contract = TaskContract::workspace("edit a", dir.path())
+        .with_verification(verify())
+        .with_max_steps(1);
     let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
     let store = Store::memory().unwrap();
     let approver = Counting::new(Decision::Approve {
@@ -259,7 +265,9 @@ async fn an_approver_can_redirect_the_write_and_the_trace_shows_both_forms() {
 #[tokio::test]
 async fn an_approved_rewrite_cannot_move_an_action_across_a_deny() {
     let dir = fixture();
-    let contract = TaskContract::workspace("edit a", dir.path(), verify()).with_max_steps(1);
+    let contract = TaskContract::workspace("edit a", dir.path())
+        .with_verification(verify())
+        .with_max_steps(1);
     let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
     let store = Store::memory().unwrap();
     // A rogue approver tries to redirect an allowed write onto a denied path.
@@ -289,7 +297,9 @@ async fn an_approved_rewrite_cannot_move_an_action_across_a_deny() {
 #[tokio::test]
 async fn remembering_a_rule_stops_the_prompting_and_is_returned_to_the_caller() {
     let dir = fixture();
-    let contract = TaskContract::workspace("edit both", dir.path(), verify()).with_max_steps(3);
+    let contract = TaskContract::workspace("edit both", dir.path())
+        .with_verification(verify())
+        .with_max_steps(3);
     let script = MockScript::new(vec![
         vec![write("src/a.rs", GOOD_A)],
         vec![write("src/b.rs", GOOD_B)],
@@ -323,8 +333,9 @@ async fn remembering_a_rule_stops_the_prompting_and_is_returned_to_the_caller() 
 #[tokio::test]
 async fn a_remembered_allow_cannot_override_a_base_deny() {
     let dir = fixture();
-    let contract =
-        TaskContract::workspace("edit then exfiltrate", dir.path(), verify()).with_max_steps(2);
+    let contract = TaskContract::workspace("edit then exfiltrate", dir.path())
+        .with_verification(verify())
+        .with_max_steps(2);
     let script = MockScript::new(vec![
         vec![write("src/a.rs", GOOD_A)],
         vec![write("secrets/key.txt", "stolen")],
@@ -354,8 +365,9 @@ async fn a_remembered_allow_cannot_override_a_base_deny() {
 #[tokio::test]
 async fn a_refused_action_consumes_a_step_so_retrying_it_hits_the_cap() {
     let dir = fixture();
-    let contract =
-        TaskContract::workspace("keep trying the secret", dir.path(), verify()).with_max_steps(3);
+    let contract = TaskContract::workspace("keep trying the secret", dir.path())
+        .with_verification(verify())
+        .with_max_steps(3);
     // The model requests the same denied write every step.
     let script = MockScript::new(vec![
         vec![write("secrets/key.txt", "x")],
@@ -388,7 +400,9 @@ async fn a_refused_action_consumes_a_step_so_retrying_it_hits_the_cap() {
 #[tokio::test]
 async fn deferring_pauses_the_run_and_persists_the_pending_action() {
     let dir = fixture();
-    let contract = TaskContract::workspace("edit a", dir.path(), verify()).with_max_steps(2);
+    let contract = TaskContract::workspace("edit a", dir.path())
+        .with_verification(verify())
+        .with_max_steps(2);
     let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
     let path = dir.path().join("runs.db");
     let store = Store::open(&path).unwrap();
@@ -427,7 +441,7 @@ async fn deferring_pauses_the_run_and_persists_the_pending_action() {
 #[tokio::test]
 async fn a_run_with_no_policy_behaves_exactly_as_0_3_0_did() {
     let dir = fixture();
-    let contract = TaskContract::workspace("make a+b 42", dir.path(), verify());
+    let contract = TaskContract::workspace("make a+b 42", dir.path()).with_verification(verify());
     let script = MockScript::new(vec![vec![
         write("src/a.rs", GOOD_A),
         write("src/b.rs", GOOD_B),
@@ -463,7 +477,7 @@ async fn a_run_with_no_policy_behaves_exactly_as_0_3_0_did() {
 #[tokio::test]
 async fn resuming_an_approval_performs_the_pending_action_and_finishes_the_run() {
     let dir = fixture();
-    let contract = TaskContract::workspace("make a+b 42", dir.path(), verify());
+    let contract = TaskContract::workspace("make a+b 42", dir.path()).with_verification(verify());
     // Step 1 defers on the write to a.rs; after resuming, step 2 writes b.rs.
     let script = MockScript::new(vec![
         vec![write("src/a.rs", GOOD_A)],
@@ -530,7 +544,7 @@ async fn resuming_an_approval_performs_the_pending_action_and_finishes_the_run()
 #[tokio::test]
 async fn resuming_a_denial_does_not_perform_the_action_and_closes_the_run() {
     let dir = fixture();
-    let contract = TaskContract::workspace("make a+b 42", dir.path(), verify());
+    let contract = TaskContract::workspace("make a+b 42", dir.path()).with_verification(verify());
     let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
     let store = Store::open(dir.path().join("runs.db")).unwrap();
 
@@ -581,7 +595,7 @@ async fn resuming_a_denial_does_not_perform_the_action_and_closes_the_run() {
 #[tokio::test]
 async fn a_deny_that_lands_while_paused_still_holds_on_resume() {
     let dir = fixture();
-    let contract = TaskContract::workspace("edit a", dir.path(), verify());
+    let contract = TaskContract::workspace("edit a", dir.path()).with_verification(verify());
     let script = MockScript::new(vec![vec![write("src/a.rs", GOOD_A)]]);
     let store = Store::open(dir.path().join("runs.db")).unwrap();
 
@@ -643,7 +657,7 @@ async fn a_slow_approver_keeps_the_whole_run_waiting_and_it_then_completes() {
     }
 
     let dir = fixture();
-    let contract = TaskContract::workspace("make a+b 42", dir.path(), verify());
+    let contract = TaskContract::workspace("make a+b 42", dir.path()).with_verification(verify());
     let script = MockScript::new(vec![vec![
         write("src/a.rs", GOOD_A),
         write("src/b.rs", GOOD_B),
@@ -677,7 +691,7 @@ async fn refusal_and_decision_records_never_carry_file_contents() {
     let dir = fixture();
     let secret_body = "SUPER-SECRET-VALUE";
     std::fs::write(dir.path().join("secrets/key.txt"), secret_body).unwrap();
-    let contract = TaskContract::workspace("make a+b 42", dir.path(), verify());
+    let contract = TaskContract::workspace("make a+b 42", dir.path()).with_verification(verify());
     let script = MockScript::new(vec![
         vec![write("secrets/key.txt", "PAYLOAD-THAT-MUST-NOT-BE-LOGGED")],
         vec![write("src/a.rs", GOOD_A), write("src/b.rs", GOOD_B)],
@@ -757,7 +771,9 @@ async fn a_policy_on_a_single_file_contract_is_refused_not_silently_ignored() {
 /// left, exactly as a crashed process leaves it, and the resume continues under
 /// the original run id.
 fn capped(dir: &std::path::Path, steps: u32) -> TaskContract {
-    TaskContract::workspace("make a+b 42", dir, verify()).with_max_steps(steps)
+    TaskContract::workspace("make a+b 42", dir)
+        .with_verification(verify())
+        .with_max_steps(steps)
 }
 
 #[tokio::test]

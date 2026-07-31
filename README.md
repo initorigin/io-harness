@@ -30,20 +30,12 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
 ```rust,no_run
-use io_harness::{run_with, ApproveAll, OpenRouter, Policy, Store, TaskContract, Verification};
+use io_harness::{ApproveAll, OpenRouter, Policy, Session, Store};
 
 #[tokio::main]
 async fn main() -> io_harness::Result<()> {
     let provider = OpenRouter::from_env()?; // OPENROUTER_API_KEY + OPENROUTER_MODEL
-    let store = Store::memory()?;
-
-    let contract = TaskContract::workspace(
-        "the test suite is failing; find out why and fix it",
-        "/path/to/repo",
-        // The project's own command decides whether the work is done. Nothing
-        // here is Rust-specific — `go test ./...` or `pytest` reads the same.
-        Verification::Command { argv: vec!["npm".into(), "test".into()], expect_exit: 0 },
-    );
+    let store = Store::open("runs.db")?;
 
     // src/ is writable, secrets/ is refused outright and never reaches a human,
     // and the agent may run the test runner and nothing that publishes.
@@ -55,10 +47,47 @@ async fn main() -> io_harness::Result<()> {
         .allow_exec("npm*")
         .deny_exec("npm publish*");
 
-    let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
-    println!("{:?}", result.outcome);
+    // A durable conversation about one workspace. Every turn is a run of its
+    // own: its own steps, its own budgets, its own boundary, its own trace.
+    let mut session = Session::open(&store, "/path/to/repo")?;
+
+    let first = session
+        .turn("the test suite is failing; why?", &provider, &store, &policy, &ApproveAll)
+        .await?;
+    println!("{}", first.reply.unwrap_or_default());
+
+    // The next turn reads the previous ones: the conversation *is* the context.
+    session
+        .turn("fix it, then run the suite", &provider, &store, &policy, &ApproveAll)
+        .await?;
+
+    // Keep the id. It is all a later process needs to pick this up again.
+    println!("session {}", session.id());
     Ok(())
 }
+```
+
+For unattended, one-shot work there is `run_with`: the same loop, the same
+boundary and the same trace, driven by a `TaskContract` instead of a
+conversation, and gated on a criterion the project itself decides.
+
+```rust,no_run
+use io_harness::{run_with, ApproveAll, TaskContract, Verification};
+
+let contract = TaskContract::workspace(
+    "the test suite is failing; find out why and fix it",
+    "/path/to/repo",
+)
+// The project's own command decides whether the work is done. Nothing here is
+// Rust-specific — `go test ./...` or `pytest` reads the same. Verification is
+// opt-in: without this the contract has no gate at all.
+.with_verification(Verification::Command {
+    argv: vec!["npm".into(), "test".into()],
+    expect_exit: 0,
+});
+
+let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+println!("{:?}", result.outcome);
 ```
 
 **Requires Rust 1.95** or later. The floor comes from `libsqlite3-sys`, which
@@ -218,7 +247,7 @@ dependency at all.
 | --- | --- |
 | macOS | Native, `sandbox-exec` |
 | Linux | Native, namespaces and rlimits |
-| Windows | Portable floor only — the Job Object backend is designed, not implemented, and only the wall clock is enforced |
+| Windows | Native resource containment (memory, CPU, process count, tree kill); no filesystem or network boundary |
 
 The full suite runs on all three in CI.
 

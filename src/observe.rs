@@ -284,6 +284,7 @@ impl RunEvent {
 /// follows it, and a sub-agent step that pauses on a deferred child is left
 /// uncommitted on purpose so a resume replays it. Count events to show
 /// activity; read the store to know what is durable.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventKind {

@@ -331,15 +331,12 @@ async fn a_rendered_prompt_drives_a_real_run_unchanged() {
         "the string under test"
     );
 
-    let contract = TaskContract::workspace(
-        rendered.clone(),
-        root.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace(rendered.clone(), root.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "SHIPPED".into(),
-        },
-    )
-    .with_max_steps(2);
+        })
+        .with_max_steps(2);
     let provider = MockScript::scripted(vec![vec![call(
         "write_file",
         json!({ "path": "out.txt", "content": "SHIPPED\n" }),

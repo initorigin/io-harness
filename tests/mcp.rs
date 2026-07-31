@@ -148,15 +148,12 @@ fn permitted() -> Policy {
 }
 
 fn contract(root: &std::path::Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "use the tools",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("use the tools", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "src/a.rs".into(),
             needle: "fn hello".into(),
-        },
-    )
-    .with_max_steps(steps)
+        })
+        .with_max_steps(steps)
 }
 
 /// F1 — tools are discovered, offered under namespaced names, called, and the

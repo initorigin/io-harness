@@ -82,13 +82,13 @@ async fn main() -> io_harness::Result<()> {
          a message describing what you did. Only once the commit exists, write \
          DONE.md containing the single word: committed",
         root,
-        // Deliberately NOT on COLOUR.md: that file exists one step before the
-        // commit, and gating on it stops the run there.
-        Verification::WorkspaceFileContains {
-            file: "DONE.md".into(),
-            needle: "committed".into(),
-        },
     )
+    // Deliberately NOT on COLOUR.md: that file exists one step before the
+    // commit, and gating on it stops the run there.
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "DONE.md".into(),
+        needle: "committed".into(),
+    })
     .with_max_steps(12)
     .with_commit_identity("io-harness agent", "agent@io-harness.invalid");
 

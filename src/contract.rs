@@ -25,12 +25,16 @@ use crate::verify::Verification;
 /// let contract = TaskContract::workspace(
 ///     "make `parse` return an error on empty input instead of panicking",
 ///     "/path/to/repo",
-///     // The criterion is checked by running the project's own suite, so a
-///     // plausible-looking stub cannot satisfy it. This is the half of the
-///     // contract that decides whether the run *succeeded*, as opposed to merely
-///     // stopping.
-///     Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
 /// )
+/// // The criterion is checked by running the project's own suite, so a
+/// // plausible-looking stub cannot satisfy it. This is the half of the
+/// // contract that decides whether the run *succeeded*, as opposed to merely
+/// // stopping. It is opt-in: a contract that never asks for one is unverified,
+/// // which is the honest description of a task with nothing to check.
+/// .with_verification(Verification::Command {
+///     argv: vec!["cargo".into(), "test".into()],
+///     expect_exit: 0,
+/// })
 /// // And this is the half that decides when it stops regardless. All three are
 /// // independent stops with their own `RunOutcome`, so a run that ran out of
 /// // money is distinguishable afterwards from one that ran out of ideas.
@@ -70,6 +74,11 @@ pub struct TaskContract {
     /// Extra rules the agent must respect, surfaced to the model verbatim.
     pub constraints: Vec<String>,
     /// The checkable success criterion. The run succeeds when this passes.
+    ///
+    /// [`TaskContract::new`] takes it positionally; [`TaskContract::workspace`]
+    /// starts it at [`Verification::None`] and leaves it to
+    /// [`TaskContract::with_verification`], since most workspace tasks have
+    /// nothing to check and should not have to say so.
     pub verify: Verification,
     /// Step budget: hard cap on loop iterations. The run stops when reached.
     pub max_steps: u32,
@@ -217,23 +226,38 @@ impl TaskContract {
     }
 
     /// A workspace task: the agent may grep, find, read, and write several files
-    /// under `root`. `verify` should be a multi-file variant
-    /// ([`Verification::EachCompilesRust`], or a [`Verification::Command`] that runs
-    /// the project's own suite).
-    /// Defaults match [`TaskContract::new`] (12 steps here, since repo tasks take
-    /// more turns), no time/token budget, 2 retries.
-    pub fn workspace(
-        goal: impl Into<String>,
-        root: impl Into<PathBuf>,
-        verify: Verification,
-    ) -> Self {
+    /// under `root`.
+    ///
+    /// Verification defaults to [`Verification::None`] and stays there until
+    /// [`with_verification`](TaskContract::with_verification) says otherwise,
+    /// because a checkable criterion is the exception in workspace work rather
+    /// than the rule. "Work out why the deploy fails", "summarise what this module
+    /// does", "port the parser and tell me what you found" are runs with an answer
+    /// and no gate, and while this constructor demanded a criterion every one of
+    /// those callers had to type `Verification::None` to say the thing that was
+    /// already true. Defaulting it puts the argument back where it belongs: on the
+    /// calls that really do have something to check, spelled out at the point they
+    /// ask for it.
+    ///
+    /// When there *is* a gate it should be a multi-file variant —
+    /// [`Verification::EachCompilesRust`], or a [`Verification::Command`] running
+    /// the project's own suite — since a workspace run touches more than the one
+    /// file a single-file criterion knows about.
+    ///
+    /// [`TaskContract::new`] is deliberately unchanged and still takes its
+    /// criterion positionally: a single-file task names one file and one thing that
+    /// must become true of it, so there is no honest default to fall back to there.
+    ///
+    /// The rest of the defaults match [`TaskContract::new`] (12 steps here, since
+    /// repo tasks take more turns), no time/token budget, 2 retries.
+    pub fn workspace(goal: impl Into<String>, root: impl Into<PathBuf>) -> Self {
         let root = root.into();
         Self {
             goal: goal.into(),
             file: root.clone(),
             root: Some(root),
             constraints: Vec::new(),
-            verify,
+            verify: Verification::None,
             max_steps: 12,
             max_duration: None,
             max_tokens: None,
@@ -252,6 +276,43 @@ impl TaskContract {
             responder: None,
             web: None,
         }
+    }
+
+    /// Decide what "succeeded" means for this run.
+    ///
+    /// The other half of what [`TaskContract::workspace`] leaves open: that
+    /// constructor starts a contract at [`Verification::None`], and this is how a
+    /// caller with something to check says so. Setting a criterion changes what the
+    /// *outcome* is allowed to be, not what the agent is allowed to do — the
+    /// boundary is the [`Policy`](crate::Policy)'s job, and a gate that passes says
+    /// nothing about how the workspace got that way. [`Verification`] documents
+    /// exactly what each variant does and does not prove.
+    ///
+    /// A named builder rather than a positional argument, for the same reason every
+    /// other capability on this type is one: every entry point takes a
+    /// `TaskContract`, so setting it here works with all sixteen of them and changes
+    /// no signature anywhere else.
+    ///
+    /// ```
+    /// use io_harness::{TaskContract, Verification};
+    ///
+    /// // Nothing to check: the deliverable is an answer, and the run ends when the
+    /// // agent stops calling tools.
+    /// let unverified = TaskContract::workspace("work out why the deploy fails", "/repo");
+    /// assert!(matches!(unverified.verify, Verification::None));
+    ///
+    /// // Something to check: the project's own suite decides, not the model.
+    /// let gated = TaskContract::workspace("make the failing test pass", "/repo")
+    ///     .with_verification(Verification::Command {
+    ///         argv: vec!["cargo".into(), "test".into()],
+    ///         expect_exit: 0,
+    ///     });
+    /// assert!(matches!(gated.verify, Verification::Command { .. }));
+    /// ```
+    #[must_use]
+    pub fn with_verification(mut self, verify: Verification) -> Self {
+        self.verify = verify;
+        self
     }
 
     /// Connect these MCP servers for the run and offer their tools to the model.
@@ -283,8 +344,11 @@ impl TaskContract {
     /// let contract = TaskContract::workspace(
     ///     "update the README's install line to the current release",
     ///     "/path/to/repo",
-    ///     Verification::WorkspaceFileContains { file: "README.md".into(), needle: "install".into() },
     /// )
+    /// .with_verification(Verification::WorkspaceFileContains {
+    ///     file: "README.md".into(),
+    ///     needle: "install".into(),
+    /// })
     /// .with_web(WebAccess::search().max_uses(3).allow("crates.io"));
     ///
     /// assert!(contract.web.is_some());
@@ -380,13 +444,9 @@ impl TaskContract {
     /// [`run_with`](crate::run_with) is inert rather than a hidden capability.
     ///
     /// ```
-    /// use io_harness::{AgentDef, Agents, TaskContract, Verification};
+    /// use io_harness::{AgentDef, Agents, TaskContract};
     ///
-    /// let contract = TaskContract::workspace(
-    ///     "find the bug, then fix it",
-    ///     "/repo",
-    ///     Verification::None,
-    /// )
+    /// let contract = TaskContract::workspace("find the bug, then fix it", "/repo")
     /// .with_agents(
     ///     Agents::new()
     ///         .with(AgentDef::new("searcher").with_model("cheap-model").deny_write())
@@ -412,10 +472,10 @@ impl TaskContract {
     /// code, which is the rule steering has followed since 0.20.0.
     ///
     /// ```
-    /// use io_harness::{FixedResponder, TaskContract, Verification};
+    /// use io_harness::{FixedResponder, TaskContract};
     /// use std::sync::Arc;
     ///
-    /// let contract = TaskContract::workspace("port the parser", "/repo", Verification::None)
+    /// let contract = TaskContract::workspace("port the parser", "/repo")
     ///     .with_responder(Arc::new(FixedResponder::new("use io.local.toml")));
     ///
     /// assert!(contract.responder.is_some());
@@ -462,17 +522,17 @@ impl TaskContract {
     /// it here works with all of them and changes no existing signature.
     ///
     /// ```
-    /// use io_harness::{TaskContract, Verification, DEFAULT_EXEC_TIMEOUT};
+    /// use io_harness::{TaskContract, DEFAULT_EXEC_TIMEOUT};
     /// use std::time::Duration;
     ///
     /// // A repository whose cold build is slower than the default ceiling. Raise
     /// // it rather than watching honest work be killed as if it had hung.
-    /// let patient = TaskContract::workspace("build and test it", "/monorepo", Verification::None)
+    /// let patient = TaskContract::workspace("build and test it", "/monorepo")
     ///     .with_exec_timeout(Duration::from_secs(2400));
     ///
     /// // And the other direction: an unattended fleet job that would rather give
     /// // up on a command than sit behind it.
-    /// let impatient = TaskContract::workspace("lint it", "/repo", Verification::None)
+    /// let impatient = TaskContract::workspace("lint it", "/repo")
     ///     .with_exec_timeout(Duration::from_secs(60));
     ///
     /// assert!(patient.exec_timeout > DEFAULT_EXEC_TIMEOUT);

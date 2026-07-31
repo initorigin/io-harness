@@ -1,0 +1,23 @@
+PR #78, run 30632486538 — the first execution of any Win32 path in this crate.
+
+test (windows-latest)  pass
+  tests\sandbox_job_object.rs — 6 passed, 0 failed, 10.18s:
+    windows_reports_the_job_object_and_not_the_floor          Backend::WindowsJobObject
+    the_process_limit_stops_the_run_and_the_job_is_what_says_so   F8
+    the_memory_limit_is_a_real_bound_and_is_named_as_one          F9 (memory)
+    the_cpu_limit_is_a_real_bound_and_is_named_as_one             F9 (CPU)
+    closing_the_job_kills_the_grandchild                          F6
+    without_the_job_the_grandchild_survives                       F6 negative control
+
+The negative control is what makes F6 proof rather than coincidence: the same
+three-generation tree, with the job disabled, leaves the grandchild running.
+
+Both risks flagged as unverifiable before this run held on a real kernel:
+  - a job-terminated process does yield a non-zero exit code, so the cap
+    attribution in cap_hit is reached;
+  - the 90%-of-cap memory heuristic does fire against the chunked allocator.
+
+test (macos-latest)  pass 5m9s
+test (ubuntu-latest) pass 5m40s
+lint pass  msrv pass  docs.rs (nightly) pass  links-consumer pass
+CodeQL pass  Analyze (rust) pass  Analyze (actions) pass

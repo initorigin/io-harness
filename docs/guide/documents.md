@@ -42,11 +42,11 @@ use io_harness::{TaskContract, Verification};
 let contract = TaskContract::workspace(
     "Add the Q3 revenue row to the summary workbook.",
     "/path/to/repo",
-    Verification::DocumentContains {
-        file: "reports/summary.xlsx".into(),
-        needle: "Q3".into(),
-    },
-);
+)
+   .with_verification(Verification::DocumentContains {
+       file: "reports/summary.xlsx".into(),
+       needle: "Q3".into(),
+   });
 ```
 
 It gates on the document's *extracted* text, and it exists because the criterion

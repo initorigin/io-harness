@@ -135,7 +135,6 @@ async fn main() -> io_harness::Result<()> {
          before you edit anything: write your plan with todo_write, and use \
          ask_question to find out which file the operator means. Do not guess.",
         root,
-        Verification::None,
     )
     .with_max_steps(8)
     .with_responder(responder.clone());
@@ -231,11 +230,11 @@ async fn main() -> io_harness::Result<()> {
          says, then once with agent=\"author\" to write result.txt. The searcher \
          cannot write, so do not ask it to.",
         tree_root,
-        Verification::WorkspaceFileContains {
-            file: "result.txt".into(),
-            needle: "42".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "result.txt".into(),
+        needle: "42".into(),
+    })
     .with_max_steps(8)
     .with_agents(
         Agents::new()

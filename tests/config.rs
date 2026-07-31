@@ -14,7 +14,6 @@ use io_harness::config::{Config, Scope};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
     run_with, Act, ApproveAll, Effect, Policy, Provider, RunOutcome, Store, TaskContract,
-    Verification,
 };
 use serde_json::json;
 
@@ -506,7 +505,7 @@ fn write_call(path: &str, content: &str) -> ToolCall {
 }
 
 fn contract(root: &Path) -> TaskContract {
-    TaskContract::workspace("edit the workspace", root, Verification::None)
+    TaskContract::workspace("edit the workspace", root)
 }
 
 /// The boundary under test, as a file: writes are denied by default and one
@@ -979,7 +978,7 @@ fn an_unknown_key_inside_an_agent_table_is_rejected_naming_it() {
 /// for a file that declares agents and nothing else.
 #[test]
 fn a_file_that_declares_only_agents_still_reaches_the_contract() {
-    use io_harness::{TaskContract, Verification};
+    use io_harness::TaskContract;
 
     let user_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -991,11 +990,7 @@ fn a_file_that_declares_only_agents_still_reaches_the_contract() {
     );
 
     let config = Config::discover(project.path()).unwrap();
-    let contract = config.apply_to(TaskContract::workspace(
-        "do the thing",
-        project.path(),
-        Verification::None,
-    ));
+    let contract = config.apply_to(TaskContract::workspace("do the thing", project.path()));
 
     assert_eq!(contract.agents.names(), vec!["searcher"]);
     assert!(contract.agents.get("searcher").unwrap().deny_write);

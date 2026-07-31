@@ -37,6 +37,7 @@ use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store, TodoI
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
 use crate::tools::git::{Git, GitCmd, GitOutcome};
+use crate::tools::shell::{Shell, ShellOutcome};
 #[cfg(feature = "barcode")]
 use crate::tools::BARCODE_DECODE_TOOL;
 #[cfg(feature = "pptx")]
@@ -50,8 +51,9 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL, GREP_TOOL,
-    READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
+    Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
+    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_TOOL,
+    TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -114,6 +116,20 @@ pub(crate) const NO_TOOL_CALL: &str = "(no tool call)";
 /// How many grep hits are folded into one observation. A relevance ceiling, not a
 /// size one — the size ceiling is the budget-derived per-entry cap on top of it.
 const OBS_GREP_CAP: usize = 50;
+
+/// How many directory entries are folded into one observation (0.24.0).
+///
+/// Higher than the grep ceiling because the units differ: a grep hit is a line of
+/// source and an entry is a name, so a listing costs roughly an order of
+/// magnitude less per item. It exists because a directory is not obliged to be
+/// small — `node_modules` and a build output tree run to thousands of entries,
+/// and a tool that spent a whole turn's budget on one of them would be unusable
+/// exactly where looking before reading matters most.
+///
+/// What is dropped is *stated* in the observation, with the true total, because a
+/// model that cannot tell a partial listing from a complete one will conclude the
+/// files it needs do not exist.
+const OBS_LIST_DIR_CAP: usize = 200;
 
 /// Why a run stopped.
 ///
@@ -462,8 +478,11 @@ pub async fn run_observed<P: Provider>(
 /// let contract = TaskContract::workspace(
 ///     "make the failing test in tests/parse.rs pass",
 ///     "/path/to/repo",
-///     Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
-/// );
+/// )
+///     .with_verification(Verification::Command {
+///         argv: vec!["cargo".into(), "test".into()],
+///         expect_exit: 0,
+///     });
 ///
 /// // Three tiers, and the middle one is the only one anybody is asked about.
 /// // `Policy::default()` already denies `.env`, `*.pem` and the other secret
@@ -666,7 +685,7 @@ pub(crate) async fn run_with_extras<P: Provider>(
         // checking. Refuse loudly instead.
         None if caller_enforces => Err(crate::error::Error::Config(
             "a permission policy requires workspace mode — build the contract \
-             with TaskContract::workspace(goal, root, verify). Single-file \
+             with TaskContract::workspace(goal, root). Single-file \
              contracts are not policy-enforced in 0.4.0."
                 .into(),
         )),
@@ -891,7 +910,7 @@ pub async fn resume_with<P: Provider>(
 ///                  Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let store = Store::open("runs.db")?;
 /// let provider = OpenRouter::from_env()?;
 /// let policy = Policy::permissive();
@@ -943,7 +962,7 @@ pub async fn resume_with_answer<P: Provider>(
 ///                  Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let result = resume_with_answer_observed(
 ///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?,
 ///     7, 3, "io.local.toml", &Policy::permissive(), &ApproveAll, &Ignore,
@@ -984,7 +1003,7 @@ pub async fn resume_with_answer_observed<P: Provider>(
 ///                  Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let store = Store::open("runs.db")?;
 ///
 /// // The question belongs to whichever agent asked it — often a child — but the run id
@@ -1037,7 +1056,7 @@ pub async fn resume_tree_with_answer<P: Provider>(
 ///                  OpenRouter, Policy, Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let result = resume_tree_with_answer_observed(
 ///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, 7, 4,
 ///     "keep the old column", &Policy::permissive(), &ApproveAll,
@@ -1360,7 +1379,7 @@ pub async fn resume_with_observed<P: Provider>(
         // nothing was checking.
         None if caller_enforces => Err(crate::error::Error::Config(
             "a permission policy requires workspace mode — build the contract \
-             with TaskContract::workspace(goal, root, verify). Single-file \
+             with TaskContract::workspace(goal, root). Single-file \
              contracts are not policy-enforced."
                 .into(),
         )),
@@ -3047,8 +3066,11 @@ struct Tree<'a, P: Provider> {
 /// let contract = TaskContract::workspace(
 ///     "document every public module under docs/, one file per module",
 ///     "/path/to/repo",
-///     Verification::WorkspaceFileContains { file: "docs/index.md".into(), needle: "##".into() },
-/// );
+/// )
+///     .with_verification(Verification::WorkspaceFileContains {
+///         file: "docs/index.md".into(),
+///         needle: "##".into(),
+///     });
 ///
 /// // The root's boundary, and therefore the ceiling for the entire tree: a child
 /// // inherits it through `Policy::contain` and may only narrow it, so no
@@ -4181,7 +4203,7 @@ async fn spawn_child<P: Provider>(
         file: file.into(),
         needle: needle.into(),
     };
-    let mut child_contract = TaskContract::workspace(goal, &tree.root, verify);
+    let mut child_contract = TaskContract::workspace(goal, &tree.root).with_verification(verify);
     // 0.22.0 — the tree's web declaration, not one the model asked for. A child
     // inherits exactly what the root was given and has no way to widen it: the
     // spawn arguments are never read for this, so "give the sub-agent web access"
@@ -4893,6 +4915,77 @@ async fn dispatch(
                 }
             }
         }
+        LIST_DIR_TOOL => {
+            // No path means the workspace root, which is the listing an agent
+            // opening an unfamiliar repository wants first. `resolve` turns the
+            // empty string into the root and the policy sees it as such, so this
+            // is a default rather than a special case.
+            let path = s("path").unwrap_or_default();
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                // The same act, the same check, the same code as a `read_file` on
+                // this path: enumerating a directory the operator denied reading
+                // is that read, done one level up.
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => match ws.list_dir(&target) {
+                    Ok(entries) => {
+                        let shown: Vec<String> = entries
+                            .iter()
+                            .take(OBS_LIST_DIR_CAP)
+                            .map(Entry::to_string)
+                            .collect();
+                        // Said in the listing, not only in the count the trace
+                        // keeps: the model reads the text and nothing else, and
+                        // what it does about a truncated directory — narrow to a
+                        // subdirectory, or glob it with `find` — is a decision it
+                        // can only make if it is told.
+                        let elided = entries.len() - shown.len();
+                        let note = match elided {
+                            0 => String::new(),
+                            n => format!(
+                                "\n[showing {} of {} entries; {n} not listed — list a \
+                                 subdirectory or use find to narrow]",
+                                shown.len(),
+                                entries.len()
+                            ),
+                        };
+                        Dispatched::Continue {
+                            decision: format!("list_dir {target} ({} entries)", entries.len()),
+                            obs: bound(
+                                &format!("\n[list_dir {target}]\n{}{note}\n", shown.join("\n")),
+                                cap,
+                                ObsKind::Find,
+                            ),
+                            // A listing is a filename answer about a path, like
+                            // `find`'s: a later listing of the same directory is
+                            // the same question asked again and supersedes this
+                            // one. It is not its own kind because nothing in the
+                            // context layer would treat it differently.
+                            kind: ObsKind::Find,
+                            target: Some(target.clone()),
+                            changed: false,
+                            remember,
+                        }
+                    }
+                    Err(e) => Dispatched::go("list_dir error", format!("\n[list_dir error] {e}\n")),
+                },
+            }
+        }
         READ_FILE_TOOL => {
             let path = s("path").unwrap_or_default();
             match gate(
@@ -5158,6 +5251,220 @@ async fn dispatch(
                         Err(e) => Dispatched::go("edit error", format!("\n[edit error] {e}\n")),
                     }
                 }
+            }
+        }
+        SHELL_TOOL => {
+            let line_src = s("line").unwrap_or_default();
+            if line_src.trim().is_empty() {
+                return Ok(Dispatched::go(
+                    "shell missing line",
+                    "\n[shell error] shell needs a non-empty \"line\" string holding the command \
+                     line to run\n",
+                ));
+            }
+            // Refusing is an observation, not an error. The model wrote something
+            // this tool does not admit, is told which construct and why, and gets
+            // to write something else — the same shape as a policy refusal, and
+            // for the same reason: an `Err` here would end the run over a
+            // recoverable mistake.
+            let parsed = match crate::tools::shell::parse(line_src) {
+                Ok(l) => l,
+                Err(r) => {
+                    return Ok(Dispatched::go(
+                        format!("shell refused: {}", r.construct),
+                        format!("\n[shell refused] {r}\n"),
+                    ))
+                }
+            };
+            let plan = match crate::tools::shell::plan(&parsed, ws.root()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(Dispatched::go(
+                        "shell refused: a path outside the workspace",
+                        format!("\n[shell refused] {e}\n"),
+                    ))
+                }
+            };
+
+            // Every check for the whole line happens here, before the first
+            // spawn. This is the criterion the tool exists to satisfy: a line
+            // whose second stage is denied must not run its first, so a loop that
+            // checked-then-ran each stage in turn would be wrong however careful
+            // it looked.
+            let mut remembered: Vec<Rule> = Vec::new();
+            for (cmd, planned) in parsed.commands().zip(plan.iter()) {
+                if let Some(dest) = &planned.cd_target {
+                    // `cd` spawns nothing, so there is no program to check against
+                    // `Act::Exec`. What it does do is choose where every later
+                    // stage runs, which is a read of that directory.
+                    let rel = relative_to(ws.root(), dest);
+                    match gate(
+                        ws,
+                        approver,
+                        store,
+                        run_id,
+                        step,
+                        Act::Read,
+                        &rel,
+                        None,
+                        watch,
+                        depth,
+                    )
+                    .await?
+                    {
+                        Gated::Refused { decision, obs } => {
+                            return Ok(Dispatched::go(decision, obs))
+                        }
+                        Gated::Paused { request_id } => {
+                            return Ok(Dispatched::Pause { request_id })
+                        }
+                        Gated::Go { remember, .. } => remembered.extend(remember),
+                    }
+                    record_shell_authorisation(ws, store, run_id, step, Act::Read, &rel)?;
+                } else {
+                    // The same two targets `exec` checks, per sub-command rather
+                    // than per call: the program alone, which is what
+                    // `deny_exec("rm")` names, and this stage's own joined argv,
+                    // which is what `allow_exec("git log*")` names. Checking the
+                    // whole line as one string could not tell one stage from
+                    // another, which is the entire point of parsing it.
+                    let program = cmd.argv[0].clone();
+                    let joined = cmd.argv.join(" ");
+                    let mut targets = vec![program.clone()];
+                    if joined != program {
+                        targets.push(joined);
+                    }
+                    for target in targets {
+                        match gate(
+                            ws,
+                            approver,
+                            store,
+                            run_id,
+                            step,
+                            Act::Exec,
+                            &target,
+                            None,
+                            watch,
+                            depth,
+                        )
+                        .await?
+                        {
+                            Gated::Refused { decision, obs } => {
+                                return Ok(Dispatched::go(decision, obs))
+                            }
+                            Gated::Paused { request_id } => {
+                                return Ok(Dispatched::Pause { request_id })
+                            }
+                            Gated::Go { remember, .. } => remembered.extend(remember),
+                        }
+                        record_shell_authorisation(ws, store, run_id, step, Act::Exec, &target)?;
+                    }
+                }
+
+                // Redirect targets are paths, so they take the path-resolved check
+                // `write_file` and `read_file` take — not the name match an
+                // `Act::Exec` rule performs. A rule denying `secrets/*` has to
+                // catch `> secrets/key` for the boundary to mean anything.
+                for (kind, target) in &planned.redirects {
+                    let Some(path) = target else { continue };
+                    let act = if kind.is_write() {
+                        Act::Write
+                    } else {
+                        Act::Read
+                    };
+                    let rel = relative_to(ws.root(), path);
+                    match gate(
+                        ws, approver, store, run_id, step, act, &rel, None, watch, depth,
+                    )
+                    .await?
+                    {
+                        Gated::Refused { decision, obs } => {
+                            return Ok(Dispatched::go(decision, obs))
+                        }
+                        Gated::Paused { request_id } => {
+                            return Ok(Dispatched::Pause { request_id })
+                        }
+                        Gated::Go { remember, .. } => remembered.extend(remember),
+                    }
+                    record_shell_authorisation(ws, store, run_id, step, act, &rel)?;
+                }
+            }
+
+            let outcome = Shell::new(exec_timeout, cap).run(&parsed, &plan).await?;
+            let (decision, obs) = match &outcome {
+                ShellOutcome::Unavailable { reason } => (
+                    "shell command unavailable".to_string(),
+                    format!(
+                        "\n[shell unavailable] {reason}. This machine cannot run that command; \
+                         try another, or carry on without it.\n"
+                    ),
+                ),
+                ShellOutcome::TimedOut { after } => (
+                    "shell timed out".to_string(),
+                    format!(
+                        "\n[shell timed out] `{line_src}` was killed after {}s without \
+                         finishing. Nothing it printed was captured. Run something narrower, or \
+                         expect this to need longer than this run allows.\n",
+                        after.as_secs()
+                    ),
+                ),
+                ShellOutcome::Ran {
+                    code,
+                    stdout,
+                    stderr,
+                    elided,
+                    ran,
+                } => {
+                    let body = crate::verify::joined_streams(stdout, stderr);
+                    let total = parsed.commands().count();
+                    (
+                        format!(
+                            "shell {}",
+                            code.map_or("(signal)".to_string(), |c| format!("exit {c}"))
+                        ),
+                        format!(
+                            "\n[shell `{line_src}` {}{}]{}\n{}\n",
+                            code.map_or("killed by a signal".to_string(), |c| format!("exit {c}")),
+                            if *ran < total {
+                                // `&&` and `||` skipping is the difference between
+                                // a command that failed and one that never ran,
+                                // and a model that cannot tell them apart will
+                                // debug the wrong stage.
+                                format!(
+                                    ", {ran} of {total} sub-commands ran; the rest were skipped \
+                                     by `&&` or `||`"
+                                )
+                            } else {
+                                String::new()
+                            },
+                            if *elided > 0 {
+                                format!(
+                                    " ({elided} characters of output elided from the middle; the \
+                                     start and the end are both here)"
+                                )
+                            } else {
+                                String::new()
+                            },
+                            if body.trim().is_empty() {
+                                "(no output)"
+                            } else {
+                                body.trim_end()
+                            }
+                        ),
+                    )
+                }
+            };
+            Dispatched::Continue {
+                decision,
+                obs: bound(&obs, cap, ObsKind::Tool),
+                // `Tool`, matching `exec`, because the target is the name of the
+                // thing that answered rather than the subject of the answer: two
+                // different command lines gave two different results, and letting
+                // the later one supersede the earlier would discard one of them.
+                kind: ObsKind::Tool,
+                target: Some(line_src.to_string()),
+                changed: false,
+                remember: remembered,
             }
         }
         EXEC_TOOL => {
@@ -5887,6 +6194,79 @@ enum Gated {
     Refused { decision: String, obs: String },
     /// An approver deferred the decision.
     Paused { request_id: i64 },
+}
+
+/// Record that one sub-command or one redirect target of a `shell` line was
+/// authorised, with the rule and layer that authorised it.
+///
+/// The crate does not otherwise record allows. A [`PolicyEvent`] is written for a
+/// refusal and for an approver's decision, and a permitted read or write leaves
+/// no row — which is right for a single-target tool, where the step's own
+/// decision already says what happened to the one thing it touched.
+///
+/// A `shell` line is not a single target. `a | b > out` is three authorisations,
+/// and a trace that recorded only "shell exit 0" would leave an operator unable
+/// to answer which stage was allowed to run and under which rule. So this is the
+/// one place allows are recorded, and it is recorded per stage rather than per
+/// line because per line is the thing that carries no information.
+///
+/// **This is a record, not a second boundary.** [`gate`] has already decided and
+/// has already refused or paused if it was going to; re-evaluating here would be
+/// a check that could disagree with the one that actually held. The verdict is
+/// recomputed only to name the deciding rule, which `gate` does not hand back,
+/// and the match below mirrors `gate`'s own dispatch exactly so the rule named is
+/// the rule that decided.
+fn record_shell_authorisation(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    act: Act,
+    target: &str,
+) -> Result<()> {
+    let verdict = match act {
+        Act::Exec | Act::Net => ws.policy().check(act, target),
+        Act::Read | Act::Write if Path::new(target).is_absolute() => ws.policy().check(act, target),
+        Act::Read | Act::Write => ws.check_path(act, target),
+    };
+    // Only an allow. A refusal already has its own row from `gate`, and an
+    // approver's decision already has one too; writing a second would double-count
+    // the same act in a trace an operator reads as a list of what happened.
+    if verdict.effect != Effect::Allow {
+        return Ok(());
+    }
+    let mut ev = PolicyEvent::decision(
+        step,
+        format!("{act:?}").to_lowercase(),
+        target,
+        "allow",
+        "policy",
+    );
+    ev.rule = verdict.rule;
+    ev.layer = verdict.layer;
+    store.record_event(run_id, &ev)
+}
+
+/// The workspace-relative form of an absolute path the shell planner resolved.
+///
+/// [`gate`] checks a read or a write through `Workspace::check_path`, which takes
+/// a path relative to the root — the same string a `write_file` call carries. The
+/// shell planner works in absolute paths, because absolute is what it must hand
+/// to the operating system. This is the only conversion between the two, kept in
+/// one place so that the string the policy sees and the path the process opens
+/// cannot drift apart: two conversions would be two chances to disagree, and the
+/// disagreement would be silent.
+///
+/// A path equal to the root becomes `.` rather than the empty string, which is
+/// what a `cd` with no argument produces and what a policy rule for the root
+/// itself is written against.
+fn relative_to(root: &std::path::Path, path: &std::path::Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    if rel.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        rel.to_string_lossy().into_owned()
+    }
 }
 
 /// Evaluate one action against the policy, consulting `approver` only for the
@@ -6754,6 +7134,22 @@ fn workspace_tools() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: LIST_DIR_TOOL.to_string(),
+            description: "List what is immediately inside one directory: each entry with its \
+                          kind (file, dir, link) and each file's size in bytes. One level only \
+                          — a subdirectory is named, not descended into, so list it in turn to \
+                          go deeper. Use this to learn the shape of an unfamiliar tree before \
+                          reading anything; use find when you already know what the name looks \
+                          like, and grep when you know what the contents say."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Directory relative to the workspace root, e.g. src. Omit it for the root itself." }
+                }
+            }),
+        },
+        ToolSpec {
             name: READ_FILE_TOOL.to_string(),
             description: "Read a file (path relative to the workspace root) into context.".to_string(),
             parameters: json!({
@@ -6954,6 +7350,35 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["argv"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_TOOL.to_string(),
+            description: "Run a command LINE, with pipelines, redirects and sequences — use this \
+                          when the work is `a | b`, `a && b`, `a; b` or `a > file`, and use \
+                          `exec` when it is a single command. The line is parsed here, not by a \
+                          shell: every sub-command in it is checked against the execute policy \
+                          and every redirect target against the file policy BEFORE anything \
+                          runs, so if one stage is denied then no stage runs. Supported: single \
+                          and double quotes, backslash escapes, `|`, `;`, `&&`, `||`, and the \
+                          redirects `>` `>>` `<` `2>` `2>>` `2>&1`. `cd` works and applies to \
+                          the rest of the line. REFUSED, each with a reason: `$(...)` and \
+                          backticks, `$VAR` and `${VAR}`, `$((...))`, `<(...)`, subshells `(...)`, \
+                          `{...}`, heredocs `<<`, background `&`, `if`/`for`/`while`/`case`, and \
+                          the glob characters `*` `?` `[` `]` outside quotes — quote a character \
+                          to pass it literally, and use `find` or `list_dir` to choose paths \
+                          rather than globbing. A line that runs too long is killed and reported \
+                          as a timeout."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "line": {
+                        "type": "string",
+                        "description": "The command line, e.g. \"cd infra && kubectl get pods | grep CrashLoop\" or \"cargo test 2>&1\".",
+                    }
+                },
+                "required": ["line"]
             }),
         },
     ];

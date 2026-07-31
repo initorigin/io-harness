@@ -17,8 +17,11 @@ use io_harness::{run_with, ApproveAll, Anthropic, Policy, Store, TaskContract,
 let contract = TaskContract::workspace(
     "update the README's install line to the current release",
     "/path/to/repo",
-    Verification::WorkspaceFileContains { file: "README.md".into(), needle: "install".into() },
 )
+.with_verification(Verification::WorkspaceFileContains {
+    file: "README.md".into(),
+    needle: "install".into(),
+})
 .with_web(WebAccess::search().max_uses(3).allow("crates.io"));
 
 let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;

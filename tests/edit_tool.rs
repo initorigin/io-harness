@@ -12,7 +12,7 @@ use io_harness::policy::Policy;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::workspace::Wrote;
 use io_harness::tools::Workspace;
-use io_harness::{run_with, ApproveAll, Provider, Store, TaskContract, Verification};
+use io_harness::{run_with, ApproveAll, Provider, Store, TaskContract};
 use serde_json::json;
 
 struct MockScript {
@@ -59,7 +59,7 @@ fn fixture() -> tempfile::TempDir {
 }
 
 fn contract(root: &std::path::Path) -> TaskContract {
-    TaskContract::workspace("edit the file", root, Verification::None).with_max_steps(6)
+    TaskContract::workspace("edit the file", root).with_max_steps(6)
 }
 
 // ---------------------------------------------------------------------------

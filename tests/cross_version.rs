@@ -255,24 +255,21 @@ fn tree_contract(root: &Path, max_steps: u32) -> TaskContract {
     TaskContract::workspace(
         "COORDINATOR: delegate to sub-agents; do not write files yourself.",
         root,
-        Verification::WorkspaceFileContains {
-            file: "b.txt".into(),
-            needle: "BETA".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "b.txt".into(),
+        needle: "BETA".into(),
+    })
     .with_max_steps(max_steps)
 }
 
 fn out_contract(root: &Path, needle: &str, max_steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "write out.txt",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("write out.txt", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: needle.into(),
-        },
-    )
-    .with_max_steps(max_steps)
+        })
+        .with_max_steps(max_steps)
 }
 
 fn containment() -> Containment {

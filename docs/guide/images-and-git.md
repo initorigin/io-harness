@@ -25,8 +25,11 @@ use io_harness::{Media, TaskContract, Verification};
 let contract = TaskContract::workspace(
     "the layout in this screenshot is wrong; fix the CSS",
     "/path/to/repo",
-    Verification::WorkspaceFileContains { file: "site.css".into(), needle: "grid".into() },
 )
+.with_verification(Verification::WorkspaceFileContains {
+    file: "site.css".into(),
+    needle: "grid".into(),
+})
 .with_images([Media::image("image/png", png_bytes)?]);
 ```
 

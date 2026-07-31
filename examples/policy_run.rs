@@ -60,11 +60,11 @@ async fn main() -> io_harness::Result<()> {
          report what it contains. Step 2: edit src/a.rs and src/b.rs so that \
          a() + b() returns 42 between them.",
         dir.path(),
-        Verification::Command {
-            argv: vec!["cargo".into(), "test".into(), "--offline".into()],
-            expect_exit: 0,
-        },
     )
+    .with_verification(Verification::Command {
+        argv: vec!["cargo".into(), "test".into(), "--offline".into()],
+        expect_exit: 0,
+    })
     // Without this, a model that meets a refusal tends to retry the same denied
     // action until the step budget is gone — the refusal is bounded by the step
     // cap, but the run is wasted. Telling it to move on is what turns a refusal

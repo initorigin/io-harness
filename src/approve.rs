@@ -630,13 +630,13 @@ impl Responder for FixedResponder {
 /// [`StdinApprover`]: a run that is waiting for a human has nothing else to do.
 ///
 /// ```no_run
-/// use io_harness::{StdinResponder, TaskContract, Verification};
+/// use io_harness::{StdinResponder, TaskContract};
 /// use std::sync::Arc;
 ///
 /// // A CLI that can hold a conversation about intent: the agent asks, the operator
 /// // types, the run carries on. An empty line declines, and the run pauses instead —
 /// // the question is durable, so nothing is lost by deciding later.
-/// let contract = TaskContract::workspace("port the parser", "/repo", Verification::None)
+/// let contract = TaskContract::workspace("port the parser", "/repo")
 ///     .with_responder(Arc::new(StdinResponder));
 /// # let _ = contract;
 /// ```

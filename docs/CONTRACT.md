@@ -129,17 +129,94 @@ change for every `match` a caller wrote.
 | --- | --- | --- |
 | macOS | Supported, full suite in CI | Native, `sandbox-exec` |
 | Linux | Supported, full suite in CI | Native, namespaces and rlimits |
-| Windows | Supported, full suite in CI | **Portable floor only** |
+| Windows | Supported, full suite in CI | **Native resource containment only** |
 
-On Windows the Job Object backend is designed and not implemented. Containment
-there is the portable floor: an ephemeral working directory, network denied, and
-the wall clock. CPU and memory caps **do not fire**. Do not read "sandboxed" on
-Windows as "resource-capped".
+Since 0.24.0 a Windows run is contained by a Job Object. Memory, CPU and active
+process count are real bounds, the whole process tree dies when the job handle
+closes, and Windows is the first backend anywhere to enforce
+`SandboxLimits::max_processes`.
+
+**A Job Object contains resources and nothing else.** There is no filesystem
+facility and no network facility in one. macOS confines writes to the working
+directory and denies outbound network; Linux does the same through mount and
+network namespaces; Windows does neither. So "sandboxed" on Windows means
+resource-capped and does not mean access-confined, and the two must not be read
+as the same claim. The access half is `AppContainer` and it is not written yet.
+
+Two further differences, stated rather than left to be discovered. The job's CPU
+limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time as
+well, so the cap is weaker on Windows for a kernel-heavy workload. And
+`JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes an allocation *fail* rather than
+terminating the process: a payload over the cap is never allowed to hold the
+memory, and typically dies of its own failed allocation rather than being killed.
+
+## What the `shell` tool will and will not run (0.24.0)
+
+This is contract rather than implementation detail: an operator writing a policy
+needs to know what their agent cannot express, and a model that discovers the
+refusal set one construct at a time spends steps doing it.
+
+`shell` takes a command line, parses it in this crate, and checks every
+sub-command against `Act::Exec` and every redirect target against `Act::Write`
+or `Act::Read` **before any process starts**. A line with a denied stage runs
+none of its stages. There is no `sh -c` and no `cmd /c` after the parse.
+
+**Admitted:** single quotes, double quotes, backslash escapes, `|`, `;`, `&&`,
+`||`, the redirects `>` `>>` `<` `2>` `2>>` `2>&1`, and `cd`, which applies to
+the remainder of the line.
+
+**Refused, each by name and with a reason:** command substitution `$( )` and
+backticks; parameter expansion `$VAR` and `${VAR}`; arithmetic `$(( ))`; process
+substitution `<( )`; subshells `( )`; brace groups `{ }`; here-documents `<<`;
+background `&`; the `if`, `then`, `elif`, `else`, `fi`, `for`, `while`, `until`,
+`do`, `done`, `case`, `esac`, `function` and `select` keywords in command
+position; and the glob characters `*` `?` `[` `]` outside quotes. Quoting is the
+escape hatch — a quoted `$` is a literal, not an expansion.
+
+The refusals are enforced by an allowlist at the lexer, not a blocklist: a
+character outside the permitted set for the current state is refused, so a
+construct nobody anticipated fails closed rather than being absorbed into a
+word. **This set may widen in a later release and will not silently narrow.** A
+line that runs today will still run.
+
+Two consequences worth stating because they are limitations rather than
+oversights. Globs are refused rather than expanded: expanding one would let the
+argv the policy checked differ from the argv that ran, since the filesystem can
+change in between, and passing it through unexpanded would mean something
+different from what a shell would have done. Use `find` or `list_dir` to choose
+paths. And `2>&1` on a stage whose stdout is piped is refused, because merging
+the two streams into a pipe needs a descriptor duplication this crate does not
+perform; on a final stage it merges in the captured output.
+
+`cd` is applied when the line is planned, not when it runs, so in
+`cd nope && ls > out.txt` the redirect resolves under `nope/` even though a real
+shell would have failed the `cd` and written in the original directory. Both
+paths are checked and neither escapes the root. The alternative — resolving at
+run time — would mean the policy approved one path and the process opened
+another.
 
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
 is fixed as of 0.23.0.
+
+**`CompletionRequest` and `CompletionResponse` are not `#[non_exhaustive]`, and
+adding a field to either is a break (0.24.0).** `EventKind`, `Backend` and `Cap`
+were marked `#[non_exhaustive]` in 0.24.0, so a variant added to any of them is
+no longer a break. These two structs were considered for the same treatment and
+deliberately left out. The attribute forbids struct-literal construction —
+including `..Default::default()` — from outside this crate, and
+`Provider::complete` must *return* a `CompletionResponse`, so marking it would
+leave the crate's primary extension point constructible only through
+`default()`-then-assign or through a builder API that does not exist. That is a
+permanent cost on everyone who implements `Provider`, paid to avoid a break
+whose fix is mechanical.
+
+So the position is: **these two structs may gain fields in a later minor, and
+that will break struct literals of them.** It is written here rather than left to
+be discovered, and 0.22.0 is the precedent — it added three fields and broke
+exactly that. If you construct either in a mock provider or a test, prefer
+`..Default::default()` so that a new field costs you nothing.
 
 **`rusqlite::Error` is in the public API, and the intent is to take it out
 (0.23.0).** `Error::State(#[from] rusqlite::Error)` carries the storage

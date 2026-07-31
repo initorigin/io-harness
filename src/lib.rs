@@ -26,10 +26,13 @@
 //!     let contract = TaskContract::workspace(
 //!         "the test suite is failing; find out why and fix it",
 //!         "/path/to/repo",
-//!         // The project's own command decides whether the work is done. Nothing
-//!         // on this path is Rust-aware.
-//!         Verification::Command { argv: vec!["npm".into(), "test".into()], expect_exit: 0 },
-//!     );
+//!     )
+//!     // The project's own command decides whether the work is done. Nothing
+//!     // on this path is Rust-aware.
+//!     .with_verification(Verification::Command {
+//!         argv: vec!["npm".into(), "test".into()],
+//!         expect_exit: 0,
+//!     });
 //!
 //!     // src/ is writable, secrets/ is refused outright and never reaches a human,
 //!     // and the agent may run the test runner but nothing that publishes.
@@ -156,12 +159,11 @@
 //! the connection.
 //!
 //! ```
-//! use io_harness::{TaskContract, Verification, WebAccess};
+//! use io_harness::{TaskContract, WebAccess};
 //!
 //! let contract = TaskContract::workspace(
 //!     "update the install line to the current release",
 //!     "/path/to/repo",
-//!     Verification::None,
 //! )
 //! .with_web(WebAccess::search().max_uses(3).allow("crates.io"));
 //!
@@ -250,13 +252,26 @@
 //! | --- | --- |
 //! | macOS | Native, `sandbox-exec` |
 //! | Linux | Native, namespaces and rlimits |
-//! | Windows | Portable floor only |
+//! | Windows | Native resource containment (memory, CPU, process count, tree kill); no filesystem or network boundary |
 //!
-//! The portable floor is the honest floor: on Windows the
-//! [`Backend::WindowsJobObject`] path was designed and never implemented, so a
-//! Windows run reports [`Backend::PortableFloor`] and only the wall-clock cap
-//! fires. [`Cap::Cpu`] and [`Cap::Memory`] rest on unix `rlimit` mechanisms with
-//! no Windows equivalent, and there is no kernel network boundary there either.
+//! The Windows row is deliberately not the word "Native" on its own, because it
+//! would not mean there what it means in the two rows above it. Since 0.24.0 a
+//! Windows run is contained by a Job Object, so [`Backend::WindowsJobObject`] is
+//! what the sandbox reports, [`Cap::Memory`], [`Cap::Cpu`] and the new
+//! [`Cap::Processes`] are real bounds rather than fields nothing applies, and
+//! Windows is the first backend anywhere to enforce
+//! [`SandboxLimits::max_processes`]. But **a Job Object contains resources and
+//! nothing else** — there is no filesystem facility and no network facility in
+//! one. macOS confines writes to the working directory and denies outbound
+//! network; Linux does the same through mount and network namespaces; Windows
+//! does neither, and the access half is `AppContainer`, which is not written yet.
+//!
+//! Two smaller differences worth knowing rather than discovering: the job's CPU
+//! limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time
+//! too, so the cap is genuinely weaker there; and the memory limit makes an
+//! allocation *fail* rather than terminating the process, so a payload usually
+//! dies of its own failed allocation rather than being killed outright.
+//!
 //! The full suite runs on all three in CI.
 //!
 //! # Guides
