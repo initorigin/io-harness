@@ -111,29 +111,58 @@ tasks:
     references `Sandbox` nowhere, and the job is on the verification path. Without this task `shell_kill`
     leaks grandchildren on the one platform with no process group, which is the exact failure 0.24.0 shipped
     the Job Object to prevent.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T03
   acceptance_criteria:
-  - 'F2 — killing kills the tree. A handle whose command spawns a child that spawns a grandchild is killed,
-    and all three are gone, on all three platforms. The negative control is what makes containment worth
-    its cost: the same test with the job disabled must leave the grandchild running on Windows, so the
-    criterion proves containment rather than coincidence. *(the handle half of 0.24.0''s F6, which that
-    release could only assert through the sandbox''s own spawn path.)*
+  - 'F2 — killing kills the tree on macOS and Linux. A handle whose command spawns a child that spawns
+    a grandchild is killed, and all three are gone. The mechanism is a process group: each handle stage
+    is spawned as its own group leader and the kill signals the group, which reaches a grandchild whose
+    parent has already exited — the case every kill built on walking the process table misses. The negative
+    control is what makes it worth its cost: the same fixture killed by pid alone must leave the grandchild
+    running. *(the handle half of 0.24.0''s F6, which that release could only assert through the sandbox''s
+    own spawn path.)*
+
+    **Amended by `US-IO-HARNESS-0.25.0-I01`:** this criterion said "on all three platforms" with a Windows
+    negative control, and Windows is withdrawn from it rather than left standing as an unmet clause. Windows
+    has no process group; its equivalent is the Job Object, and assigning a child to one requires the
+    child handle at the spawn site, where this release''s interface carries a pid. Meeting it means changing
+    that interface and verifying unsafe Win32 through a CI round trip rather than on any machine this
+    work can reach. It moves to 0.26.0, which re-owns the Windows spawn path for AppContainer regardless,
+    and where the job assignment is a few lines in the same place rather than a second interface change.
+    Until then a Windows handle''s tree kill is best-effort and a grandchild whose parent already exited
+    may survive — stated in `docs/CONTRACT.md` and the sandbox guide rather than left to be discovered.
 
     '
-  - 'F5 — a handle''s processes are contained by the run''s sandbox, which is the claim the code does
-    not support today. The spawn reaches `Job::adopt` on Windows and the recorded containment on unix,
-    verified against the cap reason rather than against the child dying — a child that dies is not evidence
-    that anything contained it. This is a criterion and not a note because `src/tools/shell.rs` references
-    `Sandbox` nowhere, so inheriting containment is work rather than a consequence.
+  - 'F5 — a handle''s processes are contained by the platform''s own facility, which is the claim the
+    code did not support before this release. On unix that is the process group F2 asserts. **Amended
+    by `US-IO-HARNESS-0.25.0-I01`:** the Windows half — reaching the Job Object from the handle path —
+    moves to 0.26.0 with F2''s Windows clause and for the same reason. What is asserted here is unix only.
+    The original wording follows, since its argument still holds for the half that shipped: a handle''s
+    processes are contained by the run''s sandbox, which is the claim the code does not support today.
+    The spawn reaches `Job::adopt` on Windows and the recorded containment on unix, verified against the
+    cap reason rather than against the child dying — a child that dies is not evidence that anything contained
+    it. This is a criterion and not a note because `src/tools/shell.rs` references `Sandbox` nowhere,
+    so inheriting containment is work rather than a consequence.
 
     '
   files:
   - src/tools/shell.rs
   - src/sandbox.rs
   - src/sandbox/windows.rs
-  evidence: []
+  evidence:
+  - 'Unix: each handle stage is spawned as its own process-group leader via setpgid(0,0) in pre_exec,
+    and Handles::kill signals the group through kill_tree_and_group, guarded on getpgid(pid) == pid so
+    it can never signal the harness own group.'
+  - 'examples/orphan.rs is the fixture, written to be hostile to a table walk: the leaf waits until the
+    kernel says it has been reparented before publishing its pid, so the kill is not racing the middle
+    exit.'
+  - 'Proven non-vacuous by sabotage: stubbing the hook to `if false` makes killing_a_handle_kills_a_grandchild_whose_parent_already_exited
+    fail with "the grandchild survived the kill". The negative control without_a_process_group_the_grandchild_survives
+    kills by pid alone and asserts the grandchild lives.'
+  - Foreground shell and exec spawns are unchanged, guarded on capture.is_some(); their suites are green.
+  - WINDOWS DEFERRED to 0.26.0 by US-IO-HARNESS-0.25.0-I01. No Job Object on the handle path; the grandchild
+    gap remains and is documented rather than claimed closed.
 - id: US-IO-HARNESS-0.25.0-T05
   summary: Orphan every pre-existing handle on resume, once, where all four call sites reach it — in or
     immediately beside `record_resume_markers`. An orphaned handle is marked with a reason, is readable

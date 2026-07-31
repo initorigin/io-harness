@@ -576,6 +576,14 @@ versions:
       scheme with a separate network story bolted beside it. Only with this does Windows say
       *native* and mean by it what the other two rows mean.
 
+      It also closes what `US-IO-HARNESS-0.25.0-I01` deferred: routing a process handle's spawn
+      through a Job Object, so that killing a handle on Windows reaches a grandchild whose parent
+      has already exited. 0.25.0 shipped that guarantee on unix through process groups and could not
+      ship it here, because Windows has no process group and the Job Object needs the child handle at
+      the spawn site. Once this release owns `CreateProcessAsUserW`, the assignment is a few lines in
+      the same place rather than a second interface change — which is the argument for it landing
+      here rather than being forced into the release that discovered it.
+
       It is a release of its own, and 0.25.0's research is why. The security capabilities reach a
       child through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` on an attribute list, and
       `tokio::process::Command` cannot carry one on stable Rust — `raw_attribute` is still gated
