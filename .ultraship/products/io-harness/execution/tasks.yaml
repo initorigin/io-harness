@@ -1,285 +1,272 @@
 product: io-harness
-version: 0.26.0
+version: 0.27.0
 tasks:
-- id: US-IO-HARNESS-0.26.0-T01
-  summary: 'windows-latest CI smoke test for AppContainer viability: create a profile, derive its SID,
-    spawn a payload into it, print what happened and fail loudly on anything unexpected. Written and run
-    before any other line of this release.'
-  why_required: The whole release is conditional on this answer and no machine this work can reach runs
-    Windows. Its result selects between the full scope and fallback_scope by the triggers the contract
-    names.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - 'F1 — an AppContainer can be created and entered on the CI runner, or this release learns that it
-    cannot. A `windows-latest` job creates a profile, derives its SID, spawns a payload into it and reports
-    the payload''s exit status and output. Proven by the job''s own output, not by a test that skips:
-    a skipped test on the one platform this release is about is indistinguishable from a passing one,
-    so the smoke test prints what it found and fails loudly on anything it did not expect. This criterion
-    is the first work in the release and gates every other one; its failure is `fallback_scope` Trigger
-    A, not a bug to grind on.
-
-    '
-  files:
-  - src/sandbox/appcontainer.rs
-  - src/sandbox.rs
-  - Cargo.toml
-  evidence:
-  - '`src/sandbox/appcontainer.rs` — profile create/adopt/delete, SID derivation, the ACL grant, and the
-    `CreateProcessW` spawn with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list.'
-  - 'The smoke test lives in the module''s own `#[cfg(all(test, windows))]` block rather than in `tests/appcontainer.rs`,
-    and needs no `ci.yml` change: `cargo test` already runs lib tests on `windows-latest`. The declared
-    `files` list said otherwise and is corrected here.'
-  - '`an_appcontainer_can_be_created_and_entered` passed on `windows-latest` first time, CI run 30665329090.
-    Trigger A does not fire.'
-  - Every Win32 signature was type-checked before any CI round trip, by compiling the module standalone
-    against `x86_64-pc-windows-msvc`, so no runner time was spent on compile errors.
-- id: US-IO-HARNESS-0.26.0-T02
-  summary: 'The owned Windows spawn: CreateProcessW with a STARTUPINFOEXW carrying PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-    plus inheritable pipes, draining, kill-on-drop, exit collection and the wall-clock cap re-implemented
-    for this backend only.'
-  why_required: tokio::process::Command cannot carry an attribute list on stable Rust, and that attribute
-    is the only route a container SID has to a child. Without owning the spawn there is no AppContainer
-    at all.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.26.0-T01
-  acceptance_criteria:
-  - 'F4 — the owned spawn keeps every guarantee the shared runner gives. The AppContainer backend''s own
-    `CreateProcessW` path collects stdout and stderr, reports the real exit code, enforces the wall-clock
-    cap, and leaves nothing running when the run ends — each asserted separately against the backend,
-    because these are five re-implementations of code that already worked and the way this feature fails
-    is that one of them quietly does not. The negative control for the wall clock is a payload that finishes
-    inside the ceiling and must report its own exit code rather than a `Cap::Wall`.
-
-    '
-  files:
-  - src/sandbox/appcontainer.rs
-  evidence:
-  - 'The owned spawn: inheritable standard handles, output collection, the wall clock and kill-on-drop,
-    all for this backend only. `run_capped_hooked` is untouched.'
-  - '`the_wall_clock_kills_only_what_overruns` asserts both halves — a payload that overruns is capped,
-    one that finishes reports its own exit code.'
-  - Output goes to one temporary file rather than two pipes, which is smaller than the runner's mechanism
-    and is the argument `tools/handles.rs` already makes. Recorded as a known limitation because the two
-    streams then interleave.
-- id: US-IO-HARNESS-0.26.0-T03
-  summary: 'The boundary itself: an empty capability array, and explicit ACEs on the container SID for
-    the named grant set. Proven by a refused read and a refused socket, each against a negative control
-    that must succeed outside the container.'
-  why_required: This is the release's claim. A container that is created but grants everything is the
-    0.9.1 defect again in a worse place, which is why every criterion here carries its negative control.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.26.0-T02
-  acceptance_criteria:
-  - 'F2 — a payload inside an AppContainer cannot read what it was not granted. A file outside the granted
-    set is opened by a payload inside the container and the open is refused. **The negative control is
-    what makes it a criterion:** the identical payload, identical path, spawned *without* the AppContainer
-    must open the file successfully. A refusal that would also have been a refusal outside the container
-    — a path that does not exist, a file the operator themselves cannot read — proves nothing about the
-    boundary, and this is the exact shape 0.9.1 was paid to learn.
-
-    '
-  - 'F3 — a payload inside an AppContainer has no route off the machine. A payload inside the container
-    attempts an outbound connection and fails, and the identical payload spawned without the container
-    succeeds against the same address. Asserted against a socket the payload opens itself, never against
-    the proxy-env strip at `src/sandbox.rs:646-659`, which is documented best-effort and which a payload
-    that does not read those variables ignores completely. The capability array is empty and the failure
-    is the token''s, not a filter''s.
-
-    '
-  files:
-  - src/sandbox/appcontainer.rs
-  - tests/appcontainer.rs
-  evidence:
-  - '`a_payload_cannot_read_what_it_was_not_granted` and `a_payload_has_no_route_off_the_machine`, each
-    asserting its negative control first: the identical payload outside the container must succeed, or
-    the test refuses to conclude.'
-  - The capability array is empty, so the network denial is the token's own rather than a filter's.
-  - 'Found in passing: an AppContainer refuses loopback as well as egress. Stronger than the criterion
-    asked for, and discovered by a test failing for the right reason.'
-  - '`a_binary_nothing_blessed_runs_once_its_own_directory_is_granted` passed — the grant mechanism scales
-    to real binaries; only enumerating which paths to grant does not. That is the finding behind `US-IO-HARNESS-0.26.0-I02`.'
-- id: US-IO-HARNESS-0.26.0-T04
-  summary: 'Route a Windows handle''s spawn through a per-handle Job Object with KILL_ON_JOB_CLOSE: each
-    stage spawned CREATE_SUSPENDED, assigned, resumed; the job handle held by the registry record so Handles::kill
-    closes it. Reuses Job::create/adopt/resume rather than copying them.'
-  why_required: It closes US-IO-HARNESS-0.25.0-I01 and a stated known limitation of 0.25.0, and it is
-    in the full scope and in both fallbacks because it depends on AppContainer for nothing.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - 'F5 — killing a process handle on Windows reaches a grandchild whose parent has already exited. The
-    fixture is the shape the tool exists for: a command spawns a child which spawns a grandchild, the
-    middle process exits, and the handle is killed. All three are gone afterwards, asserted against the
-    operating system rather than against the registry''s own bookkeeping — the distinction 0.25.0 paid
-    for. **The negative control is the same fixture killed by `taskkill /F /T /PID` alone**, the mechanism
-    `src/sandbox.rs:988` uses, which walks parent/child links and must leave the grandchild running. Without
-    that control the test passes on any kill that happens to work. *(0.25.0''s F2 Windows clause, withdrawn
-    by `US-IO-HARNESS-0.25.0-I01`, carried here.)*
-
-    '
-  - 'F6 — the Job Object reaches the handle path by reuse, not by a second implementation. The per-handle
-    job is `Job::create`/`Job::adopt`/`resume` from `src/sandbox/windows.rs:249`, `:308` and `:441`, made
-    visible outside `mod job` rather than copied, and the `CREATE_SUSPENDED`-assign- resume ordering is
-    the one that module already argues for at `:35-47`. Proven by there being one definition: a grep for
-    `AssignProcessToJobObject` finds exactly one call site in the crate.
-
-    '
-  files:
-  - src/sandbox/windows.rs
-  - src/sandbox.rs
-  - src/tools/shell.rs
-  - src/tools/handles.rs
-  - tests/handles.rs
-  - examples/orphan.rs
-  evidence:
-  - '`Job::for_handle` added beside the existing `Job::create`; `Job::adopt` and `mod job` made `pub(crate)`.
-    Exactly one `AssignProcessToJobObject` in the crate (F6).'
-  - '`Capture::on_spawn` now takes `&tokio::process::Child` and returns `Result` — the interface change
-    `US-IO-HARNESS-0.25.0-I01` named as the blocker.'
-  - '`Containment` type alias keeps `Record` the same shape on every platform: `Option<Arc<Job>>` on Windows,
-    `()` elsewhere. `Handles::kill` takes it out of the record and drops it, so closing the job is a line
-    someone can point at.'
-  - A job that cannot be created refuses the start rather than running the line uncontained, matching
-    what `own_process_group` already does on unix.
-  - '`killing_a_handle_kills_a_grandchild_whose_parent_already_exited` passes on Windows, with `without_a_job_object_taskkill_leaves_the_grandchild`
-    as the control showing `taskkill /F /T` leaves it alive.'
-  - '`examples/orphan.rs` gained a Windows half: it cannot watch for reparenting because Windows does
-    not reparent, so the leaf waits for the middle to leave the process table.'
-- id: US-IO-HARNESS-0.26.0-T05
-  summary: 'Prove the unix guarantee is untouched: the existing handle, shell and sandbox suites pass
-    unchanged on macOS and Linux, and own_process_group is not edited.'
-  why_required: The Windows work reaches src/tools/shell.rs and src/sandbox.rs, which both compile on
-    every platform. The way a platform release breaks the other two is by editing something inside a cfg
-    that turns out not to be one.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.26.0-T04
-  acceptance_criteria:
-  - 'F7 — the unix guarantee is untouched. Every existing handle, shell and sandbox test passes unchanged
-    on macOS and Linux, and the process-group path (`src/sandbox.rs:909`) is not edited. This is a criterion
-    rather than an assumption because the Windows work reaches shared files — `src/tools/shell.rs` and
-    `src/sandbox.rs` both — and the way a platform release breaks the other two is by editing something
-    inside a `cfg` that turns out not to be one.
-
-    '
-  - 'NF1 — the full suite passes on macOS, Linux and Windows, with no test skipped, ignored or made conditional
-    to get there. The standing exception is `skills::discovery_over_a_32_skill_directory_is_under_50ms`,
-    a known wall-clock assertion that fails intermittently on the Windows runner under load and is re-run
-    rather than investigated.
-
-    '
-  files:
-  - src/sandbox.rs
-  - src/tools/shell.rs
-  evidence:
-  - '`test (macos-latest)` and `test (ubuntu-latest)` green in CI run 30666016135; `own_process_group`
-    unedited.'
-  - '`cargo test` and `cargo test --all-features --lib --tests` both exit 0 on macOS.'
-- id: US-IO-HARNESS-0.26.0-T06
-  summary: Correct docs/CONTRACT.md's tree-kill limitation and docs/guide/command-execution.md's copy
-    of it, and change README.md's platform row only if the release made it true.
-  why_required: The contract under-claims a boundary the code already ships on unix, which is 0.25.0's
-    OP2 defect class recurring. A doc a consumer cannot trust is the same failure whichever direction
-    it errs in.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.26.0-T03
-  - US-IO-HARNESS-0.26.0-T04
-  acceptance_criteria:
-  - 'OP2 — `docs/CONTRACT.md`''s tree-kill limitation is corrected to say what the code does: closed on
-    unix by process groups, and on Windows either closed by the Job Object (full scope) or still open
-    (never, under any fallback — F5 is in both). Checked by reading the file against `src/tools/shell.rs:1261-1264`
-    and `src/tools/handles.rs:365`, not from memory. This is 0.25.0''s OP2 recurring, and it recurs because
-    the class of defect is a doc that was written from the plan rather than from the code.
-
-    '
-  - 'OP3 — `README.md:257`''s platform table row changes **only if the release makes it true**. If Windows
-    still lacks a default filesystem and network boundary — either fallback trigger — the row stays as
-    it is. A table that describes the intent rather than the build is the defect 0.9.1 and 0.16.1 were
-    both spent on, and this criterion exists to stop it recurring a third time.
-
-    '
-  files:
-  - docs/CONTRACT.md
-  - docs/guide/command-execution.md
-  - docs/guide/sandbox.md
-  - README.md
-  - src/lib.rs
-  - src/tools/handles.rs
-  evidence:
-  - '`docs/CONTRACT.md` and `docs/guide/command-execution.md` corrected: tree kill on a handle is a guarantee
-    with a mechanism per platform, not best-effort everywhere. The unix half had been closed since 0.25.0
-    and both files under-claimed it.'
-  - '`src/tools/handles.rs` module rustdoc corrected in the other direction — it described a process group
-    with no platform caveat, on a platform that has none.'
-  - '`README.md:257`''s platform row deliberately unchanged, per OP3: AppContainer is not the default,
-    so the row is still true.'
-- id: US-IO-HARNESS-0.26.0-T07
-  summary: 'Ship the rest of the documentation in this release: CHANGELOG.md''s 0.26.0 section with a
-    migration note per break, docs/public-api.txt hand-edited in sorted position for any new crate-root
-    re-export, and the crate rustdoc.'
-  why_required: Docs ship in the release that changes the code, never after it. tests/changelog.rs, tests/public_api.rs
-    and tests/docs_drift.rs each fail the build otherwise.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.26.0-T06
-  acceptance_criteria:
-  - 'NF2 — **the dependency tree does not move on macOS or Linux.** `cargo tree` on the default feature
-    set reads 402 lines after this release as before it. Windows may gain `windows-sys` *features* — they
-    are compiled code, not tree lines — and any addition goes under `[target.''cfg(windows)''.dependencies]`
-    at `Cargo.toml:173-174` where the existing five already live. No new crate on any platform.
-
-    '
-  - 'NF4 — `cargo doc` is warning-free, docs.rs builds with all features, and `cargo clippy --all-targets
-    -- -D warnings` is clean, on every platform the matrix runs.
-
-    '
-  files:
-  - CHANGELOG.md
-  - docs/public-api.txt
-  - src/lib.rs
-  - Cargo.toml
-  evidence:
-  - '`CHANGELOG.md` 0.26.0 section with an unlabelled opening paragraph and the house category order.
-    No entry carries the `**BREAKING` marker: `Backend` is already `#[non_exhaustive]`, so a new variant
-    would have been additive, and in the end none was added.'
-  - '`docs/public-api.txt` needs no edit — this release adds no crate-root re-export. `tests/public_api.rs`,
-    `tests/docs_drift.rs`, `tests/changelog.rs`, `tests/readme.rs` and `tests/guide_pages.rs` all pass.'
-  - Crate rustdoc in `src/lib.rs` updated to say what AppContainer is and what it is not the default of.
-- id: US-IO-HARNESS-0.26.0-T08
-  summary: 'Record the smoke test''s finding as evidence whichever way it went, then the release gates:
-    cargo package --locked with the tarball listed rather than trusted, and the MSRV re-checked by hand.'
-  why_required: A release that learned AppContainer is not viable on the runner learned something worth
-    keeping, and it must survive in the record rather than only in a decision. The package and MSRV gates
-    are what the release workflow runs anyway.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.26.0-T07
-  acceptance_criteria:
-  - 'OP1 — the smoke test''s finding is recorded as evidence whichever way it goes, in `evidence/0.26.0/`.
-    A release that discovered AppContainer is not viable on the runner has learnt something worth more
-    than a release that shipped it, and the finding must survive in the record rather than only in a decision.
-
-    '
-  - 'OP4 — `cargo package --locked` exits 0 and the tarball carries no `.env`, no `.ultraship` and no
-    `.github`, verified by listing rather than assumed from the `exclude` list at `Cargo.toml:47-54`.
-
-    '
-  - 'OP5 — MSRV re-checked and stated. No new dependency is expected to move it; it is checked rather
-    than assumed, which is the lesson 0.23.0 paid for.
-
-    '
-  - 'NF3 — every `unsafe` block added carries a `// SAFETY:` comment naming why the call is sound, in
-    the style the existing Win32 code already holds itself to (`src/sandbox/windows.rs:253`, `:286`, `:318`).
-    This release adds more unsafe than any before it, and the comment is the only review surface a reader
-    on another platform has.
-
-    '
-  files:
-  - .ultraship/products/io-harness/evidence
-  evidence:
-  - '`US-IO-HARNESS-0.26.0-I02` records the finding and its evidence.'
-  - '`cargo package --locked` and the MSRV check recorded in the release record.'
+  - id: US-IO-HARNESS-0.27.0-T01
+    summary: "`[[provider]]` and a #[non_exhaustive] ProviderSpec, with Config::provider_spec() and
+      fallback_specs()."
+    why_required: Without it the file still cannot name a provider, which is the release's headline
+      claim, and the attribute cannot be added later without a break.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F1 — a config names the provider and the chain that stands behind it, and an embedder
+        constructs from a spec instead of writing selection code. A file carrying three
+        `[[provider]]` tables yields a `Config::provider_spec()` whose vendor, model and key are the
+        ones written and a `Config::fallback_specs()` carrying the other two **in the order
+        written**, asserted on order rather than membership, because a fallback chain whose order is
+        wrong is a different configuration that a set comparison cannot see. **The negative control
+        is `a_config_with_no_provider_table_has_no_spec`:** `provider_spec()` is `None` and
+        `fallback_specs()` is empty, so "the file said nothing" stays distinguishable from "the
+        crate chose a default" — the rule `src/config.rs:423`, `:462` and `:513` already hold and
+        the one this accessor would be the first to break.
+      - >
+        F2 — `ProviderSpec` is `#[non_exhaustive]`, and stays that way. Proven by a source assertion
+        in the style `tests/public_api.rs` already uses — a text read of `src/`, not a nightly
+        rustdoc — that the attribute sits immediately above `pub enum ProviderSpec`. A runtime
+        assertion is impossible: `#[non_exhaustive]` has no effect inside the defining crate, and
+        asserting a compile failure needs `trybuild`, which NF2 forbids. **The negative control is
+        the same helper run against a type known not to carry it — `pub enum Scope`
+        (`src/config.rs:142`) — which must report absent**, so a helper that always answers yes is
+        caught by the test rather than by the next release.
+    files:
+      - src/config.rs
+      - src/lib.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T02
+    summary: "`[app]`: one opaque toml::Value the crate stores and never validates, reached through a
+      generic Config::app::<T>(key)."
+    why_required: io-cli and io-studio have nowhere in the file to put their own settings today, so the
+      second format gets invented beside io.toml rather than inside it.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.27.0-T01
+    acceptance_criteria:
+      - >
+        F3 — `[app]` is stored and never validated, and strictness is not switched off to achieve
+        it. A config whose `[app.cli]` carries keys this crate has never heard of loads without
+        error, and `Config::app::<T>("cli")` deserializes them into a caller-defined type. **The
+        negative control is the identical unknown keys written into `[run]` instead**, which must
+        still be refused naming the key (`src/config.rs:161`) — so `[app]` is one hole with a wall
+        around it, not the wall coming down. A second control: `Config::app::<T>` on a key the file
+        does not carry is `None`, not an error and not a default-constructed `T`.
+      - >
+        NF3 — no `toml` type appears in this crate's public API. `Config::app` is generic over
+        `serde::de::DeserializeOwned`, so a caller names its own type and `toml` stays a private
+        dependency. Checked by reading the signatures added to `docs/public-api.txt`, because a
+        public re-export of another crate's type is a semver commitment to that crate's version that
+        would outlive any reason for making it.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T03
+    summary: "`${cmd:}` as a fourth arm of expand, with no shell, and refused in the project scope."
+    why_required: A credential from a command is the feature operators ask for, and it is a new
+      execution path reached from parsing a file, so the scope bound ships with it or not at all.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F4 — a credential can come from a command, and not from a cloned repository's own file. An
+        `io.local.toml` whose value is `${cmd:...}` loads with the command's trimmed stdout; the
+        byte-identical line in `io.toml` is refused, naming the key, the file and the scope. Three
+        further refusals asserted separately, because each fails differently: a non-zero exit, a
+        program not on `PATH`, and empty output (`src/config.rs:901-907`). **The negative control is
+        a `${env:...}` line in the same project-scoped file, which must still load** — otherwise the
+        test would pass on an implementation that refused substitution in the project scope
+        wholesale, which is a different and much worse feature.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T04
+    summary: "The project-scope trust rule: four keys refused in Scope::Project when and only when the
+      value written is the widening one."
+    why_required: A committed io.toml travels with a clone and can today re-enable egress, switch off
+      the sandbox floor, and default exec to allow, silently, on the first Config::discover.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.27.0-T03
+    acceptance_criteria:
+      - >
+        F5 — a project-scoped file may narrow the boundary and may never widen it. Each of
+        `policy.defaults.exec = "allow"`, `policy.defaults.net = "allow"`, `sandbox.allow_network =
+        true` and `sandbox.force_floor = false` written in `io.toml` is refused, naming the key.
+        **Two negative controls, and the criterion is worthless without both:** each of the same
+        four keys written to its *narrowing* value in the same `io.toml` must load — `exec =
+        "deny"`, `net = "deny"`, `allow_network = false`, `force_floor = true` — and each *widening*
+        value written in `io.local.toml` must load. Without the first, a rule that refused the key
+        outright would pass; without the second, a rule that refused the value everywhere would.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T05
+    summary: "`[profile.<name>]`: a named overlay of the same file format, applied through the existing
+      merge by Config::with_profile."
+    why_required: Without it a team keeps two files to express two sets of choices, which is the drift
+      the four scopes were meant to end.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.27.0-T01
+    acceptance_criteria:
+      - >
+        F6 — a profile overlays the base and touches nothing else. `Config::with_profile("fast")`
+        returns a configuration in which the profile's keys won and every key the profile did not
+        name is untouched, merged by the same `merge` at `src/config.rs:931` and therefore by the
+        same key-by-key rules the scopes obey. A profile name the file does not carry is an error
+        naming it. **Two negative controls:** the receiver is unchanged by the call — selecting a
+        profile does not mutate the configuration it came from — and a key this crate does not know,
+        written inside a profile that is *never selected*, is still rejected at load, because a
+        profile body deserializes as the file format rather than as an opaque table.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T06
+    summary: "`IO_CONFIG`: an environment variable naming the user-scope file outright, ahead of
+      IO_CONFIG_HOME and every platform convention."
+    why_required: A caller with a config file at a path this crate cannot derive has no way to name it,
+      and the alternative shapes all add a Scope variant, which is a break.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        F8 — `IO_CONFIG` names the user-scope file directly, and the scopes stay four. With it set,
+        `user_path` (`src/config.rs:766-778`) resolves to it ahead of `IO_CONFIG_HOME` and every
+        platform convention, and `Config::sources()` reports it as `Scope::User`. **The negative
+        control is that a project `io.toml` still wins the same key with `IO_CONFIG` set** — the
+        variable names a scope, it does not bypass the merge — and `Scope` gains no variant, checked
+        against `docs/public-api.txt`, so `docs/CONTRACT.md:417-418` keeps saying four without
+        qualification.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T07
+    summary: "`[instructions]`: discovery of a repository's own AGENTS.md, landing in
+      TaskContract::constraints through Config::apply_to."
+    why_required: Project instructions are pasted into a goal string by every caller in turn today, and
+      a new TaskContract field would be a break this release does not carry.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.27.0-T01
+    acceptance_criteria:
+      - >
+        F7 — a repository's own instructions reach the model without a new `TaskContract` field. A
+        workspace carrying `AGENTS.md` and a config naming it yields, after `Config::apply_to`, a
+        contract whose `constraints` (`src/contract.rs:75`) carry that text. **Two negative
+        controls:** a config with **no** `[instructions]` section reads no file at all — asserted by
+        placing a file whose read would fail and requiring the load to succeed — and a named file
+        that is absent is skipped rather than erroring, which is what distinguishes discovery from
+        substitution and is the one place this module's "resolve or fail" rule deliberately does not
+        apply.
+    files:
+      - src/config.rs
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T08
+    summary: EVERY_KEY extended to every new table and key, its negative-control twin extended, and one
+      strictness test per new table.
+    why_required: f7_every_key_reaches_a_typed_field is what has enforced the file-format contract since
+      0.19.0, and a table missing from it is a key nothing proves reaches a field.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.27.0-T01
+      - US-IO-HARNESS-0.27.0-T02
+      - US-IO-HARNESS-0.27.0-T03
+      - US-IO-HARNESS-0.27.0-T04
+      - US-IO-HARNESS-0.27.0-T05
+      - US-IO-HARNESS-0.27.0-T06
+      - US-IO-HARNESS-0.27.0-T07
+    acceptance_criteria:
+      - >
+        F9 — every new key reaches a typed field, and every new table rejects what it does not know.
+        `tests/config.rs::EVERY_KEY` (`:230`) names `[[provider]]`, `[app]`, `[profile.<name>]`,
+        `[instructions]` and every key inside them, and `f7_every_key_reaches_a_typed_field`
+        (`:327`) asserts each lands — the test that has enforced this since 0.19.0 and that fails
+        naming the omission. **The negative control is its existing twin**,
+        `f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default` (`:401`),
+        extended to one new key so the fixture proves the field is read rather than defaulted. Plus
+        one strictness test per new table modelled on
+        `an_unknown_key_inside_the_web_table_is_rejected_naming_it` (`:1101`), `[app]` excepted by
+        F3.
+    files:
+      - tests/config.rs
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T09
+    summary: "Documentation: CONTRACT.md's configuration block rewritten, the guide's new sections and
+      grown limits block, README's config paragraph, public-api.txt, CHANGELOG."
+    why_required: Three CONTRACT bullets stop being true as written, and a document that under- or
+      over-claims a boundary is the defect class the last two releases each spent an OP criterion
+      on.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.27.0-T08
+    acceptance_criteria:
+      - >
+        OP1 — `docs/public-api.txt` is hand-edited in sorted position for every new crate-root
+        re-export, and each carries a doc comment with a worked example. `tests/public_api.rs` fails
+        otherwise, and there is deliberately no `--bless`.
+      - >
+        OP2 — `docs/CONTRACT.md`'s "What configuration is, and is not" (`:389-418`) is **rewritten,
+        not appended to**, because three of its bullets stop being true as written: "Scope discovery
+        is fixed" must account for `IO_CONFIG` and for profiles; "a failed substitution is an error"
+        must cover `${cmd:}` and its scope rule; and "an unknown key is an error" must name `[app]`
+        as the second exception beside `[[mcp]]`. Checked by reading the file against
+        `src/config.rs`, not from memory. This is 0.25.0's and 0.26.0's OP2 recurring, and it recurs
+        because the defect class is a document written from the plan rather than from the code.
+      - >
+        OP3 — `docs/guide/configuration.md` gains a `###` section per new table, and its "The
+        limits, stated plainly" block (`:263`) survives — `tests/guide_pages.rs` checks it — and
+        grows by the five limits this release creates: `${cmd:}` has no timeout, an absent
+        instructions file is skipped silently, `[app]` is unvalidated by construction, a project
+        file may narrow and never widen, and a discovered `AGENTS.md` is untrusted text from the
+        repository that reaches the model verbatim and grants nothing.
+      - >
+        OP4 — `README.md:200-206`'s configuration paragraph is updated to what actually ships. It
+        currently describes four scopes and `${env:}`/`${file:}` and no provider selection at all,
+        and the release's own headline claim lives in that paragraph or nowhere a reader will find
+        it.
+    files:
+      - docs/CONTRACT.md
+      - docs/guide/configuration.md
+      - docs/public-api.txt
+      - README.md
+      - CHANGELOG.md
+    evidence: []
+  - id: US-IO-HARNESS-0.27.0-T10
+    summary: "The release gates: full suite on three platforms, clippy, fmt, doc, dependency tree, cargo
+      package listing, MSRV."
+    why_required: Every one of these is a stated acceptance criterion, and the tree and package checks
+      are the two that have caught real defects in prior releases.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.27.0-T09
+    acceptance_criteria:
+      - >
+        NF1 — the full suite passes on macOS, Linux and Windows with no test skipped, ignored or
+        made conditional. The standing exception is
+        `skills::discovery_over_a_32_skill_directory_is_under_50ms`, a wall-clock assertion that
+        fails intermittently on the Windows runner under load and is re-run rather than
+        investigated.
+      - >
+        NF2 — **no new dependency, on any platform.** `cargo tree` on the default feature set reads
+        402 lines after this release as before it. `${cmd:}` is `std::process::Command`; profiles
+        reuse the existing `merge`; `[app]` uses `toml::Value`, already a dependency;
+        `[instructions]` is `std::fs`. Nothing here justifies a crate, and `trybuild` in particular
+        is not added to prove F2, which is why F2 is a source assertion.
+      - >
+        NF4 — `cargo doc` is warning-free, docs.rs builds with all features, `cargo fmt --check` is
+        clean, and `cargo clippy --all-targets -- -D warnings` is clean on every platform in the
+        matrix.
+      - >
+        OP5 — `cargo package --locked` exits 0 and the tarball is verified by **listing** rather
+        than by trusting the `exclude` list: no `.env`, no `.ultraship`, no `.github`. MSRV 1.95
+        re-checked in both directions rather than read off the manifest, which is the lesson 0.23.0
+        paid for.
+    files:
+      - Cargo.toml
+    evidence: []

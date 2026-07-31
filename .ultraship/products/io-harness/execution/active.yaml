@@ -1,0 +1,39 @@
+product: io-harness
+version: 0.27.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: A metered 5-hour usage window the owner is watching
+  budget: At most two concurrent subagents, no speculative research, no full-suite reruns beyond the
+    gates
+  capacity: null
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+  - >
+    Six features that share one module. Every one of them lands in `src/config.rs`, whose four
+    mechanisms — parse, substitute, validate, merge — already exist and are already tested; none of
+    them needs a new file, a new dependency, or a platform round trip, which is what made 0.26.0
+    expensive.
+  - >
+    The owner's recorded constraint is a metered 5-hour usage window with at most two concurrent
+    subagents and no speculative research (the user's own estimate of the budget, not anything this
+    framework measured). The work fits it because it is single-file, single-platform and locally
+    verifiable: the gates are `cargo test` and `cargo test --all-features --lib --tests`, which is
+    what CI runs, and there is no third machine to wait on.
+  - >
+    The test and documentation obligations are enforced by tests rather than requested, so the
+    expensive failure mode — discovering a doc drift after the merge — is caught by
+    `tests/config.rs`, `tests/public_api.rs`, `tests/docs_drift.rs`, `tests/guide_pages.rs` and
+    `tests/changelog.rs` before the PR exists.
+  major_cost_drivers:
+  - >
+    Serde behaviours that must be measured rather than assumed: internally-tagged enum strictness,
+    a recursive `File` for profile bodies, and a generic accessor deserializing out of a stored
+    `toml::Value`. Each has an obvious fallback shape already used elsewhere in the module.
+  - >
+    `docs/CONTRACT.md`'s configuration block is a rewrite rather than an addition — three of its
+    bullets become false — and the guide's limits block grows by five entries.
+  recommended_scope_change: null
