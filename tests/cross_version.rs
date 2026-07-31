@@ -131,22 +131,6 @@ fn schema(db: &Path) -> Vec<String> {
     sql
 }
 
-/// Two schemas are the same set of statements, or the difference is the message.
-///
-/// A plain `assert_eq!` on two of these prints both schemas in full — around forty
-/// `CREATE` statements, twice — and leaves a reader to diff them by eye. What is
-/// worth reading is the handful of statements that are on one side and not the
-/// other, so that is what this reports.
-fn assert_same_schema(left: &[String], right: &[String], what: &str) {
-    let only_left: Vec<&String> = left.iter().filter(|s| !right.contains(s)).collect();
-    let only_right: Vec<&String> = right.iter().filter(|s| !left.contains(s)).collect();
-    assert!(
-        only_left.is_empty() && only_right.is_empty(),
-        "{what}\n  present only on the left: {only_left:#?}\n  \
-         present only on the right: {only_right:#?}"
-    );
-}
-
 /// The objects 0.25.0 adds, and the only ones any comparison below may find on
 /// the new side.
 ///

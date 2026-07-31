@@ -195,6 +195,58 @@ paths are checked and neither escapes the root. The alternative — resolving at
 run time — would mean the policy approved one path and the process opened
 another.
 
+## What a process handle is, and is not (0.25.0)
+
+`shell_start` runs a command line and hands back a handle id instead of a result,
+so a dev server, a log tail or a watch build can outlive the step that started
+it. `shell_poll` reads what it has printed since the previous poll and whether it
+is still running; `shell_kill` ends it and the processes it spawned.
+
+The line is parsed and checked by exactly the machinery `shell` uses — the same
+lexer, the same refusal set, the same per-stage `Act::Exec` check and the same
+per-redirect path check, all of it before the first spawn. Everything the section
+above says about what `shell` will and will not run is therefore true of
+`shell_start` unchanged. A handle is a different *lifetime* for a command line,
+not a second way to run one.
+
+**A handle does not survive the process that started it.** When a run is resumed
+in a new process, every handle the previous process left running is marked
+orphaned, and an orphaned handle is never re-attached, polled or signalled. A
+poll or a kill naming one is answered from what was recorded, and the model is
+told to start again whatever it still needs. The reason is that the only thing a
+checkpoint records about a live process is its pid, and a pid is not an identity:
+between the crash and the resume the operating system may have given that number
+to something unrelated, and no test separates the two with enough confidence to
+justify signalling, because every "is it still our program" check races the
+signal that follows it. This is the one way this crate could damage something
+outside its own workspace, and the cost of being wrong is not a failed run but
+somebody else's process. So the handle is recorded, reported, and left alone. A
+harness that re-attached would be making a different trade with the operator's
+machine; this one does not make it, and will not start.
+
+**A run may have eight handles live at once** (`MAX_LIVE_HANDLES`). The ninth
+`shell_start` is refused with a reason naming the cap rather than queued — a
+queue is a leak with a delay — and killing one makes room for another, so the
+bound is on how many run at once and not on how many a run may start.
+
+**Every live handle is killed when the run ends, however it ends**: a finish, a
+budget stop, a cancellation, an error carried out of the loop, or a panic.
+`shell_kill` is for finishing with something early, not for tidying up.
+
+A handle has no wall-clock timeout. `shell` kills a line that runs too long
+because a foreground call has no other way to be told to stop; a handle has
+`shell_kill` and the end of the run instead, and a dev server has nothing to be
+killed at.
+
+A handle's output goes to a capture file, and a poll returns a bounded window of
+what is new since the previous one, by byte cursor rather than by re-reading. The
+capture file does not outlive the run and the store does: `process_handles` — one
+row per handle, with its line, its recorded pids and how it ended — and
+`handle_output`, appended as each poll reads it. Like the rest of the schema they
+are reached through `Store`'s methods rather than depended on directly. Both are
+additive and no checkpoint layout changed, so **`CHECKPOINT_FORMAT` stays 7**: a
+0.24.0 binary reading a database this release wrote never queries either table.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
@@ -469,6 +521,20 @@ would throttle the operator's own login session rather than the sandbox, and the
 other backend that could scope it properly — the Linux pid-namespace
 active-process limit — is not wired up. Setting it on a unix host changes
 nothing.
+
+**A process handle's own processes are not placed in the platform's containment
+(0.25.0).** `shell_start` spawns through the same runner `shell` does, and that
+runner does not go through `Sandbox`. `shell_kill` therefore ends a handle by
+signalling the pids it recorded and the descendants still reachable from them,
+rather than by closing a container around the tree — so a descendant whose own
+parent has already exited is reachable from nothing the handle recorded and can
+survive the kill. On Windows this is precisely the gap a Job Object exists to
+close: the job owns its tree and takes all of it down when the job handle closes,
+and the handle path does not use one, so a grandchild whose parent exited may
+outlive its handle there. **Read tree kill on a handle as best-effort rather than
+as a guarantee.** Routing the spawn through the platform's containment is later
+work; the run-end sweep and the drop backstop are unaffected, because both go
+through the same kill.
 
 **No seccomp filter is installed.** The Linux backend is namespaces and rlimits.
 Whatever syscall restriction applies is the kernel's own default under an

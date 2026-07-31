@@ -15,8 +15,9 @@
 //! 2. **The process exits on its own.** The reaping task notices and records the
 //!    status, so a poll after exit is answered from the recorded status rather
 //!    than by waiting on something that is already gone.
-//! 3. **Too many at once.** [`Handles::cap`] refuses the start rather than
-//!    queueing it, because a queue is a leak with a delay.
+//! 3. **Too many at once.** [`Handles::reserve`] refuses the start rather than
+//!    queueing it, because a queue is a leak with a delay. See
+//!    [`MAX_LIVE_HANDLES`].
 //! 4. **The process this crate is running in goes away.** Nothing in this module
 //!    can help there, which is exactly why a handle recorded by a previous
 //!    process is orphaned on resume and never signalled. See
@@ -165,11 +166,6 @@ impl Handles {
             .count()
     }
 
-    /// The cap this registry was built with.
-    pub(crate) fn cap(&self) -> usize {
-        self.cap
-    }
-
     /// Reserve an id and a capture path, refusing if the cap is already reached.
     ///
     /// Refusing here rather than after the spawn is the point: a queue would be
@@ -216,11 +212,6 @@ impl Handles {
         }
     }
 
-    /// Drop a reservation whose spawn never happened.
-    pub(crate) fn abandon(&self, id: u64) {
-        self.lock().remove(&id);
-    }
-
     /// The processes a handle owns, in spawn order.
     ///
     /// For the store rather than for signalling — [`Handles::kill`] walks its
@@ -263,13 +254,6 @@ impl Handles {
         }
     }
 
-    /// Ids of every handle this registry knows, live or not.
-    pub(crate) fn ids(&self) -> Vec<u64> {
-        let mut v: Vec<u64> = self.lock().keys().copied().collect();
-        v.sort_unstable();
-        v
-    }
-
     /// Read what a handle has produced since the last poll.
     ///
     /// Returns the text, how many bytes were skipped because the window is
@@ -305,24 +289,6 @@ impl Handles {
             .map_err(Error::Io)?;
         r.cursor = len;
         Ok((String::from_utf8_lossy(&buf).into_owned(), skipped))
-    }
-
-    /// Everything a handle has written, from the beginning, for the store.
-    ///
-    /// Separate from [`Handles::poll`] because they answer different questions:
-    /// a poll asks what is new and is bounded, this asks what happened and is
-    /// not. The trace has to be able to answer "what did that dev server do"
-    /// after the process is gone.
-    pub(crate) fn full_output(&self, id: u64) -> Result<String> {
-        let path = match self.lock().get(&id) {
-            Some(r) => r.capture.clone(),
-            None => return Ok(String::new()),
-        };
-        match std::fs::read(&path) {
-            Ok(b) => Ok(String::from_utf8_lossy(&b).into_owned()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-            Err(e) => Err(Error::Io(e)),
-        }
     }
 
     /// End a handle and everything it spawned.
@@ -499,21 +465,6 @@ mod tests {
         // next poll does not re-deliver the middle of the log.
         let (text, _) = h.poll(id).expect("second poll");
         assert_eq!(text, "");
-    }
-
-    #[test]
-    fn the_whole_output_is_still_readable_after_a_bounded_poll() {
-        let h = Handles::new(4);
-        let (id, capture) = h.reserve("noisy").expect("reserve");
-        let body = vec![b'y'; POLL_BYTES + 100];
-        std::fs::write(&capture, &body).expect("write");
-        let (polled, _) = h.poll(id).expect("poll");
-        assert_eq!(polled.len(), POLL_BYTES);
-        assert_eq!(
-            h.full_output(id).expect("full").len(),
-            POLL_BYTES + 100,
-            "the poll is a window; the file keeps everything"
-        );
     }
 
     #[test]

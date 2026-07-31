@@ -5236,6 +5236,18 @@ async fn dispatch(
                                 &before,
                                 &body,
                             );
+                            // The same check `edit_file` runs, for the same
+                            // reason: a write is how most new code arrives, and
+                            // a type error in a file the model just created is
+                            // worth exactly as much to know about as one it
+                            // edited into an existing file.
+                            let diagnostics = diagnostics_after_write(
+                                ws.root(),
+                                toolchain,
+                                exec_timeout,
+                                cap,
+                            )
+                            .await;
                             Dispatched::Continue {
                                 decision: format!("wrote {target}"),
                                 // A write that changed nothing says so, to the model as
@@ -5244,14 +5256,15 @@ async fn dispatch(
                                 // cannot correct for what it is not told.
                                 obs: bound(
                                     &format!(
-                                        "\n[wrote {target}] ({} chars{})\n",
+                                        "\n[wrote {target}] ({} chars{})\n{}",
                                         body.chars().count(),
                                         if wrote.moved_the_workspace() {
                                             ""
                                         } else {
                                             ", identical to what was already there — the \
                                          workspace did not change"
-                                        }
+                                        },
+                                        diagnostics
                                     ),
                                     cap,
                                     ObsKind::Write,
@@ -5324,26 +5337,13 @@ async fn dispatch(
                             // write is already on disk by the time this runs, so
                             // a checker that is missing, slow or broken costs
                             // the model a note and nothing else.
-                            let checked = crate::tools::diagnostics::after_edit(
+                            let diagnostics = diagnostics_after_write(
                                 ws.root(),
                                 toolchain,
                                 exec_timeout,
                                 cap,
                             )
                             .await;
-                            let diagnostics = match &checked {
-                                crate::tools::diagnostics::Outcome::Found(text) => text.clone(),
-                                crate::tools::diagnostics::Outcome::Clean => String::new(),
-                                // Said out loud rather than left as an absent
-                                // section. An empty diagnostics section and a
-                                // check that never ran look identical to a
-                                // model, and one of them means "your edit is
-                                // fine" while the other means nothing at all.
-                                crate::tools::diagnostics::Outcome::Skipped(_) => String::new(),
-                                crate::tools::diagnostics::Outcome::Failed(why) => {
-                                    format!("\n[check did not run] {why}\n")
-                                }
-                            };
                             Dispatched::Continue {
                                 decision: format!("edited {target}"),
                                 obs: bound(
@@ -5764,6 +5764,15 @@ async fn dispatch(
             // thing that still knows which processes this handle owned and a
             // failure mid-kill would take that knowledge with it.
             store.record_handle_pids(run_id, id, &handles.pids(id))?;
+            // Everything the process wrote and nobody asked for.
+            //
+            // The store's copy of a handle's output is written by the polls, so
+            // output produced between the last poll and the kill — or by a
+            // handle the model never polled at all — would otherwise never be
+            // recorded anywhere that outlives the run. The capture file does not
+            // survive the registry, so this is the last moment it can be read.
+            let (tail, _) = handles.poll(id).unwrap_or_default();
+            store.record_handle_output(run_id, step, id, &tail)?;
             match handles.kill(id) {
                 // Killing something already over is not a mistake worth failing
                 // a step for: a model that lost track of a handle should be told
@@ -6536,7 +6545,45 @@ enum Gated {
     Paused { request_id: i64 },
 }
 
-/// Record that one sub-command or one redirect target of a `shell` line was
+/// Run the project's own checker after a write and render what it found.
+///
+/// Shared by `edit_file` and `write_file` because they are the same event as far
+/// as a compiler is concerned: a file changed. A write is in fact where most new
+/// code arrives, so exempting it would leave the feature answering the easier
+/// half of the question.
+///
+/// Renders to a string rather than returning the outcome, because every caller
+/// wants the same thing — something to append to the observation — and the
+/// distinction that matters to them is only whether there is anything to say.
+///
+/// **This can never fail a write.** The file is already on disk by the time this
+/// runs. A checker that is missing, times out, or falls over for its own reasons
+/// produces a note saying so and nothing else; it does not turn a successful
+/// write into a failed one, and it does not return an error. An information
+/// feature that can take down the tool it informs on is a worse trade than not
+/// having it.
+async fn diagnostics_after_write(
+    root: &Path,
+    toolchain: Option<&crate::toolchain::Toolchain>,
+    timeout: Duration,
+    cap: usize,
+) -> String {
+    match crate::tools::diagnostics::after_edit(root, toolchain, timeout, cap).await {
+        crate::tools::diagnostics::Outcome::Found(text) => text,
+        crate::tools::diagnostics::Outcome::Clean => String::new(),
+        // A skip is silent. There is no ecosystem here, so there is nothing the
+        // model could do differently and nothing worth spending its context on.
+        crate::tools::diagnostics::Outcome::Skipped(_) => String::new(),
+        // A failure is not silent, and that is the point. An absent diagnostics
+        // section and a check that never ran look identical to a model, and one
+        // of them means "this file is fine" while the other means nothing at
+        // all.
+        crate::tools::diagnostics::Outcome::Failed(why) => {
+            format!("\n[check did not run] {why}\n")
+        }
+    }
+}
+
 /// What checking a parsed shell line decided.
 ///
 /// The check either clears the whole line — handing back the rules an approver
@@ -6675,6 +6722,7 @@ async fn check_shell_line(
     Ok(ShellCheck::Go(remembered))
 }
 
+/// Record that one sub-command or one redirect target of a `shell` line was
 /// authorised, with the rule and layer that authorised it.
 ///
 /// The crate does not otherwise record allows. A [`PolicyEvent`] is written for a

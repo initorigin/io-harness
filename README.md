@@ -25,7 +25,7 @@ the language the project is written in is not the harness's business.
 
 ```toml
 [dependencies]
-io-harness = "0.22"
+io-harness = "0.25"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -102,16 +102,23 @@ version of that dependency which avoided it.
 **The loop.** A [`TaskContract`] names the goal, the subject, and — optionally —
 the criterion. Workspace mode gives the agent `grep`, `find`, `read_file`,
 `write_file` and `edit_file` across a repository root. Single-file mode edits one
-file.
+file. In a project whose ecosystem the harness recognises, a successful
+`edit_file` runs that project's own type-check command and attaches what it
+found, so a mistake arrives with the edit rather than twenty steps later — see
+[language support](docs/guide/language-support.md).
 
 **Commands, under the same boundary as everything else.** The agent runs the
 project's own build, tests, linter or package manager through an `exec` tool
 taking a fixed argv and never a shell string. Every call is checked against the
 policy on the program *and* on the whole argv, so `allow_exec("cargo test*")`
-beside `deny_exec("cargo publish*")` means what it reads. A command runs with
-your process's privileges and is **not** sandboxed — that bound is stated in full
-in the [command execution guide](docs/guide/command-execution.md), because it is
-the widest thing the crate grants.
+beside `deny_exec("cargo publish*")` means what it reads. A whole command line —
+pipelines, redirects, `&&` — is `shell`, parsed in this crate rather than by a
+shell and checked stage by stage before the first process starts. `shell_start`,
+`shell_poll` and `shell_kill` are the same line with a longer life, for a dev
+server or a log tail that has to outlive the step that started it. A command runs
+with your process's privileges and is **not** sandboxed — that bound is stated in
+full in the [command execution guide](docs/guide/command-execution.md), because
+it is the widest thing the crate grants.
 
 **Verification in any language, or none.** A criterion can be the project's own
 test command in whatever language it is written, or nothing at all when the task
@@ -203,7 +210,7 @@ the caller reads the file, before the run, once.
 | Guide | What it covers |
 | --- | --- |
 | [Permissions and approval](docs/guide/permissions.md) | Layered rules, what asks and what is refused, deferring past process exit |
-| [Command execution](docs/guide/command-execution.md) | Running a project's own toolchain, checked on the whole argv — and the bound that is not there |
+| [Command execution](docs/guide/command-execution.md) | Running a project's own toolchain, checked on the whole argv, in the step or beyond it — and the bound that is not there |
 | [Language support](docs/guide/language-support.md) | Toolchain detection, a criterion in any language, migrating off the Rust-specific gates |
 | [Verification](docs/guide/verification.md) | The criteria, execution-based gates, and exactly what a pass proves |
 | [Agent composition](docs/guide/composition.md) | Sub-agents, inherit-and-narrow containment, the shared ledger |

@@ -181,15 +181,6 @@ fn transcript(store: &Store, run_id: i64) -> String {
         .join("\n")
 }
 
-/// What the model read after step `n` — that is, step `n + 1`'s prompt.
-fn observation_after(store: &Store, run_id: i64, n: usize) -> String {
-    let steps = store.steps(run_id).unwrap();
-    steps
-        .get(n + 1)
-        .map(|s| s.prompt.clone())
-        .unwrap_or_default()
-}
-
 fn run_id(store: &Store) -> i64 {
     store.runs().unwrap()[0]
 }

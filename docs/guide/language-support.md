@@ -82,6 +82,64 @@ build system.
 `cargo test`, watch it fail, and have learned less than if it had been told to go
 and look.
 
+## The project's own checker, after an edit
+
+Detection also decides what runs *after* an edit. As of 0.25.0 a successful
+`edit_file` in a project whose ecosystem `toolchain::detect` recognises runs that
+project's own type-check command and appends what it reported to the observation
+the model was going to read anyway.
+
+What that buys is when the error arrives, not that it arrives. Until now an agent
+learned that its edit did not compile only by deciding to find out — call `exec`,
+wait for a build, read the log — and a model that has just written a
+plausible-looking function has no signal telling it to doubt one. So a type error
+introduced at step 4 was discovered at step 20 by the verification gate, with
+sixteen steps built on top of it. The check costs the model no decision.
+
+| Ecosystem | Check command |
+| --- | --- |
+| cargo | `cargo check --message-format=json` |
+| deno | `deno check .` |
+| node | `tsc --noEmit` |
+| go | `go build ./...` |
+| python | `pyright` |
+
+**Every other ecosystem in the detection table is skipped on purpose.** maven,
+gradle, dotnet, swift, cmake, elixir, ruby, php and make have no type-check step
+separate from their build, and running a build after every single edit would make
+editing unusable. These commands are held to a much stricter bar than the
+`build` argv of the same detection is — which is why `cargo check` is here and
+`cargo build` is not. An ecosystem with no cheap checker is a fact about the
+ecosystem rather than a failure of the harness: nothing runs, and nothing is said
+to the model. A root with no marker file is skipped for the same reason `detect`
+reports nothing there.
+
+The check covers the workspace, not the edited file. None of these tools can
+meaningfully type-check one file in isolation, because the edited file's
+correctness depends on every file that uses it — and a caller broken by a changed
+signature is the most valuable finding of the lot. The findings say so, and may
+name files the edit did not touch. Since the cost of a check is the cost of the
+project's own type-check, it is bounded twice: by the contract's exec timeout,
+and by the run's per-observation output cap, the same ceiling every other tool
+result obeys.
+
+**It can never turn a successful edit into a failed one.** The write is on disk
+before the checker starts. A checker missing from `PATH`, killed by the timeout,
+or broken for a reason of its own reports that the edit is *unchecked* and the
+run carries on. Unchecked is deliberately not the same observation as clean: a
+model reading silence as approval is the failure this exists to prevent, and "the
+checker found nothing" and "nothing checked your work" must not look alike.
+
+Two smaller choices worth stating. It is `tsc` and not `npx tsc`, because `npx`
+will reach the network and install a package to satisfy an invocation, which is
+not something an edit should be able to trigger — a project with TypeScript
+installed has `tsc` reachable, and one that does not is told its edit is
+unchecked. And only cargo's output is parsed, because `--message-format=json` is
+the only way to get its diagnostics without its progress bars; every other
+checker's console output is passed through exactly as it printed it, since the
+rendered diagnostic is what a developer reads and there is nothing to do with one
+here except show it.
+
 ## The limits, stated plainly
 
 **It is a default offered as information, never an instruction.** The harness
