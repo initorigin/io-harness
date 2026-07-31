@@ -690,6 +690,61 @@ mod tests {
         );
     }
 
+    /// The measurement `fallback_scope` Trigger B turns on, taken rather than
+    /// guessed at.
+    ///
+    /// `cmd.exe` runs inside a container because Windows puts an
+    /// `ALL APPLICATION PACKAGES` ACE on its own system directories. Nothing else
+    /// on the machine has one. So the question this release actually has to
+    /// answer is not "does a container run a process" — F1 settled that — but
+    /// "does a container run *the payload a caller would give it*", which is a
+    /// binary in a toolchain nobody blessed.
+    ///
+    /// The subject is the running test binary itself: a real, freshly compiled
+    /// executable under `target\`, with no ACE for any container, which is
+    /// exactly the shape of the thing this crate would be asked to sandbox. It
+    /// is invoked with a filter that matches no test, so it exits promptly and
+    /// runs none of this suite inside a container.
+    ///
+    /// The grant is deliberately **only its own directory**. If that is enough,
+    /// the mechanism scales to real payloads and what is left is deciding which
+    /// paths to name. If it is not, the grant set is a discovery problem rather
+    /// than a configuration one, and that is the finding.
+    #[test]
+    fn a_binary_nothing_blessed_runs_once_its_own_directory_is_granted() {
+        let exe = std::env::current_exe().expect("the test binary knows where it is");
+        let bin_dir = exe.parent().expect("it has a directory").to_path_buf();
+        let work = tempfile::tempdir().expect("tempdir");
+
+        let profile = Profile::create(&name("toolchain")).expect("profile");
+        grant(work.path(), profile.sid(), Access::Full).expect("grant the workspace");
+        grant(&bin_dir, profile.sid(), Access::ReadExecute).expect("grant the binary's directory");
+
+        let out_path = work.path().join("o.txt");
+        let file = std::fs::File::create(&out_path).expect("capture");
+        // `--list` enumerates and exits; the filter matches nothing, so no test
+        // in this suite is re-entered inside a container.
+        let line = format!(
+            "\"{}\" --list --exact io-harness-no-such-test",
+            exe.display()
+        );
+        let mut child =
+            Spawned::start(&line, work.path(), profile.sid(), &file).expect("spawn the payload");
+        let code = child.wait(60_000).expect("wait");
+
+        let mut text = String::new();
+        std::fs::File::open(&out_path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .ok();
+        assert_eq!(
+            code,
+            Some(0),
+            "a payload nothing had blessed could not execute inside the container even with \
+             its own directory granted read-and-execute. This is fallback_scope Trigger B: the \
+             grant set is a discovery problem rather than a configuration one. Output: {text:?}"
+        );
+    }
+
     /// F4 — the wall clock fires, and does not fire on a payload that finishes.
     ///
     /// Both halves, because a ceiling that always fires and a ceiling that never
