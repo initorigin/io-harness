@@ -538,7 +538,7 @@ fn lex(src: &str) -> ParseResult<Vec<Token>> {
                     return Err(Refusal::new(
                         "background execution",
                         i,
-                        "a single `&` detaches a process this tool would then not be able to bound. Use `shell_start` for work that should outlive the step, which returns a handle you can poll and kill.",
+                        "a single `&` detaches a process this tool would then not be able to bound, so the run could end leaving it alive. Run the command in the foreground instead; if it is long, raise the contract's exec timeout rather than backgrounding it.",
                     ));
                 }
             }

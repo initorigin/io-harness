@@ -1,0 +1,43 @@
+scope.excluded — verified absent by inspection, not assumed
+
+1. No host shell anywhere after the parse:
+   grep for sh -c / cmd /c in src/tools/shell.rs and src/run.rs:
+   matches: 2
+
+2. The exec tool is unchanged, including its joined-argv gate:
+ src/tools/exec.rs | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+   exec's joined-argv gate still present:
+1
+
+3. No AppContainer, no CreateRestrictedToken:
+   matches: 2
+
+4. No seccomp; macOS and Linux sandbox backends untouched:
+   seccomp matches in src/: 3
+
+5. rusqlite::Error still not wrapped (deliberately deferred):
+0
+
+6. No LSP, no file snapshot/rewind, no process handles:
+   lsp            0
+   shell_start    1
+   shell_poll     0
+   shell_kill     0
+   snapshot_file  0
+   rewind         0
+
+Each count above was inspected rather than accepted:
+  1. Both `cmd` hits are a test literal — a command *named* `cmd` — not `cmd /c`.
+     No host shell is invoked anywhere after the parse.
+  2. exec.rs's two changed lines are its doctest losing `Verification::None` from
+     the constructor. The tool's behaviour and its joined-argv gate are untouched.
+  3. Both AppContainer hits are doc comments pointing at 0.25.0.
+  4. All three seccomp hits are doc comments stating that there is none.
+  5. `State(#[from] rusqlite::Error)` is still at src/error.rs:156, unwrapped, as
+     the contract requires (the grep pattern above was wrong, not the code).
+  6. `shell_start` appeared in the background-`&` refusal message, telling the
+     model to use a tool this release defers to 0.25.0. FIXED — the refusal now
+     points at raising the exec timeout. Re-checked: zero references to
+     shell_start, shell_poll or shell_kill anywhere in src/, docs/, README.md or
+     CHANGELOG.md.
