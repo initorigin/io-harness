@@ -170,10 +170,30 @@ libc = "0.2"
 #   suspended child's initial thread. std closes the thread handle
 #   `CreateProcess` returned before it hands back a `Child`, so the snapshot is
 #   the only documented route back to it. See `src/sandbox/windows.rs`.
+# 0.26.0 adds two more features and no new crate — the AppContainer half:
+#
+# - `Win32_Security_Isolation` — CreateAppContainerProfile,
+#   DeleteAppContainerProfile and DeriveAppContainerSidFromAppContainerName, the
+#   three `userenv.dll` entry points that make a container exist and give it a
+#   SID. This is the one feature the release could not have been built without.
+# - `Win32_Security_Authorization` — GetNamedSecurityInfoW, SetEntriesInAclW and
+#   SetNamedSecurityInfoW. An AppContainer is default-deny for reads, so a path
+#   the payload may touch is a path something granted with an explicit ACE, and
+#   these are what write one.
+#
+# `Win32_Security` above already covers SECURITY_CAPABILITIES, PSID and FreeSid,
+# and `Win32_System_Threading` already covers CreateProcessW, STARTUPINFOEXW and
+# the ProcThreadAttribute list — the feature was pulled in for CREATE_SUSPENDED
+# in 0.24.0 and happens to carry the whole extended-startup surface with it.
+#
+# Both are additive on Windows only and neither moves `cargo tree` on macOS or
+# Linux, where this dependency is not resolved at all.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
