@@ -676,9 +676,7 @@ impl Config {
             .clone()
             .try_into()
             .map(Some)
-            .map_err(|e: toml::de::Error| {
-                Error::Config(format!("`[app.{key}]`: {}", e.message()))
-            })
+            .map_err(|e: toml::de::Error| Error::Config(format!("`[app.{key}]`: {}", e.message())))
     }
 
     /// What `[instructions]` discovered, worded as constraints (0.27.0).
@@ -1177,7 +1175,9 @@ fn refuse_widening(table: &toml::value::Table, path: &Path) -> Result<()> {
     for (keys, widening) in PROJECT_WIDENING {
         let mut node = table.get(keys[0]);
         for key in &keys[1..] {
-            node = node.and_then(toml::Value::as_table).and_then(|t| t.get(*key));
+            node = node
+                .and_then(toml::Value::as_table)
+                .and_then(|t| t.get(*key));
         }
         let Some(value) = node else { continue };
         let written = match value {
@@ -1540,7 +1540,10 @@ mod tests {
         // The three ways a helper fails, each named separately.
         for (input, expect) in [
             (format!("${{cmd:{fail}}}"), "exited with"),
-            ("${cmd:io-harness-no-such-program}".to_string(), "cannot run"),
+            (
+                "${cmd:io-harness-no-such-program}".to_string(),
+                "cannot run",
+            ),
             (format!("${{cmd:{quiet}}}"), "resolved to nothing"),
         ] {
             let input = input.as_str();
