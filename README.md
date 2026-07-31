@@ -200,10 +200,17 @@ resumable — see the [sessions guide](docs/guide/sessions.md).
 **Configuration in a file.** `Config::discover(root)` reads one `io.toml` across
 four scopes — the crate's defaults, a user file, a committed project file, and a
 gitignored local one — and projects it onto the typed API: a `Policy`, a
-`SandboxConfig`, the run budgets, the toolchain commands, a price table, and MCP
-servers. `${env:...}` and `${file:...}` keep a credential out of the file, an
-unknown key is an error rather than a shrug, and nothing is loaded implicitly:
-the caller reads the file, before the run, once.
+`SandboxConfig`, the run budgets, the toolchain commands, a price table, MCP
+servers, and **which provider and model to run with what behind it**, so an
+embedder reads a `ProviderSpec` rather than writing provider-selection code.
+`[app]` is a section the crate stores and never validates, so the programs built
+on it keep their own settings in the same file; `[profile.<name>]` overlays a
+named set of choices; `[instructions]` discovers the `AGENTS.md` a repository
+already carries. `${env:...}`, `${file:...}` and `${cmd:...}` keep a credential
+out of the file, an unknown key is an error rather than a shrug, and nothing is
+loaded implicitly: the caller reads the file, before the run, once. A **project**
+file may narrow the boundary and may never widen it — the keys that would make
+cloning a repository dangerous are refused in the one file a clone delivers.
 
 ## Guides
 

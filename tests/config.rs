@@ -91,7 +91,9 @@ fn f2_a_later_scope_overrides_one_key_and_nothing_else() {
     write(
         project.path(),
         "io.toml",
-        "[sandbox]\nallow_network = true\n\
+        // `force_floor` rather than `allow_network`: this is the project scope, and
+        // since 0.27.0 a project file may narrow the boundary and may never widen it.
+        "[sandbox]\nforce_floor = true\n\
          [sandbox.limits]\nmax_wall_secs = 300\nmax_cpu_secs = 90\nmax_open_files = 64\n",
     );
 
@@ -111,7 +113,7 @@ fn f2_a_later_scope_overrides_one_key_and_nothing_else() {
         "a sibling cap is intact"
     );
     assert_eq!(with.limits.max_open_files, Some(64));
-    assert!(with.allow_network, "and so is the other section");
+    assert!(with.force_floor, "and so is the other section");
     // The negative control: the same load without the local file differs in
     // exactly that one key.
     assert_eq!(without.limits.max_wall_secs, Some(300));
@@ -321,6 +323,28 @@ fetch = true
 max_uses = 4
 allowed_domains = ["docs.rs", "crates.io"]
 blocked_domains = ["evil.test"]
+
+[[provider]]
+kind = "openrouter"
+model = "anthropic/claude-sonnet-4"
+api_key = "sk-primary"
+
+[[provider]]
+kind = "anthropic"
+model = "claude-sonnet-4"
+
+[[provider]]
+kind = "openai"
+model = "gpt-5"
+
+[app.cli]
+theme = "dark"
+
+[instructions]
+files = ["AGENTS.md"]
+
+[profile.cheap]
+run = { max_steps = 5 }
 "#;
 
 #[test]
@@ -328,9 +352,62 @@ fn f7_every_key_reaches_a_typed_field() {
     let user_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
-    write(project.path(), "io.toml", EVERY_KEY);
+    write(project.path(), "io.local.toml", EVERY_KEY);
+    write(
+        project.path(),
+        "AGENTS.md",
+        "Never touch the generated directory.",
+    );
 
     let config = Config::discover(project.path()).unwrap();
+
+    // 0.27.0's four tables. `[[provider]]` is asserted on order rather than
+    // membership: a fallback chain whose order is wrong is a different
+    // configuration that a set comparison cannot see.
+    assert_eq!(
+        config.provider_spec(),
+        Some(&io_harness::ProviderSpec::OpenRouter {
+            model: "anthropic/claude-sonnet-4".into(),
+            api_key: Some("sk-primary".into()),
+        })
+    );
+    assert_eq!(
+        config.fallback_specs(),
+        [
+            io_harness::ProviderSpec::Anthropic {
+                model: "claude-sonnet-4".into(),
+                api_key: None,
+            },
+            io_harness::ProviderSpec::OpenAi {
+                model: "gpt-5".into(),
+                api_key: None,
+            },
+        ]
+    );
+    assert_eq!(
+        config
+            .app::<std::collections::BTreeMap<String, String>>("cli")
+            .unwrap(),
+        Some(
+            [("theme".to_string(), "dark".to_string())]
+                .into_iter()
+                .collect()
+        )
+    );
+    assert_eq!(config.instructions().len(), 1);
+    assert!(config.instructions()[0].contains("generated directory"));
+    assert!(
+        config.instructions()[0].contains("AGENTS.md"),
+        "with its provenance"
+    );
+    assert_eq!(
+        config
+            .with_profile("cheap")
+            .unwrap()
+            .apply_to(contract(project.path()))
+            .max_steps,
+        5
+    );
 
     let policy = config.policy().unwrap();
     assert_eq!(policy.defaults.read, Effect::Allow);
@@ -406,7 +483,7 @@ fn f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default() {
     // The negative control for the fixture above: drop one key, and that one
     // field falls back while its neighbours do not.
     let without = EVERY_KEY.replace("max_steps = 66\n", "");
-    write(project.path(), "io.toml", &without);
+    write(project.path(), "io.local.toml", &without);
 
     let applied = Config::discover(project.path())
         .unwrap()
@@ -428,7 +505,7 @@ fn f8_the_file_fills_the_price_table_and_the_toolchain() {
     let user_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
-    write(project.path(), "io.toml", EVERY_KEY);
+    write(project.path(), "io.local.toml", EVERY_KEY);
     write(project.path(), "Cargo.toml", "[package]\nname = \"x\"\n");
 
     let config = Config::discover(project.path()).unwrap();
@@ -1170,4 +1247,445 @@ fn a_local_scope_switching_search_off_overrides_a_project_scope_that_turned_it_o
             .unwrap()
             .search
     );
+}
+
+// ---------------------------------------------------------------------------
+// 0.27.0 — F1 through F9
+// ---------------------------------------------------------------------------
+
+/// F1's negative control. `None` must mean "the file said nothing", never "the
+/// crate picked one" — which matters more here than for any other accessor,
+/// because a defaulted provider would be a vendor the operator never named.
+#[test]
+fn a_config_with_no_provider_table_has_no_spec() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(project.path(), "io.toml", "[run]\nmax_steps = 3\n");
+
+    let config = Config::discover(project.path()).unwrap();
+    assert!(config.provider_spec().is_none());
+    assert!(config.fallback_specs().is_empty());
+}
+
+/// The chain is replaced by a later scope, not appended to.
+///
+/// `policy.layers` and `[[agent]]` accumulate because a later scope *adding* one is
+/// what those types mean. A fallback chain is not that shape: appending the user's
+/// two providers to the project's two would produce a four-link chain nobody wrote.
+#[test]
+fn a_later_scope_replaces_the_whole_provider_chain() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[[provider]]\nkind = \"openrouter\"\nmodel = \"team\"\n\
+         [[provider]]\nkind = \"anthropic\"\nmodel = \"team-backup\"\n",
+    );
+    write(
+        project.path(),
+        "io.local.toml",
+        "[[provider]]\nkind = \"openai\"\nmodel = \"mine\"\n",
+    );
+
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(
+        config.provider_spec(),
+        Some(&io_harness::ProviderSpec::OpenAi {
+            model: "mine".into(),
+            api_key: None,
+        })
+    );
+    assert!(
+        config.fallback_specs().is_empty(),
+        "the project's chain is replaced, not appended to"
+    );
+}
+
+/// Is `#[non_exhaustive]` written above `item` in `src/config.rs`?
+///
+/// A source read rather than a compile check. `#[non_exhaustive]` has no effect
+/// inside the defining crate, so no runtime assertion can see it, and asserting a
+/// compile failure would need `trybuild` — a dependency this release does not add.
+/// `tests/public_api.rs` already reads `src/` for the same class of reason.
+fn is_non_exhaustive(item: &str) -> bool {
+    let src = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config.rs"))
+        .unwrap();
+    let at = src
+        .find(item)
+        .unwrap_or_else(|| panic!("`{item}` is not in src/config.rs"));
+    src[..at]
+        .rsplit('\n')
+        .take(6)
+        .any(|line| line.trim() == "#[non_exhaustive]")
+}
+
+/// F2 — the attribute is worth a test because deleting it costs nothing today and
+/// costs a major version later.
+#[test]
+fn provider_spec_is_non_exhaustive_because_a_later_release_adds_a_variant() {
+    assert!(
+        is_non_exhaustive("pub enum ProviderSpec"),
+        "ProviderSpec must be #[non_exhaustive] from the first release it exists"
+    );
+    // The negative control for the helper: a type that is deliberately *not*
+    // non-exhaustive must report absent, or a helper that always answers yes would
+    // pass this file for ever.
+    assert!(
+        !is_non_exhaustive("pub enum Scope"),
+        "the helper must be able to answer no"
+    );
+}
+
+/// F3 — `[app]` is stored and never validated, and strictness is not switched off
+/// to achieve it.
+#[test]
+fn the_app_table_takes_keys_this_crate_has_never_heard_of() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[app.cli]\nnot_a_key_this_crate_has = \"and never will\"\nwidth = 100\n\
+         [app.studio]\nanything = [1, 2, 3]\n",
+    );
+    let config = Config::discover(project.path()).unwrap();
+
+    #[derive(serde::Deserialize)]
+    struct Cli {
+        not_a_key_this_crate_has: String,
+        width: u32,
+    }
+    let cli: Cli = config.app("cli").unwrap().expect("[app.cli] is carried");
+    assert_eq!(cli.not_a_key_this_crate_has, "and never will");
+    assert_eq!(cli.width, 100);
+
+    // A sub-table the file does not carry is absent, not an error and not a
+    // default-constructed value.
+    assert!(config.app::<Cli>("nothing-wrote-this").unwrap().is_none());
+
+    // The negative control, and the boundary of the hole: the *same* unknown key
+    // in a section this crate does own is still refused, naming it.
+    write(
+        project.path(),
+        "io.toml",
+        "[run]\nnot_a_key_this_crate_has = \"and never will\"\n",
+    );
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(err.contains("not_a_key_this_crate_has"), "{err}");
+}
+
+/// F4 — through real files, since the scope is what decides and a scope only
+/// exists on disk.
+#[test]
+fn a_command_substitution_is_refused_in_the_project_scope_and_runs_in_the_local_one() {
+    #[cfg(windows)]
+    let echo = "cmd /c echo s3cret";
+    #[cfg(not(windows))]
+    let echo = "printf s3cret";
+
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    let mcp = |value: &str| {
+        format!("[[mcp]]\nid = \"gh\"\ntransport = \"stdio\"\ncommand = \"{value}\"\n")
+    };
+
+    write(project.path(), "io.toml", &mcp(&format!("${{cmd:{echo}}}")));
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(err.contains("refused in the project scope"), "{err}");
+    assert!(err.contains("io.toml"), "the error names the file: {err}");
+
+    // The negative control: it is `cmd:` that the project scope refuses, not
+    // substitution. Without this a rule that disarmed `${env:}` there — a much worse
+    // feature — would pass the assertion above.
+    std::env::set_var("IO_HARNESS_CONFIG_TEST_CMD", "from-the-environment");
+    write(
+        project.path(),
+        "io.toml",
+        &mcp("${env:IO_HARNESS_CONFIG_TEST_CMD}"),
+    );
+    let config = Config::discover(project.path()).unwrap();
+    assert!(matches!(
+        &config.mcp_servers()[0].transport,
+        io_harness::mcp::McpTransport::Stdio { command, .. } if command == "from-the-environment"
+    ));
+
+    // And the local scope, which the operator wrote, may use it.
+    write(
+        project.path(),
+        "io.local.toml",
+        &mcp(&format!("${{cmd:{echo}}}")),
+    );
+    let config = Config::discover(project.path()).unwrap();
+    assert!(matches!(
+        &config.mcp_servers()[0].transport,
+        io_harness::mcp::McpTransport::Stdio { command, .. } if command == "s3cret"
+    ));
+}
+
+/// F5 — a project-scoped file may narrow the boundary and may never widen it.
+///
+/// Both controls, and the criterion is worthless without either: without the
+/// narrowing half, a rule that refused the key outright would pass; without the
+/// local half, a rule that refused the value in every scope would.
+#[test]
+fn a_project_scoped_file_may_narrow_the_boundary_and_may_never_widen_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    let widening = [
+        (
+            "[policy.defaults]\nexec = \"allow\"\n",
+            "policy.defaults.exec",
+        ),
+        (
+            "[policy.defaults]\nnet = \"allow\"\n",
+            "policy.defaults.net",
+        ),
+        ("[sandbox]\nallow_network = true\n", "sandbox.allow_network"),
+        ("[sandbox]\nforce_floor = false\n", "sandbox.force_floor"),
+    ];
+    let narrowing = [
+        "[policy.defaults]\nexec = \"deny\"\n",
+        "[policy.defaults]\nnet = \"deny\"\n",
+        "[sandbox]\nallow_network = false\n",
+        "[sandbox]\nforce_floor = true\n",
+    ];
+
+    for (text, key) in widening {
+        write(project.path(), "io.toml", text);
+        let err = Config::discover(project.path()).unwrap_err().to_string();
+        assert!(err.contains(key), "the error names the key: {err}");
+        assert!(err.contains("widens"), "{err}");
+        assert!(
+            err.contains("io.local.toml"),
+            "and names where to write it instead: {err}"
+        );
+    }
+
+    // Control one: the same four keys, narrowing, in the same file.
+    for text in narrowing {
+        write(project.path(), "io.toml", text);
+        Config::discover(project.path())
+            .unwrap_or_else(|e| panic!("a project file may narrow: {text:?}: {e}"));
+    }
+
+    // Control two: the widening values, in the scope the operator wrote.
+    std::fs::remove_file(project.path().join("io.toml")).unwrap();
+    for (text, _) in widening {
+        write(project.path(), "io.local.toml", text);
+        Config::discover(project.path())
+            .unwrap_or_else(|e| panic!("the local scope may widen: {text:?}: {e}"));
+    }
+}
+
+/// A widening key cannot hide inside a profile in a project file either. The
+/// profile is applied later, so a check that only looked at the base would let it
+/// reach exactly the same place by a different path.
+#[test]
+fn the_project_scope_rule_reaches_inside_a_profile() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[profile.loose]\nsandbox = { allow_network = true }\n",
+    );
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(err.contains("widens"), "{err}");
+
+    // The negative control: the same profile narrowing loads.
+    write(
+        project.path(),
+        "io.toml",
+        "[profile.tight]\nsandbox = { allow_network = false }\n",
+    );
+    Config::discover(project.path()).unwrap();
+}
+
+/// F6 — a profile overlays the base and touches nothing else.
+#[test]
+fn a_profile_overlays_the_base_and_leaves_every_key_it_did_not_name() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[run]\nmax_steps = 30\nmax_retries = 4\n\
+         [profile.cheap]\nrun = { max_steps = 5 }\n",
+    );
+    let config = Config::discover(project.path()).unwrap();
+    let cheap = config.with_profile("cheap").unwrap();
+
+    let applied = cheap.apply_to(contract(project.path()));
+    assert_eq!(applied.max_steps, 5);
+    assert_eq!(
+        applied.max_retries, 4,
+        "a key the profile never named is untouched"
+    );
+
+    // Control one: selecting a profile does not mutate what it came from.
+    assert_eq!(
+        config.apply_to(contract(project.path())).max_steps,
+        30,
+        "the configuration the profile was taken from is unchanged"
+    );
+
+    // A name the file does not carry is an error naming it, because a `--profile`
+    // argument that silently does nothing is the same failure class as a typo in a
+    // key: an operator believing in a setting that is not there.
+    let err = config.with_profile("careful").unwrap_err().to_string();
+    assert!(err.contains("careful"), "{err}");
+
+    // Profiles do not compose: the overlay is applied once and the result carries
+    // no `[profile]` section of its own.
+    assert!(cheap.with_profile("cheap").is_err());
+}
+
+/// Control two for F6: a typo inside a profile that is *never selected* is still
+/// rejected at load, because a profile body deserializes as the file format rather
+/// than as an opaque table.
+#[test]
+fn an_unknown_key_inside_a_profile_that_is_never_selected_is_rejected_naming_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(
+        project.path(),
+        "io.toml",
+        "[run]\nmax_steps = 30\n[profile.cheap]\nrun = { max_stepz = 5 }\n",
+    );
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(err.contains("max_stepz"), "names the key: {err}");
+
+    // And a profile may not contain profiles: an overlay is not a tree.
+    write(
+        project.path(),
+        "io.toml",
+        "[profile.a.profile.b]\nrun = { max_steps = 1 }\n",
+    );
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(err.contains("may not contain profiles"), "{err}");
+}
+
+/// F7 — a repository's own instructions reach the model without a new
+/// `TaskContract` field.
+#[test]
+fn discovered_instructions_reach_the_contract_as_constraints() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(project.path(), "AGENTS.md", "Never touch `generated/`.");
+    write(project.path(), "io.toml", "[instructions]\n");
+
+    let applied = Config::discover(project.path())
+        .unwrap()
+        .apply_to(contract(project.path()));
+    assert_eq!(applied.constraints.len(), 1);
+    assert!(applied.constraints[0].contains("Never touch `generated/`."));
+    assert!(
+        applied.constraints[0].contains("AGENTS.md"),
+        "each constraint names the file it came from: {:?}",
+        applied.constraints[0]
+    );
+
+    // Control one: with no `[instructions]` section, the very same `AGENTS.md` is
+    // not read. Nothing is loaded implicitly, including this.
+    write(project.path(), "io.toml", "[run]\nmax_steps = 3\n");
+    let config = Config::discover(project.path()).unwrap();
+    assert!(config.instructions().is_empty());
+    assert!(config
+        .apply_to(contract(project.path()))
+        .constraints
+        .is_empty());
+
+    // Control two: a named file that is absent is skipped rather than failing the
+    // load. This is discovery, not substitution — the one place this module's
+    // "resolve or fail" rule deliberately does not apply.
+    write(
+        project.path(),
+        "io.toml",
+        "[instructions]\nfiles = [\"NOTHING-WROTE-THIS.md\", \"AGENTS.md\"]\n",
+    );
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.instructions().len(), 1);
+}
+
+/// F8 — `IO_CONFIG` names the user-scope file directly, and the scopes stay four.
+#[test]
+fn io_config_names_the_user_scope_file_and_does_not_bypass_the_merge() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    // `IO_CONFIG_HOME` points here and would otherwise win.
+    write(user_dir.path(), "io.toml", "[run]\nmax_steps = 1\n");
+    let named = elsewhere.path().join("named-outright.toml");
+    std::fs::write(&named, "[run]\nmax_steps = 7\nmax_retries = 9\n").unwrap();
+    std::env::set_var("IO_CONFIG", &named);
+
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.sources(), [(Scope::User, named.clone())]);
+    assert_eq!(config.apply_to(contract(project.path())).max_steps, 7);
+
+    // The negative control: it names a *scope*, it does not bypass the merge. A
+    // project file still wins the keys it names, which is what keeps the scopes at
+    // four and `Scope` free of a new variant.
+    write(project.path(), "io.toml", "[run]\nmax_steps = 2\n");
+    let applied = Config::discover(project.path())
+        .unwrap()
+        .apply_to(contract(project.path()));
+    assert_eq!(applied.max_steps, 2, "the project scope still wins");
+    assert_eq!(applied.max_retries, 9, "over the file IO_CONFIG named");
+
+    std::env::remove_var("IO_CONFIG");
+}
+
+/// F9 — the strictness tests for the two new tables that have keys of their own.
+/// `[app]` is excepted by design and covered by its own test above; `[profile]` by
+/// the unselected-profile test above.
+#[test]
+fn an_unknown_key_inside_a_provider_or_instructions_table_is_rejected_naming_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    for (text, key) in [
+        (
+            "[[provider]]\nkind = \"openrouter\"\nmodel = \"x\"\nmodle = \"y\"\n",
+            "modle",
+        ),
+        ("[instructions]\nfilez = [\"AGENTS.md\"]\n", "filez"),
+        (
+            "[[provider]]\nkind = \"no-such-vendor\"\nmodel = \"x\"\n",
+            "no-such-vendor",
+        ),
+    ] {
+        write(project.path(), "io.toml", text);
+        let err = Config::discover(project.path()).unwrap_err().to_string();
+        assert!(err.contains(key), "must name `{key}`, got: {err}");
+    }
+
+    // The negative control: the correctly spelled versions load.
+    write(
+        project.path(),
+        "io.toml",
+        "[[provider]]\nkind = \"openrouter\"\nmodel = \"x\"\n[instructions]\nfiles = []\n",
+    );
+    Config::discover(project.path()).unwrap();
 }
