@@ -332,9 +332,9 @@ impl Workspace {
     /// and a tool whose output reorders between runs makes two traces
     /// incomparable for no gain.
     ///
-    /// Unlike `grep` and `find`, nothing here is hidden by
-    /// [`IGNORE_DIRS`]: `target/` and `.git/` are not searched, but they *are*
-    /// in the directory, and a listing that omitted them would be answering a
+    /// Unlike `grep` and `find`, nothing here is hidden by this module's
+    /// ignore list: `target/` and `.git/` are not searched, but they *are* in
+    /// the directory, and a listing that omitted them would be answering a
     /// different question than the one asked.
     ///
     /// The whole listing is returned. Bounding what the *model* is shown is the
