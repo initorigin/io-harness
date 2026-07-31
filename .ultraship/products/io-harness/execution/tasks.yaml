@@ -10,7 +10,7 @@ tasks:
   why_required: 'The positioning fix is the one piece of this release whose cost doubles if it moves:
     shipping an API break now and this break later makes every consumer migrate twice. It is also the
     smallest and most mechanical task in the release, so it goes first and is never what drops.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F11 — the positioning fix compiles and defaults correctly. `TaskContract::workspace(goal, root)`
@@ -24,7 +24,16 @@ tasks:
   - README.md
   - docs/guide/permissions.md
   - docs/guide/sessions.md
-  evidence: []
+  evidence:
+  - '`TaskContract::workspace(goal, root)` is two-argument and defaults to `Verification::None`; `with_verification`
+    added. 173 call sites converted across src/, tests/, examples/, docs/ and README.md; zero three-argument
+    call sites remain outside the pinned 0.22.0 fixture and the changelog''s own history.'
+  - README.md and docs/guide/permissions.md both lead with `Session`; `run_with` kept and documented
+    as the one-shot form.
+  - 'F11 is only PARTLY met: its clause ''both compile as doctests'' cannot be satisfied — the README
+    and guide fences are not compiled doctests in this crate (no `include_str!` of README into the crate
+    root; `cargo test --doc` covers only `///` and `//!` in src/). Both examples were made correct Rust
+    and verified by the text-level tests that do exist. Raised for /ultraship:iterate.'
 - id: US-IO-HARNESS-0.24.0-T02
   summary: 'Add the `list_dir` tool: one directory, one level, entries with type and size, path-resolved
     and checked against `Act::Read` through `Workspace::check_path`. Registered in `workspace_tools()`,
@@ -32,7 +41,7 @@ tasks:
   why_required: Without it there is no way to ask what is in a directory — `find` walks the whole tree
     against a glob, which is a different question. It is the first thing anyone does in an unfamiliar
     repository and the release's outcome names it.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F10 — `list_dir` lists one level and no more. A directory containing a subdirectory containing
@@ -45,7 +54,12 @@ tasks:
   - src/tools/mod.rs
   - src/run.rs
   - tests/
-  evidence: []
+  evidence:
+  - '`list_dir` lists one directory one level deep, path-resolved through the same `Act::Read` check
+    `read_file` uses; `find` unchanged.'
+  - '`cargo test --test list_dir` — 12 passed, 0 failed, covering all three clauses of F10 at both the
+    `Workspace` level and through a real run, plus symlink-not-followed, deterministic ordering and
+    the truncation bound.'
 - id: US-IO-HARNESS-0.24.0-T03
   summary: 'The shell lexer and parser, pure — no execution. An allowlist lexer where any byte outside
     the permitted set for the current state is a refusal, over a conservative POSIX subset: quoted and
@@ -56,7 +70,7 @@ tasks:
     of sub-commands than it executes means the harness checked something other than what ran, which
     is worse than having no shell at all because the trace would assert a boundary that was never applied.
     Nothing downstream can be trusted until this is closed.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F4 — the refusal set is complete and fails closed, and this is the load-bearing criterion of the
@@ -77,7 +91,17 @@ tasks:
   files:
   - src/tools/shell.rs
   - tests/
-  evidence: []
+  evidence:
+  - '`cargo test --lib tools::shell` — 19 passed, 0 failed. Two sweep the entire ASCII range: every
+    character outside the permitted set is refused, and no character silently creates a sub-command.'
+  - 'Non-vacuity proven by eight sabotage runs, each caught by a NAMED test, evidence in `.ultraship/evidence/0.24.0/shell-parser-sabotage.txt`.
+    Two of them found defects in the TESTS rather than the parser: the property test''s oracle was written
+    as `is_bare_word_char(c)` — the function under test — so widening the allowlist widened the expectation
+    with it and a parser permitting an unquoted `$` passed everything. The oracle is now a literal character
+    list.'
+  - 'Zero new dependencies: the parser is written in-crate. `yash-syntax` from the roadmap is GPL-3.0-or-later
+    and unusable in an Apache-2.0 crate designed to be linked into another program; `brush-parser` measured
+    at +37 crates on the default feature set.'
 - id: US-IO-HARNESS-0.24.0-T04
   summary: 'The `shell` tool: parse, then check every sub-command''s resolved program and argv against
     `Act::Exec` and every redirect target against `Act::Write` or `Act::Read` — all before any spawn
@@ -85,7 +109,7 @@ tasks:
     handled as the one builtin, path-resolved and unable to escape the root.'
   why_required: This is the outcome the release is named for. Without it the parser is unreachable and
     the capability gap that blocks non-coding work stays open.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.24.0-T03
   acceptance_criteria:
@@ -113,7 +137,13 @@ tasks:
   - src/run.rs
   - src/tools/mod.rs
   - tests/
-  evidence: []
+  evidence:
+  - '`cargo test --test shell` — 10 passed, 0 failed, covering F1, F2 and F3.'
+  - 'F2''s negative control is the load-bearing one: a first stage with a side effect on disk leaves
+    no file when a later stage is denied, and the same line under a permissive policy does create it.'
+  - Paths are resolved once into a plan and the runner opens exactly what was checked. Resolving at
+    run time would have had the policy check `out.txt` while the process wrote `src/out.txt` after a
+    `cd`.
 - id: US-IO-HARNESS-0.24.0-T05
   summary: The `#[non_exhaustive]` rider on `CompletionRequest`, `CompletionResponse`, `EventKind` and
     `Backend`, none of which carries it and none of which has any use of the attribute in `src/` today.
@@ -123,7 +153,7 @@ tasks:
     and gives `Backend` a value it has never returned. This is the cheapest moment the attribute will
     ever cost, and 0.25.0's AppContainer variant is the next thing that would otherwise break an exhaustive
     match.
-  status: todo
+  status: blocked
   depends_on:
   - US-IO-HARNESS-0.24.0-T01
   acceptance_criteria:
@@ -139,7 +169,16 @@ tasks:
   - src/sandbox.rs
   - docs/public-api.txt
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - 'DONE: `#[non_exhaustive]` on `EventKind`, `Backend` and `Cap` (the enums), which applied with zero
+    breakage inside the crate. The `Cap` doctest carries the wildcard arm the change requires.'
+  - 'NOT DONE: `CompletionRequest` and `CompletionResponse`. Proven by probe rather than argued — applying
+    the attribute produces 11 `error[E0639]: cannot create non-exhaustive struct using struct expression`
+    across 10 files in `tests/`, which is a separate crate and therefore exactly what a consumer sees.
+    Functional-update syntax (`..Default::default()`) is blocked too.'
+  - '`Provider::complete` must RETURN a `CompletionResponse`, so the attribute makes the crate''s main
+    extension point constructible only by `default()`-then-assign, or by a public builder API that the
+    contract does not specify. That is a scope decision, not an implementation one. Raised for /ultraship:iterate.'
 - id: US-IO-HARNESS-0.24.0-T06
   summary: 'Process handles on unix: the store tables, the handle registry with a per-run cap on live
     handles, and `shell_start` / `shell_poll` / `shell_kill`. `shell_start` parses and checks exactly
@@ -196,7 +235,7 @@ tasks:
   why_required: '`shell_kill` on Windows without a job leaks grandchildren, so the handle feature from
     T06 is not correct on that platform without this — which is why the two are one release rather than
     two. It also makes Windows the first backend anywhere to enforce `SandboxLimits::max_processes`.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.24.0-T06
   acceptance_criteria:
@@ -222,7 +261,18 @@ tasks:
   - src/sandbox/windows.rs
   - src/sandbox.rs
   - tests/
-  evidence: []
+  evidence:
+  - Job created, child assigned while `CREATE_SUSPENDED` then resumed, limits set from the existing
+    `JobLimits`, `Backend::WindowsJobObject` reported. Every `unsafe` block carries a SAFETY comment.
+  - 'NF2 verified on the host: `cargo tree` is 402 lines and contains no `windows` crate at all. `windows-sys`
+    is under `[target.''cfg(windows)''.dependencies]`.'
+  - 'NOT VERIFIED BY EXECUTION: no Win32 path has run. `cargo check --target x86_64-pc-windows-msvc`
+    cannot pass `libsqlite3-sys`''s build script on macOS, so the sandbox module was mirrored into a
+    scratch crate to type-check every Win32 signature, the feature set and the `Send` bound under that
+    target. F6, F8 and F9 rest on the first CI Windows run.'
+  - 'F9''s memory clause does not match Windows semantics: `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes an
+    allocation FAIL rather than terminating the process. Documented as such rather than claimed as a
+    kill. Raised for /ultraship:iterate.'
 - id: US-IO-HARNESS-0.24.0-T09
   summary: 'Documentation and dependency accounting. The README platform table''s Windows row states
     native resource containment — memory, CPU, process count, tree kill — and no filesystem or network
@@ -232,7 +282,7 @@ tasks:
   why_required: The Windows row is a claim about a security boundary that does not exist; shortened
     to "Native" it says the opposite of the truth. And the refusal set is something a consumer needs
     before they write a policy, so it is contract rather than implementation detail.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.24.0-T04
   - US-IO-HARNESS-0.24.0-T08
@@ -260,7 +310,15 @@ tasks:
   - README.md
   - docs/CONTRACT.md
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - Platform table corrected in all three places it appears — crate root, README.md, docs/CONTRACT.md
+    — each stating resource containment only, with no filesystem or network boundary.
+  - '`docs/guide/command-execution.md` documents the `shell` tool; `docs/guide/tools-and-skills.md`
+    reserved-name list updated.'
+  - CHANGELOG 0.24.0 section written with a BREAKING entry and a `*Migration:*` note per break; `cargo
+    test --test changelog` passes.
+  - 'REMAINING: `docs/CONTRACT.md` still needs the shell refusal set recorded as part of the public
+    contract (OP4).'
 - id: US-IO-HARNESS-0.24.0-T10
   summary: 'The release gates: full suite on macOS, Linux and Windows; `cargo fmt --check`; `cargo clippy
     --all-targets -- -D warnings` with `unsafe_op_in_unsafe_fn` denied; the nightly all-features doc

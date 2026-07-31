@@ -1,52 +1,82 @@
 product: io-harness
 version: 0.24.0
-execution_state: DEVELOPING
+execution_state: BLOCKED
 checkpoint: null
-blockers: []
+blockers:
+- 'F11 cannot be satisfied as written. Its clause ''both lead with `Session` and both compile as doctests''
+  is false of this repository: the README and guide fences are not compiled doctests — there is no `include_str!`
+  of README.md into the crate root, and `cargo test --doc` covers only `///` and `//!` comments in src/.
+  Both examples were made correct Rust and are covered by the text-level tests that do exist (`tests/readme.rs`,
+  `tests/guide_pages.rs`, `tests/docs_drift.rs`). Either the criterion drops the doctest clause, or
+  the release takes on pulling the README into the crate root, which changes how the crate documents
+  itself and is not in scope.'
+- 'The `#[non_exhaustive]` rider cannot be completed on `CompletionRequest` and `CompletionResponse`
+  without a scope decision. Measured, not argued: applying it yields 11 `error[E0639]: cannot create
+  non-exhaustive struct using struct expression` across 10 files in `tests/`, a separate crate and therefore
+  what a consumer sees; functional-update syntax is blocked too. `Provider::complete` must return a
+  `CompletionResponse`, so the attribute leaves the crate''s primary extension point constructible only
+  by `default()`-then-assign or by a public builder API the contract does not specify. The enums (`EventKind`,
+  `Backend`, `Cap`) are done and applied with zero breakage.'
+- The contract's fallback_scope no longer describes a reachable state. It says process handles and the
+  Windows Job Object 'drop TOGETHER into 0.25.0, because they are one piece of machinery'. The Job Object
+  has landed and is complete; process handles (T06, T07) are not started. Dropping handles alone is
+  a coherent release and is what the evidence now supports, but it is not the fallback as written, and
+  F5, F7 and the handle half of F6 go with them.
+- F9's memory clause does not describe what Windows does. It says 'a child exceeding the job's memory
+  limit is terminated by the job'; `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes the allocation FAIL rather
+  than terminating the process, so a payload over the cap typically dies of its own failed allocation.
+  Literal termination would need a job completion port and a parked thread per run. The criterion needs
+  rewording to what the mechanism actually guarantees.
 release_fit:
   assessment: uncertain
   reasons:
-  - >
-    No constraints are recorded for this release — `ultraship constraints` had no active release to
-    attach them to at plan time and the owner has supplied no time, budget or capacity figure. The
-    assessment is therefore grounded in the contract's own `resource_profile` (complexity `large`,
-    uncertainty `high`) and in what the repository actually contains, not in a limit the framework
-    was given.
-  - >
-    Four largely independent subsystems in one release: a shell lexer and parser with a proven-closed
+  - 'No constraints are recorded for this release — `ultraship constraints` had no active release to
+    attach them to at plan time and the owner has supplied no time, budget or capacity figure. The assessment
+    is therefore grounded in the contract''s own `resource_profile` (complexity `large`, uncertainty
+    `high`) and in what the repository actually contains, not in a limit the framework was given.
+
+    '
+  - 'Four largely independent subsystems in one release: a shell lexer and parser with a proven-closed
     refusal set, a process-handle registry that crosses the checkpoint boundary, a Win32 Job Object
     backend in a crate with no existing Windows FFI, and four public API breaks. Each is tractable;
     the uncertainty is that they compound rather than that any one is hard.
-  - >
-    Two of the four cannot be verified on the development machine. The Job Object criteria (F6's
-    negative control, F8, F9) run on Windows only, so the feedback loop for the most unsafe code in
-    the release is a CI round trip rather than a local test run. That is the single largest reason
-    this is not `probable`.
-  - >
-    The parts that are well understood are genuinely well understood, which is what keeps this above
-    `unlikely`. The positioning fix is mechanical and compiler-guided. `list_dir` is a small tool
-    beside `find`, which already walks the tree. The `#[non_exhaustive]` rider is four attributes and
-    a changelog entry. `JobLimits` at `src/sandbox/windows.rs:63` already maps `SandboxLimits` onto
-    the job's flags with a test, so the Windows work is Win32 calls against a mapping that exists
-    rather than a design.
-  - >
-    The contract's `fallback_scope` was written for exactly this shape and its trigger is named: the
-    parser's refusal proof not closing, or the Job Object's negative control not reproducing. Either
-    means the remaining work is unbounded rather than large, and the response is
-    `/ultraship:iterate`, not a quiet trim.
+
+    '
+  - 'Two of the four cannot be verified on the development machine. The Job Object criteria (F6''s negative
+    control, F8, F9) run on Windows only, so the feedback loop for the most unsafe code in the release
+    is a CI round trip rather than a local test run. That is the single largest reason this is not `probable`.
+
+    '
+  - 'The parts that are well understood are genuinely well understood, which is what keeps this above
+    `unlikely`. The positioning fix is mechanical and compiler-guided. `list_dir` is a small tool beside
+    `find`, which already walks the tree. The `#[non_exhaustive]` rider is four attributes and a changelog
+    entry. `JobLimits` at `src/sandbox/windows.rs:63` already maps `SandboxLimits` onto the job''s flags
+    with a test, so the Windows work is Win32 calls against a mapping that exists rather than a design.
+
+    '
+  - 'The contract''s `fallback_scope` was written for exactly this shape and its trigger is named: the
+    parser''s refusal proof not closing, or the Job Object''s negative control not reproducing. Either
+    means the remaining work is unbounded rather than large, and the response is `/ultraship:iterate`,
+    not a quiet trim.
+
+    '
   major_cost_drivers:
-  - >
-    Proving the shell parser's refusal set closed rather than writing it. The allowlist lexer is a
-    few hundred lines; the property test over generated input, and the sabotage runs that prove it
-    non-vacuous, are the work.
-  - >
-    Win32 job creation, assignment and limit-setting, whose failure mode is a limit that returns
-    success and does not apply — indistinguishable from one that does until something exceeds it, and
-    only observable on a Windows runner.
-  - >
-    Process handles crossing a checkpoint boundary, where PID reuse turns the naive implementation
+  - 'Proving the shell parser''s refusal set closed rather than writing it. The allowlist lexer is a
+    few hundred lines; the property test over generated input, and the sabotage runs that prove it non-vacuous,
+    are the work.
+
+    '
+  - 'Win32 job creation, assignment and limit-setting, whose failure mode is a limit that returns success
+    and does not apply — indistinguishable from one that does until something exceeds it, and only observable
+    on a Windows runner.
+
+    '
+  - 'Process handles crossing a checkpoint boundary, where PID reuse turns the naive implementation
     from wrong into dangerous.
-  - >
-    The blast radius of the `TaskContract::workspace` signature change across `src/`, `tests/`,
-    `examples/` and the compiled doctests in `docs/`.
+
+    '
+  - 'The blast radius of the `TaskContract::workspace` signature change across `src/`, `tests/`, `examples/`
+    and the compiled doctests in `docs/`.
+
+    '
   recommended_scope_change: null
