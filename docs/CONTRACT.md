@@ -459,11 +459,16 @@ was working.
 
 **Windows resource caps.** See the platform table above.
 
-**`SandboxLimits::max_processes` is enforced by nothing**, on any platform. It is
-deliberately not mapped to `RLIMIT_NPROC`, which is per-real-uid and would
-throttle the operator's own login session rather than the sandbox; the two
-backends that could scope it properly — the Linux pid-namespace active-process
-limit and the Windows Job Object — are not wired up. Setting it changes nothing.
+**`SandboxLimits::max_processes` is enforced on Windows and nowhere else.** Since
+0.24.0 the Job Object's `ActiveProcessLimit` bounds the active process count per
+sandbox, and like the job's memory cap it is not a kill: the job refuses the
+`CreateProcess` that would cross the limit, so the run fails because its own
+spawn failed rather than because the payload was terminated. macOS and Linux
+enforce nothing. Neither maps it to `RLIMIT_NPROC`, which is per-real-uid and
+would throttle the operator's own login session rather than the sandbox, and the
+other backend that could scope it properly — the Linux pid-namespace
+active-process limit — is not wired up. Setting it on a unix host changes
+nothing.
 
 **No seccomp filter is installed.** The Linux backend is namespaces and rlimits.
 Whatever syscall restriction applies is the kernel's own default under an
