@@ -596,7 +596,7 @@ versions:
       tree are the rest. First work is a `windows-latest` smoke test, because viability on the CI
       runner and on Server SKUs is unverified and everything else depends on it.
     detail: specified
-    status: planned
+    status: released
   - version: 0.27.0
     outcome: >
       One file is the whole configuration, for the crate and for the applications built on it.

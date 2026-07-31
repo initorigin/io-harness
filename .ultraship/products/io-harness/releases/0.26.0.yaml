@@ -415,4 +415,140 @@ open_questions:
   Job Object as a second layer. They are not exclusive — a process can be in both — but the ordering
   and the failure modes multiply. Decided once F1 and F2 have run, and stated in the contract
   document either way.
-status: planned
+status: released
+released_at: 2026-08-01T03:00:00Z
+mode: published
+delivered: >
+  Killing a process handle on Windows now reaches the whole tree, including a grandchild whose own
+  parent has already exited. Each stage of a handle's line is created suspended, assigned to a Job
+  Object belonging to that handle, and only then resumed; the kill closes the job, and
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` walks nothing, so membership cannot be escaped or outlived.
+  That is `US-IO-HARNESS-0.25.0-I01`'s deferred clause met, and it is proven the way the unix half
+  was: with a negative control showing `taskkill /F /T` — the strongest kill the platform offers
+  short of a job — leaving the grandchild alive on the same fixture.
+
+  The mechanism is reused rather than rewritten. `Job::create`, `Job::adopt` and its resume already
+  existed on the sandbox path; what a handle needed was not a second implementation but a longer
+  *lifetime*, so the job is created when the handle is reserved, held by its registry record, and
+  dropped by the kill. The crate still contains exactly one `AssignProcessToJobObject`. The
+  interface change `US-IO-HARNESS-0.25.0-I01` identified as the blocker — `Capture::on_spawn`
+  carrying a pid where a job needs a handle — is made here: it takes the `Child`, and it can fail,
+  because a handle whose processes are not contained is one whose kill cannot be relied on.
+
+  And the Windows AppContainer exists, is proven on the CI runner, and is honest about what it is.
+  `sandbox::appcontainer` creates a container profile, derives its SID, grants a path to it with an
+  explicit ACE, and spawns into it through `CreateProcessW` with a
+  `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list — which the crate had to own, because
+  neither `tokio`'s `Command` nor `std`'s can carry an attribute list on stable Rust. A payload
+  inside one is refused a read it was not granted and has no route off the machine, each against a
+  negative control that must succeed outside the container.
+
+  It is **not** what `Sandbox::select` chooses on Windows, and the platform table is unchanged
+  because of it. The obstacle is not the mechanism — a binary nothing had blessed runs inside a
+  container once its own directory is granted, measured rather than assumed — but knowing which
+  directories to name for an arbitrary language toolchain, which is a discovery problem this release
+  did not close. Recorded with its evidence in `US-IO-HARNESS-0.26.0-I02` rather than smoothed over,
+  because a table that describes the intent instead of the build is the defect 0.9.1 and 0.16.1 were
+  both spent on.
+evidence:
+  tests:
+  - >
+    Three-platform CI, run 30666016135 — `test (windows-latest)`, `test (macos-latest)` and
+    `test (ubuntu-latest)` all green, plus `lint`, `msrv`, `docs.rs (nightly)` and `links-consumer`.
+    No test skipped, ignored or made conditional, and the standing flaky-skills exception was not
+    needed.
+  - >
+    F1 — `an_appcontainer_can_be_created_and_entered` passed on `windows-latest` the first time it
+    ran, which is the fact the whole release was gated on. `fallback_scope` Trigger A does not fire.
+  - >
+    F2 — `a_payload_cannot_read_what_it_was_not_granted`, with the negative control asserted first:
+    the same `type` of the same file must succeed outside the container, or the test refuses to
+    conclude anything. It did fail on the first attempt, for a real reason in the test rather than
+    the code — `Command::args` escapes for the C runtime's rules and `cmd.exe` does not follow them,
+    so the control was running a program called `type "C:\`. Fixed with `raw_arg`, so both halves
+    are byte-identical command lines.
+  - >
+    F3 — `a_payload_has_no_route_off_the_machine`: `curl.exe` to an external host succeeds outside
+    the container and fails inside it, with an empty capability array and therefore no
+    `internetClient`.
+  - >
+    F4 — `the_wall_clock_kills_only_what_overruns`, both halves: a payload that overruns is capped,
+    and one that finishes reports its own exit code rather than a cap.
+  - >
+    F5 — `killing_a_handle_kills_a_grandchild_whose_parent_already_exited` now runs on Windows as
+    well as unix, and `without_a_job_object_taskkill_leaves_the_grandchild` is the control that makes
+    it evidence: the same fixture killed by `taskkill /F /T` must leave the grandchild running, and
+    does. Without it the positive test would pass with the Job Object removed.
+  - >
+    F6 — proven by there being one definition rather than by assertion: `AssignProcessToJobObject`
+    has exactly one call site in the crate, in `src/sandbox/windows.rs`.
+  - >
+    F7 — the unix guarantee untouched: `test (macos-latest)` and `test (ubuntu-latest)` both green,
+    and `src/sandbox.rs`'s `own_process_group` is unedited by this release.
+  - >
+    Trigger B measured rather than reasoned about:
+    `a_binary_nothing_blessed_runs_once_its_own_directory_is_granted` passed. The running test
+    binary — a freshly compiled executable under `target\` with no ACE for any container — executes
+    inside one once its own directory is granted read-and-execute. The grant mechanism scales to real
+    payloads; only the enumeration of which paths to grant does not.
+  - >
+    Two defects found by CI that no local run could have found, both in this release's own tests. The
+    second is the more interesting: the wall-clock test used `ping -n 30 127.0.0.1` as its sleep and
+    got an exit code back in under a second, because **an AppContainer refuses loopback as well as
+    egress**. That is a stronger boundary than the criterion asked for, and it was discovered by a
+    test failing for the right reason.
+  - >
+    `cargo test` and `cargo test --all-features --lib --tests` on macOS — the two invocations CI and
+    the release workflow run — both exit 0.
+  builds:
+  - '`cargo clippy --all-targets -- -D warnings` — clean, on the `lint` job and locally.'
+  - '`cargo fmt --check` — clean. `cargo doc` — no warnings.'
+  - >
+    `docs.rs (nightly)` green. It failed once during development, on an intra-doc link into a
+    `cfg(windows)` module that docs.rs cannot resolve because it renders on Linux — exactly the
+    defect class that job was added for in 0.16.2, caught before publication rather than after.
+  - >
+    `cargo tree` unchanged at 402 lines on the default feature set on macOS and Linux. Windows gains
+    two `windows-sys` *features* — `Win32_Security_Isolation` and `Win32_Security_Authorization` —
+    and no new crate on any platform.
+  reviews:
+  - >
+    `US-IO-HARNESS-0.26.0-I02` — AppContainer ships as a proven mechanism rather than as the Windows
+    default, and the platform row is left alone. Recorded with `approval.source: agent`,
+    deliberately: the owner's standing override is authority over the release flow, not approval of a
+    change to what a release promises.
+  deployments: []
+  health_checks:
+  - >
+    No live-provider run is claimed for this release. Nothing here is reachable from a model's tool
+    calls in a way a live run would exercise better than the CI evidence above — the AppContainer is
+    not on any dispatch path, and the handle tree kill is a property of `shell_kill` that a live run
+    would assert less precisely than the grandchild fixture and its negative control already do.
+    Stated rather than quietly omitted, since 0.25.0's OP1 set the expectation.
+known_limitations:
+- >
+  **AppContainer is not what `Sandbox::select` chooses on Windows.** The mechanism is built, tested
+  and reachable, but a Windows run still gets the Job Object, so a sandboxed payload there is
+  resource-contained and not access-confined. The platform table in `README.md`, `docs/CONTRACT.md`
+  and the crate rustdoc is unchanged, and says so. See `US-IO-HARNESS-0.26.0-I02`.
+- >
+  **The grant set is the unclosed half.** An AppContainer is default-deny for reads, and a binary
+  runs inside one once its directory is granted — but deriving that set for `cargo`, `npm`, `go`,
+  `pytest` and `dotnet`, including the shims that re-exec into another tree, is a design question
+  about what this crate should know. That is what stands between the mechanism and a default.
+- >
+  The AppContainer spawn collects stdout and stderr into **one** temporary file rather than two
+  pipes, so the two streams interleave as a terminal would show them and cannot be told apart
+  afterwards. Deliberate — a pipe nobody drains fills and blocks the payload — but it is a real
+  difference from the other backends and not an accident.
+- >
+  A handle's Job Object carries the teardown guarantee and no resource limits. A handle is a
+  lifetime rather than a boundary, and a twenty-minute build is exactly the workload the sandbox's
+  caps exist to kill, so `SandboxLimits` does not reach a handle's processes on any platform.
+- >
+  The record is sealed with `mode: published` before the crates.io upload, which follows the
+  `develop` → `main` merge and the GitHub Release. The record states the authorised target; the flow
+  makes it true.
+supersedes: 0.25.0
+next_recommended_version: 0.27.0
+immutable: true
