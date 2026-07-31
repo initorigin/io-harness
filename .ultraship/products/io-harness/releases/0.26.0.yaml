@@ -508,6 +508,16 @@ evidence:
     `cfg(windows)` module that docs.rs cannot resolve because it renders on Linux — exactly the
     defect class that job was added for in 0.16.2, caught before publication rather than after.
   - >
+    `cargo package --locked` — exit 0, 182 files, 1.0MiB. The tarball was verified by **listing**
+    rather than by trusting the `exclude` list: zero entries matching `.env`, `.ultraship/` or
+    `.github/`. The one near-match is `.env.example`, which is a credential-free template and is
+    meant to ship.
+  - >
+    MSRV 1.95 re-checked by hand in both directions rather than read off the manifest, which is the
+    lesson 0.23.0 paid for: `cargo +1.94 check --ignore-rust-version` fails inside
+    `libsqlite3-sys` 0.38.1's build script on `cfg_select`, and stable 1.95 builds. Unchanged by this
+    release — no new crate was added on any platform.
+  - >
     `cargo tree` unchanged at 402 lines on the default feature set on macOS and Linux. Windows gains
     two `windows-sys` *features* — `Win32_Security_Isolation` and `Win32_Security_Authorization` —
     and no new crate on any platform.
