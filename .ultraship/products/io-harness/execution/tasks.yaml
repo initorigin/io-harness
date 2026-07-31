@@ -6,7 +6,7 @@ tasks:
       fallback_specs()."
     why_required: Without it the file still cannot name a provider, which is the release's headline
       claim, and the attribute cannot be added later without a break.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -33,13 +33,30 @@ tasks:
       - src/config.rs
       - src/lib.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - '`ProviderSpec` is an internally-tagged enum (`kind = "openrouter" | "anthropic" | "openai")
+        carrying `model` and an optional `api_key`, `#[non_exhaustive]` and `deny_unknown_fields`.
+        `Config::provider_spec()` is `first()`, `fallback_specs()` is `get(1..)`, both returning
+        references so nothing is cloned to read a configuration.'
+      - "F1 — `f7_every_key_reaches_a_typed_field` asserts the whole chain by equality on an ordered
+        slice, not by membership. `a_config_with_no_provider_table_has_no_spec` is the control:
+        `None` and empty, so the file saying nothing stays distinguishable from the crate choosing."
+      - "`a_later_scope_replaces_the_whole_provider_chain` pins the merge decision: `[[provider]]`
+        is deliberately absent from `APPENDING`, unlike `policy.layers` and `[[agent]]`, because
+        appending two chains produces a chain nobody wrote."
+      - F2 — `provider_spec_is_non_exhaustive_because_a_later_release_adds_a_variant` reads
+        `src/config.rs` and asserts the attribute, with the helper run against `pub enum Scope` as
+        the control that it can answer no. A compile check would need `trybuild`, which NF2 forbids;
+        `#[non_exhaustive]` has no effect inside its own crate, so no runtime assertion can see it.
+      - "Measured rather than assumed: serde **does** honour `deny_unknown_fields` on an
+        internally-tagged enum, so the explicitly-fielded fallback shape named in `resource_profile`
+        was not needed."
   - id: US-IO-HARNESS-0.27.0-T02
     summary: "`[app]`: one opaque toml::Value the crate stores and never validates, reached through a
       generic Config::app::<T>(key)."
     why_required: io-cli and io-studio have nowhere in the file to put their own settings today, so the
       second format gets invented beside io.toml rather than inside it.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.27.0-T01
     acceptance_criteria:
@@ -60,12 +77,19 @@ tasks:
     files:
       - src/config.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - "`[app]` is one `toml::value::Table` held opaquely. `Config::app::<T>(key)` is generic over
+        `serde::de::DeserializeOwned`, so NF3 holds by construction: no `toml` type appears in any
+        public signature and `toml` stays a private dependency."
+      - "F3 — `the_app_table_takes_keys_this_crate_has_never_heard_of` loads two sub-tables of
+        invented keys and deserializes one into a local type. Two controls: the *same* unknown key
+        written into `[run]` is still refused naming it, which is the boundary of the hole; and a
+        sub-table the file does not carry is `None` rather than an error or a default."
   - id: US-IO-HARNESS-0.27.0-T03
     summary: "`${cmd:}` as a fourth arm of expand, with no shell, and refused in the project scope."
     why_required: A credential from a command is the feature operators ask for, and it is a new
       execution path reached from parsing a file, so the scope bound ships with it or not at all.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -80,13 +104,28 @@ tasks:
     files:
       - src/config.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - "`${cmd:}` is a fourth arm of `expand`, reached by threading `Scope` through `parse` and
+        `substitute`. `run_command` splits on whitespace and calls `std::process::Command` directly
+        — no shell, so a `;` or a backtick in the value is an argument rather than a second
+        command."
+      - "The three failure modes are each their own error naming the key: a program not on `PATH`, a
+        non-zero exit, and empty output, the last through the pre-existing rule that a substitution
+        never resolves to nothing."
+      - "F4 — `a_command_substitution_runs_outside_the_project_scope_and_never_inside_it` (unit, on
+        `expand`) and
+        `a_command_substitution_is_refused_in_the_project_scope_and_runs_in_the_local_one`
+        (integration, through real files). The control is a `${env:}` line in the same
+        project-scoped file that must still load: without it the test would pass on an
+        implementation that disarmed substitution in `io.toml` wholesale."
+      - Cross-platform by naming each platform's own spelling of echo/succeed/fail rather than by
+        skipping on Windows, so the feature is proven on all three runners.
   - id: US-IO-HARNESS-0.27.0-T04
     summary: "The project-scope trust rule: four keys refused in Scope::Project when and only when the
       value written is the widening one."
     why_required: A committed io.toml travels with a clone and can today re-enable egress, switch off
       the sandbox floor, and default exec to allow, silently, on the first Config::discover.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.27.0-T03
     acceptance_criteria:
@@ -102,13 +141,30 @@ tasks:
     files:
       - src/config.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - "`PROJECT_WIDENING` pairs four key paths with the single value that widens each, and
+        `refuse_widening` runs on the project scope only — in `read_scope` and in
+        `Config::from_toml`, which is documented as the project scope. Value-dependent rather than
+        key-dependent, so a project file denying `exec` still works, which is what the scope is
+        for."
+      - It recurses into `[profile.<name>]` bodies. A widening key hidden in a profile would
+        otherwise reach the same place by a different path, since the profile is applied after the
+        check would have run.
+      - "F5 — `a_project_scoped_file_may_narrow_the_boundary_and_may_never_widen_it` carries both
+        controls, and the criterion is worthless without either: the four keys accepted at their
+        narrowing value in the same `io.toml`, and accepted at their widening value in
+        `io.local.toml`. `the_project_scope_rule_reaches_inside_a_profile` covers the profile path
+        with its own control."
+      - "The rule caught a real fixture on its first run: `EVERY_KEY` set `allow_network = true` in
+        `io.toml`, and `f2_a_later_scope_overrides_one_key_and_nothing_else` did too. Both were
+        moved rather than exempted — `EVERY_KEY` to the local scope, `f2` to `force_floor = true` —
+        which is the rule working rather than a cost of it."
   - id: US-IO-HARNESS-0.27.0-T05
     summary: "`[profile.<name>]`: a named overlay of the same file format, applied through the existing
       merge by Config::with_profile."
     why_required: Without it a team keeps two files to express two sets of choices, which is the drift
       the four scopes were meant to end.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.27.0-T01
     acceptance_criteria:
@@ -124,13 +180,25 @@ tasks:
     files:
       - src/config.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - "`Config` now keeps the merged raw table it deserialized from, so `with_profile` overlays
+        through the same `merge` the scopes use and a profile has no merge semantics of its own.
+        Scopes merge first; the profile applies to the result."
+      - "A profile body is typed as `File`, so a typo inside a profile that is never selected is
+        still rejected at load. `refuse_nested_profiles` rejects `[profile.a.profile.b]` naming it:
+        an overlay is not a tree."
+      - "F6 — `a_profile_overlays_the_base_and_leaves_every_key_it_did_not_name` with both controls:
+        the receiver is unchanged by the call, and an unknown profile name is an error naming it.
+        `an_unknown_key_inside_a_profile_that_is_never_selected_is_rejected_naming_it` covers the
+        second control and the nesting rule."
+      - "Profiles deliberately do not compose: the returned configuration carries no `[profile]`
+        section, so a second call fails rather than silently doing nothing."
   - id: US-IO-HARNESS-0.27.0-T06
     summary: "`IO_CONFIG`: an environment variable naming the user-scope file outright, ahead of
       IO_CONFIG_HOME and every platform convention."
     why_required: A caller with a config file at a path this crate cannot derive has no way to name it,
       and the alternative shapes all add a Scope variant, which is a break.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -144,13 +212,20 @@ tasks:
     files:
       - src/config.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - "`IO_CONFIG` is checked first in `user_path`, ahead of `IO_CONFIG_HOME` and every platform
+        convention. Two lines, no new `Scope` variant, and therefore no break — the alternative
+        shapes all add a variant to a public enum that is not `#[non_exhaustive]`."
+      - "F8 — `io_config_names_the_user_scope_file_and_does_not_bypass_the_merge`. The control is
+        the whole point of the shape: with `IO_CONFIG` set, a project `io.toml` still wins the key
+        it names, so the variable names a scope rather than bypassing the merge and
+        `docs/CONTRACT.md` keeps saying four scopes without qualification."
   - id: US-IO-HARNESS-0.27.0-T07
     summary: "`[instructions]`: discovery of a repository's own AGENTS.md, landing in
       TaskContract::constraints through Config::apply_to."
     why_required: Project instructions are pasted into a goal string by every caller in turn today, and
       a new TaskContract field would be a break this release does not carry.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.27.0-T01
     acceptance_criteria:
@@ -166,13 +241,27 @@ tasks:
     files:
       - src/config.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - "`[instructions]` is read inside `Config::discover` — the caller's own call, before the run
+        — so 'nothing is loaded implicitly' and 'a config the agent writes mid-run cannot widen the
+        boundary that run is already under' both hold unchanged.
+        `nf3_nothing_is_read_from_disk_for_configuration_once_the_caller_has_loaded_it` still
+        passes."
+      - "Each discovered file becomes one `TaskContract::constraints` entry naming its own path,
+        applied by `Config::apply_to`. No new public field, therefore no break: `TaskContract`'s
+        fields are public and it is not `#[non_exhaustive]`."
+      - "F7 — `discovered_instructions_reach_the_contract_as_constraints`, with both controls: the
+        same `AGENTS.md` is *not* read when no `[instructions]` section names it, and a named file
+        that is absent is skipped rather than failing the load, which is the one place this module's
+        'resolve or fail' rule deliberately does not apply."
+      - Trigger B did not fire. `TaskContract::constraints` reaches the model on the workspace path
+        as `with_constraint` documents, so `[instructions]` ships wired rather than as an accessor.
   - id: US-IO-HARNESS-0.27.0-T08
     summary: EVERY_KEY extended to every new table and key, its negative-control twin extended, and one
       strictness test per new table.
     why_required: f7_every_key_reaches_a_typed_field is what has enforced the file-format contract since
       0.19.0, and a table missing from it is a key nothing proves reaches a field.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.27.0-T01
       - US-IO-HARNESS-0.27.0-T02
@@ -195,14 +284,27 @@ tasks:
         F3.
     files:
       - tests/config.rs
-    evidence: []
+    evidence:
+      - F9 — `EVERY_KEY` names `[[provider]]` (three tables), `[app.cli]`, `[instructions]`,
+        `[profile.cheap]` and every key inside them, and `f7_every_key_reaches_a_typed_field`
+        asserts each reaches a typed field. Its negative-control twin is unchanged and still passes.
+      - The fixture moved from `io.toml` to `io.local.toml`, because it sets two keys a project file
+        may no longer widen. That is the trust rule proving itself against the crate's own most
+        complete fixture rather than being exempted from it.
+      - "Strictness per new table:
+        `an_unknown_key_inside_a_provider_or_instructions_table_is_rejected_naming_it` covers
+        `[[provider]]` (a misspelled key and an unknown `kind`) and `[instructions]`, with the
+        correctly-spelled control;
+        `an_unknown_key_inside_a_profile_that_is_never_selected_is_rejected_naming_it` covers
+        `[profile]`; `[app]` is excepted by design and F3 is what states the boundary of that
+        exception."
   - id: US-IO-HARNESS-0.27.0-T09
     summary: "Documentation: CONTRACT.md's configuration block rewritten, the guide's new sections and
       grown limits block, README's config paragraph, public-api.txt, CHANGELOG."
     why_required: Three CONTRACT bullets stop being true as written, and a document that under- or
       over-claims a boundary is the defect class the last two releases each spent an OP criterion
       on.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.27.0-T08
     acceptance_criteria:
@@ -236,7 +338,25 @@ tasks:
       - docs/public-api.txt
       - README.md
       - CHANGELOG.md
-    evidence: []
+    evidence:
+      - "OP2 — `docs/CONTRACT.md`'s 'What configuration is, and is not' is rewritten rather than
+        appended to. Three bullets stopped being true: scope discovery now has to account for
+        `IO_CONFIG` and profiles, substitution now has to cover `${cmd:}` and its scope rule, and
+        the unknown-key rule now has two exceptions rather than one. Two bullets are new — the
+        narrow/widen rule and the discovery rule — and each states what it does *not* claim."
+      - "OP3 — `docs/guide/configuration.md` gains four `###` sections and a `## A project file may
+        narrow, and may never widen` section with the four keys in a table. Its limits block
+        survives (`tests/guide_pages.rs`) and grows by five: no `${cmd:}` timeout, an absent
+        instructions file skipped silently, `[app]` unvalidated beside `[[mcp]]` as the two named
+        exceptions, the narrow/widen rule, and a discovered `AGENTS.md` as untrusted text."
+      - The guide's `[sandbox]` example previously wrote both keys a project file may no longer
+        widen; corrected in place with the reason inline rather than left to be discovered by a
+        reader copying it.
+      - OP4 — `README.md`'s configuration paragraph rewritten; OP1 — `enum ProviderSpec
+        src/config.rs` hand-edited into `docs/public-api.txt` in sorted position, with the worked
+        example on the type itself. `CHANGELOG.md` opens with prose, puts **Breaking changes**
+        first, and marks the one break `**BREAKING (behaviour)**` with a literal `Migration:` line,
+        which `tests/changelog.rs` enforces.
   - id: US-IO-HARNESS-0.27.0-T10
     summary: "The release gates: full suite on three platforms, clippy, fmt, doc, dependency tree, cargo
       package listing, MSRV."
