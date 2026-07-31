@@ -2075,6 +2075,40 @@ fn record_resume_markers(store: &Store, run_id: i64) -> Result<u32> {
     for s in 1..=last {
         store.record_checkpoint_event(&crate::state::CheckpointEvent::skipped(run_id, s))?;
     }
+    // Every process handle the previous process left running is orphaned here,
+    // unconditionally, before the loop restarts.
+    //
+    // This sits in `record_resume_markers` rather than in the resume entry
+    // points because this function is the one place every resume path passes
+    // through — the flat loop, the tree loop, and the decision, answer and
+    // stored-policy variants all reach it. Orphaning is the kind of rule that is
+    // worthless if it holds on three paths out of four, and putting it at the
+    // funnel is the only version of it that cannot be forgotten by a resume
+    // added later.
+    //
+    // It is unconditional on purpose. The only thing a checkpoint records about
+    // a live process is its pid, and a pid is not an identity: between the crash
+    // and this moment the operating system may have given that number to
+    // something unrelated. There is no test that separates the two with enough
+    // confidence to justify signalling, because every "is it still our program"
+    // check races the signal that follows it. So the handle is recorded,
+    // reported, and left alone — this is the one place this crate could damage
+    // something outside its own workspace, and the cost of being wrong is not a
+    // failed run but somebody else's process.
+    let orphaned = store.orphan_live_handles(run_id, crate::tools::handles::ORPHAN_REASON)?;
+    for h in &orphaned {
+        store.record_checkpoint_event(&crate::state::CheckpointEvent::resume(
+            run_id,
+            start_step,
+            format!(
+                "process handle {} (`{}`) was left running by a previous process and is \
+                 orphaned: {}. It is not re-attached, polled or signalled.",
+                h.handle,
+                h.line,
+                crate::tools::handles::ORPHAN_REASON
+            ),
+        ))?;
+    }
     Ok(start_step)
 }
 
@@ -2597,6 +2631,17 @@ async fn run_workspace_from<P: Provider>(
     let handles = std::sync::Arc::new(crate::tools::handles::Handles::new(
         crate::tools::handles::MAX_LIVE_HANDLES,
     ));
+    // Seeded from the store, so a handle the previous process left behind is
+    // answerable rather than merely absent. Without this a poll of an id from
+    // before the crash would report "no such handle", which is true of this
+    // registry and misleading about the run: the model would reasonably conclude
+    // it had mistyped and try again. Adopted already-terminal — nothing here
+    // attaches, polls or signals.
+    for h in store.process_handles(run_id)? {
+        if h.state == "orphaned" {
+            handles.adopt_orphan(h.handle, &h.line);
+        }
+    }
     let handles = &handles;
     // Detected once, before the first turn. The marker files do not change under
     // a run often enough to be worth a filesystem walk every step, and a run that
@@ -2611,6 +2656,23 @@ async fn run_workspace_from<P: Provider>(
     let pending_media = &mut PendingMedia::default();
 
     for step in start_step..=contract.max_steps {
+        // The store's copy of each live handle's processes, refreshed each step.
+        //
+        // Kept current here rather than swept at the end because this loop has
+        // eleven exits, and a rule applied at ten of them is the failure mode
+        // the orphaning comment above warns about. A handle's pids are only
+        // known once its stages have actually spawned, which is after the call
+        // that started it returned, so this is the first place that can record
+        // them — and recording them every step means whichever exit the run
+        // takes, the trace already has what it needs.
+        //
+        // Killing the live ones is NOT done here: `Handles` kills on drop, which
+        // covers every exit including a panic, and is the property that actually
+        // matters for the operator's machine.
+        for (id, pids) in handles.live_handles() {
+            store.record_handle_pids(run_id, id, &pids)?;
+        }
+
         // The step boundary, where a cancellation is honoured (see `cancelled`).
         if let Some(o) = cancelled(store, watch, run_id, 0, step - 1)? {
             return Ok(RunResult::new(o, run_id).with_remembered(remembered));
@@ -2797,6 +2859,7 @@ async fn run_workspace_from<P: Provider>(
                 pending_media,
                 &contract.commit_identity,
                 contract.exec_timeout,
+                toolchain.as_ref(),
                 handles,
             )
             .await?
@@ -3643,6 +3706,12 @@ fn run_agent<'f, P: Provider>(
         let handles = std::sync::Arc::new(crate::tools::handles::Handles::new(
             crate::tools::handles::MAX_LIVE_HANDLES,
         ));
+        // See the workspace loop: an orphan is adopted so it can be answered.
+        for h in tree.store.process_handles(run_id)? {
+            if h.state == "orphaned" {
+                handles.adopt_orphan(h.handle, &h.line);
+            }
+        }
         let handles = &handles;
         // Children share their parent's workspace, so they share its detection too.
         let toolchain = crate::toolchain::detect(&tree.root);
@@ -3807,6 +3876,7 @@ fn run_agent<'f, P: Provider>(
                     pending_media,
                     &contract.commit_identity,
                     contract.exec_timeout,
+                    toolchain.as_ref(),
                     handles,
                 )
                 .await?
@@ -4680,6 +4750,9 @@ async fn dispatch(
     pending_media: &mut PendingMedia,
     identity: &crate::tools::git::Identity,
     exec_timeout: Duration,
+    // The project's ecosystem, detected once by the loop rather than per edit:
+    // `toolchain::detect` reads the directory, and an edit is a hot path.
+    toolchain: Option<&crate::toolchain::Toolchain>,
     // The run's live process handles. Shared rather than owned by the dispatch
     // because a handle outlives the call that started it — which is the whole
     // point of one, and the reason every guard in `handles` exists.
@@ -5246,11 +5319,36 @@ async fn dispatch(
                                 search,
                                 &replacement,
                             );
+                            // The project's own checker, run against the edit
+                            // that just happened. It cannot fail the edit: the
+                            // write is already on disk by the time this runs, so
+                            // a checker that is missing, slow or broken costs
+                            // the model a note and nothing else.
+                            let checked = crate::tools::diagnostics::after_edit(
+                                ws.root(),
+                                toolchain,
+                                exec_timeout,
+                                cap,
+                            )
+                            .await;
+                            let diagnostics = match &checked {
+                                crate::tools::diagnostics::Outcome::Found(text) => text.clone(),
+                                crate::tools::diagnostics::Outcome::Clean => String::new(),
+                                // Said out loud rather than left as an absent
+                                // section. An empty diagnostics section and a
+                                // check that never ran look identical to a
+                                // model, and one of them means "your edit is
+                                // fine" while the other means nothing at all.
+                                crate::tools::diagnostics::Outcome::Skipped(_) => String::new(),
+                                crate::tools::diagnostics::Outcome::Failed(why) => {
+                                    format!("\n[check did not run] {why}\n")
+                                }
+                            };
                             Dispatched::Continue {
                                 decision: format!("edited {target}"),
                                 obs: bound(
                                     &format!(
-                                        "\n[edited {target}] replaced {} chars with {}{}\n",
+                                        "\n[edited {target}] replaced {} chars with {}{}\n{}",
                                         search.chars().count(),
                                         replacement.chars().count(),
                                         if wrote.moved_the_workspace() {
@@ -5258,7 +5356,8 @@ async fn dispatch(
                                         } else {
                                             " — the replacement is identical to what was there, so \
                                          the workspace did not change"
-                                        }
+                                        },
+                                        diagnostics
                                     ),
                                     cap,
                                     ObsKind::Write,
@@ -5453,6 +5552,21 @@ async fn dispatch(
                 }
             };
 
+            // Recorded before the spawn, so a crash between here and the first
+            // poll still leaves a row saying something was started — which is
+            // exactly the row a resume must find and orphan. A handle that
+            // exists only in memory is a handle a resume cannot warn about.
+            store.record_handle_started(run_id, step, id, line_src)?;
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::HandleStarted {
+                    handle: id,
+                    line: line_src.to_string(),
+                },
+            ));
+
             let registry = std::sync::Arc::clone(handles);
             let on_spawn = {
                 let registry = std::sync::Arc::clone(&registry);
@@ -5535,6 +5649,23 @@ async fn dispatch(
                 ));
             }
             let (text, skipped) = handles.poll(id)?;
+            // Every byte a poll reads goes to the store as well as to the model.
+            // The model's copy is a bounded window and the capture file does not
+            // outlive the run, so this is the only durable record of what the
+            // process actually printed — and "what did that dev server do" is a
+            // question asked after it is gone.
+            store.record_handle_output(run_id, step, id, &text)?;
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                // The count, not the text. The channel is for watching a run,
+                // not for carrying its payload — the output is in the store.
+                EventKind::HandlePolled {
+                    handle: id,
+                    bytes: text.len(),
+                },
+            ));
             let line_src = handles.line(id).unwrap_or_default();
             Dispatched::seen(
                 format!("shell_poll handle {id} ({} bytes)", text.len()),
@@ -5579,11 +5710,23 @@ async fn dispatch(
                 ));
             };
             let line_src = handles.line(id).unwrap_or_default();
+            // Written before the kill, because after it the registry is the only
+            // thing that still knows which processes this handle owned and a
+            // failure mid-kill would take that knowledge with it.
+            store.record_handle_pids(run_id, id, &handles.pids(id))?;
             match handles.kill(id) {
                 // Killing something already over is not a mistake worth failing
                 // a step for: a model that lost track of a handle should be told
                 // how it ended and carry on.
-                Ok(was) => Dispatched::seen(
+                Ok(was) => {
+                    store.record_handle_ended(run_id, id, "killed", None, None)?;
+                    watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::HandleKilled { handle: id },
+                    ));
+                    Dispatched::seen(
                     format!("shell_kill handle {id}"),
                     bound(
                         &format!(
@@ -5606,7 +5749,8 @@ async fn dispatch(
                     ),
                     ObsKind::Tool,
                     None,
-                ),
+                )
+                }
                 Err(reason) => Dispatched::go(
                     format!("shell_kill refused handle {id}"),
                     format!("\n[shell_kill error] {reason}\n"),

@@ -12,6 +12,7 @@
 //! 0.8.0 put it — the MCP client in [`crate::mcp`].
 
 pub mod custom;
+pub(crate) mod diagnostics;
 pub mod documents;
 pub mod exec;
 pub mod fs;

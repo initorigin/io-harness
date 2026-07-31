@@ -20,7 +20,7 @@
 //! 4. **The process this crate is running in goes away.** Nothing in this module
 //!    can help there, which is exactly why a handle recorded by a previous
 //!    process is orphaned on resume and never signalled. See
-//!    [`Handles::orphan_reason`].
+//!    [`ORPHAN_REASON`].
 //!
 //! ## Output goes to a file, not a buffer
 //!
@@ -45,6 +45,22 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
+
+/// Why a handle recorded before this process started is never re-attached.
+///
+/// Stated once, as a constant, because it is reasoning rather than a message and
+/// it is quoted in the store, in the trace and to the model: the only thing a
+/// checkpoint can record about a live process is its pid, and a pid is not an
+/// identity. Between the crash and the resume the operating system may have
+/// given that number to something unrelated, and there is no check that
+/// distinguishes the two with enough confidence to justify signalling it —
+/// every "but is it still our program" test is a race between the check and the
+/// signal.
+///
+/// So the handle is marked, kept readable, and left alone. This is the one way
+/// this crate could damage something outside its own workspace, and the cost of
+/// being wrong is not a failed run, it is somebody else's process.
+pub(crate) const ORPHAN_REASON: &str = "started by a previous process; its pid may since have been reused";
 
 /// How many handles one run may have live at once.
 ///
@@ -74,7 +90,7 @@ pub(crate) enum HandleState {
     /// which an operator reads in the trace.
     ///
     /// This state is terminal and is never left. There is deliberately no
-    /// transition back to `Running`: see [`Handles::orphan_reason`].
+    /// transition back to `Running`: see [`ORPHAN_REASON`].
     Orphaned(String),
 }
 
@@ -203,6 +219,29 @@ impl Handles {
     /// Drop a reservation whose spawn never happened.
     pub(crate) fn abandon(&self, id: u64) {
         self.lock().remove(&id);
+    }
+
+    /// The processes a handle owns, in spawn order.
+    ///
+    /// For the store rather than for signalling — [`Handles::kill`] walks its
+    /// own copy. Nothing outside this module should be signalling a pid it read
+    /// from here, and the resume path in particular must not: see
+    /// [`ORPHAN_REASON`].
+    pub(crate) fn pids(&self, id: u64) -> Vec<u32> {
+        self.lock().get(&id).map(|r| r.pids.clone()).unwrap_or_default()
+    }
+
+    /// Every handle that is still live, with its processes — for the run-ending
+    /// sweep, which has to record what it is about to kill.
+    pub(crate) fn live_handles(&self) -> Vec<(u64, Vec<u32>)> {
+        let guard = self.lock();
+        let mut v: Vec<(u64, Vec<u32>)> = guard
+            .iter()
+            .filter(|(_, r)| !r.state.is_over())
+            .map(|(id, r)| (*id, r.pids.clone()))
+            .collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
     }
 
     /// The line a handle was started with.
@@ -343,23 +382,6 @@ impl Handles {
         n
     }
 
-    /// Why a handle recorded before this process started is never re-attached.
-    ///
-    /// Stated once, here, because it is the reasoning and not a message: the
-    /// only thing a checkpoint can record about a live process is its pid, and a
-    /// pid is not an identity. Between the crash and the resume the operating
-    /// system may have given that number to something unrelated, and there is no
-    /// check that distinguishes the two with enough confidence to justify
-    /// signalling it — every "but is it still our program" test is a race
-    /// between the check and the signal.
-    ///
-    /// So the handle is marked, kept readable, and left alone. This is the one
-    /// way this crate could damage something outside its own workspace, and the
-    /// cost of being wrong is not a failed run, it is somebody else's process.
-    pub(crate) fn orphan_reason() -> &'static str {
-        "started by a previous process; its pid may since have been reused"
-    }
-
     /// Record a handle from a previous process as orphaned.
     ///
     /// It is inserted already-terminal. Nothing here signals, polls or waits.
@@ -371,7 +393,7 @@ impl Handles {
                 pids: Vec::new(),
                 capture: PathBuf::new(),
                 cursor: 0,
-                state: HandleState::Orphaned(Self::orphan_reason().to_string()),
+                state: HandleState::Orphaned(ORPHAN_REASON.to_string()),
             },
         );
         self.next.fetch_max(id + 1, Ordering::SeqCst);
@@ -424,7 +446,7 @@ mod tests {
         assert_eq!(
             h.state(7),
             Some(HandleState::Orphaned(
-                Handles::orphan_reason().to_string()
+                ORPHAN_REASON.to_string()
             ))
         );
     }

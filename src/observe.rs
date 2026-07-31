@@ -487,6 +487,114 @@ pub enum EventKind {
         /// How long it took.
         millis: Option<u64>,
     },
+    /// A long-running process was started and registered as a handle (0.25.0).
+    ///
+    /// The first of the five handle events this release adds. They are additive and
+    /// break no consumer: 0.24.0 made this enum `#[non_exhaustive]`, and this is the
+    /// first release in which that is true — before it, a new variant was a breaking
+    /// change for everyone who matched exhaustively, and a handle's lifecycle stayed
+    /// invisible on the channel for exactly that reason. It was never missing from
+    /// the store. It was missing from the one place an operator was already looking,
+    /// and reading it meant opening the SQLite file behind the crate's back, which is
+    /// the thing [`Observer`] exists to make unnecessary.
+    ///
+    /// A handle outlives the step that started it, so this is the last event that
+    /// mentions it until something polls it or it ends. A handle started here ends in
+    /// exactly one of [`HandleKilled`](EventKind::HandleKilled) or
+    /// [`HandleExited`](EventKind::HandleExited) — never both, and never neither,
+    /// because a run that finishes with handles still live kills them on the way out.
+    /// A `HandleStarted` with no ending anywhere after it is a process that went away
+    /// with this one.
+    HandleStarted {
+        /// The handle's id, as `shell_poll` and `shell_kill` take it.
+        handle: u64,
+        /// The command line as the model wrote it, unmodified.
+        line: String,
+    },
+    /// A poll returned new output from a handle (0.25.0).
+    ///
+    /// Carries how many bytes arrived, not the bytes. The channel is for watching a
+    /// run, not for carrying its payload: a log tail polled in a loop would put its
+    /// whole output through every registered observer, and an observer that only
+    /// wants to know the thing is alive would pay for text it never reads. The output
+    /// is in the store and in the handle's capture file, both of which outlive this
+    /// event and neither of which needs a copy of it.
+    ///
+    /// `bytes: 0` is a real and ordinary poll — a process that is running and has
+    /// said nothing since the last one. It is not an error and not an ending.
+    HandlePolled {
+        /// Which handle was polled.
+        handle: u64,
+        /// New output this poll returned, in bytes. Bounded by the poll window, so a
+        /// process that produced more than one poll can carry reports the window here
+        /// and the rest arrives on the next poll rather than being lost.
+        bytes: usize,
+    },
+    /// A handle was ended by this process (0.25.0).
+    ///
+    /// Emitted both for a `shell_kill` the model asked for and for the sweep that
+    /// ends every live handle when a run finishes, however it finishes. They go
+    /// through the same kill and they are the same fact from outside: the process did
+    /// not choose to stop. Which of the two it was is readable from where the event
+    /// falls, since the sweep happens after the run's last step.
+    ///
+    /// The kill walks the whole process tree, so a pipeline that was several
+    /// processes is still one event.
+    HandleKilled {
+        /// Which handle was ended.
+        handle: u64,
+    },
+    /// A handle's process ended on its own (0.25.0).
+    ///
+    /// The exit is reaped when it happens rather than discovered by the next poll, so
+    /// this arrives at the time the process actually stopped and a poll afterwards is
+    /// answered from the recorded status.
+    ///
+    /// A non-zero code is not a failed run. A dev server told to shut down, a build
+    /// that found a compile error and a watcher that fell over all land here, and only
+    /// the run's own logic knows which of those matters.
+    HandleExited {
+        /// Which handle ended.
+        handle: u64,
+        /// The exit code, or `None` for a death by signal. `None` is not `0`: a
+        /// consumer that treats a missing code as success reports a process the
+        /// kernel killed as one that finished cleanly.
+        code: Option<i32>,
+    },
+    /// A handle recorded by a previous process was never re-attached (0.25.0).
+    ///
+    /// A resume finds handles in the checkpoint that this process did not start. It
+    /// does not re-attach, poll or signal them — ever — and this event is that
+    /// decision being announced, not a failure being reported. The handle is inserted
+    /// already-terminal and stays readable; nothing more will happen to it.
+    ///
+    /// It is a distinct and terminal event because the reasoning behind it is not the
+    /// reasoning behind any other ending. All a checkpoint can record about a live
+    /// process is its pid, and a pid is not an identity. Between the crash and the
+    /// resume the operating system may have handed that number to something
+    /// unrelated, and no test separates the two safely — every "is it still our
+    /// program" check is a race between the check and the signal. Signalling a reused
+    /// pid is the one way this crate could damage something outside its own
+    /// workspace, and the cost of being wrong there is not a failed run, it is
+    /// somebody else's process. So the handle is marked, kept readable, and left
+    /// alone.
+    ///
+    /// This is the variant the other four were worth adding for. The orphaning was
+    /// already a row in the store, and a row is something an operator has to go and
+    /// look for. On the channel they were already watching, a process that was running
+    /// before the crash simply stopped being mentioned: a silent drop, and the one
+    /// ending here that cannot be inferred from the events around it. It is also the
+    /// only ending a handle reaches without this process having started it — there is
+    /// no [`HandleStarted`](EventKind::HandleStarted) for it anywhere in this stream,
+    /// so an observer keeping its own table of live handles learns about this one
+    /// here or not at all.
+    HandleOrphaned {
+        /// Which handle was abandoned.
+        handle: u64,
+        /// Why, in the words the trace and the model are both given — that it was
+        /// started by a previous process and its pid may since have been reused.
+        reason: String,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -773,6 +881,26 @@ mod tests {
                 tool: "web_search".into(),
                 ok: true,
             },
+            EventKind::HandleStarted {
+                handle: 1,
+                line: "npm run dev".into(),
+            },
+            EventKind::HandlePolled {
+                handle: 1,
+                bytes: 0,
+            },
+            EventKind::HandleKilled { handle: 1 },
+            // `None` rather than a code, because the signal death is the case a
+            // consumer is most likely to get wrong and the round-trip is where a
+            // missing field would show up.
+            EventKind::HandleExited {
+                handle: 1,
+                code: None,
+            },
+            EventKind::HandleOrphaned {
+                handle: 1,
+                reason: "started by a previous process".into(),
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -794,6 +922,17 @@ mod tests {
                 | EventKind::MemoryWrote { .. }
                 | EventKind::Sandbox { .. }
                 | EventKind::Mcp { .. }
+                // The five handle events sit with `Sandbox` and `Mcp` rather than
+                // anywhere else: all of them report something outside this process
+                // that the run caused to happen. `HandleOrphaned` is here with the
+                // rest because this arm is a compile-time census and not a severity
+                // ranking — nothing in this file grades events, and an orphaning
+                // filed as routine is the mistake the variant exists to stop.
+                | EventKind::HandleStarted { .. }
+                | EventKind::HandlePolled { .. }
+                | EventKind::HandleKilled { .. }
+                | EventKind::HandleExited { .. }
+                | EventKind::HandleOrphaned { .. }
                 | EventKind::Token { .. }
                 | EventKind::TodoWrote { .. }
                 | EventKind::QuestionAsked { .. }

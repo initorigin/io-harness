@@ -26,6 +26,90 @@ notes are produced from it.
 
 ### Security
 
+## [0.25.0] - 2026-07-31
+
+The release that lets a run start something that does not finish. Every tool this
+crate has ever had is a call that returns, so a dev server, a log tail, a watch
+build and a twenty-minute compile were not slow here — they were unrepresentable,
+and the only way to express one was to run it in the foreground and lose the loop
+until a timeout decided for it. This release adds a handle: a command line the
+run starts, reads from over many steps, and ends. Beside it, an edit now comes
+back carrying what the project's own checker thinks of it, so the model stops
+paying a step, a build and a provider call to discover the type error it just
+wrote.
+
+### Added
+
+- **Three tools for a process that outlives the call that started it.**
+  `shell_start` takes the same one command line `shell` takes and returns a
+  handle instead of a result; `shell_poll` returns the output the process has
+  produced since the previous poll, so a log tail polled ten times does not
+  return its whole history ten times; `shell_kill` ends the process and
+  everything it spawned.
+- The line a handle runs is parsed and checked by **exactly** the machinery
+  `shell` uses: the same allowlist lexer, the same refusal set, the same
+  per-stage `Act::Exec` check and the same path-resolved redirect targets, all of
+  it **before the first spawn**. There is no second parser, no second gate and no
+  second refusal set, so a handle is a different lifetime for a command line
+  rather than a second way to run one, and a line whose second stage is denied
+  starts no first stage.
+- **A handle does not survive the process that started it.** On resume it is
+  reported orphaned, with a reason, and is never re-attached, polled or
+  signalled. This is unconditional rather than a best-effort re-attach because a
+  PID recorded before a crash may since have been reused by an unrelated program,
+  and signalling it is the one way this crate could damage something outside its
+  own workspace. An orphaned handle stays readable in the store rather than being
+  silently dropped.
+- A per-run cap of **8 live handles**, refused with a reason naming the cap
+  rather than queued, so a model in a loop cannot fill the host with dev servers.
+  Every handle still live when its run ends is killed rather than leaked.
+- Store tables `process_handles` and `handle_output` — what was started, its
+  parsed sub-commands, the whole of its output as it was read, how it ended, and
+  whether a resume orphaned it — so "what did that dev server do" is answerable
+  after the process that started it is gone, and a poll whose result was lost to
+  a provider retry is recoverable by reading the run rather than by asking the
+  process again. The change is additive: no existing table is created, altered or
+  dropped, every 0.24.0 database opens unchanged, and **`CHECKPOINT_FORMAT` stays
+  7**. A new table is not a format change — bumping the format would make an
+  older store be refused over a table an older binary never queries.
+- New `EventKind` variants for the handle lifecycle — started, polled, killed,
+  orphaned — so a handle is visible through the observer channel an operator
+  already subscribes to. These are additive and covered by the
+  `#[non_exhaustive]` that shipped in 0.24.0: this is the first release in which
+  adding a variant costs a consumer nothing, and the reason that rider shipped
+  when it did.
+- **Diagnostics attached to the edit that caused them.** After a successful edit
+  in a project whose ecosystem this crate already detects, the project's own
+  checker runs against the workspace and its findings come back attached to the
+  edit — file, line, span, message, and the rendered error a human would see in a
+  terminal. The pass is bounded by a timeout and by a cap on how much it may
+  append, is skipped entirely when no ecosystem is detected, and **can never turn
+  a successful edit into a failed one**: the edit has already happened when the
+  checker runs, so a checker that is missing, times out or fails for its own
+  reasons yields no diagnostics and is recorded as such.
+
+### Changed
+
+- The three new tool names are reserved, as every built-in name is. A caller who
+  has registered a custom tool called `shell_start`, `shell_poll` or `shell_kill`
+  now fails validation at run start rather than having it silently shadowed by
+  the built-in. This is the standing behaviour for built-in names rather than a
+  new rule, but it newly applies to those three.
+  *Migration:* rename the custom tool, and register it under the new name —
+  there is no way to keep the old one, since the built-in answers every call to
+  it. Nothing else changes: a tool with any other name is unaffected.
+
+### Fixed
+
+- Documentation that had gone stale a release ago. `docs/CONTRACT.md` and
+  `docs/guide/sandbox.md` still said `SandboxLimits::max_processes` was "enforced
+  by nothing, on any platform" and that the Windows Job Object was "not wired
+  up", and the sandbox guide still carried a table row reading "no native backend
+  yet" — all three made false by 0.24.0, which enforces `max_processes` on
+  Windows through the Job Object. A contract document that under-claims a shipped
+  boundary is the same class of defect as one that over-claims it: either way a
+  consumer cannot trust the file.
+
 ## [0.24.0] - 2026-07-31
 
 The release that gives the agent hands. A command line becomes something it can
