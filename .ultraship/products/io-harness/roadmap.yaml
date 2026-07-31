@@ -564,7 +564,7 @@ versions:
       find-references are the queries a language server genuinely answers better than a grep; when
       they are wanted they should be argued on their own terms, not smuggled in behind diagnostics.
     detail: specified
-    status: planned
+    status: released
   - version: 0.26.0
     outcome: >
       The platform table finally reads the same on all three rows. AppContainer is the access half
@@ -579,10 +579,10 @@ versions:
       It also closes what `US-IO-HARNESS-0.25.0-I01` deferred: routing a process handle's spawn
       through a Job Object, so that killing a handle on Windows reaches a grandchild whose parent
       has already exited. 0.25.0 shipped that guarantee on unix through process groups and could not
-      ship it here, because Windows has no process group and the Job Object needs the child handle at
-      the spawn site. Once this release owns `CreateProcessAsUserW`, the assignment is a few lines in
-      the same place rather than a second interface change — which is the argument for it landing
-      here rather than being forced into the release that discovered it.
+      ship it here, because Windows has no process group and the Job Object needs the child handle
+      at the spawn site. Once this release owns `CreateProcessAsUserW`, the assignment is a few
+      lines in the same place rather than a second interface change — which is the argument for it
+      landing here rather than being forced into the release that discovered it.
 
       It is a release of its own, and 0.25.0's research is why. The security capabilities reach a
       child through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` on an attribute list, and

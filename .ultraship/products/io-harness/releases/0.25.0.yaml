@@ -504,4 +504,114 @@ open_questions:
   status. The idempotent form is friendlier to a model that lost track, which is the common case;
   the error form catches a confused agent earlier. Decided against what the refusal messages look
   like in a real run.
-status: planned
+status: released
+released_at: 2026-08-01T00:30:00Z
+mode: published
+delivered: >
+  A run can start something that does not finish and stay in control of it. `shell_start` returns a
+  handle instead of a result, `shell_poll` returns the output produced since the previous poll, and
+  `shell_kill` ends the process and everything it spawned. The line is parsed and checked by exactly
+  the machinery `shell` uses — literally the same `parse`, `plan` and `check_shell_line` — so a
+  handle is a different lifetime for a command line rather than a second way to run one, and a line
+  whose second stage is denied starts no first stage.
+
+  A handle recorded by a previous process is orphaned on resume and never re-attached, polled or
+  signalled. That rule lives in `record_resume_markers`, the one function every resume path passes
+  through, because a rule that holds on three paths out of four is worthless and this is the rule
+  whose failure kills an unrelated process on the operator's machine.
+
+  Beside it, an edit now comes back carrying what the project's own checker thinks of it. That is
+  deliberately not the LSP client the roadmap named: push diagnostics have no completion signal, the
+  3.17 pull model is not portable, and rust-analyzer's pull path never consults flycheck, so it
+  omits the borrow-check and clippy errors the feature exists for. Consuming the compiler's own
+  machine-readable output costs no new dependency and carries more.
+evidence:
+  tests:
+  - >
+    `cargo test --all-features` on macOS — 1082 passed, 0 failed, exit 0. Full output in
+    `evidence/0.25.0/tests.txt`.
+  - >
+    Three-platform CI — `test (macos-latest)`, `test (ubuntu-latest)` and `test (windows-latest)`
+    all green, plus `lint`, `msrv`, `docs.rs (nightly)` and the `links-consumer` job. Recorded in
+    `evidence/0.25.0/ci.txt`.
+  - >
+    Windows CI earned its keep: it failed twice and each failure was a real defect. The first was an
+    unquoted Windows path in a fixture, destroyed by the shell grammar's escape rule before anything
+    spawned — a behaviour that predates this release and had never been written down. The second was
+    a defect in this release's own code: a handle that exits on its own was noticed by a task that
+    cannot write to the store, so the trace said `running` forever for a process that was gone.
+  - >
+    Two more defects were found by tests written to distrust the implementation. A strong `Arc` held
+    by each handle's reaping task kept the registry's refcount above zero, so the kill-on-drop
+    backstop never ran and a process outlived its run — caught only because the assertion asks the
+    operating system whether the pid is alive rather than asking the registry. And output a process
+    produced but nobody polled was recorded nowhere durable.
+  - >
+    Non-vacuity established by sabotage rather than asserted: stubbing the process-group hook to
+    `if false` makes the grandchild test fail with "the grandchild survived the kill"; widening the
+    diagnostics timeout from zero makes the timeout test fail because a real `cargo check` runs
+    clean.
+  builds:
+  - '`cargo package --locked` — exit 0, 181 files, 960.7KiB compressed.'
+  - >
+    Tarball verified by listing rather than by trusting `exclude`: zero entries matching `.env`,
+    `.ultraship/` or `.github/`. `evidence/0.25.0/package.txt`.
+  - '`cargo clippy --all-features --all-targets` — clean. `cargo doc --all-features` — no warnings.'
+  - '`cargo fmt --check` — clean.'
+  - >
+    `cargo tree` — 402 lines on the default feature set, unchanged, and 842 with all features. This
+    is the checkable form of the argument for rejecting the LSP client, which would have cost 23
+    lines including a duplicate `lsp-types` and a second major of `bitflags`.
+  - >
+    MSRV 1.95 checked by hand in both directions rather than read off the manifest: 1.94 with
+    `--ignore-rust-version` fails inside `libsqlite3-sys` 0.38.1's build script on `cfg_select`, and
+    1.95 builds. That is the lesson 0.23.0 paid for.
+  reviews:
+  - >
+    `US-IO-HARNESS-0.25.0-I01` — F2 and F5 amended to the unix guarantee that is implemented and
+    proven, with the Windows Job Object routing deferred to 0.26.0. Recorded with
+    `approval.source: agent`, deliberately: the owner's standing override is authority over the
+    release flow, not approval of a change to what a release promises.
+  deployments: []
+  health_checks:
+  - >
+    Live OpenRouter run, nothing scripted, on `openai/gpt-5.6-luna` — 10 steps, 24,160 tokens. The
+    model chose `shell_start` over `shell`, polled it for 82 bytes, killed it, and wrote the port it
+    read out of the running process's own log. Handle state `killed`, pid recorded, nothing left
+    running. This is OP1, and it is the criterion a scripted provider cannot satisfy: it tests
+    whether the tool descriptions are good enough that a model picks the right tool unprompted.
+known_limitations:
+- >
+  **Killing a handle on Windows does not reach a grandchild whose parent has already exited.** The
+  unix guarantee is a process group; Windows has no equivalent and its Job Object needs the child
+  handle at the spawn site, where this release's interface carries a pid. Deferred to 0.26.0 by
+  `US-IO-HARNESS-0.25.0-I01`, which rewrites that spawn path for AppContainer regardless. Stated in
+  `docs/CONTRACT.md` and the sandbox guide rather than left to be discovered.
+- >
+  **Output skipped by a poll is gone, not archived.** `Store::handle_output` holds only what polls
+  actually read. A poll arriving to find more than one window waiting keeps the newest and advances
+  the cursor past the rest, so bytes no poll ever read reach no store and go with the capture file
+  when the run ends. The poll's own message to the model says so; an earlier wording claimed the
+  skipped bytes were in the trace and was corrected before release. The real fix streams the skipped
+  region to the store in bounded chunks.
+- >
+  The record is sealed with `mode: published` before the crates.io upload, which follows the
+  `develop` → `main` merge and the GitHub Release. The record states the authorised target; the flow
+  makes it true.
+- >
+  A handle has no wall-clock ceiling of its own. That is the point of one, but it means a model that
+  starts a handle and never polls or kills it holds a process for the life of the run. The per-run
+  cap of 8 and the kill-on-run-end are what bound that, not a timeout.
+- >
+  The diagnostics pass runs on every edit rather than being debounced across a burst, so a model
+  rewriting four files in one step pays four checks. Left as written and recorded as an open
+  question in this contract rather than guessed at.
+- >
+  `every_kind()` in `src/observe.rs` claims an exhaustiveness it does not prove — the guard matches
+  on the vector's items, so it proves the arms are exhaustive and never that the vector mentions
+  every variant. `TodoWrote`, `QuestionAsked` and `QuestionAnswered` have gone round-trip-untested
+  since 0.21.0. Pre-existing, found while adding this release's variants, and left alone under scope
+  freeze.
+supersedes: 0.24.0
+next_recommended_version: 0.26.0
+immutable: true
