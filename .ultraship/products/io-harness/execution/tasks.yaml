@@ -9,7 +9,7 @@ tasks:
     why_required: >
       This is the release. Everything else in it exists to prove this move changed no behaviour, and
       nothing else can be attempted until the crate compiles against the new line.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -23,7 +23,35 @@ tasks:
     files:
       - Cargo.toml
       - Cargo.lock
-    evidence: []
+    evidence:
+      - >
+        `rusqlite` 0.32 to 0.40.1, `libsqlite3-sys` 0.30.1 to 0.38.1, bundled SQLite 3.46.0 to 3.53.2.
+        0.40.1 was the newest published when development started, per the owner's newest-at-development
+        decision; 0.40 was the floor, not the target.
+      - >
+        The migration is two manifest lines and **no change in `src/state.rs`**. The bump produced 28
+        compile errors, all one root cause: `u64`'s `ToSql`/`FromSql` impls moved behind a new
+        `fallible_uint` feature in `rusqlite` 0.38.0. Enabling it restores the same macro-generated
+        impls, so the checked conversions are preserved exactly rather than replaced by a cast.
+        `cargo check --all-targets` is clean.
+      - >
+        NF2 — no new direct dependency. `cargo tree` 407 lines before, **402 after**. `ahash`,
+        `hashbrown` 0.14.5, `zerocopy` and the `version_check` build dependency drop out; `foldhash`
+        0.2.0 arrives; `hashlink` 0.9.1 to 0.12.1. Measured on the same machine by stashing the
+        manifest, not quoted from a previous release.
+      - >
+        OP1 — the MSRV moved and is stated. `libsqlite3-sys` 0.38.1's build script and `rusqlite`
+        0.40's source call the std `cfg_select!` macro, stabilised in 1.95.0, and neither crate
+        publishes a `rust-version`. Verified by hand rather than assumed: `cargo +1.93` and
+        `cargo +1.94` both fail inside the build script with
+        `cannot find macro cfg_select in this scope`, `cargo +1.95` builds. `rust-version = "1.95"` in
+        `Cargo.toml` with the reason and the dependency that set it, and matching text in `README.md`,
+        `src/lib.rs` crate-root docs and `docs/CONTRACT.md` — all three checked by
+        `tests/docs_drift.rs::msrv_is_stated_and_matches_cargo_toml`, which passes.
+      - >
+        No `rusqlite` at or above the contract's 0.40 floor avoids the MSRV move, so the choice was the
+        floor or the release. Recorded because it is the one place this release makes a consumer's life
+        harder, and the contract's `risks` anticipated it.
 
   - id: US-IO-HARNESS-0.23.0-T02
     summary: >
@@ -97,7 +125,7 @@ tasks:
       The wall this release exists to remove is a resolver error in someone else's build, which nothing
       inside this crate's own test suite can observe. Without this the release's central claim is
       asserted rather than checked.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T01]
     acceptance_criteria:
       - >
@@ -113,7 +141,27 @@ tasks:
       - tests/fixtures/links-consumer/
       - .github/workflows/ci.yml
       - Cargo.toml
-    evidence: []
+    evidence:
+      - >
+        F1 positive — `tests/fixtures/links-consumer` declares `rusqlite = "0.40"` with `bundled` AND
+        `io-harness` by path. `cargo run` in it prints
+        `links-consumer OK: rusqlite 0.40 and io-harness share one libsqlite3-sys (sqlite 3.53.2)`.
+        It is run rather than only built, because coexistence is a claim about one process: the binary
+        opens a connection through its own `rusqlite` and a `Store` through the crate's, over the same
+        linked `libsqlite3-sys`.
+      - >
+        F1 negative control — the same fixture against `io-harness = "=0.22.0"` fails at resolution,
+        exit 101, before anything compiles, with cargo naming `libsqlite3-sys` links to the native
+        library `sqlite3`, but it conflicts with a previous package which links to `sqlite3` as well.
+        The diagnostic is quoted verbatim in the 0.23.0 changelog entry, as the contract requires.
+      - >
+        OP3 — a `links-consumer` job added to `.github/workflows/ci.yml`, ubuntu-latest, 20 minutes.
+        It runs the positive control, then rebuilds the fixture against 0.22.0 in `RUNNER_TEMP` and
+        **fails the job if that build succeeds**. It also refuses to accept any failure: cargo's output
+        must name both `links` and `sqlite3`, so a network blip or a yanked version cannot pass as the
+        expected failure. YAML parses; jobs are test, msrv, lint, links-consumer, docs. All 15 `uses:`
+        lines resolve to the three full 40-character SHAs already present in the file — no new action
+        and no new SHA was introduced.
 
   - id: US-IO-HARNESS-0.23.0-T06
     summary: >
@@ -184,7 +232,7 @@ tasks:
     why_required: >
       The engine moved seven point releases and the contract asks for the number rather than an
       assumption. Recording it is also how a later regression gets a baseline to fail against.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T01]
     acceptance_criteria:
       - >
@@ -193,7 +241,32 @@ tasks:
         finding to record, not a reason to stop.
     files:
       - CHANGELOG.md
-    evidence: []
+    evidence:
+      - >
+        NF4 — measured, not assumed, and the criterion's premise was wrong: there is no "existing
+        benchmark path" in this repository. No `benches/`, no criterion, no `[[bench]]`. Both sides
+        were built instead — `examples/store_throughput.rs` on the new line and
+        `tests/fixtures/throughput-0.22.0/` pinned `io-harness =0.22.0` on the old one, running a
+        workload whose executable code is byte-identical between the two.
+      - >
+        `Store::checkpoint_step` is the timed call: the hot durable path, two inserts inside a
+        committed transaction, so every iteration pays the WAL commit the resume path depends on.
+        `record` was rejected as the subject because it writes one row without committing a
+        transaction of its own, which would flatter the engine. File-backed store, release profile,
+        20,000 and 100,000 iterations, 33 samples per side.
+      - >
+        Result: **within noise, no regression.** Order-balanced batch medians differ by +0.06%, -0.99%
+        and +1.65% — the sign flips across batches, which is what rules out a systematic effect —
+        against a paired per-round spread of 11 to 21%. The measurement rules out a regression above
+        roughly 5% and does not claim to resolve anything smaller.
+      - >
+        Recorded rather than buried: an earlier unbalanced batch that ran the new side first in every
+        round produced an apparent 18% regression from scheduling alone. It is reported because
+        discarding the one batch that looked bad without saying so would be dishonest, and because it
+        is the reason the reported batches alternate order.
+      - >
+        No CI job for it. On shared runners the noise floor is worse than the one measured here, and a
+        throughput gate against a 20% noise floor is a flake generator rather than a guard.
 
   - id: US-IO-HARNESS-0.23.0-T10
     summary: >
@@ -202,7 +275,7 @@ tasks:
     why_required: >
       Every other check in this release is offline. A store that satisfies the unit tests and fails a
       real run would still be a broken release.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.23.0-T08]
     acceptance_criteria:
       - >
@@ -211,4 +284,23 @@ tasks:
         the trace read back afterwards.
     files:
       - examples/durable_run.rs
-    evidence: []
+      - examples/live_accounting.rs
+    evidence:
+      - >
+        OP2 — `cargo run --example durable_run` against OpenRouter on the upgraded store: one run, one
+        workspace, a verified outcome under the `rustc` gate, and the trace read back from a reopened
+        file-backed `Store`. Output: `[process 1] stopped: Success { steps: 1 }`,
+        `[process 2] resumed to: Success { steps: 1 }`, `[process 2] final status = Completed`.
+      - >
+        `cargo run --example live_accounting` was run as well, because it is the example that exercises
+        the exact surface this release changed. Three live provider calls, and all seven `u64` `Usage`
+        counters written and read back through the `fallible_uint` path against real vendor numbers:
+        prompt 1345/1355/3086, completion 51/118/55, reasoning 29/45/29, cache-read 0/1250/1250,
+        totals 1396/1473/3141, 6010 tokens across the run. The edit is recorded (`step 3 write_file
+        NOTES.md (+1 -0)`) and spend prices correctly at two different rates from the same stored
+        trace, confirming no cost is stored. This is the strongest single piece of live evidence in the
+        release: the one code path the migration touched, exercised end to end against a real provider.
+      - >
+        The `.env` here carries real credentials for OpenRouter only, so the live evidence is
+        OpenRouter-only. The Anthropic and OpenAI paths rest on their wire tests, unchanged by this
+        release.
