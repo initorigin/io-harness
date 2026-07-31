@@ -112,6 +112,13 @@ wrote.
   Windows through the Job Object. A contract document that under-claims a shipped
   boundary is the same class of defect as one that over-claims it: either way a
   consumer cannot trust the file.
+- Documentation of a behaviour that had never been written down: the `shell`
+  grammar treats `\` as an escape exactly as POSIX does, on every platform, so an
+  unquoted absolute Windows path like `C:\repo\server.exe` loses its separators
+  in the parse and the spawn then fails naming a program nobody typed.
+  `docs/guide/command-execution.md` now states the rule, says to quote absolute
+  paths on Windows, and shows what the unquoted form becomes. The behaviour is
+  unchanged and has been true since `shell` shipped in 0.24.0.
 
 ## [0.24.0] - 2026-07-31
 

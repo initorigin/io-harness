@@ -108,6 +108,37 @@ has subcommands that fetch code and options that execute it, so its safe set is 
 closed one worth enumerating. `exec` exists precisely to run commands this crate
 has never heard of, so the boundary moves from the argv's *shape* to the policy.
 
+### A backslash is an escape, not a path separator
+
+`\` means here what it means in POSIX: outside quotes it escapes the next
+character and is itself removed. Nothing about that changes on Windows, so an
+unquoted absolute Windows path is taken apart before anything is spawned.
+
+```text
+C:\repo\server.exe --port 8080    →  argv[0] = C:reposerver.exe
+'C:\repo\server.exe' --port 8080  →  argv[0] = C:\repo\server.exe
+"C:\repo\server.exe" --port 8080  →  argv[0] = C:\repo\server.exe
+```
+
+**On Windows, quote absolute paths.** Single quotes are the simplest form,
+because inside them every character is literal, `\` included; double quotes work
+too, since a backslash there escapes only `"`, `\`, `$` and a backtick and is
+kept as itself otherwise. This is the grammar rather than a property of one tool,
+so it holds for `shell`, for `shell_start`, and for a redirect target as much as
+for a program or an argument: `> C:\logs\out.txt` writes to a file called
+`C:logsout.txt`.
+
+The failure it produces is worth recognising, because the error names a place the
+caller never typed — the spawn fails on `C:reposerver.exe`, a program nobody
+wrote. `shell_start` is worse: the handle registers, reports itself running, and
+produces nothing.
+
+The grammar is one grammar on all three platforms, and that is the reason there
+is no Windows special case for this. A parser that decided which backslashes were
+escapes and which were path separators would be guessing, and it would be
+guessing about the one thing this tool exists not to guess about — what the
+policy checked and what then ran.
+
 ## Leaving a command running
 
 `shell` holds the step until its line finishes or times out, which is the wrong

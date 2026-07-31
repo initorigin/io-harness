@@ -79,6 +79,12 @@ pub const SHELL_TOOL: &str = "shell";
 /// reported orphaned and is never re-attached, polled or signalled — a recorded
 /// pid may since have been reused, and signalling it is the one way this crate
 /// could damage something outside its workspace.
+///
+/// **On Windows, quote absolute paths.** The grammar treats `\` as an escape,
+/// as POSIX does, so an unquoted `C:\repo\server.exe` lexes to
+/// `C:reposerver.exe` and the spawn fails naming a program nobody wrote. This is
+/// the same answer a real shell gives and applies equally to [`SHELL_TOOL`];
+/// single quotes are the simplest form.
 pub const SHELL_START_TOOL: &str = "shell_start";
 /// The name the model uses to read what a started line has produced (0.25.0).
 ///

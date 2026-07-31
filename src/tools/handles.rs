@@ -257,6 +257,25 @@ impl Handles {
         v
     }
 
+    /// Every handle and what this process last knew it to be doing.
+    ///
+    /// For reconciling the store with the registry. A handle that exits on its
+    /// own is noticed by its reaping task, which runs in a context that cannot
+    /// touch the `Store` — a `rusqlite` connection is not `Sync`, so the task
+    /// records the ending in memory and something on the run loop's own thread
+    /// has to carry it to disk. Without that, a handle that ended by itself
+    /// reads as `running` in the trace forever, which is the one thing the trace
+    /// must not say about a process that is gone.
+    pub(crate) fn states(&self) -> Vec<(u64, HandleState)> {
+        let guard = self.lock();
+        let mut v: Vec<(u64, HandleState)> = guard
+            .iter()
+            .map(|(id, r)| (*id, r.state.clone()))
+            .collect();
+        v.sort_by_key(|(id, _)| *id);
+        v
+    }
+
     /// The line a handle was started with.
     pub(crate) fn line(&self, id: u64) -> Option<String> {
         self.lock().get(&id).map(|r| r.line.clone())

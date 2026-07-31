@@ -2671,6 +2671,18 @@ async fn run_workspace_from<P: Provider>(
         for (id, pids) in handles.live_handles() {
             store.record_handle_pids(run_id, id, &pids)?;
         }
+        // Carry any ending the reaping tasks noticed to disk.
+        //
+        // A handle that exits on its own is seen by its task, which cannot write
+        // to the store — a `rusqlite` connection is not `Sync` — so the ending
+        // lives only in memory until something on this thread records it. The
+        // write is guarded in SQL on the row still being `running`, so replaying
+        // it costs nothing and cannot overwrite a kill that already landed.
+        for (id, state) in handles.states() {
+            if let crate::tools::handles::HandleState::Exited(code) = state {
+                store.record_handle_ended(run_id, id, "exited", code, None)?;
+            }
+        }
 
         // The step boundary, where a cancellation is honoured (see `cancelled`).
         if let Some(o) = cancelled(store, watch, run_id, 0, step - 1)? {

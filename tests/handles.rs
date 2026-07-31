@@ -117,6 +117,18 @@ fn example_binary(name: &str) -> std::path::PathBuf {
     exe
 }
 
+/// A fixture path as a shell word the parser will hand back unchanged.
+///
+/// Single-quoted, and this matters only on Windows — where it matters a lot. The
+/// shell grammar this crate parses treats `\` as an escape, exactly as POSIX
+/// does, so an unquoted `D:\a\repo\tick.exe` lexes to `D:arepotick.exe` and the
+/// spawn fails with a program nobody named. Quoting is the same answer a real
+/// shell gives, and writing it here rather than special-casing the parser keeps
+/// the tests honest about what a caller has to do.
+fn word(path: &std::path::Path) -> String {
+    format!("'{}'", path.display())
+}
+
 fn start(line: &str) -> ToolCall {
     ToolCall {
         name: "shell_start".into(),
@@ -219,7 +231,7 @@ async fn a_handle_starts_polls_twice_and_is_killed() {
     let tick = tick_binary();
     let (store, _dir) = run(
         vec![
-            vec![start(&tick.display().to_string())],
+            vec![start(&word(&tick))],
             vec![poll(1)],
             vec![poll(1)],
             vec![kill(1)],
@@ -254,7 +266,7 @@ async fn a_poll_does_not_return_the_same_output_twice() {
     let tick = tick_binary();
     let (store, _dir) = run(
         vec![
-            vec![start(&tick.display().to_string())],
+            vec![start(&word(&tick))],
             vec![poll(1)],
             vec![poll(1)],
             vec![kill(1)],
@@ -312,7 +324,7 @@ async fn a_handle_left_running_is_killed_when_the_run_ends() {
     // Started and deliberately never killed, so the run ends with it live. That
     // is the leak this asserts against: a handle the model forgot about must not
     // outlive the run that made it.
-    let provider = MockScript::new(vec![vec![start(&tick.display().to_string())]]);
+    let provider = MockScript::new(vec![vec![start(&word(&tick))]]);
     run_with(
         &contract(dir.path()),
         &provider,
@@ -355,6 +367,30 @@ async fn a_handle_left_running_is_killed_when_the_run_ends() {
     }
 }
 
+#[tokio::test]
+async fn a_handle_that_exits_on_its_own_stops_reading_as_running() {
+    let tick = tick_binary();
+    // `tick 2` prints twice and returns. By the time the run ends it is gone of
+    // its own accord, with nobody having killed it.
+    let (store, _dir) = run(
+        vec![
+            vec![start(&format!("{} 2", word(&tick)))],
+            vec![poll(1)],
+        ],
+        allow_tick(),
+    )
+    .await;
+    let id = run_id(&store);
+    let handles = store.process_handles(id).expect("recorded");
+    assert_eq!(
+        handles[0].state, "exited",
+        "a handle that ended by itself still reads as {:?} in the trace; the ending is \
+         noticed by a task that cannot write to the store, so something on the run loop's \
+         thread has to carry it to disk: {handles:?}",
+        handles[0].state
+    );
+}
+
 // ---------------------------------------------------------------------------
 // F4 — the handle path is checked by the same machinery as the foreground path
 // ---------------------------------------------------------------------------
@@ -394,7 +430,7 @@ async fn a_denied_stage_starts_no_handle_and_spawns_nothing() {
     // The first stage would write a file if it ran. The second is denied, so
     // nothing may run — the same negative control the foreground tool carries,
     // and the reason the whole line is checked before the first spawn.
-    let line = format!("{} > made.txt | denied-program", tick.display());
+    let line = format!("{} > made.txt | denied-program", word(&tick));
     let provider = MockScript::new(vec![vec![start(&line)]]);
     // The second stage is denied by name. Permissive would allow it and the
     // line would merely fail to find the program, which is a different fact and
@@ -438,7 +474,7 @@ async fn starting_past_the_cap_is_refused_and_spawns_nothing() {
     // before the cap was ever reached — which would make this test pass for the
     // wrong reason if the cap were removed entirely.
     let steps: Vec<Vec<ToolCall>> = (0..9)
-        .map(|i| vec![start(&format!("{} {}", tick.display(), 900 + i))])
+        .map(|i| vec![start(&format!("{} {}", word(&tick), 900 + i))])
         .collect();
     let dir = tempfile::tempdir().unwrap();
     let store = Store::memory().unwrap();
@@ -517,7 +553,7 @@ async fn killing_a_handle_kills_a_grandchild_whose_parent_already_exited() {
     // of what a payload may write where.
     let scratch = tempfile::tempdir().unwrap();
     let pidfile = scratch.path().join("leaf.pid");
-    let line = format!("{} {}", orphan.display(), pidfile.display());
+    let line = format!("{} {}", word(&orphan), word(&pidfile));
 
     let dir = tempfile::tempdir().unwrap();
     let store = Store::memory().unwrap();
