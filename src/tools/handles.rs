@@ -268,10 +268,8 @@ impl Handles {
     /// must not say about a process that is gone.
     pub(crate) fn states(&self) -> Vec<(u64, HandleState)> {
         let guard = self.lock();
-        let mut v: Vec<(u64, HandleState)> = guard
-            .iter()
-            .map(|(id, r)| (*id, r.state.clone()))
-            .collect();
+        let mut v: Vec<(u64, HandleState)> =
+            guard.iter().map(|(id, r)| (*id, r.state.clone())).collect();
         v.sort_by_key(|(id, _)| *id);
         v
     }

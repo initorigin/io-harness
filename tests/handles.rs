@@ -373,10 +373,7 @@ async fn a_handle_that_exits_on_its_own_stops_reading_as_running() {
     // `tick 2` prints twice and returns. By the time the run ends it is gone of
     // its own accord, with nobody having killed it.
     let (store, _dir) = run(
-        vec![
-            vec![start(&format!("{} 2", word(&tick)))],
-            vec![poll(1)],
-        ],
+        vec![vec![start(&format!("{} 2", word(&tick)))], vec![poll(1)]],
         allow_tick(),
     )
     .await;
