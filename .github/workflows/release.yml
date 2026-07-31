@@ -94,21 +94,26 @@ jobs:
       # The release body is this version's CHANGELOG section verbatim, so the
       # notes say what changed instead of linking to it. Link-reference lines are
       # dropped; they would render as stray `[x]: url`.
+      #
+      # Written to RUNNER_TEMP, not the checkout: `cargo package --locked` below
+      # refuses a working directory with uncommitted files in it, and an
+      # untracked release-notes.md is exactly that.
       - name: Notes
         env:
           VERSION: ${{ steps.resolve.outputs.number }}
+          NOTES: ${{ runner.temp }}/release-notes.md
         run: |
           awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" { on = 1; next }
             on && /^## \[/ { exit }
             on && !/^\[[^]]*\]:/ { print }
-          ' CHANGELOG.md > release-notes.md
-          if ! grep -q '[^[:space:]]' release-notes.md; then
+          ' CHANGELOG.md > "$NOTES"
+          if ! grep -q '[^[:space:]]' "$NOTES"; then
             echo "::error::CHANGELOG.md has no non-empty '## [$VERSION]' section"
             exit 1
           fi
           msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          cat >> release-notes.md <<EOF
+          cat >> "$NOTES" <<EOF
 
           ### Install
 
@@ -122,7 +127,7 @@ jobs:
           The \`.crate\` tarball below is the artifact published to crates.io for
           this version. Verify it against \`SHA256SUMS\`.
           EOF
-          cat release-notes.md
+          cat "$NOTES"
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -142,8 +147,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-notes
-          path: release-notes.md
+          path: ${{ runner.temp }}/release-notes.md
           retention-days: 7
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
