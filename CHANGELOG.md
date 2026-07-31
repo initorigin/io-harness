@@ -87,6 +87,9 @@ wrote.
   a successful edit into a failed one**: the edit has already happened when the
   checker runs, so a checker that is missing, times out or fails for its own
   reasons yields no diagnostics and is recorded as such.
+- No new dependency. The three handle tools and the diagnostics pass are written
+  in this crate, over what the tree already carries, and the default `cargo tree`
+  is unchanged at 402 lines.
 
 ### Changed
 

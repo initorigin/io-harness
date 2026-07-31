@@ -147,9 +147,9 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
 fn is_added_since_0_22_0(stmt: &str) -> bool {
-    ADDED_SINCE_0_22_0.iter().any(|name| {
-        stmt.contains(&format!(" {name} ")) || stmt.contains(&format!(" {name}("))
-    })
+    ADDED_SINCE_0_22_0
+        .iter()
+        .any(|name| stmt.contains(&format!(" {name} ")) || stmt.contains(&format!(" {name}(")))
 }
 
 /// Assert that `new` contains everything `old` had, unchanged, and that whatever
@@ -489,7 +489,9 @@ fn the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it() {
     // "nothing unexpected appeared" is also true of nothing appearing.
     for name in ADDED_SINCE_0_22_0 {
         assert!(
-            new_schema.iter().any(|s| is_added_since_0_22_0(s) && s.contains(name)),
+            new_schema
+                .iter()
+                .any(|s| is_added_since_0_22_0(s) && s.contains(name)),
             "0.25.0 declares {name} and a fresh store does not have it"
         );
     }
