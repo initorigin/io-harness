@@ -156,8 +156,16 @@ impl From<&super::SandboxLimits> for JobLimits {
 
 /// The Win32 half. Compiled only on Windows; everything above this line builds
 /// on every host so the mapping and its test do too.
+///
+/// `pub(crate)` since 0.26.0, and only so that [`Job`](job::Job) can be reached
+/// from `crate::tools::handles`. A process handle needs exactly the containment
+/// this module already builds — a job that kills its tree when its handle closes
+/// — and the only thing it needs differently is a *lifetime*: the sandbox's job
+/// lives for one call, a handle's lives until the handle is killed. That is a
+/// difference in who owns the handle, not a difference in the mechanism, so the
+/// mechanism is shared rather than written twice.
 #[cfg(windows)]
-mod job {
+pub(crate) mod job {
     use std::io;
 
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -232,7 +240,7 @@ mod job {
     /// An owned job-object handle. Closing it is the teardown, so this type
     /// exists mainly to make that closing a `Drop` rather than a line someone
     /// has to remember to write on every return path.
-    struct Job(HANDLE);
+    pub(crate) struct Job(HANDLE);
 
     // SAFETY: a Win32 kernel handle is a plain process-wide table index, not a
     // thread-affine resource: every API used here (`AssignProcessToJobObject`,
@@ -245,6 +253,24 @@ mod job {
     unsafe impl Sync for Job {}
 
     impl Job {
+        /// A job for a **process handle**: the teardown guarantee and no resource
+        /// limits at all.
+        ///
+        /// A dev server or a twenty-minute build is exactly the workload the
+        /// sandbox's caps would kill, and a handle is not a sandbox — it is a
+        /// lifetime. What it needs from a job is the one thing only a job
+        /// provides on this platform: closing the handle takes down every
+        /// descendant however it was spawned and whoever its parent is by then,
+        /// which is the grandchild case `taskkill /T` provably cannot reach.
+        pub(crate) fn for_handle() -> io::Result<Self> {
+            Self::create(&JobLimits {
+                process_memory: None,
+                active_processes: None,
+                cpu_ticks: None,
+                kill_on_close: true,
+            })
+        }
+
         /// Create the job and apply `limits` to it, before any process is in it.
         fn create(limits: &JobLimits) -> io::Result<Self> {
             // SAFETY: both arguments are the documented "default security, no
@@ -305,7 +331,7 @@ mod job {
 
         /// Put `child` in the job and let it run — in that order, which is the
         /// point. Fails loudly rather than leaving a child outside the job.
-        fn adopt(&self, child: &tokio::process::Child) -> Result<()> {
+        pub(crate) fn adopt(&self, child: &tokio::process::Child) -> Result<()> {
             let sandbox = |reason: String| Error::Sandbox { reason };
             let handle = child.raw_handle().ok_or_else(|| {
                 sandbox("the sandboxed child exited before it could be put in the job".into())

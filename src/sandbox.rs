@@ -1139,6 +1139,14 @@ pub mod linux;
 pub mod macos;
 pub mod windows;
 
+// The AppContainer half is the exception to the paragraph above: it has no
+// portable logic to unit-test on the build host, because unlike a Job Object's
+// limit mapping there is no pure-data layer between the configuration and the
+// Win32 calls. The module is therefore a `cfg(windows)` shell around a
+// `cfg(windows)` body rather than a portable type with a gated implementation,
+// and it is proven on the Windows runner or nowhere.
+pub mod appcontainer;
+
 #[cfg(test)]
 mod tests {
     use super::*;

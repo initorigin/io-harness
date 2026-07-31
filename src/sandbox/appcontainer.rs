@@ -1,0 +1,792 @@
+//! Windows AppContainer — the **access** half of containment.
+//!
+//! [`WindowsSandbox`](super::windows::WindowsSandbox) contains *resources* and
+//! says so in its own first paragraphs: a job object has no filesystem facility
+//! and no network facility, because those are not options the API has. This
+//! module is the other half. An AppContainer is a low-box security context whose
+//! token answers *no* to every securable object by default, and reaches only what
+//! has been granted to its own container SID.
+//!
+//! Two columns close for the price of one mechanism:
+//!
+//! - **Filesystem** — default-deny. A path the payload may touch is a path
+//!   something granted, by name, with an explicit ACE — see `grant` below, which
+//!   is deliberately named in plain text rather than linked: everything in this
+//!   module is `cfg(windows)`, docs.rs renders on Linux, and an intra-doc link
+//!   into code that does not exist on the rendering host is a broken link on the
+//!   only page a reader actually sees.
+//! - **Network** — the capability array is **empty**. `internetClient` is the
+//!   capability that buys a socket to the outside, and it is not requested, so
+//!   there is no route off the machine. This is the absence of a permission
+//!   rather than the presence of a filter, which is the same shape as an empty
+//!   network namespace on Linux and is why it is worth preferring over a
+//!   filesystem-ACL scheme with a separate network story bolted beside it.
+//!
+//! ## Why this module owns its own spawn
+//!
+//! The container SID reaches a child through
+//! `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` on a process-thread attribute
+//! list, and that is the only documented route. `tokio::process::Command` cannot
+//! carry one on stable Rust — `raw_attribute` is still gated behind the
+//! unstabilized `windows_process_extensions_raw_attribute` — and neither can
+//! `std`'s. So there is no version of this feature, network-only included, that
+//! does not mean calling `CreateProcessW` here.
+//!
+//! What that costs is re-implementing what the shared runner at
+//! `crate::sandbox::run_capped_hooked` gives free: standard handles, collecting
+//! output, the wall clock, and killing what is left. Each is re-implemented for
+//! **this backend only** — the shared runner is not touched, because a spawn-path
+//! change that reaches macOS and Linux is a change to two shipped backends.
+//!
+//! ## Output goes to a file, not a pipe
+//!
+//! The runner pipes stdout and stderr and drains them concurrently with the wait.
+//! This module redirects both to one temporary file instead, and reads it after
+//! the process is reaped.
+//!
+//! That is a smaller mechanism for the same result, and it is the design
+//! `crate::tools::handles` already argues for: a pipe that nobody drains fills
+//! and blocks the payload, so a pipe obliges you to drain it, and draining it
+//! obliges you to do so concurrently with the wait. A file has neither problem —
+//! the kernel writes it, nothing has to be pumping for the payload to make
+//! progress, and the whole of it is still there afterwards. One file rather than
+//! two also gives the two streams a shared offset, so they interleave the way a
+//! terminal shows them; the runner's separate `stdout`/`stderr` strings are
+//! reproduced by putting the combined text in `stdout` and leaving `stderr`
+//! empty, which is stated here because it is a real difference from the other
+//! backends rather than an accident.
+
+// Exercised by this module's own tests and by nothing else yet. The smoke test
+// exists to answer whether an AppContainer can be created and entered on the CI
+// runner at all; wiring the backend into `Sandbox` and `select` is the work that
+// answer gates, so until it lands these items are legitimately dead in a
+// non-test build. The allowance comes off with the wiring.
+#[cfg(windows)]
+#[allow(dead_code)]
+mod win {
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::AsRawHandle;
+    use std::path::Path;
+
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
+        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+    };
+    use windows_sys::Win32::Security::Authorization::{
+        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
+        TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::Isolation::{
+        CreateAppContainerProfile, DeleteAppContainerProfile,
+        DeriveAppContainerSidFromAppContainerName,
+    };
+    use windows_sys::Win32::Security::{FreeSid, ACL, DACL_SECURITY_INFORMATION, PSID};
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
+        InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
+        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        STARTUPINFOW,
+    };
+
+    /// A NUL-terminated UTF-16 string, kept alive by the caller.
+    ///
+    /// Every Win32 `W` entry point takes one, and the single most common way to
+    /// get this wrong is to build the buffer inline and let it drop before the
+    /// call reads it. Returning an owned `Vec` makes the lifetime the caller's
+    /// problem, which is where it can actually be seen.
+    fn wide(s: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+        s.as_ref().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    /// What a grant lets the container do with a path.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Access {
+        /// Read and execute. What a binary, a toolchain or a read-only input
+        /// tree needs, and the most that should ever be given to one.
+        ReadExecute,
+        /// Everything. The workspace, and deliberately nothing else — this is the
+        /// one directory the payload is *meant* to be able to change.
+        Full,
+    }
+
+    impl Access {
+        fn mask(self) -> u32 {
+            match self {
+                Access::ReadExecute => GENERIC_READ | GENERIC_EXECUTE,
+                Access::Full => GENERIC_ALL,
+            }
+        }
+    }
+
+    /// An AppContainer profile, and the SID it is addressed by.
+    ///
+    /// The profile is a registry-backed, named object with a lifetime longer than
+    /// this process, which is why `Drop` deletes it: a run that leaves one behind
+    /// leaves state on the operator's machine, and a thousand runs leave a
+    /// thousand. Creation tolerates `ERROR_ALREADY_EXISTS` and falls back to
+    /// deriving the SID from the name, so a profile stranded by a crashed run is
+    /// reused rather than turned into a permanent failure.
+    pub(crate) struct Profile {
+        name: Vec<u16>,
+        sid: PSID,
+    }
+
+    // SAFETY: both members are plain data — an owned UTF-16 buffer and a SID,
+    // which is a process-wide allocation addressed by pointer and not a
+    // thread-affine resource. Every API used here accepts the SID from any
+    // thread. `PSID` is a raw pointer typedef, which is the only reason the auto
+    // traits are withheld, and the sandbox future must be `Send` to satisfy the
+    // `Sandbox` trait.
+    unsafe impl Send for Profile {}
+    unsafe impl Sync for Profile {}
+
+    impl Profile {
+        /// Create (or adopt) the profile called `name`.
+        ///
+        /// **The capability array is empty and that is the network boundary.** No
+        /// `internetClient`, no `internetClientServer`, no
+        /// `privateNetworkClientServer` — a payload in this container has no
+        /// capability that grants it a socket to anywhere, so the denial is the
+        /// token's own and not a rule something has to keep enforcing.
+        pub(crate) fn create(name: &str) -> io::Result<Self> {
+            let name = wide(name);
+            let display = wide("io-harness sandbox");
+            let mut sid: PSID = std::ptr::null_mut();
+
+            // SAFETY: `name` and `display` are live NUL-terminated UTF-16 buffers
+            // owned by this frame and outliving the call. The capability array is
+            // null with a count of zero, which is the documented way to ask for
+            // no capabilities at all. `sid` is a live out-parameter.
+            let hr = unsafe {
+                CreateAppContainerProfile(
+                    name.as_ptr(),
+                    display.as_ptr(),
+                    display.as_ptr(),
+                    std::ptr::null(),
+                    0,
+                    &mut sid,
+                )
+            };
+
+            if hr < 0 {
+                // A profile left behind by a previous run is not an error: the
+                // name is deterministic precisely so it can be re-entered.
+                // `HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)` is the one code that
+                // means "this exists", and anything else is a real failure.
+                let already = hr == hresult_from_win32(ERROR_ALREADY_EXISTS);
+                if !already {
+                    return Err(io::Error::from_raw_os_error(win32_from_hresult(hr)));
+                }
+                // SAFETY: as above; `name` is live and `sid` is a live
+                // out-parameter that this call fills on success.
+                let hr =
+                    unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
+                if hr < 0 {
+                    return Err(io::Error::from_raw_os_error(win32_from_hresult(hr)));
+                }
+            }
+
+            Ok(Profile { name, sid })
+        }
+
+        /// The container SID. Valid for as long as this `Profile` is.
+        pub(crate) fn sid(&self) -> PSID {
+            self.sid
+        }
+    }
+
+    impl Drop for Profile {
+        fn drop(&mut self) {
+            // SAFETY: `self.sid` came from `CreateAppContainerProfile` or
+            // `DeriveAppContainerSidFromAppContainerName`, is never copied out of
+            // this type, and this is the only free. `self.name` is still live.
+            unsafe {
+                FreeSid(self.sid);
+                DeleteAppContainerProfile(self.name.as_ptr());
+            }
+        }
+    }
+
+    /// `HRESULT_FROM_WIN32`, which is a macro in the SDK and therefore has no
+    /// symbol to import.
+    fn hresult_from_win32(code: u32) -> i32 {
+        if code == 0 {
+            return 0;
+        }
+        ((code & 0x0000_FFFF) | 0x8007_0000) as i32
+    }
+
+    /// The inverse, for turning a failed `HRESULT` back into something
+    /// `io::Error` can render. A non-Win32 facility is returned whole rather than
+    /// masked into a plausible-looking and wrong error number.
+    fn win32_from_hresult(hr: i32) -> i32 {
+        if (hr as u32) & 0xFFFF_0000 == 0x8007_0000 {
+            (hr as u32 & 0x0000_FFFF) as i32
+        } else {
+            hr
+        }
+    }
+
+    /// Grant `sid` `access` to `path`, by adding one ACE to its DACL.
+    ///
+    /// Adding, never replacing: `GRANT_ACCESS` merges with what is already there,
+    /// so a workspace the operator can read stays readable by the operator. The
+    /// ACE is inheritable (`3` is `CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE`)
+    /// because a grant on a directory that did not reach its contents would be a
+    /// grant that looks applied and does nothing — the failure mode this whole
+    /// module has to avoid.
+    ///
+    /// This is the expensive half of the feature. An AppContainer is default-deny
+    /// for reads, so every path the payload legitimately needs has to be named:
+    /// the workspace, the binary it executes, its toolchain, and its temporary
+    /// directory. A missing grant surfaces as a payload that cannot start, which
+    /// reads like a broken payload rather than a missing grant — hence the
+    /// tracing below.
+    pub(crate) fn grant(path: &Path, sid: PSID, access: Access) -> io::Result<()> {
+        let wpath = wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+
+        // SAFETY: `wpath` is a live NUL-terminated UTF-16 path. Every out-
+        // parameter is a live local. The owner, group and SACL outs are null,
+        // which the API documents as "do not return this".
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        // The security descriptor owns the DACL that was just handed back, so it
+        // has to outlive `SetEntriesInAclW` and be freed exactly once afterwards.
+        let _sd = LocalGuard(sd);
+
+        let ea = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: access.mask(),
+            grfAccessMode: GRANT_ACCESS,
+            // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE.
+            grfInheritance: 3,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: std::ptr::null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_GROUP,
+                ptstrName: sid.cast(),
+            },
+        };
+
+        let mut merged: *mut ACL = std::ptr::null_mut();
+        // SAFETY: one live `EXPLICIT_ACCESS_W` is passed with a count of one, the
+        // old DACL is the one just read and still owned by `_sd`, and `merged` is
+        // a live out-parameter that the call allocates into on success.
+        let rc = unsafe { SetEntriesInAclW(1, &ea, dacl, &mut merged) };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        let _merged = LocalGuard(merged.cast());
+
+        // SAFETY: `wpath` is live, `merged` is the ACL just built and still
+        // owned by `_merged`, and the owner, group and SACL arguments are null,
+        // which with `DACL_SECURITY_INFORMATION` alone means "change only the
+        // DACL".
+        let rc = unsafe {
+            SetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                merged,
+                std::ptr::null(),
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(rc as i32));
+        }
+        tracing::debug!(path = %path.display(), ?access, "sandbox: granted the AppContainer");
+        Ok(())
+    }
+
+    /// Frees a `LocalAlloc`-allocated block exactly once, on every path out.
+    struct LocalGuard(*mut core::ffi::c_void);
+
+    impl Drop for LocalGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: the pointer came from an API documented to return
+                // `LocalAlloc` memory, is not null, is owned solely by this
+                // guard, and is freed once.
+                unsafe { LocalFree(self.0) };
+            }
+        }
+    }
+
+    /// A process running inside an AppContainer.
+    ///
+    /// Holds the process handle, so [`Drop`] can be the kill-on-drop the shared
+    /// runner gets from `tokio`. Nothing this type spawns can outlive it by
+    /// accident, which is the same guarantee and for the same reason.
+    pub(crate) struct Spawned {
+        process: HANDLE,
+        thread: HANDLE,
+        reaped: bool,
+    }
+
+    // SAFETY: a Win32 kernel handle is a process-wide table index that every API
+    // used here accepts from any thread; `HANDLE` is a raw pointer typedef, which
+    // is the only reason the auto traits are withheld.
+    unsafe impl Send for Spawned {}
+    unsafe impl Sync for Spawned {}
+
+    impl Spawned {
+        /// Start `cmdline` inside the container `sid`, in `cwd`, with both
+        /// standard streams going to `out`.
+        ///
+        /// `out` must be an inheritable handle; this makes it one rather than
+        /// requiring the caller to remember, because a non-inheritable handle
+        /// here produces a process that starts, runs and writes nothing, which is
+        /// the worst available failure — it looks like a quiet payload rather
+        /// than a broken redirect.
+        pub(crate) fn start(
+            cmdline: &str,
+            cwd: &Path,
+            sid: PSID,
+            out: &std::fs::File,
+        ) -> io::Result<Self> {
+            let handle = out.as_raw_handle() as HANDLE;
+            // SAFETY: `handle` belongs to `out`, which is borrowed for this whole
+            // call and therefore outlives it.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+
+            // The attribute list, sized by the API rather than guessed. The first
+            // call is *expected* to fail with ERROR_INSUFFICIENT_BUFFER — that is
+            // how it reports the size — so its return value is deliberately not
+            // checked and `size` is what is read instead.
+            let mut size: usize = 0;
+            // SAFETY: a null list with a live `size` out-parameter is the
+            // documented way to ask how large the list must be.
+            unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
+            if size == 0 {
+                return Err(io::Error::other(
+                    "the process attribute list reported a size of zero",
+                ));
+            }
+            // `Vec<usize>` rather than `Vec<u8>`: the list has pointer alignment
+            // requirements that a byte vector does not promise.
+            let mut buf: Vec<usize> = vec![0; size.div_ceil(size_of::<usize>())];
+            let list = buf.as_mut_ptr().cast::<core::ffi::c_void>() as LPPROC_THREAD_ATTRIBUTE_LIST;
+
+            // SAFETY: `list` points at `buf`, which is at least `size` bytes and
+            // outlives every use below; the count matches the one attribute set
+            // immediately after.
+            if unsafe { InitializeProcThreadAttributeList(list, 1, 0, &mut size) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let _attrs = AttrGuard(list);
+
+            // This is the whole feature: the one attribute that carries a
+            // container SID into a child. It must outlive `CreateProcessW`,
+            // because the list stores a pointer to it rather than a copy.
+            let caps = windows_sys::Win32::Security::SECURITY_CAPABILITIES {
+                AppContainerSid: sid,
+                Capabilities: std::ptr::null_mut(),
+                CapabilityCount: 0,
+                Reserved: 0,
+            };
+            // SAFETY: `list` is initialised, the attribute constant names the
+            // `SECURITY_CAPABILITIES` type that `caps` is, the size passed is
+            // that type's own `size_of`, and `caps` lives until after the spawn
+            // below.
+            if unsafe {
+                UpdateProcThreadAttribute(
+                    list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
+                    std::ptr::from_ref(&caps).cast(),
+                    size_of_val(&caps),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+
+            let mut si = STARTUPINFOEXW {
+                StartupInfo: STARTUPINFOW {
+                    cb: size_of::<STARTUPINFOEXW>() as u32,
+                    dwFlags: STARTF_USESTDHANDLES,
+                    hStdInput: std::ptr::null_mut(),
+                    hStdOutput: handle,
+                    hStdError: handle,
+                    ..Default::default()
+                },
+                lpAttributeList: list,
+            };
+            let mut pi = PROCESS_INFORMATION::default();
+            // `CreateProcessW` may write to the command line buffer, so it gets a
+            // mutable one of its own rather than a shared literal.
+            let mut cmd = wide(cmdline);
+            let wcwd = wide(cwd);
+
+            // SAFETY: `cmd`, `wcwd` and `si` are all live for the call. Handle
+            // inheritance is on, which is required for the redirect above to
+            // reach the child. `EXTENDED_STARTUPINFO_PRESENT` is what makes the
+            // kernel read `si` as a `STARTUPINFOEXW` and consult its attribute
+            // list, and without it the container SID would be silently ignored.
+            let ok = unsafe {
+                CreateProcessW(
+                    std::ptr::null(),
+                    cmd.as_mut_ptr(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    1,
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    std::ptr::null(),
+                    wcwd.as_ptr(),
+                    std::ptr::from_mut(&mut si).cast::<STARTUPINFOW>(),
+                    &mut pi,
+                )
+            };
+            if ok == 0 {
+                return Err(io::Error::last_os_error());
+            }
+
+            Ok(Spawned {
+                process: pi.hProcess,
+                thread: pi.hThread,
+                reaped: false,
+            })
+        }
+
+        /// Wait up to `ms` for the process, killing it if the ceiling is reached.
+        ///
+        /// `Ok(Some(code))` is a process that ended by itself; `Ok(None)` is the
+        /// wall clock firing, and by the time it is returned the process has been
+        /// terminated rather than left running — which is the distinction the
+        /// shared runner's own wall-clock path exists to keep.
+        pub(crate) fn wait(&mut self, ms: u32) -> io::Result<Option<i32>> {
+            // SAFETY: `self.process` is the handle from `CreateProcessW`, still
+            // open, and this type is the only owner.
+            let w = unsafe { WaitForSingleObject(self.process, ms) };
+            if w != WAIT_OBJECT_0 {
+                self.kill();
+                return Ok(None);
+            }
+            let mut code: u32 = 0;
+            // SAFETY: as above, with a live out-parameter.
+            if unsafe { GetExitCodeProcess(self.process, &mut code) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            self.reaped = true;
+            Ok(Some(code as i32))
+        }
+
+        /// Terminate the process. Idempotent, and safe on one that is already
+        /// gone — Windows answers with an error, which is the best-effort
+        /// contract this shares with `kill_tree`.
+        pub(crate) fn kill(&mut self) {
+            if !self.reaped {
+                // SAFETY: `self.process` is this type's own still-open handle.
+                unsafe { TerminateProcess(self.process, 1) };
+                self.reaped = true;
+            }
+        }
+    }
+
+    impl Drop for Spawned {
+        fn drop(&mut self) {
+            self.kill();
+            // SAFETY: both handles came from `CreateProcessW`, are owned solely
+            // by this type, and are closed exactly once.
+            unsafe {
+                CloseHandle(self.thread);
+                CloseHandle(self.process);
+            }
+        }
+    }
+
+    /// Deletes the attribute list exactly once, on every path out of `start`.
+    struct AttrGuard(LPPROC_THREAD_ATTRIBUTE_LIST);
+
+    impl Drop for AttrGuard {
+        fn drop(&mut self) {
+            // SAFETY: the list was initialised by `InitializeProcThreadAttributeList`
+            // and is deleted once. The buffer behind it is freed by its `Vec`.
+            unsafe { DeleteProcThreadAttributeList(self.0) };
+        }
+    }
+}
+
+/// The Windows runner is the only machine that can answer any of this, so these
+/// are written to **fail loudly** rather than to skip.
+///
+/// A skipped test on the one platform a release is about is indistinguishable
+/// from a passing one, and this crate has already paid once for that: 0.9.1 found
+/// `Backend::WindowsJobObject` being reported by a backend that created no job,
+/// on a matrix that was green.
+///
+/// Every containment claim below carries its **negative control** — the identical
+/// payload, the identical target, run *outside* the container — because a denial
+/// that would also have been a denial outside proves nothing about the boundary.
+/// Where a control cannot run at all the test says so and fails, rather than
+/// quietly recording the denial as evidence.
+#[cfg(all(test, windows))]
+mod tests {
+    use super::win::{grant, Access, Profile, Spawned};
+    use std::io::Read;
+    use std::os::windows::process::CommandExt;
+
+    /// A profile name unique to this test process and this call site. Deleted by
+    /// `Profile`'s `Drop`, and re-enterable if a crash ever leaves one behind.
+    fn name(tag: &str) -> String {
+        format!("io-harness-test-{}-{tag}", std::process::id())
+    }
+
+    /// Run `cmdline` inside a container that has `Full` access to `cwd`, and
+    /// return its exit code and combined output.
+    fn in_container(tag: &str, cmdline: &str, cwd: &std::path::Path) -> (Option<i32>, String) {
+        let profile = Profile::create(&name(tag)).unwrap_or_else(|e| {
+            panic!(
+                "F1: could not create an AppContainer profile on this host ({e}). This is \
+                 fallback_scope Trigger A: the release's central mechanism is unavailable here."
+            )
+        });
+        grant(cwd, profile.sid(), Access::Full)
+            .unwrap_or_else(|e| panic!("could not grant the workspace to the container: {e}"));
+
+        let out_path = cwd.join("io-harness-out.txt");
+        let file = std::fs::File::create(&out_path).expect("create the capture file");
+        let mut child = Spawned::start(cmdline, cwd, profile.sid(), &file)
+            .unwrap_or_else(|e| panic!("F1: CreateProcessW into the AppContainer failed: {e}"));
+        drop(file);
+
+        let code = child.wait(30_000).expect("wait");
+        let mut text = String::new();
+        std::fs::File::open(&out_path)
+            .expect("reopen the capture file")
+            .read_to_string(&mut text)
+            .ok();
+        (code, text)
+    }
+
+    /// The same command, with no container at all. This is the negative control,
+    /// and it is what makes every denial below mean something.
+    fn outside(cmdline: &str, cwd: &std::path::Path) -> Option<i32> {
+        std::process::Command::new("cmd.exe")
+            // `raw_arg`, not `args`. `Command` escapes each argument for the
+            // *C runtime's* rules, and `cmd.exe` does not follow them: a single
+            // argument of `type "C:\...\x.txt"` comes back out re-quoted as
+            // `"type \"C:\...\x.txt\""`, which cmd parses as a program called
+            // `type "C:\` and reports as a failure. The container runs its line
+            // through `CreateProcessW` verbatim, so the control has to be
+            // verbatim too — otherwise the two halves are not the same command
+            // and the comparison between them means nothing.
+            .raw_arg(format!("/c {cmdline}"))
+            .current_dir(cwd)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("the control command must at least run")
+            .code()
+    }
+
+    /// F1 — an AppContainer can be created and entered on this host.
+    #[test]
+    fn an_appcontainer_can_be_created_and_entered() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (code, out) = in_container(
+            "smoke",
+            "cmd.exe /c echo io-harness-appcontainer-smoke",
+            dir.path(),
+        );
+        assert_eq!(
+            code,
+            Some(0),
+            "the payload ran inside the container but did not exit 0; output was {out:?}"
+        );
+        assert!(
+            out.contains("io-harness-appcontainer-smoke"),
+            "the redirect did not reach the capture file; a handle that is not inheritable \
+             produces exactly this — a process that starts, runs and writes nothing. Got {out:?}"
+        );
+    }
+
+    /// F2 — a payload inside an AppContainer cannot read what it was not granted.
+    ///
+    /// The secret lives in a *second* temporary directory that nothing grants, so
+    /// the only difference between the two runs is the container.
+    #[test]
+    fn a_payload_cannot_read_what_it_was_not_granted() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let vault = tempfile::tempdir().expect("tempdir");
+        let secret = vault.path().join("secret.txt");
+        std::fs::write(&secret, b"io-harness-secret").expect("write the secret");
+        let line = format!("cmd.exe /c type \"{}\"", secret.display());
+
+        // The control first. If the operator cannot read their own file, the
+        // test can conclude nothing at all about the container.
+        assert_eq!(
+            outside(&format!("type \"{}\"", secret.display()), work.path()),
+            Some(0),
+            "the negative control failed: this file is unreadable even outside the container, \
+             so a refusal inside it would prove nothing"
+        );
+
+        let (code, out) = in_container("read", &line, work.path());
+        assert_ne!(
+            code,
+            Some(0),
+            "the container read a file it was never granted; output was {out:?}"
+        );
+        assert!(
+            !out.contains("io-harness-secret"),
+            "the container printed the secret's contents: {out:?}"
+        );
+    }
+
+    /// F3 — a payload inside an AppContainer has no route off the machine.
+    ///
+    /// Asserted against a socket the payload opens itself, never against the
+    /// floor's proxy-environment strip, which is documented best-effort and which
+    /// a payload that does not read those variables ignores completely.
+    #[test]
+    fn a_payload_has_no_route_off_the_machine() {
+        let work = tempfile::tempdir().expect("tempdir");
+        let probe = "curl.exe -s -m 15 -o NUL https://example.com";
+
+        // The control. A runner with no egress at all cannot demonstrate that
+        // the container is what removed it.
+        assert_eq!(
+            outside(probe, work.path()),
+            Some(0),
+            "the negative control failed: this host has no outbound network even outside a \
+             container (or no curl.exe), so a failure inside one would prove nothing"
+        );
+
+        let (code, out) = in_container("net", &format!("cmd.exe /c {probe}"), work.path());
+        assert_ne!(
+            code,
+            Some(0),
+            "the container reached the network with an empty capability array; there is no \
+             `internetClient` on this profile, so this means the capability set is not being \
+             applied. Output was {out:?}"
+        );
+    }
+
+    /// The measurement `fallback_scope` Trigger B turns on, taken rather than
+    /// guessed at.
+    ///
+    /// `cmd.exe` runs inside a container because Windows puts an
+    /// `ALL APPLICATION PACKAGES` ACE on its own system directories. Nothing else
+    /// on the machine has one. So the question this release actually has to
+    /// answer is not "does a container run a process" — F1 settled that — but
+    /// "does a container run *the payload a caller would give it*", which is a
+    /// binary in a toolchain nobody blessed.
+    ///
+    /// The subject is the running test binary itself: a real, freshly compiled
+    /// executable under `target\`, with no ACE for any container, which is
+    /// exactly the shape of the thing this crate would be asked to sandbox. It
+    /// is invoked with a filter that matches no test, so it exits promptly and
+    /// runs none of this suite inside a container.
+    ///
+    /// The grant is deliberately **only its own directory**. If that is enough,
+    /// the mechanism scales to real payloads and what is left is deciding which
+    /// paths to name. If it is not, the grant set is a discovery problem rather
+    /// than a configuration one, and that is the finding.
+    #[test]
+    fn a_binary_nothing_blessed_runs_once_its_own_directory_is_granted() {
+        let exe = std::env::current_exe().expect("the test binary knows where it is");
+        let bin_dir = exe.parent().expect("it has a directory").to_path_buf();
+        let work = tempfile::tempdir().expect("tempdir");
+
+        let profile = Profile::create(&name("toolchain")).expect("profile");
+        grant(work.path(), profile.sid(), Access::Full).expect("grant the workspace");
+        grant(&bin_dir, profile.sid(), Access::ReadExecute).expect("grant the binary's directory");
+
+        let out_path = work.path().join("o.txt");
+        let file = std::fs::File::create(&out_path).expect("capture");
+        // `--list` enumerates and exits; the filter matches nothing, so no test
+        // in this suite is re-entered inside a container.
+        let line = format!(
+            "\"{}\" --list --exact io-harness-no-such-test",
+            exe.display()
+        );
+        let mut child =
+            Spawned::start(&line, work.path(), profile.sid(), &file).expect("spawn the payload");
+        let code = child.wait(60_000).expect("wait");
+
+        let mut text = String::new();
+        std::fs::File::open(&out_path)
+            .and_then(|mut f| f.read_to_string(&mut text))
+            .ok();
+        assert_eq!(
+            code,
+            Some(0),
+            "a payload nothing had blessed could not execute inside the container even with \
+             its own directory granted read-and-execute. This is fallback_scope Trigger B: the \
+             grant set is a discovery problem rather than a configuration one. Output: {text:?}"
+        );
+    }
+
+    /// F4 — the wall clock fires, and does not fire on a payload that finishes.
+    ///
+    /// Both halves, because a ceiling that always fires and a ceiling that never
+    /// fires are equally wrong and only one of them looks broken.
+    #[test]
+    fn the_wall_clock_kills_only_what_overruns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let profile = Profile::create(&name("wall")).expect("profile");
+        grant(dir.path(), profile.sid(), Access::Full).expect("grant");
+        let file = std::fs::File::create(dir.path().join("o.txt")).expect("capture");
+
+        // A `cmd` builtin loop, and every obvious alternative is wrong here:
+        //
+        // - `ping -n 30 127.0.0.1`, the usual Windows sleep, exits *immediately*
+        //   inside a container. An AppContainer blocks loopback as well as
+        //   egress, so the ping fails rather than waits. That is the boundary
+        //   working, and it makes ping useless as a clock.
+        // - `timeout /t 30` refuses to run at all when stdin is redirected, and
+        //   this spawn always redirects it.
+        // - `waitfor` would work but is one more binary to have to be present.
+        //
+        // A `for /L` loop over a builtin needs no file, no socket and no console,
+        // so it is the one sleep that is unaffected by the thing being tested.
+        let mut slow = Spawned::start(
+            "cmd.exe /c for /L %i in (1,1,2000000000) do @rem",
+            dir.path(),
+            profile.sid(),
+            &file,
+        )
+        .expect("spawn the slow payload");
+        assert_eq!(
+            slow.wait(1_000).expect("wait"),
+            None,
+            "a payload that runs for thirty seconds must be capped by a one-second ceiling"
+        );
+
+        let mut quick =
+            Spawned::start("cmd.exe /c exit 7", dir.path(), profile.sid(), &file).expect("spawn");
+        assert_eq!(
+            quick.wait(30_000).expect("wait"),
+            Some(7),
+            "a payload that finishes inside the ceiling must report its own exit code, not a cap"
+        );
+    }
+}

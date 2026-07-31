@@ -595,8 +595,8 @@ versions:
       toolchain, the executed binary, the redirected temp directory and every language's install
       tree are the rest. First work is a `windows-latest` smoke test, because viability on the CI
       runner and on Server SKUs is unverified and everything else depends on it.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.27.0
     outcome: >
       One file is the whole configuration, for the crate and for the applications built on it.
@@ -608,6 +608,11 @@ versions:
       project instructions a repository already carries are discovered rather than pasted into a
       goal string. A project-scoped file stops being able to set the keys that would make cloning a
       repository dangerous.
+
+      The spec this release introduces must be `#[non_exhaustive]` from the first line it exists,
+      because 0.29.0 adds a variant to it. One attribute here is the difference between that being
+      additive and it being a break, and it costs nothing to decide now while the type has no
+      consumers at all.
     detail: outline
     status: planned
   - version: 0.28.0
@@ -617,4 +622,105 @@ versions:
       a local policy check is a line of configuration rather than a trait implementation. A file the
       agent changed can be put back the way it was.
     detail: hypothesis
+    status: planned
+  - version: 0.29.0
+    outcome: >
+      The model a run uses stops being a choice between three vendors. A provider is a base URL, a
+      key and a model name, so the OpenAI-shaped endpoints — Groq, xAI, Mistral, DeepSeek, Together,
+      Fireworks, Cerebras, Perplexity, Gemini through its compatibility endpoint, Moonshot, Zhipu,
+      Qwen and MiniMax — and the runtimes a developer starts on their own machine — Ollama,
+      llama.cpp, vLLM, LM Studio, LocalAI, Jan, SGLang, KoboldCpp — are all reachable without
+      writing a provider. A model running on the developer's laptop is the half that has no
+      equivalent today, and it is the half that costs nothing to run.
+
+      It is one type, not twenty. `openai.rs` and `openrouter.rs` differ by four strings — an
+      endpoint, a name, a web flavor and two environment variable names — over a wire module that
+      is already shared and already `pub(crate)`. So the shape is a single `Compatible` provider
+      carrying a base URL and an auth style, with a table of vendor presets behind named
+      constructors, reusing `openai_wire` verbatim. Twenty structs would be twenty copies of a
+      constructor and twenty entries in `docs/public-api.txt`, each needing a worked doc example,
+      to express what a constant already expresses. A vendor added later is then a row in a table
+      rather than a file, and the crate keeps its "no dependency per vendor" property by
+      construction rather than by vigilance.
+
+      What it deliberately is not is a compatibility layer. Every vendor here diverges from the
+      OpenAI wire somewhere, and the divergences are known rather than guessed: Zhipu returns
+      `finish_reason` values outside the OpenAI set, Groq rejects `messages[].name` outright,
+      Mistral requires a nine-character alphanumeric tool-call id and names its schema field
+      `schema_definition`, DeepSeek returns 400 if `reasoning_content` is dropped from a request
+      carrying tools, Ollama ignores `tool_choice` entirely, and vLLM and SGLang emit no tool calls
+      at all unless the server was started with a parser flag this crate cannot set. The crate
+      already parses `finish_reason` as a string and already tolerates unknown response fields, so
+      the divergences that matter are the ones a caller must be told about — and they are stated in
+      the contract rather than papered over, because a boundary the caller believes in and nobody
+      enforces is worse than none.
+
+      A connected provider also says what it can run. `Provider::models()` returns the vendor's own
+      catalogue — the model ids, and for each what the vendor was willing to state: context length,
+      maximum output, whether it takes images or tools, and the price. It is a defaulted trait
+      method returning an empty list, so an out-of-tree `Provider` keeps compiling; adding a
+      *required* method to an externally-implementable trait would be a break for the one extension
+      point this crate has.
+
+      The price dimensions need no new type: `pricing::Price` already carries `input`, `output`,
+      `cache_read`, `cache_write` and `per_server_tool_request`, in micro-units per million tokens,
+      and a vendor's pricing object maps onto those five almost exactly. The catalogue therefore
+      fills a `PriceTable` directly, and derived cost stops depending on a table an operator
+      maintains by hand with an `as_of` date they have to remember to update.
+
+      The hard part is that this is not uniformly available and the release must not pretend it is.
+      `GET /v1/models` is near-universal but returns *identifiers* — OpenAI, Anthropic, Groq,
+      DeepSeek, Mistral, Fireworks and every local runtime return no cost data whatsoever.
+      OpenRouter is the outlier that makes the feature worth building: its catalogue carries
+      per-token prompt, completion and cache pricing, context length and supported parameters for
+      every model it serves. So `ModelInfo::price` is `Option<Price>`, and `None` means the vendor
+      did not say — never `Price::ZERO`, which would report a real spend as free and is exactly the
+      confident wrong answer `src/pricing.rs` already refuses to ship a price list to avoid.
+      `Spend::unpriced_calls` is the existing, honest way that surfaces. A local runtime is the one
+      place zero is true rather than unknown, and it is recorded as a stated zero.
+
+      This does not contradict "the crate ships no prices" — it is the resolution of it. That rule
+      exists because a number compiled into this crate is stale the moment a vendor moves and the
+      late upgrader gets a wrong answer. A number fetched from the vendor at run time has no such
+      shelf life, and it carries the vendor's own effective date rather than one a human typed.
+
+      For the vendors that publish nothing, a **reference catalogue** fills the gap without a table
+      anybody has to maintain. `https://openrouter.ai/api/v1/models` needs no API key, is free to
+      read, and lists most models these vendors serve with per-token prompt, completion and cache
+      pricing and a context length. One request, parsed into the same `ModelInfo` the provider path
+      produces, cached in the store with the instant it was fetched. Nothing is baked into this
+      repository: no price constants, no per-vendor mapping file, no list to update when a vendor
+      moves a number. That is the whole argument for it — the maintenance cost is zero because the
+      data never lives here, which is the same reason `src/pricing.rs` refuses to ship prices at
+      all. The source is a URL with a default, so a different catalogue, an internal mirror or an
+      air-gapped copy is configuration rather than a code change.
+
+      Three bounds on it, each of which has to be built in rather than discovered later:
+
+      A reference price is **not the vendor's price**. It is what the aggregator charges to serve
+      that model, which tracks the vendor's rate closely and is not identical to it. So a price
+      carries its provenance — stated by the vendor, or taken from a named reference — and an
+      operator reading a cost can tell which they have. A number whose origin is unrecoverable is
+      the thing that makes an invoice unarguable.
+
+      Matching is a **heuristic across naming schemes**: the reference says `deepseek/deepseek-chat`
+      where DeepSeek's own API says `deepseek-v4-flash`. Exact slug and one documented
+      normalisation, and **a miss stays `None`** — never a nearest guess, because a wrong match is a
+      wrong invoice and is worse than the gap it filled. `Spend::unpriced_calls` already reports the
+      gap honestly.
+
+      It is **an outbound request to a host the caller did not name**, and this crate authorises
+      egress against `Provider::endpoints()` before a run starts. A provider silently dialling a
+      third host would walk straight through that boundary. So the lookup is **opt-in**, and when it
+      is on the reference host appears in `endpoints()` like every other endpoint, governed by the
+      same `Act::Net` rules. Off by default, refused rather than skipped when the policy denies it.
+
+      Excluded and argued rather than omitted: AWS Bedrock's SigV4 path, Google Vertex's
+      service-account JWT, Gemini's native `interactions` API, and Azure's `api-key` header with
+      its deployment-in-path and `api-version` query param. The first three are reachable today by
+      an application that mints a bearer token itself and passes it as the key, which is where
+      OAuth has always belonged. Azure is the closest call — it costs one auth-style variant and no
+      dependency — and it is left out only because no consumer has asked for it; the shape admits
+      it later without a break.
+    detail: outline
     status: planned

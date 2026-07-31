@@ -1,0 +1,140 @@
+id: US-IO-HARNESS-0.26.0-I02
+timestamp: 2026-08-01T02:30:00Z
+category:
+  - release-level
+  - architecture-level
+trigger: >
+  0.26.0's contract makes AppContainer the Windows access boundary and names two fallback triggers
+  in advance, because viability on `windows-latest` was unverified. The smoke test settled the first
+  question in the release's favour — a container can be created and entered, a payload inside it is
+  refused a read it was not granted, and it has no route off the machine — so Trigger A does not
+  fire. What the same work established is that the remaining distance is not the mechanism but the
+  **grant set**, and that closing it is a discovery problem rather than a configuration one. The
+  contract's OP3 forbids changing the README platform row unless the release makes it true, so the
+  question of what `Sandbox::select` returns on Windows has to be answered explicitly rather than
+  left to whatever the code happens to do.
+evidence:
+  - >
+    **The mechanism works, on the runner, first time.** CI run 30665329090,
+    `test (windows-latest)`: `sandbox::appcontainer::tests::an_appcontainer_can_be_created_and_entered`
+    passed, so `CreateAppContainerProfile`, `DeriveAppContainerSidFromAppContainerName`, the
+    `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list and `CreateProcessW` all behave on
+    the GitHub Windows image. This is the fact the release was gated on and it is positive.
+  - >
+    **The network boundary works, with its negative control.**
+    `a_payload_has_no_route_off_the_machine` passed in the same run: `curl.exe` to an external host
+    succeeds outside the container and fails inside it, with an empty capability array and therefore
+    no `internetClient`. The control is what makes it evidence — a runner with no egress at all
+    would have produced the same failure inside and proved nothing.
+  - >
+    **Loopback is refused as well**, which was not asked for and is stronger than the criterion.
+    Found by accident: the wall-clock test used `ping -n 30 127.0.0.1` as its sleep and got exit 1
+    in under a second inside a container. That is not a broken clock, it is the boundary, and the
+    test now uses a `cmd` builtin loop that needs no socket at all.
+  - >
+    **The grant set is the distance that remains, and it is a discovery problem.** An AppContainer
+    is default-deny for *reads*. `cmd.exe` runs inside one only because Windows puts an
+    `ALL APPLICATION PACKAGES` ACE on its own system directories; nothing a caller would hand this
+    crate has one. So every path a payload legitimately needs must be named — the workspace, the
+    executed binary, the toolchain, the redirected temporary directory, and every language's install
+    tree. The contract's own scope says as much ("the workspace grant is the easy part and the
+    toolchain ... are the rest"), and naming them for arbitrary ecosystems is not a value someone
+    configures, it is a set the crate would have to know how to derive.
+  - >
+    **The grant mechanism itself scales — measured, and it is the reason this amendment is narrow.**
+    `a_binary_nothing_blessed_runs_once_its_own_directory_is_granted` passed in CI run 30666016135:
+    the running test binary, a freshly compiled executable under `target\` with no ACE for any
+    container, executes inside one once its own directory is granted read-and-execute, and the whole
+    lib suite including that grant still finishes in 5.60s. So this is explicitly **not** a finding
+    that the filesystem half is impractical. Naming a directory works, and it is cheap.
+
+    What is unresolved is *which* directories — deriving that set for `cargo`, `npm`, `go`, `pytest`,
+    `dotnet` and everything else `toolchain::detect` recognises, including the shims that re-exec
+    into another tree, which is the shape `rustup` has. That is a design question about what the
+    crate should know, and it is the one thing between this mechanism and a default.
+  - >
+    **The half that does not depend on any of this is closed and proven.** In the same run,
+    `killing_a_handle_kills_a_grandchild_whose_parent_already_exited` passes on Windows and its
+    negative control `without_a_job_object_taskkill_leaves_the_grandchild` shows `taskkill /F /T`
+    leaving the grandchild alive. That is `US-IO-HARNESS-0.25.0-I01`'s deferred clause met, and it
+    is unaffected by everything above.
+  - >
+    **The alternative was worse and is worth stating.** Making AppContainer the default without the
+    grant set means a Windows sandbox that cannot run the payload — every execution-based
+    verification gate this crate has failing for a reason no error message would explain. The
+    failure mode of a default-deny boundary is a payload that cannot start, and this crate has
+    already paid once (0.9.1) for a backend that reported containment it did not have; a backend
+    that reports containment it *does* have but cannot execute anything is the same defect wearing
+    the other face.
+before:
+  scope:
+    - >
+      AppContainer becomes the Windows access boundary, and `README.md:257`'s platform row changes to
+      say Windows means what the other two rows mean.
+  assumptions:
+    - >
+      That once the spawn was owned, the filesystem grant would be an amount of work rather than an
+      open question. It is an open question: the workspace is trivial and the toolchain is a set the
+      crate does not know how to enumerate for an arbitrary ecosystem.
+  implementation: >
+    `Sandbox::select` returns `WindowsSandbox` on Windows, and a run reports
+    `Backend::WindowsJobObject` — resource containment, no filesystem or network boundary.
+change:
+  summary: >
+    Ship the AppContainer mechanism, proven and documented, and do **not** make it what
+    `Sandbox::select` chooses on Windows. The platform row in `README.md`, `docs/CONTRACT.md` and the
+    crate rustdoc stays exactly as it is, because it describes what a run actually gets and that has
+    not changed. This is `fallback_scope` Trigger B's outcome, reached by its reasoning — the payload
+    half of the boundary is the unclosed part — rather than by its literal wording, and the
+    difference is recorded here rather than smoothed over.
+  added:
+    - >
+      An explicit statement, in `docs/CONTRACT.md`, `docs/guide/sandbox.md`, the crate rustdoc and
+      the changelog, that AppContainer exists, is tested, is reachable, and is not the default — with
+      the grant set named as the reason.
+  removed: []
+  deferred:
+    - >
+      Wiring `appcontainer` into the `Sandbox` trait and into `select`, and the grant-set derivation
+      that would have to come with it, to a later release argued on its own terms.
+    - >
+      Changing `README.md`'s platform row. It stays until a Windows run gets a filesystem and network
+      boundary by default, which is the only thing that row can honestly mean.
+  replaced:
+    - >
+      The release's headline moves from "the platform table finally reads the same on all three rows"
+      to "the mechanism that will make that true exists and is proven, and the Windows tree kill is
+      closed". The second half was always in scope and in both fallbacks.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.26.0
+  tasks:
+    - US-IO-HARNESS-0.26.0-T03
+    - US-IO-HARNESS-0.26.0-T06
+  dependencies: []
+  resource_effect: >
+    Removes the release's largest open-ended cost — deriving and validating a grant set for every
+    language ecosystem this crate detects, on a platform reachable only through CI round trips — and
+    keeps everything that was already proven. What ships is smaller than the contract's headline and
+    larger than either fallback as written: the full mechanism with its negative controls, plus the
+    Windows handle tree kill, which was in every version of this release.
+versioning:
+  previous_target: 0.26.0
+  new_target: 0.26.0
+  consequence: no-version-change
+approval:
+  source: agent
+  reference: >
+    Recorded as `agent` deliberately, on the same reasoning as `US-IO-HARNESS-0.25.0-I01`. The
+    owner's standing override authorises merging, releasing and publishing without asking, and that
+    is authority over the release *flow* — it is not approval of a change to what a release promises.
+    No owner decision was taken on this amendment. It is raised in the session summary so it can be
+    reversed on sight, and the honest alternative is stated rather than implied: shipping
+    AppContainer as the Windows default without a grant set, which would have made the platform row
+    true on paper and made execution-based verification fail on Windows for reasons no error message
+    would explain.
+canonical_updates:
+  - products/io-harness/releases/0.26.0.yaml
+  - products/io-harness/execution/tasks.yaml

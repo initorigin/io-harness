@@ -5589,11 +5589,32 @@ async fn dispatch(
             let registry = std::sync::Arc::downgrade(handles);
             let on_spawn = {
                 let registry = registry.clone();
-                std::sync::Arc::new(move |pid: u32| {
-                    if let Some(r) = registry.upgrade() {
+                std::sync::Arc::new(move |child: &tokio::process::Child| {
+                    // A registry that can no longer be upgraded means the run
+                    // has already ended and dropped it. Nothing is recorded and
+                    // nothing is contained, and the caller kills the stage —
+                    // which is right, because there is no longer a run that owns
+                    // it.
+                    let Some(r) = registry.upgrade() else {
+                        return Err(crate::error::Error::Sandbox {
+                            reason: "the run ended while this line was still starting".into(),
+                        });
+                    };
+                    if let Some(pid) = child.id() {
                         r.add_pid(id, pid);
                     }
-                }) as std::sync::Arc<dyn Fn(u32) + Send + Sync>
+                    // Windows only, and only for a handle: the stage is frozen
+                    // at this instant, so this is where it joins the job object
+                    // that will later take its whole tree down, and where it is
+                    // let go. On unix the containment was applied in the child
+                    // before `exec` and there is nothing left to do here.
+                    #[cfg(windows)]
+                    r.contain(id, child)?;
+                    Ok(())
+                })
+                    as std::sync::Arc<
+                        dyn Fn(&tokio::process::Child) -> crate::error::Result<()> + Send + Sync,
+                    >
             };
             let runner = Shell::detached(
                 cap,

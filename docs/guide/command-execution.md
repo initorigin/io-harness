@@ -212,13 +212,23 @@ handle should be told rather than stopped.
 
 A kill walks every process the handle spawned, in reverse spawn order, so a
 pipeline's later stages go before the ones feeding them — killing only the last
-stage of `a | b` leaves `a` writing into a closed pipe rather than dead. It is
-**best-effort rather than a guarantee**: it reaches the processes still
-attached to the pids the handle recorded, and a descendant whose own parent has
-already exited is attached to none of them. The containment that would close
-that — the Windows Job Object 0.24.0 added, which takes its whole tree down when
-the job handle closes — is not on this path, so on Windows a grandchild can
-outlive its handle. See [the contract](../CONTRACT.md).
+stage of `a | b` leaves `a` writing into a closed pipe rather than dead.
+
+**It reaches the whole tree, and that is a guarantee rather than a best effort.**
+A dev server starts a package manager which starts a runtime, and then the
+package manager exits; the runtime is still the run's responsibility and the
+parent/child link that would have led to it is gone. Walking the process table
+cannot recover it. So the handle's processes are put in containment at the moment
+they are spawned, and the kill closes the containment instead of chasing links:
+
+| | Mechanism | Since |
+|---|---|---|
+| macOS, Linux | each stage leads its own process group; the kill signals the group | 0.25.0 |
+| Windows | each stage is created suspended, assigned to a per-handle Job Object, then resumed; the kill closes the job | 0.26.0 |
+
+Both survive the death of every intermediate process, which is the only property
+that matters here. The Windows half was open in 0.25.0 and is closed now; see
+[the contract](../CONTRACT.md).
 
 ### A handle does not survive the process that started it
 
