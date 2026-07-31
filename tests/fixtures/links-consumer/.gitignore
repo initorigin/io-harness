@@ -1,0 +1,5 @@
+target/
+# Not committed: this crate depends on io-harness by path, so a lock file
+# committed here would pin the *previous* release's dependency graph and go
+# stale the moment the crate above bumps a version.
+Cargo.lock

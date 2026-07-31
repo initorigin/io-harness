@@ -8,7 +8,7 @@
 [![docs.rs](https://img.shields.io/docsrs/io-harness)](https://docs.rs/io-harness)
 [![CI](https://github.com/initorigin/io-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/initorigin/io-harness/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/crates/l/io-harness.svg)](LICENSE)
-[![MSRV 1.88](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
+[![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
 
 </div>
 
@@ -61,9 +61,12 @@ async fn main() -> io_harness::Result<()> {
 }
 ```
 
-**Requires Rust 1.88** or later. The floor comes from `rmcp`, which publishes no
-`rust-version` of its own, so cargo cannot catch it at resolve time — on 1.87 the
-build fails inside that dependency rather than here.
+**Requires Rust 1.95** or later. The floor comes from `libsqlite3-sys`, which
+publishes no `rust-version` of its own, so cargo cannot catch it at resolve
+time — on 1.94 the build fails inside that dependency's build script rather
+than here, with an error about a missing `cfg_select` macro. It rose from 1.88
+in 0.23.0; see [docs/CONTRACT.md](docs/CONTRACT.md) for why there was no
+version of that dependency which avoided it.
 
 ## What it does
 

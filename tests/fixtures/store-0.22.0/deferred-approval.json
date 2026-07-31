@@ -1,0 +1,17 @@
+{
+  "last_step": 1,
+  "outcome": "awaiting_approval",
+  "pending": {
+    "act": "write",
+    "content": "DONE\n",
+    "request_id": 1,
+    "resolved": null,
+    "run_id": 1,
+    "step": 1,
+    "target": "out.txt"
+  },
+  "request_id": 1,
+  "run_id": 1,
+  "status": "paused",
+  "workspace": "deferred-approval-workspace"
+}

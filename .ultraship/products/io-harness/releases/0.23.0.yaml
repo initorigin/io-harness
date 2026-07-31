@@ -1,0 +1,489 @@
+product: io-harness
+version: 0.23.0
+release_type: minor
+outcome:
+  user_can: >
+    Embed this crate in a Rust program that already uses a current `rusqlite`. Today that is not a
+    matter of friction, it is a matter of possibility: `libsqlite3-sys` declares `links = "sqlite3"`,
+    and cargo refuses outright to link two versions of a `links` package into one dependency graph.
+    A program on `rusqlite` 0.33 or later that adds `io-harness` does not get a warning, a duplicate
+    symbol at link time, or a degraded build — it gets a resolver error and no build at all. This
+    release moves the crate from `rusqlite` 0.32 (`libsqlite3-sys` 0.30.1, bundling SQLite 3.46.0) to
+    the newest `rusqlite` published when development starts — 0.40 (`libsqlite3-sys` 0.38.1, bundling
+    SQLite 3.53.2) is the floor, not the target — and removes that wall. The property being bought is
+    *current*, not a particular number, so the version actually reached is recorded in the release
+    record rather than promised here. A database written by 0.22.0 opens unchanged, a run
+    checkpointed by 0.22.0 resumes across the boundary without re-running a completed step or
+    double-charging its budget, and no table, index or stored format is altered.
+  business_value: >
+    This crate's whole shape is "embeddable in your own process" — the first line of the README, the
+    first constraint in `product.yaml`, and the reason the permission boundary and the trace are
+    worth anything. An embeddable library's users are other Rust programs, and a `links` collision is
+    the one dependency conflict that has no workaround available to the consumer: they cannot patch
+    it, feature-gate it, or vendor around it. They can only choose one of the two crates. Every
+    release since 0.2.0 has widened what the harness can do while this floor quietly narrowed who
+    could call it, because the rest of the ecosystem kept moving and 0.32 did not.
+
+    The cost of waiting compounds in a specific way. `state.rs` is 4,833 lines and grows with every
+    release that records something new — 0.24.0's process handles are the next table to land on it.
+    Migrating the store layer once, before that growth, is a strictly smaller diff than migrating it
+    after, and it is the difference between one mechanical release and a migration threaded through
+    a feature release where a resume regression could hide.
+
+    io-cli and io-studio are the immediate consumers and neither exists yet. They will arrive
+    carrying their own dependency trees, and the first thing a new application does is pick current
+    versions of everything. Fixing this before they are written costs one release; fixing it after
+    costs one release plus whatever those two products built against the old line.
+  evidence_of_value: >
+    A consumer crate that depends on both `io-harness 0.23.0` and `rusqlite 0.40` builds and runs;
+    the same consumer against `io-harness 0.22.0` fails with cargo's `links` error, quoted in the
+    changelog. That pair is the whole argument, and it is checkable rather than asserted.
+
+    Beyond it: the full suite green on macOS, Linux and Windows, and the 0.7.0 kill-9 resume test
+    passing against a database written by the previous release — which is what "your existing runs
+    survive" has to mean if it is going to be claimed.
+scope:
+  included:
+  - >
+    `rusqlite` 0.32 to the newest version published when development starts, keeping the `bundled`
+    feature. 0.40 is the floor: anything below it leaves some current consumer still walled out, which
+    is the whole point of the release. Decided by the owner on 2026-07-31 in preference to pinning a
+    literal number, because the property being bought is *current* rather than *0.40* — a number
+    pinned in a contract written before the work goes stale between planning and development. The
+    version reached, its `libsqlite3-sys`, and its bundled SQLite are recorded in the release record.
+    At the floor that is `libsqlite3-sys` 0.30.1 to 0.38.1 and SQLite 3.46.0 to 3.53.2. Both halves of
+    the move matter and they fail differently: the Rust API churn fails at compile time and is
+    therefore cheap, while the engine change fails at runtime against real data and is therefore the
+    part the acceptance criteria are built around — and a newer target only widens that engine gap,
+    which is a reason to test it harder, not a reason to pin lower.
+  - >
+    Every `rusqlite` touchpoint in `src/state.rs` migrated — eighteen references across a 4,833-line
+    module that owns the trace, the checkpoint, the budget ledger, the approval records and the
+    resume path. Nothing here is rewritten or restructured; the module does what it does now, through
+    the API the new version presents.
+  - >
+    `Error::State(#[from] rusqlite::Error)` in `src/error.rs` carries the 0.40 error type. This is a
+    public type in a public enum, so it is a **breaking change** for any consumer that matches on
+    `Error::State(e)` and treats `e` as their own `rusqlite::Error` — the two types are nominally
+    distinct across the version boundary. It gets a `BREAKING` entry with a migration note, in the
+    same shape as 0.22.0's three.
+  - >
+    Proof that stored data survives, as the load-bearing part of the release rather than a smoke
+    test: a database written by 0.22.0 is opened by 0.23.0 and read back in full, and a run
+    checkpointed by 0.22.0 is resumed by 0.23.0 to completion with its completed steps not re-run and
+    its budget not double-charged. `CHECKPOINT_FORMAT` stays 7 because nothing about the format
+    changes; if the engine bump makes that untrue, the release stops and the finding is recorded
+    rather than absorbed.
+  - >
+    A consumer-side build check that pins the actual outcome: a small crate depending on both
+    `io-harness` and `rusqlite` 0.40, which must build against 0.23.0 and must fail against 0.22.0.
+    Kept as a test fixture rather than a one-time manual check, because the property it guards is one
+    a future dependency bump can silently break again.
+  - >
+    Any query or pragma that the newer engine treats differently, found and fixed. The likeliest is
+    the double-quoted-string misfeature, whose default has been tightening across this engine range,
+    and any behaviour that changed between 3.46.0 and 3.53.2 in the surface `state.rs` actually uses.
+  - >
+    CI green on macOS, Linux and Windows, including the bundled build on each. Windows is called out
+    because a bundled SQLite is a C compile there and the runner is the slowest of the three.
+  - >
+    The changelog entry, the migration note, and a `cargo tree` line count recorded before and after,
+    per the standing discipline. No new direct dependency is added by this release; anything the tree
+    gains arrives through `rusqlite` itself and is reported rather than glossed.
+  excluded:
+  - >
+    Any schema change, any new table, any index change, and any `CHECKPOINT_FORMAT` bump. This
+    release changes which library talks to SQLite and nothing about what is stored in it. A store
+    change and a dependency change landing together would make a resume failure impossible to
+    attribute to either.
+  - >
+    Any feature work at all, including the process-handle tables 0.24.0 needs. The whole point of
+    shipping this alone is that a regression in the state layer has nowhere to hide.
+  - >
+    Refactoring `state.rs`. The module is long and there are things to say about that; none of them
+    are said here. A migration diff that also moves code is a diff nobody can review for the property
+    that matters.
+  - >
+    Any vector store, semantic index or embedding dependency. Evaluated on 2026-07-30 and removed
+    from consideration for now; the `rusqlite` upgrade stands on its own argument and this contract
+    does not carry that one forward, even implicitly.
+  - >
+    Wrapping `rusqlite::Error` so that it stops appearing in this crate's public API. **Decided by the
+    owner on 2026-07-31: it is the right change and it lands in a later release on its own merits, not
+    here.** The leak is why a dependency upgrade is a public break at all, and wrapping it would make
+    this the last `rusqlite` bump that can ever break a consumer — but doing it inside the migration
+    means one diff has to be reviewed for two unrelated properties, and the property this release must
+    be reviewed for is that nothing behaves differently. `CONTRACT.md` states the intent, so a consumer
+    writing new code against `Error::State` today is warned before it moves.
+  fallback_scope:
+  - >
+    The highest `rusqlite` version at or below 0.40 that migrates cleanly and keeps every existing
+    database readable and every checkpointed run resumable, with the version actually reached and the
+    reason it stopped there both stated in the changelog. This is still a coherent release: the wall
+    it exists to remove is removed for every consumer on that line or below, and the remaining gap is
+    named rather than discovered by whoever hits it. What the fallback may not do is skip the
+    cross-version resume proof — a bump that has not been shown to preserve stored runs is not a
+    smaller release, it is an unfinished one.
+acceptance:
+  functional:
+  - >
+    F1 — the collision is gone, and its absence is checkable rather than asserted. A fixture crate
+    declaring both `io-harness 0.23.0` and `rusqlite 0.40` builds and runs a trivial harness call.
+    The negative control is the same fixture against `io-harness 0.22.0`, which must fail with
+    cargo's own `links` diagnostic naming `sqlite3`, and that diagnostic is quoted verbatim in the
+    changelog so a reader knows the exact error this release retires.
+  - >
+    F2 — a database written by the previous release is fully readable by this one. A store populated
+    by 0.22.0 with runs, steps, refusals, approvals, budget draws, citations and server-tool calls is
+    opened by 0.23.0 and every row read back identical, through the public `Store` API rather than by
+    inspecting the file. The negative control is a store this release creates from scratch, which
+    must be byte-comparable in schema to one 0.22.0 creates.
+  - >
+    F3 — a run checkpointed by the previous release resumes across the boundary. A run interrupted
+    under 0.22.0 mid-tree, with a completed sub-agent, an in-flight step and a partially drawn
+    budget, is resumed by 0.23.0 to completion: no completed step re-runs, the ledger's total matches
+    what the two halves drew between them, and an irreversible action already taken is not taken
+    twice. This is the 0.7.0 crash test with the two halves on either side of the version boundary,
+    which is the only form of it that proves anything here.
+  - >
+    F4 — a pending approval survives the boundary. An approval deferred past process exit under
+    0.22.0 is resolved under 0.23.0 and the run continues, because a durable decision that does not
+    survive a dependency upgrade is not durable.
+  - >
+    F5 — `CHECKPOINT_FORMAT` is still 7 and no migration runs. Asserted directly, so that a silent
+    format bump cannot pass as a successful upgrade.
+  - >
+    F6 — the break is exactly one and it is documented. `Error::State` carries the 0.40 error type;
+    the changelog carries a `BREAKING` entry with a migration note saying what to write instead; and
+    the enumerated public API in `docs/public-api.txt` reflects it. Any second break discovered
+    during development is either eliminated or documented to the same standard — not absorbed
+    quietly.
+  non_functional:
+  - >
+    NF1 — the full suite passes on macOS, Linux and Windows, including the bundled SQLite compile on
+    each. No test is skipped, marked ignored or made conditional to get there.
+  - >
+    NF2 — no new direct dependency. Whatever the tree gains transitively through `rusqlite` is
+    recorded as a `cargo tree` line count before and after, in the changelog, per the discipline this
+    project has kept since 0.1.0.
+  - >
+    NF3 — `cargo doc` is warning-free and docs.rs builds with all features, checked by the nightly
+    job before publication rather than after.
+  - >
+    NF4 — no measurable regression in store write throughput on the existing benchmark path. The
+    engine moved seven point releases; the expectation is neutral-to-better, and a regression is a
+    finding to record, not a reason to stop.
+  operational:
+  - >
+    OP1 — MSRV is re-checked and stated. If `rusqlite` 0.40 or anything it pulls raises the floor
+    above 1.88, the new number goes in `Cargo.toml` with the same honest comment the existing floor
+    carries, naming which dependency set it.
+  - >
+    OP2 — a real end-to-end run against a live provider completes on the upgraded store, so the
+    release is not accepted on unit tests alone. One run, one workspace, one verified outcome, with
+    the trace read back afterwards.
+  - >
+    OP3 — the fixture crate from F1 is committed and runs in CI, so the property survives the next
+    dependency bump instead of being re-discovered by a consumer.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.23.0, GitHub at initorigin/io-harness with the tag `v0.23.0` and a
+    Release titled `io-harness 0.23.0`, and docs.rs, whose build is checked by the nightly CI job.
+  deployment_method: >
+    The standing flow, unchanged. All work on `feat/0.23.0` off `develop`, including the sealed
+    UltraShip release record. PR into `develop`, merged with the PR button. Release PR `develop` into
+    `main`, merged the same way. GitHub Release cut from the tag with notes taken verbatim from the
+    changelog. `cargo publish` last, after both merges and the Release exist. `develop` synced to
+    `main` fast-forward only at the end. No branch is deleted. `git fetch --tags` after the Release,
+    since `gh release create` makes the tag on the remote only.
+  migrations:
+  - >
+    `Error::State` carries `rusqlite` 0.40's error type. A consumer matching `Error::State(e)` and
+    using `e` as their own `rusqlite::Error` must move to 0.40 themselves — which is the point of the
+    release, and is now possible where before it was not. A consumer who only matches the variant and
+    ignores its payload is unaffected.
+  - >
+    No store migration. Existing databases are opened as they are; no table is created, altered or
+    dropped, and `CHECKPOINT_FORMAT` stays 7. A 0.22.0 database works under 0.23.0 and a 0.23.0
+    database works under 0.22.0, because the bytes are the same bytes.
+  - >
+    The bundled engine moves from SQLite 3.46.0 to 3.53.2. A consumer who links this crate alongside
+    their own SQLite now gets 3.53.2 in the process. That is stated rather than left to be noticed.
+  - >
+    No new direct dependency, so a consumer auditing the tree has only `rusqlite`'s own transitive
+    movement to review, and the changelog reports it.
+  observability:
+  - >
+    Nothing is added, and that is deliberate — a release whose claim is "everything behaves as it did"
+    should not also change what is recorded. A new diagnostic invented for this release would be one
+    more thing that could differ between the two sides of the boundary being compared.
+  - >
+    The existing trace is the instrument. The cross-boundary resume in F3 is read back through the
+    ordinary `Store` API, so if the migration broke something it surfaces as a wrong row in the same
+    tables an operator already reads.
+  - >
+    The `cargo tree` line count before and after is recorded in the changelog, which is how this
+    project has reported dependency movement since 0.1.0 and is the only number this release changes
+    on purpose.
+  - >
+    MSRV, whether it moved or not, is stated in `Cargo.toml` and the changelog with the dependency
+    that set it — per OP1, and because "unchanged" is a result worth publishing too.
+  rollback: >
+    A published version cannot be recalled. The forward fix is 0.23.1; `cargo yank --version 0.23.0`
+    is the escape hatch and leaves 0.22.0 as what `cargo install` resolves. Rollback is unusually
+    clean here: no stored format changed, so a consumer who reverts to 0.22.0 keeps every database and
+    every in-flight run exactly as it is, with no down-migration to run and nothing to undo. The one
+    source break reverts as easily as it applied. The single thing a revert does not undo is the
+    consumer's own move to `rusqlite` 0.40 — which is why the fixture in F1 exists, so that
+    incompatibility is proven before publication rather than reported after it.
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows
+  - A real provider account, for the live run that is OP2
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - Owner approval to merge to `main`, cut the Release, and publish, per the standing override.
+resource_profile:
+  complexity: small
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    Eight minor versions of API churn arriving at once, concentrated in the one module that cannot be
+    allowed to change behaviour. The individual edits are small and the compiler finds nearly all of
+    them; what costs time is that `state.rs` is 4,833 lines and every edit has to be read for
+    semantics rather than accepted because it compiles.
+  - >
+    Transaction and lifetime semantics, which is where a silent break would live. Anything touching
+    how a transaction is opened, committed or dropped, and anything touching row and statement
+    lifetimes, is where a change compiles cleanly and resumes wrongly. The mitigation is F3 and F4
+    rather than review alone, because review is exactly what this failure shape defeats.
+  - >
+    The engine moving seven point releases, which the compiler cannot help with at all. SQLite is
+    conservative and the expectation is that nothing breaks, but the double-quoted-string misfeature
+    has been tightening across this range and any query relying on it fails at runtime against real
+    data. This is why the acceptance criteria are built on reading back a previous release's database
+    rather than on a fresh one.
+  - >
+    Windows CI wall-clock. A bundled SQLite is a C compile and 3.53.2 is larger than 3.46.0; the
+    slowest runner gets slower, and a timeout there reads as a failure rather than as a delay.
+  - >
+    Constructing the fixtures for F3 and F4 honestly. Both need a database genuinely written by
+    0.22.0, not one this release wrote and labelled — which means pinning the previous version in a
+    test setup step and keeping the artefact it produces.
+  preferred_tools:
+  - The existing 0.7.0 kill-9 crash test, re-pointed across the version boundary rather than rewritten
+  - The compiler, which finds the API churn without help
+  - A pinned 0.22.0 build as a fixture generator, so the "previous release" databases are real
+  - The existing nightly docs.rs job, unchanged
+  constraints:
+  - CHECKPOINT_FORMAT stays 7; no table created, altered or dropped
+  - No new direct dependency
+  - Exactly one public break, with a migration note
+  - No refactoring of `state.rs` in this diff
+  - Every test offline except the single live run that is OP2
+  - Stay 0.x
+risks:
+- >
+  A behavioural change that compiles. The whole risk of this release is concentrated in one shape:
+  something in the transaction or lifetime surface changes meaning, the code still builds, the unit
+  tests still pass, and a resumed run double-charges a budget or re-runs a step that already had an
+  irreversible effect. That failure is silent by construction and would reach a user as data damage
+  rather than as an error. F3 and F4 exist for this and nothing else; if either cannot be made to run
+  honestly, the release stops rather than ships on the strength of the ones that can.
+- >
+  The engine change reaching real data. SQLite 3.46.0 to 3.53.2 is seven point releases of a database
+  that is careful about compatibility but not indifferent to it. A pragma default or a
+  double-quoted-string acceptance that moved would fail against stored rows and not against fresh
+  ones — which is why F2 reads back a previous release's database rather than a new one. The residual
+  risk is a database shape no fixture covers, and it is genuinely residual: it is not fully closable
+  by testing.
+- >
+  Scope pressure. This is a maintenance release standing between the owner and the shell tool, and
+  the pull to fold "just the process-handle tables" into it will be real. Everything that makes it
+  worth shipping alone disappears the moment it carries a feature, because a resume regression then
+  has two possible causes. The excluded list says so; this risk is the reason it does.
+- >
+  MSRV drift. If `rusqlite` 0.40 or a transitive dependency requires above 1.88, the floor moves in a
+  release whose headline is a dependency bump, which is a poor place for a consumer to discover it.
+  The mitigation is OP1 — check first, state it in `Cargo.toml` with the reason and the dependency
+  that set it, and put it in the changelog rather than in the diff.
+- >
+  Windows CI timing out on the larger bundled compile and reading as a failure. Cheap to diagnose,
+  easy to misread as a real break under time pressure, and worth naming so it is recognised rather
+  than debugged from scratch.
+open_questions:
+- >
+  Whether the F1 fixture crate lives in this repository as a test target or in CI as a generated
+  scratch project. In-repo is honest and reviewable; generated keeps a second `Cargo.toml` out of the
+  tree that `cargo package` has to reason about. Decided during development against what `cargo
+  package` and the `exclude` list actually do with it.
+- >
+  Which `rusqlite` version development actually lands on, and whether anything between 0.40 and the
+  newest published forces a store or MSRV change that 0.40 alone would not. This is the residual of
+  the owner's newest-at-development-time decision rather than a reopening of it: the target is
+  settled, the number is not knowable until the work starts, and if the newest turns out to carry a
+  cost 0.40 does not, the fallback scope already says what to do — take the highest version that
+  migrates cleanly and state where it stopped and why.
+status: released
+released_at: 2026-07-31T02:28:58Z
+mode: published
+delivered: >
+  A Rust program already using a current `rusqlite` can embed this crate. Before 0.23.0 that was not
+  a matter of friction but of possibility: `libsqlite3-sys` declares `links = "sqlite3"` and cargo
+  refuses two versions of a `links` package in one graph, so a consumer on `rusqlite` 0.33 or later
+  got a resolver error and no build, with nothing they could do about it. That wall is gone, and its
+  absence is checked by a committed consumer crate rather than asserted. A database written by
+  0.22.0 opens unchanged, a run it checkpointed resumes across the boundary without re-running a
+  completed step or double-charging its budget, an approval it deferred is resolved here, and no
+  table, index or stored format is altered. `src/state.rs` is byte-identical to 0.22.0.
+evidence:
+  tests:
+  - >
+    `cargo test` on macOS — 45 test binaries plus 237 doctests, 0 failed, 0 ignored, including the
+    real-SIGKILL crash-resume test and the five new cross-version tests.
+  - >
+    `cargo test --all-features --lib --tests` — 10 passed, 0 failed.
+    `cargo test --all-features --doc` — 239 passed, 0 failed.
+  - >
+    `cargo test --test cross_version` — 5 passed, 0 failed. F2 row-for-row read-back against the
+    sidecar 0.22.0 wrote; F2's schema negative control; F3 cross-boundary tree resume; F4 approval
+    resolved across the boundary; F5 `CHECKPOINT_FORMAT` still 7 with no migration on open.
+  - >
+    Non-vacuity proven by seven separate sabotages, each reverted after it fired the assertion meant
+    to catch it: a fixture swap, a double-charging provider, a denied decision, a `user_version`
+    stamped to 6, the same with the pre-check relaxed so a migration really ran, an extra
+    `CREATE TABLE`, and a re-driven completed child.
+  - >
+    NF1 — CI green on all three runners on PR #73: `test (ubuntu-latest)` 6m43s,
+    `test (macos-latest)` 5m48s, `test (windows-latest)` 13m49s, including the bundled SQLite compile
+    on each. No test skipped, ignored or made conditional.
+  - >
+    `msrv` job pass (2m0s) against the declared `rust-version = "1.95"`, which the job reads from
+    `Cargo.toml` rather than a hardcoded number. Floor established by hand first: `cargo +1.93` and
+    `cargo +1.94` both fail inside `libsqlite3-sys`'s build script with
+    `cannot find macro cfg_select in this scope`; 1.95 builds.
+  builds:
+  - >
+    `cargo check --all-targets` exit 0 with zero source edits in `src/state.rs`. The bump's 28 errors
+    were one root cause — `u64`'s `ToSql`/`FromSql` moved behind `rusqlite` 0.38.0's `fallible_uint`
+    feature — and enabling that feature restores the same macro-generated impls.
+  - >
+    `cargo package --locked` exit 0. 169 files, 848K. The three fixture crates
+    (`gen-0.22.0`, `links-consumer`, `throughput-0.22.0`) are excluded — 0 entries each — while the
+    nine `store-0.22.0` fixture files are included, because `tests/cross_version.rs` reads them. No
+    `.env`, no `.ultraship`, no `.github` in the tarball.
+  - >
+    `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `lint` job pass.
+  - >
+    NF3 — `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` clean
+    locally, and the `docs.rs (nightly)` job pass (1m39s). The rendered pages carry
+    `Available on crate feature`, which is the job's second assertion.
+  - >
+    NF2 — `cargo tree` 407 lines before, 402 after, measured on the same machine. `ahash`,
+    `hashbrown` 0.14.5, `zerocopy` and the `version_check` build dependency drop out; `foldhash`
+    0.2.0 arrives; `hashlink` 0.9.1 to 0.12.1. No new direct dependency.
+  - >
+    NF4 — store write throughput measured on both sides with a byte-identical workload timing
+    `Store::checkpoint_step`, release profile, 33 samples per side. Order-balanced batch medians
+    differ by +0.06%, -0.99% and +1.65%; the sign flips, against a paired per-round spread of 11-21%.
+    Within noise: rules out a regression above roughly 5%, resolves nothing smaller.
+  reviews:
+  - >
+    F1 — the `links` collision proven gone in both directions. Positive: `cargo run` in
+    `tests/fixtures/links-consumer` prints
+    `links-consumer OK: rusqlite 0.40 and io-harness share one libsqlite3-sys (sqlite 3.53.2)`.
+    Negative: the same fixture against `io-harness =0.22.0` fails at resolution, exit 101, before
+    anything compiles, with cargo naming the `links = "sqlite3"` conflict. The diagnostic is quoted
+    verbatim in the changelog.
+  - >
+    OP3 — the `links-consumer (rusqlite 0.40 coexistence)` CI job pass (1m20s) on PR #73. It runs the
+    positive control and then rebuilds against 0.22.0, failing the job if that build succeeds, and
+    refusing any failure whose output does not name both `links` and `sqlite3`.
+  - >
+    F6 — exactly one break, as predicted: `Error::State` carries 0.40's error type. No second break
+    was found; `tests/public_api.rs` passes against an unedited `docs/public-api.txt`. The changelog
+    carries `**BREAKING**` and `**BREAKING (MSRV)**` entries, each with a `*Migration:*` note, and
+    `tests/changelog.rs` enforces that pairing.
+  - >
+    Scope discipline confirmed by diff rather than by claim: the only change anywhere in `src/` is
+    six lines of MSRV doc comment in the crate root. `src/state.rs` is byte-identical to 0.22.0, so
+    "no refactoring of `state.rs`" and "no schema change" are observable facts, not assurances.
+  - >
+    Two engine risks closed by inspection. SQLite 3.53.0 moved default float-to-text rendering from
+    15 to 17 significant digits: unreachable here, because the schema has no `REAL` column and the
+    only floats computed in SQL are converted in Rust before storage. The double-quoted-string
+    misfeature: unreachable, because no SQL statement in the crate contains a double-quoted
+    identifier or literal.
+  - >
+    Security gate — the real `OPENROUTER_API_KEY` and `CARGO_REGISTRY_TOKEN` values were searched for
+    across all tracked files and appear in none. `.env` is gitignored, untracked, and in the package
+    `exclude` list.
+  deployments: []
+  health_checks:
+  - >
+    OP2 — `cargo run --example durable_run` against OpenRouter on the upgraded store: one run, one
+    workspace, a verified outcome under the `rustc` gate, trace read back from a reopened file-backed
+    store. `[process 1] stopped: Success { steps: 1 }`, `[process 2] resumed to: Success { steps: 1 }`,
+    `final status = Completed`.
+  - >
+    `cargo run --example live_accounting` — three live provider calls with all seven `u64` `Usage`
+    counters written and read back through the restored `fallible_uint` path against real vendor
+    numbers (totals 1396/1473/3141, 6010 tokens, cache-read 2500), the edit recorded, and spend priced
+    correctly at two different rates from the same stored trace. This is the code path the migration
+    touched, exercised end to end against a real provider.
+known_limitations:
+- >
+  This record is sealed before the crates.io upload, which follows the develop-to-main merge and the
+  GitHub Release. `mode: published` states the authorized target; the delivery sequence makes it true.
+- >
+  The MSRV rose from 1.88 to 1.95, which is the one place this release makes a consumer's life
+  harder — in a release whose whole purpose is to make it easier. It is not avoidable: every
+  `rusqlite` at or above the 0.40 floor calls the std `cfg_select!` macro, and below that floor the
+  `links` collision returns. A consumer pinned to an older toolchain should stay on 0.22.0.
+- >
+  F3's fixture does not exercise the adopt-a-completed-child path. 0.22.0 committed the step-capped
+  root's step, so on resume the coordinator replans rather than replaying the fan-out and
+  `Store::find_spawn` has nothing to adopt at that step. The no-re-run assertions are stronger for it
+  — the finished child is proven untouched by its own rows and its own file rather than by trusting
+  adoption to skip it — but it is a different proof. A fixture whose root paused mid-fan-out would
+  cover it; `tests/checkpoint.rs` covers adoption within a single release.
+- >
+  NF4's premise was wrong and is recorded rather than quietly satisfied: the criterion speaks of "the
+  existing benchmark path" and this repository had none — no `benches/`, no criterion, no `[[bench]]`.
+  Both sides were built for the measurement. The host was also under real load throughout
+  (load average 9.23 on 8 cores), which is why the spread is wide and why 33 samples were taken
+  instead of 5. A rerun on an idle machine would tighten the bound considerably.
+- >
+  Nothing runs the throughput comparison automatically. On shared CI runners the noise floor is worse
+  than the one measured here, and a throughput gate against a 20% noise floor would be a flake
+  generator rather than a guard. The two binaries and the protocol are in the tree for a manual rerun.
+- >
+  `docs/public-api.txt` is unchanged, and that is correct rather than an oversight: the snapshot
+  enumerates re-exported names as `<kind> <name> <file>`, so a variant's payload type is not a line
+  in it and never will be. The fact went to `docs/CONTRACT.md`'s "What is public", which now states
+  outright that `rusqlite` is a public dependency of this crate.
+- >
+  Live evidence is OpenRouter-only. The `.env` here carries real credentials for no other vendor, so
+  the Anthropic and OpenAI paths rest on their wire tests — unchanged by this release, which touched
+  no provider code.
+- >
+  `rusqlite::Error` remains in the public API, so the next `rusqlite` major bump will break consumers
+  again. The intent to wrap it is stated in `docs/CONTRACT.md` but deliberately not done here: a
+  migration release must be reviewable for exactly one property, and an error-type redesign in the
+  same diff destroys that. Not yet slotted to a version.
+- >
+  Carried forward unchanged, none of them touched by this release: `resume_tree` never calls
+  `record_run_policy`; `SandboxLimits::max_processes` is enforced by nothing; there is no seccomp
+  filter on Linux; the Windows Job Object is unimplemented; `git_status` lacks `-z`;
+  `pdf::read_text`'s `catch_unwind` is a no-op under `panic = "abort"`; `TEST_BINARY` is inert;
+  `Containment::max_total_cost` is inert; there is no `Session::resume_turn`; `Session::history` is
+  linear per hop; the stall window still does not survive a resume.
+- >
+  `skills::discovery_over_a_32_skill_directory_is_under_50ms` remains a wall-clock assertion that
+  fails intermittently on the Windows runner under load. It passed on this release's CI run.
+supersedes: 0.22.0
+next_recommended_version: 0.24.0
+immutable: true

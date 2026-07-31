@@ -1,0 +1,63 @@
+product: io-harness
+version: 0.23.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: high
+  reasons:
+    - >
+      No constraints are recorded for this workspace — `ultraship constraints` reports that the
+      product had no active release when this assessment was made, so there is no user estimate to
+      ground it in. It rests instead on the contract's own `resource_profile` (`complexity: small`,
+      `uncertainty: medium`) and on the repository's measured condition. Nothing below is a measured
+      cost figure; the framework has no provider telemetry.
+    - >
+      The API migration is already done and it is two lines. `rusqlite` 0.32 to 0.40.1 with
+      `features = ["bundled"]` produced 28 compiler errors, all of them one root cause: `u64`'s
+      `ToSql` and `FromSql` impls moved behind a new `fallible_uint` feature in `rusqlite` 0.38.0.
+      Adding that feature restores the same macro-generated impls, so `cargo check --all-targets` is
+      clean with **zero edits in `src/state.rs`**. The contract's largest predicted cost driver —
+      "eight minor versions of API churn concentrated in the one module that cannot change
+      behaviour" — did not materialise, and the recon that establishes this is exhaustive: 215
+      `rusqlite`-touching lines across 6 connection sites, 5 transactions, 29 prepares, 26
+      `query_row`, 24 `query_map`, 7 `params!`, 23 `execute_batch` and 38 typed `Row::get`, none of
+      which the compiler objects to.
+    - >
+      Two of the named risks are closed by inspection rather than by testing. The crate implements
+      `ToSql`/`FromSql` for none of its own types, so the trait-signature churn that usually
+      dominates a `rusqlite` bump has no surface here at all. And the double-quoted-string
+      misfeature is not reachable: `src/state.rs` contains no double-quoted identifier or string
+      literal inside any SQL statement, so the engine-side behaviour the contract singles out as
+      "the likeliest" cannot bite.
+    - >
+      The remaining work is proof, not migration, and every instrument it needs already exists. F3
+      is the 0.7.0 kill-9 crash test re-pointed across the version boundary rather than written; F2
+      and F4 read through the public `Store` API that the trace already uses; F5 is an assertion on
+      `CHECKPOINT_FORMAT`, which is already asserted at `tests/session.rs:443`; and the three-OS CI
+      matrix that NF1 needs has been green since 0.9.1.
+    - >
+      The repository is clean and current. `develop` equals `origin/develop` at the 0.23.0 planning
+      merge, `main` is one merge behind at the 0.22.0 release, the working tree carried no
+      uncommitted changes when `feat/0.23.0` was branched, and `df -h .` reports 40 GiB free — the
+      disk-full condition that has twice surfaced as a spurious linker error is not present.
+  major_cost_drivers:
+    - >
+      Constructing the F3 and F4 fixtures honestly. Both need a database genuinely written by a
+      pinned 0.22.0 build, not one this release wrote and labelled, and both need the two halves of
+      a run to execute under different dependency graphs. This is now the largest single piece of
+      work in the release, because the migration it exists to check turned out to be free.
+    - >
+      The engine moving SQLite 3.46.0 to 3.53.2, which the compiler cannot help with and which the
+      DQS finding narrows without closing. The residual is a stored-data shape no fixture covers,
+      and it is genuinely residual rather than closable.
+    - >
+      The F1 fixture crate — a consumer depending on both `io-harness` and `rusqlite` 0.40 — has to
+      build against 0.23.0, fail against 0.22.0, live somewhere `cargo package` tolerates, and run
+      in CI. The open question about where it lives is decided here, and the negative control needs
+      a published 0.22.0 to point at.
+    - >
+      Windows CI wall-clock on the larger bundled compile. 3.53.2 is a bigger C translation unit
+      than 3.46.0 on the slowest of the three runners, and a timeout there reads as a break rather
+      than a delay.
+  recommended_scope_change: null
