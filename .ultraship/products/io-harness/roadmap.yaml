@@ -655,6 +655,35 @@ versions:
       the contract rather than papered over, because a boundary the caller believes in and nobody
       enforces is worse than none.
 
+      A connected provider also says what it can run. `Provider::models()` returns the vendor's own
+      catalogue — the model ids, and for each what the vendor was willing to state: context length,
+      maximum output, whether it takes images or tools, and the price. It is a defaulted trait
+      method returning an empty list, so an out-of-tree `Provider` keeps compiling; adding a
+      *required* method to an externally-implementable trait would be a break for the one extension
+      point this crate has.
+
+      The price dimensions need no new type: `pricing::Price` already carries `input`, `output`,
+      `cache_read`, `cache_write` and `per_server_tool_request`, in micro-units per million tokens,
+      and a vendor's pricing object maps onto those five almost exactly. The catalogue therefore
+      fills a `PriceTable` directly, and derived cost stops depending on a table an operator
+      maintains by hand with an `as_of` date they have to remember to update.
+
+      The hard part is that this is not uniformly available and the release must not pretend it is.
+      `GET /v1/models` is near-universal but returns *identifiers* — OpenAI, Anthropic, Groq,
+      DeepSeek, Mistral, Fireworks and every local runtime return no cost data whatsoever.
+      OpenRouter is the outlier that makes the feature worth building: its catalogue carries
+      per-token prompt, completion and cache pricing, context length and supported parameters for
+      every model it serves. So `ModelInfo::price` is `Option<Price>`, and `None` means the vendor
+      did not say — never `Price::ZERO`, which would report a real spend as free and is exactly the
+      confident wrong answer `src/pricing.rs` already refuses to ship a price list to avoid.
+      `Spend::unpriced_calls` is the existing, honest way that surfaces. A local runtime is the one
+      place zero is true rather than unknown, and it is recorded as a stated zero.
+
+      This does not contradict "the crate ships no prices" — it is the resolution of it. That rule
+      exists because a number compiled into this crate is stale the moment a vendor moves and the
+      late upgrader gets a wrong answer. A number fetched from the vendor at run time has no such
+      shelf life, and it carries the vendor's own effective date rather than one a human typed.
+
       Excluded and argued rather than omitted: AWS Bedrock's SigV4 path, Google Vertex's
       service-account JWT, Gemini's native `interactions` API, and Azure's `api-key` header with
       its deployment-in-path and `api-version` query param. The first three are reachable today by
