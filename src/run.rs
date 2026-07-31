@@ -5702,11 +5702,20 @@ async fn dispatch(
                 ));
             }
             let (text, skipped) = handles.poll(id)?;
-            // Every byte a poll reads goes to the store as well as to the model.
-            // The model's copy is a bounded window and the capture file does not
-            // outlive the run, so this is the only durable record of what the
-            // process actually printed — and "what did that dev server do" is a
-            // question asked after it is gone.
+            // Every byte a poll *reads* goes to the store as well as to the model,
+            // and the qualifier is load-bearing. The capture file does not outlive
+            // the run, so this is the only durable record of what the process
+            // printed — "what did that dev server do" is a question asked after it
+            // is gone.
+            //
+            // What it is NOT is a complete transcript. A poll that arrives to find
+            // more than one window waiting keeps the newest and advances the cursor
+            // past the rest, so bytes no poll ever read reach no store and are lost
+            // with the capture file. That is the honest consequence of bounding the
+            // window, the poll says so to the model rather than implying otherwise,
+            // and it is recorded as a known limitation of this release. Fixing it
+            // means streaming the skipped region to the store in bounded chunks,
+            // which is a change to how a poll reads rather than to what it returns.
             store.record_handle_output(run_id, step, id, &text)?;
             watch.emit(RunEvent::at_depth(
                 run_id,
@@ -5735,8 +5744,9 @@ async fn dispatch(
                         },
                         if skipped > 0 {
                             format!(
-                                " ({skipped} bytes of older output skipped; the newest is here \
-                                 and the whole of it is in the run's trace)"
+                                " ({skipped} bytes of older output skipped; the newest is here, \
+                                 and the skipped bytes are gone — poll more often to see \
+                                 everything a noisy process prints)"
                             )
                         } else {
                             String::new()

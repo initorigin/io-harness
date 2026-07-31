@@ -735,8 +735,8 @@ async fn a_handle_flooding_faster_than_anything_polls_it_keeps_its_process_and_s
         text.contains("shell_start handle 1"),
         "the flood never started, so nothing below is about a flooding handle:\n{text}"
     );
-    // Not a failure: two and a half megabytes of unread output is an ordinary
-    // amount for a build log and must not turn a poll into an error.
+    // Not a failure: a megabyte of unread output is an ordinary amount for a
+    // build log and must not turn a poll into an error.
     assert!(
         !text.contains("[shell_poll error]"),
         "polling a handle that had flooded failed:\n{text}"
