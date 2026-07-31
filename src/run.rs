@@ -5291,104 +5291,14 @@ async fn dispatch(
             // whose second stage is denied must not run its first, so a loop that
             // checked-then-ran each stage in turn would be wrong however careful
             // it looked.
-            let mut remembered: Vec<Rule> = Vec::new();
-            for (cmd, planned) in parsed.commands().zip(plan.iter()) {
-                if let Some(dest) = &planned.cd_target {
-                    // `cd` spawns nothing, so there is no program to check against
-                    // `Act::Exec`. What it does do is choose where every later
-                    // stage runs, which is a read of that directory.
-                    let rel = relative_to(ws.root(), dest);
-                    match gate(
-                        ws,
-                        approver,
-                        store,
-                        run_id,
-                        step,
-                        Act::Read,
-                        &rel,
-                        None,
-                        watch,
-                        depth,
-                    )
-                    .await?
-                    {
-                        Gated::Refused { decision, obs } => {
-                            return Ok(Dispatched::go(decision, obs))
-                        }
-                        Gated::Paused { request_id } => {
-                            return Ok(Dispatched::Pause { request_id })
-                        }
-                        Gated::Go { remember, .. } => remembered.extend(remember),
-                    }
-                    record_shell_authorisation(ws, store, run_id, step, Act::Read, &rel)?;
-                } else {
-                    // The same two targets `exec` checks, per sub-command rather
-                    // than per call: the program alone, which is what
-                    // `deny_exec("rm")` names, and this stage's own joined argv,
-                    // which is what `allow_exec("git log*")` names. Checking the
-                    // whole line as one string could not tell one stage from
-                    // another, which is the entire point of parsing it.
-                    let program = cmd.argv[0].clone();
-                    let joined = cmd.argv.join(" ");
-                    let mut targets = vec![program.clone()];
-                    if joined != program {
-                        targets.push(joined);
-                    }
-                    for target in targets {
-                        match gate(
-                            ws,
-                            approver,
-                            store,
-                            run_id,
-                            step,
-                            Act::Exec,
-                            &target,
-                            None,
-                            watch,
-                            depth,
-                        )
-                        .await?
-                        {
-                            Gated::Refused { decision, obs } => {
-                                return Ok(Dispatched::go(decision, obs))
-                            }
-                            Gated::Paused { request_id } => {
-                                return Ok(Dispatched::Pause { request_id })
-                            }
-                            Gated::Go { remember, .. } => remembered.extend(remember),
-                        }
-                        record_shell_authorisation(ws, store, run_id, step, Act::Exec, &target)?;
-                    }
-                }
-
-                // Redirect targets are paths, so they take the path-resolved check
-                // `write_file` and `read_file` take — not the name match an
-                // `Act::Exec` rule performs. A rule denying `secrets/*` has to
-                // catch `> secrets/key` for the boundary to mean anything.
-                for (kind, target) in &planned.redirects {
-                    let Some(path) = target else { continue };
-                    let act = if kind.is_write() {
-                        Act::Write
-                    } else {
-                        Act::Read
-                    };
-                    let rel = relative_to(ws.root(), path);
-                    match gate(
-                        ws, approver, store, run_id, step, act, &rel, None, watch, depth,
-                    )
-                    .await?
-                    {
-                        Gated::Refused { decision, obs } => {
-                            return Ok(Dispatched::go(decision, obs))
-                        }
-                        Gated::Paused { request_id } => {
-                            return Ok(Dispatched::Pause { request_id })
-                        }
-                        Gated::Go { remember, .. } => remembered.extend(remember),
-                    }
-                    record_shell_authorisation(ws, store, run_id, step, act, &rel)?;
-                }
-            }
+            let remembered = match check_shell_line(
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+            )
+            .await?
+            {
+                ShellCheck::Go(remember) => remember,
+                ShellCheck::Stop(d) => return Ok(d),
+            };
 
             let outcome = Shell::new(exec_timeout, cap).run(&parsed, &plan).await?;
             let (decision, obs) = match &outcome {
@@ -6197,6 +6107,144 @@ enum Gated {
 }
 
 /// Record that one sub-command or one redirect target of a `shell` line was
+/// What checking a parsed shell line decided.
+///
+/// The check either clears the whole line — handing back the rules an approver
+/// asked to remember — or it stops the call, and a stop is a finished
+/// [`Dispatched`] rather than an error: a refused line is something the model can
+/// recover from by writing a different one.
+enum ShellCheck {
+    Go(Vec<Rule>),
+    Stop(Dispatched),
+}
+
+/// Check every sub-command and every redirect target of a parsed line, before
+/// anything is spawned.
+///
+/// Extracted so that the foreground `shell` tool and the handle-starting
+/// `shell_start` cannot drift apart. That is not tidiness: the whole claim of
+/// both tools is that what was checked is what runs, and two copies of this loop
+/// would be two accept-sets to keep in agreement forever. `tests/shell.rs` drives
+/// its refusal table through both tools for the same reason — the shared function
+/// is the mechanism, the shared table is the proof.
+///
+/// The order matters and is the reason this is one pass rather than a check
+/// folded into the runner: a line whose second stage is denied must not run its
+/// first, so every decision for the whole line is taken here and the caller
+/// spawns only after this returns [`ShellCheck::Go`].
+#[allow(clippy::too_many_arguments)]
+async fn check_shell_line(
+    ws: &Workspace,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    watch: &Watch<'_>,
+    depth: u32,
+    parsed: &crate::tools::shell::Line,
+    plan: &[crate::tools::shell::Planned],
+) -> Result<ShellCheck> {
+    let mut remembered: Vec<Rule> = Vec::new();
+    for (cmd, planned) in parsed.commands().zip(plan.iter()) {
+        if let Some(dest) = &planned.cd_target {
+            // `cd` spawns nothing, so there is no program to check against
+            // `Act::Exec`. What it does do is choose where every later
+            // stage runs, which is a read of that directory.
+            let rel = relative_to(ws.root(), dest);
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                &rel,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => {
+                    return Ok(ShellCheck::Stop(Dispatched::go(decision, obs)))
+                }
+                Gated::Paused { request_id } => {
+                    return Ok(ShellCheck::Stop(Dispatched::Pause { request_id }))
+                }
+                Gated::Go { remember, .. } => remembered.extend(remember),
+            }
+            record_shell_authorisation(ws, store, run_id, step, Act::Read, &rel)?;
+        } else {
+            // The same two targets `exec` checks, per sub-command rather
+            // than per call: the program alone, which is what
+            // `deny_exec("rm")` names, and this stage's own joined argv,
+            // which is what `allow_exec("git log*")` names. Checking the
+            // whole line as one string could not tell one stage from
+            // another, which is the entire point of parsing it.
+            let program = cmd.argv[0].clone();
+            let joined = cmd.argv.join(" ");
+            let mut targets = vec![program.clone()];
+            if joined != program {
+                targets.push(joined);
+            }
+            for target in targets {
+                match gate(
+                    ws,
+                    approver,
+                    store,
+                    run_id,
+                    step,
+                    Act::Exec,
+                    &target,
+                    None,
+                    watch,
+                    depth,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => {
+                        return Ok(ShellCheck::Stop(Dispatched::go(decision, obs)))
+                    }
+                    Gated::Paused { request_id } => {
+                        return Ok(ShellCheck::Stop(Dispatched::Pause { request_id }))
+                    }
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+                record_shell_authorisation(ws, store, run_id, step, Act::Exec, &target)?;
+            }
+        }
+
+        // Redirect targets are paths, so they take the path-resolved check
+        // `write_file` and `read_file` take — not the name match an
+        // `Act::Exec` rule performs. A rule denying `secrets/*` has to
+        // catch `> secrets/key` for the boundary to mean anything.
+        for (kind, target) in &planned.redirects {
+            let Some(path) = target else { continue };
+            let act = if kind.is_write() {
+                Act::Write
+            } else {
+                Act::Read
+            };
+            let rel = relative_to(ws.root(), path);
+            match gate(
+                ws, approver, store, run_id, step, act, &rel, None, watch, depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => {
+                    return Ok(ShellCheck::Stop(Dispatched::go(decision, obs)))
+                }
+                Gated::Paused { request_id } => {
+                    return Ok(ShellCheck::Stop(Dispatched::Pause { request_id }))
+                }
+                Gated::Go { remember, .. } => remembered.extend(remember),
+            }
+            record_shell_authorisation(ws, store, run_id, step, act, &rel)?;
+        }
+    }
+    Ok(ShellCheck::Go(remembered))
+}
+
 /// authorised, with the rule and layer that authorised it.
 ///
 /// The crate does not otherwise record allows. A [`PolicyEvent`] is written for a
