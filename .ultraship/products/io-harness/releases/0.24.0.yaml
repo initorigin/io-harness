@@ -1,0 +1,511 @@
+product: io-harness
+version: 0.24.0
+release_type: minor
+outcome:
+  user_can: >
+    Give an agent a command line and have the boundary hold. Today the crate's `exec` tool takes an
+    argv array and spawns `argv[0]` directly — no `sh -c`, no joining — which is what makes its
+    permission check meaningful and also what makes half of real work unreachable: `cd infra &&
+    kubectl get pods | grep CrashLoop` is not a thing the model can express, and every pipeline,
+    redirect and command sequence has to be smuggled in as a script the harness cannot see inside of.
+    This release adds a `shell` tool that parses what the model wrote, walks the parse, and checks
+    every sub-command's argv against `Act::Exec` and every redirect target against `Act::Write` or
+    `Act::Read` — the same rules a fixed argv has always been checked against, applied to each
+    element of the line rather than to a string. What it cannot resolve statically it refuses:
+    command substitution, variable expansion in command position, `eval`, subshells, heredocs and
+    control flow are named refusals with reasons, not guesses. Nothing in a refused line runs, and a
+    pipeline whose second stage is denied does not execute its first.
+
+    Long-running work stops being unrepresentable. A dev server, a log tail or a twenty-minute build
+    is started through a process handle, polled for incremental output, and killed — instead of
+    blocking one step of the loop until a 900-second timeout decides for it. On Windows those
+    handles are backed by a Job Object, which is also the containment the sandbox has been missing:
+    memory, CPU and active process count become real bounds on a Windows run rather than mapped
+    fields nothing applies, and `SandboxLimits::max_processes` becomes enforced for the first time on
+    any platform.
+
+    And a directory can be listed. `find` walks the whole tree against a glob; there is no way to ask
+    what is in one directory, which is the first thing anyone does in an unfamiliar repository.
+
+    Finally, the entry point stops describing a product this is no longer. `TaskContract::workspace`
+    stops demanding a success criterion as a positional argument — it becomes
+    `workspace(goal, root)` defaulting to `Verification::None`, with `.with_verification(v)` for the
+    projects that have a test command — and the documentation leads with `Session`, the durable
+    conversation, ahead of `run_with`, the one-shot verified run.
+  business_value: >
+    The shell is the gap that decides which jobs this crate can be pointed at. Every capability
+    added since 0.13.0 has widened what an agent can do inside a workspace while the way it reaches
+    the outside world stayed a fixed argv per step. For coding work that is survivable — the tools
+    are typed and the compiler is the verifier. For everything else it is not: an operator's work is
+    a pipeline, a data task is a redirect, an infrastructure task is a sequence, and none of those
+    are expressible. 0.22.0 made the model's *reading* of the outside world provider-executed and
+    deliberately dialled by a vendor; a private host, an internal endpoint, a local daemon are all
+    unreachable through it by construction. The shell is the one path this process actually
+    enforces, so it is the only way those become reachable without giving up the boundary.
+
+    The boundary is why it must be parsed rather than passed through. Handing a string to `sh -c` is
+    ten lines and destroys the product: the permission layer, the trace, the refusal record and the
+    sandbox all describe a command the harness never saw. A parsed shell is the only version of this
+    feature that is consistent with the crate's claim, and it is the reason this is a release rather
+    than an afternoon.
+
+    The Windows half is not a separate ambition. Killing a process handle on Windows without a Job
+    Object leaks the grandchildren: a shell that spawns a package manager that spawns a runtime
+    leaves orphans that outlive the run, on the one platform where there is no process group to kill.
+    The handle feature is not correct on Windows without it, so it lands here rather than in a
+    release of its own — and it brings with it the first real resource containment that platform has
+    had.
+
+    The positioning fix rides here because this release already breaks. A harness whose primary
+    signature demands a checkable success criterion reads as a verified-task runner no matter what
+    the prose says, and a shell is precisely the capability that makes uncheckable work real. Moving
+    it in a release that is already a break costs a consumer one migration; moving it later costs
+    them a second.
+  evidence_of_value: >
+    A live run in which the model composes a real command line — a sequence with a pipeline and a
+    redirect — the harness parses it, checks each stage, runs it, and the trace afterwards shows one
+    row per sub-command with the rule that allowed it. Beside it the negative control that makes the
+    claim mean something: the same line with one stage denied is refused whole, nothing executes, and
+    the refusal names the stage and the rule.
+
+    For the handles: a dev server started, polled twice with incremental output, killed, and its
+    whole process tree confirmed gone — on Windows by a Job Object, verified by a grandchild that
+    outlives a naive kill and does not outlive this one.
+
+    For the boundary that was always claimed and never held: a process that tries to exceed
+    `max_processes` on Windows and cannot.
+scope:
+  included:
+  - >
+    A `shell` tool that takes one command line and executes it under a parse the harness performs
+    itself. Supported grammar is deliberately a conservative subset of POSIX: words with single
+    quotes, double quotes and backslash escapes; pipelines with `|`; sequences and conditionals with
+    `;`, `&&` and `||`; and redirects `>`, `>>`, `<`, `2>`, `2>>` and `2>&1`. Every sub-command's
+    resolved program and argv is checked against `Act::Exec` through the same `gate` that
+    `src/run.rs:5900` already routes every tool through, and every redirect target is path-resolved
+    and checked against `Act::Write` or `Act::Read` through `Workspace::check_path`
+    (`src/tools/workspace.rs:117`) exactly as `write_file` and `read_file` are — by path, not by
+    name.
+  - >
+    A refusal set that is enumerated, tested and fails closed. Command substitution `$(...)` and
+    backticks, parameter expansion `${...}` and `$VAR`, arithmetic expansion `$(( ))`, process
+    substitution `<(...)`, `eval` and any dynamic command position, subshells `( )`, brace groups,
+    heredocs `<<`, background `&`, function definitions, and the `if`/`for`/`while`/`case` compound
+    commands are each refused by name with a reason a human can read. The mechanism is an **allowlist
+    at the lexer**, not a blocklist of known-bad constructs: any byte that is not in the permitted set
+    for the current lexer state is a refusal, so a construct nobody anticipated fails closed rather
+    than falling through to execution. This is the single most important property in the release and
+    the acceptance criteria are built around proving it rather than asserting it.
+  - >
+    **No new dependency for the parser.** The roadmap named `yash-syntax`; it is licensed
+    GPL-3.0-or-later, and this crate is Apache-2.0 whose entire premise is that it is embedded in
+    someone else's process — a copyleft link would propagate to every consumer's program, which is
+    not friction but a bar. The MIT alternative `brush-parser` 0.4.0 was measured rather than
+    estimated: 37 new crates on the default feature set, including `insta`, `similar`, `console`,
+    `pest`, `peg` and `cached` in a *runtime* tree, against a project that reports its `cargo tree`
+    line count in every changelog. Both were rejected in favour of an in-crate parser, and the
+    deciding argument is not cost: a complete bash parser accepts a superset of what this tool
+    permits, so its accept-set becomes a second surface that has to be audited against the permit-set
+    forever. A parser that only has to be *conservative* rather than *complete* is small, and the
+    thing it must get right — refusing what it does not understand — is the thing an allowlist lexer
+    gets right by construction.
+  - >
+    `cd` handled as the one recognised builtin, because the roadmap's own motivating example opens
+    with it. It changes the effective working directory for the remainder of the line, its target is
+    path-resolved and checked, and it cannot escape the workspace root. Every other word in command
+    position is an external program checked against `Act::Exec`. No other builtin is implemented; a
+    word that looks like one and is not on disk fails as a missing program, which is honest.
+  - >
+    Process handles: `shell_start`, `shell_poll` and `shell_kill`. `shell_start` parses and checks a
+    command line exactly as `shell` does, then spawns it detached from the step, returning an opaque
+    handle. `shell_poll` returns output produced since the last poll plus the handle's state.
+    `shell_kill` terminates the whole tree. Handles are recorded in the store so the trace shows what
+    was started, what it produced and how it ended, and they are bounded — a cap on concurrent live
+    handles per run, and a handle whose run ends is killed rather than leaked.
+  - >
+    Resume semantics for handles, stated rather than discovered. A handle recorded by a previous
+    process points at a PID that no longer belongs to it, and a PID may have been reused. On resume
+    every pre-existing handle is marked orphaned and never re-attached, polled or killed; the model
+    is told the handle is gone and why. This is the one place a process handle can cause data damage
+    rather than an error, so it is scope rather than a limitation.
+  - >
+    A `list_dir` tool: one directory, one level, entries with type and size, checked against
+    `Act::Read` by path. `find` (`src/tools/workspace.rs:223`) stays as it is — a whole-tree glob is
+    a different question from "what is in here" and answering the second with the first is why the
+    second was never asked.
+  - >
+    The Windows Job Object backend, resource half only. `JobLimits` (`src/sandbox/windows.rs:63`)
+    already maps `SandboxLimits` onto the job's flags and has a test; line 60 says outright it is
+    "prepared but not applied". This release applies it: creates the job, assigns the child,
+    sets memory, CPU and active-process limits, sets kill-on-close, and reports
+    `Backend::WindowsJobObject` (`src/sandbox.rs:89`), which has existed as a reserved variant and
+    has never been returned. This makes Windows the first backend anywhere to enforce
+    `SandboxLimits::max_processes`, which `src/sandbox.rs:204` currently documents as "enforced by no
+    backend today, on any platform".
+  - >
+    `windows-sys` as a new dependency under `[target.'cfg(windows)'.dependencies]`, mirroring how
+    `libc` is already declared under `[target.'cfg(unix)'.dependencies]` at `Cargo.toml:139`. The
+    macOS and Linux dependency trees do not move at all in this release, and that is a checkable
+    claim rather than a hope, because the parser adds nothing.
+  - >
+    The platform table row for Windows updated to say exactly what a Job Object is and no more:
+    native resource containment — memory, CPU, process count, tree kill — and **no filesystem or
+    network boundary**. A Job Object contains resources; there is no filesystem facility and no
+    network facility in one. The row must not be shortened to "Native", which is what the macOS and
+    Linux rows mean and this is not. The access half is AppContainer and it is 0.25.0's.
+  - >
+    The positioning fix. `TaskContract::workspace` (`src/contract.rs:225`) drops its third positional
+    `Verification` and defaults to `Verification::None`; a new `with_verification` builder joins the
+    seventeen builders already on the type. `TaskContract::new` (`src/contract.rs:192`) is left alone
+    — a contract naming a single file and a criterion is coherent as it stands. README's first
+    example (`README.md:32-62`) and `docs/guide/permissions.md:12-26` lead with `Session` instead of
+    `run_with`; `run_with` stays, documented as the one-shot form.
+  - >
+    The rider: `#[non_exhaustive]` on `CompletionRequest` (`src/provider/mod.rs:343`),
+    `CompletionResponse` (`src/provider/mod.rs:553`), `EventKind` (`src/observe.rs:289`) and
+    `Backend` (`src/sandbox.rs:79`). None of the four carries it today and `src/` contains no use of
+    the attribute at all. 0.22.0 already broke literals of the first three and this release adds
+    variants to `EventKind` and gives `Backend` a value it has never returned, so this is the
+    cheapest moment this will ever be — and 0.25.0's AppContainer variant is the next one that would
+    otherwise break an exhaustive match.
+  - >
+    New `EventKind` variants for the shell and the handles, so a refused sub-command, a started
+    handle, a poll and a kill are observable through the channel an operator already reads rather
+    than inferred from a step result.
+  - >
+    The changelog with a `BREAKING` entry and a `*Migration:*` note per break, which
+    `tests/changelog.rs` already enforces as a pair; `docs/public-api.txt` regenerated;
+    `docs/CONTRACT.md`'s platform and limits sections updated for what is now enforced and what
+    still is not.
+  excluded:
+  - >
+    Windows AppContainer, and any filesystem or network boundary on Windows. That is the *access*
+    half and it is 0.25.0's. Nothing in this release forces it — where the Job Object is forced, by
+    `shell_kill` leaking grandchildren without one — and an unforced Win32 access-control subsystem
+    does not belong in a release already carrying a parser, a process registry and four API breaks.
+  - >
+    A complete POSIX shell. Not variable expansion, not globbing in command position, not job
+    control, not aliases, not functions, not `set -e`, not exit-status arithmetic beyond what `&&`
+    and `||` need. Each of these is a refusal with a reason. The tool is a bounded command composer,
+    not an interpreter, and any pressure to grow it toward one should be answered by asking what the
+    permission check would mean afterwards.
+  - >
+    Any use of `sh -c`, `cmd /c`, or any host shell to execute the parsed result. Sub-commands are
+    spawned as argv exactly as `Exec::run` (`src/tools/exec.rs:140`) spawns them today; the pipeline
+    is wired between them by this crate. Handing the original string to a shell after parsing it
+    would make the parse decorative.
+  - >
+    Retiring or changing the existing `exec` tool. It stays, it keeps its argv contract, and a
+    consumer who only wants fixed argv keeps exactly what they have. The joined-string looseness in
+    its gate (`src/run.rs:5187` checks `argv.join(" ")` as a second target, which cannot distinguish
+    one argument containing a space from two arguments) is noted and **not** fixed here: it is a
+    behaviour change to an existing tool's permission decisions, and it does not belong in the same
+    diff as a new one.
+  - >
+    An LSP client, and file snapshot or rewind. 0.25.0 and 0.27.0 respectively.
+  - >
+    Wrapping `rusqlite::Error` out of the public API. Still the right change, still not slotted; the
+    argument recorded in 0.23.0 stands, and this release is an even worse host for it than that one
+    was.
+  - >
+    Any seccomp filter on Linux, and any change to the macOS or Linux sandbox backends. This release
+    touches Windows containment only.
+  fallback_scope:
+  - >
+    The shell tool with its parser and refusal set, `list_dir`, the positioning fix and the
+    `#[non_exhaustive]` rider. Process handles and the Windows Job Object drop **together** into
+    0.25.0, because they are one piece of machinery: handles without a job are incorrect on Windows,
+    and a job with nothing long-running to contain is a solution to a problem this release would no
+    longer have. That is still a coherent release — the capability gap that blocks non-coding work is
+    closed, the boundary is checked, and the API break happens once.
+
+    What may not drop is the positioning fix. It is the smallest piece of work in the release and the
+    only one whose cost doubles if it moves: shipping a break now and the positioning break later
+    makes consumers migrate twice, which is the exact outcome it rides here to avoid.
+acceptance:
+  functional:
+  - >
+    F1 — a real command line runs under a checked boundary. `cd infra && kubectl get pods | grep
+    CrashLoop` executes under a policy allowing `kubectl*` and `grep*`, and the trace afterwards
+    carries one policy decision per sub-command naming the rule and layer that allowed it — read back
+    through the public `Store` API, not from logs.
+  - >
+    F2 — a denied stage refuses the whole line and nothing executes. The same pipeline under a policy
+    that denies `grep*` is refused before any process is spawned, the refusal names the stage and the
+    rule, and the negative control is observable rather than argued: a first stage with a side effect
+    on disk — `kubectl get pods > out.txt | grep x` shaped so the first stage would write — leaves no
+    file behind. Every check happens before any spawn.
+  - >
+    F3 — redirect targets are checked by path, not by name. `cmd > ../outside.txt` is refused by the
+    workspace path rules even when `cmd` is allowed; `cmd > allowed/out.txt` succeeds; `cmd <
+    secrets/key` is refused as a read. Each goes through `Workspace::check_path`, proven by a policy
+    whose deny rule is a path pattern that no name match would catch.
+  - >
+    F4 — the refusal set is complete and fails closed, and this is the load-bearing criterion of the
+    release. Every construct in the excluded grammar has a test asserting it is refused, that the
+    reason names the construct, and that no process was spawned. Beyond the enumerated list, a
+    property test over generated input asserts the invariant directly: **any input containing a byte
+    outside the lexer's permitted set for its state is refused**. Non-vacuity is proven the way
+    0.23.0 proved its cross-version tests — by sabotage: the allowlist is widened by one byte, the
+    property test must fail, and the change is reverted.
+  - >
+    F5 — a process handle starts, polls and dies. A command producing output over time is started,
+    polled twice returning incremental output with no duplication and no loss across the two polls,
+    then killed; the handle's terminal state and its full output are readable from the store
+    afterwards. A handle left live when its run ends is killed, not leaked, and that is asserted by
+    checking the process is gone rather than by trusting the code path.
+  - >
+    F6 — killing kills the tree, including on Windows. A handle whose command spawns a child that
+    spawns a grandchild is killed, and all three are gone. The negative control is the one that makes
+    the Job Object worth its cost: the same test with the job disabled must leave the grandchild
+    running on Windows, so the criterion proves containment rather than coincidence.
+  - >
+    F7 — handles do not survive a process boundary, and say so. A run with a live handle is
+    checkpointed and the process exits; on resume the handle is reported orphaned with a reason, is
+    never polled or killed, and no PID is signalled. The negative control is a resumed run whose
+    recorded PID has been reused by an unrelated live process, which must not be touched.
+  - >
+    F8 — `max_processes` is enforced on Windows, for the first time on any platform. A command that
+    attempts to exceed the configured active-process limit is stopped by the job rather than by the
+    wall clock, and the failure is attributed to the process limit in the trace. `Backend::
+    WindowsJobObject` is what the sandbox reports on that platform, replacing `PortableFloor`.
+  - >
+    F9 — memory and CPU are real bounds on Windows. A child exceeding the job's memory limit is
+    terminated by the job; a child exceeding its CPU allotment likewise. Both are asserted against
+    the recorded cap reason, so a wall-clock timeout cannot pass as either.
+  - >
+    F10 — `list_dir` lists one level and no more. A directory containing a subdirectory containing a
+    file returns the subdirectory and not the file; a path outside the workspace is refused; a
+    directory the policy denies reading is refused by path.
+  - >
+    F11 — the positioning fix compiles and defaults correctly. `TaskContract::workspace(goal, root)`
+    takes two arguments and yields `Verification::None`; `.with_verification(v)` sets it; the README's
+    first example and `docs/guide/permissions.md`'s first example both lead with `Session` and both
+    compile as doctests.
+  - >
+    F12 — the four types carry `#[non_exhaustive]` and the breaks are documented to the same standard
+    0.23.0 held. `docs/public-api.txt` reflects the surface, `tests/public_api.rs` passes against it,
+    and the changelog carries a `BREAKING` entry with a `*Migration:*` note per break — pairing
+    enforced by the existing `tests/changelog.rs`.
+  non_functional:
+  - >
+    NF1 — the full suite passes on macOS, Linux and Windows. No test skipped, ignored or made
+    conditional to get there. Windows carries more new code than either other platform in this
+    release and is where the Job Object tests live, so a Windows-only failure is a release blocker
+    rather than a flake to re-run — with the standing exception of
+    `skills::discovery_over_a_32_skill_directory_is_under_50ms`, a known wall-clock assertion.
+  - >
+    NF2 — **the macOS and Linux dependency trees do not move.** `cargo tree` on the default feature
+    set reads the same 402 lines after this release as before it. The only new dependency is
+    `windows-sys` under `[target.'cfg(windows)'.dependencies]`, and its transitive cost is reported
+    separately as a Windows-only figure. This is checkable and it is the strongest single argument
+    for the in-crate parser, so it is a criterion rather than a note.
+  - >
+    NF3 — the parser terminates on adversarial input within a bound. Nesting depth is capped, input
+    length is capped, and both refusals are ordinary refusals with reasons. No input causes unbounded
+    recursion, unbounded allocation, or a stack overflow — asserted by the property test in F4 running
+    against deeply nested and pathologically long inputs.
+  - >
+    NF4 — `cargo doc` is warning-free and docs.rs builds with all features, checked by the existing
+    nightly job before publication rather than after.
+  - >
+    NF5 — every `unsafe` block added for the Win32 calls carries a safety comment stating the
+    invariant it relies on, and `cargo clippy --all-targets -- -D warnings` is clean with
+    `unsafe_op_in_unsafe_fn` denied. This crate has no Win32 FFI today; the standard it enters at is
+    set here.
+  operational:
+  - >
+    OP1 — a real end-to-end run against a live provider in which the model composes a shell line
+    itself, it is parsed, checked and executed, and the trace is read back afterwards. One run, one
+    workspace, one verified outcome. Evidence is OpenRouter unless another key exists, per the
+    standing credential position.
+  - >
+    OP2 — MSRV re-checked and stated. If `windows-sys` or anything it pulls raises the floor above
+    1.95, the new number goes in `Cargo.toml` with the same honest comment the existing floor carries,
+    naming the dependency that set it — and it is checked by hand rather than trusted from a
+    manifest, which is the lesson 0.23.0 paid for.
+  - >
+    OP3 — the README platform table's Windows row states native resource containment (memory, CPU,
+    process count, tree kill) **and** no filesystem or network boundary, in the same row. Reviewed as
+    a criterion because the shortened version — "Native" — is the failure mode, and it is a claim
+    about a security boundary that does not exist.
+  - >
+    OP4 — `docs/CONTRACT.md` updated in both directions: `SandboxLimits::max_processes` is no longer
+    "enforced by nothing" and says which platform enforces it, and the shell tool's refusal set is
+    documented as part of the public contract rather than as an implementation detail, because a
+    consumer needs to know what their agent cannot express.
+  - >
+    OP5 — `cargo package --locked` exits 0 and the tarball carries no `.env`, no `.ultraship` and no
+    `.github`, verified by listing rather than assumed from the `exclude` list.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.24.0, GitHub at initorigin/io-harness with the tag `v0.24.0` and a
+    Release titled `io-harness 0.24.0`, and docs.rs, whose build is checked by the nightly CI job.
+  deployment_method: >
+    The standing flow. All work on `feat/0.24.0` off `develop`, including the sealed UltraShip release
+    record. PR into `develop`, merged with the PR button. Release PR `develop` into `main`, merged the
+    same way. The GitHub Release is cut by `release.yml` — `gh workflow run release.yml --ref main -f
+    version=0.24.0` — which refuses any ref but `main`, a version the manifest does not declare, an
+    existing tag, or a version with no changelog section, and takes the notes verbatim from the
+    changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and the
+    Release exist. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+    `git fetch --tags` after the Release, since the tag is made on the remote only.
+  migrations:
+  - >
+    `TaskContract::workspace(goal, root, verify)` becomes `workspace(goal, root)`. Every caller
+    breaks at compile time, which is the good failure. Migration: drop the third argument, and if the
+    project has a success criterion, append `.with_verification(v)`. A contract that had
+    `Verification::None` there loses a line.
+  - >
+    `CompletionRequest`, `CompletionResponse`, `EventKind` and `Backend` become `#[non_exhaustive]`.
+    A consumer constructing either struct with a literal must use the constructor or
+    `..Default::default()`; a consumer matching `EventKind` or `Backend` exhaustively must add a
+    wildcard arm. This is the last release in which adding a variant to any of the four is a break.
+  - >
+    New `EventKind` variants for shell refusals and process handles. Additive, and from this release
+    covered by `#[non_exhaustive]`.
+  - >
+    Store: new tables for process handles. Additive — no existing table is created, altered or
+    dropped, and every 0.23.0 database opens unchanged. Whether `CHECKPOINT_FORMAT` moves from 7 is
+    an open question resolved during development against whether a 0.23.0 reader can honestly open a
+    0.24.0 database; 0.22.0's precedent is that purely additive tables did not move it.
+  - >
+    Windows consumers gain `windows-sys` in their tree. macOS and Linux consumers gain nothing.
+  observability:
+  - >
+    New `EventKind` variants covering a refused sub-command, a started handle, a poll and a kill, so
+    the shell is visible through the channel an operator already subscribes to rather than only in the
+    store.
+  - >
+    One policy decision recorded per sub-command and per redirect target, not one per line. A line
+    that is refused records the decision that refused it and the stage it belonged to — otherwise the
+    trace says a command line was denied and an operator cannot tell which part.
+  - >
+    Handle lifecycle rows in the store: what was started, its parsed sub-commands, its output, how it
+    ended, and whether it was orphaned by a resume. The trace has to be able to answer "what did that
+    dev server do" after the process that started it is gone.
+  - >
+    The sandbox event for a Windows run reports `Backend::WindowsJobObject` and the cap that fired,
+    so a memory kill, a CPU kill and a process-limit kill are distinguishable from each other and
+    from a wall-clock timeout — which is what F8 and F9 assert against.
+  - >
+    `cargo tree` line counts recorded per platform in the changelog, which for macOS and Linux is the
+    unchanged number and is the point.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.24.1 and `cargo yank --version
+    0.24.0` is the escape hatch, leaving 0.23.0 as what `cargo install` resolves. A consumer reverting
+    to 0.23.0 keeps every database — the store change is additive, so a 0.23.0 build opens a 0.24.0
+    database and simply does not read the new tables — and reverses the four source breaks
+    mechanically. What a revert does not undo is any process a handle started and did not kill, which
+    is why F5 asserts that a run ending kills its live handles rather than leaking them. The shell
+    tool itself needs no rollback story beyond removal: a policy that never allowed a command still
+    never allowed it, and a refused line ran nothing.
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows — Windows carries the most new code here
+  - A real provider account, for the live run that is OP1
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - Owner approval to merge to `main`, cut the Release, and publish, per the standing override.
+resource_profile:
+  complexity: large
+  uncertainty: high
+  likely_cost_drivers:
+  - >
+    The parser, whose cost is not writing it but proving the refusal set closed. A conservative
+    subset of POSIX is a few hundred lines of lexer and recursive descent; the work is the property
+    test, the sabotage runs that prove it non-vacuous, and the care that every unrecognised byte
+    reaches a refusal rather than a fallthrough. This is where the release's whole security argument
+    lives and it should absorb the most review.
+  - >
+    Win32 FFI in a crate that has none. `windows-sys` job creation, assignment and limit-setting is
+    unsafe code against an API with ordering requirements — the job must be assigned before the child
+    runs, or a fast child escapes it — and the failure mode is a limit that silently does not apply,
+    which looks exactly like a limit that does. F6's negative control exists because of this.
+  - >
+    Process handles crossing the checkpoint boundary. The interaction between a durable run and a
+    live OS process is the one genuinely new concept in the release, and PID reuse makes the naive
+    implementation dangerous rather than merely wrong. F7 is written as two criteria for that reason.
+  - >
+    Three-platform behaviour for one feature. The shell must wire pipelines and redirects identically
+    on all three; the handles must kill trees on all three by different mechanisms; and Windows is the
+    slowest runner and the one carrying the new code.
+  - >
+    The API break's blast radius across this repository's own examples, doctests and guides. Every
+    `TaskContract::workspace` call site in `src/`, `tests/`, `examples/` and `docs/` moves, and the
+    doctests are compiled.
+  preferred_tools:
+  - An allowlist lexer, so the security property is structural rather than enumerated
+  - Property testing over generated input for F4, with sabotage runs to prove non-vacuity
+  - The existing `gate` at `src/run.rs:5900` and `Workspace::check_path`, reused rather than reimplemented
+  - The existing `kill_tree` (`src/sandbox.rs:811`) for unix, and the job's kill-on-close for Windows
+  - "`JobLimits` (`src/sandbox/windows.rs:63`) and its test, which already map the limits"
+  - The compiler, for the positioning break's call sites
+  constraints:
+  - No `sh -c`, `cmd /c`, or any host shell, at any point after the parse
+  - No new dependency on macOS or Linux; `cargo tree` default-feature line count unchanged at 402
+  - Every refusal names the construct and spawns nothing
+  - No existing table created, altered or dropped
+  - The Windows platform row states resource containment only, never "Native"
+  - Every `unsafe` block carries a safety comment
+  - Stay 0.x
+risks:
+- >
+  A parser bug is a policy bypass, and it is the only failure in this release that reaches a user as
+  a breach rather than as an error. A line that lexes to a different set of sub-commands than it
+  executes, or a construct that falls through instead of refusing, means the harness checked
+  something other than what ran — which is worse than having no shell, because the trace would assert
+  a boundary that was not applied. The allowlist-at-the-lexer design exists for this and nothing
+  else, and F4's sabotage runs exist because a test that would pass against a broken allowlist proves
+  nothing.
+- >
+  A Job Object that is created and does not contain. Win32 job assignment has ordering requirements
+  and failure modes that return success; a limit that does not apply looks identical to a limit that
+  does until something exceeds it. The mitigation is F6's negative control and F8/F9 asserting the
+  cap reason rather than the outcome — a child that dies is not evidence that the job killed it.
+- >
+  Scope. This is the largest release on the roadmap by a wide margin: a parser, a process registry,
+  a Win32 subsystem, a new tool, and four API breaks. The fallback exists and its trigger should be
+  pulled early rather than late — the signal is the parser's refusal proof not closing, or the Job
+  Object's negative control not reproducing, either of which means the remaining work is unbounded
+  rather than merely large.
+- >
+  Handles and PID reuse. A resumed run that signals a recorded PID can kill an unrelated process on
+  the host. This is data damage outside the workspace, the one such risk this crate has ever carried,
+  and it is why orphaning on resume is unconditional rather than a best-effort re-attach.
+- >
+  The positioning break landing in the same release as everything else, so a consumer reviewing the
+  changelog sees four breaks and a large feature set at once. Mitigated by migration notes rather than
+  by splitting, because splitting is what makes them migrate twice.
+- >
+  Windows CI wall-clock and flakiness on the platform now carrying the most new code, where a job
+  that is slow to tear down reads as a hang. Named so it is recognised rather than debugged from
+  scratch.
+open_questions:
+- >
+  Whether the process-handle tables move `CHECKPOINT_FORMAT` from 7. The tables are additive, which
+  by 0.22.0's precedent does not move it; but a 0.24.0 run checkpointed with a live handle and
+  resumed by a 0.23.0 build would silently lose the handle rather than orphan it, and whether that is
+  a format concern or a documented limitation is a judgement to make against the code. Decided during
+  development, stated either way.
+- >
+  Whether `cd` is genuinely the only builtin worth having. `echo` and `true`/`false` are trivially
+  safe and frequently used in conditionals; each one added is a word that no longer means "check this
+  against `Act::Exec`", which is a cost the shell should pay only where the alternative is unusable.
+  Resolved against what the refusal messages look like in a real run.
+- >
+  Whether `windows-sys` raises the MSRV above 1.95, and which feature set is minimal for job
+  objects. Checked by hand per OP2, not read off a manifest.
+- >
+  Whether `shell_poll` returns incremental output or the full buffer with an offset. Incremental is
+  cheaper for a log tail and loses data if a poll is dropped; the offset form is idempotent. Decided
+  against what a resumed conversation needs, since a handle outlives a step but not a process.
+- >
+  Whether the joined-argv looseness in the existing `exec` gate (`src/run.rs:5187`) should be
+  deprecated in the changelog now that a tool exists which does not have it. Documenting a known
+  weakness while shipping its replacement is honest; doing it in this release's notes may read as
+  fixing it, which this release does not.
+status: planned

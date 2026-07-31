@@ -534,7 +534,7 @@ versions:
       primary signature demands a checkable success criterion reads as a verified-task runner no
       matter what its prose claims, and a shell is precisely the capability that makes uncheckable
       work real. It rides here so a consumer migrates once: this release already breaks.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.25.0
     outcome: >
