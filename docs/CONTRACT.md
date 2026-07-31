@@ -65,13 +65,27 @@ the mechanism the first time someone was in a hurry.
 
 ## Minimum supported Rust version
 
-The MSRV is **1.88**, declared as `rust-version` in `Cargo.toml` and asserted
+The MSRV is **1.95**, declared as `rust-version` in `Cargo.toml` and asserted
 against this page by a test.
 
-The floor comes from `rmcp`, which uses let-chains and publishes no
-`rust-version` of its own, so cargo cannot catch it at resolve time — an older
-toolchain fails inside that dependency rather than here. The other floors are
-lower: `process-wrap` needs 1.87, `reqwest` 0.13 needs 1.85.
+It moved from 1.88 in 0.23.0, and the reason is worth stating plainly because
+the release that raised it is otherwise a release in which nothing changes. The
+floor now comes from `libsqlite3-sys` 0.38.1, whose build script — and
+`rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
+1.95.0. Neither crate publishes a `rust-version`, so cargo cannot catch it at
+resolve time: an older toolchain fails inside the dependency's build script
+with `cannot find macro cfg_select in this scope`, which reads like a toolchain
+bug and is not one. It was checked rather than assumed — 1.93 and 1.94 both
+fail, 1.95 builds.
+
+There is no `rusqlite` at or above the 0.40 floor that avoids this, and below
+that floor the `links = "sqlite3"` collision that 0.23.0 exists to remove comes
+back. So the choice was this floor or that wall, and this floor is the one a
+consumer can do something about.
+
+The previous floor came from `rmcp`, which uses let-chains and also publishes
+no `rust-version` of its own. The other floors are lower: `process-wrap` needs
+1.87, `reqwest` 0.13 needs 1.85.
 
 An MSRV raise is a **minor** bump and is called out in the changelog like any
 other break.
@@ -116,7 +130,33 @@ Windows as "resource-capped".
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.22.0.
+is fixed as of 0.23.0.
+
+**`rusqlite::Error` is in the public API, and the intent is to take it out
+(0.23.0).** `Error::State(#[from] rusqlite::Error)` carries the storage
+dependency's own error type, which makes `rusqlite` a *public* dependency of
+this crate: every `rusqlite` major bump is a breaking change here, whether or
+not anything about this crate's behaviour changes. That is exactly what
+happened in 0.23.0, whose entire content is a dependency move and which still
+had to be published as a break.
+
+The intent is to wrap it, so that the variant carries a type this crate owns
+and a future `rusqlite` bump stops being a consumer break. It is stated here
+rather than done in 0.23.0 on purpose: a migration release has to be reviewable
+for exactly one property — that nothing behaves differently — and an
+error-type redesign in the same diff destroys that. It is not yet slotted to a
+version.
+
+**What this means if you are writing code today.** Matching the variant and
+ignoring its payload is safe and will stay safe:
+
+```rust,ignore
+Err(Error::State(_)) => { /* the store failed; the payload will change */ }
+```
+
+Reaching *through* the variant to use the payload as your own
+`rusqlite::Error` is the thing that will break when the wrap lands, and it
+already breaks on every `rusqlite` bump.
 
 **What a provider-executed search or fetch is, and is not (0.22.0).** A
 `WebAccess` on the contract asks the *provider* to look something up inside the
