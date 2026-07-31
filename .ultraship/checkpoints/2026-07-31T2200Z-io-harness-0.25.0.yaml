@@ -1,0 +1,42 @@
+product: io-harness
+version: 0.25.0
+timestamp: 2026-07-31T22:00:00Z
+reason: capacity
+repository_state: passing
+completed_acceptance:
+- >
+  F1 — a process handle starts, polls and dies, with the run-end kill asserted against the
+  operating system rather than against the registry.
+- >
+  F3 — handles do not survive a process boundary: orphaning is unconditional, lives at the single
+  resume funnel, and no recorded pid is signalled on any resume path.
+- F4 — the handle path is checked by the same machinery as the foreground path.
+- F6 — the live-handle cap refuses rather than queues.
+- F7, F8, F9 — diagnostics reach the model attached to the edit, never fail an edit, and a skip is
+  distinguishable from a clean check.
+- NF2 — no new dependency on any platform.
+- NF5 — cargo doc warning-free, clippy --all-targets clean.
+- OP2, OP3, OP4 — the stale documentation is corrected and the new behaviour is documented, with
+  the orphaning rule stated as a contract.
+remaining_acceptance:
+- >
+  F2 — killing kills the tree, with the Windows negative control. BLOCKED on T04: the handle spawn
+  does not yet route through the Job Object, so tree kill is best-effort and a grandchild whose
+  parent already exited may survive on Windows. Documented as a limitation rather than claimed.
+- >
+  F5 — a handle's processes are contained by the run's sandbox. Same blocker: src/tools/shell.rs
+  references Sandbox nowhere, which is the roadmap premise this release corrected.
+- NF1 — the full suite on all three platforms. Only macOS has been run; Windows is where the new
+  code is least verified and cannot be checked on this machine.
+- NF3 — a handle nobody polls cannot exhaust memory. The file-backed design makes this true by
+  construction but it is not yet asserted with a generator process.
+- NF4 — the diagnostics timeout and cap are enforced; unit-tested, not yet asserted end to end.
+- OP1 — the live provider run.
+- OP5, OP6 — cargo package tarball listing, MSRV re-check by hand, cargo tree counts per platform.
+active_hypotheses: []
+next_task: US-IO-HARNESS-0.25.0-T04
+required_context:
+- src/tools/shell.rs
+- src/sandbox/windows.rs
+- src/sandbox.rs
+- src/tools/handles.rs

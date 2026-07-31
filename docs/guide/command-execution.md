@@ -108,6 +108,131 @@ has subcommands that fetch code and options that execute it, so its safe set is 
 closed one worth enumerating. `exec` exists precisely to run commands this crate
 has never heard of, so the boundary moves from the argv's *shape* to the policy.
 
+### A backslash is an escape, not a path separator
+
+`\` means here what it means in POSIX: outside quotes it escapes the next
+character and is itself removed. Nothing about that changes on Windows, so an
+unquoted absolute Windows path is taken apart before anything is spawned.
+
+```text
+C:\repo\server.exe --port 8080    →  argv[0] = C:reposerver.exe
+'C:\repo\server.exe' --port 8080  →  argv[0] = C:\repo\server.exe
+"C:\repo\server.exe" --port 8080  →  argv[0] = C:\repo\server.exe
+```
+
+**On Windows, quote absolute paths.** Single quotes are the simplest form,
+because inside them every character is literal, `\` included; double quotes work
+too, since a backslash there escapes only `"`, `\`, `$` and a backtick and is
+kept as itself otherwise. This is the grammar rather than a property of one tool,
+so it holds for `shell`, for `shell_start`, and for a redirect target as much as
+for a program or an argument: `> C:\logs\out.txt` writes to a file called
+`C:logsout.txt`.
+
+The failure it produces is worth recognising, because the error names a place the
+caller never typed — the spawn fails on `C:reposerver.exe`, a program nobody
+wrote. `shell_start` is worse: the handle registers, reports itself running, and
+produces nothing.
+
+The grammar is one grammar on all three platforms, and that is the reason there
+is no Windows special case for this. A parser that decided which backslashes were
+escapes and which were path separators would be guessing, and it would be
+guessing about the one thing this tool exists not to guess about — what the
+policy checked and what then ran.
+
+## Leaving a command running
+
+`shell` holds the step until its line finishes or times out, which is the wrong
+shape for a dev server, a log tail or a watch build — the things whose whole
+purpose is not to finish. `shell_start` takes the same single `line` and returns
+a handle id instead of a result; `shell_poll` reads what that line has printed,
+and `shell_kill` ends it.
+
+```jsonc
+{ "line": "npm run dev" }  // shell_start → handle 1
+{ "handle": 1 }            // shell_poll  → what it printed since the last poll
+{ "handle": 1 }            // shell_kill  → it, and every process it spawned
+```
+
+The line is parsed and checked by **exactly** the machinery `shell` uses — the
+same parser, the same planner, the same per-stage `Act::Exec` check and the same
+per-redirect path check, in the same order and all of it before the first spawn.
+The grammar above is the grammar here, a construct `shell` refuses is refused
+here with the same reason, and a line with a denied stage still runs no stage. A
+handle is a different *lifetime* for a command line, not a second way to run one;
+a second way would be a second place for the parse and the processes to disagree.
+
+What changes is only what happens after the check passes. A handle has no
+wall-clock timeout at all: the timeout exists on `shell` because a foreground
+call has no other way to be told to stop, and a dev server has nothing to be
+killed at. What a handle has instead is `shell_kill` and the end of the run.
+
+### What a poll returns
+
+A poll answers two questions — what the line has printed since the previous poll,
+and whether it is still running. It is a byte cursor into the line's output
+rather than a re-read of it, so polling in a loop shows progress instead of
+returning the same log ten times, and a poll before the process has written
+anything is empty rather than an error. Bytes and not lines: a half-written line
+is a real thing a running process produces, and waiting for the newline would
+hide it.
+
+One poll returns at most 16 KiB, and when there is more than that the newest
+bytes are the ones kept, because the newest is what a poll is asking about. It
+then says how many bytes it skipped rather than eliding them quietly, and the
+cursor advances past what was skipped as well as what was read, so the next poll
+does not re-deliver the middle of the log. Nothing is lost by the window: every
+byte a poll reads is written to the trace as it is read, so "what did that dev
+server actually print" is answerable after the process is gone.
+
+The output goes to a capture file rather than to a buffer in memory, and that is
+the whole streaming design. The criterion is that a handle nobody polls must not
+be able to exhaust memory. A buffer needs a bound, a bound needs a policy for
+what to discard, and discarding the middle of a log is how an operator loses the
+line that mattered. A file has none of those problems — the kernel writes it, a
+poll reads a window of it, the whole of it is still there afterwards, and the
+memory cost is the size of one poll rather than the size of the output. The file
+lives outside the workspace, because a handle's output is not a file the agent
+wrote and must not appear to be one.
+
+### The bounds on a handle
+
+**A run may have eight live handles at once.** The ninth `shell_start` is refused
+with a reason naming the cap and telling the model to kill one, rather than
+queued: a queue is a leak with a delay, and a process started and then rejected
+is a process that ran. Ending a handle makes room for another, so this bounds how
+many run at once and not how many a run may start.
+
+**Every live handle is killed when the run ends, however it ends** — a finish, a
+budget stop, a cancellation, an error carried out of the loop, or a panic. That
+is the property that matters for the operator's machine, and it is why
+`shell_kill` is for finishing with something early rather than for tidying up at
+the end. Killing a handle that has already ended is not an error either: it
+reports how it ended and the run carries on, because a model that lost track of a
+handle should be told rather than stopped.
+
+A kill walks every process the handle spawned, in reverse spawn order, so a
+pipeline's later stages go before the ones feeding them — killing only the last
+stage of `a | b` leaves `a` writing into a closed pipe rather than dead. It is
+**best-effort rather than a guarantee**: it reaches the processes still
+attached to the pids the handle recorded, and a descendant whose own parent has
+already exited is attached to none of them. The containment that would close
+that — the Windows Job Object 0.24.0 added, which takes its whole tree down when
+the job handle closes — is not on this path, so on Windows a grandchild can
+outlive its handle. See [the contract](../CONTRACT.md).
+
+### A handle does not survive the process that started it
+
+If a run is resumed in a new process, every handle the previous process left
+running is reported **orphaned**: it is never re-attached, never polled and never
+signalled. A poll or a kill naming one is answered from what was recorded, and
+the model is told to start again whatever it still needs.
+
+That is a stated guarantee rather than a gap, and the reasoning is in
+[the contract](../CONTRACT.md) because a consumer has to be able to depend on it.
+The short version: the only thing a checkpoint records about a live process is
+its pid, a pid is not an identity, and the operating system may have handed that
+number to something unrelated in between.
+
 ## What a rule can say
 
 Every call is checked twice, and the second check is what makes a useful rule
@@ -206,6 +331,8 @@ Sandboxed execution as an opt-in is later work.
 | --- | --- |
 | what commands did this run ask to run | `steps.tool_call`, and the `ToolCall` observer event |
 | which were refused, or went to a human | `policy_events`, `act = "exec"`, with the rule and layer |
+| what this run started and left running | `process_handles`, one row per handle with the line, its processes and how it ended |
+| what a handle printed | `handle_output`, appended as each poll read it |
 | what a gate command printed when it failed | `sandbox_events`, `kind = "gate_output"` |
 | which phase of a gate failed | `sandbox_events`, `kind = "gate_phase_failed"` |
 | what the agent saw | the step's observation, and the next step's prompt |

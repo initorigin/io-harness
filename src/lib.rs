@@ -394,8 +394,8 @@ pub use skills::{Skill, Skills};
 pub use agent::{AgentDef, Agents};
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, Pending,
-    PendingQuestion, PolicyEvent, ProviderCall, RunStatus, RunSummary, SandboxEvent, SpawnRow,
-    StepRecord, Store, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
+    PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall, RunStatus, RunSummary, SandboxEvent,
+    SpawnRow, StepRecord, Store, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
     MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS,
     TODO_TEXT_CAP, UNKNOWN_MODEL,
 };

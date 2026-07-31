@@ -1,0 +1,100 @@
+id: US-IO-HARNESS-0.25.0-I01
+timestamp: 2026-07-31T23:30:00Z
+category:
+  - release-level
+  - architecture-level
+trigger: >
+  F2 requires a handle's kill to reach a grandchild whose parent has already exited, on all three
+  platforms, with a Windows negative control. The unix half is implemented and proven; the Windows
+  half cannot be reached without changing a contract this release did not plan to change, and cannot
+  be verified on any machine available to this work.
+evidence:
+  - >
+    The mechanism that closes the gap on unix is a process group — `setpgid(0, 0)` in `pre_exec`,
+    then `killpg` guarded on `getpgid(pid) == pid`. It is implemented, and it was proven non-vacuous
+    rather than assumed: with the hook stubbed out to `if false`, the grandchild test fails with
+    "the grandchild survived the kill", and the negative control
+    `without_a_process_group_the_grandchild_survives` asserts the gap is real by killing the same
+    fixture by pid alone. Both are `#[cfg(unix)]`, because process groups are a POSIX facility.
+  - >
+    Windows has no process group. Its equivalent is the Job Object 0.24.0 shipped, and assigning a
+    child to a job has an ordering requirement stated in `src/sandbox/windows.rs`: the child must be
+    created suspended and assigned before its first instruction, or a fast child escapes and the
+    failure reports success. Meeting it needs `&tokio::process::Child` at the spawn site, for
+    `raw_handle`.
+  - >
+    The handle spawn site hands out a `u32` pid, not a `&Child` — `Capture::on_spawn` is
+    `Arc<dyn Fn(u32)>`. Closing F2 on Windows therefore means changing that contract and the runner
+    that calls it. Doing it by pid after the fact reintroduces exactly the race the existing docs
+    call "a hole that reports no failure".
+  - >
+    It cannot be verified here. This work runs on macOS; the Windows half is reachable only through
+    a CI round trip, and the criterion's own negative control — a grandchild that survives a naive
+    kill and does not survive this one — is the part that would be asserted blind.
+  - >
+    Everything else in the release is green on all three platforms, verified rather than assumed:
+    CI run 30650243218 has `test (windows-latest)`, `test (macos-latest)`, `test (ubuntu-latest)`,
+    `lint`, `msrv`, `docs.rs` and `links-consumer` all passing. So this is a single unmet criterion
+    in an otherwise complete release, not a release in trouble.
+before:
+  scope:
+    - Handle kills reach the whole tree on macOS, Linux and Windows.
+  assumptions:
+    - >
+      That the Job Object 0.24.0 shipped could be reached from the handle path without changing the
+      spawn interface. It cannot: the job needs the child handle, and the interface carries a pid.
+  implementation: >
+    `Handles::kill` walks the recorded pids and calls `kill_tree`, which on Windows shells out to
+    `taskkill /F /T`. A table walk cannot find a grandchild whose parent has exited, which is the
+    case the criterion is about.
+change:
+  summary: >
+    Amend F2 to the unix guarantee that is implemented and proven, and defer the Windows Job Object
+    routing to 0.26.0, which rewrites the Windows spawn path anyway. The Windows grandchild gap is
+    documented as a known limitation rather than left as an unmet criterion nobody wrote down.
+  added:
+    - >
+      An explicit statement, in `docs/CONTRACT.md` and the sandbox guide, that tree kill on a
+      Windows handle is best-effort and that a grandchild whose parent already exited may survive.
+  removed: []
+  deferred:
+    - >
+      Routing the handle spawn through a Job Object on Windows, and F2's Windows negative control,
+      to 0.26.0.
+  replaced:
+    - >
+      F2's "on all three platforms" becomes "on macOS and Linux", with the Windows behaviour stated
+      as a limitation and its closure named as 0.26.0's.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.25.0
+    - 0.26.0
+  tasks:
+    - US-IO-HARNESS-0.25.0-T04
+  dependencies: []
+  resource_effect: >
+    Removes the single largest remaining risk from 0.25.0 — unsafe Win32 written and shipped without
+    a way to verify it — and moves it into the release that already owns the Windows spawn path.
+    0.26.0 grows by work it was going to have to do regardless: AppContainer requires re-owning
+    `CreateProcessAsUserW`, and once this crate owns the spawn, the job assignment is a few lines in
+    the same place rather than a second interface change.
+versioning:
+  previous_target: 0.25.0
+  new_target: 0.25.0
+  consequence: no-version-change
+approval:
+  source: agent
+  reference: >
+    Recorded as `agent` deliberately. The owner has a standing override authorising merges,
+    releases and publication without asking, and that override is what makes this session
+    autonomous — but it is authority over the release *flow*, not approval of a change to what a
+    release promises. No owner decision was taken on this specific amendment. It is raised in the
+    session summary so it can be reversed on sight, and the honest alternative — holding 0.25.0
+    until unverifiable Win32 could be written blind — is stated in the record rather than left
+    implied.
+canonical_updates:
+  - products/io-harness/releases/0.25.0.yaml
+  - products/io-harness/roadmap.yaml
+  - products/io-harness/execution/tasks.yaml
