@@ -1,14 +1,23 @@
 [package]
 name = "io-harness"
-version = "0.22.0"
+version = "0.23.0"
 edition = "2021"
-# rmcp sets the real floor: it uses let-chains, stabilised in 1.88. On 2.2.0 it
-# published no rust-version of its own, so cargo could not catch it at resolve
-# time and a 1.87 build failed inside the dependency; 3.0.0 declares 1.88
-# itself, which is the same number arrived at honestly. The other floors are lower:
-# process-wrap (via rmcp's child-process transport) needs 1.87, reqwest 0.13
-# needs 1.85. 0.8.0 and 0.8.1 declared 1.87 by counting only process-wrap.
-rust-version = "1.88"
+# `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
+# `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
+# 1.95.0. Neither crate publishes a `rust-version`, so cargo cannot catch it at
+# resolve time; it fails inside the dependency's build script with
+# `cannot find macro cfg_select in this scope`, which reads like a toolchain bug
+# and is not one. Checked by hand rather than assumed: 1.93 and 1.94 both fail,
+# 1.95 builds. This is the same shape as the rmcp 2.2.0 problem below, and the
+# same lesson — an undeclared floor is still a floor.
+#
+# The previous floor was 1.88, set by rmcp's let-chains: on 2.2.0 it published no
+# rust-version of its own so a 1.87 build failed inside the dependency; 3.0.0
+# declares 1.88 itself, which is the same number arrived at honestly. The other
+# floors are lower: process-wrap (via rmcp's child-process transport) needs 1.87,
+# reqwest 0.13 needs 1.85. 0.8.0 and 0.8.1 declared 1.87 by counting only
+# process-wrap.
+rust-version = "1.95"
 authors = ["Aakash Pawar"]
 license = "Apache-2.0"
 # One sentence a human reads. This field was a comma-separated inventory of
@@ -31,7 +40,22 @@ categories = ["asynchronous", "api-bindings"]
 # docs/ is deliberately NOT excluded: the crate root and the README link the
 # guide pages, and a package that ships the links without the pages is worse
 # than one that ships neither.
-exclude = [".ultraship", ".env", ".github"]
+#
+# The three crates under `tests/fixtures/` are excluded because each is a
+# separate cargo package with its own manifest, and one of them deliberately
+# fails to resolve. They exist to be run from a git checkout by CI, never from
+# the published package. The fixtures they *produce* — the 0.22.0-written
+# databases under `tests/fixtures/store-0.22.0/` — are NOT excluded, because
+# `tests/cross_version.rs` reads them and `cargo package` verifies the tests
+# compile.
+exclude = [
+    ".ultraship",
+    ".env",
+    ".github",
+    "tests/fixtures/gen-0.22.0",
+    "tests/fixtures/links-consumer",
+    "tests/fixtures/throughput-0.22.0",
+]
 
 # docs.rs is the page this crate is mostly read on, and the default build hides
 # the documents and media surface entirely. Build it with everything on, and set
@@ -58,7 +82,13 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 futures-util = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# `fallible_uint` is new in 0.38.0 and carries the `u64`/`usize` `ToSql` and
+# `FromSql` impls that were unconditional up to 0.37. The token counters and the
+# budget ledger in `state.rs` are `u64`, so this feature is what keeps their
+# conversions the checked ones they already were — `ToSqlConversionFailure` above
+# `i64::MAX` on write, `FromSqlError::OutOfRange` on a negative read — rather than
+# a hand-written cast that would silently wrap.
+rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 thiserror = "2"
 tracing = "0.1"
 # Execution-based verification compiles the produced file in a throwaway dir.
