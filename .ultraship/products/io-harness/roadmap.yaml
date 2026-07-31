@@ -595,7 +595,7 @@ versions:
       toolchain, the executed binary, the redirected temp directory and every language's install
       tree are the rest. First work is a `windows-latest` smoke test, because viability on the CI
       runner and on Server SKUs is unverified and everything else depends on it.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.27.0
     outcome: >
