@@ -193,6 +193,84 @@ jobs:
       - run: cargo clippy --all-targets --features documents -- -D warnings
       - run: cargo clippy --all-targets --features media -- -D warnings
 
+  # 0.23.0 — the `links` wall, proven gone. This job exists because of a defect
+  # no other job in this file could see, for the same reason the `docs` job
+  # below does: it is invisible from inside this crate.
+  #
+  # `libsqlite3-sys` declares `links = "sqlite3"`, and cargo will not put two
+  # versions of a `links` package into one dependency graph. Up to 0.22.0 this
+  # crate pinned `rusqlite` 0.32 (`libsqlite3-sys` 0.30), so a program already on
+  # `rusqlite` 0.33 or later could not add io-harness **at all** — not a warning,
+  # not a duplicate symbol at link time, but a hard resolver error and no build.
+  # Every job above passed on that tree, because nothing above ever asks cargo to
+  # resolve io-harness *alongside* another `rusqlite`. Only a second package can
+  # ask that, which is what `tests/fixtures/links-consumer` is.
+  #
+  # Linux only. This is a resolver question, and the resolver does not vary by
+  # OS; the three-OS matrix above already builds the bundled `libsqlite3-sys` on
+  # all three.
+  links-consumer:
+    name: links-consumer (rusqlite 0.40 coexistence)
+    runs-on: ubuntu-latest
+    # A cap that never fires means a process that is never killed. 20 minutes,
+    # in line with the other single-OS jobs: this compiles the crate twice over
+    # (once per fixture) with a bundled SQLite each time.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The positive control: the fixture depends on `rusqlite` 0.40 directly AND
+      # on io-harness by path, so this resolving at all is the claim. It is run,
+      # not merely built, because coexistence is about one process — the binary
+      # opens a connection through its own `rusqlite` and a `Store` through the
+      # crate's, over the same linked `libsqlite3-sys`.
+      - name: the fixture builds and runs against this tree
+        working-directory: tests/fixtures/links-consumer
+        run: cargo run
+      # The negative control, and the reason this job is worth its runtime: a
+      # proof that only ever passes proves nothing. The same fixture, pointed at
+      # the published 0.22.0 instead of this tree, MUST fail — and must fail *at
+      # resolution*, before a line is compiled.
+      #
+      # Copied to RUNNER_TEMP rather than edited in place, so the checkout the
+      # step above just used is left untouched and the two builds cannot share a
+      # target directory.
+      #
+      # A build failure is not enough on its own: a network blip, a yanked
+      # version or an unrelated compile error would all fail too, and would sail
+      # through as "the expected failure". So cargo's output has to name both the
+      # `links` conflict and `sqlite3` before this counts as the wall we mean.
+      - name: the same fixture must NOT resolve against io-harness 0.22.0
+        run: |
+          set -uo pipefail
+          scratch="$RUNNER_TEMP/links-consumer-0.22.0"
+          rm -rf "$scratch"
+          cp -R tests/fixtures/links-consumer "$scratch"
+          sed -i 's|^io-harness = .*|io-harness = "=0.22.0"|' "$scratch/Cargo.toml"
+          if out=$(cd "$scratch" && cargo build 2>&1); then
+            echo "::error::io-harness 0.22.0 resolved next to rusqlite 0.40."
+            echo "That build is supposed to be impossible — libsqlite3-sys sets"
+            echo "links = \"sqlite3\" and 0.22.0 pins rusqlite 0.32. If cargo has"
+            echo "started allowing this, or the pin in the fixture drifted, this"
+            echo "job no longer proves anything and needs rewriting."
+            echo "$out"
+            exit 1
+          fi
+          echo "$out"
+          if ! grep -q 'links' <<<"$out" || ! grep -q 'sqlite3' <<<"$out"; then
+            echo "::error::0.22.0 failed to build, but not for the links reason."
+            echo "Expected cargo to name the links conflict on sqlite3. Something"
+            echo "else broke this step and would otherwise pass as the expected"
+            echo "failure — read the output above."
+            exit 1
+          fi
+          echo "0.22.0 rejected at resolution, on the links conflict, as expected."
+
   # OP1 — the docs.rs build, reproduced. This job exists because of a defect no
   # other job in this file could see.
   #

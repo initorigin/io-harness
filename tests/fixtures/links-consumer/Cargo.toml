@@ -1,0 +1,33 @@
+# The `links` wall, stood up as a buildable crate.
+#
+# `libsqlite3-sys` declares `links = "sqlite3"`, and cargo will not put two
+# versions of a `links` package into one dependency graph. Up to 0.22.0
+# io-harness pinned `rusqlite` 0.32 (`libsqlite3-sys` 0.30.1), so a program
+# already on `rusqlite` 0.33 or later could not add io-harness *at all* — not a
+# warning, not a duplicate symbol at link time, but a hard resolver error and no
+# build. 0.23.0 moves to `rusqlite` 0.40.1 (`libsqlite3-sys` 0.38.1), and this
+# crate is what proves the wall is gone: it depends on a modern `rusqlite`
+# directly AND on io-harness, and it has to build.
+#
+# Swap the path dependency below for `io-harness = "=0.22.0"` and this crate is
+# EXPECTED TO FAIL, at resolution, before a single line is compiled. CI does
+# exactly that in a scratch copy and fails if the build succeeds — a proof that
+# only ever passes is not a proof.
+#
+# Not a workspace member: the `[workspace]` table below cuts it loose from the
+# crate above, and the root manifest's `exclude` list keeps it out of the
+# published package. It is run from a git checkout by CI and from nowhere else.
+[package]
+name = "links-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+# The whole point of the fixture: the consumer's own `rusqlite`, at a version
+# 0.22.0 could not have coexisted with. `bundled` so the runner needs no system
+# libsqlite3 — the same reason the crate above bundles it.
+rusqlite = { version = "0.40", features = ["bundled"] }
+io-harness = { path = "../../.." }
