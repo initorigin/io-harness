@@ -508,7 +508,7 @@ impl Config {
 
     /// This configuration with `[profile.<name>]` overlaid on it (0.27.0).
     ///
-    /// The overlay uses the same [`merge`] the scopes use, so a profile has no merge
+    /// The overlay uses the same merge the scopes use, so a profile has no merge
     /// semantics of its own: a scalar replaces, a table merges key by key, an array
     /// replaces whole. Scopes merge first and the profile applies to the result, so a
     /// profile in any scope beats a base key in every scope.
