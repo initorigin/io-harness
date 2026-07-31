@@ -50,7 +50,10 @@ requirements:
   - Stop conditions and budgets — cap steps, time, cost, retries, risky actions
   - Observability and tracing — record prompts, decisions, tool calls, cost
   - Human approval layer — review before sensitive or irreversible actions
-  - Providers — OpenRouter, Anthropic, and OpenAI, via own HTTP+SSE client, with fallback between them
+  - >
+    Providers — OpenRouter, Anthropic and OpenAI natively, plus any OpenAI-shaped endpoint reached
+    by a base URL and a key, hosted or running on the developer's own machine; all over this
+    crate's own HTTP+SSE client, with fallback between them
   - Agent composition — spawn and nest many agents (100+) with shared context
   - Long-running autonomous tasks — 24h+ with no user input
   - Ephemeral local code-exec sandboxes — write, run, capture, destroy
@@ -97,8 +100,16 @@ constraints:
   - Embeddable in-process library first; daemon/client mode added later
   - Apache 2.0
   - Runs locally on the developer's machine; no hosted service in scope
-  - Exactly three providers — Anthropic, OpenAI, OpenRouter. No fourth without a fresh decision.
-  - Credentials are API keys read from the environment. No OAuth, no subscription authentication.
+  - >
+    A provider may be added only when it costs no new runtime dependency and no signing or token
+    stack — an OpenAI-shaped body over the wire this crate already speaks, reached by a base URL
+    and an API key string. This replaces the "exactly three providers" rule on 2026-08-01, which
+    had already served its purpose: it was never about the number, it was about not paying for a
+    vendor SDK per vendor. The dependency is the thing that binds, so the constraint now says so.
+  - >
+    Credentials are API keys read from the environment. No OAuth, no subscription authentication.
+    A provider whose auth is a bearer token this crate did not mint is in scope — the application
+    obtains the token and hands it over as the key — but minting one never is.
   - >
     No system package on any CI runner. This has already removed OCR and PDF-viewer verification
     from scope and it continues to bind.
@@ -125,11 +136,17 @@ non_goals:
   - Building or fine-tuning models
   - GUI (that is io-studio)
   - Daemon/client mode in the first release
-  - Google Gemini and local or OpenAI-compatible providers
   - OAuth and subscription authentication
   - >
-    A client-side web search or fetch implementation. All three configured providers execute both
-    server-side; building our own would duplicate them and discard their citations.
+    A vendor whose wire is not OpenAI-shaped and whose auth this crate would have to mint —
+    AWS Bedrock's SigV4 path, Vertex's service-account JWT, and Gemini's native `interactions`
+    API. Each is reachable today by an application that obtains a bearer token itself and passes
+    it as the key; none is built in. Gemini is in scope through its OpenAI-compatible endpoint,
+    which is why the blanket "no Gemini" non-goal was dropped on 2026-08-01.
+  - >
+    A client-side web search or fetch implementation. The providers that execute search do it
+    server-side; building our own would duplicate them and discard their citations. Note this
+    also means a provider with no server-side search simply has none — it is not emulated.
   - >
     Per-language Rust modules. Language support is command execution plus a data-driven toolchain
     table plus a command-shaped verification criterion — not thirty parsers to maintain.
