@@ -91,43 +91,16 @@ jobs:
             exit 1
           fi
 
-      # The release body is this version's CHANGELOG section verbatim, so the
-      # notes say what changed instead of linking to it. Link-reference lines are
-      # dropped; they would render as stray `[x]: url`.
-      #
-      # Written to RUNNER_TEMP, not the checkout: `cargo package --locked` below
-      # refuses a working directory with uncommitted files in it, and an
-      # untracked release-notes.md is exactly that.
-      - name: Notes
+      # The changelog has to carry this version before anything is tagged. The
+      # notes themselves are built in the release job.
+      - name: Changelog has a section
         env:
           VERSION: ${{ steps.resolve.outputs.number }}
-          NOTES: ${{ runner.temp }}/release-notes.md
         run: |
-          awk -v v="$VERSION" '
-            $0 ~ "^## \\[" v "\\]" { on = 1; next }
-            on && /^## \[/ { exit }
-            on && !/^\[[^]]*\]:/ { print }
-          ' CHANGELOG.md > "$NOTES"
-          if ! grep -q '[^[:space:]]' "$NOTES"; then
-            echo "::error::CHANGELOG.md has no non-empty '## [$VERSION]' section"
+          if ! grep -q "^## \[$VERSION\]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## [$VERSION]' section"
             exit 1
           fi
-          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          cat >> "$NOTES" <<EOF
-
-          ### Install
-
-          \`\`\`toml
-          [dependencies]
-          io-harness = "$VERSION"
-          \`\`\`
-
-          Or \`cargo add io-harness@$VERSION\`. Requires Rust $msrv or later.
-
-          The \`.crate\` tarball below is the artifact published to crates.io for
-          this version. Verify it against \`SHA256SUMS\`.
-          EOF
-          cat "$NOTES"
 
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
@@ -146,13 +119,6 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-notes
-          path: ${{ runner.temp }}/release-notes.md
-          retention-days: 7
-          if-no-files-found: error
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
           name: package
           path: target/package/io-harness-${{ steps.resolve.outputs.number }}.crate
           retention-days: 7
@@ -165,10 +131,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Two paths: everything in dist/ is attached, the notes are the body.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: release-notes
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: package
@@ -180,13 +144,46 @@ jobs:
           sha256sum *.crate > SHA256SUMS
           cat SHA256SUMS
 
+      # The release body is this version's CHANGELOG section verbatim, so the
+      # notes say what changed instead of linking to it. Link-reference lines are
+      # dropped; they would render as stray `[x]: url`.
+      - name: Notes
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { on = 1; next }
+            on && /^## \[/ { exit }
+            on && !/^\[[^]]*\]:/ { print }
+          ' CHANGELOG.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "::error::CHANGELOG.md has no non-empty '## [$VERSION]' section"
+            exit 1
+          fi
+          msrv=$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          cat >> notes.md <<EOF
+
+          ### Install
+
+          \`\`\`toml
+          [dependencies]
+          io-harness = "$VERSION"
+          \`\`\`
+
+          Or \`cargo add io-harness@$VERSION\`. Requires Rust $msrv or later.
+
+          The \`.crate\` tarball below is the artifact published to crates.io for
+          this version. Verify it against \`SHA256SUMS\`.
+          EOF
+          cat notes.md
+
       # Release titles drop the tag's leading "v": "io-harness 0.23.0".
       # `target_commitish` only on a dispatch, where the tag does not exist yet.
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
           tag_name: v${{ needs.verify.outputs.version }}
           name: io-harness ${{ needs.verify.outputs.version }}
-          body_path: release-notes.md
+          body_path: notes.md
           files: dist/*
           target_commitish: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
           fail_on_unmatched_files: true
