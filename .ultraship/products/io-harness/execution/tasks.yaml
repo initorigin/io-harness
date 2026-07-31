@@ -242,7 +242,7 @@ tasks:
   why_required: The Windows row is a claim about a security boundary that does not exist; shortened
     to "Native" it says the opposite of the truth. And the refusal set is something a consumer needs
     before they write a policy, so it is contract rather than implementation detail.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.24.0-T04
   - US-IO-HARNESS-0.24.0-T08
@@ -277,8 +277,12 @@ tasks:
     reserved-name list updated.'
   - CHANGELOG 0.24.0 section written with a BREAKING entry and a `*Migration:*` note per break; `cargo
     test --test changelog` passes.
-  - 'REMAINING: `docs/CONTRACT.md` still needs the shell refusal set recorded as part of the public
-    contract (OP4).'
+  - 'OP4 complete: `docs/CONTRACT.md` records the shell refusal set as public contract — stated as a
+    set that may widen and will not silently narrow — plus the `cd`-at-plan-time and `2>&1`-in-a-pipe
+    limitations, and the position that `CompletionRequest` and `CompletionResponse` are deliberately
+    not `#[non_exhaustive]`.'
+  - 'NF2 verified: `cargo tree` on the macOS host is 402 lines, identical to 0.23.0, and contains no
+    crate matching `windows`. Evidence in `evidence/0.24.0/dependency-and-msrv.txt`.'
 - id: US-IO-HARNESS-0.24.0-T10
   summary: 'The release gates: full suite on macOS, Linux and Windows; `cargo fmt --check`; `cargo clippy
     --all-targets -- -D warnings` with `unsafe_op_in_unsafe_fn` denied; the nightly all-features doc
@@ -288,7 +292,7 @@ tasks:
   why_required: The release is `published` mode. Every one of these is a refusal `release.yml` will
     make on `main` anyway, and the live run is the only evidence that the feature works against a real
     model rather than against tests written by the same hand that wrote the code.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.24.0-T05
   - US-IO-HARNESS-0.24.0-T07
@@ -330,4 +334,22 @@ tasks:
   - .github/workflows/
   - Cargo.toml
   - examples/
-  evidence: []
+  evidence:
+  - 'Local gates all green: fmt clean, `clippy --all-targets -- -D warnings` clean, 721 tests passed
+    / 0 failed, 239 doctests passed / 0 failed. Evidence in `evidence/0.24.0/gates.txt`.'
+  - 'OP5: `cargo package --locked` exit 0, 174 files, 922,399 bytes. No `.ultraship`, no `.github`,
+    no exact `.env`, none of the three excluded fixture crates; `src/tools/shell.rs`, `tests/shell.rs`,
+    `tests/list_dir.rs` and the nine `store-0.22.0` fixtures all present. Verified by listing the tarball
+    rather than trusting the exclude list. Security sweep: the real registry token and API key appear
+    in no tracked file and not in the tarball.'
+  - 'OP2: MSRV re-checked and unchanged at 1.95. `windows-sys` 0.61.2 declares `rust-version = 1.71`,
+    well below the floor `libsqlite3-sys` already sets, so the new dependency does not move it. Licence
+    MIT OR Apache-2.0.'
+  - 'OP1 satisfied: `cargo run --example shell_live` against OpenRouter. The model composed `grep -c
+    ''ERROR'' notes.txt > count.txt` itself — a real command line with a redirect — the crate parsed
+    it, and the trace read back from the store carries the per-stage authorisations: exec `grep` and
+    exec `grep -c ERROR notes.txt` under rule `grep*` layer `live`, and write `count.txt` under rule
+    `count.txt` layer `live`. Outcome Success, `count.txt` = "3\n", verification passed. Evidence in
+    `evidence/0.24.0/live-shell-run.txt`.'
+  - 'REMAINING: NF1 (full suite on macOS, Linux and Windows) and NF3 (nightly docs.rs job) complete
+    on the pull request''s CI run. F6, F8 and F9 are verified there and nowhere else.'
