@@ -264,7 +264,15 @@
 //! nothing else** — there is no filesystem facility and no network facility in
 //! one. macOS confines writes to the working directory and denies outbound
 //! network; Linux does the same through mount and network namespaces; Windows
-//! does neither, and the access half is `AppContainer`, which is not written yet.
+//! does neither.
+//!
+//! The access half is `AppContainer`, and 0.26.0 built it — `sandbox::appcontainer`
+//! creates a container, grants paths to its SID, and spawns into it with an empty
+//! capability array, proven on CI against negative controls for both a refused
+//! read and a refused socket. It is **not** what the sandbox selects on Windows,
+//! because an AppContainer is default-deny for reads and naming everything an
+//! arbitrary toolchain needs is a discovery problem that release did not close. So
+//! the table above still describes what a run gets.
 //!
 //! Two smaller differences worth knowing rather than discovering: the job's CPU
 //! limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time

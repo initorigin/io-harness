@@ -72,6 +72,22 @@ and what it does not yet default to, is stated exactly below rather than implied
   the denial is the token's own rather than a filter's — the same shape as an empty
   network namespace on Linux.
 
+  Both claims are proven on the Windows CI runner against negative controls that
+  must succeed outside the container, because a denial that would also have been a
+  denial outside proves nothing. Loopback turns out to be refused as well, which is
+  a stronger result than was asked for.
+
+  **It is not what `Sandbox::select` chooses on Windows, and the platform table is
+  therefore unchanged.** A run still gets the Job Object. The obstacle is the grant
+  set rather than the mechanism: an AppContainer is default-deny for *reads*, so
+  the workspace is the easy part and the executed binary, the toolchain, the
+  redirected temporary directory and every language's install tree are the rest.
+  Naming those for arbitrary ecosystems is a discovery problem this release did not
+  close, and a default boundary that cannot run the payload would be worse than one
+  a caller reaches for deliberately. Recorded, with the evidence, in
+  `US-IO-HARNESS-0.26.0-I02`. A table that described the intent rather than the
+  build is the defect 0.9.1 and 0.16.1 were both spent on.
+
 ### Changed
 
 - Two more `windows-sys` features (`Win32_Security_Isolation`,

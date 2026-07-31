@@ -141,7 +141,24 @@ facility and no network facility in one. macOS confines writes to the working
 directory and denies outbound network; Linux does the same through mount and
 network namespaces; Windows does neither. So "sandboxed" on Windows means
 resource-capped and does not mean access-confined, and the two must not be read
-as the same claim. The access half is `AppContainer` and it is not written yet.
+as the same claim.
+
+**The access half is `AppContainer`, and 0.26.0 built it without making it the
+default.** `io_harness::sandbox::appcontainer` creates a container profile,
+derives its SID, grants a path to it with an explicit ACE, and spawns into it
+through `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
+attribute list. On the Windows CI runner a payload inside one is refused a read it
+was not granted and has no route off the machine, each against a negative control
+that must succeed outside the container.
+
+`Sandbox::select` still chooses the Job Object on Windows, so **the table above is
+what a run actually gets** and is unchanged by this release. The obstacle is the
+grant set, not the mechanism: an AppContainer is default-deny for reads, so the
+workspace is the easy part and the executed binary, the toolchain, the redirected
+temporary directory and every language's install tree are the rest. Naming those
+for arbitrary ecosystems is a discovery problem 0.26.0 did not close, and a
+default boundary that cannot run the payload would be worse than one a caller
+reaches for deliberately. Recorded in `US-IO-HARNESS-0.26.0-I02`.
 
 Two further differences, stated rather than left to be discovered. The job's CPU
 limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time as
