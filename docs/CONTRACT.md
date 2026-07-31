@@ -141,7 +141,24 @@ facility and no network facility in one. macOS confines writes to the working
 directory and denies outbound network; Linux does the same through mount and
 network namespaces; Windows does neither. So "sandboxed" on Windows means
 resource-capped and does not mean access-confined, and the two must not be read
-as the same claim. The access half is `AppContainer` and it is not written yet.
+as the same claim.
+
+**The access half is `AppContainer`, and 0.26.0 built it without making it the
+default.** `io_harness::sandbox::appcontainer` creates a container profile,
+derives its SID, grants a path to it with an explicit ACE, and spawns into it
+through `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
+attribute list. On the Windows CI runner a payload inside one is refused a read it
+was not granted and has no route off the machine, each against a negative control
+that must succeed outside the container.
+
+`Sandbox::select` still chooses the Job Object on Windows, so **the table above is
+what a run actually gets** and is unchanged by this release. The obstacle is the
+grant set, not the mechanism: an AppContainer is default-deny for reads, so the
+workspace is the easy part and the executed binary, the toolchain, the redirected
+temporary directory and every language's install tree are the rest. Naming those
+for arbitrary ecosystems is a discovery problem 0.26.0 did not close, and a
+default boundary that cannot run the payload would be worse than one a caller
+reaches for deliberately. Recorded in `US-IO-HARNESS-0.26.0-I02`.
 
 Two further differences, stated rather than left to be discovered. The job's CPU
 limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time as
@@ -522,19 +539,38 @@ other backend that could scope it properly — the Linux pid-namespace
 active-process limit — is not wired up. Setting it on a unix host changes
 nothing.
 
-**A process handle's own processes are not placed in the platform's containment
-(0.25.0).** `shell_start` spawns through the same runner `shell` does, and that
-runner does not go through `Sandbox`. `shell_kill` therefore ends a handle by
-signalling the pids it recorded and the descendants still reachable from them,
-rather than by closing a container around the tree — so a descendant whose own
-parent has already exited is reachable from nothing the handle recorded and can
-survive the kill. On Windows this is precisely the gap a Job Object exists to
-close: the job owns its tree and takes all of it down when the job handle closes,
-and the handle path does not use one, so a grandchild whose parent exited may
-outlive its handle there. **Read tree kill on a handle as best-effort rather than
-as a guarantee.** Routing the spawn through the platform's containment is later
-work; the run-end sweep and the drop backstop are unaffected, because both go
-through the same kill.
+**Killing a process handle reaches the whole tree, on every platform (0.26.0).**
+`shell_kill` ends the processes the handle started *and* every descendant they
+produced, including a grandchild whose own parent has already exited — the shape
+a real dev server has, and the one no kill built on walking the process table can
+reach, because the parent/child link it would have followed is gone.
+
+That is a guarantee rather than a best effort, and it rests on a different
+mechanism per platform:
+
+- **macOS and Linux (since 0.25.0)** — each stage of a handle's line is spawned as
+  the leader of its own process group, and the kill signals the group. Membership
+  is inherited across `fork` and outlives every parent in the chain.
+- **Windows (since 0.26.0)** — there is no process group. Each stage is created
+  suspended, assigned to a per-handle Job Object, and only then resumed, and the
+  kill closes the job. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` walks nothing, so
+  membership cannot be escaped or outlived.
+
+This is *not* the same claim as the sandbox's. A handle's job carries the
+teardown guarantee and no resource limits, because a handle is a lifetime rather
+than a boundary — a twenty-minute build is exactly the workload the sandbox's
+caps exist to kill. A handle's processes are governed by the policy checks its
+command line passed before anything spawned, not by `SandboxLimits`.
+
+Until 0.26.0 the Windows half was genuinely open, and until this paragraph was
+rewritten this document said the unix half was too. It was not: process groups
+closed it in 0.25.0 and there has been a test and a negative control for it since.
+Under-claiming a shipped boundary is the same defect as over-claiming one — either
+way the file cannot be trusted — and it is recorded here because this is the
+second consecutive release in which this document has done it.
+
+The run-end sweep and the drop backstop go through the same kill, so both inherit
+the guarantee.
 
 **No seccomp filter is installed.** The Linux backend is namespaces and rlimits.
 Whatever syscall restriction applies is the kernel's own default under an

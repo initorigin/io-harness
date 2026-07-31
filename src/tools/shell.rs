@@ -89,7 +89,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-use tokio::process::Command as TokioCommand;
+use tokio::process::{Child as TokioChild, Command as TokioCommand};
 
 use crate::error::{Error, Result};
 
@@ -1106,9 +1106,19 @@ pub(crate) struct Shell {
 ///
 /// `on_spawn` fires per stage rather than once at the end, because a pipeline
 /// whose third stage fails to spawn must still leave the first two killable.
+///
+/// It takes the `Child` rather than the pid, and that is load-bearing on Windows
+/// rather than tidier: assigning a process to a Job Object needs its *handle*,
+/// and a pid is not one. This signature is what `US-IO-HARNESS-0.25.0-I01`
+/// identified as the interface change the Job Object routing was waiting for.
+/// It can fail, because the two things it does — recording the pid and placing
+/// the process in its containment — differ in what a failure means: a handle
+/// whose processes are not contained is a handle whose kill cannot be relied on,
+/// and the crate promises the kill.
 pub(crate) struct Capture {
     pub(crate) path: std::path::PathBuf,
-    pub(crate) on_spawn: std::sync::Arc<dyn Fn(u32) + Send + Sync>,
+    #[allow(clippy::type_complexity)]
+    pub(crate) on_spawn: std::sync::Arc<dyn Fn(&TokioChild) -> Result<()> + Send + Sync>,
 }
 
 impl Shell {
@@ -1249,18 +1259,35 @@ impl Shell {
                 .current_dir(&planned.cwd)
                 .kill_on_drop(true);
 
-            // A detached line's stages go in a process group of their own, and a
+            // A detached line's stages go into containment of their own, and a
             // foreground line's stages deliberately do not. The foreground case
             // is awaited and dropped inside the call that made it, so
             // `kill_on_drop` and the process table between them already reach
             // everything; the handle case outlives its call, and by the time it
             // is killed the parent/child links a table walk would follow have
-            // had time to disappear. The group is what survives that. Nothing
-            // else about the two spawns differs, which is the property this
-            // shared runner exists to keep.
+            // had time to disappear. Nothing else about the two spawns differs,
+            // which is the property this shared runner exists to keep.
+            //
+            // The containment is per platform because the platforms genuinely
+            // differ, not because the code drifted:
+            //
+            // - **unix** — the stage becomes a process group leader here, before
+            //   `exec`. Group membership is inherited across `fork` and outlives
+            //   every parent in the chain, so nothing needs to be held.
+            // - **Windows** — there is no process group. The equivalent is a Job
+            //   Object, and a job needs the *child handle* at the spawn site,
+            //   which is why this is two halves: freeze the stage before its
+            //   first instruction here, then assign and resume it below once it
+            //   exists. A process that ran even briefly outside the job can
+            //   spawn a descendant that never joins it, and every call involved
+            //   would still return success.
             #[cfg(unix)]
             if self.capture.is_some() {
                 crate::sandbox::own_process_group(&mut cmd);
+            }
+            #[cfg(windows)]
+            if self.capture.is_some() {
+                cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
             }
 
             match prev_stdout.take() {
@@ -1311,9 +1338,16 @@ impl Shell {
             };
             // Reported the moment it exists, before the next stage is even
             // attempted, so a line that fails to spawn its third stage still
-            // leaves the first two killable.
-            if let (Some(c), Some(pid)) = (&self.capture, child.id()) {
-                (c.on_spawn)(pid);
+            // leaves the first two killable — and, on Windows, put into the
+            // handle's job and resumed while it is still frozen.
+            //
+            // A failure here is fatal to the line rather than a warning. The
+            // stage is suspended and outside its containment at this instant, so
+            // continuing would mean either releasing an uncontained process or
+            // leaving a frozen one behind; returning drops `child`, whose
+            // `kill_on_drop` ends it, which is the only correct third option.
+            if let Some(c) = &self.capture {
+                (c.on_spawn)(&child)?;
             }
             if i != last {
                 if let Some(so) = child.stdout.take() {

@@ -51,9 +51,39 @@ process tree, so nothing the run spawned outlives it. What a Job Object has **no
 facility for** is the filesystem and the network — there is no path rule and no
 socket rule to set on one. macOS confines writes to the workdir and denies
 outbound network, Linux does the same through mount and network namespaces, and
-Windows does neither, so "sandboxed" on Windows means resource-capped rather than
-access-confined and the two must not be read as the same claim. The access half
-is `AppContainer`, scheduled for 0.26.0.
+Windows does neither, so **"sandboxed" on Windows still means resource-capped
+rather than access-confined** and the two must not be read as the same claim.
+
+### AppContainer — what 0.26.0 shipped, and what it is not yet
+
+The access half is an AppContainer, and 0.26.0 built it: `io_harness::sandbox::appcontainer`
+creates a container profile, derives its SID, grants a path to it with an explicit
+ACE, and spawns a process into it through `CreateProcessW` with a
+`PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute list. It is proven on the
+Windows CI runner, and each claim carries a negative control — the identical
+payload outside the container, which must succeed at the thing the container is
+refused:
+
+- **Filesystem** — default-deny. A payload inside reads only what was granted;
+  a file in an ungranted directory is refused, and the same payload outside reads
+  it fine.
+- **Network** — the capability array is **empty**, so there is no `internetClient`
+  and no socket the token may open. Outbound fails inside and succeeds outside.
+  Loopback is refused as well, which is a stronger result than was asked for.
+
+**It is not what `Sandbox::select` chooses on Windows, and this guide will not
+imply otherwise.** A run still gets the Job Object. The reason is the grant set
+rather than the mechanism: an AppContainer is default-deny for *reads*, so
+everything a payload legitimately needs has to be named — the workspace is easy,
+and the executed binary, the toolchain, the redirected temporary directory and
+every language's install tree are the rest. Naming those for arbitrary ecosystems
+is a discovery problem this release did not close, and a boundary that is on by
+default and cannot run the payload is worse than one a caller opts into
+deliberately.
+
+So: the mechanism exists, is tested, and is reachable. The platform table above is
+unchanged, because the table describes what a run gets by default and that has not
+changed. See [the contract](../CONTRACT.md).
 
 Two differences from the unix mechanisms are worth naming rather than leaving to
 be discovered. The job's CPU limit

@@ -39,7 +39,7 @@
 //! also how job control has always worked, which is a good sign for a design
 //! rather than a coincidence.
 //!
-//! ## A handle's processes are a process group
+//! ## A handle's processes are contained, so the kill does not have to chase them
 //!
 //! Killing a handle by pid, or by pid and whatever the process table still says
 //! descends from it, is not enough and cannot be made enough. A dev server
@@ -48,15 +48,26 @@
 //! programs this tool exists to run. The runtime and the watcher are still
 //! there, they are still the run's responsibility, and the parent/child links
 //! that would have led to them are gone. Nothing about walking the table
-//! recovers them; they have been reparented to init and are indistinguishable
-//! from anything else on the machine.
+//! recovers them.
 //!
-//! So each stage of a handle's line is spawned as the leader of its own process
-//! group (see [`own_process_group`](crate::sandbox::own_process_group)), and the
-//! kill signals the group. Membership is inherited across `fork` and outlives
-//! every parent in the chain, so one signal reaches the whole tree no matter
-//! what shape it has grown into or which of its middles are already dead. The
-//! foreground `shell` and `exec` tools keep their old spawn exactly: they are
+//! So each stage of a handle's line is put into containment as it is spawned,
+//! and the kill ends the containment rather than chasing what is inside it. The
+//! mechanism is per platform because the platforms have nothing in common here
+//! beyond the problem — see [`Containment`]:
+//!
+//! - **macOS and Linux** — the stage becomes the leader of its own process group
+//!   (see [`own_process_group`](crate::sandbox::own_process_group)) and the kill
+//!   signals the group. Membership is inherited across `fork`, outlives every
+//!   parent in the chain, and a process that never asks to leave never leaves.
+//! - **Windows** — there is no process group. The stage is created suspended,
+//!   assigned to this handle's Job Object, and only then resumed; the kill closes
+//!   the job, and `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` takes down every member
+//!   without walking anything. The suspend is not caution, it is the correctness
+//!   argument: a process that runs even briefly outside the job can spawn a
+//!   descendant that never joins it, and every call involved still returns
+//!   success.
+//!
+//! The foreground `shell` and `exec` tools keep their old spawn exactly: they are
 //! awaited and dropped inside the call that made them, so they never have the
 //! problem this solves.
 
@@ -67,6 +78,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::error::{Error, Result};
+
+/// What holds a handle's processes together, per platform.
+///
+/// On unix it is nothing, because the containment is the process group and a
+/// group needs no owner: it is a property the children carry, it is inherited
+/// across `fork`, and one `killpg` reaches it whoever is still alive. On Windows
+/// there is no process group, and the equivalent — a Job Object — is a kernel
+/// object that exists only while something holds its handle open. So the handle
+/// owns it, and closing it *is* the kill.
+///
+/// The type alias rather than a `cfg`-gated field so that [`Record`] has the same
+/// shape on every platform and nothing that touches it has to be written twice.
+#[cfg(windows)]
+type Containment = Option<std::sync::Arc<crate::sandbox::windows::job::Job>>;
+#[cfg(not(windows))]
+type Containment = ();
 
 /// Why a handle recorded before this process started is never re-attached.
 ///
@@ -151,6 +178,12 @@ struct Record {
     /// thing a running process produces and pretending otherwise loses it.
     cursor: u64,
     state: HandleState,
+    /// The containment this handle's processes are in. See [`Containment`].
+    ///
+    /// On Windows, dropping this is the kill — so it is taken out of the record
+    /// by [`Handles::kill`] rather than left to the record's own drop, which
+    /// would tie the teardown to when the map entry happens to go away.
+    contained: Containment,
 }
 
 /// The live handles of one run.
@@ -204,6 +237,25 @@ impl Handles {
         })?;
         let id = self.next.fetch_add(1, Ordering::SeqCst);
         let capture = dir.path().join(format!("handle-{id}.out"));
+
+        // The containment is created *before* the first spawn, and a failure to
+        // create it refuses the start. Running the line anyway would produce a
+        // handle whose kill cannot be relied on, which is the same trade
+        // `own_process_group` already refuses on unix: a cap that could not be
+        // applied fails the spawn rather than running the payload uncapped.
+        #[cfg(windows)]
+        let contained = Some(std::sync::Arc::new(
+            crate::sandbox::windows::job::Job::for_handle().map_err(|e| {
+                format!(
+                    "could not create the job object that would contain this handle ({e}); \
+                         the line was not started, because a handle whose processes are not in a \
+                         job is one whose kill cannot reach a re-parented grandchild"
+                )
+            })?,
+        ));
+        #[cfg(not(windows))]
+        let contained = ();
+
         self.lock().insert(
             id,
             Record {
@@ -212,6 +264,7 @@ impl Handles {
                 capture: capture.clone(),
                 cursor: 0,
                 state: HandleState::Running,
+                contained,
             },
         );
         Ok((id, capture))
@@ -228,6 +281,37 @@ impl Handles {
     pub(crate) fn add_pid(&self, id: u64, pid: u32) {
         if let Some(r) = self.lock().get_mut(&id) {
             r.pids.push(pid);
+        }
+    }
+
+    /// Put a freshly spawned stage into this handle's containment, and let it run.
+    ///
+    /// Windows only, and it is the whole of `US-IO-HARNESS-0.25.0-I01`. The stage
+    /// is spawned `CREATE_SUSPENDED` by the runner, so at this instant it exists
+    /// and has not executed an instruction; assigning it here and resuming it —
+    /// which is what [`Job::adopt`](crate::sandbox::windows::job::Job::adopt)
+    /// does, in that order — is the only sequencing with no window in which the
+    /// process is both running and outside the job. A process that ran even
+    /// briefly outside can spawn a descendant that is never a member, and that
+    /// descendant then outlives the kill while every call involved returns
+    /// success.
+    ///
+    /// On unix this is not called at all: the equivalent is `setpgid` in the
+    /// child before `exec`, which the runner has already done by the time a
+    /// `Child` exists.
+    #[cfg(windows)]
+    pub(crate) fn contain(&self, id: u64, child: &tokio::process::Child) -> Result<()> {
+        let job = self.lock().get(&id).and_then(|r| r.contained.clone());
+        match job {
+            Some(job) => job.adopt(child),
+            // The handle was killed while its own pipeline was still spawning.
+            // The job is already closed, so this stage is not going into it —
+            // and it must not be resumed either, which is what returning an
+            // error achieves: the caller kills the child rather than releasing
+            // a process into a run that has stopped owning it.
+            None => Err(Error::Sandbox {
+                reason: format!("process handle {id} was ended while its line was still starting"),
+            }),
         }
     }
 
@@ -338,8 +422,13 @@ impl Handles {
     /// a bare signal — a package manager that spawned a runtime leaves
     /// grandchildren otherwise, and a grandchild whose parent has already
     /// exited is reachable by nothing but its process group.
+    // `Containment` is `Option<Arc<Job>>` on Windows and `()` everywhere else, so
+    // on unix the binding below genuinely is a unit value — which clippy is right
+    // about in general and wrong about here, since the alternative is two
+    // versions of this function differing by one line.
+    #[cfg_attr(not(windows), allow(clippy::let_unit_value))]
     pub(crate) fn kill(&self, id: u64) -> std::result::Result<HandleState, String> {
-        let (pids, was) = {
+        let (pids, was, contained) = {
             let mut guard = self.lock();
             let r = guard
                 .get_mut(&id)
@@ -358,9 +447,26 @@ impl Handles {
             if !was.is_over() {
                 r.state = HandleState::Killed;
             }
-            (r.pids.clone(), was)
+            // Taken out of the record rather than left in it. On Windows this is
+            // the last handle to the job, so dropping it below is what kills the
+            // tree — and it must happen at a point in the code someone can point
+            // at, not whenever the map entry is eventually replaced.
+            let contained = std::mem::take(&mut r.contained);
+            (r.pids.clone(), was, contained)
         };
         if !was.is_over() {
+            // Closing the job first. `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` does
+            // not walk the process table, so this reaches a grandchild whose
+            // parent has already exited — the case `taskkill /T` below provably
+            // cannot reach, and the reason this release exists.
+            //
+            // `cfg`-gated rather than an unconditional `drop`, because on unix
+            // the containment is `()` and dropping it is a no-op the compiler is
+            // right to warn about: there the group signal below is the teardown.
+            #[cfg(windows)]
+            drop(contained);
+            #[cfg(not(windows))]
+            let () = contained;
             for pid in pids.into_iter().rev() {
                 crate::sandbox::kill_tree_and_group(Some(pid));
             }
@@ -401,6 +507,10 @@ impl Handles {
                 capture: PathBuf::new(),
                 cursor: 0,
                 state: HandleState::Orphaned(ORPHAN_REASON.to_string()),
+                // An orphan has no containment and must never acquire one: the
+                // job that held its processes died with the process that made
+                // it, and there is nothing here to close.
+                contained: Containment::default(),
             },
         );
         self.next.fetch_max(id + 1, Ordering::SeqCst);
