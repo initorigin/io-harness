@@ -26,6 +26,92 @@ notes are produced from it.
 
 ### Security
 
+## [0.27.0] - 2026-08-01
+
+One file is now the whole configuration. `io.toml` gains the piece it has been
+missing since 0.19.0 — which provider and model to run, and what stands behind it
+— so an embedder reads a spec instead of writing provider-selection code. Beside
+it: a section the crate stores and never validates, so the programs built on this
+one keep their settings in the same file; profiles that overlay a named set of
+choices; a credential that can come from a command; and the project instructions a
+repository already carries, discovered rather than pasted into a goal string.
+
+And a project-scoped file stops being able to widen a boundary. `io.toml` is
+committed and arrives with a `git clone`, and the keys whose only effect is to
+remove containment are refused in that one scope — a project file may narrow, and
+may never widen.
+
+### Breaking changes
+
+- **BREAKING (behaviour)** — a project-scoped `io.toml` may no longer set four keys
+  to the value that *widens* a boundary. `policy.defaults.exec = "allow"`,
+  `policy.defaults.net = "allow"`, `sandbox.allow_network = true` and
+  `sandbox.force_floor = false` now fail the load naming the key, in the project
+  scope only, including inside a `[profile.<name>]`. The narrowing value of each is
+  still legal there. Also refused in that scope: `${cmd:...}`, anywhere in the file.
+  `Config::from_toml` is the project scope and refuses them too.
+  *Migration:* move the key out of `io.toml` and into `io.local.toml` (gitignored,
+  yours) or your user-scope file, where all five are accepted unchanged and mean
+  exactly what they meant before. Nothing else changes; a project file that only
+  ever narrowed needs no edit.
+
+### Added
+
+- **`[[provider]]` and `ProviderSpec`.** The first table is the provider a run
+  uses, each later one the next link in the fallback chain, in the order written.
+  `Config::provider_spec()` and `Config::fallback_specs()` project them. It yields a
+  *spec* rather than a provider because `Provider::complete` returns `impl Future`,
+  so the trait is not dyn-compatible; the application constructs from the spec and
+  nests `Fallback` itself. `ProviderSpec` is `#[non_exhaustive]` from this first
+  release — match it with a `_ =>` arm, because a later release adds a variant.
+  Unlike `[[policy.layers]]` and `[[agent]]`, a later scope replaces the chain whole
+  rather than appending to it.
+- **`[app]`, stored and never validated.** `Config::app::<T>(key)` deserializes
+  `[app.<key>]` into the caller's own type. The crate learns nothing about the
+  contents and rejects no key inside it — that is the feature, and it is the second
+  and last exception to "an unknown key is an error", beside `[[mcp]]`. The accessor
+  is generic, so no `toml` type enters this crate's public API.
+- **`${cmd:...}`.** A credential from a command rather than a literal: the value is
+  split on whitespace, the first word is the program, and there is **no shell**
+  between the string and the process. Trimmed stdout on success; a missing program,
+  a non-zero exit and empty output are each an error naming the key, as every other
+  substitution already was. Refused in the project scope — see the break above.
+- **`[profile.<name>]`.** A named overlay of the same file format, applied by
+  `Config::with_profile(name)` through the same merge the scopes use: scopes merge
+  first, the profile applies to the result. A name the file does not carry is an
+  error naming it, and a typo *inside* a profile is rejected at load even when that
+  profile is never selected. Profiles do not nest and do not compose.
+- **`IO_CONFIG`.** Names the user-scope file outright, ahead of `IO_CONFIG_HOME` and
+  every platform convention. It names a scope rather than bypassing the merge, so a
+  project file still wins the keys it names and the scopes stay four.
+- **`[instructions]`.** Discovers the files a repository already carries —
+  `AGENTS.md` by default — inside `Config::discover`, and `Config::apply_to` lands
+  each in `TaskContract::constraints`, naming the file it came from. No new public
+  field, therefore no break. A named file that is absent is skipped: this is
+  discovery, not substitution. What it finds is untrusted text from the repository,
+  reaches the model verbatim, and grants nothing.
+
+### Changed
+
+- `docs/CONTRACT.md`'s "What configuration is, and is not" is rewritten rather than
+  extended: three of its bullets stopped being true as written. The guide gains a
+  section per new table, a trust-rule section, and five entries in its limits block.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+- A committed `io.toml` in a repository you cloned can no longer re-enable outbound
+  network inside the sandbox, switch the portable floor off, or default `exec` and
+  `net` to `allow`, and can no longer cause a command to run when you read it. This
+  narrows one specific hazard and does not make an unfamiliar repository safe:
+  `[[mcp]]` still names a command, `[toolchain]` still names an argv, and the
+  boundary against the agent is still the `Policy` the caller loaded.
+
 ## [0.26.0] - 2026-08-01
 
 The release that closes the Windows tree kill. Killing a process handle now ends

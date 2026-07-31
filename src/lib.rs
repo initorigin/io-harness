@@ -354,7 +354,7 @@ pub use approve::{
     AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Question, Request,
     Responder, ResponderNone, StdinApprover, StdinResponder,
 };
-pub use config::Config;
+pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use context::ContextBudget;
 pub use contract::TaskContract;

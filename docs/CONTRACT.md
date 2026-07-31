@@ -386,36 +386,69 @@ the runs, not a second execution path:
   ceilings, so `max_steps` on one turn does not bound the next. A conversation-wide
   limit is the caller's to enforce, per turn, from `Store::run_summary`.
 
-**What configuration is, and is not (0.19.0).** `io.toml` is a projection onto
-the typed API and never a second path into the run loop:
+**What configuration is, and is not (0.19.0, extended in 0.27.0).** `io.toml` is
+a projection onto the typed API and never a second path into the run loop:
 
 - **The typed API is the authority.** Every key lands in a type this crate
   already had — `Policy`, `SandboxConfig`, `Toolchain`, `PriceTable`,
   `McpServer`, `TaskContract` — and a file can express nothing the typed API
-  cannot. A test asserts every key reaches a typed field.
+  cannot. A test asserts every key reaches a typed field. `[[provider]]` (0.27.0)
+  is the same rule and not an exception to it: it yields a **`ProviderSpec`**, a
+  value the application constructs a provider from, never a provider. `Provider::complete`
+  returns `impl Future`, so the trait is not dyn-compatible and there is no
+  `Box<dyn Provider>` for an accessor to return.
 - **The file is read once, by the caller, before the run, and never again.**
   Nothing in this crate discovers a config on its own: `Config::discover` is the
   caller's own call. That is what makes the one guarantee here true — a config
   the agent writes *during* a run cannot widen the boundary that run is already
-  under.
+  under. `[instructions]` (0.27.0) reads the repository's own `AGENTS.md` inside
+  that same call, before the run, and never during one.
 - **A config file is not a security boundary against the agent.** The boundary is
   the `Policy` the caller loaded; the file is where it was written down. An agent
   that can write the workspace root can write an `io.toml`, and the *next* load —
   the caller's act, not the agent's — will read it.
+- **A project-scoped file may narrow the boundary and may never widen it
+  (0.27.0).** Four keys are refused in `io.toml` when, and only when, the value
+  written is the widening one: `policy.defaults.exec = "allow"`,
+  `policy.defaults.net = "allow"`, `sandbox.allow_network = true`, and
+  `sandbox.force_floor = false`. So is `${cmd:...}` anywhere in that file, including
+  inside a `[profile]`. Each is accepted unchanged in `io.local.toml` and in the
+  user scope, and the narrowing value of each stays legal in `io.toml`. **This does
+  not claim that a cloned repository is safe** — `[[mcp]]` still names a command,
+  `[toolchain]` still names an argv, and a policy layer can still allow what the
+  defaults did not. It is a specific narrowing of a specific hazard: the keys whose
+  effect is to remove containment from a file that arrives with a `git clone`.
 - **An unknown key is an error**, naming the key and the file, rather than being
-  ignored. The exception is a key inside a `[[mcp]]` table, because `McpServer`
-  is `#[serde(flatten)]`-based and serde refuses `flatten` beside
-  `deny_unknown_fields`.
+  ignored. There are exactly two exceptions and they are stated together: a key
+  inside a `[[mcp]]` table, because `McpServer` is `#[serde(flatten)]`-based and
+  serde refuses `flatten` beside `deny_unknown_fields`; and anything under `[app]`
+  (0.27.0), which this crate stores and deliberately never validates so that the
+  applications built on it keep their own settings in the same file. A typo inside
+  a `[profile.<name>]` is an error even when that profile is never selected.
 - **A failed substitution is an error, never an empty string.** An unset
-  `${env:...}`, an unreadable `${file:...}`, and a value that resolves to nothing
-  each fail the load, because an empty string in a boundary rule is a rule that
-  matches nothing.
+  `${env:...}`, an unreadable `${file:...}`, a `${cmd:...}` whose program is missing
+  or whose exit status is non-zero, and a value that resolves to nothing each fail
+  the load, because an empty string in a boundary rule is a rule that matches
+  nothing. `${cmd:...}` (0.27.0) runs with **no shell** — the value is split on
+  whitespace and the first word is the program — and has no timeout, which is stated
+  rather than fixed: it runs at the caller's own `Config::discover`, with the
+  caller's own privileges, before any run exists.
+- **`[instructions]` is discovery, and the one place "resolve or fail" does not
+  apply (0.27.0).** A named file that is absent is skipped rather than failing the
+  load. What it finds lands in `TaskContract::constraints` — no new public field —
+  and it is **untrusted text from the repository**: it reaches the model verbatim
+  and grants nothing.
 - **The `[toolchain]` override does not reach this crate's own run loop.** The
   harness detects for itself; `Config::toolchain(detected)` gives the embedding
   application the merged value. Wiring it into the loop needs a new
-  `TaskContract` field, which is a break, and 0.19.0 carries none.
+  `TaskContract` field, which is a break, and no release so far carries one.
 - **Scope discovery is fixed**: four scopes, no `include`, no `extends`, no
-  parent-directory search, no JSON or YAML form, and no reload.
+  parent-directory search, no JSON or YAML form, and no reload. `IO_CONFIG` (0.27.0)
+  names the user-scope *file* outright, ahead of `IO_CONFIG_HOME` and every platform
+  convention — it names a scope rather than bypassing the merge, so a project file
+  still wins the keys it names and the count stays four. A `[profile.<name>]` is an
+  overlay of the same file that was already read, applied by an explicit
+  `Config::with_profile` call: not a fifth scope, not a second file, not a reload.
 
 **What every recorded number is, and is not (0.18.0).** The trace now answers
 what a run cost and which model spent it, and the provenance of each figure

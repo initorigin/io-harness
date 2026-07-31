@@ -108,8 +108,8 @@ file at all.
 
 ```toml
 [sandbox]
-allow_network = false
-force_floor = false
+allow_network = false    # `true` is refused in a project file — see the trust rule below
+force_floor = true       # `false` is refused there too
 
 [sandbox.limits]
 max_cpu_secs = 60
@@ -185,6 +185,112 @@ vendor's list accurate on its own release schedule — so until an operator writ
 one down, every call is reported as unpriced rather than as free. A dimension the
 file omits is an explicit zero.
 
+### `[[provider]]` → `ProviderSpec`, via `Config::provider_spec` (0.27.0)
+
+```toml
+[[provider]]                              # the first entry is the provider
+kind = "openrouter"                       # "openrouter" | "anthropic" | "openai"
+model = "anthropic/claude-sonnet-4"
+api_key = "${env:OPENROUTER_API_KEY}"     # optional: absent means the provider's own variable
+
+[[provider]]                              # each later entry is the next link in the chain
+kind = "anthropic"
+model = "claude-sonnet-4"
+```
+
+`Config::provider_spec()` is the first entry and `Config::fallback_specs()` is the
+rest, **in the order written** — the order is the configuration, not a detail of
+it. The application builds from the spec:
+
+```rust
+let provider = match config.provider_spec() {
+    Some(ProviderSpec::OpenRouter { model, api_key }) => /* ... */,
+    Some(ProviderSpec::Anthropic { model, api_key }) => /* ... */,
+    _ => OpenRouter::from_env()?,
+};
+```
+
+A **spec**, not a provider. `Provider::complete` returns `impl Future`, so the
+trait is not dyn-compatible and there is no `Box<dyn Provider>` for an accessor to
+hand back. `Fallback` is generic over two type parameters and nests —
+`Fallback::new(a, Fallback::new(b, c))` — so the caller assembles the chain the
+file named in three lines of their own code.
+
+`ProviderSpec` is `#[non_exhaustive]`: match it with a `_ =>` arm, because a later
+release adds a variant.
+
+Unlike `[[policy.layers]]` and `[[agent]]`, the chain is **replaced** by a later
+scope rather than appended to. A half-appended fallback chain is not a chain.
+
+### `[app]` — stored, never validated (0.27.0)
+
+```toml
+[app.cli]
+theme = "dark"
+width = 100
+
+[app.studio]
+open_tabs = ["trace", "policy"]
+```
+
+The one section this crate keeps and does not understand, so io-cli, io-studio and
+your own program keep their settings in the same file instead of inventing a
+second format beside it. Read it into your own type:
+
+```rust
+let cli: CliSettings = config.app("cli")?.unwrap_or_default();
+```
+
+**Nothing here is validated.** An unknown key under `[app]` is your business, not
+an error. Every other section still rejects what it does not know — this is one
+hole with a wall around it, and the wall is the point.
+
+### `[profile.<name>]` — a named overlay (0.27.0)
+
+```toml
+[run]
+max_steps = 30
+max_retries = 4
+
+[profile.cheap]
+run = { max_steps = 5 }
+
+[profile.careful]
+run = { max_steps = 120 }
+policy = { defaults = { write = "ask" } }
+```
+
+```rust
+let config = Config::discover(&root)?.with_profile("cheap")?;
+```
+
+A profile is the same file format again, overlaid through the same merge the
+scopes use: a scalar replaces, a table merges key by key, an array replaces whole.
+**Scopes merge first, and the profile applies to the result** — so a profile in any
+scope beats a base key in every scope.
+
+A name the file does not carry is an error naming it: a `--profile` argument that
+silently does nothing is the same failure as a typo in a key. A typo *inside* a
+profile is rejected at load even when that profile is never selected, because a
+profile body is validated as the file format. Profiles do not compose and do not
+nest.
+
+### `[instructions]` — discovering a repository's own rules (0.27.0)
+
+```toml
+[instructions]
+files = ["AGENTS.md"]     # the default; relative to the discovery root
+```
+
+`Config::discover` reads each file that exists and `Config::apply_to` lands them in
+`TaskContract::constraints`, one per file, each naming the file it came from — so
+the instructions a repository already carries reach the model without being pasted
+into a goal string.
+
+A named file that does not exist is **skipped**. This is discovery, not
+substitution: the "resolve or fail" rule that governs `${...}` deliberately does
+not apply here.
+
 ### `[[mcp]]` → [`McpServer`](mcp-and-network.md)
 
 ```toml
@@ -230,9 +336,9 @@ and the contract records it as one.
 `Act::Net` never sees it and the domain lists are filling in the *vendor's* filter.
 A caller who needs the boundary enforced in this process must leave this off.
 
-## Secrets: `${env:...}` and `${file:...}`
+## Secrets: `${env:...}`, `${file:...}` and `${cmd:...}`
 
-Any string value may name an environment variable or a file:
+Any string value may name an environment variable, a file, or a command to run:
 
 ```toml
 [[mcp]]
@@ -244,12 +350,65 @@ Authorization = "Bearer ${env:SEARCH_TOKEN}"
 X-Key = "${file:./secrets/mcp-key}"
 ```
 
+`${cmd:...}` runs a credential helper and takes its trimmed stdout:
+
+```toml
+# io.local.toml — gitignored, and yours.
+[[mcp]]
+id = "search"
+transport = "http"
+url = "https://mcp.example.com"
+[mcp.headers]
+Authorization = "Bearer ${cmd:op read op://vault/mcp/token}"
+```
+
+There is **no shell**. The value is split on whitespace and the first word is the
+program, so a `;`, a `|` or a backtick in it is an argument rather than a second
+command. A non-zero exit is a failure, because a helper that failed did not produce
+a credential.
+
+**`${cmd:...}` is refused in the project scope.** `io.toml` is committed and arrives
+with a `git clone`, and a run-this primitive in that file would run on the first
+`Config::discover` of a repository you have not read. Write it in `io.local.toml`
+or in your user-scope file. `Config::from_toml` is the project scope too, and
+refuses it for the same reason.
+
 `${file:...}` resolves against the directory of the file that wrote it, and its
-contents are trimmed. Both forms **resolve or fail**: an unset variable, an
+contents are trimmed. All three forms **resolve or fail**: an unset variable, an
 unreadable file, and a value that resolves to nothing are each an error naming
 the key and the file. None of them is ever an empty string — an empty string in a
 boundary rule is a rule that matches nothing, and a config that silently disarms
 itself is the worst thing this feature could do.
+
+## A project file may narrow, and may never widen (0.27.0)
+
+`io.toml` is committed. It travels with a `git clone`, and until 0.27.0 a cloned
+repository's file could switch off the parts of the boundary that stop it mattering.
+Four keys are therefore refused in the **project** scope, and only when the value
+written is the one that widens:
+
+| Key | Refused in `io.toml` when it says | Still legal there |
+| --- | --- | --- |
+| `policy.defaults.exec` | `"allow"` | `"ask"`, `"deny"` |
+| `policy.defaults.net` | `"allow"` | `"ask"`, `"deny"` |
+| `sandbox.allow_network` | `true` | `false` |
+| `sandbox.force_floor` | `false` | `true` |
+
+Plus `${cmd:...}` anywhere in the file. The refusal names the key, the file, and
+where to write it instead — `io.local.toml` or your user-scope file, where all five
+are accepted unchanged. A widening key hidden inside `[profile.<name>]` is refused
+too; the profile is applied later, and a check that only looked at the base would
+let it reach the same place by a different path.
+
+Value-dependent rather than key-dependent, deliberately: a project file *denying*
+`exec` is exactly what the project scope is for, and a rule that refused the key
+outright would forbid the good half to stop the bad one.
+
+**What this does not claim.** Not that a cloned repository is safe. `[[mcp]]` still
+names a command, `[toolchain]` still names an argv, and a `[[policy.layers]]` entry
+can still allow what the defaults did not. This is a specific narrowing of a
+specific hazard — four keys and one substitution, no more — and it is the file half
+of a boundary whose enforcing half is still the `Policy` you loaded.
 
 ## An unknown key is an error
 
@@ -282,16 +441,41 @@ a break this release does not carry. `Config::toolchain(detected)` gives io-cli,
 io-studio and any other caller the merged value today; the run loop wiring is a
 later release's job.
 
-**An unknown key inside a `[[mcp]]` table is not rejected.** `McpServer` is
-`#[serde(flatten)]`-based and serde refuses `flatten` beside
-`deny_unknown_fields`. Every other section rejects what it does not know; that
-one accepts and ignores it.
+**Two sections do not reject an unknown key, and they are these two.** A
+`[[mcp]]` table does not, because `McpServer` is `#[serde(flatten)]`-based and
+serde refuses `flatten` beside `deny_unknown_fields`. `[app]` does not, because
+that is the whole point of it — the crate stores it and never looks inside. Every
+other section rejects what it does not know. Two exceptions listed together are a
+rule with edges; one listed and one hidden is a rule nobody can trust.
+
+**`${cmd:...}` has no timeout.** A credential helper that hangs hangs your own
+`Config::discover`, before any run exists, with your own privileges. That is
+visible rather than silent, and it is the reason there is no timeout knob rather
+than an excuse for one: when a consumer meets it, a timeout is a key argued on its
+own terms.
+
+**A named instructions file that is absent is skipped silently.** `[instructions]`
+is discovery, so a file that is not there is not an error and a typo in a filename
+is not reported. This is the one place the "resolve or fail" rule above does not
+apply, and it is deliberate: `AGENTS.md` is present in some repositories and not in
+others, which is the normal case rather than the failure.
+
+**A discovered `AGENTS.md` is untrusted text.** It comes from the repository, it
+reaches the model verbatim as a constraint, and it grants nothing: the boundary is
+still the `Policy` you loaded. Treat a workspace whose instructions file you have
+not read the way you would treat any other text a stranger wrote into your prompt.
+
+**A project file may narrow and never widen, and that is all it does.** See the
+section above for the four keys, and for the sentence it is not.
 
 **`${` always begins a substitution.** There is no escape, so a literal `${` in a
 value — in a glob pattern, say — is not expressible. An unknown prefix is an
 error rather than a passthrough, which is what keeps a typo from reaching a
 policy rule as text.
 
-**The scopes are fixed.** There is no `include`, no `extends`, no `$schema`, no
-JSON or YAML form, no parent-directory search, and no reload. Each would be a
-second mechanism doing the job the four scopes already do.
+**The scopes are still four.** There is no `include`, no `extends`, no `$schema`,
+no JSON or YAML form, no parent-directory search, and no reload. `IO_CONFIG` names
+the **user-scope file** outright, ahead of `IO_CONFIG_HOME` and every platform
+convention — it names a scope rather than bypassing the merge, so a project file
+still wins the keys it names. A profile is a section of the same file that was
+already read, not a fifth scope and not a second read.
