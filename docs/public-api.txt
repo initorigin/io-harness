@@ -66,6 +66,7 @@ enum Flow src/observe.rs
 enum McpTransport src/mcp.rs
 enum Progressing src/resilience.rs
 enum ProviderErrorKind src/error.rs
+enum ProviderSpec src/config.rs
 enum RunOutcome src/run.rs
 enum RunStatus src/state.rs
 enum Selected src/sandbox.rs

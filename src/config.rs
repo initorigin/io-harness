@@ -3,9 +3,12 @@
 //! # What this is
 //!
 //! An operator writes `io.toml` and gets a permission boundary, sandbox caps,
-//! run budgets, per-ecosystem toolchain commands, MCP servers and a price table
+//! run budgets, per-ecosystem toolchain commands, MCP servers, a price table and
+//! — since 0.27.0 — which provider and model to run with what standing behind it,
 //! without compiling anything. io-cli and io-studio read the same file rather
-//! than inventing two formats that would have to be reconciled later.
+//! than inventing two formats that would have to be reconciled later, and `[app]`
+//! is the section that makes that literally true: the crate stores it and never
+//! looks inside.
 //!
 //! # What this is not
 //!
@@ -31,10 +34,15 @@
 //! Later wins, key by key:
 //!
 //! 1. the crate's own defaults — whatever the typed API produces with no file;
-//! 2. **user** — `$IO_CONFIG_HOME/io.toml`, else `$XDG_CONFIG_HOME/io/io.toml`
-//!    or `~/.config/io/io.toml` on unix, `%APPDATA%\io\io.toml` on Windows;
+//! 2. **user** — `$IO_CONFIG` outright, else `$IO_CONFIG_HOME/io.toml`, else
+//!    `$XDG_CONFIG_HOME/io/io.toml` or `~/.config/io/io.toml` on unix,
+//!    `%APPDATA%\io\io.toml` on Windows;
 //! 3. **project** — `io.toml` in the workspace root. Meant to be committed;
 //! 4. **local** — `io.local.toml` beside it. Meant to be gitignored.
+//!
+//! Still four. `$IO_CONFIG` names a scope's *file*; it does not bypass the merge.
+//! [`Config::with_profile`] overlays `[profile.<name>]` on the merged result, which
+//! is a section of a file already read rather than a fifth scope.
 //!
 //! Discovery reads the root it was given and does **not** walk upward out of it:
 //! a run's configuration comes from the directory the caller named, never from
@@ -71,16 +79,29 @@
 //! # demo().unwrap();
 //! ```
 //!
-//! # Two rules that make it trustworthy
+//! # Three rules that make it trustworthy
 //!
 //! **An unknown key is an error.** A typo in a permission rule that is silently
-//! ignored leaves an operator believing in a boundary that is not there.
+//! ignored leaves an operator believing in a boundary that is not there. Two
+//! sections are exempt and they are named together: a `[[mcp]]` table, because
+//! `McpServer` is `#[serde(flatten)]`-based, and `[app]`, which exists to be
+//! unvalidated.
 //!
-//! **A substitution resolves or fails; it never empties.** `${env:NAME}` and
-//! `${file:path}` keep a credential out of a committed file. A variable that is
-//! unset, a file that cannot be read, and a value that resolves to nothing are
-//! all errors naming the key — because an empty string in a boundary rule is a
-//! rule that matches nothing.
+//! **A substitution resolves or fails; it never empties.** `${env:NAME}`,
+//! `${file:path}` and `${cmd:program args}` keep a credential out of a committed
+//! file. A variable that is unset, a file that cannot be read, a command that is
+//! missing or exits non-zero, and a value that resolves to nothing are all errors
+//! naming the key — because an empty string in a boundary rule is a rule that
+//! matches nothing.
+//!
+//! **A project-scoped file may narrow the boundary and may never widen it**
+//! (0.27.0). `io.toml` arrives with a `git clone`, so four keys are refused there
+//! when the value written is the widening one — `policy.defaults.exec = "allow"`,
+//! `policy.defaults.net = "allow"`, `sandbox.allow_network = true`,
+//! `sandbox.force_floor = false` — and so is `${cmd:}` anywhere in that file. Each
+//! is accepted in `io.local.toml` and in the user scope. This does not claim that a
+//! cloned repository is safe: `[[mcp]]` still names a command and the boundary
+//! against the agent is still the [`Policy`] the caller loaded.
 //!
 //! ```
 //! use io_harness::Config;
