@@ -1,0 +1,18 @@
+cargo package --locked
+tests/shell.rs
+
+to proceed despite this and include the uncommitted changes, pass the `--allow-dirty` flag
+
+tarball: 173 files, 919811 bytes
+forbidden entries:
+  \.ultraship -> 0
+0
+  \.github -> 0
+0
+  fixtures/gen-0\.22\.0 -> 0
+0
+  fixtures/links-consumer -> 0
+0
+  exact .env basename -> 0
+  (.env.example ships deliberately; it holds only empty placeholders)
+secret sweep: CARGO_REGISTRY_TOKEN and OPENROUTER_API_KEY appear in no tracked file and not in the tarball

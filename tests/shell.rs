@@ -164,6 +164,61 @@ async fn a_sequence_with_cd_runs_every_stage_in_the_right_directory() {
 }
 
 #[tokio::test]
+async fn the_trace_carries_one_authorisation_per_stage_and_per_redirect() {
+    // F1's actual content. A trace that recorded only "shell exit 0" would leave
+    // an operator unable to say which stage was allowed to run, or under which
+    // rule — which is the whole difference between checking a line and checking
+    // the string it was written as.
+    let dir = fixture();
+    let policy = Policy::permissive().layer("test").allow_exec("rustc*");
+    let (store, result) = run_line(
+        &dir,
+        policy,
+        "rustc --version | rustc --print sysroot > out/log.txt",
+    )
+    .await;
+
+    let events = store.events(result.run_id).unwrap();
+    let execs: Vec<_> = events
+        .iter()
+        .filter(|e| e.act == "exec" && e.kind == "decision")
+        .collect();
+    let writes: Vec<_> = events
+        .iter()
+        .filter(|e| e.act == "write" && e.kind == "decision")
+        .collect();
+
+    // Two stages, each authorised on its own. The program and the joined argv are
+    // both checked, so each stage contributes more than one row; what matters is
+    // that both stages are represented rather than the line as a whole.
+    assert!(
+        execs.iter().any(|e| e.target.contains("--version")),
+        "the first stage is named in the trace: {:?}",
+        execs.iter().map(|e| &e.target).collect::<Vec<_>>()
+    );
+    assert!(
+        execs.iter().any(|e| e.target.contains("--print")),
+        "the second stage is named in the trace: {:?}",
+        execs.iter().map(|e| &e.target).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        writes.len(),
+        1,
+        "the redirect target is authorised as a write: {writes:?}"
+    );
+    assert!(
+        writes[0].target.contains("log.txt"),
+        "and it names the path: {:?}",
+        writes[0].target
+    );
+    // The rule and layer that allowed it, not merely that something did.
+    assert!(
+        execs.iter().any(|e| e.rule.is_some() && e.layer.is_some()),
+        "an authorisation names the deciding rule and layer: {execs:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_pipeline_wires_one_stage_into_the_next() {
     let dir = fixture();
     // Two commands with different output. Only the LAST stage's stdout is

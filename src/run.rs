@@ -5320,6 +5320,7 @@ async fn dispatch(
                         }
                         Gated::Go { remember, .. } => remembered.extend(remember),
                     }
+                    record_shell_authorisation(ws, store, run_id, step, Act::Read, &rel)?;
                 } else {
                     // The same two targets `exec` checks, per sub-command rather
                     // than per call: the program alone, which is what
@@ -5356,6 +5357,7 @@ async fn dispatch(
                             }
                             Gated::Go { remember, .. } => remembered.extend(remember),
                         }
+                        record_shell_authorisation(ws, store, run_id, step, Act::Exec, &target)?;
                     }
                 }
 
@@ -5384,6 +5386,7 @@ async fn dispatch(
                         }
                         Gated::Go { remember, .. } => remembered.extend(remember),
                     }
+                    record_shell_authorisation(ws, store, run_id, step, act, &rel)?;
                 }
             }
 
@@ -6191,6 +6194,57 @@ enum Gated {
     Refused { decision: String, obs: String },
     /// An approver deferred the decision.
     Paused { request_id: i64 },
+}
+
+/// Record that one sub-command or one redirect target of a `shell` line was
+/// authorised, with the rule and layer that authorised it.
+///
+/// The crate does not otherwise record allows. A [`PolicyEvent`] is written for a
+/// refusal and for an approver's decision, and a permitted read or write leaves
+/// no row — which is right for a single-target tool, where the step's own
+/// decision already says what happened to the one thing it touched.
+///
+/// A `shell` line is not a single target. `a | b > out` is three authorisations,
+/// and a trace that recorded only "shell exit 0" would leave an operator unable
+/// to answer which stage was allowed to run and under which rule. So this is the
+/// one place allows are recorded, and it is recorded per stage rather than per
+/// line because per line is the thing that carries no information.
+///
+/// **This is a record, not a second boundary.** [`gate`] has already decided and
+/// has already refused or paused if it was going to; re-evaluating here would be
+/// a check that could disagree with the one that actually held. The verdict is
+/// recomputed only to name the deciding rule, which `gate` does not hand back,
+/// and the match below mirrors `gate`'s own dispatch exactly so the rule named is
+/// the rule that decided.
+fn record_shell_authorisation(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    act: Act,
+    target: &str,
+) -> Result<()> {
+    let verdict = match act {
+        Act::Exec | Act::Net => ws.policy().check(act, target),
+        Act::Read | Act::Write if Path::new(target).is_absolute() => ws.policy().check(act, target),
+        Act::Read | Act::Write => ws.check_path(act, target),
+    };
+    // Only an allow. A refusal already has its own row from `gate`, and an
+    // approver's decision already has one too; writing a second would double-count
+    // the same act in a trace an operator reads as a list of what happened.
+    if verdict.effect != Effect::Allow {
+        return Ok(());
+    }
+    let mut ev = PolicyEvent::decision(
+        step,
+        format!("{act:?}").to_lowercase(),
+        target,
+        "allow",
+        "policy",
+    );
+    ev.rule = verdict.rule;
+    ev.layer = verdict.layer;
+    store.record_event(run_id, &ev)
 }
 
 /// The workspace-relative form of an absolute path the shell planner resolved.
