@@ -16,13 +16,17 @@ outcome:
     control flow are named refusals with reasons, not guesses. Nothing in a refused line runs, and a
     pipeline whose second stage is denied does not execute its first.
 
-    Long-running work stops being unrepresentable. A dev server, a log tail or a twenty-minute build
-    is started through a process handle, polled for incremental output, and killed — instead of
-    blocking one step of the loop until a 900-second timeout decides for it. On Windows those
-    handles are backed by a Job Object, which is also the containment the sandbox has been missing:
-    memory, CPU and active process count become real bounds on a Windows run rather than mapped
-    fields nothing applies, and `SandboxLimits::max_processes` becomes enforced for the first time on
-    any platform.
+    Windows gains the containment the sandbox has been missing. Memory, CPU and active process count
+    become real bounds on a Windows run rather than mapped fields nothing applies, the whole process
+    tree dies with the job, and `SandboxLimits::max_processes` becomes enforced for the first time on
+    any platform. What it does not become is "native" in the sense the macOS and Linux rows of the
+    platform table mean: a Job Object contains resources and nothing else.
+
+    **Amended by `US-IO-HARNESS-0.24.0-I01`:** this paragraph promised that long-running work — a
+    dev server, a log tail, a twenty-minute build — would be started, polled and killed through
+    process handles instead of blocking a step until the timeout. Handles are deferred to 0.25.0 and
+    that promise is withdrawn from this release rather than left standing. The Job Object stays,
+    because it bounds every sandboxed run whether or not anything long-running is holding it.
 
     And a directory can be listed. `find` walks the whole tree against a glob; there is no way to ask
     what is in one directory, which is the first thing anyone does in an unfamiliar repository.
@@ -49,12 +53,16 @@ outcome:
     feature that is consistent with the crate's claim, and it is the reason this is a release rather
     than an afternoon.
 
-    The Windows half is not a separate ambition. Killing a process handle on Windows without a Job
+    The Windows half was not a separate ambition. Killing a process handle on Windows without a Job
     Object leaks the grandchildren: a shell that spawns a package manager that spawns a runtime
     leaves orphans that outlive the run, on the one platform where there is no process group to kill.
-    The handle feature is not correct on Windows without it, so it lands here rather than in a
-    release of its own — and it brings with it the first real resource containment that platform has
-    had.
+    That is why the two were planned together.
+
+    **Amended by `US-IO-HARNESS-0.24.0-I01`:** the handles moved and the Job Object did not, because
+    the dependency runs one way. Handles need the job; the job does not need handles. It ships here
+    on its own merits — it is the first real resource containment that platform has had, and it
+    bounds every sandboxed run, not only the long-running ones. It also means 0.25.0's handles
+    arrive on a platform that can already contain them.
 
     The positioning fix rides here because this release already breaks. A harness whose primary
     signature demands a checkable success criterion reads as a verified-task runner no matter what
@@ -68,12 +76,15 @@ outcome:
     claim mean something: the same line with one stage denied is refused whole, nothing executes, and
     the refusal names the stage and the rule.
 
-    For the handles: a dev server started, polled twice with incremental output, killed, and its
-    whole process tree confirmed gone — on Windows by a Job Object, verified by a grandchild that
+    For containment: a sandboxed run whose command spawns a child that spawns a grandchild is
+    stopped and all three are gone — on Windows by the Job Object, verified by a grandchild that
     outlives a naive kill and does not outlive this one.
 
     For the boundary that was always claimed and never held: a process that tries to exceed
     `max_processes` on Windows and cannot.
+
+    **Amended by `US-IO-HARNESS-0.24.0-I01`:** the handle-based form of the first item — a dev
+    server started, polled twice and killed — goes to 0.25.0 with the handles.
 scope:
   included:
   - >
@@ -116,19 +127,6 @@ scope:
     position is an external program checked against `Act::Exec`. No other builtin is implemented; a
     word that looks like one and is not on disk fails as a missing program, which is honest.
   - >
-    Process handles: `shell_start`, `shell_poll` and `shell_kill`. `shell_start` parses and checks a
-    command line exactly as `shell` does, then spawns it detached from the step, returning an opaque
-    handle. `shell_poll` returns output produced since the last poll plus the handle's state.
-    `shell_kill` terminates the whole tree. Handles are recorded in the store so the trace shows what
-    was started, what it produced and how it ended, and they are bounded — a cap on concurrent live
-    handles per run, and a handle whose run ends is killed rather than leaked.
-  - >
-    Resume semantics for handles, stated rather than discovered. A handle recorded by a previous
-    process points at a PID that no longer belongs to it, and a PID may have been reused. On resume
-    every pre-existing handle is marked orphaned and never re-attached, polled or killed; the model
-    is told the handle is gone and why. This is the one place a process handle can cause data damage
-    rather than an error, so it is scope rather than a limitation.
-  - >
     A `list_dir` tool: one directory, one level, entries with type and size, checked against
     `Act::Read` by path. `find` (`src/tools/workspace.rs:223`) stays as it is — a whole-tree glob is
     a different question from "what is in here" and answering the second with the first is why the
@@ -161,13 +159,21 @@ scope:
     example (`README.md:32-62`) and `docs/guide/permissions.md:12-26` lead with `Session` instead of
     `run_with`; `run_with` stays, documented as the one-shot form.
   - >
-    The rider: `#[non_exhaustive]` on `CompletionRequest` (`src/provider/mod.rs:343`),
-    `CompletionResponse` (`src/provider/mod.rs:553`), `EventKind` (`src/observe.rs:289`) and
-    `Backend` (`src/sandbox.rs:79`). None of the four carries it today and `src/` contains no use of
-    the attribute at all. 0.22.0 already broke literals of the first three and this release adds
-    variants to `EventKind` and gives `Backend` a value it has never returned, so this is the
-    cheapest moment this will ever be — and 0.25.0's AppContainer variant is the next one that would
-    otherwise break an exhaustive match.
+    The rider: `#[non_exhaustive]` on the public enums this release changes — `EventKind`
+    (`src/observe.rs:289`), `Backend` (`src/sandbox.rs:79`) and `Cap`, which gains
+    `Cap::Processes` here. None carries it today and `src/` contains no use of the attribute at
+    all. This release adds variants to all three and 0.25.0's AppContainer adds another, so this is
+    the last release in which adding one breaks an exhaustive match.
+
+    **Amended by `US-IO-HARNESS-0.24.0-I01`:** `CompletionRequest` and `CompletionResponse` were in
+    this rider and are no longer. On an enum the attribute costs a consumer one wildcard arm and
+    protects them from every future variant. On these two structs it does the reverse — it forbids
+    struct-literal construction, including `..Default::default()`, from outside the crate, and
+    `Provider::complete` must *return* a `CompletionResponse`. Applying it produced 11
+    `error[E0639]`s across 10 files in `tests/`, which is a separate crate and so is what a consumer
+    sees. Keeping it would have required a builder API this contract does not specify, in exchange
+    for avoiding a break whose fix is mechanical. `Cap` joins the rider in their place because this
+    release breaks it anyway.
   - >
     New `EventKind` variants for the shell and the handles, so a refused sub-command, a started
     handle, a poll and a kill are observable through the channel an operator already reads rather
@@ -212,12 +218,16 @@ scope:
     touches Windows containment only.
   fallback_scope:
   - >
-    The shell tool with its parser and refusal set, `list_dir`, the positioning fix and the
-    `#[non_exhaustive]` rider. Process handles and the Windows Job Object drop **together** into
-    0.25.0, because they are one piece of machinery: handles without a job are incorrect on Windows,
-    and a job with nothing long-running to contain is a solution to a problem this release would no
-    longer have. That is still a coherent release — the capability gap that blocks non-coding work is
-    closed, the boundary is checked, and the API break happens once.
+    The shell tool with its parser and refusal set, `list_dir`, the Windows Job Object, the
+    positioning fix and the `#[non_exhaustive]` rider — that is, everything except process handles.
+
+    **Restated by `US-IO-HARNESS-0.24.0-I01`, and adopted.** The original fallback dropped process
+    handles and the Job Object *together*, on the reasoning that they are one piece of machinery.
+    That coupling runs one way only: handles are incorrect on Windows without a job, because
+    killing one leaks the grandchildren. The reverse does not hold — a job with nothing
+    long-running to contain still bounds every sandboxed run on a platform where nothing bounded
+    them before. The Job Object is built and the handles are not, so the fallback that was actually
+    available is the smaller one, and it is the one taken.
 
     What may not drop is the positioning fix. It is the smallest piece of work in the release and the
     only one whose cost doubles if it moves: shipping a break now and the positioning break later
@@ -249,30 +259,27 @@ acceptance:
     0.23.0 proved its cross-version tests — by sabotage: the allowlist is widened by one byte, the
     property test must fail, and the change is reverted.
   - >
-    F5 — a process handle starts, polls and dies. A command producing output over time is started,
-    polled twice returning incremental output with no duplication and no loss across the two polls,
-    then killed; the handle's terminal state and its full output are readable from the store
-    afterwards. A handle left live when its run ends is killed, not leaked, and that is asserted by
-    checking the process is gone rather than by trusting the code path.
-  - >
-    F6 — killing kills the tree, including on Windows. A handle whose command spawns a child that
-    spawns a grandchild is killed, and all three are gone. The negative control is the one that makes
-    the Job Object worth its cost: the same test with the job disabled must leave the grandchild
-    running on Windows, so the criterion proves containment rather than coincidence.
-  - >
-    F7 — handles do not survive a process boundary, and say so. A run with a live handle is
-    checkpointed and the process exits; on resume the handle is reported orphaned with a reason, is
-    never polled or killed, and no PID is signalled. The negative control is a resumed run whose
-    recorded PID has been reused by an unrelated live process, which must not be touched.
+    F6 — killing kills the tree, including on Windows. A sandboxed run whose command spawns a child
+    that spawns a grandchild is stopped, and all three are gone. The negative control is the one
+    that makes the Job Object worth its cost: the same test with the job disabled must leave the
+    grandchild running on Windows, so the criterion proves containment rather than coincidence.
+    **Amended by `US-IO-HARNESS-0.24.0-I01`:** originally written in terms of killing a process
+    *handle*; handles are deferred to 0.25.0, so this is asserted through the sandbox's own spawn
+    path, which closes the same job handle by the same mechanism. The handle-initiated form of this
+    criterion goes to 0.25.0 with the handles.
   - >
     F8 — `max_processes` is enforced on Windows, for the first time on any platform. A command that
     attempts to exceed the configured active-process limit is stopped by the job rather than by the
     wall clock, and the failure is attributed to the process limit in the trace. `Backend::
     WindowsJobObject` is what the sandbox reports on that platform, replacing `PortableFloor`.
   - >
-    F9 — memory and CPU are real bounds on Windows. A child exceeding the job's memory limit is
-    terminated by the job; a child exceeding its CPU allotment likewise. Both are asserted against
-    the recorded cap reason, so a wall-clock timeout cannot pass as either.
+    F9 — memory and CPU are real bounds on Windows. A child exceeding its CPU allotment is
+    terminated by the job. A child exceeding the job's memory limit is refused the memory:
+    **amended by `US-IO-HARNESS-0.24.0-I01`**, because `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes the
+    offending allocation fail rather than terminating the process, and the original wording
+    described something the Win32 API does not do. What must be shown is unchanged in force — the
+    process is never permitted to hold more than the cap, and the outcome is asserted against the
+    recorded cap reason so a wall-clock timeout cannot pass as either.
   - >
     F10 — `list_dir` lists one level and no more. A directory containing a subdirectory containing a
     file returns the subdirectory and not the file; a path outside the workspace is refused; a
@@ -280,8 +287,13 @@ acceptance:
   - >
     F11 — the positioning fix compiles and defaults correctly. `TaskContract::workspace(goal, root)`
     takes two arguments and yields `Verification::None`; `.with_verification(v)` sets it; the README's
-    first example and `docs/guide/permissions.md`'s first example both lead with `Session` and both
-    compile as doctests.
+    first example and `docs/guide/permissions.md`'s first example both lead with `Session`.
+    **Amended by `US-IO-HARNESS-0.24.0-I01`:** the original clause also required both to "compile as
+    doctests", which is false of this repository — there is no `include_str!` of the README into the
+    crate root and `cargo test --doc` compiles only `///` and `//!` comments under `src/`. The
+    markdown is checked as text by `tests/readme.rs`, `tests/guide_pages.rs` and
+    `tests/docs_drift.rs`. Making the clause true would mean changing how the crate documents
+    itself, which is not this release's work.
   - >
     F12 — the four types carry `#[non_exhaustive]` and the breaks are documented to the same standard
     0.23.0 held. `docs/public-api.txt` reflects the surface, `tests/public_api.rs` passes against it,

@@ -538,6 +538,15 @@ versions:
     status: planned
   - version: 0.25.0
     outcome: >
+      Long-running work stops being unrepresentable. A dev server, a log tail or a twenty-minute
+      build is started through a process handle, polled for incremental output, and killed —
+      instead of blocking one step of the loop until a 900-second timeout decides for it. A handle
+      recorded by a previous process is orphaned on resume and never re-attached, polled or
+      signalled, because a recorded PID may since have been reused by something unrelated and
+      signalling it is the one way this crate could damage something outside its workspace. Moved
+      here from 0.24.0 by `US-IO-HARNESS-0.24.0-I01`; the Windows Job Object they need already
+      shipped in 0.24.0, so they arrive on a platform that can contain them.
+
       The agent stops guessing at symbol names in a large repository. An LSP client gives it
       goto-definition, references and diagnostics from the same language server a human's editor
       talks to, so "where is this defined" and "what breaks if I change it" are answered by the

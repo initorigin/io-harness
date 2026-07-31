@@ -1,34 +1,10 @@
 product: io-harness
 version: 0.24.0
-execution_state: BLOCKED
+execution_state: DEVELOPING
 checkpoint: null
-blockers:
-- 'F11 cannot be satisfied as written. Its clause ''both lead with `Session` and both compile as doctests''
-  is false of this repository: the README and guide fences are not compiled doctests — there is no `include_str!`
-  of README.md into the crate root, and `cargo test --doc` covers only `///` and `//!` comments in src/.
-  Both examples were made correct Rust and are covered by the text-level tests that do exist (`tests/readme.rs`,
-  `tests/guide_pages.rs`, `tests/docs_drift.rs`). Either the criterion drops the doctest clause, or
-  the release takes on pulling the README into the crate root, which changes how the crate documents
-  itself and is not in scope.'
-- 'The `#[non_exhaustive]` rider cannot be completed on `CompletionRequest` and `CompletionResponse`
-  without a scope decision. Measured, not argued: applying it yields 11 `error[E0639]: cannot create
-  non-exhaustive struct using struct expression` across 10 files in `tests/`, a separate crate and therefore
-  what a consumer sees; functional-update syntax is blocked too. `Provider::complete` must return a
-  `CompletionResponse`, so the attribute leaves the crate''s primary extension point constructible only
-  by `default()`-then-assign or by a public builder API the contract does not specify. The enums (`EventKind`,
-  `Backend`, `Cap`) are done and applied with zero breakage.'
-- The contract's fallback_scope no longer describes a reachable state. It says process handles and the
-  Windows Job Object 'drop TOGETHER into 0.25.0, because they are one piece of machinery'. The Job Object
-  has landed and is complete; process handles (T06, T07) are not started. Dropping handles alone is
-  a coherent release and is what the evidence now supports, but it is not the fallback as written, and
-  F5, F7 and the handle half of F6 go with them.
-- F9's memory clause does not describe what Windows does. It says 'a child exceeding the job's memory
-  limit is terminated by the job'; `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes the allocation FAIL rather
-  than terminating the process, so a payload over the cap typically dies of its own failed allocation.
-  Literal termination would need a job completion port and a parked thread per run. The criterion needs
-  rewording to what the mechanism actually guarantees.
+blockers: []
 release_fit:
-  assessment: uncertain
+  assessment: probable
   reasons:
   - 'No constraints are recorded for this release — `ultraship constraints` had no active release to
     attach them to at plan time and the owner has supplied no time, budget or capacity figure. The assessment
@@ -60,6 +36,13 @@ release_fit:
     not a quiet trim.
 
     '
+  - 'Reassessed to `probable` after `US-IO-HARNESS-0.24.0-I01`. The two subsystems that made this `uncertain`
+    have resolved in opposite directions: the Job Object is built and type-checked under the Windows
+    target, and the process-handle registry — the riskiest remaining work, where PID reuse makes the
+    naive implementation dangerous rather than merely wrong — is deferred. What is left to finish is
+    documentation, a live provider run and the three-OS CI round trip. It is not `high` because F6,
+    F8 and F9 have still never executed: no Win32 path has run on any machine, and the first Windows
+    CI run is their only verification.'
   major_cost_drivers:
   - 'Proving the shell parser''s refusal set closed rather than writing it. The allowlist lexer is a
     few hundred lines; the property test over generated input, and the sabotage runs that prove it non-vacuous,
@@ -79,4 +62,6 @@ release_fit:
     and the compiled doctests in `docs/`.
 
     '
-  recommended_scope_change: null
+  recommended_scope_change: 'Adopted. `US-IO-HARNESS-0.24.0-I01` defers process handles to 0.25.0, which
+    is a restatement of the recorded fallback rather than the fallback as written: the Job Object stays,
+    because handles need it and it does not need them.'
