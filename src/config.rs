@@ -612,7 +612,7 @@ impl Config {
     ///     [[provider]]
     ///     kind = "anthropic"
     ///     model = "claude-sonnet-4"
-    ///     api_key = "${env:HOME}"
+    ///     api_key = "sk-written-here-or-left-out-for-ANTHROPIC_API_KEY"
     /// "#).unwrap();
     ///
     /// assert!(matches!(config.provider_spec(), Some(ProviderSpec::Anthropic { .. })));
