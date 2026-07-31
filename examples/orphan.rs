@@ -17,10 +17,10 @@
 //!   can tell "the kill reached the top" from "the kill reached the leaf".
 //! - `orphan --middle <pidfile>` starts the leaf and returns immediately. It is
 //!   alive for milliseconds and its only job is to stop being alive.
-//! - `orphan --leaf <pidfile> <middle-pid>` waits until it has actually been
-//!   reparented — until the kernel says its parent is no longer the middle — and
-//!   only then writes its own pid to `<pidfile>` and runs forever. The wait is
-//!   what makes the fixture deterministic: when the pid file appears, the
+//! - `orphan --leaf <pidfile> <middle-pid>` waits until the middle really is
+//!   gone (see [`orphaned`], which asks a different question on each platform)
+//!   and only then writes its own pid to `<pidfile>` and runs forever. The wait
+//!   is what makes the fixture deterministic: when the pid file appears, the
 //!   parent/child link a walk would have followed is provably gone, so a test
 //!   that kills after reading it is not racing the middle's exit.
 //!
@@ -31,20 +31,28 @@
 //! happened. Comparing against the pid it was told to expect has no such state
 //! in it: the leaf is orphaned exactly when its parent is no longer that pid.
 //!
-//! Unix only, and it says so rather than pretending: the reparenting this turns
-//! on is a POSIX behaviour, `getppid` is how it is observed, and the containment
-//! it exercises is a process group. The Windows answer to the same problem is a
-//! Job Object and is a different fixture.
+//! Both platforms since 0.26.0, because both have the gap and neither has the
+//! same mechanism for it. The shape of the chain is identical; only the leaf's
+//! definition of "my parent is gone" differs, and it differs because the
+//! operating systems genuinely do:
+//!
+//! - **unix** — the leaf is *reparented* to init, so `getppid` changing away from
+//!   the middle's pid is a direct observation of the event that breaks a table
+//!   walk. The containment that closes it is a process group.
+//! - **Windows** — there is no reparenting and no process group. A process
+//!   carries the pid of whatever created it forever, dead or not, which is
+//!   exactly why `taskkill /T` cannot reach the leaf: it walks from the top to a
+//!   middle that is no longer in the table and stops there. So the leaf waits for
+//!   the middle to *leave the process table* instead, which is the same moment
+//!   observed a different way. The containment that closes it is a Job Object.
 //!
 //! Run directly rather than as a test: `cargo run --example orphan /tmp/leaf.pid`.
 
 /// How often the leaf asks whether it has been reparented yet, and how long the
 /// two surviving processes sleep between doing nothing. Short enough that a test
 /// is not waiting on it, long enough that neither process is a busy loop.
-#[cfg(unix)]
 const POLL_MS: u64 = 20;
 
-#[cfg(unix)]
 fn main() {
     let mut args = std::env::args().skip(1);
     let first = args.next().unwrap_or_default();
@@ -62,7 +70,7 @@ fn main() {
                 .next()
                 .and_then(|a| a.parse().ok())
                 .expect("--leaf takes the pid of the process that started it");
-            while std::os::unix::process::parent_id() == middle {
+            while !orphaned(middle) {
                 std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
             }
             announce(&pidfile);
@@ -89,7 +97,6 @@ fn main() {
 /// all. The zombie that leaves behind is welcome — a table walk from the top
 /// process finds a dead middle with no children, which is exactly the misleading
 /// picture a real dev-server tree presents to the kill this test is about.
-#[cfg(unix)]
 #[allow(clippy::zombie_processes)]
 fn spawn_self(args: &[&str]) {
     let exe = std::env::current_exe().expect("a running program knows its own path");
@@ -105,7 +112,6 @@ fn spawn_self(args: &[&str]) {
 /// reader polling for the file would otherwise be able to open it between the
 /// create and the write and parse an empty string as a pid. `rename` within one
 /// directory is atomic, so the file either is not there or is complete.
-#[cfg(unix)]
 fn announce(pidfile: &str) {
     let tmp = format!("{pidfile}.partial");
     std::fs::write(&tmp, std::process::id().to_string())
@@ -122,7 +128,6 @@ fn announce(pidfile: &str) {
 /// failure between that assertion and its cleanup leaks by construction. Left
 /// alone these accumulate across runs. Far longer than any test that uses this,
 /// short enough that a leak is measured in minutes rather than until reboot.
-#[cfg(unix)]
 fn forever() -> ! {
     let started = std::time::Instant::now();
     while started.elapsed() < std::time::Duration::from_secs(300) {
@@ -131,10 +136,37 @@ fn forever() -> ! {
     std::process::exit(0);
 }
 
-#[cfg(not(unix))]
-fn main() {
-    // Compiled everywhere so `cargo build --all-targets` is the same command on
-    // every host, and does nothing off unix so it cannot be mistaken for a
-    // fixture that proves something here. See the module docs.
-    eprintln!("the orphan fixture exercises POSIX reparenting and process groups; it does nothing on this platform");
+/// Has the process that started this one gone?
+///
+/// The two implementations observe the same instant by different means, because
+/// the platforms disagree about what happens to a child whose parent dies. See
+/// the module docs.
+#[cfg(unix)]
+fn orphaned(middle: u32) -> bool {
+    // Reparenting: the kernel moves this process to init, so the answer is
+    // simply that its parent is no longer the one it was told to expect.
+    std::os::unix::process::parent_id() != middle
+}
+
+#[cfg(windows)]
+fn orphaned(middle: u32) -> bool {
+    // No reparenting to observe — this process's recorded parent stays the
+    // middle's pid forever, which is precisely the stale link that makes
+    // `taskkill /T` miss it. So the question is asked of the process table
+    // instead: the middle is gone when its pid is no longer in it.
+    //
+    // `tasklist` rather than `OpenProcess`, so the fixture needs no crate at all
+    // and stays a plain example. The same command answers the same question in
+    // `tests/handles.rs`.
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {middle}"), "/NH"])
+        .output();
+    match out {
+        Ok(o) => !String::from_utf8_lossy(&o.stdout).contains(&middle.to_string()),
+        // A `tasklist` that will not run answers nothing, and answering "yes,
+        // orphaned" there would publish the pid file before the scenario the
+        // test needs has happened. Keep waiting; the ceiling in `forever` bounds
+        // it either way.
+        Err(_) => false,
+    }
 }

@@ -512,12 +512,10 @@ async fn starting_past_the_cap_is_refused_and_spawns_nothing() {
 
 /// Wait for the `orphan` fixture's leaf to announce its pid, and return it.
 ///
-/// The file appearing is the fixture's signal that the leaf has been reparented
-/// — that the middle process is gone and the parent/child link from the handle
-/// to the leaf no longer exists. So this is not only how the test learns the
-/// pid, it is how the test knows the scenario it wanted has actually happened
-/// before it kills anything.
-#[cfg(unix)]
+/// The file appearing is the fixture's signal that the middle process is gone
+/// and the parent/child link from the handle to the leaf no longer exists. So
+/// this is not only how the test learns the pid, it is how the test knows the
+/// scenario it wanted has actually happened before it kills anything.
 async fn leaf_pid(pidfile: &std::path::Path) -> u32 {
     for _ in 0..200 {
         if let Ok(text) = std::fs::read_to_string(pidfile) {
@@ -533,13 +531,12 @@ async fn leaf_pid(pidfile: &std::path::Path) -> u32 {
     );
 }
 
-/// Give a signal time to be delivered before asking whether it worked.
+/// Give a kill time to take effect before asking whether it worked.
 ///
-/// `SIGKILL` is not synchronous with the `kill` that sent it, and a test that
-/// checks immediately is a test that fails on a loaded runner for a reason that
-/// has nothing to do with the code. Polls rather than sleeps a fixed time, so
-/// the usual case costs one poll.
-#[cfg(unix)]
+/// Neither `SIGKILL` nor closing a job handle is synchronous with the call that
+/// did it, and a test that checks immediately is a test that fails on a loaded
+/// runner for a reason that has nothing to do with the code. Polls rather than
+/// sleeps a fixed time, so the usual case costs one poll.
 async fn gone_within(pid: u32, tries: u32) -> bool {
     for _ in 0..tries {
         if !alive(pid) {
@@ -550,7 +547,11 @@ async fn gone_within(pid: u32, tries: u32) -> bool {
     false
 }
 
-#[cfg(unix)]
+/// Both platforms since 0.26.0. The claim is identical — a kill reaches a
+/// grandchild whose parent has already exited — and only the mechanism under it
+/// differs: a process group on unix, a Job Object on Windows. The Windows half
+/// is the clause `US-IO-HARNESS-0.25.0-I01` withdrew from 0.25.0's F2, carried
+/// here and now met.
 #[tokio::test]
 async fn killing_a_handle_kills_a_grandchild_whose_parent_already_exited() {
     let orphan = example_binary("orphan");
@@ -646,6 +647,56 @@ async fn without_a_process_group_the_grandchild_survives() {
     // SAFETY: as above; the leaf pid was published by the fixture moments ago
     // and was still alive at the assertion.
     unsafe { libc::kill(leaf as i32, libc::SIGKILL) };
+}
+
+/// The Windows negative control, and the reason the Job Object is worth its
+/// unsafe code.
+///
+/// Same fixture, same shape, containment switched off — spawned straight from
+/// here, so nothing puts it in a job — and killed the way `kill_tree` kills on
+/// this platform: `taskkill /F /T /PID`. That walks the parent/child links in the
+/// process table, and the middle is already out of the table by the time the pid
+/// file exists, so the walk stops at the top and the grandchild lives.
+///
+/// Without this, the test above would pass on any kill that happened to work and
+/// would be evidence of nothing.
+#[cfg(windows)]
+#[tokio::test]
+async fn without_a_job_object_taskkill_leaves_the_grandchild() {
+    let orphan = example_binary("orphan");
+    let scratch = tempfile::tempdir().unwrap();
+    let pidfile = scratch.path().join("leaf.pid");
+
+    let mut top = std::process::Command::new(&orphan)
+        .arg(&pidfile)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the orphan fixture starts");
+    let leaf = leaf_pid(&pidfile).await;
+
+    // The old kill, in full, and reproduced here rather than called because it
+    // is crate-private. `/T` is the tree flag — this is the strongest kill the
+    // platform offers short of a job, which is exactly the point.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &top.id().to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    let _ = top.wait();
+
+    assert!(
+        !gone_within(leaf, 6).await,
+        "the grandchild {leaf} died to `taskkill /T` alone, so the test above would pass \
+         even with the job object removed and is not evidence of anything"
+    );
+
+    // Do not leave the thing this test just proved is unkillable-by-tree running.
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/PID", &leaf.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 // ---------------------------------------------------------------------------
