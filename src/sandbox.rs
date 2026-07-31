@@ -890,7 +890,7 @@ fn set_rlimit(resource: u32, value: Option<u64>) -> std::io::Result<()> {
 /// neither signals nor `ps`, so it uses the tree kill the OS itself ships,
 /// `taskkill /T` — a system utility, not a new dependency. Best-effort by
 /// design: a process that is already gone is a success, not an error.
-fn kill_tree(pid: Option<u32>) {
+pub(crate) fn kill_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     #[cfg(unix)]
     {

@@ -16,6 +16,8 @@ pub mod documents;
 pub mod exec;
 pub mod fs;
 pub mod git;
+/// Long-running processes a run owns beyond the call that started them.
+pub(crate) mod handles;
 pub mod shell;
 pub mod workspace;
 
