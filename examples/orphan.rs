@@ -113,12 +113,22 @@ fn announce(pidfile: &str) {
     std::fs::rename(&tmp, pidfile).expect("the orphan fixture could not publish its pid file");
 }
 
-/// Run until something kills this process. Which is the whole test.
+/// Run until something kills this process, or until the ceiling gives up on it.
+///
+/// The ceiling exists because this fixture's whole job is to outlive its caller,
+/// so it will also outlive a caller that dies badly — a `SIGKILL`ed test binary
+/// runs no `Drop` and kills nothing it started. The negative control here is
+/// worse than most: it asserts that a grandchild SURVIVES a naive kill, so a
+/// failure between that assertion and its cleanup leaks by construction. Left
+/// alone these accumulate across runs. Far longer than any test that uses this,
+/// short enough that a leak is measured in minutes rather than until reboot.
 #[cfg(unix)]
 fn forever() -> ! {
-    loop {
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(300) {
         std::thread::sleep(std::time::Duration::from_millis(POLL_MS));
     }
+    std::process::exit(0);
 }
 
 #[cfg(not(unix))]

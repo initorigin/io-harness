@@ -47,7 +47,10 @@ fn main() {
     }
     // Silent, and still here. A handle that has finished flooding is still a
     // live process the run owns, which is the state the kill tests want.
-    loop {
+    // Bounded for the reason tick.rs states: a fixture that outlives its caller
+    // outlives a caller that died badly, and those accumulate across runs.
+    let started = std::time::Instant::now();
+    while started.elapsed() < std::time::Duration::from_secs(300) {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
 }

@@ -25,8 +25,18 @@ use std::io::Write;
 /// enough that a test waiting for three of them is not slow.
 const TICK_MS: u64 = 120;
 
+/// How long this runs before giving up on being killed.
+///
+/// A fixture whose whole job is to outlive its caller will outlive a caller that
+/// dies badly — a `SIGKILL`ed test binary runs no `Drop`, so nothing kills what
+/// it started. Left alone these accumulate across runs and quietly degrade every
+/// later one. The ceiling is far longer than any test that uses this and short
+/// enough that a leak is measured in minutes rather than until reboot.
+const CEILING: std::time::Duration = std::time::Duration::from_secs(300);
+
 fn main() {
     let limit: Option<u64> = std::env::args().nth(1).and_then(|a| a.parse().ok());
+    let started = std::time::Instant::now();
     let mut n: u64 = 0;
     loop {
         n += 1;
@@ -39,6 +49,9 @@ fn main() {
             if n >= limit {
                 return;
             }
+        }
+        if started.elapsed() > CEILING {
+            return;
         }
         std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
     }
