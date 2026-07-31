@@ -26,6 +26,152 @@ notes are produced from it.
 
 ### Security
 
+## [0.23.0] - 2026-07-31
+
+The dependency release. Nothing this crate does changes; who is allowed to call
+it does.
+
+`libsqlite3-sys` declares `links = "sqlite3"`, and cargo refuses to put two
+versions of a `links` package into one dependency graph. Every release up to
+0.22.0 pinned `rusqlite` 0.32, so a Rust program already using `rusqlite` 0.33
+or later could not add io-harness **at all**. Not a warning, not a duplicate
+symbol at link time, not a degraded build — a resolver error and no build, with
+no workaround available to the consumer. They could not patch it, feature-gate
+it, or vendor around it. They could only pick one of the two crates. This is
+the exact error that retires with this release:
+
+```text
+error: failed to select a version for `libsqlite3-sys`.
+    ... required by package `rusqlite v0.40.0`
+    ... which satisfies dependency `rusqlite = "^0.40"` of package `links-consumer v0.0.0`
+versions that meet the requirements `^0.38.0` are: 0.38.1, 0.38.0
+
+package `libsqlite3-sys` links to the native library `sqlite3`, but it conflicts with a previous package which links to `sqlite3` as well:
+package `libsqlite3-sys v0.30.0`
+    ... which satisfies dependency `libsqlite3-sys = "^0.30.0"` of package `rusqlite v0.32.0`
+    ... which satisfies dependency `rusqlite = "^0.32"` of package `io-harness v0.22.0`
+    ... which satisfies dependency `io-harness = "=0.22.0"` of package `links-consumer v0.0.0`
+Only one package in the dependency graph may specify the same links value. This helps ensure that only one copy of a native library is linked in the final binary. Try to adjust your dependencies so that only one package uses the `links = "sqlite3"` value. For more information, see https://doc.rust-lang.org/cargo/reference/resolver.html#links.
+
+failed to select a version for `libsqlite3-sys` which could resolve this conflict
+```
+
+For a crate whose first line is "embeddable in your own process", that was the
+one dependency conflict with no answer. Every release since 0.2.0 widened what
+the harness could do while this floor quietly narrowed who could call it.
+
+**Not one line of `src/` changed.** The move produced 28 compile errors and all
+28 were one root cause, described under Breaking changes below. That is the
+claim this release has to be reviewed for — that nothing behaves differently —
+and it is why nothing else ships alongside it.
+
+### Breaking changes
+
+- **BREAKING** — `Error::State(#[from] rusqlite::Error)` now carries `rusqlite`
+  0.40's error type, which is a nominally distinct type from 0.32's. This
+  affects only code that matches the variant *and* uses its payload as its own
+  `rusqlite::Error`; code that matches the variant and ignores the payload is
+  unaffected. Moving to `rusqlite` 0.40 yourself is both the fix and the point
+  of the release — it is now possible, where before it was not.
+  *Migration:* take the same `rusqlite` version this crate does.
+
+  ```toml
+  # Cargo.toml — before, and the reason the two could not coexist
+  rusqlite = "0.32"
+
+  # after
+  rusqlite = "0.40"
+  ```
+
+  ```rust,ignore
+  // Unaffected — match the variant, ignore the payload.
+  Err(Error::State(_)) => { /* the store failed */ }
+
+  // Affected — the payload is now rusqlite 0.40's type, not 0.32's.
+  Err(Error::State(e)) => inspect(e),
+  ```
+
+  `docs/CONTRACT.md` now records the intent to wrap this type so that a future
+  `rusqlite` bump stops being a break here at all. That change is deliberately
+  **not** in this release: a migration has to be reviewable for exactly one
+  property, and an error-type redesign in the same diff destroys it.
+
+- **BREAKING (MSRV)** — the minimum supported Rust version moves from **1.88 to
+  1.95**. `libsqlite3-sys` 0.38.1's build script, and `rusqlite` 0.40's own
+  source, call the std `cfg_select!` macro, stabilised in 1.95.0. Neither crate
+  publishes a `rust-version`, so cargo cannot catch this at resolve time: an
+  older toolchain fails *inside the dependency's build script* with
+  `cannot find macro cfg_select in this scope`, which reads like a broken
+  toolchain and is not one. Checked rather than assumed — 1.93 and 1.94 both
+  fail, 1.95 is the first that builds.
+  *Migration:* update your toolchain to 1.95 or later; there is no opt-out and
+  no version of the dependency that avoids it. Every `rusqlite` at or above the
+  0.40 floor carries the same requirement, and below that floor the `links`
+  collision above comes back — so the choice was this floor or that wall.
+
+  ```sh
+  rustup update stable   # 1.95.0 or later
+  ```
+
+### Added
+
+- `tests/cross_version.rs` and the committed fixtures under
+  `tests/fixtures/store-0.22.0/`: three databases written by a real 0.22.0
+  build, carrying `SQLite version 3046000` in their headers. A populated store,
+  a three-run tree stopped mid-fan-out, and a run paused awaiting a human. The
+  generator that wrote them, `tests/fixtures/gen-0.22.0/`, is pinned
+  `io-harness =0.22.0` and its lockfile is committed as evidence of the
+  dependency line that produced them.
+- `tests/fixtures/links-consumer/`, a consumer crate depending on both
+  `rusqlite` 0.40 and this one, and a CI job that builds and runs it — plus the
+  negative control that matters more: the same fixture pointed at 0.22.0 must
+  fail at resolution, and the job fails if that build succeeds. The property is
+  kept as a fixture rather than a one-time check because a future dependency
+  bump can silently break it again.
+- `examples/store_throughput.rs`, and `tests/fixtures/throughput-0.22.0/`
+  running the identical workload on the old line, so the engine bump's cost was
+  measured rather than assumed.
+
+### Changed
+
+- `rusqlite` 0.32 → **0.40.1**, `libsqlite3-sys` 0.30.1 → **0.38.1**, and the
+  bundled SQLite engine **3.46.0 → 3.53.2**. The `fallible_uint` feature is now
+  enabled: `u64`'s `ToSql` and `FromSql` impls moved behind it in `rusqlite`
+  0.38.0, and turning it on restores the same macro-generated impls, so the
+  token counters and the budget ledger keep the checked conversions they always
+  had — `ToSqlConversionFailure` above `i64::MAX` on write,
+  `FromSqlError::OutOfRange` on a negative read — instead of a hand-written
+  cast that would silently wrap. Those 28 errors were the whole migration.
+- **No new direct dependency.** The default `cargo tree` goes from **407 lines
+  to 402**: `ahash`, `hashbrown` 0.14, `zerocopy` and the `version_check` build
+  dependency drop out, `foldhash` arrives, and `hashlink` follows `rusqlite`
+  from 0.9.1 to 0.12.1. A dependency move that made the tree smaller.
+- No store migration, and no schema change of any kind. `CHECKPOINT_FORMAT`
+  stays **7**; no table is created, altered or dropped. A 0.22.0 database works
+  under 0.23.0 and a 0.23.0 database works under 0.22.0, because the bytes are
+  the same bytes. Asserted directly against the committed 0.22.0 fixtures, so a
+  silent format bump cannot pass as a successful upgrade.
+- Store write throughput is unchanged. `Store::checkpoint_step` — the hot
+  durable path, two inserts and a WAL commit — was measured on both sides of
+  the engine bump with the same workload. Order-balanced batches put the median
+  difference at +0.06%, −0.99% and +1.65%; the sign flips, against a paired
+  spread of 11–21%. The measurement rules out a regression above roughly 5% and
+  does not claim to resolve anything smaller.
+- Two engine-behaviour risks were closed by inspection rather than by hope.
+  SQLite 3.53.0 changed default floating-point rendering from 15 to 17
+  significant digits, which would matter to any float persisted as text: this
+  crate has no `REAL` column, and the only floats it computes are converted in
+  Rust before storage. And the double-quoted-string misfeature, whose default
+  has been tightening across this engine range, is unreachable — no SQL
+  statement in the crate contains a double-quoted identifier or literal.
+
+### Security
+
+- The bundled SQLite engine moves to 3.53.2, which includes the fix for the
+  WAL-reset database corruption bug. A consumer who links this crate alongside
+  their own SQLite now gets 3.53.2 in the process; that is stated rather than
+  left to be noticed.
+
 ## [0.22.0] - 2026-07-30
 
 The web release. The agent can look something up before it answers, and the run

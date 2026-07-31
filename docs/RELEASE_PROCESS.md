@@ -35,24 +35,38 @@ the CHANGELOG. The public surface governed by this is defined in
 8. Sync `develop` with `main` (`git merge --ff-only main`), so the two do not
    diverge.
 
-## Steps 4–6, by workflow
+## Steps 4–5, by workflow
 
-[`.github/workflows/release.yml`](../.github/workflows/release.yml) does steps 4,
-5 and 6 in that order. Run it from the **Actions** tab, on `main`, with the
-version (no leading `v`) and whether to publish.
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) does steps 4
+and 5. There are two ways to start it, and they differ only in which one creates
+the tag:
 
-It runs the same gate CI runs — `fmt`, `clippy --all-features`, the three test
-invocations, `cargo package --locked` — against the exact commit being released,
-then tags, cuts the Release with the CHANGELOG section as its notes, and only
-then publishes. It refuses to start when the ref is not `main`, when
-`Cargo.toml` declares a different version, when the tag already exists, or when
-the CHANGELOG has no section to quote.
+- **Push a `v*` tag.** The tag names the version and the Release is cut from the
+  commit it points at. `git tag vX.Y.Z && git push origin vX.Y.Z`.
+- **Run it from the Actions tab** (or `gh workflow run release.yml --ref main -f
+  version=X.Y.Z`), giving the version with no leading `v`. The workflow creates
+  the tag itself, pinned to the commit that passed the gate.
 
-It changes what is typed, not what is decided: a human still decides the version
-is ready and presses the button, and steps 1–3, 7 and 8 stay by hand. Publishing
-needs a `CRATES_IO_TOKEN` secret in the repository's `crates-io` environment; add
-a required reviewer to that environment if the button should ask before spending
-the irreversible step.
+Either way the same checks run first. It runs the gate CI runs — `fmt`,
+`clippy --all-features`, the three test invocations, `cargo package --locked` —
+against the exact commit being released, then cuts the Release with the CHANGELOG
+section as its notes. It refuses to start when the commit is not on `main`, when
+`Cargo.toml` declares a different version, when the Release already exists, or
+when the CHANGELOG has no section to quote.
+
+The "must be on `main`" check asks whether the *commit* is an ancestor of
+`main`, not whether the ref is `main` — the same question, and the only form of
+it that can be asked of a tag.
+
+**Step 6 is not in the workflow and must not be added to it.** `cargo publish`
+is run by hand, from a checkout of `main`, after the Release exists — always the
+last thing that happens. It is the one step of a release that cannot be
+recalled: a version can never be re-uploaded, and the only remedy is a forward
+patch plus `cargo yank`. A workflow that *could* publish is a workflow that can
+publish by mistake, so it holds no registry token and needs no environment.
+
+The workflow changes what is typed, not what is decided: a human still decides
+the version is ready and presses the button, and steps 1–3 and 6–8 stay by hand.
 
 ## Why the CHANGELOG drives release notes
 

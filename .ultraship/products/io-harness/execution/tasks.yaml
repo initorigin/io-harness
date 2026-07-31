@@ -1,425 +1,433 @@
 product: io-harness
-version: 0.22.0
+version: 0.23.0
 tasks:
-  - id: US-IO-HARNESS-0.22.0-T01
+  - id: US-IO-HARNESS-0.23.0-T01
     summary: >
-      The vendor-neutral declaration and its two response types: `src/web.rs` with `WebAccess` and
-      `Citation`, `CompletionRequest::web`, `CompletionResponse::citations`, `TaskContract::with_web`,
-      and the re-exports. Everything off by default, so the types existing changes no run.
+      Move the dependency: `rusqlite` 0.32 to 0.40.1 with `bundled`, plus the `fallible_uint` feature
+      that carries the `u64` `ToSql`/`FromSql` impls from 0.38.0 onward. Record the `cargo tree` line
+      count either side and re-check the MSRV against the 1.88 floor.
     why_required: >
-      Every other task in this release either fills these types or reads them. Without one neutral
-      declaration the three providers would each grow their own configuration, which is the divergence
-      the release exists to prevent.
+      This is the release. Everything else in it exists to prove this move changed no behaviour, and
+      nothing else can be attempted until the crate compiles against the new line.
     status: done
     depends_on: []
     acceptance_criteria:
       - >
-        F9 — an out-of-tree provider is unaffected. A `Provider` implementation written before
-        0.22.0 that ignores `request.web` compiles and runs unchanged, its responses carry no
-        citations, and the run completes — a provider that cannot search is honestly non-searching,
-        not an error.
+        NF2 — no new direct dependency. Whatever the tree gains transitively through `rusqlite` is
+        recorded as a `cargo tree` line count before and after, in the changelog, per the discipline this
+        project has kept since 0.1.0.
       - >
-        NF2 — exactly three break sites, each marked, and no others. `CompletionRequest` gains `web:
-        Option<WebAccess>`; `CompletionResponse` gains both `citations: Vec<Citation>` and
-        `server_tools: Vec<ServerToolCall>`, because a call that failed inside an HTTP 200 cannot be
-        represented by the citations it did not produce; `EventKind` gains `ServerToolUsed`. Nothing
-        is removed or renamed, no existing signature changes, and every other item in
-        `docs/public-api.txt` keeps its meaning. Each break is fixed by `..Default::default()` or a
-        `_` arm, and the changelog carries a migration snippet for each.
+        OP1 — MSRV is re-checked and stated. If `rusqlite` 0.40 or anything it pulls raises the floor
+        above 1.88, the new number goes in `Cargo.toml` with the same honest comment the existing floor
+        carries, naming which dependency set it.
     files:
-      - src/web.rs
-      - src/provider/mod.rs
-      - src/contract.rs
-      - src/lib.rs
+      - Cargo.toml
+      - Cargo.lock
     evidence:
       - >
-        src/web.rs — `WebAccess`, `Citation` and `ServerToolCall`, all `Default`-off, all
-        with worked examples. `CompletionRequest::web`, `CompletionResponse::citations` and
-        `CompletionResponse::server_tools`, `TaskContract::with_web`, and the three re-
-        exports in `src/lib.rs` with their lines in `docs/public-api.txt`.
+        `rusqlite` 0.32 to 0.40.1, `libsqlite3-sys` 0.30.1 to 0.38.1, bundled SQLite 3.46.0 to 3.53.2.
+        0.40.1 was the newest published when development started, per the owner's newest-at-development
+        decision; 0.40 was the floor, not the target.
       - >
-        DEVIATION, recorded in US-IO-HARNESS-0.22.0-I01: `CompletionResponse` gained TWO
-        fields, not one. A call that failed inside an HTTP 200 cannot be represented by the
-        citations it did not produce, so `server_tools: Vec<ServerToolCall>` carries it.
-        Still three break sites; NF2 was amended to say four items across three sites.
+        The migration is two manifest lines and **no change in `src/state.rs`**. The bump produced 28
+        compile errors, all one root cause: `u64`'s `ToSql`/`FromSql` impls moved behind a new
+        `fallible_uint` feature in `rusqlite` 0.38.0. Enabling it restores the same macro-generated
+        impls, so the checked conversions are preserved exactly rather than replaced by a cast.
+        `cargo check --all-targets` is clean.
       - >
-        tests/web.rs::a_provider_that_ignores_the_declaration_still_runs — a 0.21.0-shaped
-        `Provider` that never mentions `web` compiles, runs and completes with no citations.
-        Passing.
-  - id: US-IO-HARNESS-0.22.0-T02
+        NF2 — no new direct dependency. `cargo tree` 407 lines before, **402 after**. `ahash`,
+        `hashbrown` 0.14.5, `zerocopy` and the `version_check` build dependency drop out; `foldhash`
+        0.2.0 arrives; `hashlink` 0.9.1 to 0.12.1. Measured on the same machine by stashing the
+        manifest, not quoted from a previous release.
+      - >
+        OP1 — the MSRV moved and is stated. `libsqlite3-sys` 0.38.1's build script and `rusqlite`
+        0.40's source call the std `cfg_select!` macro, stabilised in 1.95.0, and neither crate
+        publishes a `rust-version`. Verified by hand rather than assumed: `cargo +1.93` and
+        `cargo +1.94` both fail inside the build script with
+        `cannot find macro cfg_select in this scope`, `cargo +1.95` builds. `rust-version = "1.95"` in
+        `Cargo.toml` with the reason and the dependency that set it, and matching text in `README.md`,
+        `src/lib.rs` crate-root docs and `docs/CONTRACT.md` — all three checked by
+        `tests/docs_drift.rs::msrv_is_stated_and_matches_cargo_toml`, which passes.
+      - >
+        No `rusqlite` at or above the contract's 0.40 floor avoids the MSRV move, so the choice was the
+        floor or the release. Recorded because it is the one place this release makes a consumer's life
+        harder, and the contract's `risks` anticipated it.
+
+  - id: US-IO-HARNESS-0.23.0-T02
     summary: >
-      The Anthropic translation and parse: `web_search_20250305` and `web_fetch_20250910` entries in
-      `tools` carrying `max_uses` and both domain lists, the `web-fetch-2025-09-10` beta header sent
-      only when fetch is asked for, citations read off text blocks, and
-      `web_search_tool_result_error` recognised as a failure with its error code.
+      Prove a database written by 0.22.0 is fully readable by 0.23.0, through the public `Store` API,
+      with a fixture generated by a genuinely pinned 0.22.0 build rather than written by this release
+      and labelled.
     why_required: >
-      Anthropic is the provider whose server-tool shape is richest and whose failure-inside-a-200
-      object is the one the roadmap names. If this parse is naive the release ships the quiet failure
-      it was written to avoid.
+      The engine moves seven point releases and the compiler cannot check any of it. Reading back a
+      previous release's stored rows is the only evidence that the move preserved what is on disk.
     status: done
-    depends_on: [US-IO-HARNESS-0.22.0-T01]
+    depends_on: [US-IO-HARNESS-0.23.0-T01]
     acceptance_criteria:
       - >
-        F1 — a declaration reaches each vendor in that vendor's own shape, and a declaration a
-        vendor cannot carry is refused rather than trimmed. A `WebAccess` with search, fetch,
-        `max_uses` and both domain lists produces an Anthropic body carrying a `web_search_20250305`
-        and a `web_fetch_20250910` tool entry with those fields; a search-only declaration with an
-        allow-list produces an OpenAI body carrying `web_search_options` with that filter; a
-        search-only declaration with a cap produces an OpenRouter body carrying the `web` plugin
-        with its `max_results`. Asked for what it does not have — fetch on either OpenAI-wire
-        vendor, a block-list on OpenAI, any domain list on OpenRouter — the provider returns an
-        `Error::Config` naming itself and what it cannot do, before a request is sent. Asserted
-        against the built bodies and the refusals, not a live call. The negative control is `web:
-        None`, which produces bodies byte-identical to 0.21.0's for all three.
-      - >
-        F2 — the Anthropic fetch beta header is sent when fetch is asked for and not otherwise. A
-        request with `fetch: true` carries `anthropic-beta: web-fetch-2025-09-10`; a search-only
-        request carries no beta header at all.
-      - >
-        F4 — a failed search is a failure, not an empty result. A 200 response carrying a
-        `web_search_tool_result_error` with `error_code: max_uses_exceeded` produces a
-        `server_tool_calls` row marked failed with that code, an observation to the model naming the
-        failure, and an `EventKind::ServerToolUsed { ok: false }`. The negative control is a
-        successful search with zero results, which is recorded as a successful call — the two are
-        different facts and the trace tells them apart. This test fails on 0.21.0's parser, which
-        has no concept of either.
+        F2 — a database written by the previous release is fully readable by this one. A store populated
+        by 0.22.0 with runs, steps, refusals, approvals, budget draws, citations and server-tool calls is
+        opened by 0.23.0 and every row read back identical, through the public `Store` API rather than by
+        inspecting the file. The negative control is a store this release creates from scratch, which
+        must be byte-comparable in schema to one 0.22.0 creates.
     files:
-      - src/provider/anthropic.rs
-      - src/web.rs
+      - tests/cross_version.rs
+      - tests/fixtures/store-0.22.0/
     evidence:
       - >
-        src/provider/anthropic.rs — `web_tools` building `web_search_20250305` /
-        `web_fetch_20250910` entries from one declaration, the `web-fetch-2025-09-10` beta
-        header sent only when fetch is asked for, and the `Accumulator` extended with
-        `server_tool_use`, `*_tool_result`, `citations_delta` and `citations` handling.
+        The fixtures are genuinely the previous release's. `tests/fixtures/gen-0.22.0` is pinned
+        `io-harness =0.22.0` and its committed lockfile resolves `rusqlite` 0.32.1 and `libsqlite3-sys`
+        0.30.1. All three `.sqlite3` headers read `SQLite version 3046000` — 3.46.0, the old engine,
+        not the 3.53.2 this release links. `PRAGMA integrity_check` is `ok` on all three and no WAL
+        sidecar was left behind.
       - >
-        6 unit tests in `provider::anthropic::web_wire`, all passing: the dated tool entries
-        with their fields; a block-list alone; the 0.21.0 body when nothing is declared; the
-        beta header on and off, asserted by capturing the real request head over a local
-        socket; citations from both a result block and a delta, deduplicated by url and
-        enriched by the later mention; and the failure inside a 200 with its negative
-        control — a search that succeeded and found nothing.
-  - id: US-IO-HARNESS-0.22.0-T03
+        F2 — `a_0_22_0_store_reads_back_row_for_row_through_the_public_api` passes. It builds a value
+        from the public `Store` readers alone and compares key-by-key against the sidecar 0.22.0 wrote:
+        outcome, status, step count, last step, spent tokens, checkpoint events, every step
+        (number/decision/tokens), every provider call (step, attempt, provider, model, finish reason,
+        failure and all seven `Usage` counters), every observation, the edit, both policy events
+        including the refusal, the resolved pending approval, both citations — including the one with
+        two NULL columns — and both server-tool calls. The comparison is driven by the sidecar's own
+        key set and counts are checked both ways, so a table added later fails the test rather than
+        going unread.
+      - >
+        F2 negative control — `the_schema_this_release_creates_is_identical_to_the_one_0_22_0_created`
+        passes. `sqlite_master` from a store this release creates equals the fixture's normalised
+        `CREATE TABLE`/`CREATE INDEX` set, with a length guard so an empty set cannot match an empty
+        set.
+      - >
+        Two values are not asserted and the omission is checked rather than silent: `runs.goal` has no
+        public reader and `RunSummary` carries no `goal`, and the sidecar's `workspace` is the
+        generator's own relative directory, which is not where the test's copy lives. Both sit in a
+        named constant in the test so they cannot be forgotten.
+
+  - id: US-IO-HARNESS-0.23.0-T03
     summary: >
-      The two OpenAI-wire translations and their parse: `web_search_options` with its domain filter on
-      the OpenAI body, a `web` `plugins` entry with `max_results` on the OpenRouter body, and
-      `annotations` with `url_citation` read into `CompletionResponse::citations` — with the shared
-      `openai_wire::body` staying shared while the two web keys stay apart.
+      Resume a run across the version boundary: interrupted under 0.22.0 mid-tree, finished under
+      0.23.0, with no completed step re-run, the ledger totalling what the two halves drew, and no
+      irreversible action taken twice. The 0.7.0 kill-9 test re-pointed, not rewritten.
     why_required: >
-      The release promises the declaration works across all three providers. Two of them share a body
-      builder and differ in exactly this key, so the split has to be made deliberately rather than by
-      copying the builder.
+      This is the one failure shape the release can produce that compiles, passes the unit tests, and
+      still damages a user's data. Review cannot catch it; only this can.
     status: done
-    depends_on: [US-IO-HARNESS-0.22.0-T01]
+    depends_on: [US-IO-HARNESS-0.23.0-T02]
     acceptance_criteria:
       - >
-        F1 — a declaration reaches each vendor in that vendor's own shape, and a declaration a
-        vendor cannot carry is refused rather than trimmed. A `WebAccess` with search, fetch,
-        `max_uses` and both domain lists produces an Anthropic body carrying a `web_search_20250305`
-        and a `web_fetch_20250910` tool entry with those fields; a search-only declaration with an
-        allow-list produces an OpenAI body carrying `web_search_options` with that filter; a
-        search-only declaration with a cap produces an OpenRouter body carrying the `web` plugin
-        with its `max_results`. Asked for what it does not have — fetch on either OpenAI-wire
-        vendor, a block-list on OpenAI, any domain list on OpenRouter — the provider returns an
-        `Error::Config` naming itself and what it cannot do, before a request is sent. Asserted
-        against the built bodies and the refusals, not a live call. The negative control is `web:
-        None`, which produces bodies byte-identical to 0.21.0's for all three.
-      - >
-        NF3 — a run that uses none of this behaves exactly as it did. A 0.21.0-shaped run with `web:
-        None` produces the identical event sequence, the identical step count, the identical outcome
-        and — for all three providers — a byte-identical request body, proven by comparing the built
-        body against the literal 0.21.0 shape rather than against itself.
+        F3 — a run checkpointed by the previous release resumes across the boundary. A run interrupted
+        under 0.22.0 mid-tree, with a completed sub-agent, an in-flight step and a partially drawn
+        budget, is resumed by 0.23.0 to completion: no completed step re-runs, the ledger's total matches
+        what the two halves drew between them, and an irreversible action already taken is not taken
+        twice. This is the 0.7.0 crash test with the two halves on either side of the version boundary,
+        which is the only form of it that proves anything here.
     files:
-      - src/provider/openai_wire.rs
-      - src/provider/openai.rs
-      - src/provider/openrouter.rs
+      - tests/cross_version.rs
+      - examples/crash_fixture.rs
     evidence:
       - >
-        src/provider/openai_wire.rs — `WebFlavor`, `web_key` adding `web_search_options` for
-        OpenAI and a `web` `plugins` entry for OpenRouter to the shared body,
-        `ensure_web_supported` refusing what a vendor cannot carry, and `annotations` /
-        `url_citation` parsing plus the mid-stream `error` object.
+        F3 — `a_0_22_0_interrupted_tree_resumes_without_re_running_or_double_charging` passes. The
+        pre-resume state is asserted against `interrupted.json` first (tree ids 1/2/3, agent count 3,
+        root step-capped at step 1, child 2 completed at 80 tokens, child 3 step-capped at 160, tree
+        total 400, and both workspace file contents), so the test is anchored to what 0.22.0 stored
+        rather than to whatever it finds.
       - >
-        DEVIATION, recorded in US-IO-HARNESS-0.22.0-I01: the three vendors do not accept the
-        same declaration. OpenAI has no fetch tool and an allow-list-only filter; OpenRouter
-        has neither fetch nor any domain filter. Unsupported combinations are refused with
-        `Error::Config` before a request is sent rather than trimmed to fit, and F1 was
-        amended to assert each vendor's supported subset plus the refusals.
+        After `resume_tree`: verified success; no run in the tree has a duplicate step number; the
+        child that had already finished gained neither a step nor a token; the tree total equals
+        `400 + served * 25`, where `served` is the resume provider's own call counter living outside
+        the database, so the ledger is checked against an external witness rather than against itself;
+        `a.txt` still holds exactly one copy of `ALPHA`; `b.txt` reaches `BETA`; and a `resume`
+        checkpoint event exists.
       - >
-        6 unit tests in `provider::openai_wire::web_wire`, all passing, including
-        `no_declaration_adds_no_key_to_either_body`, which asserts the built body's key set
-        is exactly the five keys 0.21.0 sent.
-  - id: US-IO-HARNESS-0.22.0-T04
+        Non-vacuity proven, not assumed. A provider rewired to report double tokens fired
+        `the tree's total must be what 0.22.0 drew plus exactly what this release drew` (500 against
+        450), and bumping the finished child's step baseline fired
+        `the child that had already finished gained a step on resume`. Both were reverted and the file
+        re-confirmed green.
+      - >
+        Gap recorded rather than glossed: 0.22.0 committed the step-capped root step, so on resume the
+        coordinator replans instead of replaying the fan-out, and `Store::find_spawn` has nothing to
+        adopt at that step. This fixture therefore does NOT exercise the adopt-a-completed-child path.
+        It makes the no-re-run assertions stronger — the finished child is proven untouched by its own
+        rows and its own file rather than by trusting adoption to skip it — but it is a different
+        proof. `tests/checkpoint.rs` covers adoption within a single release.
+
+  - id: US-IO-HARNESS-0.23.0-T04
     summary: >
-      The trace and the loop: the `citations` and `server_tool_calls` tables with their writers and
-      readers, `EventKind::ServerToolUsed`, the failure observation handed to the model, and
-      `pause_turn` treated as a continuation rather than an ending.
+      Resolve, under 0.23.0, an approval that 0.22.0 deferred past process exit, and let the run
+      continue.
     why_required: >
-      An answer whose sources are not recorded is the same answer a scraper would have produced, and a
-      paused turn that ends the run is a defect the release would ship on its first long search. This
-      is the task that makes the feature auditable and the loop correct.
+      The approval record is the crate's one durable human decision. If it does not survive a dependency
+      upgrade the permission boundary is not durable, whatever the trace says.
     status: done
-    depends_on: [US-IO-HARNESS-0.22.0-T02, US-IO-HARNESS-0.22.0-T03]
+    depends_on: [US-IO-HARNESS-0.23.0-T02]
     acceptance_criteria:
       - >
-        F3 — citations survive to SQLite. A scripted response carrying each vendor's citation shape
-        produces `CompletionResponse::citations` with the url, title and cited text, rows in the
-        `citations` table keyed by run and step, and the same rows readable from a fresh `Store`
-        over the same file after the writing process is gone. The negative control is an answer with
-        no citations, which produces no rows rather than one empty row.
-      - >
-        F5 — a paused turn continues. A response with `stop_reason: "pause_turn"` and partial text
-        does not end the run: the text becomes an observation, the step's usage is drawn from the
-        ledger once, and the loop takes another step. The negative control is `end_turn`, which ends
-        the run as it does today. Asserted through the real loop against a scripted provider.
-      - >
-        F10 — the observer sees it. A run that searches emits `ServerToolUsed` with the provider
-        name, the tool and `ok: true` in the same place `Refused` is emitted, and a failing search
-        emits the same variant with `ok: false`. A consumer that matches `_` is unaffected, which is
-        what the changelog's migration snippet says.
-      - >
-        F13 — a spawned child inherits the root's declaration and cannot ask for its own. A tree
-        whose root declared web access spawns a child whose every request carries that same
-        declaration, read from the requests the provider actually received; a spawn call whose
-        arguments ask for web access, or for a wider domain list, changes nothing — the spawn tool
-        never reads one, exactly as it never reads a toolbox, a skills directory or an agent roster
-        from the model.
-      - >
-        NF1 — no store format bump and no new dependency. `CHECKPOINT_FORMAT` stays 7, `citations`
-        and `server_tool_calls` are `CREATE TABLE IF NOT EXISTS`, the diff carries no `ALTER TABLE`,
-        a 0.21.0 database opens, resumes and is queried against 0.22.0 unchanged, and the default
-        `cargo tree` line count is still the 407 lines inherited from `develop`.
+        F4 — a pending approval survives the boundary. An approval deferred past process exit under
+        0.22.0 is resolved under 0.23.0 and the run continues, because a durable decision that does not
+        survive a dependency upgrade is not durable.
     files:
-      - src/state.rs
-      - src/run.rs
-      - src/observe.rs
-      - tests/web.rs
+      - tests/cross_version.rs
     evidence:
       - >
-        src/state.rs — `citations` and `server_tool_calls` as `CREATE TABLE IF NOT EXISTS`
-        with their indexes, `Store::record_citations` / `citations` /
-        `record_server_tool_calls` / `server_tool_calls`. `CHECKPOINT_FORMAT` untouched at
-        7.
+        F4 — `a_0_22_0_deferred_approval_is_resolved_here_and_the_run_continues` passes. Before the
+        resume, `Store::pending(1)` returns the row 0.22.0 left behind with `resolved == None` and the
+        act, target, content and step from the sidecar, and `out.txt` does not exist — the deferred
+        write genuinely did not happen. It is then resolved through `resume_with_decision` with
+        `Decision::Approve` under the generator's own `ask_write("out.txt")` policy: the run reaches
+        `Success`, the pending row reads `resolved == Some("approve")`, `out.txt` holds `DONE\n`, and
+        the run's status is `completed`.
       - >
-        src/run.rs — `record_web_activity` writing both tables and emitting
-        `EventKind::ServerToolUsed` beside the existing `provider_calls` row; `paused_turn`
-        making a `pause_turn` stop reason a continuation rather than an ending;
-        `web_failure_note` handing a failed provider call to the model as an observation in
-        both the flat and the tree loop; the root declaration carried on `Tree` and copied
-        onto every spawned child by `spawn_child`.
-      - >
-        tests/web.rs — 10 tests, all passing: citations readable from a fresh `Store` after
-        the writing process is gone, with a no-citation negative control; the failed search
-        recorded, evented with `ok: false` and reaching the next step's prompt; the found-
-        nothing control recorded as a success with nothing told to the model; the paused
-        turn continuing to step 2 with both turns charged, and an `end_turn` control ending
-        at step 1; and a spawned child inheriting the root's declaration while a spawn
-        argument asking for `evil.test` is ignored.
-      - >
-        `cargo tree` is 407 lines, unchanged.
-  - id: US-IO-HARNESS-0.22.0-T05
+        Non-vacuity proven: flipping the decision to `Decision::deny(...)` fired
+        `the run must continue to a terminal outcome once the approval is resolved: Denied { steps: 1 }`.
+        Reverted and re-confirmed green.
+
+  - id: US-IO-HARNESS-0.23.0-T05
     summary: >
-      One declaration, two boundaries: `WebAccess::from_policy` projecting `Act::Net` allow- and
-      deny-rules onto the vendor domain filter with an allow-everything rule projecting to no filter,
-      and `[web]` in `io.toml` layering onto `WebAccess` through the existing config machinery.
+      The consumer-side build check: a fixture crate depending on both `io-harness` and `rusqlite` 0.40
+      that must build against 0.23.0 and must fail against 0.22.0 with cargo's `links` diagnostic, kept
+      in the repository and run in CI.
     why_required: >
-      Without the projection an operator states the same boundary twice and the two drift; without
-      `[web]` the feature is unreachable from configuration and io-cli and io-studio each write their
-      own. The inverting case is the release's worst silent failure and is decided here.
+      The wall this release exists to remove is a resolver error in someone else's build, which nothing
+      inside this crate's own test suite can observe. Without this the release's central claim is
+      asserted rather than checked.
     status: done
-    depends_on: [US-IO-HARNESS-0.22.0-T01]
+    depends_on: [US-IO-HARNESS-0.23.0-T01]
     acceptance_criteria:
       - >
-        F6 — the policy projects onto the vendor filter. A policy allowing `docs.rs:443` and
-        `crates.io:443` and denying `*.example.com` yields a `WebAccess::from_policy` whose
-        `allowed_domains` are the two hosts without their ports and whose `blocked_domains` carry
-        the denied pattern. A policy allowing `*` yields no allow-list rather than an empty one —
-        the inversion that would silently allow nothing — and a rule the filter cannot express is an
-        `Error::Config` naming the rule.
+        F1 — the collision is gone, and its absence is checkable rather than asserted. A fixture crate
+        declaring both `io-harness 0.23.0` and `rusqlite 0.40` builds and runs a trivial harness call.
+        The negative control is the same fixture against `io-harness 0.22.0`, which must fail with
+        cargo's own `links` diagnostic naming `sqlite3`, and that diagnostic is quoted verbatim in the
+        changelog so a reader knows the exact error this release retires.
       - >
-        F7 — `[web]` reaches a run from configuration. An `io.toml` carrying `[web]` with search,
-        fetch, `max_uses` and both domain lists projects onto a `WebAccess` equal to the
-        programmatic one, an unknown key inside `[web]` is an error naming the key and the file, and
-        a local scope turning `search` off overrides a project scope that turned it on — the
-        existing layering, asserted for the new table rather than assumed.
+        OP3 — the fixture crate from F1 is committed and runs in CI, so the property survives the next
+        dependency bump instead of being re-discovered by a consumer.
     files:
-      - src/web.rs
-      - src/config.rs
-      - tests/config.rs
+      - tests/fixtures/links-consumer/
+      - .github/workflows/ci.yml
+      - Cargo.toml
     evidence:
       - >
-        src/web.rs — `WebAccess::from_policy` projecting `Act::Net` rules onto the vendor
-        filter, with the inverting case handled explicitly: an allow-everything rule yields
-        NO allow-list rather than an empty one. An `Ask` rule and a pattern carrying a
-        scheme or a path are `Error::Config` naming the rule, because neither can be
-        honoured by a filter the provider enforces.
+        F1 positive — `tests/fixtures/links-consumer` declares `rusqlite = "0.40"` with `bundled` AND
+        `io-harness` by path. `cargo run` in it prints
+        `links-consumer OK: rusqlite 0.40 and io-harness share one libsqlite3-sys (sqlite 3.53.2)`.
+        It is run rather than only built, because coexistence is a claim about one process: the binary
+        opens a connection through its own `rusqlite` and a `Store` through the crate's, over the same
+        linked `libsqlite3-sys`.
       - >
-        src/config.rs — `[web]` as a top-level table merged key by key through the existing
-        scope layering, with unknown keys rejected by the type's own `deny_unknown_fields`
-        and reported by the existing per-scope validation that names the file. No new public
-        item, so `docs/public-api.txt` is unchanged.
+        F1 negative control — the same fixture against `io-harness = "=0.22.0"` fails at resolution,
+        exit 101, before anything compiles, with cargo naming `libsqlite3-sys` links to the native
+        library `sqlite3`, but it conflicts with a previous package which links to `sqlite3` as well.
+        The diagnostic is quoted verbatim in the 0.23.0 changelog entry, as the contract requires.
       - >
-        3 unit tests in `web::tests` and 3 in tests/config.rs, all passing, including a
-        local scope switching `search` off over a project scope that turned it on, asserting
-        the project's `max_uses` and domain list survive the override.
-  - id: US-IO-HARNESS-0.22.0-T06
+        OP3 — a `links-consumer` job added to `.github/workflows/ci.yml`, ubuntu-latest, 20 minutes.
+        It runs the positive control, then rebuilds the fixture against 0.22.0 in `RUNNER_TEMP` and
+        **fails the job if that build succeeds**. It also refuses to accept any failure: cargo's output
+        must name both `links` and `sqlite3`, so a network blip or a yanked version cannot pass as the
+        expected failure. YAML parses; jobs are test, msrv, lint, links-consumer, docs. All 15 `uses:`
+        lines resolve to the three full 40-character SHAs already present in the file — no new action
+        and no new SHA was introduced.
+
+  - id: US-IO-HARNESS-0.23.0-T06
     summary: >
-      The meter moves: `server_tool_requests` reaching the ledger from a run, the per-request price
-      charged on top of tokens, and the accounting guide's "always zero" sentence removed.
+      Assert directly that `CHECKPOINT_FORMAT` is still 7 and that no migration runs on a store the
+      previous release wrote.
     why_required: >
-      0.18.0 built the counter, the column and the price against this release. If the money is not
-      charged and asserted, the release adds a per-request cost the operator cannot see, which is the
-      failure the accounting tables were built to prevent.
+      A silent format bump would let a broken upgrade present itself as a successful one. The existing
+      assertion covers a fresh store; this release needs it against a 0.22.0 store.
     status: done
-    depends_on: [US-IO-HARNESS-0.22.0-T04]
+    depends_on: [US-IO-HARNESS-0.23.0-T02]
     acceptance_criteria:
       - >
-        F8 — the meter moves where the vendor reports one, and the money is charged. A run whose
-        responses report two `server_tool_requests` is priced at the per-request charge twice on top
-        of its tokens, the `provider_calls` rows carry the count, and `Store` reads it back. The
-        negative control is the identical run reporting zero, which is charged for tokens alone.
-        This is the first non-zero `server_tool_requests` in the crate's history and the test says
-        so. The counter is the vendor's: Anthropic reports it and the crate reads it; the OpenAI
-        wire reports no such member today, so a run that demonstrably searched there records a zero
-        rather than a count this crate derived for itself. The `server_tool_calls` row is the
-        vendor-independent record that the call happened.
-      - >
-        NF6 — no key, no host and no query is logged that was not already. Citations hold URLs the
-        model was given and the run recorded; the API key never enters a `server_tool_calls` row;
-        and a query is stored only where the vendor discloses it in the response, never
-        reconstructed from the prompt.
+        F5 — `CHECKPOINT_FORMAT` is still 7 and no migration runs. Asserted directly, so that a silent
+        format bump cannot pass as a successful upgrade.
     files:
-      - src/pricing.rs
-      - src/run.rs
-      - docs/guide/accounting.md
-      - tests/accounting.rs
+      - tests/cross_version.rs
+      - tests/checkpoint.rs
     evidence:
       - >
-        No code change was needed: `pricing.rs::cost_micros` has charged
-        `server_tool_requests * per_server_tool_request` since 0.18.0, and `run.rs` never
-        prices anything — money reaches a caller through `Store::spend_by_*(&PriceTable)`.
-        Verified by reading the path and then pinning it with tests rather than editing it.
+        F5 — `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_migrates_nothing` passes.
+        `CHECKPOINT_FORMAT == 7`, and for each of the three 0.22.0 fixtures `PRAGMA user_version` reads
+        7 before `Store::open` and 7 after, with `sqlite_master` captured either side of the open and
+        required to be unchanged. That pair is what "no migration ran" has to mean here: not that the
+        constant is still 7, but that opening an old store did not quietly rewrite it.
       - >
-        tests/accounting.rs — 3 tests, all passing: the same recorded trace priced twice,
-        once with a zero per-request price and once with 10_000, differing by exactly two
-        charges; the negative control charging the identical amount under both tables when
-        the counter is zero, which a flat per-run search charge would fail; and NF6, which
-        puts a credential-shaped string and a distinctive phrase in the goal and asserts
-        neither reaches any column of either web table, while the provider's own url does.
+        No schema change anywhere in the release. `from_conn`'s `CREATE TABLE IF NOT EXISTS` batches
+        are untouched, and the F2 negative control independently requires the schema this release
+        creates to equal 0.22.0's.
       - >
-        DEVIATION, recorded in US-IO-HARNESS-0.22.0-I01: the counter is the vendor's.
-        Anthropic reports it; the OpenAI wire reports no such member, so a run that
-        demonstrably searched there records a zero rather than a count this crate derived.
-        F8 was amended to say so.
-  - id: US-IO-HARNESS-0.22.0-T07
+        Non-vacuity proven twice. Stamping a fixture copy to `user_version = 6` fired the pre-check
+        (`populated.sqlite3 was stamped at 6 by 0.22.0`); stamping it to 6 *and* relaxing the pre-check
+        so the open really would migrate fired
+        `opening populated.sqlite3 changed its checkpoint format — a migration ran`. Both reverted.
+
+  - id: US-IO-HARNESS-0.23.0-T07
     summary: >
-      Documentation and the public surface: `docs/guide/web.md`, `docs/public-api.txt` by hand, the
-      `CHANGELOG.md` entry with all three migration snippets, the `docs/CONTRACT.md` amendments
-      including removing the 0.18.0 "always zero" sentence, and the README / CAPABILITIES / crate-root
-      links.
+      Document the one break: the `BREAKING` changelog entry with a migration note for
+      `Error::State(#[from] rusqlite::Error)`, the `docs/public-api.txt` check, the `CONTRACT.md` entry
+      stating the intent to wrap `rusqlite::Error` in a later release, and the quoted `links`
+      diagnostic.
     why_required: >
-      The release's central honesty — the domain filter is enforced by the vendor and not by this
-      process — lives in the contract and the guide. Shipping the code without it ships a false sense
-      of containment, which the contract names as the release's first risk.
+      The break is real for any consumer matching `Error::State(e)`, and the release notes are taken
+      verbatim from the changelog. An undocumented break is the same thing as an unannounced one.
     status: done
-    depends_on: [US-IO-HARNESS-0.22.0-T04, US-IO-HARNESS-0.22.0-T05]
+    depends_on: [US-IO-HARNESS-0.23.0-T05]
     acceptance_criteria:
       - >
-        OP1 — `docs/public-api.txt` is updated by hand, `tests/public_api.rs` passes against the
-        live surface, and every added public item carries a fenced worked example, enforced by the
-        existing docs test.
-      - >
-        OP2 — `docs/guide/web.md` exists, is listed in `tests/guide_pages.rs` with its limits block,
-        and is linked from `README.md`, `docs/CAPABILITIES.md` and the crate root.
-      - >
-        OP3 — `docs/CONTRACT.md` states, in its own voice: a provider-executed fetch is dialled by
-        the provider, so `Act::Net` never sees it and the domain filter is enforced by the vendor,
-        not by this process; a citation is what the provider returned and is not verified by the
-        crate; a paused turn resumes as a fresh request and may repeat a search; and the 0.18.0
-        sentence saying `server_tool_requests` is always zero is **removed**, because this release
-        makes it non-zero.
-      - >
-        OP4 — `CHANGELOG.md` carries all three breaks with migration snippets and the new capability
-        in the user-facing voice the changelog test enforces.
+        F6 — the break is exactly one and it is documented. `Error::State` carries the 0.40 error type;
+        the changelog carries a `BREAKING` entry with a migration note saying what to write instead; and
+        the enumerated public API in `docs/public-api.txt` reflects it. Any second break discovered
+        during development is either eliminated or documented to the same standard — not absorbed
+        quietly.
     files:
-      - docs/guide/web.md
-      - docs/public-api.txt
-      - docs/CONTRACT.md
-      - docs/CAPABILITIES.md
       - CHANGELOG.md
-      - README.md
-      - src/lib.rs
-      - tests/guide_pages.rs
+      - docs/CONTRACT.md
+      - docs/public-api.txt
     evidence:
       - >
-        docs/guide/web.md — the declaration, the three vendors and what each refuses, the
-        policy projection and its inverting case, citations and what a citation is not, the
-        failure inside a 200, the paused turn and its repeat-cost, the price, `[web]`,
-        reading it back, and a limits block. Listed in tests/guide_pages.rs and linked from
-        README.md and docs/CAPABILITIES.md.
+        F6 — the break is exactly one, and it is the one the contract predicted: `Error::State` carries
+        `rusqlite` 0.40's error type. No second break was discovered. The 28 compile errors were all
+        the `fallible_uint` feature move and none of them reached a public signature; `src/` is
+        unchanged apart from the MSRV sentence in the crate-root docs, and `tests/public_api.rs` passes
+        against an unedited `docs/public-api.txt`.
       - >
-        docs/CONTRACT.md — the provider dials the URL so `Act::Net` never sees it and the
-        filter is the vendor's; a mismatched declaration is refused, not narrowed; a
-        citation is unverified; a paused turn may repeat a search; a child inherits the
-        root's declaration and cannot ask for its own. The 0.18.0 sentence saying
-        `server_tool_requests` is zero until 0.22.0 is gone, replaced by the truthful per-
-        vendor statement.
+        The changelog carries the `**BREAKING**` entry with a `*Migration:*` note showing both the
+        manifest change and the two match shapes — the one that is unaffected and the one that is not —
+        plus a second `**BREAKING (MSRV)**` entry for the 1.88 to 1.95 move with its own migration note
+        saying plainly that there is no opt-out and no version of the dependency that avoids it.
+        `tests/changelog.rs` passes, which is what enforces that every marked break carries a note.
       - >
-        CHANGELOG.md — the 0.22.0 entry with all three break sites and a migration snippet
-        each. README.md carries `io-harness = "0.22"`, the capability and the guide link;
-        `Cargo.toml` is at 0.22.0.
+        `docs/public-api.txt` needed no edit, and the reason is recorded rather than left as an
+        apparent omission: the snapshot enumerates re-exported *names* as `<kind> <name> <file>`, so it
+        holds `enum Error src/error.rs` and stops there. A variant's payload type is not a line in that
+        file and never will be. Writing one in would have corrupted the format the drift test checks.
       - >
-        One correction after the fact: the docs first described children as NOT inheriting
-        the declaration, which was true of the code at the time. The code was fixed to
-        inherit and both pages were corrected — the guide and CONTRACT now describe what T04
-        actually does.
-  - id: US-IO-HARNESS-0.22.0-T08
+        So the fact went where it can actually be read. `docs/CONTRACT.md`'s "What is public" now
+        states outright that `rusqlite` is a **public dependency** of this crate and that a `rusqlite`
+        major bump is therefore a public API change here whether or not behaviour moves — which is
+        exactly what 0.23.0 was. "Limits that hold today" carries the intent to wrap the type in a
+        later release, with the two match shapes spelled out so a consumer writing code today knows
+        which one survives.
+
+  - id: US-IO-HARNESS-0.23.0-T08
     summary: >
-      The gate and the live evidence: `cargo fmt --check`, both clippy legs, `cargo doc --all-features`,
-      the full suite on three platforms via CI, and a hand-run live example that asserts a citation, a
-      non-zero `server_tool_requests` and the per-request charge.
+      The full suite green on macOS, Linux and Windows including the bundled compile, and the nightly
+      docs.rs job warning-free with all features, both before publication.
     why_required: >
-      The suite proves the translation this crate wrote; only a live call proves a vendor accepts the
-      body it builds. Every release since 0.9.0 has been gated this way and OP5 makes it a criterion.
+      Windows is where the bundled SQLite is a C compile and the runner is slowest, and docs.rs failing
+      after publication cannot be fixed without another version.
     status: done
-    depends_on: [US-IO-HARNESS-0.22.0-T07]
+    depends_on: [US-IO-HARNESS-0.23.0-T03, US-IO-HARNESS-0.23.0-T04, US-IO-HARNESS-0.23.0-T06]
     acceptance_criteria:
       - >
-        NF4 — the full suite passes on macOS, Linux and Windows with the Windows leg's
-        `timeout-minutes` unchanged at 40. Every new test is offline: bodies are asserted as JSON
-        and responses are scripted, so nothing in CI depends on a vendor being up, on a key
-        existing, or on what a search returns today.
+        NF1 — the full suite passes on macOS, Linux and Windows, including the bundled SQLite compile on
+        each. No test is skipped, marked ignored or made conditional to get there.
       - >
-        NF5 — `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo clippy
-        --all-targets --all-features -- -D warnings` and `cargo doc --all-features` all pass with
-        zero warnings.
-      - >
-        OP5 — a live run against a real provider is performed by hand before the release is cut and
-        its output kept as evidence: a question answered from current information, at least one
-        citation read back from SQLite, and a `server_tool_calls` row for the call that produced it
-        — plus a non-zero `server_tool_requests` where the vendor reports one, which of the three is
-        Anthropic alone. The suite proves the translation; only a live run proves a vendor accepts
-        the body this crate builds.
+        NF3 — `cargo doc` is warning-free and docs.rs builds with all features, checked by the nightly
+        job before publication rather than after.
     files:
-      - examples/web_search.rs
-      - .ultraship/products/io-harness/evidence
+      - .github/workflows/ci.yml
     evidence:
       - >
-        Gate, all green on this machine after a `cargo clean` (the disk was full at 140 MiB
-        free with `target/` at 31 GiB, which surfaced as a linker failure — the known
-        machine fact, not a code defect): `cargo fmt --check`; `cargo clippy --all-targets
-        -- -D warnings`; `cargo clippy --all-targets --all-features -- -D warnings`; `cargo
-        doc --all-features --no-deps`; `cargo test` (45 test binaries, 0 failures, including
-        237 doc tests); `cargo test --all-features --lib --tests`.
+        NF1 locally on macOS (arm64, rustc 1.95.0): `cargo test` green — 45 test binaries plus 237
+        doctests, 0 failed, 0 ignored — including the real-SIGKILL crash-resume test and the five new
+        cross-version tests. `cargo test --all-features --lib --tests` green; `cargo test --all-features
+        --doc` green at 239. `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` clean.
+        No test was skipped, ignored or made conditional to get there.
       - >
-        OP5 — live run on OpenRouter, kept at evidence/0.22.0/live-web-search.txt. The
-        vendor accepted the body this crate builds, ran a search, and the run cited two
-        sources newer than the model: docs.rs showing io-harness 0.21.0 and the CHANGELOG on
-        GitHub. One `server_tool_calls` row, `ok`. The vendor-reported
-        `server_tool_requests` is 0, because OpenRouter's chat-completions response carries
-        no such counter.
+        NF3 — `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`
+        builds clean, which is the exact command and flags the nightly `docs` job runs. The job's
+        second assertion was checked too: the rendered pages under `target/doc/io_harness/` carry
+        `Available on crate feature`, so the feature labelling that job exists to protect is intact.
+        Checked before publication, as the criterion requires, not after.
       - >
-        LIMITATION, recorded in US-IO-HARNESS-0.22.0-I01: a live non-zero counter needs an
-        Anthropic key, and the `.env` in this workspace holds placeholders for both
-        `ANTHROPIC_API_KEY` and `OPENAI_API_KEY`. The Anthropic path is therefore proven by
-        its wire tests and not by a live call.
+        Linux and Windows are CI's to confirm on the pull request. Windows is the one to watch: the
+        bundled SQLite is a C compile there, 3.53.2 is a larger translation unit than 3.46.0, and the
+        runner is the slowest of the three, so a timeout there is a delay rather than a break. The
+        `skills::discovery_over_a_32_skill_directory_is_under_50ms` wall-clock test is also a known
+        intermittent on that runner — re-run before investigating, and check the failing test name
+        first.
+      - >
+        Machine note acted on rather than rediscovered: `target/` plus the three fixture crates' own
+        target directories took the disk to 10 GiB free, which is the condition that has twice
+        surfaced as a linker error reading like a toolchain bug. Cleaned before the release steps —
+        35.2 GiB freed, 38 GiB available.
+
+  - id: US-IO-HARNESS-0.23.0-T09
+    summary: >
+      Measure store write throughput either side of the boundary and record the numbers in the
+      changelog.
+    why_required: >
+      The engine moved seven point releases and the contract asks for the number rather than an
+      assumption. Recording it is also how a later regression gets a baseline to fail against.
+    status: done
+    depends_on: [US-IO-HARNESS-0.23.0-T01]
+    acceptance_criteria:
+      - >
+        NF4 — no measurable regression in store write throughput on the existing benchmark path. The
+        engine moved seven point releases; the expectation is neutral-to-better, and a regression is a
+        finding to record, not a reason to stop.
+    files:
+      - CHANGELOG.md
+    evidence:
+      - >
+        NF4 — measured, not assumed, and the criterion's premise was wrong: there is no "existing
+        benchmark path" in this repository. No `benches/`, no criterion, no `[[bench]]`. Both sides
+        were built instead — `examples/store_throughput.rs` on the new line and
+        `tests/fixtures/throughput-0.22.0/` pinned `io-harness =0.22.0` on the old one, running a
+        workload whose executable code is byte-identical between the two.
+      - >
+        `Store::checkpoint_step` is the timed call: the hot durable path, two inserts inside a
+        committed transaction, so every iteration pays the WAL commit the resume path depends on.
+        `record` was rejected as the subject because it writes one row without committing a
+        transaction of its own, which would flatter the engine. File-backed store, release profile,
+        20,000 and 100,000 iterations, 33 samples per side.
+      - >
+        Result: **within noise, no regression.** Order-balanced batch medians differ by +0.06%, -0.99%
+        and +1.65% — the sign flips across batches, which is what rules out a systematic effect —
+        against a paired per-round spread of 11 to 21%. The measurement rules out a regression above
+        roughly 5% and does not claim to resolve anything smaller.
+      - >
+        Recorded rather than buried: an earlier unbalanced batch that ran the new side first in every
+        round produced an apparent 18% regression from scheduling alone. It is reported because
+        discarding the one batch that looked bad without saying so would be dishonest, and because it
+        is the reason the reported batches alternate order.
+      - >
+        No CI job for it. On shared runners the noise floor is worse than the one measured here, and a
+        throughput gate against a 20% noise floor is a flake generator rather than a guard.
+
+  - id: US-IO-HARNESS-0.23.0-T10
+    summary: >
+      One real end-to-end run against a live provider, on a store already upgraded, with the trace read
+      back afterwards.
+    why_required: >
+      Every other check in this release is offline. A store that satisfies the unit tests and fails a
+      real run would still be a broken release.
+    status: done
+    depends_on: [US-IO-HARNESS-0.23.0-T08]
+    acceptance_criteria:
+      - >
+        OP2 — a real end-to-end run against a live provider completes on the upgraded store, so the
+        release is not accepted on unit tests alone. One run, one workspace, one verified outcome, with
+        the trace read back afterwards.
+    files:
+      - examples/durable_run.rs
+      - examples/live_accounting.rs
+    evidence:
+      - >
+        OP2 — `cargo run --example durable_run` against OpenRouter on the upgraded store: one run, one
+        workspace, a verified outcome under the `rustc` gate, and the trace read back from a reopened
+        file-backed `Store`. Output: `[process 1] stopped: Success { steps: 1 }`,
+        `[process 2] resumed to: Success { steps: 1 }`, `[process 2] final status = Completed`.
+      - >
+        `cargo run --example live_accounting` was run as well, because it is the example that exercises
+        the exact surface this release changed. Three live provider calls, and all seven `u64` `Usage`
+        counters written and read back through the `fallible_uint` path against real vendor numbers:
+        prompt 1345/1355/3086, completion 51/118/55, reasoning 29/45/29, cache-read 0/1250/1250,
+        totals 1396/1473/3141, 6010 tokens across the run. The edit is recorded (`step 3 write_file
+        NOTES.md (+1 -0)`) and spend prices correctly at two different rates from the same stored
+        trace, confirming no cost is stored. This is the strongest single piece of live evidence in the
+        release: the one code path the migration touched, exercised end to end against a real provider.
+      - >
+        The `.env` here carries real credentials for OpenRouter only, so the live evidence is
+        OpenRouter-only. The Anthropic and OpenAI paths rest on their wire tests, unchanged by this
+        release.
