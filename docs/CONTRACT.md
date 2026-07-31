@@ -129,12 +129,26 @@ change for every `match` a caller wrote.
 | --- | --- | --- |
 | macOS | Supported, full suite in CI | Native, `sandbox-exec` |
 | Linux | Supported, full suite in CI | Native, namespaces and rlimits |
-| Windows | Supported, full suite in CI | **Portable floor only** |
+| Windows | Supported, full suite in CI | **Native resource containment only** |
 
-On Windows the Job Object backend is designed and not implemented. Containment
-there is the portable floor: an ephemeral working directory, network denied, and
-the wall clock. CPU and memory caps **do not fire**. Do not read "sandboxed" on
-Windows as "resource-capped".
+Since 0.24.0 a Windows run is contained by a Job Object. Memory, CPU and active
+process count are real bounds, the whole process tree dies when the job handle
+closes, and Windows is the first backend anywhere to enforce
+`SandboxLimits::max_processes`.
+
+**A Job Object contains resources and nothing else.** There is no filesystem
+facility and no network facility in one. macOS confines writes to the working
+directory and denies outbound network; Linux does the same through mount and
+network namespaces; Windows does neither. So "sandboxed" on Windows means
+resource-capped and does not mean access-confined, and the two must not be read
+as the same claim. The access half is `AppContainer` and it is not written yet.
+
+Two further differences, stated rather than left to be discovered. The job's CPU
+limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time as
+well, so the cap is weaker on Windows for a kernel-heavy workload. And
+`JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes an allocation *fail* rather than
+terminating the process: a payload over the cap is never allowed to hold the
+memory, and typically dies of its own failed allocation rather than being killed.
 
 ## Limits that hold today
 

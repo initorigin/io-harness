@@ -73,8 +73,8 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
   rule and layer in the trace. An `ask_exec` routes to the `Approver` and
   survives a restart like any other [deferred approval](durable-runs.md).
 - **Nothing may shadow anything** — a registered tool cannot take one of the
-  names the harness reserves (`write_file`, `grep`, `find`, `read_file`,
-  `read_skill`, `remember`, `spawn_agent`), cannot use the `mcp__` prefix
+  names the harness reserves (`write_file`, `grep`, `find`, `list_dir`,
+  `read_file`, `shell`, `exec`, `read_skill`, `remember`, `spawn_agent`), cannot use the `mcp__` prefix
   reserved for server tools, and two registered tools cannot share a name. Each
   is an `Error::Config` raised **before the provider is called once**, not a
   silent shadowing found at dispatch. The feature-gated built-ins — the `git_*`

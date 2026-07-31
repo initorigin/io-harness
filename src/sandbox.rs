@@ -75,6 +75,7 @@ use crate::error::Result;
 ///     eprintln!("no kernel isolation on this host: {}", backend.as_str());
 /// }
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
     /// macOS `sandbox-exec` profile + rlimits + RSS monitor.
@@ -123,6 +124,10 @@ impl Backend {
 ///         Some(Cap::Processes) => "forked past max_processes".into(),
 ///         // No cap fired, so the exit code is the whole story.
 ///         None => format!("exited {:?}", outcome.exit_code),
+///         // `Cap` is `#[non_exhaustive]` from 0.24.0, so this arm is required
+///         // and is the point of the attribute: a cap added in a later release
+///         // reaches here instead of failing your build.
+///         Some(other) => format!("stopped by {}", other.as_str()),
 ///     }
 /// }
 ///
@@ -130,6 +135,7 @@ impl Backend {
 /// assert_eq!(Cap::Wall.as_str(), "wall");
 /// # let _ = why;
 /// ```
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cap {
     /// CPU time. `RLIMIT_CPU` on unix (the process took SIGXCPU); the Job

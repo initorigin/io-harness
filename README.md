@@ -247,7 +247,7 @@ dependency at all.
 | --- | --- |
 | macOS | Native, `sandbox-exec` |
 | Linux | Native, namespaces and rlimits |
-| Windows | Portable floor only — the Job Object backend is designed, not implemented, and only the wall clock is enforced |
+| Windows | Native resource containment (memory, CPU, process count, tree kill); no filesystem or network boundary |
 
 The full suite runs on all three in CI.
 
