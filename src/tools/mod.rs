@@ -12,10 +12,13 @@
 //! 0.8.0 put it — the MCP client in [`crate::mcp`].
 
 pub mod custom;
+pub(crate) mod diagnostics;
 pub mod documents;
 pub mod exec;
 pub mod fs;
 pub mod git;
+/// Long-running processes a run owns beyond the call that started them.
+pub(crate) mod handles;
 pub mod shell;
 pub mod workspace;
 
@@ -61,6 +64,37 @@ pub const EXEC_TOOL: &str = "exec";
 /// expansion, subshells, heredocs, background and control flow are refused by
 /// name. See [`shell`] for the whole set and why it is drawn where it is.
 pub const SHELL_TOOL: &str = "shell";
+/// The name the model uses to start a command line and keep it running (0.25.0).
+///
+/// The line is parsed and checked by exactly the machinery [`SHELL_TOOL`] uses —
+/// same lexer, same refusal set, same per-stage [`Act::Exec`](crate::Act::Exec)
+/// and per-redirect path check, all before the first spawn. A handle is a
+/// different *lifetime* for a command line, not a second way to run one.
+///
+/// What it changes is what happens after the check passes: the processes are
+/// registered and an id comes back instead of a result. That id is polled with
+/// [`SHELL_POLL_TOOL`] and ended with [`SHELL_KILL_TOOL`].
+///
+/// A handle does not survive the process that started it. On resume it is
+/// reported orphaned and is never re-attached, polled or signalled — a recorded
+/// pid may since have been reused, and signalling it is the one way this crate
+/// could damage something outside its workspace.
+///
+/// **On Windows, quote absolute paths.** The grammar treats `\` as an escape,
+/// as POSIX does, so an unquoted `C:\repo\server.exe` lexes to
+/// `C:reposerver.exe` and the spawn fails naming a program nobody wrote. This is
+/// the same answer a real shell gives and applies equally to [`SHELL_TOOL`];
+/// single quotes are the simplest form.
+pub const SHELL_START_TOOL: &str = "shell_start";
+/// The name the model uses to read what a started line has produced (0.25.0).
+///
+/// Returns what was written since the previous poll, not the whole history: a
+/// log tail polled ten times must not return its output ten times. The full
+/// stream stays in the run's trace, so nothing is lost by the window.
+pub const SHELL_POLL_TOOL: &str = "shell_poll";
+/// The name the model uses to end a started line and everything it spawned
+/// (0.25.0).
+pub const SHELL_KILL_TOOL: &str = "shell_kill";
 /// The name the model uses to search file contents by regex/substring.
 pub const GREP_TOOL: &str = "grep";
 /// The name the model uses to list files by name/path glob.

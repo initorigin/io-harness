@@ -13,9 +13,9 @@ every such execution through a boundary:
   (success, failure, cap kill), so nothing it writes or spawns outlives it.
 - **Resource caps that kill, not throttle** — `SandboxLimits` caps CPU time,
   wall-clock, and memory; a breach returns a *typed* cap hit, never a hang. The
-  CPU and memory caps are unix mechanisms (`RLIMIT_CPU`, an RSS monitor); on
-  Windows only the wall clock is enforced, and a cap that was not applied is
-  never reported as hit.
+  unix mechanisms behind the CPU and memory caps are `RLIMIT_CPU` and an RSS
+  monitor; on Windows the Job Object caps memory, CPU and the active process
+  count instead, and a cap that was not applied is never reported as hit.
 - **Network denied by default** — `SandboxConfig::allow_network` is `false`
   unless you set it. How strong that denial is depends entirely on the backend:
   a kernel boundary on Linux, an SBPL rule on macOS, and only a proxy-env strip
@@ -41,27 +41,44 @@ everywhere — so a task isolates the same way on mac, linux, and windows:
 | --- | --- |
 | **macOS `sandbox-exec`** | a generated profile confines writes to the workdir and **denies network**; rlimits cap CPU and open files; an RSS monitor caps memory (macOS does not enforce address-space rlimits) |
 | **Linux namespaces** | user/mount/pid/**net** namespaces via `unshare` — a *hard* network boundary and a private root — plus the same rlimits and RSS monitor *(cfg-gated; compiled + unit-tested, not live-run on the macOS build host)* |
-| **Windows** | **no native backend yet** — the portable floor, wall clock only (see the note under this table) |
+| **Windows Job Object** | a **resource** boundary and only that: caps committed memory, user-mode CPU and the active process count, and kills the whole process tree when the job handle closes. A Job Object has no path rule and no socket rule to set, so filesystem scoping is still the floor's ephemeral workdir and egress denial is still the proxy-env strip (see the note under this table) |
 | **Portable floor** | the guaranteed minimum on every OS: fresh subprocess, ephemeral workdir, resource caps, network env stripped. Deliberately the **weakest** backend — filesystem-scoped and resource-capped, *not* a full syscall jail |
 
-**Windows, stated plainly.** The Job Object is designed but **unimplemented** — no
-Win32 call is made — so a Windows run gets the portable floor and reports it as
-such. On Windows that floor
-enforces the **wall clock only**: no CPU cap, no memory cap, no process cap (all
-three are unix `rlimit`/`ps` mechanisms) and no kernel network boundary. The
-wall-clock kill does reach the whole process tree. Caps that are not applied are
-never reported — a Windows run never claims a CPU or memory cap hit. Tracked for a
-dedicated release.
+**Windows, stated plainly.** Since 0.24.0 a Windows run is contained by a real
+Job Object and reports `Backend::WindowsJobObject`. Memory, CPU and the active
+process count are real bounds there, and closing the job handle kills the whole
+process tree, so nothing the run spawned outlives it. What a Job Object has **no
+facility for** is the filesystem and the network — there is no path rule and no
+socket rule to set on one. macOS confines writes to the workdir and denies
+outbound network, Linux does the same through mount and network namespaces, and
+Windows does neither, so "sandboxed" on Windows means resource-capped rather than
+access-confined and the two must not be read as the same claim. The access half
+is `AppContainer`, scheduled for 0.26.0.
+
+Two differences from the unix mechanisms are worth naming rather than leaving to
+be discovered. The job's CPU limit
+counts user-mode time only, where `RLIMIT_CPU` counts kernel time as well, so the
+cap is weaker on Windows for a kernel-heavy payload. And the memory limit makes
+the offending allocation *fail* rather than terminating the process: the payload
+is never allowed to hold more than the cap and typically dies of its own failed
+allocation. That one is reported from the job's peak-memory accounting at ninety
+percent of the cap, because the job records the peak a process reached and never
+the allocation it was refused — a run that got that close and then failed, failed
+because of the ceiling.
 
 Two further caveats belong beside it. The Linux backend applies no seccomp
 filter of its own: whatever syscall tightening a Linux run gets is what the
 kernel layers by default under an unprivileged user namespace, not something the
-crate installs. And `SandboxLimits::max_processes` is enforced by **nothing**
-today — it is deliberately not mapped to `RLIMIT_NPROC`, because that limit is
-per-real-uid rather than per-sandbox and capping it would throttle the
-operator's whole login session; the backends that could scope it properly are
-the Linux pid namespace's active-process limit and the Windows Job Object's,
-neither of which is wired up. Setting it has no effect on any platform.
+crate installs. And `SandboxLimits::max_processes` is enforced by the **Windows
+Job Object alone** — its `ActiveProcessLimit` is the one mechanism this crate
+has that bounds the process count per sandbox, and like the job's memory cap it
+is not a kill: the job refuses the `CreateProcess` that would cross the limit, so
+the run fails because its own spawn failed rather than because it was shot.
+macOS and Linux enforce nothing here. Neither maps it to `RLIMIT_NPROC`, because
+that limit is per-real-uid rather than per-sandbox and capping it would throttle
+the operator's whole login session; the other backend that could scope it
+properly is the Linux pid namespace's active-process limit, which is not wired
+up. Setting it on a unix host has no effect.
 
 `select` picks the strongest backend the host can actually deliver and records
 which ran. The *candidate* is chosen at compile time by cfg, but a native

@@ -1,355 +1,393 @@
 product: io-harness
-version: 0.24.0
+version: 0.25.0
 tasks:
-- id: US-IO-HARNESS-0.24.0-T01
-  summary: Make the task contract's success criterion optional. `TaskContract::workspace` drops its
-    third positional `Verification` and defaults to `Verification::None`; a `with_verification` builder
-    joins the seventeen already on the type. Every call site in `src/`, `tests/`, `examples/` and the
-    compiled doctests moves. README's first example and `docs/guide/permissions.md`'s first example
-    lead with `Session` rather than `run_with`.
-  why_required: 'The positioning fix is the one piece of this release whose cost doubles if it moves:
-    shipping an API break now and this break later makes every consumer migrate twice. It is also the
-    smallest and most mechanical task in the release, so it goes first and is never what drops.'
+- id: US-IO-HARNESS-0.25.0-T01
+  summary: Add the handle registry and the `shell_start` tool, sharing 0.24.0's parser and gate. `shell_start`
+    runs the line through `parse` and `plan`, walks the same per-stage `Act::Exec` and redirect checks
+    the `SHELL_TOOL` arm walks, and only then spawns and registers. The registry owns the children beyond
+    the dispatch that made them, which is the guarantee this release gives up on purpose.
+  why_required: 'Every other handle task needs something to start. This is also where the release stops
+    being like every previous one: the registry is the first thing in the crate that owns a process beyond
+    the call that created it, so it is the task that defines what the rest must prove.'
   status: done
   depends_on: []
   acceptance_criteria:
-  - 'F11 — the positioning fix compiles and defaults correctly. `TaskContract::workspace(goal, root)`
-    takes two arguments and yields `Verification::None`; `.with_verification(v)` sets it; the README''s
-    first example and `docs/guide/permissions.md`''s first example both lead with `Session`. **Amended
-    by `US-IO-HARNESS-0.24.0-I01`:** the original clause also required both to "compile as doctests",
-    which is false of this repository — there is no `include_str!` of the README into the crate root
-    and `cargo test --doc` compiles only `///` and `//!` comments under `src/`. The markdown is checked
-    as text by `tests/readme.rs`, `tests/guide_pages.rs` and `tests/docs_drift.rs`. Making the clause
-    true would mean changing how the crate documents itself, which is not this release''s work.
-
-    '
-  files:
-  - src/contract.rs
-  - README.md
-  - docs/guide/permissions.md
-  - docs/guide/sessions.md
-  evidence:
-  - '`TaskContract::workspace(goal, root)` is two-argument and defaults to `Verification::None`; `with_verification`
-    added. 173 call sites converted across src/, tests/, examples/, docs/ and README.md; zero three-argument
-    call sites remain outside the pinned 0.22.0 fixture and the changelog''s own history.'
-  - README.md and docs/guide/permissions.md both lead with `Session`; `run_with` kept and documented
-    as the one-shot form.
-  - 'F11 is only PARTLY met: its clause ''both compile as doctests'' cannot be satisfied — the README
-    and guide fences are not compiled doctests in this crate (no `include_str!` of README into the crate
-    root; `cargo test --doc` covers only `///` and `//!` in src/). Both examples were made correct Rust
-    and verified by the text-level tests that do exist. Raised for /ultraship:iterate.'
-- id: US-IO-HARNESS-0.24.0-T02
-  summary: 'Add the `list_dir` tool: one directory, one level, entries with type and size, path-resolved
-    and checked against `Act::Read` through `Workspace::check_path`. Registered in `workspace_tools()`,
-    dispatched in `run.rs`, and added to `RESERVED_TOOL_NAMES`.'
-  why_required: Without it there is no way to ask what is in a directory — `find` walks the whole tree
-    against a glob, which is a different question. It is the first thing anyone does in an unfamiliar
-    repository and the release's outcome names it.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - 'F10 — `list_dir` lists one level and no more. A directory containing a subdirectory containing
-    a file returns the subdirectory and not the file; a path outside the workspace is refused; a directory
-    the policy denies reading is refused by path.
-
-    '
-  files:
-  - src/tools/workspace.rs
-  - src/tools/mod.rs
-  - src/run.rs
-  - tests/
-  evidence:
-  - '`list_dir` lists one directory one level deep, path-resolved through the same `Act::Read` check
-    `read_file` uses; `find` unchanged.'
-  - '`cargo test --test list_dir` — 12 passed, 0 failed, covering all three clauses of F10 at both the
-    `Workspace` level and through a real run, plus symlink-not-followed, deterministic ordering and
-    the truncation bound.'
-- id: US-IO-HARNESS-0.24.0-T03
-  summary: 'The shell lexer and parser, pure — no execution. An allowlist lexer where any byte outside
-    the permitted set for the current state is a refusal, over a conservative POSIX subset: quoted and
-    escaped words, `|`, `;`, `&&`, `||`, and the `>` `>>` `<` `2>` `2>>` `2>&1` redirects. Every excluded
-    construct refused by name with a reason. Depth and length caps. Property test over generated input
-    plus the sabotage runs that prove it non-vacuous.'
-  why_required: This is the release's entire security argument. A line that parses to a different set
-    of sub-commands than it executes means the harness checked something other than what ran, which
-    is worse than having no shell at all because the trace would assert a boundary that was never applied.
-    Nothing downstream can be trusted until this is closed.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - 'F4 — the refusal set is complete and fails closed, and this is the load-bearing criterion of the
-    release. Every construct in the excluded grammar has a test asserting it is refused, that the reason
-    names the construct, and that no process was spawned. Beyond the enumerated list, a property test
-    over generated input asserts the invariant directly: **any input containing a byte outside the lexer''s
-    permitted set for its state is refused**. Non-vacuity is proven the way 0.23.0 proved its cross-version
-    tests — by sabotage: the allowlist is widened by one byte, the property test must fail, and the
-    change is reverted.
-
-    '
-  - 'NF3 — the parser terminates on adversarial input within a bound. Nesting depth is capped, input
-    length is capped, and both refusals are ordinary refusals with reasons. No input causes unbounded
-    recursion, unbounded allocation, or a stack overflow — asserted by the property test in F4 running
-    against deeply nested and pathologically long inputs.
+  - 'F4 — the handle path is checked by the same machinery as the foreground path, proven rather than
+    asserted. Every refusal case in `tests/shell.rs` runs again through `shell_start` and refuses identically,
+    spawning nothing and registering no handle — driven from one shared table through the existing `run_line`
+    harness (`tests/shell.rs:88`) parameterised over the tool, so a refusal added to one path cannot be
+    missing from the other. A line whose second stage is denied starts no first stage.
 
     '
   files:
   - src/tools/shell.rs
-  - tests/
+  - src/tools/mod.rs
+  - src/run.rs
+  - src/tools/custom.rs
   evidence:
-  - '`cargo test --lib tools::shell` — 19 passed, 0 failed. Two sweep the entire ASCII range: every
-    character outside the permitted set is refused, and no character silently creates a sub-command.'
-  - 'Non-vacuity proven by eight sabotage runs, each caught by a NAMED test, evidence in `.ultraship/evidence/0.24.0/shell-parser-sabotage.txt`.
-    Two of them found defects in the TESTS rather than the parser: the property test''s oracle was written
-    as `is_bare_word_char(c)` — the function under test — so widening the allowlist widened the expectation
-    with it and a parser permitting an unquoted `$` passed everything. The oracle is now a literal character
-    list.'
-  - 'Zero new dependencies: the parser is written in-crate. `yash-syntax` from the roadmap is GPL-3.0-or-later
-    and unusable in an Apache-2.0 crate designed to be linked into another program; `brush-parser` measured
-    at +37 crates on the default feature set.'
-- id: US-IO-HARNESS-0.24.0-T04
-  summary: 'The `shell` tool: parse, then check every sub-command''s resolved program and argv against
-    `Act::Exec` and every redirect target against `Act::Write` or `Act::Read` — all before any spawn
-    — then execute, wiring the pipeline between argv-spawned children with no host shell anywhere. `cd`
-    handled as the one builtin, path-resolved and unable to escape the root.'
-  why_required: This is the outcome the release is named for. Without it the parser is unreachable and
-    the capability gap that blocks non-coding work stays open.
+  - check_shell_line extracted at src/run.rs so shell and shell_start share one check pass rather than
+    two copies; shell, exec_tool and policy unchanged after the extraction.
+  - 'src/tools/handles.rs: the registry, 8 unit tests covering the cap refusing rather than queueing,
+    a poll returning only what is new, a poll over the window reporting its gap, and an orphan never re-using
+    a live id.'
+  - shell_start, shell_poll and shell_kill wired into dispatch, workspace_tools and RESERVED_TOOL_NAMES;
+    registry created per run in the flat loop and per agent in the tree loop.
+  - 'tests/handles.rs, 5 end-to-end tests through the run loop with a scripted provider: a handle starts,
+    polls and is killed; no output is delivered by two polls; every construct shell refuses shell_start
+    refuses; a denied later stage starts no handle and writes no file; the ninth start against a cap of
+    8 is refused.'
+  - examples/tick.rs added as the fixture — nothing that ships on all three platforms both keeps running
+    and keeps printing.
+- id: US-IO-HARNESS-0.25.0-T02
+  summary: 'Add the handle lifecycle tables to `src/state.rs` and their `Store` reader and writer, copying
+    the `citations` pattern: additive `CREATE TABLE IF NOT EXISTS` at the end of `from_conn`, a public
+    row struct, a transactional writer, an `ORDER BY id` reader, and a rustdoc example against `Store::memory()`.
+    `CHECKPOINT_FORMAT` stays 7.'
+  why_required: 'A handle outlives its poll and must outlive its step: the trace has to answer what a
+    dev server did after the process that started it is gone. It is also what makes the incremental-poll
+    decision safe, since the whole stream is recoverable from the store when a poll result is lost.'
   status: done
   depends_on:
-  - US-IO-HARNESS-0.24.0-T03
+  - US-IO-HARNESS-0.25.0-T01
   acceptance_criteria:
-  - 'F1 — a real command line runs under a checked boundary. `cd infra && kubectl get pods | grep CrashLoop`
-    executes under a policy allowing `kubectl*` and `grep*`, and the trace afterwards carries one policy
-    decision per sub-command naming the rule and layer that allowed it — read back through the public
-    `Store` API, not from logs.
+  - 'NF3 — a handle that is never polled cannot exhaust memory. Output accumulates to the store with a
+    bounded in-memory buffer, and a process producing unbounded output while nothing polls it is bounded
+    by that policy rather than by the host''s memory. Asserted with a generator process, not argued.
 
     '
-  - 'F2 — a denied stage refuses the whole line and nothing executes. The same pipeline under a policy
-    that denies `grep*` is refused before any process is spawned, the refusal names the stage and the
-    rule, and the negative control is observable rather than argued: a first stage with a side effect
-    on disk — `kubectl get pods > out.txt | grep x` shaped so the first stage would write — leaves no
-    file behind. Every check happens before any spawn.
+  files:
+  - src/state.rs
+  evidence:
+  - process_handles and handle_output added to Store::from_conn with the citations pattern; 7 Store methods
+    and a public ProcessHandle row struct; 9 unit tests. CHECKPOINT_FORMAT stays 7. record_handle_started
+    uses INSERT OR IGNORE so a replayed step cannot clobber a live row; record_handle_ended will not re-end
+    an already-ended row.
+  - tests/cross_version.rs updated from a schema equality to an additive-only assertion naming the four
+    permitted new objects, and both tests renamed — "migrates nothing" had become an overstatement. The
+    suite caught the schema change unprompted, which is what 0.23.0 built it for.
+- id: US-IO-HARNESS-0.25.0-T03
+  summary: Add `shell_poll` and `shell_kill`. `shell_poll` returns output produced since the last poll
+    from a per-stream byte cursor, bounded by the existing `head_and_tail` elision, while every byte read
+    goes to the store. `shell_kill` ends the process and its tree and records the terminal status. Add
+    the per-run cap on live handles, and kill every live handle when a run ends.
+  why_required: 'A handle that cannot be read or ended is not a capability, it is a leak. The cap and
+    the kill-on-run-end are not extras: they are two of the four ways the registry can leak a process
+    onto the operator''s machine.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.25.0-T01
+  - US-IO-HARNESS-0.25.0-T02
+  acceptance_criteria:
+  - 'F1 — a process handle starts, polls and dies. A command producing output over time is started, polled
+    twice returning incremental output with no duplication and no loss across the two polls, then killed;
+    the handle''s terminal state and its full output are readable from the store afterwards. A handle
+    left live when its run ends is killed, not leaked, and that is asserted by checking the process is
+    gone rather than by trusting the code path. *(0.24.0''s F5, deferred by `US-IO-HARNESS-0.24.0-I01`,
+    carried here unchanged.)*
 
     '
-  - 'F3 — redirect targets are checked by path, not by name. `cmd > ../outside.txt` is refused by the
-    workspace path rules even when `cmd` is allowed; `cmd > allowed/out.txt` succeeds; `cmd < secrets/key`
-    is refused as a read. Each goes through `Workspace::check_path`, proven by a policy whose deny rule
-    is a path pattern that no name match would catch.
+  - 'F6 — the live-handle cap refuses rather than queues. Starting one handle past the configured cap
+    is refused with a reason naming the cap, no process is spawned, and the handles already live are untouched.
 
     '
   files:
   - src/tools/shell.rs
   - src/run.rs
-  - src/tools/mod.rs
-  - tests/
+  - src/state.rs
   evidence:
-  - '`cargo test --test shell` — 10 passed, 0 failed, covering F1, F2 and F3.'
-  - 'F2''s negative control is the load-bearing one: a first stage with a side effect on disk leaves
-    no file when a later stage is denied, and the same line under a permissive policy does create it.'
-  - Paths are resolved once into a plan and the runner opens exactly what was checked. Resolving at
-    run time would have had the policy check `out.txt` while the process wrote `src/out.txt` after a
-    `cd`.
-- id: US-IO-HARNESS-0.24.0-T05
-  summary: The `#[non_exhaustive]` rider on `CompletionRequest`, `CompletionResponse`, `EventKind` and
-    `Backend`, none of which carries it and none of which has any use of the attribute in `src/` today.
-    Regenerate `docs/public-api.txt`; add a `BREAKING` entry with a `*Migration:*` note per break, the
-    pairing enforced by the existing `tests/changelog.rs`.
-  why_required: 0.22.0 already broke literals of three of these and this release adds `EventKind` variants
-    and gives `Backend` a value it has never returned. This is the cheapest moment the attribute will
-    ever cost, and 0.25.0's AppContainer variant is the next thing that would otherwise break an exhaustive
-    match.
+  - shell_poll and shell_kill implemented and tested end to end, including incremental output and killing
+    an already-ended handle being reported rather than failed.
+  - 'F1 is now closed: a_handle_left_running_is_killed_when_the_run_ends asserts against the operating
+    system via the recorded pids, not against the registry.'
+  - 'That assertion found a real bug that would have shipped: the reaping task held a strong Arc to the
+    registry, so a handle that never exits kept the refcount above zero, Drop never ran, and the process
+    outlived the run. Both the reaper and the pid callback now hold Weak.'
+  - Killing a handle flushes output nobody polled, which was otherwise recorded nowhere durable.
+- id: US-IO-HARNESS-0.25.0-T04
+  summary: Route the handle spawn into the platform's containment — `Job::create`/`Job::adopt` on Windows,
+    the recorded containment and `kill_tree` on unix — so `shell_kill` ends a tree rather than a parent.
+    `shell` and `exec` keep the spawn path they shipped with.
+  why_required: 'The roadmap assumed handles inherited 0.24.0''s Job Object. They do not: `src/tools/shell.rs`
+    references `Sandbox` nowhere, and the job is on the verification path. Without this task `shell_kill`
+    leaks grandchildren on the one platform with no process group, which is the exact failure 0.24.0 shipped
+    the Job Object to prevent.'
   status: done
   depends_on:
-  - US-IO-HARNESS-0.24.0-T01
+  - US-IO-HARNESS-0.25.0-T03
   acceptance_criteria:
-  - 'F12 — the four types carry `#[non_exhaustive]` and the breaks are documented to the same standard
-    0.23.0 held. `docs/public-api.txt` reflects the surface, `tests/public_api.rs` passes against it,
-    and the changelog carries a `BREAKING` entry with a `*Migration:*` note per break — pairing enforced
-    by the existing `tests/changelog.rs`.
+  - 'F2 — killing kills the tree on macOS and Linux. A handle whose command spawns a child that spawns
+    a grandchild is killed, and all three are gone. The mechanism is a process group: each handle stage
+    is spawned as its own group leader and the kill signals the group, which reaches a grandchild whose
+    parent has already exited — the case every kill built on walking the process table misses. The negative
+    control is what makes it worth its cost: the same fixture killed by pid alone must leave the grandchild
+    running. *(the handle half of 0.24.0''s F6, which that release could only assert through the sandbox''s
+    own spawn path.)*
+
+    **Amended by `US-IO-HARNESS-0.25.0-I01`:** this criterion said "on all three platforms" with a Windows
+    negative control, and Windows is withdrawn from it rather than left standing as an unmet clause. Windows
+    has no process group; its equivalent is the Job Object, and assigning a child to one requires the
+    child handle at the spawn site, where this release''s interface carries a pid. Meeting it means changing
+    that interface and verifying unsafe Win32 through a CI round trip rather than on any machine this
+    work can reach. It moves to 0.26.0, which re-owns the Windows spawn path for AppContainer regardless,
+    and where the job assignment is a few lines in the same place rather than a second interface change.
+    Until then a Windows handle''s tree kill is best-effort and a grandchild whose parent already exited
+    may survive — stated in `docs/CONTRACT.md` and the sandbox guide rather than left to be discovered.
+
+    '
+  - 'F5 — a handle''s processes are contained by the platform''s own facility, which is the claim the
+    code did not support before this release. On unix that is the process group F2 asserts. **Amended
+    by `US-IO-HARNESS-0.25.0-I01`:** the Windows half — reaching the Job Object from the handle path —
+    moves to 0.26.0 with F2''s Windows clause and for the same reason. What is asserted here is unix only.
+    The original wording follows, since its argument still holds for the half that shipped: a handle''s
+    processes are contained by the run''s sandbox, which is the claim the code does not support today.
+    The spawn reaches `Job::adopt` on Windows and the recorded containment on unix, verified against the
+    cap reason rather than against the child dying — a child that dies is not evidence that anything contained
+    it. This is a criterion and not a note because `src/tools/shell.rs` references `Sandbox` nowhere,
+    so inheriting containment is work rather than a consequence.
 
     '
   files:
-  - src/provider/mod.rs
-  - src/observe.rs
+  - src/tools/shell.rs
   - src/sandbox.rs
-  - docs/public-api.txt
-  - CHANGELOG.md
-  evidence:
-  - 'DONE: `#[non_exhaustive]` on `EventKind`, `Backend` and `Cap` (the enums), which applied with zero
-    breakage inside the crate. The `Cap` doctest carries the wildcard arm the change requires.'
-  - '`CompletionRequest` and `CompletionResponse` removed from the rider by `US-IO-HARNESS-0.24.0-I01`,
-    owner-approved, with the measured evidence recorded there. `Cap` added to it in their place, since
-    `Cap::Processes` breaks it this release anyway.'
-  - '`cargo test --doc` — 239 passed, 0 failed. The `Cap` doctest carries the wildcard arm the attribute
-    requires, so it is the migration note as well as the test.'
-- id: US-IO-HARNESS-0.24.0-T08
-  summary: The Windows Job Object resource backend. `windows-sys` under `[target.'cfg(windows)'.dependencies]`,
-    job creation, child assignment before the child runs, memory / CPU / active-process limits from
-    the existing `JobLimits` mapping, kill-on-close, and `Backend::WindowsJobObject` reported where
-    `PortableFloor` is reported today. Every `unsafe` block carries a safety comment.
-  why_required: '`shell_kill` on Windows without a job leaks grandchildren, so the handle feature from
-    T06 is not correct on that platform without this — which is why the two are one release rather than
-    two. It also makes Windows the first backend anywhere to enforce `SandboxLimits::max_processes`.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.24.0-T06
-  acceptance_criteria:
-  - 'F6 — killing kills the tree, including on Windows. A sandboxed run whose command spawns a child
-    that spawns a grandchild is stopped, and all three are gone. The negative control is the one that
-    makes the Job Object worth its cost: the same test with the job disabled must leave the grandchild
-    running on Windows, so the criterion proves containment rather than coincidence. **Amended by `US-IO-HARNESS-0.24.0-I01`:**
-    originally written in terms of killing a process *handle*; handles are deferred to 0.25.0, so this
-    is asserted through the sandbox''s own spawn path, which closes the same job handle by the same
-    mechanism. The handle-initiated form of this criterion goes to 0.25.0 with the handles.
-
-    '
-  - 'F8 — `max_processes` is enforced on Windows, for the first time on any platform. A command that
-    attempts to exceed the configured active-process limit is stopped by the job rather than by the
-    wall clock, and the failure is attributed to the process limit in the trace. `Backend:: WindowsJobObject`
-    is what the sandbox reports on that platform, replacing `PortableFloor`.
-
-    '
-  - 'F9 — memory and CPU are real bounds on Windows. A child exceeding its CPU allotment is terminated
-    by the job. A child exceeding the job''s memory limit is refused the memory: **amended by `US-IO-HARNESS-0.24.0-I01`**,
-    because `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes the offending allocation fail rather than terminating
-    the process, and the original wording described something the Win32 API does not do. What must be
-    shown is unchanged in force — the process is never permitted to hold more than the cap, and the
-    outcome is asserted against the recorded cap reason so a wall-clock timeout cannot pass as either.
-
-    '
-  files:
-  - Cargo.toml
   - src/sandbox/windows.rs
-  - src/sandbox.rs
-  - tests/
   evidence:
-  - Job created, child assigned while `CREATE_SUSPENDED` then resumed, limits set from the existing
-    `JobLimits`, `Backend::WindowsJobObject` reported. Every `unsafe` block carries a SAFETY comment.
-  - 'NF2 verified on the host: `cargo tree` is 402 lines and contains no `windows` crate at all. `windows-sys`
-    is under `[target.''cfg(windows)''.dependencies]`.'
-  - 'NOT VERIFIED BY EXECUTION: no Win32 path has run. `cargo check --target x86_64-pc-windows-msvc`
-    cannot pass `libsqlite3-sys`''s build script on macOS, so the sandbox module was mirrored into a
-    scratch crate to type-check every Win32 signature, the feature set and the `Send` bound under that
-    target. F6, F8 and F9 rest on the first CI Windows run.'
-  - 'F9''s memory clause does not match Windows semantics: `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes an
-    allocation FAIL rather than terminating the process. Documented as such rather than claimed as a
-    kill. Raised for /ultraship:iterate.'
-- id: US-IO-HARNESS-0.24.0-T09
-  summary: 'Documentation and dependency accounting. The README platform table''s Windows row states
-    native resource containment — memory, CPU, process count, tree kill — and no filesystem or network
-    boundary, in the same row. `docs/CONTRACT.md` updated in both directions: `max_processes` is no
-    longer enforced by nothing, and the shell''s refusal set becomes part of the public contract. `cargo
-    tree` line counts recorded per platform.'
-  why_required: The Windows row is a claim about a security boundary that does not exist; shortened
-    to "Native" it says the opposite of the truth. And the refusal set is something a consumer needs
-    before they write a policy, so it is contract rather than implementation detail.
+  - 'Unix: each handle stage is spawned as its own process-group leader via setpgid(0,0) in pre_exec,
+    and Handles::kill signals the group through kill_tree_and_group, guarded on getpgid(pid) == pid so
+    it can never signal the harness own group.'
+  - 'examples/orphan.rs is the fixture, written to be hostile to a table walk: the leaf waits until the
+    kernel says it has been reparented before publishing its pid, so the kill is not racing the middle
+    exit.'
+  - 'Proven non-vacuous by sabotage: stubbing the hook to `if false` makes killing_a_handle_kills_a_grandchild_whose_parent_already_exited
+    fail with "the grandchild survived the kill". The negative control without_a_process_group_the_grandchild_survives
+    kills by pid alone and asserts the grandchild lives.'
+  - Foreground shell and exec spawns are unchanged, guarded on capture.is_some(); their suites are green.
+  - WINDOWS DEFERRED to 0.26.0 by US-IO-HARNESS-0.25.0-I01. No Job Object on the handle path; the grandchild
+    gap remains and is documented rather than claimed closed.
+- id: US-IO-HARNESS-0.25.0-T05
+  summary: Orphan every pre-existing handle on resume, once, where all four call sites reach it — in or
+    immediately beside `record_resume_markers`. An orphaned handle is marked with a reason, is readable
+    from the store, is never re-attached, polled or signalled, and no recorded PID is signalled on any
+    resume path.
+  why_required: This is the only way this crate can damage something outside its own workspace. A PID
+    recorded before a crash may have been reused, and signalling it kills a stranger's program. It goes
+    at the single funnel rather than per path because being right on three of four paths is the same as
+    being wrong.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.24.0-T04
-  - US-IO-HARNESS-0.24.0-T08
+  - US-IO-HARNESS-0.25.0-T03
   acceptance_criteria:
-  - 'OP3 — the README platform table''s Windows row states native resource containment (memory, CPU,
-    process count, tree kill) **and** no filesystem or network boundary, in the same row. Reviewed as
-    a criterion because the shortened version — "Native" — is the failure mode, and it is a claim about
-    a security boundary that does not exist.
-
-    '
-  - 'OP4 — `docs/CONTRACT.md` updated in both directions: `SandboxLimits::max_processes` is no longer
-    "enforced by nothing" and says which platform enforces it, and the shell tool''s refusal set is
-    documented as part of the public contract rather than as an implementation detail, because a consumer
-    needs to know what their agent cannot express.
-
-    '
-  - 'NF2 — **the macOS and Linux dependency trees do not move.** `cargo tree` on the default feature
-    set reads the same 402 lines after this release as before it. The only new dependency is `windows-sys`
-    under `[target.''cfg(windows)''.dependencies]`, and its transitive cost is reported separately as
-    a Windows-only figure. This is checkable and it is the strongest single argument for the in-crate
-    parser, so it is a criterion rather than a note.
+  - 'F3 — handles do not survive a process boundary, and say so. A run with a live handle is checkpointed
+    and the process exits; on resume the handle is reported orphaned with a reason, is never polled or
+    killed, and no PID is signalled. The negative control is a resumed run whose recorded PID has been
+    reused by an unrelated live process, which must not be touched. *(0.24.0''s F7, carried unchanged.)*
+    Asserted on every resume entry point, not one — the criterion is that the pass sits where all four
+    call sites reach it.
 
     '
   files:
-  - README.md
-  - docs/CONTRACT.md
-  - CHANGELOG.md
+  - src/run.rs
+  - src/state.rs
   evidence:
-  - Platform table corrected in all three places it appears — crate root, README.md, docs/CONTRACT.md
-    — each stating resource containment only, with no filesystem or network boundary.
-  - '`docs/guide/command-execution.md` documents the `shell` tool; `docs/guide/tools-and-skills.md`
-    reserved-name list updated.'
-  - CHANGELOG 0.24.0 section written with a BREAKING entry and a `*Migration:*` note per break; `cargo
-    test --test changelog` passes.
-  - 'OP4 complete: `docs/CONTRACT.md` records the shell refusal set as public contract — stated as a
-    set that may widen and will not silently narrow — plus the `cd`-at-plan-time and `2>&1`-in-a-pipe
-    limitations, and the position that `CompletionRequest` and `CompletionResponse` are deliberately
-    not `#[non_exhaustive]`.'
-  - 'NF2 verified: `cargo tree` on the macOS host is 402 lines, identical to 0.23.0, and contains no
-    crate matching `windows`. Evidence in `evidence/0.24.0/dependency-and-msrv.txt`.'
-- id: US-IO-HARNESS-0.24.0-T10
-  summary: 'The release gates: full suite on macOS, Linux and Windows; `cargo fmt --check`; `cargo clippy
-    --all-targets -- -D warnings` with `unsafe_op_in_unsafe_fn` denied; the nightly all-features doc
-    build; `cargo package --locked` with the tarball listed rather than assumed; the MSRV re-checked
-    by hand against whatever `windows-sys` requires; and the live provider run in which the model composes
-    a shell line itself.'
-  why_required: The release is `published` mode. Every one of these is a refusal `release.yml` will
-    make on `main` anyway, and the live run is the only evidence that the feature works against a real
-    model rather than against tests written by the same hand that wrote the code.
-  status: in-progress
+  - Orphaning lives in record_resume_markers, the single function every resume path passes through. Store::orphan_live_handles
+    marks only rows still running, is idempotent, and never signals. The fresh registry adopts the orphaned
+    rows so a poll of an old id reports orphaned rather than unknown.
+- id: US-IO-HARNESS-0.25.0-T06
+  summary: Add the `EventKind` variants for a started handle, a poll, a kill, an orphaning and a diagnostics
+    pass, so both features are visible on the observer channel. Additive under the `#[non_exhaustive]`
+    that shipped in 0.24.0.
+  why_required: An orphaning that is only a database row is a silent drop to every operator watching the
+    channel, and the whole argument for orphaning over re-attaching is that it is visible.
+  status: done
   depends_on:
-  - US-IO-HARNESS-0.24.0-T05
-  - US-IO-HARNESS-0.24.0-T07
-  - US-IO-HARNESS-0.24.0-T09
+  - US-IO-HARNESS-0.25.0-T05
   acceptance_criteria:
-  - 'NF1 — the full suite passes on macOS, Linux and Windows. No test skipped, ignored or made conditional
-    to get there. Windows carries more new code than either other platform in this release and is where
-    the Job Object tests live, so a Windows-only failure is a release blocker rather than a flake to
-    re-run — with the standing exception of `skills::discovery_over_a_32_skill_directory_is_under_50ms`,
-    a known wall-clock assertion.
+  - 'F3 — handles do not survive a process boundary, and say so. A run with a live handle is checkpointed
+    and the process exits; on resume the handle is reported orphaned with a reason, is never polled or
+    killed, and no PID is signalled. The negative control is a resumed run whose recorded PID has been
+    reused by an unrelated live process, which must not be touched. *(0.24.0''s F7, carried unchanged.)*
+    Asserted on every resume entry point, not one — the criterion is that the pass sits where all four
+    call sites reach it.
 
     '
-  - 'NF4 — `cargo doc` is warning-free and docs.rs builds with all features, checked by the existing
-    nightly job before publication rather than after.
+  files:
+  - src/observe.rs
+  - src/run.rs
+  evidence:
+  - 'Five EventKind variants added (HandleStarted, HandlePolled, HandleKilled, HandleExited, HandleOrphaned),
+    placed deliberately in the exhaustiveness census rather than behind a wildcard, and emitted from the
+    three dispatch arms. Additive under the #[non_exhaustive] that shipped in 0.24.0.'
+- id: US-IO-HARNESS-0.25.0-T07
+  summary: Run the project's own checker after a successful edit and attach its diagnostics to the observation.
+    Ecosystem comes from `toolchain::detect`; for cargo the command is `cargo check --message-format=json`
+    and each `compiler-message`'s `rendered` field is appended. Bounded by a timeout and an output cap,
+    skipped when no ecosystem is detected or the pass is disabled, and never able to fail an edit.
+  why_required: Without it a type error costs a step, a build and a provider call to discover, on a loop
+    where those compound. This is the feature that replaces the roadmap's LSP client, and it delivers
+    more for Rust because it carries borrow-check and clippy diagnostics that rust-analyzer's pull path
+    does not.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.25.0-T01
+  acceptance_criteria:
+  - 'F7 — a diagnostic reaches the model attached to the edit that caused it. An `edit_file` that introduces
+    a type error into a cargo project returns an observation containing the rendered compiler error, its
+    file, its line and its error code, with no intervening tool call by the model. The negative control
+    is an edit introducing no error, whose observation carries no diagnostics section at all.
 
     '
-  - 'NF5 — every `unsafe` block added for the Win32 calls carries a safety comment stating the invariant
-    it relies on, and `cargo clippy --all-targets -- -D warnings` is clean with `unsafe_op_in_unsafe_fn`
-    denied. This crate has no Win32 FFI today; the standard it enters at is set here.
+  - 'F8 — the diagnostics pass never turns a good edit into a failed one. With the checker absent from
+    `PATH`, with it timing out, and with it failing for an unrelated reason, the edit still succeeds,
+    the observation still reports the edit, and the failure of the pass is recorded rather than raised.
+    Three cases, three tests, because this is the way an information feature becomes an availability bug.
 
     '
-  - 'OP1 — a real end-to-end run against a live provider in which the model composes a shell line itself,
-    it is parsed, checked and executed, and the trace is read back afterwards. One run, one workspace,
-    one verified outcome. Evidence is OpenRouter unless another key exists, per the standing credential
-    position.
+  - 'F9 — the pass is genuinely off when it is off. A project with no detected ecosystem, and a configuration
+    that disables it, both produce an edit with no checker process spawned at all — asserted by process
+    observation, not by an absent diagnostics section, since an empty section and a skipped pass are indistinguishable
+    from the output alone.
 
     '
-  - 'OP2 — MSRV re-checked and stated. If `windows-sys` or anything it pulls raises the floor above
-    1.95, the new number goes in `Cargo.toml` with the same honest comment the existing floor carries,
-    naming the dependency that set it — and it is checked by hand rather than trusted from a manifest,
-    which is the lesson 0.23.0 paid for.
+  - 'NF4 — the diagnostics pass costs nothing measurable on a warm tree and is bounded on a cold one.
+    Its timeout is enforced and its output cap is enforced, both asserted; an edit in a project whose
+    check is slow returns within the bound with the pass recorded as timed out.
+
+    '
+  files:
+  - src/run.rs
+  - src/toolchain.rs
+  - src/config.rs
+  evidence:
+  - 'src/tools/diagnostics.rs: after_edit returns Found/Clean/Skipped/Failed, so "ran and found nothing"
+    is distinguishable from "never ran" (F9). Reuses toolchain::detect and the existing Exec timeout and
+    head_and_tail cap. Cargo parses --message-format=json for the rendered error; five ecosystems have
+    checkers and the rest are skipped because their type-check step is their build. 8 unit tests, no test
+    compiles a crate. ZERO new dependencies.'
+  - Wired after both edit_file and write_file through one shared helper.
+- id: US-IO-HARNESS-0.25.0-T08
+  summary: 'Correct the two stale documentation claims 0.24.0 left behind — `docs/CONTRACT.md` and `docs/guide/sandbox.md`
+    both still say `SandboxLimits::max_processes` is enforced by nothing and that the Windows Job Object
+    is not wired up — and update every doc surface this release touches: the README tool list, `docs/CONTRACT.md`
+    for the handle lifecycle and the orphaning rule, `docs/guide/command-execution.md`, `docs/guide/language-support.md`,
+    and the crate rustdoc.'
+  why_required: 'A contract document that under-claims a shipped boundary is the same class of defect
+    as one that over-claims it: either way a consumer cannot trust the file. The orphaning rule in particular
+    is a contract, not an implementation detail — it is the difference between this crate and one that
+    would re-attach to a recorded PID.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.25.0-T05
+  - US-IO-HARNESS-0.25.0-T07
+  acceptance_criteria:
+  - 'OP2 — the two stale documentation claims are corrected and checked by reading the files: `docs/CONTRACT.md`
+    no longer says `max_processes` is enforced by nothing, and `docs/guide/sandbox.md` agrees with it
+    and with `src/sandbox.rs:26`. Reviewed as a criterion because a contract document that under-claims
+    a shipped boundary is as much a defect as one that over-claims it.
+
+    '
+  - 'OP3 — every doc surface this release touches is updated in this release: the README tool list, `docs/CONTRACT.md`
+    for the handle lifecycle and the orphaning rule, `docs/guide/command-execution.md`, `docs/guide/language-support.md`
+    for the check command, and the crate rustdoc. Checked by grepping the docs for each API this release
+    adds or changes rather than from memory.
+
+    '
+  - 'OP4 — `docs/CONTRACT.md` states the orphaning rule as a contract, not an implementation detail: a
+    consumer needs to know that a handle does not survive a resume and that no recorded PID is ever signalled,
+    because that is the difference between this crate and one that would re-attach.
+
+    '
+  files:
+  - docs/CONTRACT.md
+  - docs/guide/sandbox.md
+  - docs/guide/command-execution.md
+  - docs/guide/language-support.md
+  - README.md
+  - src/lib.rs
+  evidence:
+  - README, docs/CONTRACT.md, docs/guide/command-execution.md and docs/guide/language-support.md updated
+    for the three tools and the diagnostics pass; the orphaning rule is stated as a contract.
+  - The two stale max_processes claims 0.24.0 left behind are corrected, plus three further stale Windows
+    claims found in docs/guide/sandbox.md (a table row reading "no native backend yet" and a note calling
+    the Job Object unimplemented).
+  - 'The Windows containment gap is stated rather than glossed: tree kill on a handle is best-effort until
+    T04 routes the spawn through the Job Object.'
+- id: US-IO-HARNESS-0.25.0-T09
+  summary: 'Release mechanics: the changelog entry with a migration note per change, `docs/public-api.txt`
+    regenerated and `tests/public_api.rs` green, the manifest at 0.25.0, MSRV re-checked by hand, `cargo
+    tree` line counts confirmed unmoved on every platform, `cargo doc` warning-free, clippy clean, and
+    `cargo package --locked` verified by listing the tarball.'
+  why_required: 'The release cannot be cut without them: `release.yml` refuses a version the manifest
+    does not declare or that has no changelog section, and `cargo publish` is irreversible.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.25.0-T08
+  acceptance_criteria:
+  - 'NF2 — **the dependency tree does not move on any platform.** `cargo tree` on the default feature
+    set reads 402 lines after this release as before it, and the Windows tree gains nothing: the handles
+    use the `windows-sys` features 0.24.0 already declares, and the diagnostics pass parses NDJSON with
+    the `serde_json` already present. This is the checkable form of the argument for rejecting the LSP
+    client, so it is a criterion.
+
+    '
+  - 'NF5 — `cargo doc` is warning-free, docs.rs builds with all features, and `cargo clippy --all-targets
+    -- -D warnings` is clean.
 
     '
   - 'OP5 — `cargo package --locked` exits 0 and the tarball carries no `.env`, no `.ultraship` and no
     `.github`, verified by listing rather than assumed from the `exclude` list.
 
     '
+  - 'OP6 — MSRV re-checked by hand and stated. No new dependency is expected to move it; it is checked
+    rather than assumed, which is the lesson 0.23.0 paid for.
+
+    '
   files:
-  - .github/workflows/
+  - CHANGELOG.md
   - Cargo.toml
+  - docs/public-api.txt
+  evidence:
+  - Cargo.toml 0.25.0; CHANGELOG 0.25.0 written; docs/public-api.txt updated by hand for ProcessHandle.
+  - cargo tree 402 default / 842 all-features — unchanged, measured not assumed.
+  - 'MSRV 1.95 checked by hand BOTH directions: 1.94 --ignore-rust-version fails inside libsqlite3-sys
+    build.rs on cfg_select; 1.95 builds. README and docs/CONTRACT.md agree and say nothing else.'
+  - cargo package --locked exit 0; tarball 178 files; verified by listing that no .env, .ultraship, .github
+    or target is present. description 461 chars against the 1000 cap.
+  - clippy --all-features --all-targets clean; cargo doc --all-features warning-free; cargo fmt clean.
+- id: US-IO-HARNESS-0.25.0-T10
+  summary: 'Full-suite verification on all three platforms via CI, and the live provider run that is OP1:
+    the model itself starts a long-running process, polls it, does other work between polls, and kills
+    it, read back from the store afterwards.'
+  why_required: F2's negative control is Windows-only and cannot be verified on the development machine,
+    and a handle that works in a test but not against a real model is not the capability the contract
+    promises.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.25.0-T09
+  acceptance_criteria:
+  - 'NF1 — the full suite passes on macOS, Linux and Windows, with no test skipped, ignored or made conditional
+    to get there. The standing exception is `skills::discovery_over_a_32_skill_directory_is_under_50ms`,
+    a known wall-clock assertion that fails intermittently on the Windows runner under load.
+
+    '
+  - 'OP1 — a real end-to-end run against a live provider in which the model itself starts a long-running
+    process, polls it, does other work between polls, and kills it. One run, one workspace, read back
+    from the store afterwards. Evidence is OpenRouter unless another key exists, per the standing credential
+    position.
+
+    '
+  files:
+  - tests/shell.rs
+  - tests/handles.rs
   - examples/
   evidence:
-  - 'Local gates all green: fmt clean, `clippy --all-targets -- -D warnings` clean, 721 tests passed
-    / 0 failed, 239 doctests passed / 0 failed. Evidence in `evidence/0.24.0/gates.txt`.'
-  - 'OP5: `cargo package --locked` exit 0, 174 files, 922,399 bytes. No `.ultraship`, no `.github`,
-    no exact `.env`, none of the three excluded fixture crates; `src/tools/shell.rs`, `tests/shell.rs`,
-    `tests/list_dir.rs` and the nine `store-0.22.0` fixtures all present. Verified by listing the tarball
-    rather than trusting the exclude list. Security sweep: the real registry token and API key appear
-    in no tracked file and not in the tarball.'
-  - 'OP2: MSRV re-checked and unchanged at 1.95. `windows-sys` 0.61.2 declares `rust-version = 1.71`,
-    well below the floor `libsqlite3-sys` already sets, so the new dependency does not move it. Licence
-    MIT OR Apache-2.0.'
-  - 'OP1 satisfied: `cargo run --example shell_live` against OpenRouter. The model composed `grep -c
-    ''ERROR'' notes.txt > count.txt` itself — a real command line with a redirect — the crate parsed
-    it, and the trace read back from the store carries the per-stage authorisations: exec `grep` and
-    exec `grep -c ERROR notes.txt` under rule `grep*` layer `live`, and write `count.txt` under rule
-    `count.txt` layer `live`. Outcome Success, `count.txt` = "3\n", verification passed. Evidence in
-    `evidence/0.24.0/live-shell-run.txt`.'
-  - 'REMAINING: NF1 (full suite on macOS, Linux and Windows) and NF3 (nightly docs.rs job) complete
-    on the pull request''s CI run. F6, F8 and F9 are verified there and nowhere else.'
+  - 'NF1 MET: CI run 30650243218 green on all three platforms — test (windows-latest), test (macos-latest),
+    test (ubuntu-latest), plus lint, msrv, docs.rs and links-consumer.'
+  - 'OP1 MET: live OpenRouter run via examples/handles_live.rs on openai/gpt-5.6-luna. Unscripted, 10
+    steps, 24160 tokens. The model chose shell_start over shell, polled it for 82 bytes, killed it, and
+    wrote the port it read from the running process own output. Handle state=killed, pids recorded, nothing
+    left running.'
+  - 'Windows CI first failed and found two real defects: an unquoted Windows path in the fixture was destroyed
+    by the shell escape rule, and a handle that exits on its own never had its ending carried to the store.
+    Both fixed; the second was a defect in this release code, not in the test.'
+  - 'REMAINING: NF3 and NF4 end-to-end assertions.'
+  - NF3 and NF4 asserted end to end in tests/handles.rs with examples/flood.rs; full suite 1082 passed
+    0 failed.

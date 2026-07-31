@@ -1090,15 +1090,51 @@ pub(crate) enum ShellOutcome {
 /// *exactly* the [`Planned`] paths it was handed — no re-parse, no re-resolve, no
 /// shell, no expansion.
 pub(crate) struct Shell {
-    timeout: Duration,
+    /// `None` for a handle: a dev server has no wall-clock ceiling to be
+    /// killed at, which is the whole reason it is a handle rather than a call.
+    timeout: Option<Duration>,
     cap: usize,
+    capture: Option<Capture>,
+}
+
+/// Where a detached line's output goes, and who to tell about its processes.
+///
+/// Present only for [`shell_start`](crate::tools::SHELL_START_TOOL). Its two
+/// members are the two things a foreground line never needs: somewhere for the
+/// output to accumulate while nobody is awaiting it, and a way to report each
+/// pid as it appears, so the registry can kill a tree that is still being built.
+///
+/// `on_spawn` fires per stage rather than once at the end, because a pipeline
+/// whose third stage fails to spawn must still leave the first two killable.
+pub(crate) struct Capture {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) on_spawn: std::sync::Arc<dyn Fn(u32) + Send + Sync>,
 }
 
 impl Shell {
     /// Kill the whole line after `timeout`, bounding each captured stream at
     /// `cap` chars.
     pub(crate) fn new(timeout: Duration, cap: usize) -> Self {
-        Self { timeout, cap }
+        Self {
+            timeout: Some(timeout),
+            cap,
+            capture: None,
+        }
+    }
+
+    /// Run a line with no ceiling, sending its output to a file.
+    ///
+    /// The same runner, the same wiring, the same redirect handling — the only
+    /// differences are that nothing times it out and the last stage's streams go
+    /// to `capture.path` instead of to pipes this process would have to drain.
+    /// Sharing the runner is deliberate: a second spawn path would be a second
+    /// place for the plan and the processes to disagree.
+    pub(crate) fn detached(cap: usize, capture: Capture) -> Self {
+        Self {
+            timeout: None,
+            cap,
+            capture: Some(capture),
+        }
     }
 
     /// Execute an authorised line.
@@ -1108,10 +1144,11 @@ impl Shell {
     /// let a ten-stage line run ten times longer than the contract's ceiling
     /// implies.
     pub(crate) async fn run(&self, line: &Line, plan: &[Planned]) -> Result<ShellOutcome> {
-        match tokio::time::timeout(self.timeout, self.run_line(line, plan)).await {
-            Err(_elapsed) => Ok(ShellOutcome::TimedOut {
-                after: self.timeout,
-            }),
+        let Some(limit) = self.timeout else {
+            return self.run_line(line, plan).await;
+        };
+        match tokio::time::timeout(limit, self.run_line(line, plan)).await {
+            Err(_elapsed) => Ok(ShellOutcome::TimedOut { after: limit }),
             Ok(r) => r,
         }
     }
@@ -1212,12 +1249,54 @@ impl Shell {
                 .current_dir(&planned.cwd)
                 .kill_on_drop(true);
 
+            // A detached line's stages go in a process group of their own, and a
+            // foreground line's stages deliberately do not. The foreground case
+            // is awaited and dropped inside the call that made it, so
+            // `kill_on_drop` and the process table between them already reach
+            // everything; the handle case outlives its call, and by the time it
+            // is killed the parent/child links a table walk would follow have
+            // had time to disappear. The group is what survives that. Nothing
+            // else about the two spawns differs, which is the property this
+            // shared runner exists to keep.
+            #[cfg(unix)]
+            if self.capture.is_some() {
+                crate::sandbox::own_process_group(&mut cmd);
+            }
+
             match prev_stdout.take() {
                 Some(s) => cmd.stdin(s),
                 None => cmd.stdin(Stdio::null()),
             };
-            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            match (&self.capture, i == last) {
+                // A detached line's final stage writes straight to the capture
+                // file. Nothing in this process is awaiting it, so a pipe would
+                // fill and block the payload rather than buffer it — the one
+                // failure mode that would make a handle worse than no handle.
+                (Some(c), true) => {
+                    // Opened ONCE and cloned, never opened twice.
+                    //
+                    // Two independent opens of the same path work on unix and
+                    // fail on Windows, where the second one hits a sharing
+                    // violation and takes the whole spawn down with it — the
+                    // handle then exists, reports itself running, and produces
+                    // nothing forever, which is the worst of the available
+                    // failures because it looks like a quiet process rather than
+                    // a broken one. Cloning the descriptor also gives the two
+                    // streams one shared file offset, so stdout and stderr
+                    // interleave the way a terminal shows them instead of
+                    // overwriting each other at independent positions.
+                    let out = append_to(&c.path)?;
+                    let err = out.try_clone().map_err(Error::Io)?;
+                    cmd.stdout(out).stderr(err);
+                }
+                _ => {
+                    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+                }
+            }
 
+            // After the capture defaults on purpose: an explicit redirect in the
+            // line is the model's own instruction and outranks the capture, the
+            // same way it outranks the pipe in the foreground case.
             apply_redirects(&mut cmd, planned, i != last)?;
 
             let mut child = match cmd.spawn() {
@@ -1230,6 +1309,12 @@ impl Shell {
                 }
                 Err(e) => return Err(Error::Io(e)),
             };
+            // Reported the moment it exists, before the next stage is even
+            // attempted, so a line that fails to spawn its third stage still
+            // leaves the first two killable.
+            if let (Some(c), Some(pid)) = (&self.capture, child.id()) {
+                (c.on_spawn)(pid);
+            }
             if i != last {
                 if let Some(so) = child.stdout.take() {
                     // `TryInto`, not `TryFrom`: tokio implements the conversion in
@@ -1324,6 +1409,21 @@ fn apply_redirects(cmd: &mut TokioCommand, planned: &Planned, piped_out: bool) -
         }
     }
     Ok(())
+}
+
+/// Open a handle's capture file for appending, creating it if this is the first
+/// stage to write.
+///
+/// Always append, never truncate: stdout and stderr are opened separately and
+/// both point here, so a truncating open would have the second one erase the
+/// first. Interleaving is what a terminal shows and is what an operator reading
+/// a log expects.
+fn append_to(path: &Path) -> Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(Error::Io)
 }
 
 fn open_for_write(path: &Path, append: bool) -> Result<std::fs::File> {

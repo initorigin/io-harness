@@ -52,8 +52,8 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
-    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_TOOL,
-    TODO_WRITE_TOOL, WRITE_FILE_TOOL,
+    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL,
+    SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -2074,6 +2074,40 @@ fn record_resume_markers(store: &Store, run_id: i64) -> Result<u32> {
     for s in 1..=last {
         store.record_checkpoint_event(&crate::state::CheckpointEvent::skipped(run_id, s))?;
     }
+    // Every process handle the previous process left running is orphaned here,
+    // unconditionally, before the loop restarts.
+    //
+    // This sits in `record_resume_markers` rather than in the resume entry
+    // points because this function is the one place every resume path passes
+    // through — the flat loop, the tree loop, and the decision, answer and
+    // stored-policy variants all reach it. Orphaning is the kind of rule that is
+    // worthless if it holds on three paths out of four, and putting it at the
+    // funnel is the only version of it that cannot be forgotten by a resume
+    // added later.
+    //
+    // It is unconditional on purpose. The only thing a checkpoint records about
+    // a live process is its pid, and a pid is not an identity: between the crash
+    // and this moment the operating system may have given that number to
+    // something unrelated. There is no test that separates the two with enough
+    // confidence to justify signalling, because every "is it still our program"
+    // check races the signal that follows it. So the handle is recorded,
+    // reported, and left alone — this is the one place this crate could damage
+    // something outside its own workspace, and the cost of being wrong is not a
+    // failed run but somebody else's process.
+    let orphaned = store.orphan_live_handles(run_id, crate::tools::handles::ORPHAN_REASON)?;
+    for h in &orphaned {
+        store.record_checkpoint_event(&crate::state::CheckpointEvent::resume(
+            run_id,
+            start_step,
+            format!(
+                "process handle {} (`{}`) was left running by a previous process and is \
+                 orphaned: {}. It is not re-attached, polled or signalled.",
+                h.handle,
+                h.line,
+                crate::tools::handles::ORPHAN_REASON
+            ),
+        ))?;
+    }
     Ok(start_step)
 }
 
@@ -2588,6 +2622,26 @@ async fn run_workspace_from<P: Provider>(
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
+    // The run's live process handles, created before the first turn and killed
+    // when the run ends however it ends. `Arc` because the reaping task for each
+    // handle outlives the dispatch that started it and has to be able to record
+    // the exit; `Handles` also kills whatever is still live when it drops, which
+    // is the backstop for the paths that leave this function by `?`.
+    let handles = std::sync::Arc::new(crate::tools::handles::Handles::new(
+        crate::tools::handles::MAX_LIVE_HANDLES,
+    ));
+    // Seeded from the store, so a handle the previous process left behind is
+    // answerable rather than merely absent. Without this a poll of an id from
+    // before the crash would report "no such handle", which is true of this
+    // registry and misleading about the run: the model would reasonably conclude
+    // it had mistyped and try again. Adopted already-terminal — nothing here
+    // attaches, polls or signals.
+    for h in store.process_handles(run_id)? {
+        if h.state == "orphaned" {
+            handles.adopt_orphan(h.handle, &h.line);
+        }
+    }
+    let handles = &handles;
     // Detected once, before the first turn. The marker files do not change under
     // a run often enough to be worth a filesystem walk every step, and a run that
     // creates its own `package.json` is creating a project rather than working in
@@ -2601,6 +2655,35 @@ async fn run_workspace_from<P: Provider>(
     let pending_media = &mut PendingMedia::default();
 
     for step in start_step..=contract.max_steps {
+        // The store's copy of each live handle's processes, refreshed each step.
+        //
+        // Kept current here rather than swept at the end because this loop has
+        // eleven exits, and a rule applied at ten of them is the failure mode
+        // the orphaning comment above warns about. A handle's pids are only
+        // known once its stages have actually spawned, which is after the call
+        // that started it returned, so this is the first place that can record
+        // them — and recording them every step means whichever exit the run
+        // takes, the trace already has what it needs.
+        //
+        // Killing the live ones is NOT done here: `Handles` kills on drop, which
+        // covers every exit including a panic, and is the property that actually
+        // matters for the operator's machine.
+        for (id, pids) in handles.live_handles() {
+            store.record_handle_pids(run_id, id, &pids)?;
+        }
+        // Carry any ending the reaping tasks noticed to disk.
+        //
+        // A handle that exits on its own is seen by its task, which cannot write
+        // to the store — a `rusqlite` connection is not `Sync` — so the ending
+        // lives only in memory until something on this thread records it. The
+        // write is guarded in SQL on the row still being `running`, so replaying
+        // it costs nothing and cannot overwrite a kill that already landed.
+        for (id, state) in handles.states() {
+            if let crate::tools::handles::HandleState::Exited(code) = state {
+                store.record_handle_ended(run_id, id, "exited", code, None)?;
+            }
+        }
+
         // The step boundary, where a cancellation is honoured (see `cancelled`).
         if let Some(o) = cancelled(store, watch, run_id, 0, step - 1)? {
             return Ok(RunResult::new(o, run_id).with_remembered(remembered));
@@ -2787,6 +2870,8 @@ async fn run_workspace_from<P: Provider>(
                 pending_media,
                 &contract.commit_identity,
                 contract.exec_timeout,
+                toolchain.as_ref(),
+                handles,
             )
             .await?
             {
@@ -3625,6 +3710,20 @@ fn run_agent<'f, P: Provider>(
         // is the same child, at whatever depth it sits.
         let (mut ledger, mut written) = restore_ledger(tree.store, run_id)?;
         let mut progress = Progress::new();
+        // Per agent, not per tree. A child's handles are the child's: it is the
+        // one that knows when they are finished with, and a shared registry
+        // would let one agent kill a sibling's dev server. The cap is therefore
+        // also per agent, which is the same rule the ledger's budgets follow.
+        let handles = std::sync::Arc::new(crate::tools::handles::Handles::new(
+            crate::tools::handles::MAX_LIVE_HANDLES,
+        ));
+        // See the workspace loop: an orphan is adopted so it can be answered.
+        for h in tree.store.process_handles(run_id)? {
+            if h.state == "orphaned" {
+                handles.adopt_orphan(h.handle, &h.line);
+            }
+        }
+        let handles = &handles;
         // Children share their parent's workspace, so they share its detection too.
         let toolchain = crate::toolchain::detect(&tree.root);
         // Children share their parent's workspace, so they share its memory: one
@@ -3788,6 +3887,8 @@ fn run_agent<'f, P: Provider>(
                     pending_media,
                     &contract.commit_identity,
                     contract.exec_timeout,
+                    toolchain.as_ref(),
+                    handles,
                 )
                 .await?
                 {
@@ -4660,6 +4761,13 @@ async fn dispatch(
     pending_media: &mut PendingMedia,
     identity: &crate::tools::git::Identity,
     exec_timeout: Duration,
+    // The project's ecosystem, detected once by the loop rather than per edit:
+    // `toolchain::detect` reads the directory, and an edit is a hot path.
+    toolchain: Option<&crate::toolchain::Toolchain>,
+    // The run's live process handles. Shared rather than owned by the dispatch
+    // because a handle outlives the call that started it — which is the whole
+    // point of one, and the reason every guard in `handles` exists.
+    handles: &std::sync::Arc<crate::tools::handles::Handles>,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -5139,6 +5247,14 @@ async fn dispatch(
                                 &before,
                                 &body,
                             );
+                            // The same check `edit_file` runs, for the same
+                            // reason: a write is how most new code arrives, and
+                            // a type error in a file the model just created is
+                            // worth exactly as much to know about as one it
+                            // edited into an existing file.
+                            let diagnostics =
+                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                    .await;
                             Dispatched::Continue {
                                 decision: format!("wrote {target}"),
                                 // A write that changed nothing says so, to the model as
@@ -5147,14 +5263,15 @@ async fn dispatch(
                                 // cannot correct for what it is not told.
                                 obs: bound(
                                     &format!(
-                                        "\n[wrote {target}] ({} chars{})\n",
+                                        "\n[wrote {target}] ({} chars{})\n{}",
                                         body.chars().count(),
                                         if wrote.moved_the_workspace() {
                                             ""
                                         } else {
                                             ", identical to what was already there — the \
                                          workspace did not change"
-                                        }
+                                        },
+                                        diagnostics
                                     ),
                                     cap,
                                     ObsKind::Write,
@@ -5222,11 +5339,19 @@ async fn dispatch(
                                 search,
                                 &replacement,
                             );
+                            // The project's own checker, run against the edit
+                            // that just happened. It cannot fail the edit: the
+                            // write is already on disk by the time this runs, so
+                            // a checker that is missing, slow or broken costs
+                            // the model a note and nothing else.
+                            let diagnostics =
+                                diagnostics_after_write(ws.root(), toolchain, exec_timeout, cap)
+                                    .await;
                             Dispatched::Continue {
                                 decision: format!("edited {target}"),
                                 obs: bound(
                                     &format!(
-                                        "\n[edited {target}] replaced {} chars with {}{}\n",
+                                        "\n[edited {target}] replaced {} chars with {}{}\n{}",
                                         search.chars().count(),
                                         replacement.chars().count(),
                                         if wrote.moved_the_workspace() {
@@ -5234,7 +5359,8 @@ async fn dispatch(
                                         } else {
                                             " — the replacement is identical to what was there, so \
                                          the workspace did not change"
-                                        }
+                                        },
+                                        diagnostics
                                     ),
                                     cap,
                                     ObsKind::Write,
@@ -5291,104 +5417,14 @@ async fn dispatch(
             // whose second stage is denied must not run its first, so a loop that
             // checked-then-ran each stage in turn would be wrong however careful
             // it looked.
-            let mut remembered: Vec<Rule> = Vec::new();
-            for (cmd, planned) in parsed.commands().zip(plan.iter()) {
-                if let Some(dest) = &planned.cd_target {
-                    // `cd` spawns nothing, so there is no program to check against
-                    // `Act::Exec`. What it does do is choose where every later
-                    // stage runs, which is a read of that directory.
-                    let rel = relative_to(ws.root(), dest);
-                    match gate(
-                        ws,
-                        approver,
-                        store,
-                        run_id,
-                        step,
-                        Act::Read,
-                        &rel,
-                        None,
-                        watch,
-                        depth,
-                    )
-                    .await?
-                    {
-                        Gated::Refused { decision, obs } => {
-                            return Ok(Dispatched::go(decision, obs))
-                        }
-                        Gated::Paused { request_id } => {
-                            return Ok(Dispatched::Pause { request_id })
-                        }
-                        Gated::Go { remember, .. } => remembered.extend(remember),
-                    }
-                    record_shell_authorisation(ws, store, run_id, step, Act::Read, &rel)?;
-                } else {
-                    // The same two targets `exec` checks, per sub-command rather
-                    // than per call: the program alone, which is what
-                    // `deny_exec("rm")` names, and this stage's own joined argv,
-                    // which is what `allow_exec("git log*")` names. Checking the
-                    // whole line as one string could not tell one stage from
-                    // another, which is the entire point of parsing it.
-                    let program = cmd.argv[0].clone();
-                    let joined = cmd.argv.join(" ");
-                    let mut targets = vec![program.clone()];
-                    if joined != program {
-                        targets.push(joined);
-                    }
-                    for target in targets {
-                        match gate(
-                            ws,
-                            approver,
-                            store,
-                            run_id,
-                            step,
-                            Act::Exec,
-                            &target,
-                            None,
-                            watch,
-                            depth,
-                        )
-                        .await?
-                        {
-                            Gated::Refused { decision, obs } => {
-                                return Ok(Dispatched::go(decision, obs))
-                            }
-                            Gated::Paused { request_id } => {
-                                return Ok(Dispatched::Pause { request_id })
-                            }
-                            Gated::Go { remember, .. } => remembered.extend(remember),
-                        }
-                        record_shell_authorisation(ws, store, run_id, step, Act::Exec, &target)?;
-                    }
-                }
-
-                // Redirect targets are paths, so they take the path-resolved check
-                // `write_file` and `read_file` take — not the name match an
-                // `Act::Exec` rule performs. A rule denying `secrets/*` has to
-                // catch `> secrets/key` for the boundary to mean anything.
-                for (kind, target) in &planned.redirects {
-                    let Some(path) = target else { continue };
-                    let act = if kind.is_write() {
-                        Act::Write
-                    } else {
-                        Act::Read
-                    };
-                    let rel = relative_to(ws.root(), path);
-                    match gate(
-                        ws, approver, store, run_id, step, act, &rel, None, watch, depth,
-                    )
-                    .await?
-                    {
-                        Gated::Refused { decision, obs } => {
-                            return Ok(Dispatched::go(decision, obs))
-                        }
-                        Gated::Paused { request_id } => {
-                            return Ok(Dispatched::Pause { request_id })
-                        }
-                        Gated::Go { remember, .. } => remembered.extend(remember),
-                    }
-                    record_shell_authorisation(ws, store, run_id, step, act, &rel)?;
-                }
-            }
+            let remembered = match check_shell_line(
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+            )
+            .await?
+            {
+                ShellCheck::Go(remember) => remember,
+                ShellCheck::Stop(d) => return Ok(d),
+            };
 
             let outcome = Shell::new(exec_timeout, cap).run(&parsed, &plan).await?;
             let (decision, obs) = match &outcome {
@@ -5465,6 +5501,332 @@ async fn dispatch(
                 target: Some(line_src.to_string()),
                 changed: false,
                 remember: remembered,
+            }
+        }
+        SHELL_START_TOOL => {
+            let line_src = s("line").unwrap_or_default();
+            if line_src.trim().is_empty() {
+                return Ok(Dispatched::go(
+                    "shell_start missing line",
+                    "\n[shell_start error] shell_start needs a non-empty \"line\" string holding \
+                     the command line to start\n",
+                ));
+            }
+            // Parsed and refused by the same functions the foreground tool uses.
+            // The refusal wording names this tool so the model knows which call
+            // was rejected, but the decision is the same decision.
+            let parsed = match crate::tools::shell::parse(line_src) {
+                Ok(l) => l,
+                Err(r) => {
+                    return Ok(Dispatched::go(
+                        format!("shell_start refused: {}", r.construct),
+                        format!("\n[shell_start refused] {r}\n"),
+                    ))
+                }
+            };
+            let plan = match crate::tools::shell::plan(&parsed, ws.root()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(Dispatched::go(
+                        "shell_start refused: a path outside the workspace",
+                        format!("\n[shell_start refused] {e}\n"),
+                    ))
+                }
+            };
+            let remembered = match check_shell_line(
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+            )
+            .await?
+            {
+                ShellCheck::Go(remember) => remember,
+                ShellCheck::Stop(d) => return Ok(d),
+            };
+
+            // Reserved only after the whole line has cleared. A refused line
+            // must not consume a slot, and a reservation is the first thing that
+            // could leak if it did.
+            let (id, capture) = match handles.reserve(line_src) {
+                Ok(pair) => pair,
+                Err(reason) => {
+                    return Ok(Dispatched::go(
+                        "shell_start refused: the handle cap",
+                        format!("\n[shell_start refused] {reason}\n"),
+                    ))
+                }
+            };
+
+            // Recorded before the spawn, so a crash between here and the first
+            // poll still leaves a row saying something was started — which is
+            // exactly the row a resume must find and orphan. A handle that
+            // exists only in memory is a handle a resume cannot warn about.
+            store.record_handle_started(run_id, step, id, line_src)?;
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::HandleStarted {
+                    handle: id,
+                    line: line_src.to_string(),
+                },
+            ));
+
+            // WEAK, not strong, and this is load-bearing rather than tidy.
+            //
+            // The registry kills whatever is still live when it drops, and that
+            // backstop is what covers the paths this loop leaves by `?` or by a
+            // panic. A strong reference held by the reaping task below defeats
+            // it completely: the task lives exactly as long as the process it is
+            // waiting on, so a handle that never exits keeps the registry's
+            // refcount above zero forever, `Drop` never runs, and the process
+            // outlives the run that started it. That is the leak the whole
+            // module exists to prevent, reintroduced by the thing meant to
+            // observe it.
+            //
+            // With a weak reference the registry's only owner is the run loop.
+            // When the loop returns, it drops, it kills, and these tasks find
+            // nothing to upgrade to — which is correct, because by then there is
+            // no run left to record anything for.
+            let registry = std::sync::Arc::downgrade(handles);
+            let on_spawn = {
+                let registry = registry.clone();
+                std::sync::Arc::new(move |pid: u32| {
+                    if let Some(r) = registry.upgrade() {
+                        r.add_pid(id, pid);
+                    }
+                }) as std::sync::Arc<dyn Fn(u32) + Send + Sync>
+            };
+            let runner = Shell::detached(
+                cap,
+                crate::tools::shell::Capture {
+                    path: capture,
+                    on_spawn,
+                },
+            );
+            // Detached on purpose: this is the one tool whose work outlives its
+            // dispatch. The task reaps, so a process that ends on its own is
+            // recorded as ended rather than left looking live to every later
+            // poll — one of the four ways a handle could otherwise leak.
+            let reaper = registry.clone();
+            tokio::spawn(async move {
+                let outcome = runner.run(&parsed, &plan).await;
+                // Upgraded only to record. If the run has already ended, the
+                // registry is gone, it killed this process on its way out, and
+                // there is nothing left to tell.
+                let Some(reaper) = reaper.upgrade() else {
+                    return;
+                };
+                match outcome {
+                    Ok(crate::tools::shell::ShellOutcome::Ran { code, .. }) => {
+                        reaper.finished(id, code)
+                    }
+                    // `Unavailable` is a line whose program is not on this
+                    // machine, and a timeout cannot happen without a ceiling.
+                    // Either way the handle is over and must not read as live.
+                    _ => reaper.finished(id, None),
+                }
+            });
+
+            // Wait briefly for the first process to appear, then record what
+            // was spawned.
+            //
+            // The pids are only knowable after the spawn, which happens in the
+            // task above, so there is a short window in which the trace knows a
+            // handle exists and not what it owns. Closing it matters because a
+            // run that starts a handle and then ends — the model never polls,
+            // never kills — would otherwise record a handle with no processes,
+            // and "what did that run leave running" is exactly the question the
+            // row exists to answer.
+            //
+            // Bounded and best-effort on purpose: this is a trace concern, not a
+            // safety one. Whatever is not recorded here is recorded by the next
+            // poll, by the kill, or by the per-step refresh, and the killing
+            // itself never depended on this — `Handles` kills what it knows on
+            // drop regardless of what reached the store.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+            let pids = loop {
+                let pids = handles.pids(id);
+                if !pids.is_empty() || std::time::Instant::now() >= deadline {
+                    break pids;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            };
+            store.record_handle_pids(run_id, id, &pids)?;
+
+            Dispatched::Continue {
+                decision: format!("shell_start handle {id}"),
+                obs: bound(
+                    &format!(
+                        "\n[shell_start handle {id}] `{line_src}` is running. Read what it \
+                         prints with shell_poll {id}, and end it with shell_kill {id}. It is \
+                         killed automatically when this run ends.\n"
+                    ),
+                    cap,
+                    ObsKind::Tool,
+                ),
+                kind: ObsKind::Tool,
+                target: Some(line_src.to_string()),
+                changed: false,
+                remember: remembered,
+            }
+        }
+        SHELL_POLL_TOOL => {
+            let Some(id) = a.get("handle").and_then(|v| v.as_u64()) else {
+                return Ok(Dispatched::go(
+                    "shell_poll missing handle",
+                    "\n[shell_poll error] shell_poll needs a \"handle\" number, the id \
+                     shell_start returned\n",
+                ));
+            };
+            let Some(state) = handles.state(id) else {
+                return Ok(Dispatched::go(
+                    "shell_poll unknown handle",
+                    format!(
+                        "\n[shell_poll error] no process handle {id} in this run; shell_start \
+                         returns the id to poll\n"
+                    ),
+                ));
+            };
+            // An orphan is answered from what was recorded, never by touching
+            // anything. There is no process here to read from and the pid that
+            // was recorded may belong to something else entirely.
+            if let crate::tools::handles::HandleState::Orphaned(reason) = &state {
+                return Ok(Dispatched::seen(
+                    format!("shell_poll handle {id} orphaned"),
+                    format!(
+                        "\n[shell_poll handle {id}] orphaned: {reason}. It was started before \
+                         this run was resumed and cannot be read or signalled. Start what you \
+                         need again.\n"
+                    ),
+                    ObsKind::Tool,
+                    None,
+                ));
+            }
+            let (text, skipped) = handles.poll(id)?;
+            // Every byte a poll *reads* goes to the store as well as to the model,
+            // and the qualifier is load-bearing. The capture file does not outlive
+            // the run, so this is the only durable record of what the process
+            // printed — "what did that dev server do" is a question asked after it
+            // is gone.
+            //
+            // What it is NOT is a complete transcript. A poll that arrives to find
+            // more than one window waiting keeps the newest and advances the cursor
+            // past the rest, so bytes no poll ever read reach no store and are lost
+            // with the capture file. That is the honest consequence of bounding the
+            // window, the poll says so to the model rather than implying otherwise,
+            // and it is recorded as a known limitation of this release. Fixing it
+            // means streaming the skipped region to the store in bounded chunks,
+            // which is a change to how a poll reads rather than to what it returns.
+            store.record_handle_output(run_id, step, id, &text)?;
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                // The count, not the text. The channel is for watching a run,
+                // not for carrying its payload — the output is in the store.
+                EventKind::HandlePolled {
+                    handle: id,
+                    bytes: text.len(),
+                },
+            ));
+            let line_src = handles.line(id).unwrap_or_default();
+            Dispatched::seen(
+                format!("shell_poll handle {id} ({} bytes)", text.len()),
+                bound(
+                    &format!(
+                        "\n[shell_poll handle {id} `{line_src}` {}]{}\n{}\n",
+                        match &state {
+                            crate::tools::handles::HandleState::Running => "running".to_string(),
+                            crate::tools::handles::HandleState::Exited(Some(c)) =>
+                                format!("exited {c}"),
+                            crate::tools::handles::HandleState::Exited(None) =>
+                                "killed by a signal".to_string(),
+                            other => other.as_str().to_string(),
+                        },
+                        if skipped > 0 {
+                            format!(
+                                " ({skipped} bytes of older output skipped; the newest is here, \
+                                 and the skipped bytes are gone — poll more often to see \
+                                 everything a noisy process prints)"
+                            )
+                        } else {
+                            String::new()
+                        },
+                        if text.trim().is_empty() {
+                            "(nothing new)"
+                        } else {
+                            text.trim_end()
+                        }
+                    ),
+                    cap,
+                    ObsKind::Tool,
+                ),
+                ObsKind::Tool,
+                None,
+            )
+        }
+        SHELL_KILL_TOOL => {
+            let Some(id) = a.get("handle").and_then(|v| v.as_u64()) else {
+                return Ok(Dispatched::go(
+                    "shell_kill missing handle",
+                    "\n[shell_kill error] shell_kill needs a \"handle\" number, the id \
+                     shell_start returned\n",
+                ));
+            };
+            let line_src = handles.line(id).unwrap_or_default();
+            // Written before the kill, because after it the registry is the only
+            // thing that still knows which processes this handle owned and a
+            // failure mid-kill would take that knowledge with it.
+            store.record_handle_pids(run_id, id, &handles.pids(id))?;
+            // Everything the process wrote and nobody asked for.
+            //
+            // The store's copy of a handle's output is written by the polls, so
+            // output produced between the last poll and the kill — or by a
+            // handle the model never polled at all — would otherwise never be
+            // recorded anywhere that outlives the run. The capture file does not
+            // survive the registry, so this is the last moment it can be read.
+            let (tail, _) = handles.poll(id).unwrap_or_default();
+            store.record_handle_output(run_id, step, id, &tail)?;
+            match handles.kill(id) {
+                // Killing something already over is not a mistake worth failing
+                // a step for: a model that lost track of a handle should be told
+                // how it ended and carry on.
+                Ok(was) => {
+                    store.record_handle_ended(run_id, id, "killed", None, None)?;
+                    watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::HandleKilled { handle: id },
+                    ));
+                    Dispatched::seen(
+                        format!("shell_kill handle {id}"),
+                        bound(
+                            &format!(
+                                "\n[shell_kill handle {id} `{line_src}`] {}\n",
+                                match was {
+                                    crate::tools::handles::HandleState::Running =>
+                                        "killed, with every process it spawned".to_string(),
+                                    crate::tools::handles::HandleState::Exited(Some(c)) =>
+                                        format!("had already exited {c}; nothing to kill"),
+                                    crate::tools::handles::HandleState::Exited(None) =>
+                                        "had already been killed by a signal; nothing to kill"
+                                            .to_string(),
+                                    crate::tools::handles::HandleState::Killed =>
+                                        "had already been killed; nothing to kill".to_string(),
+                                    crate::tools::handles::HandleState::Orphaned(r) => r,
+                                }
+                            ),
+                            cap,
+                            ObsKind::Tool,
+                        ),
+                        ObsKind::Tool,
+                        None,
+                    )
+                }
+                Err(reason) => Dispatched::go(
+                    format!("shell_kill refused handle {id}"),
+                    format!("\n[shell_kill error] {reason}\n"),
+                ),
             }
         }
         EXEC_TOOL => {
@@ -6194,6 +6556,183 @@ enum Gated {
     Refused { decision: String, obs: String },
     /// An approver deferred the decision.
     Paused { request_id: i64 },
+}
+
+/// Run the project's own checker after a write and render what it found.
+///
+/// Shared by `edit_file` and `write_file` because they are the same event as far
+/// as a compiler is concerned: a file changed. A write is in fact where most new
+/// code arrives, so exempting it would leave the feature answering the easier
+/// half of the question.
+///
+/// Renders to a string rather than returning the outcome, because every caller
+/// wants the same thing — something to append to the observation — and the
+/// distinction that matters to them is only whether there is anything to say.
+///
+/// **This can never fail a write.** The file is already on disk by the time this
+/// runs. A checker that is missing, times out, or falls over for its own reasons
+/// produces a note saying so and nothing else; it does not turn a successful
+/// write into a failed one, and it does not return an error. An information
+/// feature that can take down the tool it informs on is a worse trade than not
+/// having it.
+async fn diagnostics_after_write(
+    root: &Path,
+    toolchain: Option<&crate::toolchain::Toolchain>,
+    timeout: Duration,
+    cap: usize,
+) -> String {
+    match crate::tools::diagnostics::after_edit(root, toolchain, timeout, cap).await {
+        crate::tools::diagnostics::Outcome::Found(text) => text,
+        crate::tools::diagnostics::Outcome::Clean => String::new(),
+        // A skip is silent. There is no ecosystem here, so there is nothing the
+        // model could do differently and nothing worth spending its context on.
+        crate::tools::diagnostics::Outcome::Skipped(_) => String::new(),
+        // A failure is not silent, and that is the point. An absent diagnostics
+        // section and a check that never ran look identical to a model, and one
+        // of them means "this file is fine" while the other means nothing at
+        // all.
+        crate::tools::diagnostics::Outcome::Failed(why) => {
+            format!("\n[check did not run] {why}\n")
+        }
+    }
+}
+
+/// What checking a parsed shell line decided.
+///
+/// The check either clears the whole line — handing back the rules an approver
+/// asked to remember — or it stops the call, and a stop is a finished
+/// [`Dispatched`] rather than an error: a refused line is something the model can
+/// recover from by writing a different one.
+enum ShellCheck {
+    Go(Vec<Rule>),
+    Stop(Dispatched),
+}
+
+/// Check every sub-command and every redirect target of a parsed line, before
+/// anything is spawned.
+///
+/// Extracted so that the foreground `shell` tool and the handle-starting
+/// `shell_start` cannot drift apart. That is not tidiness: the whole claim of
+/// both tools is that what was checked is what runs, and two copies of this loop
+/// would be two accept-sets to keep in agreement forever. `tests/shell.rs` drives
+/// its refusal table through both tools for the same reason — the shared function
+/// is the mechanism, the shared table is the proof.
+///
+/// The order matters and is the reason this is one pass rather than a check
+/// folded into the runner: a line whose second stage is denied must not run its
+/// first, so every decision for the whole line is taken here and the caller
+/// spawns only after this returns [`ShellCheck::Go`].
+#[allow(clippy::too_many_arguments)]
+async fn check_shell_line(
+    ws: &Workspace,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    watch: &Watch<'_>,
+    depth: u32,
+    parsed: &crate::tools::shell::Line,
+    plan: &[crate::tools::shell::Planned],
+) -> Result<ShellCheck> {
+    let mut remembered: Vec<Rule> = Vec::new();
+    for (cmd, planned) in parsed.commands().zip(plan.iter()) {
+        if let Some(dest) = &planned.cd_target {
+            // `cd` spawns nothing, so there is no program to check against
+            // `Act::Exec`. What it does do is choose where every later
+            // stage runs, which is a read of that directory.
+            let rel = relative_to(ws.root(), dest);
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                &rel,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => {
+                    return Ok(ShellCheck::Stop(Dispatched::go(decision, obs)))
+                }
+                Gated::Paused { request_id } => {
+                    return Ok(ShellCheck::Stop(Dispatched::Pause { request_id }))
+                }
+                Gated::Go { remember, .. } => remembered.extend(remember),
+            }
+            record_shell_authorisation(ws, store, run_id, step, Act::Read, &rel)?;
+        } else {
+            // The same two targets `exec` checks, per sub-command rather
+            // than per call: the program alone, which is what
+            // `deny_exec("rm")` names, and this stage's own joined argv,
+            // which is what `allow_exec("git log*")` names. Checking the
+            // whole line as one string could not tell one stage from
+            // another, which is the entire point of parsing it.
+            let program = cmd.argv[0].clone();
+            let joined = cmd.argv.join(" ");
+            let mut targets = vec![program.clone()];
+            if joined != program {
+                targets.push(joined);
+            }
+            for target in targets {
+                match gate(
+                    ws,
+                    approver,
+                    store,
+                    run_id,
+                    step,
+                    Act::Exec,
+                    &target,
+                    None,
+                    watch,
+                    depth,
+                )
+                .await?
+                {
+                    Gated::Refused { decision, obs } => {
+                        return Ok(ShellCheck::Stop(Dispatched::go(decision, obs)))
+                    }
+                    Gated::Paused { request_id } => {
+                        return Ok(ShellCheck::Stop(Dispatched::Pause { request_id }))
+                    }
+                    Gated::Go { remember, .. } => remembered.extend(remember),
+                }
+                record_shell_authorisation(ws, store, run_id, step, Act::Exec, &target)?;
+            }
+        }
+
+        // Redirect targets are paths, so they take the path-resolved check
+        // `write_file` and `read_file` take — not the name match an
+        // `Act::Exec` rule performs. A rule denying `secrets/*` has to
+        // catch `> secrets/key` for the boundary to mean anything.
+        for (kind, target) in &planned.redirects {
+            let Some(path) = target else { continue };
+            let act = if kind.is_write() {
+                Act::Write
+            } else {
+                Act::Read
+            };
+            let rel = relative_to(ws.root(), path);
+            match gate(
+                ws, approver, store, run_id, step, act, &rel, None, watch, depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => {
+                    return Ok(ShellCheck::Stop(Dispatched::go(decision, obs)))
+                }
+                Gated::Paused { request_id } => {
+                    return Ok(ShellCheck::Stop(Dispatched::Pause { request_id }))
+                }
+                Gated::Go { remember, .. } => remembered.extend(remember),
+            }
+            record_shell_authorisation(ws, store, run_id, step, act, &rel)?;
+        }
+    }
+    Ok(ShellCheck::Go(remembered))
 }
 
 /// Record that one sub-command or one redirect target of a `shell` line was
@@ -7379,6 +7918,68 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["line"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_START_TOOL.to_string(),
+            description: "Start a command line and LEAVE IT RUNNING, returning a handle id \
+                          instead of a result — use this for a dev server, a log tail, a watch \
+                          build or anything else that does not finish on its own. `shell` blocks \
+                          the step until the command ends or times out, which is the wrong shape \
+                          for these. The line is parsed and checked exactly as `shell` parses and \
+                          checks it, with the same grammar and the same refusals, and nothing \
+                          runs if any stage is denied. Read what it has printed with \
+                          `shell_poll`, and end it with `shell_kill`. A handle does not survive \
+                          past this run: if the run is resumed in a new process the handle is \
+                          reported orphaned and is never signalled."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "line": {
+                        "type": "string",
+                        "description": "The command line to start, e.g. \"npm run dev\" or \"tail -f logs/app.log\".",
+                    }
+                },
+                "required": ["line"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_POLL_TOOL.to_string(),
+            description: "Read what a handle started by `shell_start` has printed SINCE THE LAST \
+                          POLL, and whether it is still running. Output already returned by an \
+                          earlier poll is not returned again, so polling in a loop shows progress \
+                          rather than repeating the log. A handle that has printed nothing yet \
+                          returns empty, which is not an error."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "integer",
+                        "description": "The handle id `shell_start` returned.",
+                    }
+                },
+                "required": ["handle"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_KILL_TOOL.to_string(),
+            description: "End a handle started by `shell_start`, together with every process it \
+                          spawned. Killing a handle that has already ended is not an error and \
+                          reports how it ended. Every handle still running is killed when the run \
+                          ends, so this is for finishing with something early rather than for \
+                          tidying up at the end."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "handle": {
+                        "type": "integer",
+                        "description": "The handle id `shell_start` returned.",
+                    }
+                },
+                "required": ["handle"]
             }),
         },
     ];

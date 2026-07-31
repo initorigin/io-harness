@@ -1831,6 +1831,80 @@ impl Edit {
     }
 }
 
+/// One background process the run started, as the store last knew it.
+///
+/// A row is written when the handle starts and updated when it ends, so a handle
+/// still running reads back with `state` of `running`, no `code`, and no `reason`.
+/// What it records is what this process last observed, never a claim about the
+/// machine now: the pids may have been reused since, which is why a resume reads
+/// this to know something was left behind and does not signal it.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("bring the dev server up", "/repo")?;
+/// store.record_handle_started(run, 1, 1, "npm run dev")?;
+/// store.record_handle_pids(run, 1, &[4021, 4022])?;
+///
+/// let handles = store.process_handles(run)?;
+/// assert_eq!(handles[0].line, "npm run dev");
+/// assert_eq!(handles[0].pids, vec![4021, 4022]);
+/// // Still running, so there is no exit to report yet.
+/// assert_eq!(handles[0].state, "running");
+/// assert_eq!(handles[0].code, None);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessHandle {
+    /// The handle the run allocated, unique within the run.
+    pub handle: u64,
+    /// The step that started it.
+    pub step: u32,
+    /// The command line, as the agent wrote it.
+    pub line: String,
+    /// Every pid the process tree was last seen to hold — the leader first.
+    ///
+    /// Empty for a handle whose pids were never recorded, which is both a handle
+    /// that failed to spawn and a handle recorded by a writer that only knew the
+    /// command. Stored as one comma-joined column rather than a child table
+    /// because the pids are only ever read as a unit, with the handle they belong
+    /// to; nothing queries by pid, so a second table would buy a join and an
+    /// index for a list that is read whole or not at all.
+    pub pids: Vec<u32>,
+    /// What the handle was last known to be doing: `running`, or the terminal
+    /// state it reached.
+    pub state: String,
+    /// The exit code, once it exited. `None` while it runs, and `None` for a
+    /// handle that ended without one — killed, or never spawned.
+    pub code: Option<i32>,
+    /// Why it left `running`, in the words of whatever ended it. `None` while it
+    /// runs.
+    pub reason: Option<String>,
+}
+
+/// The columns [`handle_row`] reads, in the order it reads them. Named once so
+/// the two queries that select handles cannot drift out of step with the mapping.
+const HANDLE_COLUMNS: &str = "handle, step, line, pids, state, code, reason";
+
+fn handle_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ProcessHandle> {
+    let pids: String = r.get(3)?;
+    Ok(ProcessHandle {
+        handle: r.get(0)?,
+        step: r.get(1)?,
+        line: r.get(2)?,
+        // A pid that does not parse is dropped rather than guessed at. This crate
+        // only ever writes decimal pids, so that can only happen to a database
+        // another program has written to.
+        pids: pids.split(',').filter_map(|p| p.parse().ok()).collect(),
+        state: r.get(4)?,
+        code: r.get(5)?,
+        reason: r.get(6)?,
+    })
+}
+
 /// How long a contended statement waits for the writer before giving up, set on
 /// every store opened from a file. Without it rusqlite's default is to fail
 /// immediately with `SQLITE_BUSY`, which turns a moment of contention into an
@@ -2331,6 +2405,49 @@ impl Store {
                  ran_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              );
              CREATE INDEX IF NOT EXISTS server_tool_calls_run ON server_tool_calls(run_id, step);",
+        )?;
+
+        // 0.25.0 — process handles. Two more additive tables and, by the same rule
+        // the four above follow, NOT a `CHECKPOINT_FORMAT` bump: no checkpoint
+        // layout changed and a 0.24.0 binary never queries either of them.
+        //
+        // `process_handles` is one row per handle, updated as it ends. It carries
+        // the pids because the pids are the whole reason a handle is dangerous:
+        // the row is what a resume reads to know something was left running, and
+        // it is deliberately NOT what a resume acts on. A pid recorded before a
+        // crash may since have been reused, so the resume marks the row orphaned
+        // and signals nothing. `state` is therefore a record of what this process
+        // last knew, never a claim about what is true on the machine now.
+        //
+        // `handle_output` is append-only and holds what each poll actually read.
+        // It exists because the poll the model sees is a bounded window and the
+        // trace has to answer "what did that dev server print" after the process
+        // is gone — a question the window cannot answer and the capture file does
+        // not outlive the run to answer either.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS process_handles (
+                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id     INTEGER NOT NULL,
+                 handle     INTEGER NOT NULL,
+                 step       INTEGER NOT NULL,
+                 line       TEXT NOT NULL,
+                 pids       TEXT NOT NULL DEFAULT '',
+                 state      TEXT NOT NULL,
+                 code       INTEGER,
+                 reason     TEXT,
+                 started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+                 ended_at   TEXT
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS process_handles_run ON process_handles(run_id, handle);
+             CREATE TABLE IF NOT EXISTS handle_output (
+                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id  INTEGER NOT NULL,
+                 handle  INTEGER NOT NULL,
+                 step    INTEGER NOT NULL,
+                 chunk   TEXT NOT NULL,
+                 read_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS handle_output_run ON handle_output(run_id, handle);",
         )?;
 
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
@@ -4066,6 +4183,272 @@ impl Store {
             .conn
             .execute("DELETE FROM memory WHERE workspace = ?1", [workspace])?)
     }
+
+    // ---- 0.25.0: what the run left running ----
+
+    /// Record that `handle` started, at the step that started it.
+    ///
+    /// Written the moment the process exists, before anything is known about it
+    /// beyond the line that asked for it, because the window in which a spawn can
+    /// be lost is exactly the window between the spawn and the first thing the
+    /// run learns about it. The row starts in `running` and is completed later by
+    /// [`Store::record_handle_pids`] and [`Store::record_handle_ended`].
+    ///
+    /// A handle already recorded for this run is left as it is rather than
+    /// written twice: the run allocates handles from a counter that a resume
+    /// restarts, so a replayed step can present a number this run has seen, and
+    /// overwriting the row would replace what is known about a live process with
+    /// the little that is known at a spawn.
+    pub fn record_handle_started(
+        &self,
+        run_id: i64,
+        step: u32,
+        handle: u64,
+        line: &str,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO process_handles (run_id, handle, step, line, state)
+             VALUES (?1, ?2, ?3, ?4, 'running')",
+            rusqlite::params![run_id, handle, step, line],
+        )?;
+        Ok(())
+    }
+
+    /// Record the pids `handle` was seen to hold.
+    ///
+    /// Called once the spawn has returned and again whenever the tree is
+    /// re-examined, replacing what was there — a pid list is a snapshot, and half
+    /// of an old one merged with half of a new one describes no process that ever
+    /// ran. Stored comma-joined for the reason given on
+    /// [`ProcessHandle::pids`]. Nothing happens for a handle this run never
+    /// started; the pids of a process no row claims are not attributable.
+    pub fn record_handle_pids(&self, run_id: i64, handle: u64, pids: &[u32]) -> Result<()> {
+        let joined = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        self.conn.execute(
+            "UPDATE process_handles SET pids = ?3 WHERE run_id = ?1 AND handle = ?2",
+            rusqlite::params![run_id, handle, joined],
+        )?;
+        Ok(())
+    }
+
+    /// Record that `handle` left `running`, with what ended it.
+    ///
+    /// The `WHERE state = 'running'` guard is the whole method: a handle is
+    /// routinely told about twice — a process that exited on its own is still
+    /// killed by the teardown that walks every handle at the end of a run, and
+    /// the kill is reported whether or not there was anything left to kill. First
+    /// writer wins, so a handle that exited stays `exited` with its code, and the
+    /// later kill of an already-dead process changes nothing. Doing it in SQL
+    /// rather than by reading the state first keeps that true between two writers
+    /// racing on the same row, which a read-then-write would not.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("run the tests", "/repo")?;
+    /// store.record_handle_started(run, 1, 1, "cargo test")?;
+    /// store.record_handle_ended(run, 1, "exited", Some(0), None)?;
+    /// // The teardown kills every handle it knows of, including this one.
+    /// store.record_handle_ended(run, 1, "killed", None, Some("run ended"))?;
+    ///
+    /// let handles = store.process_handles(run)?;
+    /// assert_eq!(handles[0].state, "exited");
+    /// assert_eq!(handles[0].code, Some(0));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn record_handle_ended(
+        &self,
+        run_id: i64,
+        handle: u64,
+        state: &str,
+        code: Option<i32>,
+        reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE process_handles
+                 SET state = ?3, code = ?4, reason = ?5,
+                     ended_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+             WHERE run_id = ?1 AND handle = ?2 AND state = 'running'",
+            rusqlite::params![run_id, handle, state, code, reason],
+        )?;
+        Ok(())
+    }
+
+    /// Append what a poll of `handle` read, at the step that polled it.
+    ///
+    /// Append-only, because this is the only place the output survives: the
+    /// window the model is shown is bounded and the capture file does not outlive
+    /// the run. A poll that read nothing writes no row — the common case for a
+    /// quiet server, and a row per quiet poll would bury the output that matters
+    /// under thousands of empty ones.
+    pub fn record_handle_output(
+        &self,
+        run_id: i64,
+        step: u32,
+        handle: u64,
+        chunk: &str,
+    ) -> Result<()> {
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO handle_output (run_id, handle, step, chunk) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![run_id, handle, step, chunk],
+        )?;
+        Ok(())
+    }
+
+    /// Every handle this run started, in the order they were started.
+    ///
+    /// Empty for a run that started nothing in the background, which is most
+    /// runs.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("a run that spawned nothing", "/repo")?;
+    /// assert!(store.process_handles(run)?.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn process_handles(&self, run_id: i64) -> Result<Vec<ProcessHandle>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {HANDLE_COLUMNS} FROM process_handles WHERE run_id = ?1 ORDER BY id"
+        ))?;
+        let rows = stmt.query_map([run_id], handle_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Mark every handle of `run_id` still recorded as running as orphaned, and
+    /// return the rows that changed.
+    ///
+    /// The resume path, and the one place in this set where the safe thing and
+    /// the obvious thing differ. A handle still in `running` when a resume opens
+    /// the store was started by a process that is now gone; whatever it started
+    /// may or may not still be alive, and this run can no longer tell. The rows
+    /// come back so the caller can seed its registry with what was left behind
+    /// and emit an event for each — the operator is told, in full, and nothing
+    /// else happens.
+    ///
+    /// It records and never signals, and that is deliberate. The only thing a
+    /// checkpoint can hold about a live process is its pid, and a pid is not an
+    /// identity: between the crash and the resume the operating system may have
+    /// given that number to something entirely unrelated. No check closes the
+    /// gap — every "is this still our program" test is a race between the check
+    /// and the signal, and the cost of losing that race is killing a process that
+    /// was never ours. So `orphaned` is terminal in both directions: nothing may
+    /// transition a row out of it, and no caller may read one as a licence to
+    /// send a signal.
+    ///
+    /// Only `running` becomes `orphaned`. A handle that exited on its own before
+    /// the crash is `exited` with its code, and it stays that way — its fate is
+    /// known, and overwriting a known fate with an unknown one loses the more
+    /// specific fact. Calling this twice is therefore a no-op the second time:
+    /// the run's handles are all terminal by then, and the second call returns
+    /// nothing.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("bring the dev server up", "/repo")?;
+    /// store.record_handle_started(run, 1, 1, "npm run dev")?;
+    /// store.record_handle_started(run, 1, 2, "cargo test")?;
+    /// store.record_handle_ended(run, 2, "exited", Some(0), None)?;
+    ///
+    /// // The resume finds one process it can no longer account for.
+    /// let orphans = store.orphan_live_handles(run, "run resumed after a crash")?;
+    /// assert_eq!(orphans.len(), 1);
+    /// assert_eq!(orphans[0].line, "npm run dev");
+    /// assert_eq!(orphans[0].state, "orphaned");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn orphan_live_handles(&self, run_id: i64, reason: &str) -> Result<Vec<ProcessHandle>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let mut out = Vec::new();
+        {
+            // Read first, then update, both inside the transaction: the update
+            // erases the very `state = 'running'` that selects these rows, so a
+            // read afterwards could not tell the handles this call orphaned from
+            // ones an earlier call already had. The transaction is what makes the
+            // pair atomic to a concurrent reader, which sees either every row
+            // still running or every row orphaned.
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {HANDLE_COLUMNS} FROM process_handles
+                 WHERE run_id = ?1 AND state = 'running' ORDER BY id"
+            ))?;
+            let rows = stmt.query_map([run_id], handle_row)?;
+            for row in rows {
+                out.push(row?);
+            }
+            tx.execute(
+                "UPDATE process_handles
+                     SET state = 'orphaned', reason = ?2,
+                         ended_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+                 WHERE run_id = ?1 AND state = 'running'",
+                rusqlite::params![run_id, reason],
+            )?;
+        }
+        tx.commit()?;
+        // The rows were read before the update, so they carry what they are
+        // about to become rather than what they were — the caller is being handed
+        // the orphans, not a snapshot of the moment before.
+        for handle in &mut out {
+            handle.state = "orphaned".into();
+            handle.reason = Some(reason.into());
+        }
+        Ok(out)
+    }
+
+    /// Everything `handle` printed, in the order it was read.
+    ///
+    /// The chunks are joined with nothing between them: each is a verbatim slice
+    /// of the stream, so anything inserted at the seams would be output the
+    /// process never produced. Empty for a handle that printed nothing and for a
+    /// handle this run never had — a trace has no output for either, and the
+    /// caller that wants to tell them apart has [`Store::process_handles`].
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("bring the dev server up", "/repo")?;
+    /// store.record_handle_started(run, 1, 1, "npm run dev")?;
+    /// store.record_handle_output(run, 1, 1, "listening on ")?;
+    /// store.record_handle_output(run, 2, 1, "3000\n")?;
+    ///
+    /// // Readable after the process is gone, which the poll window is not.
+    /// assert_eq!(store.handle_output(run, 1)?, "listening on 3000\n");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn handle_output(&self, run_id: i64, handle: u64) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT chunk FROM handle_output WHERE run_id = ?1 AND handle = ?2 ORDER BY id",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![run_id, handle], |r| r.get::<_, String>(0))?;
+        let mut out = String::new();
+        for row in rows {
+            out.push_str(&row?);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -4810,6 +5193,210 @@ mod tests {
         // enforce nothing".
         assert_eq!(store.run_policy(unrecorded).unwrap(), None);
         assert!(store.run_policy(permissive).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_started_handle_reads_back_with_its_line_and_step_still_running() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 3, 1, "npm run dev")
+            .unwrap();
+
+        let handles = store.process_handles(run).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].handle, 1);
+        assert_eq!(handles[0].step, 3);
+        assert_eq!(handles[0].line, "npm run dev");
+        // Nothing is known about the outcome yet, and nothing is invented.
+        assert_eq!(handles[0].state, "running");
+        assert_eq!(handles[0].code, None);
+        assert_eq!(handles[0].reason, None);
+    }
+
+    #[test]
+    fn pids_round_trip_through_the_joined_column_including_the_empty_case() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "npm run dev")
+            .unwrap();
+        store
+            .record_handle_started(run, 1, 2, "cargo test")
+            .unwrap();
+        store
+            .record_handle_pids(run, 1, &[4021, 4022, 4023])
+            .unwrap();
+        // A handle that failed to spawn holds nothing, which must not read back
+        // as a pid 0 the joined column could plausibly be parsed into.
+        store.record_handle_pids(run, 2, &[]).unwrap();
+
+        let handles = store.process_handles(run).unwrap();
+        assert_eq!(handles[0].pids, vec![4021, 4022, 4023]);
+        assert!(handles[1].pids.is_empty());
+    }
+
+    #[test]
+    fn re_recording_pids_replaces_the_list_rather_than_appending_to_it() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "npm run dev")
+            .unwrap();
+        store.record_handle_pids(run, 1, &[4021]).unwrap();
+        // The tree grew a worker between polls; the second reading is the whole
+        // truth, not the part of it the first reading missed.
+        store.record_handle_pids(run, 1, &[4021, 4098]).unwrap();
+
+        assert_eq!(
+            store.process_handles(run).unwrap()[0].pids,
+            vec![4021, 4098]
+        );
+    }
+
+    #[test]
+    fn an_ended_handle_is_not_re_ended_by_a_later_kill() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "cargo test")
+            .unwrap();
+        store
+            .record_handle_ended(run, 1, "exited", Some(0), None)
+            .unwrap();
+        // The end-of-run teardown kills every handle it knows of, whether or not
+        // there is anything left to kill.
+        store
+            .record_handle_ended(run, 1, "killed", None, Some("run ended"))
+            .unwrap();
+
+        let handles = store.process_handles(run).unwrap();
+        assert_eq!(handles[0].state, "exited");
+        assert_eq!(handles[0].code, Some(0));
+        assert_eq!(handles[0].reason, None);
+    }
+
+    #[test]
+    fn output_chunks_concatenate_in_the_order_they_were_read() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "npm run dev")
+            .unwrap();
+        store
+            .record_handle_output(run, 1, 1, "listening on ")
+            .unwrap();
+        store.record_handle_output(run, 2, 1, "3000\n").unwrap();
+        // Another handle's output is not this handle's.
+        store.record_handle_output(run, 2, 2, "unrelated").unwrap();
+
+        // Joined with nothing between them: each chunk is a verbatim slice of the
+        // stream, so a separator would be output the process never produced.
+        assert_eq!(store.handle_output(run, 1).unwrap(), "listening on 3000\n");
+    }
+
+    #[test]
+    fn an_empty_chunk_writes_no_row() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "npm run dev")
+            .unwrap();
+        store.record_handle_output(run, 1, 1, "").unwrap();
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM handle_output", [], |r| r.get(0))
+            .unwrap();
+        // A quiet server is polled hundreds of times and says nothing each time;
+        // a row per silent poll would bury the output that matters.
+        assert_eq!(rows, 0);
+        assert_eq!(store.handle_output(run, 1).unwrap(), "");
+    }
+
+    #[test]
+    fn orphaning_a_run_touches_only_the_handles_still_running() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "npm run dev")
+            .unwrap();
+        store
+            .record_handle_started(run, 1, 2, "cargo test")
+            .unwrap();
+        store
+            .record_handle_started(run, 1, 3, "tail -f log")
+            .unwrap();
+        store
+            .record_handle_ended(run, 2, "exited", Some(0), None)
+            .unwrap();
+        store
+            .record_handle_ended(run, 3, "orphaned", None, Some("an earlier resume"))
+            .unwrap();
+
+        let orphans = store
+            .orphan_live_handles(run, "resumed after a crash")
+            .unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].handle, 1);
+        assert_eq!(orphans[0].state, "orphaned");
+        assert_eq!(orphans[0].reason.as_deref(), Some("resumed after a crash"));
+
+        let handles = store.process_handles(run).unwrap();
+        // The known fate is the more specific fact and is not overwritten by an
+        // unknown one.
+        assert_eq!(handles[1].state, "exited");
+        assert_eq!(handles[1].code, Some(0));
+        assert_eq!(handles[1].reason, None);
+        // Already orphaned, so its original reason survives this pass.
+        assert_eq!(handles[2].state, "orphaned");
+        assert_eq!(handles[2].reason.as_deref(), Some("an earlier resume"));
+    }
+
+    #[test]
+    fn orphaning_a_run_twice_returns_nothing_the_second_time() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "npm run dev")
+            .unwrap();
+
+        assert_eq!(
+            store
+                .orphan_live_handles(run, "first resume")
+                .unwrap()
+                .len(),
+            1
+        );
+        // Idempotent: `orphaned` is terminal, so a second resume finds nothing
+        // left to orphan and reports no new abandoned process to the operator.
+        assert!(store
+            .orphan_live_handles(run, "second resume")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.process_handles(run).unwrap()[0].reason.as_deref(),
+            Some("first resume")
+        );
+    }
+
+    #[test]
+    fn a_handle_started_twice_keeps_what_is_known_about_the_first() {
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "root").unwrap();
+        store
+            .record_handle_started(run, 1, 1, "npm run dev")
+            .unwrap();
+        store.record_handle_pids(run, 1, &[4021]).unwrap();
+        // A replayed step presents a handle number this run has already seen.
+        store
+            .record_handle_started(run, 4, 1, "npm run dev")
+            .unwrap();
+
+        let handles = store.process_handles(run).unwrap();
+        assert_eq!(handles.len(), 1);
+        assert_eq!(handles[0].step, 1);
+        assert_eq!(handles[0].pids, vec![4021]);
     }
 
     #[test]

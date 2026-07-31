@@ -1,0 +1,617 @@
+product: io-harness
+version: 0.25.0
+release_type: minor
+outcome:
+  user_can: >
+    Start something that does not finish, and stay in control of it. Every tool this crate has ever
+    had is a call that returns: `exec` and, since 0.24.0, `shell` run a command line to completion or
+    to a timeout, and one step of the loop is blocked for the whole of it. So a dev server, a log
+    tail, a watch build and a twenty-minute compile are not slow here — they are unrepresentable. The
+    only way the model can express one is to run it in the foreground and lose the loop until a
+    900-second timeout decides for it, which is not a decision anyone made. This release adds three
+    tools: `shell_start` returns a handle instead of a result, `shell_poll` reads the output produced
+    since the last poll, and `shell_kill` ends the process and everything it spawned. The line is
+    parsed and checked by exactly the machinery 0.24.0 built — same allowlist lexer, same per-stage
+    `Act::Exec` check, same path-resolved redirect targets, all before the first spawn — so a handle
+    is a different lifetime for a command line, not a second way to run one.
+
+    A handle recorded by a previous process is orphaned on resume and never re-attached, polled or
+    signalled. This is the one place this crate could damage something outside its own workspace: a
+    PID recorded before a crash may since have been reused by an unrelated process, and a resumed run
+    that signals it kills a stranger's program. So orphaning is unconditional rather than a
+    best-effort re-attach, and the handle is readable in the store with a reason afterwards rather
+    than silently dropped.
+
+    And the agent stops paying a step to find out what it just broke. When an edit changes a file in
+    a project whose toolchain the crate already detects, the project's own checker runs against it
+    and its diagnostics come back attached to the edit — file, line, span, message, and the exact
+    rendered error a human would see in a terminal. Today a type error costs a step, a build and a
+    provider call to discover; attached to the edit result it costs nothing, and the model corrects
+    it inside the same turn it made it.
+  business_value: >
+    Handles are what decide whether this crate can be pointed at a running system rather than only at
+    a repository. Debugging a service means starting it and watching it. A deployment means tailing a
+    log while something else happens. Iterating on a frontend means a dev server that stays up across
+    many steps. None of that is a long `exec` — it is a process the agent must be able to hold, read
+    from and end. Without handles the honest description of this crate is a batch tool whatever its
+    prose says, and the roadmap's own motivating examples for 0.24.0 were of exactly this shape.
+
+    They were deferred once already, by `US-IO-HARNESS-0.24.0-I01`, and the reason was scope rather
+    than doubt: the release carrying them also carried a shell parser, a Win32 subsystem and four API
+    breaks. This release is scoped so that reason cannot recur. Deferring them a second time would
+    mean the roadmap promised the same capability three releases running, which is the point at which
+    a roadmap stops being believed.
+
+    Diagnostics-on-edit changes the loop's economics rather than its capability, and that is the
+    cheaper kind of win. The model already writes code; what it does badly is notice immediately that
+    it wrote the wrong code. Every provider call spent rediscovering a compile error is a call not
+    spent on the task, and on a long run those compound into context spent on a fact the toolchain
+    knew the moment the file was written.
+
+    The version of this that ships is deliberately not the version the roadmap named. The roadmap
+    said LSP client; the research says a language server is the wrong instrument for this loop, and
+    the right one is the compiler's own machine-readable output, which is *what a language server
+    forwards anyway*. That is not a smaller feature — for Rust it is a strictly larger one, because
+    it carries borrow-check and clippy diagnostics that rust-analyzer's pull path does not.
+  evidence_of_value: >
+    A live run in which the model starts a server through `shell_start`, polls it twice while doing
+    other work, sees the output it produced between the polls, and kills it — with the process
+    demonstrably gone afterwards, checked against the OS rather than against the crate's own
+    bookkeeping.
+
+    Beside it the negative control that makes the resume claim mean something: a run checkpointed
+    with a live handle, its process killed out from under it, its PID re-used by an unrelated live
+    process, and a resume that reports the handle orphaned and does not signal that PID.
+
+    For diagnostics: an edit that introduces a type error, whose `edit_file` result carries the
+    rendered compiler error with its line and span, and no build step of the model's own in between.
+    The negative control is an edit that introduces no error, whose result carries no diagnostics and
+    costs no measurable extra time on a warm tree.
+scope:
+  included:
+  - >
+    Three tools — `shell_start`, `shell_poll`, `shell_kill` — sharing 0.24.0's parse and check path
+    exactly. `shell_start` takes the same one command line `shell` takes, runs it through `parse`
+    (`src/tools/shell.rs:796`) and `plan` (`src/tools/shell.rs:1015`), and walks the same gate loop
+    the `SHELL_TOOL` arm walks at `src/run.rs:5294` — every sub-command's argv against `Act::Exec`,
+    every redirect target path-resolved against `Act::Write` or `Act::Read` — **before the first
+    spawn**. What differs is only what happens after the check passes: instead of awaiting the
+    children it registers them and returns a handle id. No second parser, no second gate, no second
+    refusal set exists, and that is a criterion rather than an intention (F4).
+  - >
+    A handle registry that outlives a tool call, which is the genuinely new concept in this release.
+    Nothing in the crate owns a process beyond one dispatch today: `Shell::run`
+    (`src/tools/shell.rs:1110`) holds its children in a local `Vec` inside a single `async fn` with
+    `kill_on_drop(true)`, so the drop that ends the call also ends the processes. The registry is what
+    makes a process outlive its call, and every guard below — the per-run cap, the kill on run end,
+    the orphaning on resume — exists because that drop guarantee is being given up deliberately.
+  - >
+    **Routing the handle spawn through the platform's containment, which the `shell` tool does not do
+    today.** This corrects a premise the roadmap carried. 0.24.0's argument for shipping the Job
+    Object was that killing a handle on Windows without one leaks the grandchildren — but
+    `src/tools/shell.rs` contains no reference to `Sandbox` at all; the Job Object is on the
+    verification path (`src/sandbox.rs:687`), not the shell path. So the containment handles need is
+    not inherited by existing, it has to be reached. A handle's processes are placed under the
+    platform's containment at start — the existing `Job::create`/`Job::adopt` pair
+    (`src/sandbox/windows.rs:249`, `:308`) on Windows, the existing `kill_tree`
+    (`src/sandbox.rs:888`) on unix — so that `shell_kill` ends a tree rather than a parent. The
+    foreground `shell` and `exec` tools are **not** changed to route this way: that is a behaviour
+    change to shipped tools and it does not belong in the same diff as a new one, which is the same
+    line 0.24.0 drew around the `exec` gate's joined-argv looseness.
+  - >
+    Incremental output to the model, the whole stream to the store. This resolves the open question
+    0.24.0 left. `shell_poll` returns what the process wrote since the previous poll — a byte cursor
+    per stream held by the registry, not a re-read and diff — because a log tail polled ten times
+    must not return its whole history ten times. The idempotence that the offset form would have
+    bought is bought instead by writing every byte to the store as it is read, so a poll whose result
+    is lost to a provider retry is recoverable by reading the run rather than by asking the process
+    again. Both streams are bounded by the same `head_and_tail` elision `exec` and `shell` already
+    use, so one chatty poll cannot spend the model's whole context.
+  - >
+    A per-run cap on live handles, refused with a reason naming the cap rather than silently queued,
+    so a model in a loop cannot fill the host with dev servers. Every handle still live when its run
+    ends is killed rather than leaked.
+  - >
+    Store tables for the handle lifecycle — what was started, its parsed sub-commands, its output,
+    how it ended, and whether a resume orphaned it — written with the additive pattern
+    `src/state.rs:2301-2334` establishes for `citations`, with reader and writer methods shaped like
+    `record_citations` (`src/state.rs:3678`) and `citations` (`src/state.rs:3723`). No existing table
+    is created, altered or dropped. **`CHECKPOINT_FORMAT` does not move from 7**, per the convention
+    the source states at `src/state.rs:2260-2266`: a new table is not a format change, because
+    bumping would make `check_resumable` (`src/state.rs:3208`) refuse every older store over a table
+    an older binary never queries. This decides 0.24.0's open question rather than re-inheriting it.
+  - >
+    Unconditional orphaning on resume, implemented once. Every resume path funnels through
+    `record_resume_markers` (`src/run.rs:2066`) — flat and tree loops, and the decision, answer and
+    stored-policy variants all reach it — so the orphaning pass lives there or immediately beside its
+    four call sites, and cannot be added to three paths and missed on the fourth. A handle recorded by
+    a previous process is marked orphaned with a reason and is never re-attached, polled or
+    signalled. No recorded PID is signalled on any resume path, ever.
+  - >
+    Diagnostics attached to an edit, produced by the project's own checker rather than by a language
+    server. After a successful `edit_file` or `write_file` in a project whose ecosystem
+    `toolchain::detect` already recognises, the ecosystem's check command runs against the workspace
+    in machine-readable form — `cargo check --message-format=json` for cargo, and the same shape for
+    the ecosystems `toolchain.rs` already tables — and each resulting diagnostic is appended to the
+    observation the model receives. For cargo this is the `rendered` field of each `compiler-message`
+    record: the exact terminal error, with its code, its span and its machine-applicable suggestion.
+    This is the same stream a language server's flycheck consumes and converts; taking it directly is
+    both less code and strictly more information.
+  - >
+    The diagnostics pass is bounded, off by default at no cost, and never fails an edit. It runs
+    under a timeout and a cap on how much it may append; it is skipped entirely when no ecosystem is
+    detected or no check command is configured; a checker that is missing, times out, or exits
+    non-zero for its own reasons yields no diagnostics and is recorded as such rather than turning a
+    successful edit into a failed one. The edit has already happened when the checker runs — its
+    result is information, never a veto.
+  - >
+    New `EventKind` variants for a started handle, a poll, a kill, an orphaning, and a diagnostics
+    pass, so both features are visible through the observer channel an operator already subscribes
+    to. `EventKind` became `#[non_exhaustive]` in 0.24.0, so these are additive and break nothing —
+    this is the first release in which that is true, and the reason that rider shipped when it did.
+  - >
+    **Two stale claims in the documentation, corrected.** `docs/CONTRACT.md:462-466` still states that
+    `SandboxLimits::max_processes` is "enforced by nothing, on any platform" and that the Windows Job
+    Object is "not wired up"; `docs/guide/sandbox.md:59` says the same. Both were made false by
+    0.24.0, which enforces it on Windows — the rustdoc at `src/sandbox.rs:26` was updated and the two
+    markdown files were not. A contract document that under-claims a shipped boundary is the same
+    class of defect as one that over-claims it: both mean a consumer cannot trust the file.
+  - >
+    The changelog with a migration note per break, `docs/public-api.txt` regenerated, and every doc
+    surface this release touches updated in the same release rather than after it: `README.md`'s tool
+    list and feature prose, `docs/CONTRACT.md`, `docs/guide/command-execution.md` for the handle
+    lifecycle, `docs/guide/sandbox.md`, `docs/guide/language-support.md` for the check command, and
+    the crate-level rustdoc in `src/lib.rs`.
+  excluded:
+  - >
+    **An LSP client, cut on evidence rather than deferred on scope.** The roadmap named one; the
+    research says it is the wrong instrument for this loop and the reasons stack rather than trade
+    off. `textDocument/publishDiagnostics` is a server-initiated notification with no pairing, so a
+    push server offers no signal that diagnostics are complete and any implementation degenerates
+    into an arbitrary sleep. The 3.17 pull model is not portable — of six servers checked, only
+    rust-analyzer implements it unconditionally and gopls behind an opt-in; typescript-language-server,
+    pyright (closed as not planned) and clangd do not. And for Rust the pull path returns the wrong
+    half: rust-analyzer's `textDocument/diagnostic` handler calls `full_diagnostics` and never
+    consults flycheck, so it yields syntax, name-resolution and type-inference diagnostics but **not**
+    borrow-check errors and not clippy — which is precisely what "the type error it just wrote" means.
+    Cold workspace load before any diagnostic is minutes on a real crate. Against that, the crate
+    would own a stateful long-lived subprocess with an init handshake, versioned document sync,
+    capability negotiation and crash recovery, plus `async-lsp` at +23 `cargo tree` lines including a
+    duplicate `lsp-types` and a second major of `bitflags`. The check-command form costs zero new
+    dependencies and delivers more. If a future release wants goto-definition and find-references —
+    which greps genuinely cannot answer and which a language server genuinely can — that is a
+    different feature with a different justification, and it should be argued on those two queries
+    rather than on diagnostics.
+  - >
+    **Windows AppContainer, moved to 0.26.0 as a release of its own.** Not dropped and not doubted —
+    it remains the right mechanism, and an AppContainer with an empty capability array is a real
+    kernel-enforced no-network boundary of the same shape as an empty net namespace. What the
+    research established is that it cannot ride beside another feature. The security capabilities
+    reach a child through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` on an attribute list, and
+    `tokio::process::Command` cannot carry one on stable Rust — `raw_attribute` is gated behind the
+    unstabilized `windows_process_extensions_raw_attribute` (rust-lang/rust#114854). So *any*
+    AppContainer, network-only included, means owning `CreateProcessAsUserW` in this crate and
+    re-implementing what the shared runner at `src/sandbox.rs:627-644` gives free today: pipe
+    creation with inheritable handles, async draining into tokio, kill-on-drop, exit-status
+    collection and the wall-clock timeout. That rewrite is the release. Its filesystem half compounds
+    the cost — an AppContainer is default-deny for reads, so the workspace grant is the easy part and
+    the toolchain, the executed binary, the redirected temp directory and every per-language install
+    tree are the rest — and viability on `windows-latest` and Server SKUs is unverified. Handles have
+    been deferred once already; planning them beside a Windows spawn-path rewrite is how that
+    happened.
+  - >
+    Changing `shell`, `exec` or the sandbox's own spawn path. The handle path reaches containment;
+    the foreground paths keep exactly the behaviour they shipped with. Retro-fitting the sandbox onto
+    `shell` is a behaviour change to a shipped tool's guarantees and belongs in a release that is
+    about that.
+  - >
+    Any expansion of the shell grammar. The refusal set 0.24.0 proved closed is the refusal set
+    `shell_start` gets, unchanged and re-tested through the new path.
+  - >
+    Re-attaching to a handle across a process boundary, under any condition, including a PID that
+    still appears to be the recorded program. There is no check that distinguishes a surviving
+    process from a reused PID with sufficient confidence to justify signalling it, and the failure
+    mode is killing an unrelated program on the operator's machine.
+  - >
+    Wrapping `rusqlite::Error` out of the public API. Still right, still not slotted; the argument
+    recorded in 0.23.0 stands.
+  - >
+    Any seccomp filter on Linux, and any change to the macOS or Linux sandbox backends.
+  fallback_scope:
+  - >
+    Process handles alone — the three tools, the registry, the containment routing, the store tables
+    and the unconditional orphaning on resume — with diagnostics-on-edit dropped.
+
+    This is a coherent release on its own and the smaller half is the one that drops, which is the
+    opposite of 0.24.0's mistake. Handles are the capability the roadmap has promised twice; the
+    diagnostics pass is an efficiency win on a loop that already works. The trigger to pull it is
+    named rather than left to judgement: if the containment routing (F5) or the orphaning proof (F3)
+    is not closed by the time the diagnostics work would start, diagnostics do not start. A run that
+    leaks processes or signals a reused PID is a worse release than one that spends an extra provider
+    call on a compile error.
+acceptance:
+  functional:
+  - >
+    F1 — a process handle starts, polls and dies. A command producing output over time is started,
+    polled twice returning incremental output with no duplication and no loss across the two polls,
+    then killed; the handle's terminal state and its full output are readable from the store
+    afterwards. A handle left live when its run ends is killed, not leaked, and that is asserted by
+    checking the process is gone rather than by trusting the code path. *(0.24.0's F5, deferred by
+    `US-IO-HARNESS-0.24.0-I01`, carried here unchanged.)*
+  - >
+    F2 — killing kills the tree on macOS and Linux. A handle whose command spawns a child that
+    spawns a grandchild is killed, and all three are gone. The mechanism is a process group: each
+    handle stage is spawned as its own group leader and the kill signals the group, which reaches a
+    grandchild whose parent has already exited — the case every kill built on walking the process
+    table misses. The negative control is what makes it worth its cost: the same fixture killed by
+    pid alone must leave the grandchild running. *(the handle half of 0.24.0's F6, which that
+    release could only assert through the sandbox's own spawn path.)*
+
+    **Amended by `US-IO-HARNESS-0.25.0-I01`:** this criterion said "on all three platforms" with a
+    Windows negative control, and Windows is withdrawn from it rather than left standing as an unmet
+    clause. Windows has no process group; its equivalent is the Job Object, and assigning a child to
+    one requires the child handle at the spawn site, where this release's interface carries a pid.
+    Meeting it means changing that interface and verifying unsafe Win32 through a CI round trip
+    rather than on any machine this work can reach. It moves to 0.26.0, which re-owns the Windows
+    spawn path for AppContainer regardless, and where the job assignment is a few lines in the same
+    place rather than a second interface change. Until then a Windows handle's tree kill is
+    best-effort and a grandchild whose parent already exited may survive — stated in
+    `docs/CONTRACT.md` and the sandbox guide rather than left to be discovered.
+  - >
+    F3 — handles do not survive a process boundary, and say so. A run with a live handle is
+    checkpointed and the process exits; on resume the handle is reported orphaned with a reason, is
+    never polled or killed, and no PID is signalled. The negative control is a resumed run whose
+    recorded PID has been reused by an unrelated live process, which must not be touched. *(0.24.0's
+    F7, carried unchanged.)* Asserted on every resume entry point, not one — the criterion is that
+    the pass sits where all four call sites reach it.
+  - >
+    F4 — the handle path is checked by the same machinery as the foreground path, proven rather than
+    asserted. Every refusal case in `tests/shell.rs` runs again through `shell_start` and refuses
+    identically, spawning nothing and registering no handle — driven from one shared table through
+    the existing `run_line` harness (`tests/shell.rs:88`) parameterised over the tool, so a refusal
+    added to one path cannot be missing from the other. A line whose second stage is denied starts no
+    first stage.
+  - >
+    F5 — a handle's processes are contained by the platform's own facility, which is the claim the
+    code did not support before this release. On unix that is the process group F2 asserts.
+    **Amended by `US-IO-HARNESS-0.25.0-I01`:** the Windows half — reaching the Job Object from the
+    handle path — moves to 0.26.0 with F2's Windows clause and for the same reason. What is asserted
+    here is unix only. The original wording follows, since its argument still holds for the half
+    that shipped: a handle's processes are contained by the run's sandbox, which is the claim the
+    code does not support today. The spawn reaches `Job::adopt` on Windows and the recorded containment on
+    unix, verified against the cap reason rather than against the child dying — a child that dies is
+    not evidence that anything contained it. This is a criterion and not a note because
+    `src/tools/shell.rs` references `Sandbox` nowhere, so inheriting containment is work rather than
+    a consequence.
+  - >
+    F6 — the live-handle cap refuses rather than queues. Starting one handle past the configured cap
+    is refused with a reason naming the cap, no process is spawned, and the handles already live are
+    untouched.
+  - >
+    F7 — a diagnostic reaches the model attached to the edit that caused it. An `edit_file` that
+    introduces a type error into a cargo project returns an observation containing the rendered
+    compiler error, its file, its line and its error code, with no intervening tool call by the
+    model. The negative control is an edit introducing no error, whose observation carries no
+    diagnostics section at all.
+  - >
+    F8 — the diagnostics pass never turns a good edit into a failed one. With the checker absent from
+    `PATH`, with it timing out, and with it failing for an unrelated reason, the edit still succeeds,
+    the observation still reports the edit, and the failure of the pass is recorded rather than
+    raised. Three cases, three tests, because this is the way an information feature becomes an
+    availability bug.
+  - >
+    F9 — the pass is genuinely off when it is off. A project with no detected ecosystem, and a
+    configuration that disables it, both produce an edit with no checker process spawned at all —
+    asserted by process observation, not by an absent diagnostics section, since an empty section and
+    a skipped pass are indistinguishable from the output alone.
+  non_functional:
+  - >
+    NF1 — the full suite passes on macOS, Linux and Windows, with no test skipped, ignored or made
+    conditional to get there. The standing exception is
+    `skills::discovery_over_a_32_skill_directory_is_under_50ms`, a known wall-clock assertion that
+    fails intermittently on the Windows runner under load.
+  - >
+    NF2 — **the dependency tree does not move on any platform.** `cargo tree` on the default feature
+    set reads 402 lines after this release as before it, and the Windows tree gains nothing: the
+    handles use the `windows-sys` features 0.24.0 already declares, and the diagnostics pass parses
+    NDJSON with the `serde_json` already present. This is the checkable form of the argument for
+    rejecting the LSP client, so it is a criterion.
+  - >
+    NF3 — a handle that is never polled cannot exhaust memory. Output accumulates to the store with a
+    bounded in-memory buffer, and a process producing unbounded output while nothing polls it is
+    bounded by that policy rather than by the host's memory. Asserted with a generator process, not
+    argued.
+  - >
+    NF4 — the diagnostics pass costs nothing measurable on a warm tree and is bounded on a cold one.
+    Its timeout is enforced and its output cap is enforced, both asserted; an edit in a project whose
+    check is slow returns within the bound with the pass recorded as timed out.
+  - >
+    NF5 — `cargo doc` is warning-free, docs.rs builds with all features, and
+    `cargo clippy --all-targets -- -D warnings` is clean.
+  operational:
+  - >
+    OP1 — a real end-to-end run against a live provider in which the model itself starts a
+    long-running process, polls it, does other work between polls, and kills it. One run, one
+    workspace, read back from the store afterwards. Evidence is OpenRouter unless another key exists,
+    per the standing credential position.
+  - >
+    OP2 — the two stale documentation claims are corrected and checked by reading the files:
+    `docs/CONTRACT.md` no longer says `max_processes` is enforced by nothing, and
+    `docs/guide/sandbox.md` agrees with it and with `src/sandbox.rs:26`. Reviewed as a criterion
+    because a contract document that under-claims a shipped boundary is as much a defect as one that
+    over-claims it.
+  - >
+    OP3 — every doc surface this release touches is updated in this release: the README tool list,
+    `docs/CONTRACT.md` for the handle lifecycle and the orphaning rule, `docs/guide/command-execution.md`,
+    `docs/guide/language-support.md` for the check command, and the crate rustdoc. Checked by grepping
+    the docs for each API this release adds or changes rather than from memory.
+  - >
+    OP4 — `docs/CONTRACT.md` states the orphaning rule as a contract, not an implementation detail: a
+    consumer needs to know that a handle does not survive a resume and that no recorded PID is ever
+    signalled, because that is the difference between this crate and one that would re-attach.
+  - >
+    OP5 — `cargo package --locked` exits 0 and the tarball carries no `.env`, no `.ultraship` and no
+    `.github`, verified by listing rather than assumed from the `exclude` list.
+  - >
+    OP6 — MSRV re-checked by hand and stated. No new dependency is expected to move it; it is checked
+    rather than assumed, which is the lesson 0.23.0 paid for.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.25.0, GitHub at initorigin/io-harness with the tag `v0.25.0` and a
+    Release titled `io-harness 0.25.0`, and docs.rs, whose build is checked by the nightly CI job.
+  deployment_method: >
+    The standing flow. All work on `feat/0.25.0` off `develop`, including the sealed UltraShip
+    release record. PR into `develop`, merged with the PR button. Release PR `develop` into `main`,
+    merged the same way. The GitHub Release is cut by `release.yml` — `gh workflow run release.yml
+    --ref main -f version=0.25.0` — which refuses any ref but `main`, a version the manifest does not
+    declare, an existing tag, or a version with no changelog section, and takes its notes verbatim
+    from the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges
+    and the Release exist. `develop` synced to `main` fast-forward only at the end. No branch is
+    deleted. `git fetch --tags` after the Release, since the tag is made on the remote only.
+  migrations:
+  - >
+    New `EventKind` variants for the handle lifecycle and the diagnostics pass. Additive, and covered
+    by the `#[non_exhaustive]` that shipped in 0.24.0 — a consumer matching `EventKind` already has a
+    wildcard arm, so this is the first release in which new variants cost them nothing.
+  - >
+    Store: new tables for the handle lifecycle. Additive — no existing table is created, altered or
+    dropped, every 0.24.0 database opens unchanged, and `CHECKPOINT_FORMAT` stays 7, so a 0.24.0
+    build opens a 0.25.0 database and simply does not read the new tables.
+  - >
+    New tool names are reserved: a caller who has registered a custom tool named `shell_start`,
+    `shell_poll` or `shell_kill` will now fail validation, which `RESERVED_TOOL_NAMES`
+    (`src/tools/custom.rs:352`) enforces at run start rather than silently shadowing. Migration:
+    rename the custom tool. This is the standing behaviour for every built-in name, not a new rule.
+  - >
+    A project with a detected ecosystem now runs its check command after an edit unless disabled. No
+    API changes, but a consumer embedding this crate in an environment where running the project's
+    checker is unwanted should disable the pass; the configuration key and its default are documented
+    in the changelog entry rather than left to discovery.
+  observability:
+  - >
+    Handle lifecycle rows in the store: what was started, its parsed sub-commands, its output, how it
+    ended, and whether a resume orphaned it. The trace must be able to answer "what did that dev
+    server do" after the process that started it is gone, which is the whole reason the output goes
+    to the store rather than only to the poll that asked for it.
+  - >
+    One policy decision recorded per sub-command and per redirect target on the handle path, exactly
+    as the foreground path records them, so a refused `shell_start` is as legible in the trace as a
+    refused `shell`.
+  - >
+    An orphaning is an event and a stored reason, never a silent drop. An operator reading a resumed
+    run must be able to see that a handle existed, that it was abandoned, and why.
+  - >
+    The diagnostics pass records that it ran, how long it took, and whether it was skipped, timed
+    out, or produced findings — so a pass that is quietly never running is distinguishable from a
+    project that quietly has no errors.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.25.1 and `cargo yank --version
+    0.25.0` is the escape hatch, leaving 0.24.0 as what `cargo install` resolves. A consumer
+    reverting to 0.24.0 keeps every database — the store change is additive and the format did not
+    move — and loses only the new tools, which no 0.24.0 policy ever allowed anyway. What a revert
+    does not undo is any process a handle started and did not kill, which is why F1 asserts that a
+    run ending kills its live handles rather than leaking them, and why the per-run cap exists. The
+    diagnostics pass needs no rollback story beyond disabling it: it never modifies a file and never
+    fails an edit.
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows
+  - A real provider account, for the live run that is OP1
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - Owner approval to merge to `main`, cut the Release, and publish, per the standing override.
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    The registry, because it is where the crate gives up a guarantee it has always had. Every process
+    this crate has ever spawned died with the call that made it; a handle is the first that does not.
+    The cost is not the data structure, it is proving the four ways it can leak — a run that ends, a
+    process that exits on its own, a cap that is hit, and a resume — each close correctly.
+  - >
+    Routing the spawn into containment, which is new integration rather than new code: the shell path
+    and the sandbox path have never met, and the Windows half has ordering requirements whose failure
+    mode returns success. F5 asserts against the cap reason for that reason.
+  - >
+    Orphaning proven on every resume path rather than one. There are more than a dozen public resume
+    entry points; they funnel through `record_resume_markers`, and the work is proving that funnel
+    holds rather than assuming it from a reading.
+  - >
+    Three-platform process behaviour for one feature: kill semantics differ per platform, and Windows
+    has no process group.
+  - >
+    The diagnostics pass's boundedness — the timeout, the output cap, and the three failure modes of
+    F8 — which is more of the work than parsing the JSON, since `serde_json` is already present and
+    the format is documented NDJSON.
+  preferred_tools:
+  - 0.24.0's `parse` and `plan`, and the `SHELL_TOOL` gate loop, reused rather than reimplemented
+  - The existing `Job::create`/`Job::adopt` on Windows and `kill_tree` on unix
+  - The `citations` table pattern in `src/state.rs` for the additive store work
+  - The existing `run_line` harness in `tests/shell.rs`, parameterised, for F4
+  - '`toolchain::detect`, which already maps a workspace to an ecosystem and its commands'
+  - '`serde_json` over cargo''s documented NDJSON; no `cargo_metadata` dependency'
+  constraints:
+  - No new dependency on any platform; `cargo tree` stays 402 on the default feature set
+  - No recorded PID is signalled on any resume path, ever
+  - No existing table created, altered or dropped; `CHECKPOINT_FORMAT` stays 7
+  - The handle path reuses the foreground parser and gate; no second refusal set
+  - No change to `shell`, `exec`, or the sandbox's own spawn path
+  - A diagnostics failure never fails an edit
+  - Stay 0.x
+risks:
+- >
+  A leaked process is the failure that reaches the operator's machine rather than their run. The
+  crate is giving up `kill_on_drop`, which has been its guarantee since the first tool, and the ways
+  to leak are not one bug but four independent paths — run end, self-exit, cap, resume. F1's
+  assertion against the OS rather than the registry exists because the registry believing a process
+  is dead is exactly the shape this failure takes.
+- >
+  Signalling a reused PID. A resumed run that kills an unrelated program is the only way this crate
+  can damage something outside its workspace, and it is why orphaning is unconditional rather than a
+  confidence-weighted re-attach. The temptation to add "but only if the PID still looks like our
+  program" should be refused: every such check is a race.
+- >
+  Containment that is created and does not contain. Job assignment has ordering requirements and
+  failure modes that return success, and a limit that does not apply looks identical to one that
+  does until something exceeds it. Mitigated by asserting the cap reason, never the child's death.
+- >
+  The diagnostics pass becoming an availability problem. A checker that hangs, floods, or is absent
+  must degrade to no diagnostics — an edit tool whose reliability now depends on a build tool being
+  healthy would be a worse crate than one that never had the feature. F8 and NF4 exist for this and
+  should not be softened.
+- >
+  Scope discipline, restated because this is the failure the previous release actually had. This
+  contract is deliberately two features rather than the roadmap's three, the third moved on evidence
+  and not on feel. The fallback is diagnostics dropping, and its trigger is named: F3 or F5 not
+  closed by the time diagnostics would start.
+open_questions:
+- >
+  Whether the diagnostics pass runs on every edit or is debounced across a burst of edits in one
+  step. Per-edit is simpler and is what F7 describes; a model that rewrites four files in one turn
+  pays four checks for one useful answer. Decided during development against a real multi-file run,
+  and stated either way — the debounced form must still attribute each diagnostic to an edit or it
+  stops being the feature.
+- >
+  Whether a handle's output cap is per poll, per handle, or both. Per poll bounds one observation;
+  per handle bounds the run. NF3 requires the second to exist; whether the first is separately
+  configurable is a judgement about how many knobs this deserves.
+- >
+  Whether `shell_kill` on an already-exited handle is an error or a no-op returning the terminal
+  status. The idempotent form is friendlier to a model that lost track, which is the common case;
+  the error form catches a confused agent earlier. Decided against what the refusal messages look
+  like in a real run.
+status: released
+released_at: 2026-08-01T00:30:00Z
+mode: published
+delivered: >
+  A run can start something that does not finish and stay in control of it. `shell_start` returns a
+  handle instead of a result, `shell_poll` returns the output produced since the previous poll, and
+  `shell_kill` ends the process and everything it spawned. The line is parsed and checked by exactly
+  the machinery `shell` uses — literally the same `parse`, `plan` and `check_shell_line` — so a
+  handle is a different lifetime for a command line rather than a second way to run one, and a line
+  whose second stage is denied starts no first stage.
+
+  A handle recorded by a previous process is orphaned on resume and never re-attached, polled or
+  signalled. That rule lives in `record_resume_markers`, the one function every resume path passes
+  through, because a rule that holds on three paths out of four is worthless and this is the rule
+  whose failure kills an unrelated process on the operator's machine.
+
+  Beside it, an edit now comes back carrying what the project's own checker thinks of it. That is
+  deliberately not the LSP client the roadmap named: push diagnostics have no completion signal, the
+  3.17 pull model is not portable, and rust-analyzer's pull path never consults flycheck, so it
+  omits the borrow-check and clippy errors the feature exists for. Consuming the compiler's own
+  machine-readable output costs no new dependency and carries more.
+evidence:
+  tests:
+  - >
+    `cargo test --all-features` on macOS — 1082 passed, 0 failed, exit 0. Full output in
+    `evidence/0.25.0/tests.txt`.
+  - >
+    Three-platform CI — `test (macos-latest)`, `test (ubuntu-latest)` and `test (windows-latest)`
+    all green, plus `lint`, `msrv`, `docs.rs (nightly)` and the `links-consumer` job. Recorded in
+    `evidence/0.25.0/ci.txt`.
+  - >
+    Windows CI earned its keep: it failed twice and each failure was a real defect. The first was an
+    unquoted Windows path in a fixture, destroyed by the shell grammar's escape rule before anything
+    spawned — a behaviour that predates this release and had never been written down. The second was
+    a defect in this release's own code: a handle that exits on its own was noticed by a task that
+    cannot write to the store, so the trace said `running` forever for a process that was gone.
+  - >
+    Two more defects were found by tests written to distrust the implementation. A strong `Arc` held
+    by each handle's reaping task kept the registry's refcount above zero, so the kill-on-drop
+    backstop never ran and a process outlived its run — caught only because the assertion asks the
+    operating system whether the pid is alive rather than asking the registry. And output a process
+    produced but nobody polled was recorded nowhere durable.
+  - >
+    Non-vacuity established by sabotage rather than asserted: stubbing the process-group hook to
+    `if false` makes the grandchild test fail with "the grandchild survived the kill"; widening the
+    diagnostics timeout from zero makes the timeout test fail because a real `cargo check` runs
+    clean.
+  builds:
+  - '`cargo package --locked` — exit 0, 181 files, 960.7KiB compressed.'
+  - >
+    Tarball verified by listing rather than by trusting `exclude`: zero entries matching `.env`,
+    `.ultraship/` or `.github/`. `evidence/0.25.0/package.txt`.
+  - '`cargo clippy --all-features --all-targets` — clean. `cargo doc --all-features` — no warnings.'
+  - '`cargo fmt --check` — clean.'
+  - >
+    `cargo tree` — 402 lines on the default feature set, unchanged, and 842 with all features. This
+    is the checkable form of the argument for rejecting the LSP client, which would have cost 23
+    lines including a duplicate `lsp-types` and a second major of `bitflags`.
+  - >
+    MSRV 1.95 checked by hand in both directions rather than read off the manifest: 1.94 with
+    `--ignore-rust-version` fails inside `libsqlite3-sys` 0.38.1's build script on `cfg_select`, and
+    1.95 builds. That is the lesson 0.23.0 paid for.
+  reviews:
+  - >
+    `US-IO-HARNESS-0.25.0-I01` — F2 and F5 amended to the unix guarantee that is implemented and
+    proven, with the Windows Job Object routing deferred to 0.26.0. Recorded with
+    `approval.source: agent`, deliberately: the owner's standing override is authority over the
+    release flow, not approval of a change to what a release promises.
+  deployments: []
+  health_checks:
+  - >
+    Live OpenRouter run, nothing scripted, on `openai/gpt-5.6-luna` — 10 steps, 24,160 tokens. The
+    model chose `shell_start` over `shell`, polled it for 82 bytes, killed it, and wrote the port it
+    read out of the running process's own log. Handle state `killed`, pid recorded, nothing left
+    running. This is OP1, and it is the criterion a scripted provider cannot satisfy: it tests
+    whether the tool descriptions are good enough that a model picks the right tool unprompted.
+known_limitations:
+- >
+  **Killing a handle on Windows does not reach a grandchild whose parent has already exited.** The
+  unix guarantee is a process group; Windows has no equivalent and its Job Object needs the child
+  handle at the spawn site, where this release's interface carries a pid. Deferred to 0.26.0 by
+  `US-IO-HARNESS-0.25.0-I01`, which rewrites that spawn path for AppContainer regardless. Stated in
+  `docs/CONTRACT.md` and the sandbox guide rather than left to be discovered.
+- >
+  **Output skipped by a poll is gone, not archived.** `Store::handle_output` holds only what polls
+  actually read. A poll arriving to find more than one window waiting keeps the newest and advances
+  the cursor past the rest, so bytes no poll ever read reach no store and go with the capture file
+  when the run ends. The poll's own message to the model says so; an earlier wording claimed the
+  skipped bytes were in the trace and was corrected before release. The real fix streams the skipped
+  region to the store in bounded chunks.
+- >
+  The record is sealed with `mode: published` before the crates.io upload, which follows the
+  `develop` → `main` merge and the GitHub Release. The record states the authorised target; the flow
+  makes it true.
+- >
+  A handle has no wall-clock ceiling of its own. That is the point of one, but it means a model that
+  starts a handle and never polls or kills it holds a process for the life of the run. The per-run
+  cap of 8 and the kill-on-run-end are what bound that, not a timeout.
+- >
+  The diagnostics pass runs on every edit rather than being debounced across a burst, so a model
+  rewriting four files in one step pays four checks. Left as written and recorded as an open
+  question in this contract rather than guessed at.
+- >
+  `every_kind()` in `src/observe.rs` claims an exhaustiveness it does not prove — the guard matches
+  on the vector's items, so it proves the arms are exhaustive and never that the vector mentions
+  every variant. `TodoWrote`, `QuestionAsked` and `QuestionAnswered` have gone round-trip-untested
+  since 0.21.0. Pre-existing, found while adding this release's variants, and left alone under scope
+  freeze.
+supersedes: 0.24.0
+next_recommended_version: 0.26.0
+immutable: true

@@ -1,6 +1,6 @@
 [package]
 name = "io-harness"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2021"
 # `libsqlite3-sys` 0.38.1 sets the floor from 0.23.0 on: its build script — and
 # `rusqlite` 0.40's own source — call the std `cfg_select!` macro, stabilised in
