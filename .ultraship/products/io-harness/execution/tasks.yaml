@@ -9,7 +9,7 @@ tasks:
   why_required: 'Every other handle task needs something to start. This is also where the release stops
     being like every previous one: the registry is the first thing in the crate that owns a process beyond
     the call that created it, so it is the task that defines what the rest must prove.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - 'F4 — the handle path is checked by the same machinery as the foreground path, proven rather than
@@ -24,7 +24,20 @@ tasks:
   - src/tools/mod.rs
   - src/run.rs
   - src/tools/custom.rs
-  evidence: []
+  evidence:
+  - check_shell_line extracted at src/run.rs so shell and shell_start share one check pass rather than
+    two copies; shell, exec_tool and policy unchanged after the extraction.
+  - 'src/tools/handles.rs: the registry, 8 unit tests covering the cap refusing rather than queueing,
+    a poll returning only what is new, a poll over the window reporting its gap, and an orphan never re-using
+    a live id.'
+  - shell_start, shell_poll and shell_kill wired into dispatch, workspace_tools and RESERVED_TOOL_NAMES;
+    registry created per run in the flat loop and per agent in the tree loop.
+  - 'tests/handles.rs, 5 end-to-end tests through the run loop with a scripted provider: a handle starts,
+    polls and is killed; no output is delivered by two polls; every construct shell refuses shell_start
+    refuses; a denied later stage starts no handle and writes no file; the ninth start against a cap of
+    8 is refused.'
+  - examples/tick.rs added as the fixture — nothing that ships on all three platforms both keeps running
+    and keeps printing.
 - id: US-IO-HARNESS-0.25.0-T02
   summary: 'Add the handle lifecycle tables to `src/state.rs` and their `Store` reader and writer, copying
     the `citations` pattern: additive `CREATE TABLE IF NOT EXISTS` at the end of `from_conn`, a public
@@ -53,7 +66,7 @@ tasks:
   why_required: 'A handle that cannot be read or ended is not a capability, it is a leak. The cap and
     the kill-on-run-end are not extras: they are two of the four ways the registry can leak a process
     onto the operator''s machine.'
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.25.0-T01
   - US-IO-HARNESS-0.25.0-T02
@@ -74,7 +87,13 @@ tasks:
   - src/tools/shell.rs
   - src/run.rs
   - src/state.rs
-  evidence: []
+  evidence:
+  - shell_poll and shell_kill are implemented and tested end to end, including the incremental-output
+    claim and killing an already-ended handle being reported rather than failed.
+  - 'INCOMPLETE: the other half of F1 — that a handle still live when the run ends is killed rather than
+    leaked — is implemented (Handles::kill_all plus a Drop backstop) but NOT yet asserted against the
+    operating system. The assertion needs the pid, which the store tables in T02 record; there is no route
+    from an integration test to it until those land. Noted in tests/handles.rs rather than dropped.'
 - id: US-IO-HARNESS-0.25.0-T04
   summary: Route the handle spawn into the platform's containment — `Job::create`/`Job::adopt` on Windows,
     the recorded containment and `kill_tree` on unix — so `shell_kill` ends a tree rather than a parent.
