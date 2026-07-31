@@ -1,0 +1,34 @@
+# Pinned to io-harness 0.22.0 — the PREVIOUS release — on purpose, with an `=`
+# requirement so cargo cannot drift it forward. Never bump this. The whole job of
+# this crate is to be the OLD side of the 0.23.0 engine bump: 0.22.0 is the last
+# release on `rusqlite` 0.32 (bundled SQLite 3.46.0), 0.23.0 is the first on
+# `rusqlite` 0.40 (bundled SQLite 3.53.2), and "no measurable regression in store
+# write throughput" is a claim about the difference between those two engines. It
+# can only be measured by running the same workload against both. Bump this
+# dependency and there is no old side left to compare against — the measurement
+# becomes the current tree against itself, which always passes.
+#
+# `src/main.rs` must stay byte-for-byte the same workload as
+# `examples/store_throughput.rs` in the main crate: same call, same payload, same
+# iteration count. Two different workloads produce two numbers that cannot be
+# subtracted.
+#
+# It is listed in the root manifest's `exclude`, so it is never packaged, and it
+# is built with its own `target/` (run it from this directory) so it never drags
+# a second `libsqlite3-sys` into the main crate's build.
+[package]
+name = "throughput-0-22-0"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Empty on purpose: without it cargo walks up and tries to join the io-harness
+# package as a workspace member, which fails because the root manifest excludes
+# this directory.
+[workspace]
+
+[dependencies]
+io-harness = "=0.22.0"
+# The workload writes to a file-backed store in a throwaway directory. No tokio:
+# `Store` is synchronous on both releases, and the measured loop never awaits.
+tempfile = "3"
