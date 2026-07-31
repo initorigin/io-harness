@@ -41,7 +41,7 @@ use std::sync::Mutex;
 
 use io_harness::{
     run_with_observed, Anthropic, ApproveAll, EventKind, Flow, Observer, OpenRouter, Policy,
-    Provider, RunEvent, Store, TaskContract, Verification, WebAccess,
+    Provider, RunEvent, Store, TaskContract, WebAccess,
 };
 
 /// Records the server-tool events as they arrive, so the example can say what the
@@ -127,11 +127,12 @@ async fn run<P: Provider>(provider: &P, web: WebAccess) -> io_harness::Result<()
          Say the version number and one sentence about the release, and cite where \
          you found it.",
         root,
-        // No gate: the deliverable is an answer, not a file, and the run ends when
-        // the model stops calling tools. This is also the shape a paused search
-        // turn is indistinguishable from — see `paused_turn` in src/run.rs.
-        Verification::None,
     )
+    // No gate — and none asked for, since a contract verifies nothing unless
+    // `with_verification` says otherwise. The deliverable is an answer, not a
+    // file, and the run ends when the model stops calling tools. This is also the
+    // shape a paused search turn is indistinguishable from — see `paused_turn` in
+    // src/run.rs.
     .with_max_steps(6)
     .with_web(web);
 

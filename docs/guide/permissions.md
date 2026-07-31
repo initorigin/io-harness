@@ -9,21 +9,34 @@ A `Policy` is a stack of named layers plus a per-action default. It is evaluated
 other, so a layer can add capability but can never re-allow what a layer beneath
 it denied.
 
-```rust
-use io_harness::{run_with, ApproveAll, Policy, Store, TaskContract, Verification};
+```rust,no_run
+use io_harness::{ApproveAll, OpenRouter, Policy, Session, Store};
 
+# async fn demo() -> io_harness::Result<()> {
 let policy = Policy::default() // reads open, writes/execs ask, egress denied, secrets denied
     .layer("project")
     .allow_read("*")
     .deny_read("secrets/*")
     .deny_write("secrets/*");
 
-let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
+// The boundary belongs to the turn, not to the session: every turn of the
+// conversation is a run, checked by this policy the same way a one-shot is.
+let store = Store::open("runs.db")?;
+let provider = OpenRouter::from_env()?;
+let mut session = Session::open(&store, "/path/to/repo")?;
+session
+    .turn("read the config and tell me what it sets", &provider, &store, &policy, &ApproveAll)
+    .await?;
 
 // Why was that refused? Same function the tool layer enforces with.
 let verdict = policy.explain(io_harness::Act::Write, "secrets/key.txt");
 println!("{:?} by rule {:?} in layer {:?}", verdict.effect, verdict.rule, verdict.layer);
+# Ok(()) }
 ```
+
+The one-shot form takes the same policy: `run_with(&contract, &provider, &store,
+&policy, &ApproveAll)` runs a `TaskContract` under exactly this boundary, with
+the same checks and the same trace.
 
 `Policy::check` and `Policy::explain` are literally the same function — `check`
 calls `explain` — so an explanation can never describe a boundary different from

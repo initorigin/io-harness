@@ -131,20 +131,17 @@ fn spawn_as(agent: &str, goal: &str, file: &str, needle: &str) -> ToolCall {
 #[tokio::test]
 async fn two_named_agents_put_their_own_two_models_on_the_wire() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "search, then write",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("search, then write", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "done.txt".into(),
             needle: "done".into(),
-        },
-    )
-    .with_max_steps(6)
-    .with_agents(
-        Agents::new()
-            .with(AgentDef::new("searcher").with_model("cheap-model"))
-            .with(AgentDef::new("author").with_model("strong-model")),
-    );
+        })
+        .with_max_steps(6)
+        .with_agents(
+            Agents::new()
+                .with(AgentDef::new("searcher").with_model("cheap-model"))
+                .with(AgentDef::new("author").with_model("strong-model")),
+        );
 
     let provider = MockScript::new(vec![
         vec![spawn_as("searcher", "find it", "found.txt", "found")],
@@ -193,16 +190,13 @@ async fn two_named_agents_put_their_own_two_models_on_the_wire() {
 #[tokio::test]
 async fn a_spawn_with_no_agent_named_uses_the_providers_configured_model() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "delegate once",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate once", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "ok".into(),
-        },
-    )
-    .with_max_steps(4)
-    .with_agents(Agents::new().with(AgentDef::new("unused").with_model("never-asked-for")));
+        })
+        .with_max_steps(4)
+        .with_agents(Agents::new().with(AgentDef::new("unused").with_model("never-asked-for")));
 
     let provider = MockScript::new(vec![
         vec![call(
@@ -252,16 +246,13 @@ async fn a_spawn_with_no_agent_named_uses_the_providers_configured_model() {
 async fn a_named_agents_role_is_prepended_to_its_system_prompt() {
     let dir = ws();
     const ROLE: &str = "You only read. You report paths and line numbers.";
-    let contract = TaskContract::workspace(
-        "delegate the search",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate the search", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "ok".into(),
-        },
-    )
-    .with_max_steps(4)
-    .with_agents(Agents::new().with(AgentDef::new("searcher").with_role(ROLE)));
+        })
+        .with_max_steps(4)
+        .with_agents(Agents::new().with(AgentDef::new("searcher").with_role(ROLE)));
 
     let provider = MockScript::new(vec![
         vec![spawn_as("searcher", "look", "out.txt", "ok")],
@@ -306,16 +297,13 @@ async fn a_named_agents_role_is_prepended_to_its_system_prompt() {
 #[tokio::test]
 async fn a_definition_that_denies_writes_produces_a_child_that_cannot_write() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "delegate to a reader",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate to a reader", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "never.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(4)
-    .with_agents(Agents::new().with(AgentDef::new("reader").deny_write()));
+        })
+        .with_max_steps(4)
+        .with_agents(Agents::new().with(AgentDef::new("reader").deny_write()));
 
     let provider = MockScript::new(vec![
         vec![spawn_as("reader", "try to write", "child.txt", "written")],
@@ -377,17 +365,14 @@ async fn a_definition_that_denies_writes_produces_a_child_that_cannot_write() {
 async fn a_definition_silent_about_a_denied_path_does_not_restore_it() {
     let dir = ws();
     std::fs::write(dir.path().join("secret.txt"), "classified\n").unwrap();
-    let contract = TaskContract::workspace(
-        "delegate",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "never.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(4)
-    // Says nothing at all about secret.txt.
-    .with_agents(Agents::new().with(AgentDef::new("worker").with_role("You do the work.")));
+        })
+        .with_max_steps(4)
+        // Says nothing at all about secret.txt.
+        .with_agents(Agents::new().with(AgentDef::new("worker").with_role("You do the work.")));
 
     let provider = MockScript::new(vec![
         vec![spawn_as("worker", "read the secret", "out.txt", "ok")],
@@ -431,16 +416,13 @@ async fn a_definition_silent_about_a_denied_path_does_not_restore_it() {
 #[tokio::test]
 async fn an_unknown_agent_name_yields_an_error_observation_and_no_child() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "delegate",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "never.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(3)
-    .with_agents(Agents::new().with(AgentDef::new("searcher")));
+        })
+        .with_max_steps(3)
+        .with_agents(Agents::new().with(AgentDef::new("searcher")));
 
     let provider = MockScript::new(vec![
         vec![spawn_as("Searcher", "wrong case", "out.txt", "ok")],
@@ -493,16 +475,13 @@ async fn an_unknown_agent_name_yields_an_error_observation_and_no_child() {
 #[tokio::test]
 async fn the_trace_records_which_definition_a_child_was_spawned_from() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "delegate",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "ok".into(),
-        },
-    )
-    .with_max_steps(4)
-    .with_agents(Agents::new().with(AgentDef::new("searcher")));
+        })
+        .with_max_steps(4)
+        .with_agents(Agents::new().with(AgentDef::new("searcher")));
 
     let provider = MockScript::new(vec![
         vec![spawn_as("searcher", "look for it", "out.txt", "ok")],

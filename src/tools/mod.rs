@@ -16,12 +16,13 @@ pub mod documents;
 pub mod exec;
 pub mod fs;
 pub mod git;
+pub mod shell;
 pub mod workspace;
 
 pub use custom::{Tool, ToolFuture, Toolbox};
 pub use exec::DEFAULT_EXEC_TIMEOUT;
 pub use fs::FsTool;
-pub use workspace::{Match, Workspace, Wrote};
+pub use workspace::{Entry, EntryKind, Match, Workspace, Wrote};
 
 /// The name the model uses to write a file (single-file 0.1/0.2 form: content only).
 pub const WRITE_FILE_TOOL: &str = "write_file";
@@ -47,6 +48,20 @@ pub const EXEC_TOOL: &str = "exec";
 pub const GREP_TOOL: &str = "grep";
 /// The name the model uses to list files by name/path glob.
 pub const FIND_TOOL: &str = "find";
+/// The name the model uses to list one directory, one level deep (0.24.0).
+///
+/// Beside [`FIND_TOOL`] rather than replacing it, because they answer different
+/// questions. `find` globs the entire tree and needs a name to glob for; this
+/// needs only a directory, and returns what is immediately in it with each
+/// entry's kind and each file's size. It is the first thing anyone does in an
+/// unfamiliar repository, and until 0.24.0 the only way to do it was to glob `*`
+/// and read the shape of the tree out of the paths that came back.
+///
+/// Gated as the read it is: an [`Act::Read`](crate::Act::Read) check on the
+/// directory's own path, through the same `check_path` that decides a
+/// [`READ_FILE_TOOL`] call, so a directory an operator denied reading cannot be
+/// enumerated by naming it to a different tool.
+pub const LIST_DIR_TOOL: &str = "list_dir";
 /// The name the model uses to read a file into context.
 pub const READ_FILE_TOOL: &str = "read_file";
 /// The names the model uses for git work (0.15.0).

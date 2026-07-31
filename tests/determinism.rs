@@ -60,15 +60,12 @@ fn workspace() -> tempfile::TempDir {
 }
 
 fn contract(root: &std::path::Path) -> TaskContract {
-    TaskContract::workspace(
-        "write a few files",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("write a few files", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "src/f2.rs".into(),
             needle: "fn hello2".into(),
-        },
-    )
-    .with_max_steps(4)
+        })
+        .with_max_steps(4)
 }
 
 fn open_policy() -> Policy {
@@ -405,14 +402,11 @@ async fn a_replay_still_refuses_a_request_that_was_never_recorded() {
     let dir = workspace();
     let store = Store::memory().unwrap();
     let p = Replay::load(&path).unwrap();
-    let other = TaskContract::workspace(
-        "a goal the recording never saw",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let other = TaskContract::workspace("a goal the recording never saw", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    );
+        });
     let err = run_with(&other, &p, &store, &open_policy(), &ApproveAll)
         .await
         .expect_err("an unrecorded request must refuse, not improvise");

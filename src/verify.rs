@@ -108,11 +108,11 @@ use crate::state::{PolicyEvent, SandboxEvent, Store};
 /// let contract = TaskContract::workspace(
 ///     "make `parse` reject an empty input instead of panicking",
 ///     "/path/to/repo",
-///     Verification::Command {
-///         argv: vec!["cargo".into(), "test".into()],
-///         expect_exit: 0,
-///     },
 /// )
+/// .with_verification(Verification::Command {
+///     argv: vec!["cargo".into(), "test".into()],
+///     expect_exit: 0,
+/// })
 /// .with_time_budget(Duration::from_secs(600));
 ///
 /// // A pass proves this criterion was satisfied under the harness's compile and
@@ -170,11 +170,11 @@ pub enum Verification {
     /// let contract = TaskContract::workspace(
     ///     "make the failing test in test/parse.test.js pass",
     ///     "/path/to/js-repo",
-    ///     Verification::Command {
+    /// )
+    ///     .with_verification(Verification::Command {
     ///         argv: vec!["npm".into(), "test".into()],
     ///         expect_exit: 0,
-    ///     },
-    /// );
+    ///     });
     /// # let _ = contract;
     /// ```
     ///
@@ -208,14 +208,20 @@ pub enum Verification {
     /// verified one, and a model that has nothing left to do says so by saying
     /// something.
     ///
+    /// It is also what [`TaskContract::workspace`](crate::TaskContract::workspace)
+    /// starts at, so an open-ended task is now the shape a caller falls into rather
+    /// than one they have to name; a task that does have a criterion asks for it
+    /// with
+    /// [`with_verification`](crate::TaskContract::with_verification).
+    ///
     /// ```
     /// use io_harness::{RunOutcome, TaskContract, Verification};
     ///
     /// let contract = TaskContract::workspace(
     ///     "work out why the nightly deploy has been failing and write up what you find",
     ///     "/path/to/repo",
-    ///     Verification::None,
     /// );
+    /// assert!(matches!(contract.verify, Verification::None));
     ///
     /// // What "it worked" means for a run with no criterion: it finished on its
     /// // own terms rather than hitting a ceiling. Nothing here claims the work is

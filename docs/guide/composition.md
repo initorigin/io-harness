@@ -21,8 +21,11 @@ let store = Store::memory()?;
 let contract = TaskContract::workspace(
     "Coordinate: delegate each file to a sub-agent, then combine.",
     "path/to/workspace",
-    Verification::WorkspaceFileContains { file: "summary.txt".into(), needle: "DONE".into() },
-);
+)
+   .with_verification(Verification::WorkspaceFileContains {
+       file: "summary.txt".into(),
+       needle: "DONE".into(),
+   });
 
 // Caps for the WHOLE tree — no spawned task can raise them.
 let containment = Containment::new(

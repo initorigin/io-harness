@@ -93,7 +93,7 @@ lifted as the control so the refusal is provably the policy's.
 ### Answered in this process
 
 ```rust,no_run
-use io_harness::{AnswerFuture, Question, Responder, TaskContract, Verification};
+use io_harness::{AnswerFuture, Question, Responder, TaskContract};
 use std::sync::Arc;
 
 /// Answers from what the UI already knows, and declines what it does not.
@@ -107,7 +107,7 @@ impl Responder for FromUi {
 }
 
 # fn demo(root: &str) -> io_harness::Result<()> {
-let contract = TaskContract::workspace("port the parser", root, Verification::None)
+let contract = TaskContract::workspace("port the parser", root)
     .with_responder(Arc::new(FromUi));
 # let _ = contract;
 # Ok(()) }
@@ -214,10 +214,10 @@ write with the strong one" — the largest cost lever this crate has — was
 unexpressible, and a role was something you smuggled into the goal text.
 
 ```rust,no_run
-use io_harness::{AgentDef, Agents, TaskContract, Verification};
+use io_harness::{AgentDef, Agents, TaskContract};
 
 # fn demo(root: &str) -> io_harness::Result<()> {
-let contract = TaskContract::workspace("port the tokenizer", root, Verification::None)
+let contract = TaskContract::workspace("port the tokenizer", root)
     .with_agents(
         Agents::new()
             .with(
@@ -299,7 +299,7 @@ Fix the failing test {{test}} in {{file}}. $ARGUMENTS
 ```
 
 ```rust,no_run
-use io_harness::{TaskContract, Templates, Verification};
+use io_harness::{TaskContract, Templates};
 
 # fn demo(root: &str) -> io_harness::Result<()> {
 let goal = Templates::discover("./templates")?.render("bugfix", &[
@@ -309,7 +309,7 @@ let goal = Templates::discover("./templates")?.render("bugfix", &[
 ])?;
 // "Fix the failing test parses_a_crlf_header in src/parse.rs. it only fails on CI"
 
-let contract = TaskContract::workspace(goal, root, Verification::None);
+let contract = TaskContract::workspace(goal, root);
 # let _ = contract;
 # Ok(()) }
 ```

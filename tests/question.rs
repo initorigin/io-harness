@@ -115,15 +115,12 @@ fn open_policy() -> Policy {
 /// A contract that can never pass, so the run's length is decided by the thing under
 /// test rather than by a verification that happens to succeed.
 fn never_passes(root: &std::path::Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "write the file the operator meant",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("write the file the operator meant", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(steps)
+        })
+        .with_max_steps(steps)
 }
 
 // ------------------------------------------- F3: answered here, and it matters
@@ -530,15 +527,12 @@ async fn a_childs_question_pauses_the_whole_tree_and_the_tree_resumes_on_the_ans
     let dir = ws();
     let db = dir.path().join("trace.db");
     let store = Store::open(&db).unwrap();
-    let contract = TaskContract::workspace(
-        "delegate the question",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate the question", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "child.txt".into(),
             needle: "answered".into(),
-        },
-    )
-    .with_max_steps(4);
+        })
+        .with_max_steps(4);
     let containment = Containment::new(10, 4, 3, 1_000_000);
 
     let result = run_tree(

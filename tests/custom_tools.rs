@@ -198,15 +198,12 @@ fn ws() -> tempfile::TempDir {
 /// A contract that can never be satisfied, so the loop runs its full step budget
 /// and every scripted turn is reached.
 fn never_passes(root: &std::path::Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "exercise the registered tools",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("exercise the registered tools", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(steps)
+        })
+        .with_max_steps(steps)
 }
 
 fn open_policy() -> Policy {
@@ -975,16 +972,13 @@ async fn dispatching_a_registered_tool_costs_under_a_millisecond_over_a_direct_c
 #[tokio::test]
 async fn a_contract_with_no_registered_tools_behaves_as_before() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "write the note",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("write the note", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "NOTES.md".into(),
             needle: "hello".into(),
-        },
-    )
-    .with_max_steps(2)
-    .with_constraint("keep it short");
+        })
+        .with_max_steps(2)
+        .with_constraint("keep it short");
 
     let provider = MockScript::new(vec![vec![call(
         "write_file",

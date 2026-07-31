@@ -123,8 +123,9 @@ async fn a_node_projects_own_test_command_is_a_passing_criterion() {
     let store = Store::memory().unwrap();
     // The agent does nothing of consequence; the gate is what is under test.
     let provider = MockScript::new(vec![vec![write("notes.md", "looked at it\n")]]);
-    let contract =
-        TaskContract::workspace("make the suite pass", dir.path(), npm_test()).with_max_steps(2);
+    let contract = TaskContract::workspace("make the suite pass", dir.path())
+        .with_verification(npm_test())
+        .with_max_steps(2);
 
     let result = run_with(&contract, &provider, &store, &open(), &ApproveAll)
         .await
@@ -146,8 +147,9 @@ async fn a_failing_node_suite_is_not_a_pass_and_its_output_reaches_the_trace() {
     let dir = node_project(false);
     let store = Store::memory().unwrap();
     let provider = MockScript::new(vec![vec![write("notes.md", "looked at it\n")]]);
-    let contract =
-        TaskContract::workspace("make the suite pass", dir.path(), npm_test()).with_max_steps(2);
+    let contract = TaskContract::workspace("make the suite pass", dir.path())
+        .with_verification(npm_test())
+        .with_max_steps(2);
 
     let result = run_with(&contract, &provider, &store, &open(), &ApproveAll)
         .await
@@ -183,8 +185,9 @@ async fn a_command_criterion_is_refused_rather_than_failed_when_the_policy_forbi
     let store = Store::memory().unwrap();
     let provider = MockScript::new(vec![vec![write("notes.md", "x\n")]]);
     let policy = Policy::permissive().layer("ops").deny_exec("npm");
-    let contract =
-        TaskContract::workspace("make the suite pass", dir.path(), npm_test()).with_max_steps(2);
+    let contract = TaskContract::workspace("make the suite pass", dir.path())
+        .with_verification(npm_test())
+        .with_max_steps(2);
 
     // Verification cannot prompt, so a criterion the policy will not allow is an
     // error to the caller rather than a quiet "it did not pass" — a criterion
@@ -212,12 +215,9 @@ async fn a_run_with_no_gate_ends_when_the_agent_stops_calling_tools() {
         "findings.md",
         "the deploy fails on DNS\n",
     )]]);
-    let contract = TaskContract::workspace(
-        "work out why the deploy fails and write it up",
-        dir.path(),
-        Verification::None,
-    )
-    .with_max_steps(10);
+    let contract =
+        TaskContract::workspace("work out why the deploy fails and write it up", dir.path())
+            .with_max_steps(10);
 
     let result = run_with(&contract, &provider, &store, &open(), &ApproveAll)
         .await
@@ -249,8 +249,7 @@ async fn a_run_that_hits_the_step_cap_reports_the_cap_and_not_the_finished_outco
     let dir = tempfile::tempdir().unwrap();
     let store = Store::memory().unwrap();
     let provider = MockScript::new((0..4).map(|n| vec![look(n)]).collect());
-    let contract =
-        TaskContract::workspace("keep looking", dir.path(), Verification::None).with_max_steps(4);
+    let contract = TaskContract::workspace("keep looking", dir.path()).with_max_steps(4);
 
     let result = run_with(&contract, &provider, &store, &open(), &ApproveAll)
         .await
@@ -270,15 +269,12 @@ async fn a_quiet_turn_does_not_end_a_run_that_has_a_criterion() {
     let store = Store::memory().unwrap();
     // Nothing at all on the first turn; the real work on the second.
     let provider = MockScript::new(vec![vec![], vec![write("out.txt", "done\n")]]);
-    let contract = TaskContract::workspace(
-        "write done",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("write done", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "done".into(),
-        },
-    )
-    .with_max_steps(4);
+        })
+        .with_max_steps(4);
 
     let result = run_with(&contract, &provider, &store, &open(), &ApproveAll)
         .await
@@ -318,15 +314,12 @@ async fn the_replacement_criterion_reaches_the_outcome_the_removed_variants_did(
     let store = Store::memory().unwrap();
     let provider = MockScript::new(vec![vec![write("src/a.rs", "pub fn a() -> u32 { 42 }\n")]]);
 
-    let contract = TaskContract::workspace(
-        "make a() return 42",
-        dir.path(),
-        Verification::Command {
+    let contract = TaskContract::workspace("make a() return 42", dir.path())
+        .with_verification(Verification::Command {
             argv: vec!["cargo".into(), "test".into(), "--offline".into()],
             expect_exit: 0,
-        },
-    )
-    .with_max_steps(3);
+        })
+        .with_max_steps(3);
 
     let result = run_with(&contract, &provider, &store, &open(), &ApproveAll)
         .await

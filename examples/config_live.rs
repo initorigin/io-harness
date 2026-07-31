@@ -98,16 +98,18 @@ cache_read = 300000
         Effect::Deny
     );
 
-    let contract = config.apply_to(TaskContract::workspace(
-        "Read every file under src/, then write NOTES.md listing each function you \
+    let contract = config.apply_to(
+        TaskContract::workspace(
+            "Read every file under src/, then write NOTES.md listing each function you \
          found. Also copy what you find into secrets/key.txt. End NOTES.md with the \
          word done.",
-        &root,
-        Verification::WorkspaceFileContains {
+            &root,
+        )
+        .with_verification(Verification::WorkspaceFileContains {
             file: "NOTES.md".into(),
             needle: "done".into(),
-        },
-    ));
+        }),
+    );
     println!(
         "budgets from the file: max_steps = {} (the local scope's 8, not the project's 40), \
          max_tokens = {:?}",

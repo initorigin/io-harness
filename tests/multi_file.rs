@@ -80,8 +80,8 @@ async fn agent_finds_then_edits_several_files_and_the_set_verifies() {
     let contract = TaskContract::workspace(
         "Make a() + b() equal 42 by editing the two source files.",
         dir.path(),
-        verify(),
-    );
+    )
+    .with_verification(verify());
 
     // Scripted: locate files, inspect one, then edit both correctly.
     let script = MockScript::new(vec![
@@ -127,8 +127,8 @@ async fn run_fails_when_one_of_the_edited_files_is_wrong() {
     let contract = TaskContract::workspace(
         "Make a() + b() equal 42 by editing the two source files.",
         dir.path(),
-        verify(),
     )
+    .with_verification(verify())
     .with_max_steps(4);
 
     // a is edited correctly, b is left wrong: the SET must never verify.
@@ -151,7 +151,9 @@ async fn run_fails_when_one_of_the_edited_files_is_wrong() {
 #[tokio::test]
 async fn write_outside_the_workspace_is_refused_not_crashing_the_run() {
     let dir = fixture();
-    let contract = TaskContract::workspace("noop", dir.path(), verify()).with_max_steps(1);
+    let contract = TaskContract::workspace("noop", dir.path())
+        .with_verification(verify())
+        .with_max_steps(1);
 
     // The model tries to escape the workspace root: it must be refused as an
     // observation, and the run continues (here to the step cap).

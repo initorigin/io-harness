@@ -30,11 +30,12 @@ use io_harness::{run_with, ApproveAll, Config, TaskContract, Verification};
 let config = Config::discover(&root)?;
 
 let policy = config.policy().unwrap_or_default();
-let contract = config.apply_to(TaskContract::workspace(
-    "make the suite pass",
-    &root,
-    Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
-));
+let contract = TaskContract::workspace("make the suite pass", &root)
+    .with_verification(Verification::Command {
+        argv: vec!["cargo".into(), "test".into()],
+        expect_exit: 0,
+    });
+let contract = config.apply_to(contract);
 
 let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
 ```

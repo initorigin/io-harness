@@ -14,8 +14,11 @@ use io_harness::{run_with, ApproveAll, McpServer, OpenRouter, Policy, Store,
 let contract = TaskContract::workspace(
     "summarise the repo's README into NOTES.md",
     "/path/to/repo",
-    Verification::WorkspaceFileContains { file: "NOTES.md".into(), needle: "#".into() },
 )
+.with_verification(Verification::WorkspaceFileContains {
+    file: "NOTES.md".into(),
+    needle: "#".into(),
+})
 .with_mcp([
     McpServer::stdio("files", "my-mcp-file-server"),
     McpServer::http("search", "https://mcp.example.com/mcp"),

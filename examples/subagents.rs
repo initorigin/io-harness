@@ -31,11 +31,11 @@ async fn main() -> io_harness::Result<()> {
          b.txt, verify_contains BETA). After both sub-agents finish, write \
          summary.txt containing the word DONE.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "summary.txt".into(),
-            needle: "DONE".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "summary.txt".into(),
+        needle: "DONE".into(),
+    })
     .with_max_steps(8);
 
     // Inherit-and-narrow: children get this policy and can only tighten it.

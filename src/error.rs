@@ -302,11 +302,11 @@ impl From<reqwest::Error> for Error {
 /// # async fn build_notes(repo: &str) -> Result<io_harness::RunOutcome> {
 /// let store = Store::open("runs.db")?;          // rusqlite failure -> Error::State
 /// let provider = OpenRouter::from_env()?;       // missing key   -> Error::Config
-/// let contract = TaskContract::workspace(
-///     "summarise the README into NOTES.md",
-///     repo,
-///     Verification::WorkspaceFileContains { file: "NOTES.md".into(), needle: "#".into() },
-/// );
+/// let contract = TaskContract::workspace("summarise the README into NOTES.md", repo)
+///     .with_verification(Verification::WorkspaceFileContains {
+///         file: "NOTES.md".into(),
+///         needle: "#".into(),
+///     });
 /// let policy = Policy::default().layer("app").allow_write("NOTES.md");
 /// let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?;
 /// Ok(result.outcome)

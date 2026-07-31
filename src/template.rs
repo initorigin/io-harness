@@ -161,11 +161,11 @@ pub struct Template {
 ///     ("test", "parses_a_crlf_header"),
 ///     ("file", "src/parse.rs"),
 /// ])?;
-/// let contract = TaskContract::workspace(
-///     goal,
-///     "/path/to/repo",
-///     Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
-/// );
+/// let contract = TaskContract::workspace(goal, "/path/to/repo")
+///     .with_verification(Verification::Command {
+///         argv: vec!["cargo".into(), "test".into()],
+///         expect_exit: 0,
+///     });
 /// # let _ = contract;
 /// # Ok(())
 /// # }

@@ -88,13 +88,13 @@ async fn main() -> io_harness::Result<()> {
          repository — it is a skill. Read the skill that applies before you \
          write, and follow it exactly.",
         dir.path(),
-        // The version is a shape the prompt already carries. The house-rule
-        // check after the run is what proves a body was loaded.
-        Verification::WorkspaceFileContains {
-            file: "NOTES.md".into(),
-            needle: "0.9.0".into(),
-        },
     )
+    // The version is a shape the prompt already carries. The house-rule
+    // check after the run is what proves a body was loaded.
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "NOTES.md".into(),
+        needle: "0.9.0".into(),
+    })
     .with_skills(skills.path())
     .with_max_steps(6);
 

@@ -73,11 +73,11 @@ async fn a_parent_spawns_three_children_over_a_shared_workspace() {
     let contract = TaskContract::workspace(
         "Split the work across three sub-agents, then combine.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "combined.txt".into(),
-            needle: "abc".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "combined.txt".into(),
+        needle: "abc".into(),
+    })
     .with_max_steps(6);
 
     // parent#1 spawn A -> childA writes a.txt; parent#2 spawn B -> childB; parent#3
@@ -133,14 +133,12 @@ async fn spawn_agent_composes_the_childs_result_back() {
     let dir = ws();
     // The parent's success criterion is a value it never writes itself — only a
     // child produces result.txt, so the parent can only succeed via compose-back.
-    let contract = TaskContract::workspace(
-        "Delegate producing the answer to a sub-agent.",
-        dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "result.txt".into(),
-            needle: "42".into(),
-        },
-    );
+    let contract =
+        TaskContract::workspace("Delegate producing the answer to a sub-agent.", dir.path())
+            .with_verification(Verification::WorkspaceFileContains {
+                file: "result.txt".into(),
+                needle: "42".into(),
+            });
 
     let script = MockScript::new(vec![
         vec![spawn("produce the answer", "result.txt", "42")],
@@ -177,11 +175,11 @@ async fn a_spawn_beyond_the_agent_cap_is_refused_but_the_rest_complete() {
     let contract = TaskContract::workspace(
         "Try to spawn three children under an agent cap of three.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "done.txt".into(),
-            needle: "ok".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "done.txt".into(),
+        needle: "ok".into(),
+    })
     .with_max_steps(6);
 
     let script = MockScript::new(vec![
@@ -230,11 +228,11 @@ async fn a_spawn_beyond_max_depth_is_refused_and_depth_counts_from_the_root() {
     let contract = TaskContract::workspace(
         "Nest agents until the depth cap refuses the deepest spawn.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "top.txt".into(),
-            needle: "T".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "top.txt".into(),
+        needle: "T".into(),
+    })
     .with_max_steps(4);
 
     let script = MockScript::new(vec![
@@ -283,15 +281,12 @@ async fn one_approver_serves_the_whole_tree_approve() {
     let dir = ws();
     // Default policy gates every write on approval. A sensitive write inside a
     // child must reach the root's approver; ApproveAll lets it through.
-    let contract = TaskContract::workspace(
-        "Delegate a sensitive write to a child.",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("Delegate a sensitive write to a child.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "OK".into(),
-        },
-    )
-    .with_max_steps(2);
+        })
+        .with_max_steps(2);
 
     let script = MockScript::new(vec![
         vec![spawn("write out", "out.txt", "OK")],
@@ -328,11 +323,11 @@ async fn one_approver_serves_the_whole_tree_deny() {
     let contract = TaskContract::workspace(
         "Delegate a sensitive write the approver will refuse.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "out.txt".into(),
-            needle: "OK".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "out.txt".into(),
+        needle: "OK".into(),
+    })
     .with_max_steps(2);
 
     // The child keeps trying to write; DenyAll refuses every time.
@@ -382,11 +377,11 @@ async fn sub_agents_are_opt_in_a_plain_run_never_exposes_spawn() {
     let contract = TaskContract::workspace(
         "A plain workspace run that ignores a stray spawn call.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "f.txt".into(),
-            needle: "V".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "f.txt".into(),
+        needle: "V".into(),
+    })
     .with_max_steps(3);
 
     let script = MockScript::new(vec![
@@ -486,11 +481,11 @@ async fn concurrent_fanout_to_over_100_stays_bounded_and_completes() {
     let contract = TaskContract::workspace(
         "ROOT-FANOUT: spawn a large fleet of sub-agents at once.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "never.txt".into(),
-            needle: "never".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "never.txt".into(),
+        needle: "never".into(),
+    })
     .with_max_steps(1);
 
     let probe = ConcurrencyProbe::new(fanout);
@@ -568,11 +563,11 @@ async fn the_aggregate_ceiling_halts_the_whole_tree() {
     let contract = TaskContract::workspace(
         "BUDGET-ROOT: spawn children until the tree's spend ceiling stops it.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "x.txt".into(),
-            needle: "x".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "x.txt".into(),
+        needle: "x".into(),
+    })
     .with_max_steps(2);
 
     let provider = TokenBurner {
@@ -645,11 +640,11 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
     let contract = TaskContract::workspace(
         "Delegate a sensitive write; the child will defer to a human.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "out.txt".into(),
-            needle: "OK".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "out.txt".into(),
+        needle: "OK".into(),
+    })
     .with_max_steps(3);
 
     let script = MockScript::new(vec![
@@ -693,9 +688,7 @@ async fn a_child_defer_persists_and_resumes_via_resume_with_decision() {
 
     // A human approves; resume_with_decision performs the pending write and
     // finishes the child — the 0.4.0 resume path, reused unchanged.
-    let child_contract = TaskContract::workspace(
-        "write out",
-        dir.path(),
+    let child_contract = TaskContract::workspace("write out", dir.path()).with_verification(
         Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "OK".into(),
@@ -749,15 +742,12 @@ async fn a_tree_halts_on_its_duration_ceiling_instead_of_ignoring_it() {
     let mut containment = Containment::new(10, 1, 3, 1_000_000);
     containment.max_total_duration = Some(std::time::Duration::from_millis(200));
 
-    let contract = TaskContract::workspace(
-        "Run until something stops you.",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("Run until something stops you.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "never.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(20);
+        })
+        .with_max_steps(20);
 
     let provider = Slow {
         per_call: std::time::Duration::from_millis(400),
@@ -794,15 +784,12 @@ async fn a_tree_with_no_duration_ceiling_is_unaffected() {
     let containment = Containment::new(10, 1, 3, 1_000_000);
     assert!(containment.max_total_duration.is_none());
 
-    let contract = TaskContract::workspace(
-        "Run until something stops you.",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("Run until something stops you.", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "never.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(3);
+        })
+        .with_max_steps(3);
 
     let provider = Slow {
         per_call: std::time::Duration::from_millis(50),
@@ -890,11 +877,11 @@ async fn children_are_composed_in_spawn_order_not_completion_order() {
     let contract = TaskContract::workspace(
         "ORDER-ROOT: spawn several children that finish out of order.",
         dir.path(),
-        Verification::WorkspaceFileContains {
-            file: "never.txt".into(),
-            needle: "never".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "never.txt".into(),
+        needle: "never".into(),
+    })
     .with_max_steps(1);
 
     let store = Store::memory().unwrap();
@@ -962,15 +949,12 @@ async fn children_are_composed_in_spawn_order_not_completion_order() {
 async fn each_agent_keeps_its_own_durable_ledger_under_its_own_run_id() {
     let dir = ws();
     std::fs::write(dir.path().join("seed.txt"), "SEED-CONTENT").unwrap();
-    let contract = TaskContract::workspace(
-        "delegate a read and a write",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate a read and a write", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "OK".into(),
-        },
-    )
-    .with_max_steps(3);
+        })
+        .with_max_steps(3);
 
     let script = MockScript::new(vec![
         vec![call(

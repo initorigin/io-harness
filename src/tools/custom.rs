@@ -180,11 +180,11 @@ pub trait Tool: Send + Sync {
 /// let tools = Toolbox::new().with(Now).with(OpenTicket);
 /// assert_eq!(tools.names(), vec!["now", "open_ticket"]);
 ///
-/// let contract = TaskContract::workspace(
-///     "triage the failing build",
-///     "/path/to/repo",
-///     Verification::WorkspaceFileContains { file: "TRIAGE.md".into(), needle: "#".into() },
-/// )
+/// let contract = TaskContract::workspace("triage the failing build", "/path/to/repo")
+/// .with_verification(Verification::WorkspaceFileContains {
+///     file: "TRIAGE.md".into(),
+///     needle: "#".into(),
+/// })
 /// .with_tools(tools);
 /// # let _ = contract;
 /// ```
@@ -354,6 +354,7 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::EXEC_TOOL,
     super::GREP_TOOL,
     super::FIND_TOOL,
+    super::LIST_DIR_TOOL,
     super::READ_FILE_TOOL,
     super::READ_SKILL_TOOL,
     super::REMEMBER_TOOL,

@@ -11,9 +11,12 @@ use io_harness::{run_with, ApproveAll, OpenRouter, Policy, Store, TaskContract, 
 let contract = TaskContract::workspace(
     "the test suite is failing; find out why and fix it",
     "/path/to/repo",
-    // The gate is the project's own command, in whatever language it is written.
-    Verification::Command { argv: vec!["npm".into(), "test".into()], expect_exit: 0 },
-);
+)
+// The gate is the project's own command, in whatever language it is written.
+.with_verification(Verification::Command {
+    argv: vec!["npm".into(), "test".into()],
+    expect_exit: 0,
+});
 
 // What the agent may run, decided before it runs anything.
 let policy = Policy::permissive()

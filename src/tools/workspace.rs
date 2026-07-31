@@ -1,5 +1,5 @@
-//! Workspace-scoped tools: grep, find, read_file, write_file — all confined to
-//! one root directory.
+//! Workspace-scoped tools: grep, find, list_dir, read_file, write_file — all
+//! confined to one root directory.
 //!
 //! 0.1/0.2 scoped the agent to exactly one file. 0.3 gives it a repository: it
 //! greps and finds to locate what to change, reads what it found, and writes
@@ -7,6 +7,7 @@
 //! and refused if it escapes — an absolute path or a `..` climbing above the
 //! root is an error, so the agent cannot touch files outside the workspace.
 
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use regex::Regex;
@@ -78,6 +79,68 @@ pub struct Match {
     pub line: u32,
     /// The matching line's text.
     pub text: String,
+}
+
+/// What one entry of a directory listing is (0.24.0).
+///
+/// The distinction a listing exists to draw. A name on its own does not tell the
+/// agent whether the next call is [`Workspace::read_file`] or another
+/// [`Workspace::list_dir`], and a tree is walked by making exactly that decision
+/// at every level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    /// A regular file, which is the only kind that carries a size.
+    File,
+    /// A directory. Named, never descended into — see [`Workspace::list_dir`].
+    Dir,
+    /// A symbolic link, reported as the link itself rather than as whatever it
+    /// points at.
+    ///
+    /// A listing that silently followed links would report a directory outside
+    /// the workspace as if it were inside one, and would hang on a link that
+    /// pointed at itself. What the link resolves to is decided where it matters —
+    /// at the [`Act::Read`] check on the path — and not here.
+    Symlink,
+}
+
+/// One entry of a directory listing: where it is, what it is, and how big it is
+/// (0.24.0).
+///
+/// The path is relative to the workspace root and `/`-separated, exactly as
+/// [`Workspace::find`] reports one, so what a listing returns can be handed
+/// straight back to a read without the model having to join anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    /// Path relative to the workspace root, `/`-separated.
+    pub path: String,
+    /// Whether this is a file, a directory or a link.
+    pub kind: EntryKind,
+    /// Size in bytes, for a [`EntryKind::File`] whose metadata could be read.
+    ///
+    /// `None` for a directory and a link, where the number would be a property
+    /// of the entry rather than of anything the agent could read, and for a file
+    /// whose metadata the platform refused — a size that could not be measured is
+    /// absent rather than reported as zero.
+    pub size: Option<u64>,
+}
+
+/// The one line the model reads for this entry.
+///
+/// The kind comes first and in a fixed width so a listing is a column a reader
+/// scans rather than a sentence they parse, and the size is stated in bytes with
+/// no unit-scaling: `1.2 KB` is a judgement about what matters, and the model is
+/// better at that judgement than a formatter is.
+impl fmt::Display for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            EntryKind::Dir => write!(f, "dir  {}/", self.path),
+            EntryKind::Symlink => write!(f, "link {}", self.path),
+            EntryKind::File => match self.size {
+                Some(n) => write!(f, "file {} ({n} bytes)", self.path),
+                None => write!(f, "file {}", self.path),
+            },
+        }
+    }
 }
 
 impl Workspace {
@@ -235,6 +298,116 @@ impl Workspace {
                     && self.check_path(Act::Read, file).effect != Effect::Deny
             })
             .collect())
+    }
+
+    /// List the immediate contents of one directory under the root, one level
+    /// deep and no deeper (0.24.0).
+    ///
+    /// [`Workspace::find`] globs the whole tree, which answers "where is the
+    /// thing I can already name". This answers the question that comes before it
+    /// and that the crate had no way to ask: *what is in here*. It is the first
+    /// move in an unfamiliar repository, and an agent that could only glob had to
+    /// guess a name to make it.
+    ///
+    /// One level is the whole point rather than a limitation to work around. A
+    /// directory is reported as a directory and not descended into, so the cost
+    /// of looking is proportional to the directory and not to the tree beneath
+    /// it, and the agent decides which branch is worth another call. Recursion is
+    /// spelled by calling this again.
+    ///
+    /// The bounds it shares with the rest of the layer:
+    ///
+    /// * The directory itself is an [`Act::Read`] on its path, refused through
+    ///   the same [`Workspace::check_path`] that refuses a `read_file` — a
+    ///   listing of a denied directory is a cheaper way to learn what is in it,
+    ///   not a different act.
+    /// * An entry whose own path is denied is left out entirely, exactly as
+    ///   [`Workspace::grep`] and [`Workspace::find`] leave one out: a name the
+    ///   policy will not let the agent read is a name it does not get told.
+    /// * A path that escapes the root is refused by [`Workspace::resolve`]
+    ///   before anything is opened.
+    ///
+    /// Sorted by path, so two runs over an unchanged directory produce the same
+    /// listing — the filesystem's own order is arbitrary and platform-dependent,
+    /// and a tool whose output reorders between runs makes two traces
+    /// incomparable for no gain.
+    ///
+    /// Unlike `grep` and `find`, nothing here is hidden by
+    /// [`IGNORE_DIRS`]: `target/` and `.git/` are not searched, but they *are*
+    /// in the directory, and a listing that omitted them would be answering a
+    /// different question than the one asked.
+    ///
+    /// The whole listing is returned. Bounding what the *model* is shown is the
+    /// run loop's job, done there for every tool at once against the turn's
+    /// context budget, so an embedding program calling this directly gets the
+    /// directory rather than a truncated view of it.
+    ///
+    /// ```
+    /// use io_harness::tools::Workspace;
+    /// use io_harness::tools::workspace::EntryKind;
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// std::fs::create_dir_all(dir.path().join("src/deep"))?;
+    /// std::fs::write(dir.path().join("src/deep/buried.rs"), "fn f() {}\n")?;
+    /// let ws = Workspace::new(dir.path());
+    ///
+    /// // One level: the subdirectory is named, what is inside it is not.
+    /// let entries = ws.list_dir("src")?;
+    /// assert_eq!(entries.len(), 1);
+    /// assert_eq!(entries[0].path, "src/deep");
+    /// assert_eq!(entries[0].kind, EntryKind::Dir);
+    ///
+    /// // And the level below is one more call away.
+    /// assert_eq!(ws.list_dir("src/deep")?[0].path, "src/deep/buried.rs");
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn list_dir(&self, rel: &str) -> Result<Vec<Entry>> {
+        let abs = self.resolve(rel)?;
+        self.enforce(Act::Read, rel)?;
+        // Every failure names the path. `read_dir` on a file reports "Not a
+        // directory (os error 20)" and on a missing one "No such file or
+        // directory", and neither says *which* — the model reads this text and
+        // nothing else, and cannot correct a mistake it cannot locate.
+        let read = std::fs::read_dir(&abs)
+            .map_err(|e| Error::Config(format!("cannot list {rel}: {e}")))?;
+        let mut out = Vec::new();
+        for entry in read.flatten() {
+            // An entry whose type or path cannot be read is skipped rather than
+            // failing the listing: one unreadable name in a directory is not a
+            // reason to tell the agent nothing about the other ninety-nine.
+            let Ok(ft) = entry.file_type() else { continue };
+            let Ok(path) = entry
+                .path()
+                .strip_prefix(&self.root)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+            else {
+                continue;
+            };
+            if self.check_path(Act::Read, &path).effect == Effect::Deny {
+                continue;
+            }
+            // Order matters: a symlink to a directory answers true to `is_dir`
+            // only after being followed, and `DirEntry::file_type` does not
+            // follow, so the link test has to come first to stay honest.
+            let kind = if ft.is_symlink() {
+                EntryKind::Symlink
+            } else if ft.is_dir() {
+                EntryKind::Dir
+            } else {
+                EntryKind::File
+            };
+            let size = match kind {
+                // `DirEntry::metadata` does not traverse links either, so this is
+                // the file's own size in every case.
+                EntryKind::File => entry.metadata().ok().map(|m| m.len()),
+                EntryKind::Dir | EntryKind::Symlink => None,
+            };
+            out.push(Entry { path, kind, size });
+        }
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
     }
 
     /// Read a file under the root. A missing file reads as empty, so the agent

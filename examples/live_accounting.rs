@@ -37,11 +37,11 @@ async fn main() -> io_harness::Result<()> {
         "Read every file under src/, then write NOTES.md listing each function you \
          found and the value it returns. End the file with the word done.",
         &root,
-        Verification::WorkspaceFileContains {
-            file: "NOTES.md".into(),
-            needle: "done".into(),
-        },
     )
+    .with_verification(Verification::WorkspaceFileContains {
+        file: "NOTES.md".into(),
+        needle: "done".into(),
+    })
     .with_max_steps(10)
     .with_token_budget(200_000);
 

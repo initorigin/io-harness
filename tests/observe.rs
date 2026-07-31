@@ -180,19 +180,16 @@ fn open_policy() -> Policy {
 /// run. Retries wait no time at all: this suite asserts *that* a retry happened,
 /// and `src/resilience.rs` unit-tests how long one waits.
 fn never_passes(root: &Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "exercise the observer",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("exercise the observer", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(steps)
-    .with_retry_policy(RetryPolicy {
-        base: std::time::Duration::ZERO,
-        max: std::time::Duration::ZERO,
-    })
+        })
+        .with_max_steps(steps)
+        .with_retry_policy(RetryPolicy {
+            base: std::time::Duration::ZERO,
+            max: std::time::Duration::ZERO,
+        })
 }
 
 /// One committed step or one retry, as the *trace* records it.
@@ -683,9 +680,7 @@ async fn an_observer_can_cancel_a_run_which_then_stays_resumable() {
 #[tokio::test]
 async fn a_sub_agents_events_carry_its_own_run_id_and_depth() {
     let dir = ws();
-    let contract = TaskContract::workspace(
-        "delegate the answer",
-        dir.path(),
+    let contract = TaskContract::workspace("delegate the answer", dir.path()).with_verification(
         Verification::WorkspaceFileContains {
             file: "result.txt".into(),
             needle: "42".into(),
@@ -775,15 +770,12 @@ async fn a_sub_agents_events_carry_its_own_run_id_and_depth() {
 async fn a_step_left_uncommitted_for_replay_is_not_announced_as_a_step() {
     let dir = ws();
     // `Policy::default` makes the child's write a sensitive (Ask) action.
-    let contract = TaskContract::workspace(
-        "delegate a sensitive write",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("delegate a sensitive write", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "out.txt".into(),
             needle: "OK".into(),
-        },
-    )
-    .with_max_steps(3);
+        })
+        .with_max_steps(3);
     let provider = Mock::new(vec![
         Turn::Calls(vec![call(
             "spawn_agent",
@@ -1172,12 +1164,9 @@ async fn a_memory_write_is_announced_under_the_key_the_trace_row_names() {
 async fn the_verify_gates_sandbox_is_announced_as_sandbox_events_records_it() {
     let dir = ws();
     std::fs::write(dir.path().join("a.rs"), "pub fn a() {}\n").unwrap();
-    let contract = TaskContract::workspace(
-        "compile a.rs",
-        dir.path(),
-        Verification::EachCompilesRust(vec!["a.rs".into()]),
-    )
-    .with_max_steps(1);
+    let contract = TaskContract::workspace("compile a.rs", dir.path())
+        .with_verification(Verification::EachCompilesRust(vec!["a.rs".into()]))
+        .with_max_steps(1);
     let provider = Mock::new(vec![Turn::Calls(vec![call(
         "read_file",
         json!({ "path": "a.rs" }),
@@ -1331,15 +1320,12 @@ async fn a_denied_network_host_is_announced_with_what_the_row_records() {
         .allow_write("*")
         .deny_net("127.0.0.1");
 
-    let contract = TaskContract::workspace(
-        "reach a denied host",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("reach a denied host", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "never.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(1);
+        })
+        .with_max_steps(1);
 
     let err =
         io_harness::run_with_observed(&contract, &Dialer, &store, &policy, &ApproveAll, &watcher)

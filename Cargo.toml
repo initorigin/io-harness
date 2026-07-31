@@ -139,6 +139,46 @@ rmcp = { version = "3.0.0", default-features = false, features = [
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# The Windows Job Object backend (0.24.0), and the only new dependency in this
+# release. Target-gated for the same reason `libc` above is: a macOS or Linux
+# build must not resolve it at all, so `cargo tree` on those hosts does not name
+# it and no unix consumer pays a line for a crate it cannot call. This is the
+# same discipline the optional document features keep — the difference is that a
+# `cfg(windows)` gate is enforced by cargo rather than by a feature flag someone
+# has to remember not to set.
+#
+# 0.61 is the version already in the lock file as a transitive dependency of
+# tokio/mio and reqwest's TLS stack on Windows, so asking for it by name adds a
+# dependency *edge*, not a dependency: the Windows graph compiles exactly one
+# `windows-sys`, with the union of everyone's features.
+#
+# Five features and no umbrella, because windows-sys generates one module per
+# feature and every one asked for is bindings compiled on the Windows runner:
+#
+# - `Win32_System_JobObjects` — the job itself: CreateJobObjectW,
+#   SetInformationJobObject, AssignProcessToJobObject, QueryInformationJobObject.
+# - `Win32_Foundation` — HANDLE, INVALID_HANDLE_VALUE and CloseHandle. Closing
+#   the job handle is what kills the tree, so this one is load-bearing.
+# - `Win32_Security` — not used for security here at all: CreateJobObjectW takes
+#   a `*const SECURITY_ATTRIBUTES` and windows-sys gates the *symbol* behind the
+#   feature that defines that type. We pass null. The feature buys the
+#   declaration, nothing else.
+# - `Win32_System_Threading` — CREATE_SUSPENDED, OpenThread and ResumeThread,
+#   which are how the child is held still until it is inside the job; also
+#   IO_COUNTERS, a member of JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+# - `Win32_System_Diagnostics_ToolHelp` — the thread snapshot used to find the
+#   suspended child's initial thread. std closes the thread handle
+#   `CreateProcess` returned before it hands back a `Child`, so the snapshot is
+#   the only documented route back to it. See `src/sandbox/windows.rs`.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 hyper = { version = "1.11.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "service", "server"] }

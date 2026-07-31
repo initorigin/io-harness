@@ -49,8 +49,11 @@ impl Tool for LookupOrder {
 let contract = TaskContract::workspace(
     "Write the status of order 4471 into REPORT.md.",
     "/path/to/repo",
-    Verification::WorkspaceFileContains { file: "REPORT.md".into(), needle: "4471".into() },
 )
+.with_verification(Verification::WorkspaceFileContains {
+    file: "REPORT.md".into(),
+    needle: "4471".into(),
+})
 .with_tools(Toolbox::new().with(LookupOrder { db }));
 
 let policy = Policy::default()
@@ -110,11 +113,8 @@ skills/
 ```
 
 ```rust
-let contract = TaskContract::workspace(
-    "Add the `orders` table migration.",
-    "/path/to/repo",
-    Verification::EachCompilesRust(vec!["migrations/003_orders.rs".into()]),
-)
+let contract = TaskContract::workspace("Add the `orders` table migration.", "/path/to/repo")
+.with_verification(Verification::EachCompilesRust(vec!["migrations/003_orders.rs".into()]))
 .with_skills("skills");   // discovered once per run, not once per step
 ```
 

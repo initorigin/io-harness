@@ -249,15 +249,12 @@ async fn a_caller_reads_the_summary_off_its_own_run_result() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let store = Store::memory().expect("memory");
-    let contract = TaskContract::workspace(
-        "write a hello function",
-        dir.path(),
-        Verification::WorkspaceFileContains {
+    let contract = TaskContract::workspace("write a hello function", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
             file: "a.rs".into(),
             needle: "fn hello".into(),
-        },
-    )
-    .with_max_steps(2);
+        })
+        .with_max_steps(2);
     let policy = Policy::default()
         .layer("test")
         .allow_read("*")

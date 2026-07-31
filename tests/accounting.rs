@@ -131,21 +131,18 @@ impl Provider for Mock {
 
 /// A workspace whose gate is satisfied by writing `NOTES.md`.
 fn contract(root: &std::path::Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "write the notes",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("write the notes", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "NOTES.md".into(),
             needle: "done".into(),
-        },
-    )
-    .with_max_steps(steps)
-    // No wait between attempts: this suite is about what is recorded, not about
-    // backoff, which `resilience` covers.
-    .with_retry_policy(RetryPolicy {
-        base: Duration::ZERO,
-        max: Duration::ZERO,
-    })
+        })
+        .with_max_steps(steps)
+        // No wait between attempts: this suite is about what is recorded, not about
+        // backoff, which `resilience` covers.
+        .with_retry_policy(RetryPolicy {
+            base: Duration::ZERO,
+            max: Duration::ZERO,
+        })
 }
 
 fn open() -> Policy {
@@ -671,10 +668,9 @@ fn searching_prices(per_request: u64) -> PriceTable {
 /// shape a real search turn has.
 async fn a_searching_run(store: &Store, requests: u64) -> i64 {
     let dir = tempfile::tempdir().unwrap();
-    let contract =
-        TaskContract::workspace("what shipped this week", dir.path(), Verification::None)
-            .with_max_steps(4)
-            .with_web(WebAccess::search().max_uses(3));
+    let contract = TaskContract::workspace("what shipped this week", dir.path())
+        .with_max_steps(4)
+        .with_web(WebAccess::search().max_uses(3));
     let provider = Searching::new(vec![
         searched(requests, "pause_turn"),
         searched(requests, "end_turn"),
@@ -786,7 +782,6 @@ async fn the_web_tables_carry_no_credential_and_no_prompt_derived_query() {
     let contract = TaskContract::workspace(
         format!("find out {QUERY}, authenticating with {KEY}"),
         dir.path(),
-        Verification::None,
     )
     .with_max_steps(2)
     .with_web(WebAccess::search());

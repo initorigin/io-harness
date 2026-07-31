@@ -96,15 +96,12 @@ fn ws() -> tempfile::TempDir {
 /// A contract that can never be satisfied, so the loop runs its whole step budget
 /// and every scripted turn is reached.
 fn never_passes(root: &Path, steps: u32) -> TaskContract {
-    TaskContract::workspace(
-        "exercise the context assembler",
-        root,
-        Verification::WorkspaceFileContains {
+    TaskContract::workspace("exercise the context assembler", root)
+        .with_verification(Verification::WorkspaceFileContains {
             file: "unreachable.txt".into(),
             needle: "never".into(),
-        },
-    )
-    .with_max_steps(steps)
+        })
+        .with_max_steps(steps)
 }
 
 fn open_policy() -> Policy {

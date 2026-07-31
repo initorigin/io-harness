@@ -26,10 +26,13 @@
 //!     let contract = TaskContract::workspace(
 //!         "the test suite is failing; find out why and fix it",
 //!         "/path/to/repo",
-//!         // The project's own command decides whether the work is done. Nothing
-//!         // on this path is Rust-aware.
-//!         Verification::Command { argv: vec!["npm".into(), "test".into()], expect_exit: 0 },
-//!     );
+//!     )
+//!     // The project's own command decides whether the work is done. Nothing
+//!     // on this path is Rust-aware.
+//!     .with_verification(Verification::Command {
+//!         argv: vec!["npm".into(), "test".into()],
+//!         expect_exit: 0,
+//!     });
 //!
 //!     // src/ is writable, secrets/ is refused outright and never reaches a human,
 //!     // and the agent may run the test runner but nothing that publishes.
@@ -156,12 +159,11 @@
 //! the connection.
 //!
 //! ```
-//! use io_harness::{TaskContract, Verification, WebAccess};
+//! use io_harness::{TaskContract, WebAccess};
 //!
 //! let contract = TaskContract::workspace(
 //!     "update the install line to the current release",
 //!     "/path/to/repo",
-//!     Verification::None,
 //! )
 //! .with_web(WebAccess::search().max_uses(3).allow("crates.io"));
 //!

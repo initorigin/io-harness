@@ -8,11 +8,11 @@
 //! teardown so nothing the run wrote or spawned outlives it.
 //!
 //! The sandbox is both **OS-native** and **OS-neutral**. One trait,
-//! [`Sandbox`], has a native backend per platform — macOS `sandbox-exec` and
-//! Linux namespaces; Windows is still the floor (its Job Object is
-//! unimplemented) — over a [portable floor](FloorSandbox) (fresh subprocess,
-//! ephemeral tempdir, resource caps, network env stripped) that compiles and runs
-//! on all three, so isolation is never *absent* on any OS the crate builds for.
+//! [`Sandbox`], has a native backend per platform — macOS `sandbox-exec`, Linux
+//! namespaces, Windows Job Object — over a [portable floor](FloorSandbox) (fresh
+//! subprocess, ephemeral tempdir, resource caps, network env stripped) that
+//! compiles and runs on all three, so isolation is never *absent* on any OS the
+//! crate builds for.
 //! [`select`] picks the strongest backend this host can actually deliver — the
 //! candidate by cfg, degraded to the floor if its primitive turns out to be
 //! unavailable — and the one that ran is recorded.
@@ -83,9 +83,10 @@ pub enum Backend {
     /// seccomp filter; only the kernel's own defaults for an unprivileged user
     /// namespace apply on top.
     LinuxNamespaces,
-    /// Windows Job Object + restricted token. **Reserved, never reported** —
-    /// the Job Object is not implemented, so Windows runs report
-    /// [`Backend::PortableFloor`]. Kept so the variant is here when it is.
+    /// Windows Job Object: memory, CPU and active-process limits, and a
+    /// tree kill on close. A **resource** boundary and nothing else — a Job
+    /// Object has no filesystem facility and no network facility, so a run
+    /// reporting this is resource-contained, not jailed. See [`windows`].
     WindowsJobObject,
     /// The portable floor: subprocess + ephemeral workdir + caps + env strip.
     PortableFloor,
@@ -117,8 +118,9 @@ impl Backend {
 /// fn why(outcome: &SandboxOutcome) -> String {
 ///     match outcome.cap_hit {
 ///         Some(Cap::Wall) => "hung: outlived max_wall_secs".into(),
-///         Some(Cap::Cpu) => "spun: burned max_cpu_secs of CPU and took SIGXCPU".into(),
-///         Some(Cap::Memory) => "grew past max_memory_bytes and the RSS monitor killed it".into(),
+///         Some(Cap::Cpu) => "spun: burned max_cpu_secs of CPU".into(),
+///         Some(Cap::Memory) => "grew past max_memory_bytes".into(),
+///         Some(Cap::Processes) => "forked past max_processes".into(),
 ///         // No cap fired, so the exit code is the whole story.
 ///         None => format!("exited {:?}", outcome.exit_code),
 ///     }
@@ -130,12 +132,24 @@ impl Backend {
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Cap {
-    /// CPU time (`RLIMIT_CPU` on unix; the process took SIGXCPU).
+    /// CPU time. `RLIMIT_CPU` on unix (the process took SIGXCPU); the Job
+    /// Object's per-job user-time limit on Windows (the job terminated it).
     Cpu,
-    /// Resident memory (an RSS monitor killed it).
+    /// Memory. An RSS monitor killed it on unix; on Windows the job refused the
+    /// commit that would have crossed the limit and the process died of that.
     Memory,
     /// Wall-clock time (the run outlived `max_wall_secs`).
     Wall,
+    /// The active-process limit. **Windows only** — the Job Object's
+    /// `ActiveProcessLimit` is the one mechanism this crate has that bounds the
+    /// process count *per sandbox*; unix `RLIMIT_NPROC` is per-real-uid and is
+    /// deliberately not used. See [`SandboxLimits::max_processes`].
+    ///
+    /// Unlike the other three this one is not a kill: the job denies the
+    /// `CreateProcess` that would have crossed the limit, and the run fails
+    /// because its own spawn failed. The distinction matters to anyone reading
+    /// the trace — the payload was *stopped*, not shot.
+    Processes,
 }
 
 impl Cap {
@@ -145,6 +159,7 @@ impl Cap {
             Cap::Cpu => "cpu",
             Cap::Memory => "memory",
             Cap::Wall => "wall",
+            Cap::Processes => "processes",
         }
     }
 }
@@ -174,48 +189,63 @@ impl Cap {
 ///         max_wall_secs: Some(30),
 ///         max_memory_bytes: Some(256 * 1024 * 1024),
 ///         max_open_files: Some(64),
-///         // Left as-is: no backend enforces it yet, so setting it would
-///         // buy a false sense of a process-count bound.
+///         // Set, but read the field docs before relying on it: only the
+///         // Windows Job Object enforces a process count, so on a unix host
+///         // this line still buys nothing.
+///         max_processes: Some(16),
 ///         ..SandboxLimits::default()
 ///     },
 ///     ..SandboxConfig::new()
 /// };
 ///
-/// // Only the wall cap is enforced on every platform. On Windows it is the
-/// // *only* one, so leaving it `None` there means the run is bounded by
-/// // nothing at all.
+/// // Only the wall cap is enforced on every platform under every backend, so
+/// // it is the one that must never be left `None` — it is what bounds a run
+/// // whose backend degraded to the floor.
 /// assert!(config.limits.max_wall_secs.is_some());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SandboxLimits {
-    /// Max CPU seconds before SIGXCPU. `None` = no CPU cap. **Unix only** —
-    /// `RLIMIT_CPU` has no Windows equivalent, so this is not applied there and
-    /// [`Cap::Cpu`] is never reported.
+    /// Max CPU seconds before the run is killed. `None` = no CPU cap.
+    ///
+    /// Two different mechanisms, both real: `RLIMIT_CPU` and SIGXCPU on unix,
+    /// which counts user *and* system time; the Job Object's per-job time limit
+    /// on Windows, which counts **user-mode time only** and terminates every
+    /// process in the job at once. A payload that burns its seconds inside the
+    /// kernel is therefore capped on unix and not on Windows — the Win32 API
+    /// offers no per-job kernel-time limit to set, so this is the ceiling of the
+    /// mechanism rather than a choice.
     pub max_cpu_secs: Option<u64>,
     /// Max wall-clock seconds before the run is killed. `None` = no wall cap.
-    /// The one cap enforced on **every** platform, and on Windows the only one —
-    /// leaving it `None` there means the run is bounded by nothing.
+    /// The one cap enforced on **every** platform under **every** backend, and
+    /// the only one the portable floor applies on Windows — leaving it `None`
+    /// under the floor there means the run is bounded by nothing.
     pub max_wall_secs: Option<u64>,
-    /// Max resident bytes before the RSS monitor kills the run. `None` = no cap.
-    /// **Unix only** — the monitor reads the process table with `ps`, which does
-    /// not exist on Windows, so this is not applied there and [`Cap::Memory`] is
-    /// never reported.
+    /// Max memory before the run is stopped. `None` = no cap.
+    ///
+    /// Two mechanisms again, and they differ in more than implementation. On
+    /// unix an RSS monitor polls the process tree and kills it after the fact,
+    /// so a payload can briefly exceed the cap before it dies. On Windows the
+    /// Job Object's per-process commit limit is enforced *by the allocator*: the
+    /// commit that would cross the line simply fails, the payload never holds
+    /// more than this many bytes, and it usually dies of the allocation failure
+    /// rather than of a kill. Either way the outcome reports [`Cap::Memory`].
     pub max_memory_bytes: Option<u64>,
-    /// Max concurrent processes in the sandbox. **Enforced by no backend
-    /// today, on any platform** — setting it changes nothing.
+    /// Max concurrent processes in the sandbox. **Enforced on Windows only**,
+    /// by the Job Object's `ActiveProcessLimit` — see [`windows`]. On every
+    /// other platform setting it still changes nothing.
     ///
     /// The portable floor and the unix native backends deliberately do not map
     /// it to `RLIMIT_NPROC`: that limit is per-real-uid, not per-sandbox, so
     /// capping it there would throttle the operator's whole login session
-    /// rather than the sandboxed run. The two mechanisms that *can* scope it —
-    /// the Linux pid namespace's process limit and the Windows Job Object's
-    /// active-process limit — are not wired up (the Job Object is not
-    /// implemented at all; see [`windows`]).
+    /// rather than the sandboxed run. Windows is the first platform where the
+    /// crate has a mechanism that scopes the count to *this run* and nothing
+    /// else. The other one that could — the Linux pid namespace's process limit
+    /// — is still not wired up.
     ///
-    /// The field is kept because it is the shape the native implementations
-    /// will use, and because removing it would break every serialized config
-    /// carrying it. Treat it as reserved, not as a bound you have. `None` = no
-    /// cap, which is also what any other value means right now.
+    /// So this is the one limit whose meaning is genuinely OS-dependent, and it
+    /// is stated rather than smoothed over: a config that relies on it for
+    /// containment is relying on running on Windows. `None` = no cap, and on a
+    /// non-Windows host any other value means the same thing.
     pub max_processes: Option<u64>,
     /// Max open file descriptors (`RLIMIT_NOFILE`, unix). `None` = no cap.
     pub max_open_files: Option<u64>,
@@ -548,23 +578,51 @@ impl Sandbox for FloorSandbox {
 ///
 /// Caps:
 /// - **CPU** via `RLIMIT_CPU` (unix `pre_exec`) → SIGXCPU → [`Cap::Cpu`]. *Unix
-///   only* — Windows has no equivalent and applies no CPU cap.
+///   only here* — on Windows the CPU cap is the Job Object's per-job time limit,
+///   applied by [`windows`], not by this function.
 /// - **Memory** via an RSS poll-and-kill monitor → [`Cap::Memory`] (macOS does
 ///   not enforce address-space rlimits, so a monitor is the portable mechanism).
-///   *Unix only* — the monitor reads the process table with `ps`, which does not
-///   exist on Windows, so no memory cap is applied there.
+///   *Unix only here* — the monitor reads the process table with `ps`, which does
+///   not exist on Windows; the Windows memory bound is the job's commit limit.
 /// - **Wall** via a tokio timeout → [`Cap::Wall`]. The one cap that applies on
-///   **every** platform, and therefore the only thing standing between a Windows
-///   run and running forever.
+///   **every** platform and under **every** backend, and therefore the backstop
+///   that fires when nothing else can.
 ///
 /// A cap the platform cannot apply is never *claimed*: [`SandboxOutcome::cap_hit`]
-/// only ever names a cap that really fired, and a run on a platform missing the
-/// CPU/memory mechanisms warns once rather than letting a caller believe the
+/// only ever names a cap that really fired, and a run whose backend has no
+/// CPU/memory mechanism warns once rather than letting a caller believe the
 /// limits it configured are in force.
 async fn run_capped(
     backend: Backend,
     spec: RunSpec<'_>,
     configure: impl FnOnce(&mut tokio::process::Command),
+) -> Result<SandboxOutcome> {
+    run_capped_hooked(backend, spec, configure, |_child| Ok(())).await
+}
+
+/// [`run_capped`] plus a second hook, `started`, which runs on the *spawned*
+/// child before anything else touches it.
+///
+/// The two hooks exist because two genuinely different moments matter, and only
+/// one of them is expressible as "mutate the `Command`". `configure` shapes the
+/// command; `started` acts on the process that command produced. The Windows Job
+/// Object needs the second: a process can only be assigned to a job once it
+/// exists, and it must be assigned *before it executes a single instruction*, or
+/// it can spawn a descendant that never joins the job and outlives the run. The
+/// backend closes that window by spawning `CREATE_SUSPENDED` in `configure` and
+/// doing the assignment-then-resume here, where the child is alive and still
+/// frozen.
+///
+/// A `started` that fails is fatal to the run and kills the child on the way
+/// out: a process left suspended, or running outside the containment its backend
+/// promised, is worse than a spawn that never happened. Every unix backend and
+/// the floor pass a no-op, which is why they go through [`run_capped`] and never
+/// see this signature.
+async fn run_capped_hooked(
+    backend: Backend,
+    spec: RunSpec<'_>,
+    configure: impl FnOnce(&mut tokio::process::Command),
+    started: impl FnOnce(&tokio::process::Child) -> Result<()>,
 ) -> Result<SandboxOutcome> {
     use std::process::Stdio;
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -627,12 +685,30 @@ async fn run_capped(
     })?;
     let pid = child.id();
 
-    // Say once, out loud, what this platform cannot enforce. The CPU cap is
+    // The child exists and, if the backend asked for it, has not run yet. This
+    // is the only instant at which a Job Object assignment is both possible and
+    // race-free, so it is where the hook goes — before the wall clock starts,
+    // before the memory monitor, before anything can read its output.
+    if let Err(e) = started(&child) {
+        // Whatever the backend was setting up did not take. Kill rather than
+        // continue: a child that is still suspended would otherwise sit there
+        // until the wall clock, and one that is running uncontained would be
+        // running under a backend name that no longer describes it.
+        kill_tree(pid);
+        return Err(e);
+    }
+
+    // Say once, out loud, what this run cannot enforce. The CPU cap is
     // `RLIMIT_CPU` and the memory cap is an RSS monitor over `ps` — both unix
-    // mechanisms — so a Windows run gets the wall clock and nothing else. A cap
-    // silently not applied is worse than no cap: the caller thinks it has one.
+    // mechanisms — so a non-unix run gets the wall clock and nothing else,
+    // *unless* it is a Windows Job Object run, where the job supplies both.
+    // A cap silently not applied is worse than no cap: the caller thinks it has
+    // one. A warning for a cap that *is* applied is just as bad in the other
+    // direction, which is why the backend is part of the condition.
     #[cfg(not(unix))]
-    if spec.limits.max_cpu_secs.is_some() || spec.limits.max_memory_bytes.is_some() {
+    if backend != Backend::WindowsJobObject
+        && (spec.limits.max_cpu_secs.is_some() || spec.limits.max_memory_bytes.is_some())
+    {
         static SAID: std::sync::Once = std::sync::Once::new();
         SAID.call_once(|| {
             tracing::warn!(

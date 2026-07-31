@@ -50,8 +50,9 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL, GREP_TOOL,
-    READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
+    Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
+    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, TODO_WRITE_TOOL,
+    WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -114,6 +115,20 @@ pub(crate) const NO_TOOL_CALL: &str = "(no tool call)";
 /// How many grep hits are folded into one observation. A relevance ceiling, not a
 /// size one — the size ceiling is the budget-derived per-entry cap on top of it.
 const OBS_GREP_CAP: usize = 50;
+
+/// How many directory entries are folded into one observation (0.24.0).
+///
+/// Higher than the grep ceiling because the units differ: a grep hit is a line of
+/// source and an entry is a name, so a listing costs roughly an order of
+/// magnitude less per item. It exists because a directory is not obliged to be
+/// small — `node_modules` and a build output tree run to thousands of entries,
+/// and a tool that spent a whole turn's budget on one of them would be unusable
+/// exactly where looking before reading matters most.
+///
+/// What is dropped is *stated* in the observation, with the true total, because a
+/// model that cannot tell a partial listing from a complete one will conclude the
+/// files it needs do not exist.
+const OBS_LIST_DIR_CAP: usize = 200;
 
 /// Why a run stopped.
 ///
@@ -462,8 +477,11 @@ pub async fn run_observed<P: Provider>(
 /// let contract = TaskContract::workspace(
 ///     "make the failing test in tests/parse.rs pass",
 ///     "/path/to/repo",
-///     Verification::Command { argv: vec!["cargo".into(), "test".into()], expect_exit: 0 },
-/// );
+/// )
+///     .with_verification(Verification::Command {
+///         argv: vec!["cargo".into(), "test".into()],
+///         expect_exit: 0,
+///     });
 ///
 /// // Three tiers, and the middle one is the only one anybody is asked about.
 /// // `Policy::default()` already denies `.env`, `*.pem` and the other secret
@@ -666,7 +684,7 @@ pub(crate) async fn run_with_extras<P: Provider>(
         // checking. Refuse loudly instead.
         None if caller_enforces => Err(crate::error::Error::Config(
             "a permission policy requires workspace mode — build the contract \
-             with TaskContract::workspace(goal, root, verify). Single-file \
+             with TaskContract::workspace(goal, root). Single-file \
              contracts are not policy-enforced in 0.4.0."
                 .into(),
         )),
@@ -891,7 +909,7 @@ pub async fn resume_with<P: Provider>(
 ///                  Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let store = Store::open("runs.db")?;
 /// let provider = OpenRouter::from_env()?;
 /// let policy = Policy::permissive();
@@ -943,7 +961,7 @@ pub async fn resume_with_answer<P: Provider>(
 ///                  Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let result = resume_with_answer_observed(
 ///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?,
 ///     7, 3, "io.local.toml", &Policy::permissive(), &ApproveAll, &Ignore,
@@ -984,7 +1002,7 @@ pub async fn resume_with_answer_observed<P: Provider>(
 ///                  Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let store = Store::open("runs.db")?;
 ///
 /// // The question belongs to whichever agent asked it — often a child — but the run id
@@ -1037,7 +1055,7 @@ pub async fn resume_tree_with_answer<P: Provider>(
 ///                  OpenRouter, Policy, Store, TaskContract, Verification};
 ///
 /// # async fn demo() -> io_harness::Result<()> {
-/// # let contract = TaskContract::workspace("port it", "/repo", Verification::None);
+/// # let contract = TaskContract::workspace("port it", "/repo");
 /// let result = resume_tree_with_answer_observed(
 ///     &contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, 7, 4,
 ///     "keep the old column", &Policy::permissive(), &ApproveAll,
@@ -1360,7 +1378,7 @@ pub async fn resume_with_observed<P: Provider>(
         // nothing was checking.
         None if caller_enforces => Err(crate::error::Error::Config(
             "a permission policy requires workspace mode — build the contract \
-             with TaskContract::workspace(goal, root, verify). Single-file \
+             with TaskContract::workspace(goal, root). Single-file \
              contracts are not policy-enforced."
                 .into(),
         )),
@@ -3047,8 +3065,11 @@ struct Tree<'a, P: Provider> {
 /// let contract = TaskContract::workspace(
 ///     "document every public module under docs/, one file per module",
 ///     "/path/to/repo",
-///     Verification::WorkspaceFileContains { file: "docs/index.md".into(), needle: "##".into() },
-/// );
+/// )
+///     .with_verification(Verification::WorkspaceFileContains {
+///         file: "docs/index.md".into(),
+///         needle: "##".into(),
+///     });
 ///
 /// // The root's boundary, and therefore the ceiling for the entire tree: a child
 /// // inherits it through `Policy::contain` and may only narrow it, so no
@@ -4181,7 +4202,7 @@ async fn spawn_child<P: Provider>(
         file: file.into(),
         needle: needle.into(),
     };
-    let mut child_contract = TaskContract::workspace(goal, &tree.root, verify);
+    let mut child_contract = TaskContract::workspace(goal, &tree.root).with_verification(verify);
     // 0.22.0 — the tree's web declaration, not one the model asked for. A child
     // inherits exactly what the root was given and has no way to widen it: the
     // spawn arguments are never read for this, so "give the sub-agent web access"
@@ -4891,6 +4912,77 @@ async fn dispatch(
                     info!(run_id, step, question_id, "run paused for an answer");
                     Dispatched::Ask { question_id }
                 }
+            }
+        }
+        LIST_DIR_TOOL => {
+            // No path means the workspace root, which is the listing an agent
+            // opening an unfamiliar repository wants first. `resolve` turns the
+            // empty string into the root and the policy sees it as such, so this
+            // is a default rather than a special case.
+            let path = s("path").unwrap_or_default();
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                // The same act, the same check, the same code as a `read_file` on
+                // this path: enumerating a directory the operator denied reading
+                // is that read, done one level up.
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
+                Gated::Paused { request_id } => Dispatched::Pause { request_id },
+                Gated::Go {
+                    target, remember, ..
+                } => match ws.list_dir(&target) {
+                    Ok(entries) => {
+                        let shown: Vec<String> = entries
+                            .iter()
+                            .take(OBS_LIST_DIR_CAP)
+                            .map(Entry::to_string)
+                            .collect();
+                        // Said in the listing, not only in the count the trace
+                        // keeps: the model reads the text and nothing else, and
+                        // what it does about a truncated directory — narrow to a
+                        // subdirectory, or glob it with `find` — is a decision it
+                        // can only make if it is told.
+                        let elided = entries.len() - shown.len();
+                        let note = match elided {
+                            0 => String::new(),
+                            n => format!(
+                                "\n[showing {} of {} entries; {n} not listed — list a \
+                                 subdirectory or use find to narrow]",
+                                shown.len(),
+                                entries.len()
+                            ),
+                        };
+                        Dispatched::Continue {
+                            decision: format!("list_dir {target} ({} entries)", entries.len()),
+                            obs: bound(
+                                &format!("\n[list_dir {target}]\n{}{note}\n", shown.join("\n")),
+                                cap,
+                                ObsKind::Find,
+                            ),
+                            // A listing is a filename answer about a path, like
+                            // `find`'s: a later listing of the same directory is
+                            // the same question asked again and supersedes this
+                            // one. It is not its own kind because nothing in the
+                            // context layer would treat it differently.
+                            kind: ObsKind::Find,
+                            target: Some(target.clone()),
+                            changed: false,
+                            remember,
+                        }
+                    }
+                    Err(e) => Dispatched::go("list_dir error", format!("\n[list_dir error] {e}\n")),
+                },
             }
         }
         READ_FILE_TOOL => {
@@ -6751,6 +6843,22 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "name_glob": { "type": "string", "description": "Glob to match, e.g. *.rs or src/*.rs." }
                 },
                 "required": ["name_glob"]
+            }),
+        },
+        ToolSpec {
+            name: LIST_DIR_TOOL.to_string(),
+            description: "List what is immediately inside one directory: each entry with its \
+                          kind (file, dir, link) and each file's size in bytes. One level only \
+                          — a subdirectory is named, not descended into, so list it in turn to \
+                          go deeper. Use this to learn the shape of an unfamiliar tree before \
+                          reading anything; use find when you already know what the name looks \
+                          like, and grep when you know what the contents say."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Directory relative to the workspace root, e.g. src. Omit it for the root itself." }
+                }
             }),
         },
         ToolSpec {

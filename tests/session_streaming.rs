@@ -228,11 +228,7 @@ async fn a_one_shot_run_emits_no_deltas_and_a_session_turn_does() {
     let provider = Streamer::default();
 
     let quiet = Listener::default();
-    let contract = io_harness::TaskContract::workspace(
-        "read the notes",
-        ws.path(),
-        io_harness::Verification::None,
-    );
+    let contract = io_harness::TaskContract::workspace("read the notes", ws.path());
     run_with_observed(&contract, &provider, &store, &policy(), &ApproveAll, &quiet)
         .await
         .unwrap();

@@ -60,13 +60,13 @@ use crate::error::{Error, Result};
 /// when a run should give up sooner:
 ///
 /// ```
-/// use io_harness::{TaskContract, Verification, DEFAULT_EXEC_TIMEOUT};
+/// use io_harness::{TaskContract, DEFAULT_EXEC_TIMEOUT};
 /// use std::time::Duration;
 ///
 /// assert_eq!(DEFAULT_EXEC_TIMEOUT, Duration::from_secs(900));
 ///
 /// // A monorepo whose cold build genuinely takes half an hour.
-/// let contract = TaskContract::workspace("build it", "/repo", Verification::None)
+/// let contract = TaskContract::workspace("build it", "/repo")
 ///     .with_exec_timeout(Duration::from_secs(1800));
 ///
 /// assert_eq!(contract.exec_timeout, Duration::from_secs(1800));
