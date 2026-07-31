@@ -359,7 +359,7 @@ tasks:
   why_required: F2's negative control is Windows-only and cannot be verified on the development machine,
     and a handle that works in a test but not against a real model is not the capability the contract
     promises.
-  status: in-progress
+  status: done
   depends_on:
   - US-IO-HARNESS-0.25.0-T09
   acceptance_criteria:
@@ -389,3 +389,5 @@ tasks:
     by the shell escape rule, and a handle that exits on its own never had its ending carried to the store.
     Both fixed; the second was a defect in this release code, not in the test.'
   - 'REMAINING: NF3 and NF4 end-to-end assertions.'
+  - NF3 and NF4 asserted end to end in tests/handles.rs with examples/flood.rs; full suite 1082 passed
+    0 failed.
