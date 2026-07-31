@@ -268,7 +268,11 @@ enum Token {
     /// POSIX only treats an *unquoted* digit string as a file-descriptor prefix.
     /// Dropping the distinction would let a quoted argument silently become a
     /// redirect.
-    Word { text: String, quoted: bool, at: usize },
+    Word {
+        text: String,
+        quoted: bool,
+        at: usize,
+    },
     /// `|`
     Pipe(usize),
     /// `&&`
@@ -791,7 +795,11 @@ fn lex(src: &str) -> ParseResult<Vec<Token>> {
 /// what makes checking it meaningful.
 pub(crate) fn parse(src: &str) -> ParseResult<Line> {
     let tokens = lex(src)?;
-    let mut p = Parser { tokens, pos: 0, commands: 0 };
+    let mut p = Parser {
+        tokens,
+        pos: 0,
+        commands: 0,
+    };
     let line = p.line()?;
     if line.seq.is_empty() {
         return Err(Refusal::new(
@@ -951,8 +959,95 @@ impl Parser {
 // Execution
 // ---------------------------------------------------------------------------
 
-/// The one builtin. See [`Shell::run`] for why it is the only one.
+/// The one builtin. See [`plan`] for why it is the only one.
 pub(crate) const CD: &str = "cd";
+
+/// One sub-command with every path it touches already resolved.
+///
+/// This type is the reason the tool's central claim holds. The policy is checked
+/// against these paths and the runner opens *these* paths — not the text in the
+/// [`Line`], re-resolved later against wherever the run happened to get to. A
+/// redirect written as `> out.txt` after a `cd src` means `src/out.txt`, and if
+/// the check resolved it one way and the open resolved it the other, the boundary
+/// would be applied to a file that was never written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Planned {
+    /// Where this sub-command runs. Absolute.
+    pub(crate) cwd: PathBuf,
+    /// Its redirects, targets absolute. `None` for `2>&1`, which names no file.
+    pub(crate) redirects: Vec<(RedirectKind, Option<PathBuf>)>,
+    /// Where a `cd` moves to, absolute, or `None` for every other command.
+    ///
+    /// Recorded here so the caller can check the destination against
+    /// [`Act::Read`](crate::Act::Read) without resolving the path a second time.
+    /// A second resolution is a second chance to disagree, and the disagreement
+    /// would be between the directory that was approved and the directory the
+    /// commands after it actually ran in.
+    pub(crate) cd_target: Option<PathBuf>,
+}
+
+/// Resolve every path in `line` against `root`, in written order.
+///
+/// The result is parallel to [`Line::commands`] and is indexed by the same walk,
+/// so the caller checks entry *n* and the runner runs entry *n*.
+///
+/// ## `cd` is applied unconditionally, and that is deliberate
+///
+/// `&&` and `||` mean a `cd` may or may not execute, so where a later redirect
+/// points is not knowable before the line runs. Three answers were possible and
+/// only one of them is safe. Resolving at run time makes the checked path and the
+/// opened path different objects, which is the whole hazard. Refusing any line
+/// that mixes `cd` with a redirect would refuse most real uses of both. So the
+/// plan assumes every `cd` happens, resolves against that, and the runner uses
+/// the resolved path whether or not the `cd` ran.
+///
+/// The cost is one stated difference from a real shell: in
+/// `cd nope && ls > out.txt`, a shell that failed the `cd` would write `out.txt`
+/// in the original directory, and this writes it in `nope/`. Both were checked,
+/// neither escapes the root, and the model is told where the file went. That is a
+/// smaller surprise than a path the policy approved and the process did not use.
+///
+/// `cd` is the only builtin for a related reason: every other word in command
+/// position is a program looked up on `PATH`, which is what keeps "checked
+/// against [`Act::Exec`](crate::Act::Exec)" a complete statement about what may
+/// run. Adding `echo` or `test` would each be one more word that no longer means
+/// an external program was authorised.
+pub(crate) fn plan(line: &Line, root: &Path) -> Result<Vec<Planned>> {
+    let mut cwd = root.to_path_buf();
+    let mut out = Vec::new();
+    for cmd in line.commands() {
+        let here = cwd.clone();
+        let mut redirects = Vec::with_capacity(cmd.redirects.len());
+        for r in &cmd.redirects {
+            let target = match r.target.as_deref() {
+                None => None,
+                Some(t) => Some(resolve(&here, t, root)?),
+            };
+            redirects.push((r.kind, target));
+        }
+        let cd_target = if cmd.argv[0] == CD {
+            Some(match cmd.argv.get(1) {
+                None => root.to_path_buf(),
+                Some(t) => resolve(&here, t, root)?,
+            })
+        } else {
+            None
+        };
+        out.push(Planned {
+            cwd: here.clone(),
+            redirects,
+            cd_target: cd_target.clone(),
+        });
+        // A `cd` moves the directory for everything after it, including the
+        // stages of a later pipeline. Applied after this command is planned, so
+        // `cd x > log` — which is odd but legal — resolves `log` where it was
+        // written rather than where it is going.
+        if let Some(t) = cd_target {
+            cwd = t;
+        }
+    }
+    Ok(out)
+}
 
 /// What one `shell` invocation produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -985,29 +1080,25 @@ pub(crate) enum ShellOutcome {
     },
 }
 
-/// Runs a parsed [`Line`], wiring the pipes itself.
+/// Runs a parsed [`Line`] against its [`plan`], wiring the pipes itself.
 ///
 /// Holds no [`Policy`](crate::Policy) for the same reason [`Exec`](super::exec)
-/// holds none: every sub-command and every redirect target in the line has
-/// already been through `dispatch`'s gate by the time this is reached, and a
-/// runner that re-checked would be a second boundary that could disagree with the
-/// first. What this type guarantees instead is that it runs *exactly* the
-/// [`Line`] it was handed — no re-parse, no shell, no expansion.
+/// holds none: every sub-command and every path in the plan has already been
+/// through `dispatch`'s gate by the time this is reached, and a runner that
+/// re-checked would be a second boundary that could disagree with the first.
+/// What this type guarantees instead is that it runs *exactly* the [`Line`] and
+/// *exactly* the [`Planned`] paths it was handed — no re-parse, no re-resolve, no
+/// shell, no expansion.
 pub(crate) struct Shell {
-    root: PathBuf,
     timeout: Duration,
     cap: usize,
 }
 
 impl Shell {
-    /// Run under `root`, killing the whole line after `timeout`, bounding each
-    /// captured stream at `cap` chars.
-    pub(crate) fn new(root: impl Into<PathBuf>, timeout: Duration, cap: usize) -> Self {
-        Self {
-            root: root.into(),
-            timeout,
-            cap,
-        }
+    /// Kill the whole line after `timeout`, bounding each captured stream at
+    /// `cap` chars.
+    pub(crate) fn new(timeout: Duration, cap: usize) -> Self {
+        Self { timeout, cap }
     }
 
     /// Execute an authorised line.
@@ -1016,16 +1107,8 @@ impl Shell {
     /// because a line is what the model asked for and a per-stage timeout would
     /// let a ten-stage line run ten times longer than the contract's ceiling
     /// implies.
-    ///
-    /// `cd` is the only builtin, and it exists because the motivating case for
-    /// this tool opens with it. Every other word in command position is a program
-    /// looked up on `PATH`, which is what keeps "check it against
-    /// [`Act::Exec`](crate::Act::Exec)" a complete statement about what may run.
-    /// Adding `echo` or `test` would each be one more word that no longer means
-    /// "an external program was authorised", and the shell should pay that price
-    /// only where the alternative is unusable.
-    pub(crate) async fn run(&self, line: &Line) -> Result<ShellOutcome> {
-        match tokio::time::timeout(self.timeout, self.run_line(line)).await {
+    pub(crate) async fn run(&self, line: &Line, plan: &[Planned]) -> Result<ShellOutcome> {
+        match tokio::time::timeout(self.timeout, self.run_line(line, plan)).await {
             Err(_elapsed) => Ok(ShellOutcome::TimedOut {
                 after: self.timeout,
             }),
@@ -1033,20 +1116,19 @@ impl Shell {
         }
     }
 
-    async fn run_line(&self, line: &Line) -> Result<ShellOutcome> {
-        // The working directory a `cd` moves, threaded through the whole line.
-        // It is a line-local value rather than state on `self`, so one `shell`
-        // call cannot change where the next one starts — a durable run whose
-        // directory depended on a previous tool call would be a resume hazard.
-        let mut cwd = self.root.clone();
+    async fn run_line(&self, line: &Line, plan: &[Planned]) -> Result<ShellOutcome> {
         let mut out = String::new();
         let mut err = String::new();
         let mut code = Some(0);
         let mut ran = 0usize;
+        // Walks in step with `Line::commands`, which is the order `plan` was
+        // built in. Advanced even for a skipped pipeline, so a `&&` that does not
+        // fire cannot slide every later stage onto the wrong plan entry.
+        let mut at = 0usize;
 
         for list in &line.seq {
             let mut status = match self
-                .run_pipeline(&list.first, &mut cwd, &mut out, &mut err)
+                .run_pipeline(&list.first, plan, &mut at, &mut out, &mut err)
                 .await?
             {
                 Stage::Ran(c) => {
@@ -1056,12 +1138,12 @@ impl Shell {
                 Stage::Unavailable(reason) => return Ok(ShellOutcome::Unavailable { reason }),
             };
             for (op, pipeline) in &list.rest {
-                let succeeded = status == Some(0);
-                if (*op == AndOr::And) != succeeded {
+                if (*op == AndOr::And) != (status == Some(0)) {
+                    at += pipeline.stages.len();
                     continue;
                 }
                 status = match self
-                    .run_pipeline(pipeline, &mut cwd, &mut out, &mut err)
+                    .run_pipeline(pipeline, plan, &mut at, &mut out, &mut err)
                     .await?
                 {
                     Stage::Ran(c) => {
@@ -1088,16 +1170,28 @@ impl Shell {
     async fn run_pipeline(
         &self,
         pipeline: &Pipeline,
-        cwd: &mut PathBuf,
+        plan: &[Planned],
+        at: &mut usize,
         out: &mut String,
         err: &mut String,
     ) -> Result<Stage> {
+        let base = *at;
+        *at += pipeline.stages.len();
+
         // `cd` only means anything as a whole pipeline. `cd x | y` is a directory
         // change in a subshell that a real shell throws away, so representing it
-        // would mean implementing a semantic whose only correct behaviour is to do
-        // nothing visible.
+        // would mean implementing a semantic whose only correct behaviour is to
+        // do nothing visible. The move itself already happened in `plan`; all
+        // that is left is to report a target that turned out not to be there.
         if pipeline.stages.len() == 1 && pipeline.stages[0].argv[0] == CD {
-            return self.change_directory(&pipeline.stages[0], cwd, err);
+            let next = plan.get(base + 1).map(|p| p.cwd.clone());
+            return Ok(match next {
+                Some(d) if !d.is_dir() => {
+                    err.push_str(&format!("[shell] cd: no such directory: {}\n", d.display()));
+                    Stage::Ran(Some(1))
+                }
+                _ => Stage::Ran(Some(0)),
+            });
         }
 
         let mut children = Vec::with_capacity(pipeline.stages.len());
@@ -1105,29 +1199,26 @@ impl Shell {
         let mut prev_stdout: Option<Stdio> = None;
 
         for (i, stage) in pipeline.stages.iter().enumerate() {
+            let planned = &plan[base + i];
             if stage.argv[0] == CD {
                 err.push_str(
-                    "[shell] `cd` inside a pipeline changes nothing and was skipped; run it as its own stage.\n",
+                    "[shell] `cd` inside a pipeline changes nothing and was skipped; run it as \
+                     its own stage.\n",
                 );
                 continue;
             }
             let mut cmd = TokioCommand::new(&stage.argv[0]);
             cmd.args(&stage.argv[1..])
-                .current_dir(&*cwd)
+                .current_dir(&planned.cwd)
                 .kill_on_drop(true);
 
             match prev_stdout.take() {
-                Some(s) => {
-                    cmd.stdin(s);
-                }
-                None => {
-                    cmd.stdin(Stdio::null());
-                }
-            }
-            cmd.stdout(Stdio::piped());
-            cmd.stderr(Stdio::piped());
+                Some(s) => cmd.stdin(s),
+                None => cmd.stdin(Stdio::null()),
+            };
+            cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-            self.apply_redirects(&mut cmd, stage, cwd, i != last)?;
+            apply_redirects(&mut cmd, planned, i != last)?;
 
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
@@ -1142,8 +1233,8 @@ impl Shell {
             if i != last {
                 if let Some(so) = child.stdout.take() {
                     // `TryInto`, not `TryFrom`: tokio implements the conversion in
-                    // that direction only, so the usual `Stdio::try_from(..)` does
-                    // not resolve and the blanket impl does not bridge it.
+                    // that direction only, so `Stdio::try_from(..)` does not
+                    // resolve and the blanket impl does not bridge it.
                     let piped: Stdio = so.try_into().map_err(Error::Io)?;
                     prev_stdout = Some(piped);
                 }
@@ -1154,15 +1245,17 @@ impl Shell {
         // Wait in order. The last child's status is the pipeline's, which is what
         // POSIX says without `pipefail` and what `&&` will read.
         let mut code = Some(0);
-        let merge_stderr = pipeline
-            .stages
-            .last()
-            .is_some_and(|s| s.redirects.iter().any(|r| r.kind == RedirectKind::StderrToStdout));
+        let merge_stderr = pipeline.stages.last().is_some_and(|s| {
+            s.redirects
+                .iter()
+                .any(|r| r.kind == RedirectKind::StderrToStdout)
+        });
+        let n = children.len();
         for (i, child) in children.into_iter().enumerate() {
             let output = child.wait_with_output().await.map_err(Error::Io)?;
             let so = String::from_utf8_lossy(&output.stdout);
             let se = String::from_utf8_lossy(&output.stderr);
-            if i == last {
+            if i + 1 == n {
                 code = output.status.code();
                 out.push_str(&so);
                 if merge_stderr {
@@ -1171,85 +1264,66 @@ impl Shell {
                     err.push_str(&se);
                 }
             } else {
-                // An intermediate stage's stdout went down the pipe; only what it
-                // wrote to stderr is left to report, and it is reported rather
-                // than dropped because a failing middle stage is otherwise
+                // An intermediate stage's stdout went down the pipe; what it wrote
+                // to stderr is all that is left to report, and it is reported
+                // rather than dropped because a failing middle stage is otherwise
                 // invisible.
                 err.push_str(&se);
             }
         }
         Ok(Stage::Ran(code))
     }
-
-    /// Open the files a stage redirects, relative to the line's current directory.
-    ///
-    /// Every one of these paths was checked against
-    /// [`Act::Write`](crate::Act::Write) or [`Act::Read`](crate::Act::Read) before
-    /// this ran. Opening is still done here rather than by the caller because the
-    /// file has to be opened at spawn time to be a redirect at all.
-    fn apply_redirects(
-        &self,
-        cmd: &mut TokioCommand,
-        stage: &Command,
-        cwd: &Path,
-        piped_out: bool,
-    ) -> Result<()> {
-        for r in &stage.redirects {
-            let Some(target) = r.target.as_deref() else {
-                if piped_out {
-                    return Err(Error::Config(
-                        "`2>&1` on a stage whose stdout is piped is not supported by this tool: \
-                         merging the two streams into a pipe needs a descriptor duplication this \
-                         crate does not perform. Put the redirect on the last stage."
-                            .into(),
-                    ));
-                }
-                continue;
-            };
-            let path = resolve(cwd, target)?;
-            match r.kind {
-                RedirectKind::Stdin => {
-                    cmd.stdin(Stdio::from(std::fs::File::open(&path).map_err(Error::Io)?));
-                }
-                RedirectKind::Stdout | RedirectKind::StdoutAppend => {
-                    let f = open_for_write(&path, r.kind == RedirectKind::StdoutAppend)?;
-                    cmd.stdout(Stdio::from(f));
-                }
-                RedirectKind::Stderr | RedirectKind::StderrAppend => {
-                    let f = open_for_write(&path, r.kind == RedirectKind::StderrAppend)?;
-                    cmd.stderr(Stdio::from(f));
-                }
-                RedirectKind::StderrToStdout => unreachable!("handled above: no target"),
-            }
-        }
-        Ok(())
-    }
-
-    fn change_directory(
-        &self,
-        stage: &Command,
-        cwd: &mut PathBuf,
-        err: &mut String,
-    ) -> Result<Stage> {
-        let Some(target) = stage.argv.get(1) else {
-            // Bare `cd` in a shell goes to `$HOME`. Here there is no home to go
-            // to and the workspace root is the only defensible answer.
-            *cwd = self.root.clone();
-            return Ok(Stage::Ran(Some(0)));
-        };
-        let next = resolve(cwd, target)?;
-        if !next.is_dir() {
-            err.push_str(&format!("[shell] cd: no such directory: {target}\n"));
-            return Ok(Stage::Ran(Some(1)));
-        }
-        *cwd = next;
-        Ok(Stage::Ran(Some(0)))
-    }
 }
 
 enum Stage {
     Ran(Option<i32>),
     Unavailable(String),
+}
+
+/// Open the files a stage redirects, at the paths [`plan`] already resolved.
+///
+/// Every one of these paths was checked against
+/// [`Act::Write`](crate::Act::Write) or [`Act::Read`](crate::Act::Read) before
+/// this ran. Opening happens here rather than in the caller because a file has to
+/// be opened at spawn time to be a redirect at all.
+fn apply_redirects(cmd: &mut TokioCommand, planned: &Planned, piped_out: bool) -> Result<()> {
+    for (kind, target) in &planned.redirects {
+        let Some(path) = target else {
+            // `2>&1`, which names no file. Merging the two streams into a *pipe*
+            // needs a descriptor duplication this crate does not perform, so it is
+            // refused on a stage whose stdout is piped rather than silently
+            // dropped. On a final stage the merge happens in the captured output,
+            // which is where the model reads it from anyway.
+            if piped_out {
+                return Err(Error::Config(
+                    "`2>&1` on a stage whose stdout is piped is not supported by this tool: \
+                     merging the two streams into a pipe needs a descriptor duplication this \
+                     crate does not perform. Put the redirect on the last stage of the pipeline."
+                        .into(),
+                ));
+            }
+            continue;
+        };
+        match kind {
+            RedirectKind::Stdin => {
+                cmd.stdin(Stdio::from(std::fs::File::open(path).map_err(Error::Io)?));
+            }
+            RedirectKind::Stdout | RedirectKind::StdoutAppend => {
+                cmd.stdout(Stdio::from(open_for_write(
+                    path,
+                    *kind == RedirectKind::StdoutAppend,
+                )?));
+            }
+            RedirectKind::Stderr | RedirectKind::StderrAppend => {
+                cmd.stderr(Stdio::from(open_for_write(
+                    path,
+                    *kind == RedirectKind::StderrAppend,
+                )?));
+            }
+            RedirectKind::StderrToStdout => unreachable!("handled above: it has no target"),
+        }
+    }
+    Ok(())
 }
 
 fn open_for_write(path: &Path, append: bool) -> Result<std::fs::File> {
@@ -1262,47 +1336,39 @@ fn open_for_write(path: &Path, append: bool) -> Result<std::fs::File> {
         .map_err(Error::Io)
 }
 
-/// Join `rel` onto `base` and refuse anything that leaves it.
+/// Join `rel` onto `base` and refuse anything that leaves `root`.
 ///
 /// Lexical rather than `canonicalize`, and deliberately: `canonicalize` requires
-/// the path to exist, and a redirect target usually does not exist yet — it is
-/// about to be created. So `..` is resolved by walking components, and a walk
-/// that would rise above the root is refused rather than clamped. Clamping would
-/// silently redirect `> ../../etc/passwd` into the workspace, which is a surprise
-/// in the one direction that matters.
+/// the path to exist, and a redirect target usually does not — it is about to be
+/// created. So `..` is resolved by walking components, and a walk that would rise
+/// above the root is refused rather than clamped. Clamping would silently
+/// redirect `> ../../etc/passwd` into the workspace, which is a surprise in the
+/// one direction that matters.
 ///
-/// This is a second line rather than the first: the caller has already checked
-/// every one of these paths against the policy through `Workspace::check_path`.
-/// It is here because this function is what actually opens the file, and a
-/// boundary that is enforced only by its caller is a boundary one refactor away
-/// from being gone.
-fn resolve(base: &Path, rel: &str) -> Result<PathBuf> {
+/// This is a second line rather than the first: `dispatch` checks each of these
+/// paths against the policy through `Workspace::check_path`. It is here because
+/// this module is what actually opens the file, and a boundary enforced only by
+/// its caller is one refactor away from being gone.
+fn resolve(base: &Path, rel: &str, root: &Path) -> Result<PathBuf> {
     let joined = if Path::new(rel).is_absolute() {
         PathBuf::from(rel)
     } else {
         base.join(rel)
     };
     let mut out = PathBuf::new();
-    let mut depth = 0usize;
     for c in joined.components() {
         match c {
             Component::ParentDir => {
-                if depth == 0 {
-                    return Err(Error::Config(format!(
-                        "`{rel}` leaves the workspace root"
-                    )));
+                if !out.pop() {
+                    return Err(Error::Config(format!("`{rel}` leaves the workspace root")));
                 }
-                depth -= 1;
-                out.pop();
             }
             Component::CurDir => {}
-            other => {
-                out.push(other);
-                if !matches!(other, Component::RootDir | Component::Prefix(_)) {
-                    depth += 1;
-                }
-            }
+            other => out.push(other),
         }
+    }
+    if !out.starts_with(root) {
+        return Err(Error::Config(format!("`{rel}` leaves the workspace root")));
     }
     Ok(out)
 }
@@ -1338,7 +1404,10 @@ mod tests {
                 .collect::<Vec<_>>()]
         );
         // Adjacent quoted and bare segments are one word, as in any shell.
-        assert_eq!(argvs(&ok("echo a'b'c")), vec![vec!["echo".to_string(), "abc".to_string()]]);
+        assert_eq!(
+            argvs(&ok("echo a'b'c")),
+            vec![vec!["echo".to_string(), "abc".to_string()]]
+        );
     }
 
     #[test]
@@ -1495,15 +1564,27 @@ mod tests {
         // `$` or `*` is reachable, it just cannot be an expansion.
         assert_eq!(
             argvs(&ok("grep '$HOME' f")),
-            vec![vec!["grep".to_string(), "$HOME".to_string(), "f".to_string()]]
+            vec![vec![
+                "grep".to_string(),
+                "$HOME".to_string(),
+                "f".to_string()
+            ]]
         );
         assert_eq!(
             argvs(&ok("grep \\$HOME f")),
-            vec![vec!["grep".to_string(), "$HOME".to_string(), "f".to_string()]]
+            vec![vec![
+                "grep".to_string(),
+                "$HOME".to_string(),
+                "f".to_string()
+            ]]
         );
         assert_eq!(
             argvs(&ok("grep '*.rs' f")),
-            vec![vec!["grep".to_string(), "*.rs".to_string(), "f".to_string()]]
+            vec![vec![
+                "grep".to_string(),
+                "*.rs".to_string(),
+                "f".to_string()
+            ]]
         );
     }
 
@@ -1512,18 +1593,36 @@ mod tests {
         // Only `" \ $ ` are escapable inside double quotes; before anything else a
         // backslash is a literal backslash. Copying the rule is what keeps this
         // parser's reading of a word identical to a shell's.
-        assert_eq!(argvs(&ok("echo \"a\\\"b\"")), vec![vec!["echo".to_string(), "a\"b".to_string()]]);
-        assert_eq!(argvs(&ok("echo \"a\\\\b\"")), vec![vec!["echo".to_string(), "a\\b".to_string()]]);
-        assert_eq!(argvs(&ok("echo \"a\\nb\"")), vec![vec!["echo".to_string(), "a\\nb".to_string()]]);
+        assert_eq!(
+            argvs(&ok("echo \"a\\\"b\"")),
+            vec![vec!["echo".to_string(), "a\"b".to_string()]]
+        );
+        assert_eq!(
+            argvs(&ok("echo \"a\\\\b\"")),
+            vec![vec!["echo".to_string(), "a\\b".to_string()]]
+        );
+        assert_eq!(
+            argvs(&ok("echo \"a\\nb\"")),
+            vec![vec!["echo".to_string(), "a\\nb".to_string()]]
+        );
     }
 
     #[test]
     fn non_ascii_is_a_literal_and_control_characters_are_not() {
         assert_eq!(
             argvs(&ok("grep café ./notes")),
-            vec![vec!["grep".to_string(), "café".to_string(), "./notes".to_string()]]
+            vec![vec![
+                "grep".to_string(),
+                "café".to_string(),
+                "./notes".to_string()
+            ]]
         );
-        for src in ["echo a\u{0}b", "echo 'a\u{0}b'", "echo \"a\u{0}b\"", "echo a\rb"] {
+        for src in [
+            "echo a\u{0}b",
+            "echo 'a\u{0}b'",
+            "echo \"a\u{0}b\"",
+            "echo a\rb",
+        ] {
             assert_eq!(refused(src).construct, "a control character", "for {src:?}");
         }
     }
@@ -1565,14 +1664,18 @@ mod tests {
         let mut next = move || {
             // Numerical Recipes LCG. Any full-period generator does; this one is
             // four lines and needs no crate.
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) as usize
         };
 
         let mut accepted = 0usize;
         for _ in 0..20_000 {
             let len = 1 + next() % 12;
-            let src: String = (0..len).map(|_| ALPHABET[next() % ALPHABET.len()]).collect();
+            let src: String = (0..len)
+                .map(|_| ALPHABET[next() % ALPHABET.len()])
+                .collect();
 
             let Ok(line) = parse(&src) else { continue };
             accepted += 1;
@@ -1580,11 +1683,11 @@ mod tests {
             // Whatever was accepted must be built only from permitted characters,
             // and must contain no control character anywhere.
             for cmd in line.commands() {
-                for word in cmd.argv.iter().chain(
-                    cmd.redirects
-                        .iter()
-                        .filter_map(|r| r.target.as_ref()),
-                ) {
+                for word in cmd
+                    .argv
+                    .iter()
+                    .chain(cmd.redirects.iter().filter_map(|r| r.target.as_ref()))
+                {
                     for c in word.chars() {
                         assert!(
                             is_permitted_in_quotes(c),
@@ -1614,11 +1717,11 @@ mod tests {
             ];
             if !src.contains(['\'', '"', '\\']) {
                 for cmd in line.commands() {
-                    for word in cmd.argv.iter().chain(
-                        cmd.redirects
-                            .iter()
-                            .filter_map(|r| r.target.as_ref()),
-                    ) {
+                    for word in cmd
+                        .argv
+                        .iter()
+                        .chain(cmd.redirects.iter().filter_map(|r| r.target.as_ref()))
+                    {
                         for c in word.chars() {
                             assert!(
                                 !NEVER_UNQUOTED.contains(&c),
@@ -1650,8 +1753,7 @@ mod tests {
 
     /// The grammar's own syntax, exempt from the sweeps because creating structure
     /// is exactly what it is for. Each has a test of its own above.
-    const ADMITTED_SYNTAX: &[char] =
-        &[' ', '\t', '\n', ';', '|', '<', '>', '&', '\'', '"', '\\'];
+    const ADMITTED_SYNTAX: &[char] = &[' ', '\t', '\n', ';', '|', '<', '>', '&', '\'', '"', '\\'];
 
     /// The module's central claim, swept exhaustively rather than sampled:
     /// **every character outside the permitted set is refused.**

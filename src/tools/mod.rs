@@ -44,6 +44,23 @@ pub const EDIT_FILE_TOOL: &str = "edit_file";
 /// and deny `rm *` with the rule syntax the policy already has. See
 /// [`exec`] for what it does and does not bound.
 pub const EXEC_TOOL: &str = "exec";
+/// The name the model uses to run a command *line* (0.24.0).
+///
+/// [`EXEC_TOOL`] takes an argv array, which is what makes its check meaningful
+/// and what puts pipelines, redirects and sequences out of reach: `;` and `&&`
+/// are ordinary bytes inside one argument because nothing on that path parses
+/// them. This tool parses the line itself and checks every sub-command it finds
+/// against [`Act::Exec`](crate::Act::Exec) and every redirect target against
+/// [`Act::Write`](crate::Act::Write) or [`Act::Read`](crate::Act::Read) —
+/// **all of them before anything is spawned**, so a line whose second stage is
+/// denied does not run its first.
+///
+/// There is no host shell after the parse. Each sub-command is spawned as argv
+/// the way [`EXEC_TOOL`] spawns one, and this crate wires the pipes. The grammar
+/// admitted is a conservative subset of POSIX; command substitution, parameter
+/// expansion, subshells, heredocs, background and control flow are refused by
+/// name. See [`shell`] for the whole set and why it is drawn where it is.
+pub const SHELL_TOOL: &str = "shell";
 /// The name the model uses to search file contents by regex/substring.
 pub const GREP_TOOL: &str = "grep";
 /// The name the model uses to list files by name/path glob.

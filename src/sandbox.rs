@@ -23,7 +23,7 @@
 //!   to the workdir and denies network; `setrlimit` caps CPU time and open file
 //!   descriptors; memory is capped by an RSS monitor (macOS does not enforce
 //!   `RLIMIT_AS`/`RLIMIT_DATA`). It does **not** cap the process count — see
-//!   [`SandboxLimits::max_processes`], which no backend enforces today.
+//!   [`SandboxLimits::max_processes`], which only the Windows backend enforces.
 //! - **Linux namespaces** — user + mount + pid + net namespaces give a hard
 //!   network boundary and a private tmpfs; rlimits on top. The crate installs
 //!   **no seccomp filter of its own**; what syscall filtering there is comes
@@ -31,16 +31,16 @@
 //!   namespace. Probed at runtime: a kernel that restricts unprivileged user
 //!   namespaces gets the portable floor, reported as such. *(cfg-gated, not
 //!   live-run on the macOS build host.)*
-//! - **Windows** — *no native backend yet.* The Job Object was designed but
-//!   never implemented (no Win32 call is made), so a Windows run gets the
-//!   portable floor and reports it as such. On Windows that floor enforces the
-//!   **wall clock only**: no CPU cap, no memory cap, and no process cap — all
-//!   three are unix `rlimit`/`ps` mechanisms with no Windows equivalent until the
-//!   Job Object lands — and no kernel network boundary either, only the
-//!   best-effort proxy-env strip. What it does have is an ephemeral workdir and a
-//!   wall-clock kill that reaches the whole process tree. A cap that is not
-//!   applied is never reported: [`Cap::Cpu`] and [`Cap::Memory`] are never
-//!   claimed on Windows. See [`windows`].
+//! - **Windows Job Object** — a **resource** boundary, and only that. The job
+//!   caps per-process committed memory, per-job user CPU time and the active
+//!   process count, and kills the whole tree when its handle closes. It is also
+//!   the only backend on any platform that enforces
+//!   [`SandboxLimits::max_processes`]. What a Job Object has no facility for is
+//!   the filesystem and the network: there is no path rule and no socket rule to
+//!   set on one, so on Windows the filesystem scoping is still the floor's
+//!   ephemeral workdir and egress denial is still the best-effort proxy-env
+//!   strip. A Windows run is resource-contained, not jailed, and the two are not
+//!   the same claim. See [`windows`].
 //! - **Portable floor** — the weakest backend: filesystem-scoped (a fresh
 //!   ephemeral workdir) and resource-capped, **not a full syscall jail**. Network
 //!   deny is best-effort (proxy env stripped), *not* a kernel boundary. It exists
@@ -515,9 +515,9 @@ impl Sandbox for Selected {
 /// [`Backend::PortableFloor`] rather than naming an isolation it did not apply —
 /// [`linux`] probes its `unshare` wrapper (0.9.1: Ubuntu 24.04 restricts
 /// unprivileged user namespaces, and every wrapped spawn failed there), and
-/// [`windows`] has no native backend to offer at all. Since the backend is
-/// recorded in the trace, a degraded run is auditable, not silent. Use
-/// [`Sandbox::backend`] on the result to see what will really run.
+/// [`windows`] falls back the same way when the job object cannot be created.
+/// Since the backend is recorded in the trace, a degraded run is auditable, not
+/// silent. Use [`Sandbox::backend`] on the result to see what will really run.
 ///
 /// Which is the point of the example: ask, never assume. Compiling for Linux
 /// does not mean you got namespaces. Ubuntu 24.04 ships

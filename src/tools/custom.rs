@@ -352,6 +352,7 @@ pub(crate) const RESERVED_TOOL_NAMES: &[&str] = &[
     super::WRITE_FILE_TOOL,
     super::EDIT_FILE_TOOL,
     super::EXEC_TOOL,
+    super::SHELL_TOOL,
     super::GREP_TOOL,
     super::FIND_TOOL,
     super::LIST_DIR_TOOL,

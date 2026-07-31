@@ -37,6 +37,7 @@ use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store, TodoI
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
 use crate::tools::git::{Git, GitCmd, GitOutcome};
+use crate::tools::shell::{Shell, ShellOutcome};
 #[cfg(feature = "barcode")]
 use crate::tools::BARCODE_DECODE_TOOL;
 #[cfg(feature = "pptx")]
@@ -51,8 +52,8 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
-    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, TODO_WRITE_TOOL,
-    WRITE_FILE_TOOL,
+    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_TOOL,
+    TODO_WRITE_TOOL, WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -5252,6 +5253,217 @@ async fn dispatch(
                 }
             }
         }
+        SHELL_TOOL => {
+            let line_src = s("line").unwrap_or_default();
+            if line_src.trim().is_empty() {
+                return Ok(Dispatched::go(
+                    "shell missing line",
+                    "\n[shell error] shell needs a non-empty \"line\" string holding the command \
+                     line to run\n",
+                ));
+            }
+            // Refusing is an observation, not an error. The model wrote something
+            // this tool does not admit, is told which construct and why, and gets
+            // to write something else — the same shape as a policy refusal, and
+            // for the same reason: an `Err` here would end the run over a
+            // recoverable mistake.
+            let parsed = match crate::tools::shell::parse(line_src) {
+                Ok(l) => l,
+                Err(r) => {
+                    return Ok(Dispatched::go(
+                        format!("shell refused: {}", r.construct),
+                        format!("\n[shell refused] {r}\n"),
+                    ))
+                }
+            };
+            let plan = match crate::tools::shell::plan(&parsed, ws.root()) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Ok(Dispatched::go(
+                        "shell refused: a path outside the workspace",
+                        format!("\n[shell refused] {e}\n"),
+                    ))
+                }
+            };
+
+            // Every check for the whole line happens here, before the first
+            // spawn. This is the criterion the tool exists to satisfy: a line
+            // whose second stage is denied must not run its first, so a loop that
+            // checked-then-ran each stage in turn would be wrong however careful
+            // it looked.
+            let mut remembered: Vec<Rule> = Vec::new();
+            for (cmd, planned) in parsed.commands().zip(plan.iter()) {
+                if let Some(dest) = &planned.cd_target {
+                    // `cd` spawns nothing, so there is no program to check against
+                    // `Act::Exec`. What it does do is choose where every later
+                    // stage runs, which is a read of that directory.
+                    let rel = relative_to(ws.root(), dest);
+                    match gate(
+                        ws,
+                        approver,
+                        store,
+                        run_id,
+                        step,
+                        Act::Read,
+                        &rel,
+                        None,
+                        watch,
+                        depth,
+                    )
+                    .await?
+                    {
+                        Gated::Refused { decision, obs } => {
+                            return Ok(Dispatched::go(decision, obs))
+                        }
+                        Gated::Paused { request_id } => {
+                            return Ok(Dispatched::Pause { request_id })
+                        }
+                        Gated::Go { remember, .. } => remembered.extend(remember),
+                    }
+                } else {
+                    // The same two targets `exec` checks, per sub-command rather
+                    // than per call: the program alone, which is what
+                    // `deny_exec("rm")` names, and this stage's own joined argv,
+                    // which is what `allow_exec("git log*")` names. Checking the
+                    // whole line as one string could not tell one stage from
+                    // another, which is the entire point of parsing it.
+                    let program = cmd.argv[0].clone();
+                    let joined = cmd.argv.join(" ");
+                    let mut targets = vec![program.clone()];
+                    if joined != program {
+                        targets.push(joined);
+                    }
+                    for target in targets {
+                        match gate(
+                            ws,
+                            approver,
+                            store,
+                            run_id,
+                            step,
+                            Act::Exec,
+                            &target,
+                            None,
+                            watch,
+                            depth,
+                        )
+                        .await?
+                        {
+                            Gated::Refused { decision, obs } => {
+                                return Ok(Dispatched::go(decision, obs))
+                            }
+                            Gated::Paused { request_id } => {
+                                return Ok(Dispatched::Pause { request_id })
+                            }
+                            Gated::Go { remember, .. } => remembered.extend(remember),
+                        }
+                    }
+                }
+
+                // Redirect targets are paths, so they take the path-resolved check
+                // `write_file` and `read_file` take — not the name match an
+                // `Act::Exec` rule performs. A rule denying `secrets/*` has to
+                // catch `> secrets/key` for the boundary to mean anything.
+                for (kind, target) in &planned.redirects {
+                    let Some(path) = target else { continue };
+                    let act = if kind.is_write() {
+                        Act::Write
+                    } else {
+                        Act::Read
+                    };
+                    let rel = relative_to(ws.root(), path);
+                    match gate(
+                        ws, approver, store, run_id, step, act, &rel, None, watch, depth,
+                    )
+                    .await?
+                    {
+                        Gated::Refused { decision, obs } => {
+                            return Ok(Dispatched::go(decision, obs))
+                        }
+                        Gated::Paused { request_id } => {
+                            return Ok(Dispatched::Pause { request_id })
+                        }
+                        Gated::Go { remember, .. } => remembered.extend(remember),
+                    }
+                }
+            }
+
+            let outcome = Shell::new(exec_timeout, cap).run(&parsed, &plan).await?;
+            let (decision, obs) = match &outcome {
+                ShellOutcome::Unavailable { reason } => (
+                    "shell command unavailable".to_string(),
+                    format!(
+                        "\n[shell unavailable] {reason}. This machine cannot run that command; \
+                         try another, or carry on without it.\n"
+                    ),
+                ),
+                ShellOutcome::TimedOut { after } => (
+                    "shell timed out".to_string(),
+                    format!(
+                        "\n[shell timed out] `{line_src}` was killed after {}s without \
+                         finishing. Nothing it printed was captured. Run something narrower, or \
+                         expect this to need longer than this run allows.\n",
+                        after.as_secs()
+                    ),
+                ),
+                ShellOutcome::Ran {
+                    code,
+                    stdout,
+                    stderr,
+                    elided,
+                    ran,
+                } => {
+                    let body = crate::verify::joined_streams(stdout, stderr);
+                    let total = parsed.commands().count();
+                    (
+                        format!(
+                            "shell {}",
+                            code.map_or("(signal)".to_string(), |c| format!("exit {c}"))
+                        ),
+                        format!(
+                            "\n[shell `{line_src}` {}{}]{}\n{}\n",
+                            code.map_or("killed by a signal".to_string(), |c| format!("exit {c}")),
+                            if *ran < total {
+                                // `&&` and `||` skipping is the difference between
+                                // a command that failed and one that never ran,
+                                // and a model that cannot tell them apart will
+                                // debug the wrong stage.
+                                format!(
+                                    ", {ran} of {total} sub-commands ran; the rest were skipped \
+                                     by `&&` or `||`"
+                                )
+                            } else {
+                                String::new()
+                            },
+                            if *elided > 0 {
+                                format!(
+                                    " ({elided} characters of output elided from the middle; the \
+                                     start and the end are both here)"
+                                )
+                            } else {
+                                String::new()
+                            },
+                            if body.trim().is_empty() {
+                                "(no output)"
+                            } else {
+                                body.trim_end()
+                            }
+                        ),
+                    )
+                }
+            };
+            Dispatched::Continue {
+                decision,
+                obs: bound(&obs, cap, ObsKind::Tool),
+                // `Tool`, matching `exec`, because the target is the name of the
+                // thing that answered rather than the subject of the answer: two
+                // different command lines gave two different results, and letting
+                // the later one supersede the earlier would discard one of them.
+                kind: ObsKind::Tool,
+                target: Some(line_src.to_string()),
+                changed: false,
+                remember: remembered,
+            }
+        }
         EXEC_TOOL => {
             let argv: Vec<String> = a
                 .get("argv")
@@ -5979,6 +6191,28 @@ enum Gated {
     Refused { decision: String, obs: String },
     /// An approver deferred the decision.
     Paused { request_id: i64 },
+}
+
+/// The workspace-relative form of an absolute path the shell planner resolved.
+///
+/// [`gate`] checks a read or a write through `Workspace::check_path`, which takes
+/// a path relative to the root — the same string a `write_file` call carries. The
+/// shell planner works in absolute paths, because absolute is what it must hand
+/// to the operating system. This is the only conversion between the two, kept in
+/// one place so that the string the policy sees and the path the process opens
+/// cannot drift apart: two conversions would be two chances to disagree, and the
+/// disagreement would be silent.
+///
+/// A path equal to the root becomes `.` rather than the empty string, which is
+/// what a `cd` with no argument produces and what a policy rule for the root
+/// itself is written against.
+fn relative_to(root: &std::path::Path, path: &std::path::Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    if rel.as_os_str().is_empty() {
+        ".".to_string()
+    } else {
+        rel.to_string_lossy().into_owned()
+    }
 }
 
 /// Evaluate one action against the policy, consulting `approver` only for the
@@ -7062,6 +7296,35 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     }
                 },
                 "required": ["argv"]
+            }),
+        },
+        ToolSpec {
+            name: SHELL_TOOL.to_string(),
+            description: "Run a command LINE, with pipelines, redirects and sequences — use this \
+                          when the work is `a | b`, `a && b`, `a; b` or `a > file`, and use \
+                          `exec` when it is a single command. The line is parsed here, not by a \
+                          shell: every sub-command in it is checked against the execute policy \
+                          and every redirect target against the file policy BEFORE anything \
+                          runs, so if one stage is denied then no stage runs. Supported: single \
+                          and double quotes, backslash escapes, `|`, `;`, `&&`, `||`, and the \
+                          redirects `>` `>>` `<` `2>` `2>>` `2>&1`. `cd` works and applies to \
+                          the rest of the line. REFUSED, each with a reason: `$(...)` and \
+                          backticks, `$VAR` and `${VAR}`, `$((...))`, `<(...)`, subshells `(...)`, \
+                          `{...}`, heredocs `<<`, background `&`, `if`/`for`/`while`/`case`, and \
+                          the glob characters `*` `?` `[` `]` outside quotes — quote a character \
+                          to pass it literally, and use `find` or `list_dir` to choose paths \
+                          rather than globbing. A line that runs too long is killed and reported \
+                          as a timeout."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "line": {
+                        "type": "string",
+                        "description": "The command line, e.g. \"cd infra && kubectl get pods | grep CrashLoop\" or \"cargo test 2>&1\".",
+                    }
+                },
+                "required": ["line"]
             }),
         },
     ];
