@@ -613,7 +613,15 @@ versions:
       because 0.29.0 adds a variant to it. One attribute here is the difference between that being
       additive and it being a break, and it costs nothing to decide now while the type has no
       consumers at all.
-    detail: outline
+
+      Specified as `[[provider]]` projecting to a `#[non_exhaustive] ProviderSpec` — a spec, never a
+      `Box<dyn Provider>`, because `Provider::complete` returns `impl Future` and the trait is not
+      dyn-compatible (`src/provider/fallback.rs:5-7`) — plus `[app]` stored as an opaque table,
+      `${cmd:}` refused in the project scope, `[profile.<name>]` overlaying the base, `IO_CONFIG`
+      naming the user-scope file directly so the four scopes stay four, `[instructions]` discovered
+      into `TaskContract::constraints` rather than a new field, and a project scope that may narrow a
+      boundary and may never widen it.
+    detail: specified
     status: planned
   - version: 0.28.0
     outcome: >

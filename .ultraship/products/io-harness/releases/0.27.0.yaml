@@ -1,0 +1,495 @@
+product: io-harness
+version: 0.27.0
+release_type: minor
+status: planned
+outcome:
+  user_can: >
+    Write one `io.toml` that is the whole configuration — for this crate and for the applications
+    built on it — and get from it the piece it has never carried: **which provider and model to run,
+    and what stands behind it**. Since 0.19.0 the file has described the boundary, the budgets, the
+    toolchain, the prices, the MCP servers and the agents (`src/config.rs:161-191`), and every
+    embedder has still had to write provider-selection code in Rust because nothing in the file could
+    name a vendor. `[[provider]]` closes that: the first entry is the provider, the rest are the
+    fallback chain in order, and `Config::provider_spec()` / `Config::fallback_specs()` hand the
+    application a spec it constructs from.
+
+    Four things ride with it, each of which is a reason someone still keeps a second config file
+    today. `[app]` is a table this crate stores and never validates, so io-cli and io-studio keep
+    their own settings beside the harness's instead of inventing a second format that would have to
+    be reconciled later. `[profile.<name>]` overlays a named set of choices onto the base, so "the
+    cheap one" and "the careful one" are one file rather than two. `${cmd:}` produces a credential
+    from a command — `op read`, `vault kv get`, `gcloud print-access-token` — rather than from a
+    literal a file has to hold. And `[instructions]` discovers the `AGENTS.md` a repository already
+    carries, so project instructions reach the model as constraints instead of being pasted into a
+    goal string by every caller in turn.
+
+    And a project-scoped `io.toml` stops being able to widen a boundary. It travels with a clone, and
+    the keys that turn a `git clone` into a risk — a command run at config load, egress re-enabled
+    inside the sandbox, the sandbox floor switched off, `exec` or `net` defaulted to `allow` — are
+    refused in that scope, naming the key and the file, with the user and local scopes as the stated
+    alternative. A project file may narrow the boundary and may never widen it.
+  business_value: >
+    The crate's stated position is that `io.toml` is "the ergonomic front end to the typed API"
+    (`src/config.rs:12-16`) and that io-cli and io-studio "read the same file rather than inventing
+    two formats that would have to be reconciled later" (`src/config.rs:7-8`). Both sentences are
+    aspirations today, for two concrete reasons. An application cannot get its provider from the
+    file, so every consumer writes the same `from_env`-or-argument selection code
+    (`src/provider/openrouter.rs:88`, `src/provider/anthropic.rs:111`, `src/provider/openai.rs:90`)
+    and each writes it differently. And an application has nowhere in the file to put anything of its
+    own, because every section is `deny_unknown_fields` — so the second format gets invented anyway,
+    beside `io.toml` rather than inside it. This release is the one that makes the sentence true, and
+    it makes it true for the two consumers that already exist rather than for a hypothetical one.
+
+    The trust rule is the half that is owed rather than wanted. `docs/CONTRACT.md:401-404` is careful
+    that a config file is not a security boundary *against the agent* — the boundary is the `Policy`
+    the caller loaded. It says nothing about the other direction, and the other direction is the one
+    a human meets weekly: cloning an unfamiliar repository and pointing a tool at it. Today a
+    committed `io.toml` in that clone can set `sandbox.allow_network = true`, can set
+    `force_floor = false`, and can default `exec` to `allow` — and it takes effect on the first
+    `Config::discover`, silently, because that is exactly what the four scopes are for. Nothing in
+    this crate has ever distinguished the file a team wrote from the file a stranger wrote. The
+    narrow/widen rule is that distinction, and it is cheap precisely because the scopes are already
+    tracked (`src/config.rs:142-149`) and the merge already knows which file each key came from.
+
+    `${cmd:}` is what makes the rule urgent rather than tidy. A credential from a command is the
+    feature operators actually ask for, and it is also a new execution path reached from *parsing a
+    file*. Shipping it without deciding which scopes may use it would put a `run-this` primitive into
+    the one file that arrives with a `git clone`. The two are therefore one release: the mechanism
+    and the rule that bounds it, argued together, rather than the mechanism now and the rule after
+    the first report.
+  evidence_of_value: >
+    A config naming three providers producing a spec whose vendor, model and key are the ones
+    written, in the order written, with the pair nesting into
+    `Fallback::new(a, Fallback::new(b, c))` (`src/provider/fallback.rs:57`) in a doc example that
+    compiles — so the claim "an embedder reads a spec instead of writing provider-selection code" is
+    demonstrated by the code an embedder would write, not asserted.
+
+    For the trust rule, a paired fixture rather than a single refusal: the same four keys written
+    into `io.toml` and into `io.local.toml`, refused in the first and accepted in the second, plus
+    each of the four written to its *narrowing* value in `io.toml` and accepted there. A rule that
+    refused the section outright would pass a test that only checked the refusal, and that is the
+    shape 0.9.1 was paid to learn.
+scope:
+  included:
+  - >
+    **`[[provider]]` and `ProviderSpec`.** An array of tables at the top level, like `[[mcp]]` and
+    `[[agent]]` beside it (`src/config.rs:176`, `:182`): the first entry is the provider to run, each
+    later entry is the next link in the fallback chain. It projects to `Config::provider_spec()`
+    returning `Option<ProviderSpec>` and `Config::fallback_specs()` returning the rest in order —
+    `None` and empty where there is no table, the rule every accessor in this module already holds
+    (`src/config.rs:423`, `:462`, `:513`). Unlike `[[agent]]` and `policy.layers` it is **not** in
+    `APPENDING` (`src/config.rs:928`): a later scope replaces the chain whole, because a half-appended
+    fallback chain is not a chain.
+  - >
+    **`ProviderSpec` is `#[non_exhaustive]` from the first line it exists.** A roadmap requirement,
+    not a preference: 0.29.0 adds a `Compatible` variant covering the OpenAI-shaped vendors and the
+    local runtimes, and the attribute is the difference between that being additive and being a
+    break. It costs nothing here because the type has no consumers at all, and it is guarded by a
+    test rather than by memory.
+  - >
+    **`[app]`, stored and never validated.** One `toml::Value`, held opaquely, reached through
+    `Config::app::<T>(key)` which deserializes the caller's own sub-table into the caller's own type.
+    The crate learns nothing about the contents and validates none of them — that is the whole
+    feature — and the accessor is generic over `serde::de::DeserializeOwned` rather than returning a
+    `toml::Value`, so `toml` stays a private dependency and this crate does not acquire a
+    semver-relevant re-export it would then have to keep.
+  - >
+    **`${cmd:}`, and the scopes that may use it.** A fourth substitution beside `${env:}` and
+    `${file:}` in `expand` (`src/config.rs:859-913`), running the named argv with no shell — split on
+    whitespace, `argv[0]` is the program — and taking its trimmed stdout. Every existing failure rule
+    applies unchanged: a non-zero exit, a program that is not on `PATH`, and output that resolves to
+    nothing are each an error naming the key and the file (`src/config.rs:901-907`). It is **refused
+    in the project scope**, which is the scope a `git clone` delivers.
+  - >
+    **The project-scope trust rule: a project file may narrow, and may never widen.** Four keys plus
+    the substitution above, refused in `Scope::Project` when and only when the value written is the
+    widening one — `policy.defaults.exec = "allow"`, `policy.defaults.net = "allow"`,
+    `sandbox.allow_network = true`, `sandbox.force_floor = false`. Value-dependent rather than
+    key-dependent, because a project file denying `exec` is exactly what the scope is for and a rule
+    that refused the key outright would forbid the good half to stop the bad one. Refused naming the
+    key, the file and the scope, with the alternative in the message.
+  - >
+    **`[profile.<name>]`.** A named overlay of the same file format, applied by
+    `Config::with_profile(name)` through the existing `merge` (`src/config.rs:931`) — so a profile
+    obeys the same key-by-key rules the scopes do, with no second merge semantics to learn. A profile
+    body deserializes as the file format, so a typo *inside an unselected profile* is still rejected
+    at load; a profile name the file does not carry is an error naming it, because a `--profile`
+    argument that silently does nothing is the same failure class as an unknown key.
+  - >
+    **`IO_CONFIG`.** An environment variable naming the user-scope file outright, ahead of
+    `IO_CONFIG_HOME` and every platform convention in `user_path` (`src/config.rs:766-778`). It names
+    a scope; it does not bypass the merge, so a project file still wins the keys it names. That is
+    the deliberate shape: the scopes stay four, `Scope` gains no variant, and
+    `docs/CONTRACT.md:417-418` keeps saying "four scopes" without qualification.
+  - >
+    **`[instructions]` and `AGENTS.md` discovery.** A list of files, defaulting to `AGENTS.md`, read
+    by `Config::discover` relative to the root it was given, and applied by `Config::apply_to` into
+    `TaskContract::constraints` (`src/contract.rs:75`) — the field that already exists to carry
+    "extra rules the agent must respect, surfaced to the model verbatim". No new `TaskContract`
+    field, therefore no break: `TaskContract`'s fields are public and it is not `#[non_exhaustive]`
+    (`src/contract.rs:64`), which is the constraint 0.19.0 met the same way. A named file that is
+    absent is skipped, because this is discovery rather than substitution.
+  - >
+    Every test obligation this repository enforces rather than requests.
+    `tests/config.rs::EVERY_KEY` (`:230`) gains every new table and every key inside them, and
+    `f7_every_key_reaches_a_typed_field` (`:327`) asserts each reaches a typed field, with its
+    negative-control twin (`:401`) extended. A strictness test per new table, modelled on
+    `an_unknown_key_inside_the_web_table_is_rejected_naming_it` (`:1101`) — except `[app]`, whose
+    purpose is to have none and which is covered by its own criterion instead.
+  - >
+    Every documentation surface, in this release. `docs/CONTRACT.md`'s "What configuration is, and is
+    not" block (`:389-418`) **rewritten** rather than appended to — three of its bullets stop being
+    true as written. `docs/guide/configuration.md` gains a `###` section per new table and its "The
+    limits, stated plainly" block (`:263`) survives and grows. `README.md:200-206` updated for what
+    ships. `docs/public-api.txt` hand-edited in sorted position, each new crate-root re-export
+    carrying a worked example. `CHANGELOG.md` with **Breaking changes** first and a literal
+    `Migration:` line, which `tests/changelog.rs` enforces.
+  excluded:
+  - >
+    **`Config::provider()` returning a constructed provider.** `Provider::complete` returns
+    `impl Future` (RPITIT), so the trait is not dyn-compatible and there is no `Box<dyn Provider>` to
+    return — `src/provider/fallback.rs:5-7` states this in the module that exists because of it. A
+    spec the application constructs from is the shape that follows from that fact, not a compromise
+    reached under it. Restated here because it is the first question this design will be asked.
+  - >
+    **Building the fallback chain for the caller.** `Fallback` is generic over two type parameters
+    and nests (`src/provider/fallback.rs:57-60`); a chain of N assembled from a runtime list is
+    exactly the `dyn` the trait cannot have. The file names the chain and its order; the application
+    builds it, and the doc example shows the three lines that takes.
+  - >
+    **`base_url` on `OpenAi`.** Deliberately superseded. 0.29.0's `Compatible` provider is a base
+    URL, a key and a model name over the already-shared `openai_wire`, and it is the type that
+    reaches Groq, Ollama, vLLM and the rest. Adding a base URL to `OpenAi` now would ship a second
+    spelling of the same idea that the crate would then carry forever, and `OpenAi` stays pointed at
+    OpenAI.
+  - >
+    A trust store, a prompt, or a "trust this project" switch. The project-scope rule is a refusal
+    with a stated alternative — write the key in `io.local.toml` or the user file — and not a
+    dialogue. A rule the caller can be talked out of is not a rule, and a trust database is a second
+    piece of state with its own staleness and its own migration.
+  - >
+    A timeout, a sandbox, or an allow-list on `${cmd:}`. The command runs with the caller's own
+    privileges at the caller's own `Config::discover`, before any run exists, and the scope rule is
+    the bound. A helper that hangs hangs visibly at a call the caller made. Stated as a limitation
+    rather than built; when a consumer meets it, it is a key argued on its own terms.
+  - >
+    `include`, `extends`, `$schema`, a JSON or YAML form, a parent-directory search, and reload.
+    Standing exclusion (`docs/CONTRACT.md:417-418`), carried. Profiles are deliberately not the first
+    of these: a profile is a section of the same file that is already read, not a second file and not
+    a second read.
+  - >
+    Any change to when configuration is read. `[instructions]` is read inside `Config::discover`,
+    which is the caller's own call, before the run — so "nothing is loaded implicitly" and "a config
+    the agent writes mid-run cannot widen the boundary that run is already under"
+    (`docs/CONTRACT.md:396-400`) both hold exactly as they did. This is a constraint on the design,
+    not a consequence of it.
+  - >
+    Wiring `[toolchain]` into this crate's own run loop. Still needs a new `TaskContract` field,
+    still a break, still not this release. The standing sentence at `docs/guide/configuration.md`
+    stands.
+  - >
+    Wrapping `rusqlite::Error` out of the public API. Still right, still not slotted; the argument
+    recorded in 0.23.0 stands.
+  fallback_scope:
+  - >
+    **Trigger A — the narrow/widen rule cannot be stated without a false claim.** Named as: F5's
+    negative controls not both holding — either a project file that legitimately *narrows* one of the
+    four keys is refused, or a widening path is found that the four named keys do not cover, so the
+    release would be claiming a boundary that has a door in it. Not "feels incomplete": the trigger
+    is a failing control or a named escaping key, after one round of extending the key list. Then the
+    trust rule ships as **`${cmd:}` refused in the project scope and nothing else**, `docs/CONTRACT.md`
+    says exactly that and no more, and the four-key rule moves to a later version with an UltraShip
+    iteration recording the escaping path. The release stays coherent: "a repository you cloned can no
+    longer make your machine run a command when you read its config" is a complete sentence an
+    operator can act on, and it is the half that `${cmd:}` itself creates.
+  - >
+    **Trigger B — `[instructions]` cannot reach the model without a `TaskContract` break.** Named as:
+    `TaskContract::constraints` not being surfaced to the model on the workspace path in the way
+    `with_constraint` documents (`src/contract.rs:583`), checked by reading the prompt builder
+    *before* the discovery code is written rather than after. Then `[instructions]` ships as
+    `Config::instructions()` — an accessor the embedding application uses — carrying the same standing
+    sentence `[toolchain]` already carries: for the embedding application, not for this crate's run
+    loop. Discovery is still real and still in the file; only the last hop is the caller's, and the
+    hop is recorded as a later release's job rather than implied to be done.
+acceptance:
+  functional:
+  - >
+    F1 — a config names the provider and the chain that stands behind it, and an embedder constructs
+    from a spec instead of writing selection code. A file carrying three `[[provider]]` tables yields
+    a `Config::provider_spec()` whose vendor, model and key are the ones written and a
+    `Config::fallback_specs()` carrying the other two **in the order written**, asserted on order
+    rather than membership, because a fallback chain whose order is wrong is a different
+    configuration that a set comparison cannot see. **The negative control is
+    `a_config_with_no_provider_table_has_no_spec`:** `provider_spec()` is `None` and
+    `fallback_specs()` is empty, so "the file said nothing" stays distinguishable from "the crate
+    chose a default" — the rule `src/config.rs:423`, `:462` and `:513` already hold and the one this
+    accessor would be the first to break.
+  - >
+    F2 — `ProviderSpec` is `#[non_exhaustive]`, and stays that way. Proven by a source assertion in
+    the style `tests/public_api.rs` already uses — a text read of `src/`, not a nightly rustdoc — that
+    the attribute sits immediately above `pub enum ProviderSpec`. A runtime assertion is impossible:
+    `#[non_exhaustive]` has no effect inside the defining crate, and asserting a compile failure needs
+    `trybuild`, which NF2 forbids. **The negative control is the same helper run against a type known
+    not to carry it — `pub enum Scope` (`src/config.rs:142`) — which must report absent**, so a helper
+    that always answers yes is caught by the test rather than by the next release.
+  - >
+    F3 — `[app]` is stored and never validated, and strictness is not switched off to achieve it. A
+    config whose `[app.cli]` carries keys this crate has never heard of loads without error, and
+    `Config::app::<T>("cli")` deserializes them into a caller-defined type. **The negative control is
+    the identical unknown keys written into `[run]` instead**, which must still be refused naming the
+    key (`src/config.rs:161`) — so `[app]` is one hole with a wall around it, not the wall coming
+    down. A second control: `Config::app::<T>` on a key the file does not carry is `None`, not an
+    error and not a default-constructed `T`.
+  - >
+    F4 — a credential can come from a command, and not from a cloned repository's own file. An
+    `io.local.toml` whose value is `${cmd:...}` loads with the command's trimmed stdout; the
+    byte-identical line in `io.toml` is refused, naming the key, the file and the scope. Three further
+    refusals asserted separately, because each fails differently: a non-zero exit, a program not on
+    `PATH`, and empty output (`src/config.rs:901-907`). **The negative control is a `${env:...}` line
+    in the same project-scoped file, which must still load** — otherwise the test would pass on an
+    implementation that refused substitution in the project scope wholesale, which is a different and
+    much worse feature.
+  - >
+    F5 — a project-scoped file may narrow the boundary and may never widen it. Each of
+    `policy.defaults.exec = "allow"`, `policy.defaults.net = "allow"`,
+    `sandbox.allow_network = true` and `sandbox.force_floor = false` written in `io.toml` is refused,
+    naming the key. **Two negative controls, and the criterion is worthless without both:** each of
+    the same four keys written to its *narrowing* value in the same `io.toml` must load —
+    `exec = "deny"`, `net = "deny"`, `allow_network = false`, `force_floor = true` — and each
+    *widening* value written in `io.local.toml` must load. Without the first, a rule that refused the
+    key outright would pass; without the second, a rule that refused the value everywhere would.
+  - >
+    F6 — a profile overlays the base and touches nothing else. `Config::with_profile("fast")` returns
+    a configuration in which the profile's keys won and every key the profile did not name is
+    untouched, merged by the same `merge` at `src/config.rs:931` and therefore by the same key-by-key
+    rules the scopes obey. A profile name the file does not carry is an error naming it. **Two
+    negative controls:** the receiver is unchanged by the call — selecting a profile does not mutate
+    the configuration it came from — and a key this crate does not know, written inside a profile that
+    is *never selected*, is still rejected at load, because a profile body deserializes as the file
+    format rather than as an opaque table.
+  - >
+    F7 — a repository's own instructions reach the model without a new `TaskContract` field. A
+    workspace carrying `AGENTS.md` and a config naming it yields, after `Config::apply_to`, a contract
+    whose `constraints` (`src/contract.rs:75`) carry that text. **Two negative controls:** a config
+    with **no** `[instructions]` section reads no file at all — asserted by placing a file whose read
+    would fail and requiring the load to succeed — and a named file that is absent is skipped rather
+    than erroring, which is what distinguishes discovery from substitution and is the one place this
+    module's "resolve or fail" rule deliberately does not apply.
+  - >
+    F8 — `IO_CONFIG` names the user-scope file directly, and the scopes stay four. With it set,
+    `user_path` (`src/config.rs:766-778`) resolves to it ahead of `IO_CONFIG_HOME` and every platform
+    convention, and `Config::sources()` reports it as `Scope::User`. **The negative control is that a
+    project `io.toml` still wins the same key with `IO_CONFIG` set** — the variable names a scope, it
+    does not bypass the merge — and `Scope` gains no variant, checked against `docs/public-api.txt`,
+    so `docs/CONTRACT.md:417-418` keeps saying four without qualification.
+  - >
+    F9 — every new key reaches a typed field, and every new table rejects what it does not know.
+    `tests/config.rs::EVERY_KEY` (`:230`) names `[[provider]]`, `[app]`, `[profile.<name>]`,
+    `[instructions]` and every key inside them, and `f7_every_key_reaches_a_typed_field` (`:327`)
+    asserts each lands — the test that has enforced this since 0.19.0 and that fails naming the
+    omission. **The negative control is its existing twin**,
+    `f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default` (`:401`), extended to
+    one new key so the fixture proves the field is read rather than defaulted. Plus one strictness
+    test per new table modelled on `an_unknown_key_inside_the_web_table_is_rejected_naming_it`
+    (`:1101`), `[app]` excepted by F3.
+  non_functional:
+  - >
+    NF1 — the full suite passes on macOS, Linux and Windows with no test skipped, ignored or made
+    conditional. The standing exception is
+    `skills::discovery_over_a_32_skill_directory_is_under_50ms`, a wall-clock assertion that fails
+    intermittently on the Windows runner under load and is re-run rather than investigated.
+  - >
+    NF2 — **no new dependency, on any platform.** `cargo tree` on the default feature set reads 402
+    lines after this release as before it. `${cmd:}` is `std::process::Command`; profiles reuse the
+    existing `merge`; `[app]` uses `toml::Value`, already a dependency; `[instructions]` is
+    `std::fs`. Nothing here justifies a crate, and `trybuild` in particular is not added to prove F2,
+    which is why F2 is a source assertion.
+  - >
+    NF3 — no `toml` type appears in this crate's public API. `Config::app` is generic over
+    `serde::de::DeserializeOwned`, so a caller names its own type and `toml` stays a private
+    dependency. Checked by reading the signatures added to `docs/public-api.txt`, because a public
+    re-export of another crate's type is a semver commitment to that crate's version that would
+    outlive any reason for making it.
+  - >
+    NF4 — `cargo doc` is warning-free, docs.rs builds with all features, `cargo fmt --check` is
+    clean, and `cargo clippy --all-targets -- -D warnings` is clean on every platform in the matrix.
+  operational:
+  - >
+    OP1 — `docs/public-api.txt` is hand-edited in sorted position for every new crate-root
+    re-export, and each carries a doc comment with a worked example. `tests/public_api.rs` fails
+    otherwise, and there is deliberately no `--bless`.
+  - >
+    OP2 — `docs/CONTRACT.md`'s "What configuration is, and is not" (`:389-418`) is **rewritten, not
+    appended to**, because three of its bullets stop being true as written: "Scope discovery is
+    fixed" must account for `IO_CONFIG` and for profiles; "a failed substitution is an error" must
+    cover `${cmd:}` and its scope rule; and "an unknown key is an error" must name `[app]` as the
+    second exception beside `[[mcp]]`. Checked by reading the file against `src/config.rs`, not from
+    memory. This is 0.25.0's and 0.26.0's OP2 recurring, and it recurs because the defect class is a
+    document written from the plan rather than from the code.
+  - >
+    OP3 — `docs/guide/configuration.md` gains a `###` section per new table, and its "The limits,
+    stated plainly" block (`:263`) survives — `tests/guide_pages.rs` checks it — and grows by the
+    five limits this release creates: `${cmd:}` has no timeout, an absent instructions file is
+    skipped silently, `[app]` is unvalidated by construction, a project file may narrow and never
+    widen, and a discovered `AGENTS.md` is untrusted text from the repository that reaches the model
+    verbatim and grants nothing.
+  - >
+    OP4 — `README.md:200-206`'s configuration paragraph is updated to what actually ships. It
+    currently describes four scopes and `${env:}`/`${file:}` and no provider selection at all, and
+    the release's own headline claim lives in that paragraph or nowhere a reader will find it.
+  - >
+    OP5 — `cargo package --locked` exits 0 and the tarball is verified by **listing** rather than by
+    trusting the `exclude` list: no `.env`, no `.ultraship`, no `.github`. MSRV 1.95 re-checked in
+    both directions rather than read off the manifest, which is the lesson 0.23.0 paid for.
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.27.0, GitHub at initorigin/io-harness with the tag `v0.27.0` and a
+    Release titled `io-harness 0.27.0`, and docs.rs, whose build is checked by the nightly CI job.
+  deployment_method: >
+    The standing flow. All work on `feat/0.27.0` off `develop`, including the sealed UltraShip
+    release record. PR into `develop`, merged with the PR button. Release PR `develop` into `main`,
+    merged the same way. The GitHub Release is cut by `release.yml` — `gh workflow run release.yml
+    --ref main -f version=0.27.0` — which refuses any ref but `main`, a version the manifest does not
+    declare, an existing tag, or a version with no changelog section, and takes its notes verbatim
+    from the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges
+    and the Release exist. `develop` synced to `main` fast-forward only at the end. No branch is
+    deleted.
+  migrations:
+  - >
+    `[[provider]]`, `[app]`, `[profile.<name>]` and `[instructions]` are new optional tables. A file
+    that carries none of them behaves exactly as it did under 0.26.0, and no accessor changes its
+    answer for such a file.
+  - >
+    **BREAKING for a project file that already widens.** The narrow/widen rule refuses four keys in
+    the project scope that 0.26.0 accepted there, so an existing committed `io.toml` setting any of
+    them now fails the load naming the key. Migration: move `sandbox.allow_network = true`,
+    `sandbox.force_floor = false`, `policy.defaults.exec = "allow"` and
+    `policy.defaults.net = "allow"` out of `io.toml` and into `io.local.toml` or the user-scope file,
+    where they are accepted unchanged. The narrowing values of all four keys stay legal in `io.toml`.
+    This is a deliberate break rather than a warning, because a warning about a boundary is a
+    boundary nobody has.
+  - >
+    `ProviderSpec` ships `#[non_exhaustive]`, so a consumer matching it exhaustively needs a `_ =>`
+    arm from the first release it exists. That is not a migration for anyone today — the type has no
+    consumers — and it is stated because 0.29.0 is the release that makes it matter.
+  observability:
+  - >
+    `Config::sources()` (`src/config.rs:368`) already reports which files were merged and in which
+    order, which is the existing answer to "why did my key not take effect" and is what makes the
+    scope-dependent refusals legible: the error names the file, and `sources()` explains why that
+    file was read at all.
+  - >
+    A `${cmd:}` invocation is traced at debug level with the program and the key it resolved — never
+    with its output, which is a credential. The failure mode of a credential helper is a command that
+    ran and produced something unexpected, and nothing else in the load prints that it ran.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.27.1 and `cargo yank --version
+    0.27.0` is the escape hatch, leaving 0.26.0 as what `cargo install` resolves. A consumer
+    reverting to 0.26.0 keeps every database — this release changes no schema and no stored format —
+    and loses the four new tables, which a 0.26.0 loader rejects as unknown keys rather than ignoring,
+    so the revert is loud rather than silent. The one edit this release may force on a consumer —
+    moving a widening key out of `io.toml` — is valid under 0.26.0 as well, since 0.26.0 accepts those
+    keys in any scope, so no consumer is left with a file that only one version can read.
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - Owner approval to merge to `main`, cut the Release, and publish, per the standing override.
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    Six features in one module. They share `src/config.rs` and its four existing mechanisms — parse,
+    substitute, validate, merge — which is what keeps them one release rather than three, and it is
+    also the reason a mistake in any one of them reaches the other five. The mitigation is that each
+    has its own criterion with its own named negative control, rather than one suite over the module.
+  - >
+    Serde behaviours that must be measured rather than assumed: whether an internally-tagged enum can
+    carry `deny_unknown_fields` (F9 needs it to), whether the `File` struct can hold a
+    `BTreeMap<String, File>` for profile bodies and still derive what it derives, and whether a
+    generic `app::<T>` accessor deserializes cleanly out of a stored `toml::Value`. Each is a
+    ten-minute experiment and each has an obvious fallback shape — an explicitly-fielded section
+    struct projecting to the spec, exactly as `src/config.rs:195-272` already does for every other
+    section — so none of them is a release risk, only a cost.
+  - >
+    The documentation is a rewrite rather than an addition. `docs/CONTRACT.md:389-418` has three
+    bullets that become false, and the guide's limits block grows by five. Writing that from the code
+    rather than from this contract is the work, and it is the thing OP2 exists to force.
+  preferred_tools:
+  - The existing `expand` (`src/config.rs:859`) for `${cmd:}`, as a fourth arm rather than a second
+    substitution pass
+  - The existing `merge` (`src/config.rs:931`) for profiles, so a profile has no merge semantics of
+    its own
+  - The existing private-section-struct-then-project shape (`src/config.rs:195-272`), for
+    `[[provider]]` if internally-tagged deserialization will not carry strictness
+  - '`TaskContract::with_constraint` (`src/contract.rs:583`) for `[instructions]`, so no public field
+    is added'
+  - '`std::process::Command` with no shell, so `${cmd:}` has no metacharacter surface beyond its own
+    argv'
+  constraints:
+  - No new dependency on any platform; `cargo tree` stays 402 on the default feature set
+  - No `toml` type in the public API
+  - No new `TaskContract` field, and no new `Scope` variant
+  - '`ProviderSpec` is `#[non_exhaustive]` from the first line it exists'
+  - Nothing is loaded implicitly; every read stays inside the caller's own `Config::discover`
+  - Stay 0.x
+risks:
+- >
+  **`${cmd:}` is a new execution path reached from parsing a file, and it is the sharpest thing in
+  the release.** Parsing has never run anything before. The mitigation is the scope rule shipping in
+  the same release rather than after it, no shell between the string and the program, and F4's
+  control proving the refusal is about `cmd:` rather than about the project scope refusing
+  substitution wholesale. The residual risk is a user-scope file an attacker can already write — at
+  which point they have the operator's home directory and the config file is not the interesting
+  thing they have.
+- >
+  **The trust rule claiming more than it delivers.** "A project file cannot widen the boundary" is a
+  sentence a reader will over-read into "a cloned repository is safe", which it is not and cannot be:
+  `[[mcp]]` still names a command, `[toolchain]` still names an argv, and `docs/CONTRACT.md:401-404`
+  is still right that the boundary is the `Policy` the caller loaded. The rule is a specific
+  narrowing of a specific hazard and the documentation must say which four keys and no more.
+  Trigger A exists so that a rule that cannot be stated honestly is cut rather than softened.
+- >
+  **`[app]` becoming the hole strictness leaks through.** The module's loudest guarantee is that an
+  unknown key is an error (`src/config.rs:159-161`), and this release deliberately adds a section
+  where it is not. F3's negative control is the boundary of the hole, and the guide states it beside
+  the `[[mcp]]` exception rather than in a footnote — two exceptions listed together are a rule with
+  edges; one listed and one hidden is a rule nobody trusts.
+- >
+  **Two overlay mechanisms in one file.** Scopes overlay, and now profiles overlay too, and a key set
+  in a profile in the user scope against a key set at the base of the project scope is a question a
+  reader will have. The answer is fixed by ordering — scopes merge first, the profile applies to the
+  merged result — and stating it is cheaper than the alternative, which is an operator discovering it
+  from a run that did the wrong thing.
+- >
+  **Scope, honestly.** This contract is six features. They are small individually and they share one
+  file, which is the argument for one release, but the documentation surface is a rewrite and the
+  test obligations are per-table. The two named triggers each cut a whole feature to its accessor
+  rather than trimming all six, because a release that ships five of these completely is better than
+  one that ships six at four-fifths.
+open_questions:
+- >
+  Whether `${cmd:}` is permitted in `io.local.toml` as well as the user scope, or in the user scope
+  alone. Local is gitignored by convention and by this crate's own `.gitignore` rather than by
+  enforcement, so it is *nearly* as trusted as the user file and it is the only natural home for a
+  per-project credential helper. Decided in development against whether such a helper has any other
+  home; whichever way it goes, `Config::from_toml` is documented as the project scope
+  (`src/config.rs:338-342`) and refuses it.
+- >
+  Whether a `[profile.<name>]` may itself contain a `[profile]` table — rejected naming it, or
+  accepted and ignored. Rejection is the module's own house rule and costs three lines; the question
+  is only whether the recursive type makes the error message legible.
+- >
+  Whether `Config::app` takes a key naming the application's own sub-table (`app::<T>("cli")`) or
+  returns the whole `[app]` table for the caller to destructure. The sub-table form is what "io-cli
+  and io-studio keep their settings in the same file" actually needs; the whole-table form is one
+  fewer argument. Decided against what a two-application file looks like, not against the signature.
+- >
+  Whether the discovered `[instructions]` text lands as one constraint per file or one joined
+  constraint. Per-file keeps the provenance a reader of the trace would want; joined is what the
+  model sees anyway. Decided against what the trace shows, since `constraints` is surfaced verbatim.
