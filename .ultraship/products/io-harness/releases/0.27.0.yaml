@@ -1,7 +1,6 @@
 product: io-harness
 version: 0.27.0
 release_type: minor
-status: planned
 outcome:
   user_can: >
     Write one `io.toml` that is the whole configuration — for this crate and for the applications
@@ -493,3 +492,177 @@ open_questions:
   Whether the discovered `[instructions]` text lands as one constraint per file or one joined
   constraint. Per-file keeps the provenance a reader of the trace would want; joined is what the
   model sees anyway. Decided against what the trace shows, since `constraints` is surfaced verbatim.
+status: released
+released_at: 2026-08-01T04:45:00Z
+mode: published
+delivered: >
+  `io.toml` can now say which provider and model to run and what stands behind it.
+  `[[provider]]` is an ordered chain — the first table is the provider, each later one the next link
+  — projected by `Config::provider_spec()` and `Config::fallback_specs()` onto a `ProviderSpec` the
+  application constructs from. It is a spec rather than a provider because `Provider::complete`
+  returns `impl Future` and the trait is not dyn-compatible; that is the reason for the shape, not a
+  compromise reached under it. `ProviderSpec` is `#[non_exhaustive]` from this first line, which is
+  what makes 0.29.0's `Compatible` variant additive, and a test reads `src/config.rs` to keep it that
+  way — with the same helper run against `pub enum Scope` so it can be seen answering no.
+
+  Four things ride with it. `[app]` is one table this crate stores and never validates, reached
+  through a generic `Config::app::<T>(key)` so that no `toml` type enters the public API; it is now
+  literally true, rather than aspirationally true, that io-cli and io-studio keep their settings in
+  the same file. `[profile.<name>]` overlays a named set of choices through the same `merge` the
+  scopes already use, so it has no merge semantics of its own — and a typo inside a profile that is
+  never selected is still rejected at load. `IO_CONFIG` names the user-scope file outright; it names
+  a *scope* rather than bypassing the merge, which is the whole reason the scopes stay four and
+  `Scope` gains no variant. And `[instructions]` discovers the `AGENTS.md` a repository already
+  carries, landing it in `TaskContract::constraints` — the field that already exists for exactly
+  this — so no public field was added and no break was carried.
+
+  The sharpest half is `${cmd:}` and the rule that bounds it, which shipped together rather than one
+  after the other. A credential can now come from a command: split on whitespace, no shell between
+  the string and the process, trimmed stdout, and a missing program, a non-zero exit or empty output
+  each an error naming the key. Because parsing has never run anything before, and because `io.toml`
+  is the file a `git clone` delivers, it is refused in the project scope. Beside it, four keys whose
+  widening value a project file may no longer write — `policy.defaults.exec = "allow"`,
+  `policy.defaults.net = "allow"`, `sandbox.allow_network = true`, `sandbox.force_floor = false` —
+  refused in `io.toml` only, at that value only, and inside a `[profile]` too. A project file may
+  narrow the boundary and may never widen it.
+
+  The rule proved itself before any test was written for it: it rejected two of this crate's own
+  fixtures, including `EVERY_KEY`, the most complete configuration this repository has. Both were
+  moved rather than exempted, because a rule that has to exempt its author's own file is not one.
+evidence:
+  tests:
+  - >
+    `cargo test` — exit 0 on macOS. Every suite green, no test skipped, ignored or made conditional;
+    the standing `skills::discovery_over_a_32_skill_directory_is_under_50ms` exception was not
+    needed. `cargo test --all-features --lib --tests` — the second invocation CI and the release
+    workflow run — also exit 0, 385 lib tests with every feature on.
+  - >
+    F1 — `f7_every_key_reaches_a_typed_field` asserts the whole three-link chain by equality on an
+    **ordered** slice rather than by membership, because a chain whose order is wrong is a different
+    configuration a set comparison cannot see. The control is
+    `a_config_with_no_provider_table_has_no_spec`: `None` and empty, so the file saying nothing stays
+    distinguishable from the crate choosing a vendor nobody named.
+    `a_later_scope_replaces_the_whole_provider_chain` pins the merge decision to keep `[[provider]]`
+    out of `APPENDING`.
+  - >
+    F2 — `provider_spec_is_non_exhaustive_because_a_later_release_adds_a_variant` reads `src/config.rs`
+    and asserts the attribute, with the helper run against `pub enum Scope` as the control that it can
+    report absent. A compile check was not available: `#[non_exhaustive]` has no effect inside its own
+    crate, and asserting a compile failure needs `trybuild`, which NF2 forbids.
+  - >
+    F3 — `the_app_table_takes_keys_this_crate_has_never_heard_of`, with the control that draws the
+    boundary of the hole: the *same* unknown key written into `[run]` is still refused naming it. A
+    second control asserts that a sub-table the file does not carry is `None` rather than an error or
+    a default-constructed value.
+  - >
+    F4 — `a_command_substitution_runs_outside_the_project_scope_and_never_inside_it` on `expand`, and
+    `a_command_substitution_is_refused_in_the_project_scope_and_runs_in_the_local_one` through real
+    files, since the scope is what decides and a scope only exists on disk. The control is a
+    `${env:}` line in the same project-scoped file that must still load: without it the test would
+    pass on an implementation that disarmed substitution in `io.toml` wholesale, which is a different
+    and far worse feature. Written cross-platform by naming each platform's own echo/succeed/fail
+    rather than by skipping on Windows.
+  - >
+    F5 — `a_project_scoped_file_may_narrow_the_boundary_and_may_never_widen_it`, with **both**
+    controls, and the criterion is worthless without either: the four keys accepted at their
+    narrowing value in the same `io.toml`, and accepted at their widening value in `io.local.toml`.
+    Without the first a rule that refused the key outright would pass; without the second, one that
+    refused the value in every scope would. `the_project_scope_rule_reaches_inside_a_profile` covers
+    the path a profile would otherwise open, with its own control.
+  - >
+    F6 — `a_profile_overlays_the_base_and_leaves_every_key_it_did_not_name`, with the control that
+    the configuration the profile was taken from is unchanged, and
+    `an_unknown_key_inside_a_profile_that_is_never_selected_is_rejected_naming_it` as the second: a
+    profile body deserializes as the file format, so strictness reaches into a profile nobody chose.
+    An unknown profile name is an error naming it, and profiles do not compose.
+  - >
+    F7 — `discovered_instructions_reach_the_contract_as_constraints`, with both controls: the same
+    `AGENTS.md` is **not** read when no `[instructions]` section names it, and a named file that is
+    absent is skipped rather than failing the load — the one place this module's "resolve or fail"
+    rule deliberately does not apply. `nf3_nothing_is_read_from_disk_for_configuration_once_the_caller_has_loaded_it`
+    still passes, so the release added a read without weakening the property that makes the module
+    trustworthy.
+  - >
+    F8 — `io_config_names_the_user_scope_file_and_does_not_bypass_the_merge`. The control is the
+    entire justification for the shape: with `IO_CONFIG` set, a project `io.toml` still wins the key
+    it names, so the variable names a scope and the count stays four.
+  - >
+    F9 — `EVERY_KEY` names all four new tables and every key inside them; the fixture moved from
+    `io.toml` to `io.local.toml` because it sets two keys a project file may no longer widen, which
+    is the trust rule proving itself against this crate's own most complete configuration rather than
+    being exempted from it. Strictness per new table:
+    `an_unknown_key_inside_a_provider_or_instructions_table_is_rejected_naming_it` (a misspelled key
+    and an unknown `kind`, with the correctly-spelled control), plus the profile test above. `[app]`
+    is excepted by design and F3 is what states the boundary of that exception.
+  builds:
+  - '`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` — clean.'
+  - >
+    `cargo doc` — warning-free, on the second run. The first reported
+    `public documentation for with_profile links to private item merge`, which is exactly the
+    intra-doc class the `docs.rs (nightly)` job was added for in 0.16.2, caught locally this time
+    rather than on a runner.
+  - >
+    `cargo tree` unchanged at **402 lines** on the default feature set. No new dependency on any
+    platform: `${cmd:}` is `std::process::Command`, profiles reuse the existing `merge`, `[app]` uses
+    `toml`, already a dependency, and `[instructions]` is `std::fs`. `trybuild` was deliberately not
+    added to prove F2, which is why F2 is a source assertion.
+  - >
+    `cargo package --locked` — exit 0, 182 files, 1.0MiB. The tarball was verified by **listing**
+    rather than by trusting the `exclude` list: zero entries matching `.env`, `.ultraship/` or
+    `.github/`.
+  - >
+    MSRV 1.95 re-checked in both directions rather than read off the manifest, which is the lesson
+    0.23.0 paid for: stable 1.95 builds the whole suite, and `cargo +1.94 check --ignore-rust-version`
+    still fails inside `libsqlite3-sys` 0.38.1's build script on `cfg_select`. Unchanged by this
+    release — no crate was added on any platform.
+  reviews: []
+  deployments: []
+  health_checks:
+  - >
+    No live-provider run is claimed. Nothing in this release is reachable from a model's tool calls:
+    every criterion is a property of `Config`, which the caller loads before a run exists, and a live
+    run would assert them less precisely than the fixtures and their controls already do. Stated
+    rather than quietly omitted, since 0.25.0's OP1 set the expectation.
+known_limitations:
+- >
+  **`${cmd:}` has no timeout.** A credential helper that hangs hangs the caller's own
+  `Config::discover`, before any run exists, with the caller's own privileges. Deliberate rather than
+  overlooked — the failure is visible at a call the caller made, and a timeout is a key to be argued
+  on its own terms when a consumer meets it — but it is a real difference from every other
+  substitution, all of which complete or fail promptly.
+- >
+  **The trust rule is four keys and one substitution, and nothing wider.** A project-scoped `io.toml`
+  can still name a command through `[[mcp]]`, still name an argv through `[toolchain]`, and still
+  add a `[[policy.layers]]` entry that allows what the defaults did not. Cloning an unfamiliar
+  repository is not made safe by this release; one specific hazard is narrowed. The contract, the
+  guide and the changelog each say so in the same words rather than leaving the reader to infer the
+  limit from the feature's name.
+- >
+  **A named `[instructions]` file that does not exist is skipped silently.** A typo in a filename is
+  not reported, because discovery over a file that is present in some repositories and absent in
+  others is the normal case rather than the failure. It is the one place this module's "a
+  substitution resolves or fails" rule deliberately does not apply, and the asymmetry is stated in
+  the guide's limits block.
+- >
+  **A discovered `AGENTS.md` is untrusted text that reaches the model verbatim.** It grants nothing —
+  the boundary is still the `Policy` the caller loaded — but a repository's instructions file is
+  written by whoever wrote the repository, and a caller pointing this at a clone should read it the
+  way they would read any other text a stranger put in their prompt.
+- >
+  **`[app]` is a hole in the strictness guarantee, by design.** An unknown key under it is never an
+  error, so a typo in an application's own settings is the application's problem. It is the second
+  and last such exception beside `[[mcp]]`, and the two are listed together everywhere they appear,
+  because one stated and one hidden is a rule nobody can trust.
+- >
+  **`IO_CONFIG` names the user scope, so a project file still beats it.** A caller who wants a
+  specific file to win outright cannot express that: they must pass its directory as the discovery
+  root, or hold the configuration themselves. Chosen over a fifth `Scope` variant, which would be a
+  break to a public enum that is not `#[non_exhaustive]`, and over a bypass, which would make "four
+  scopes, later wins" false.
+- >
+  The record is sealed with `mode: published` before the crates.io upload, which follows the
+  `develop` → `main` merge and the GitHub Release. The record states the authorised target; the flow
+  makes it true.
+supersedes: 0.26.0
+next_recommended_version: 0.28.0
+immutable: true

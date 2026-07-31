@@ -362,7 +362,7 @@ tasks:
       package listing, MSRV."
     why_required: Every one of these is a stated acceptance criterion, and the tree and package checks
       are the two that have caught real defects in prior releases.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.27.0-T09
     acceptance_criteria:
@@ -389,4 +389,27 @@ tasks:
         paid for.
     files:
       - Cargo.toml
-    evidence: []
+    evidence:
+      - "NF1 — `cargo test` on macOS: every suite green, exit 0, nothing skipped, ignored or made
+        conditional. The standing flaky-skills exception was not needed. `cargo test --all-features
+        --lib --tests` — the second invocation CI and the release workflow run — also exit 0."
+      - "NF2 — `cargo tree` on the default feature set reads **402 lines**, unchanged. No new
+        dependency on any platform: `${cmd:}` is `std::process::Command`, profiles reuse the
+        existing `merge`, `[app]` uses `toml`, which was already a dependency, and `[instructions]`
+        is `std::fs`. `trybuild` was deliberately not added to prove F2, which is why F2 is a source
+        assertion."
+      - NF3 — no `toml` type appears in a public signature. `Config::app` is generic over
+        `serde::de::DeserializeOwned`, so `toml` stays a private dependency and this crate acquires
+        no semver commitment to its version.
+      - "NF4 — `cargo fmt --check` clean; `cargo clippy --all-targets -- -D warnings` clean; `cargo
+        doc` warning-free. It was not, on the first run: `Config::with_profile`'s doc linked to the
+        private `merge`, which is exactly the intra-doc class the `docs.rs (nightly)` job exists to
+        catch, and it was caught locally instead."
+      - "OP5 — `cargo package --locked` exit 0, 182 files, 1.0MiB. The tarball was verified by
+        **listing** rather than by trusting the `exclude` list: zero entries matching `.env`,
+        `.ultraship/` or `.github/`. MSRV 1.95 unchanged and re-checked in both directions rather
+        than read off the manifest, which is the lesson 0.23.0 paid for: stable 1.95 builds the
+        whole suite, and `cargo +1.94 check --ignore-rust-version` still fails inside
+        `libsqlite3-sys` 0.38.1's build script on `cfg_select`."
+      - "`target/` was cleaned before packaging, on the standing rule that it fills the disk: it had
+        reached 27.4GiB during the release and the machine was at 15GiB free before the clean."

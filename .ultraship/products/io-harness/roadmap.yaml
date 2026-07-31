@@ -619,10 +619,10 @@ versions:
       dyn-compatible (`src/provider/fallback.rs:5-7`) — plus `[app]` stored as an opaque table,
       `${cmd:}` refused in the project scope, `[profile.<name>]` overlaying the base, `IO_CONFIG`
       naming the user-scope file directly so the four scopes stay four, `[instructions]` discovered
-      into `TaskContract::constraints` rather than a new field, and a project scope that may narrow a
-      boundary and may never widen it.
+      into `TaskContract::constraints` rather than a new field, and a project scope that may narrow
+      a boundary and may never widen it.
     detail: specified
-    status: planned
+    status: released
   - version: 0.28.0
     outcome: >
       An operator shapes a run without writing Rust. Lifecycle hooks declared in `io.toml` fire on
@@ -642,12 +642,12 @@ versions:
       equivalent today, and it is the half that costs nothing to run.
 
       It is one type, not twenty. `openai.rs` and `openrouter.rs` differ by four strings — an
-      endpoint, a name, a web flavor and two environment variable names — over a wire module that
-      is already shared and already `pub(crate)`. So the shape is a single `Compatible` provider
+      endpoint, a name, a web flavor and two environment variable names — over a wire module that is
+      already shared and already `pub(crate)`. So the shape is a single `Compatible` provider
       carrying a base URL and an auth style, with a table of vendor presets behind named
       constructors, reusing `openai_wire` verbatim. Twenty structs would be twenty copies of a
-      constructor and twenty entries in `docs/public-api.txt`, each needing a worked doc example,
-      to express what a constant already expresses. A vendor added later is then a row in a table
+      constructor and twenty entries in `docs/public-api.txt`, each needing a worked doc example, to
+      express what a constant already expresses. A vendor added later is then a row in a table
       rather than a file, and the crate keeps its "no dependency per vendor" property by
       construction rather than by vigilance.
 
@@ -724,11 +724,11 @@ versions:
       same `Act::Net` rules. Off by default, refused rather than skipped when the policy denies it.
 
       Excluded and argued rather than omitted: AWS Bedrock's SigV4 path, Google Vertex's
-      service-account JWT, Gemini's native `interactions` API, and Azure's `api-key` header with
-      its deployment-in-path and `api-version` query param. The first three are reachable today by
-      an application that mints a bearer token itself and passes it as the key, which is where
-      OAuth has always belonged. Azure is the closest call — it costs one auth-style variant and no
-      dependency — and it is left out only because no consumer has asked for it; the shape admits
-      it later without a break.
+      service-account JWT, Gemini's native `interactions` API, and Azure's `api-key` header with its
+      deployment-in-path and `api-version` query param. The first three are reachable today by an
+      application that mints a bearer token itself and passes it as the key, which is where OAuth
+      has always belonged. Azure is the closest call — it costs one auth-style variant and no
+      dependency — and it is left out only because no consumer has asked for it; the shape admits it
+      later without a break.
     detail: outline
     status: planned
