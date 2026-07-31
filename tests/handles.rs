@@ -1,4 +1,4 @@
-//! Process handles through the full loop — F1, F4 and F6 of 0.25.0.
+//! Process handles through the full loop — F1, F4, F6, NF3 and NF4 of 0.25.0.
 //!
 //! What the unit tests beside the registry in `src/tools/handles.rs` cannot
 //! reach is asserted here: that a handle is actually *joined to the loop* — that
@@ -7,9 +7,18 @@
 //! the process with it, and that the refusal set of the foreground tool applies
 //! to this one.
 //!
-//! The process under test is `examples/tick.rs`, built by the same `cargo test`
-//! that runs this file, for the reason its own docs give: nothing that ships on
-//! all three platforms both keeps running and keeps printing.
+//! NF3 and NF4 are the two non-functional criteria that are only true end to
+//! end. NF3 — a handle nobody polls cannot exhaust memory — is a claim about a
+//! real process producing real bytes faster than anything reads them, which no
+//! unit test writing a file with `std::fs::write` can make. NF4 — the
+//! diagnostics pass is bounded — is a claim about the pass as the run loop
+//! actually calls it, with the run's own timeout, and `src/tools/diagnostics.rs`
+//! can only test itself with a timeout it chose.
+//!
+//! The processes under test are `examples/tick.rs` and `examples/flood.rs`,
+//! built by the same `cargo test` that runs this file, for the reason their own
+//! docs give: nothing that ships on all three platforms both keeps running and
+//! keeps printing.
 //!
 //! Every kill assertion checks the operating system rather than the registry.
 //! The registry believing a process is dead is precisely the failure mode these
@@ -637,4 +646,406 @@ async fn without_a_process_group_the_grandchild_survives() {
     // SAFETY: as above; the leaf pid was published by the fixture moments ago
     // and was still alive at the assertion.
     unsafe { libc::kill(leaf as i32, libc::SIGKILL) };
+}
+
+// ---------------------------------------------------------------------------
+// NF3 — a handle nobody polls cannot exhaust memory
+// ---------------------------------------------------------------------------
+
+/// How much of one poll's output reaches the model and the store at most.
+///
+/// `handles::POLL_BYTES` is crate-private, so this is a restatement rather than
+/// an import — which is the right shape for this file anyway. Asserting the
+/// window from outside the crate is asserting the behaviour a caller can
+/// actually observe, and a copy that drifts from the constant fails loudly the
+/// moment the window changes, which is precisely when someone should be looking
+/// at the tests that depend on it.
+const POLL_BYTES: usize = 16 * 1024;
+
+/// Lines the flood fixture writes before it goes quiet.
+///
+/// Every line is `flood ` plus six zero-padded digits plus a newline — thirteen
+/// bytes, identically on all three platforms, because `writeln!` does not
+/// translate newlines anywhere. So the flood is exactly [`FLOOD_BYTES`], about
+/// eighty times the poll window.
+///
+/// Large enough that no window can hold a meaningful fraction of it, and small
+/// enough that an unoptimised fixture — examples are built in debug, and this is
+/// a hundred thousand `writeln!`s — finishes it in tens of milliseconds, which
+/// is two orders of magnitude inside the pauses the tests give it. That margin
+/// is why these assertions can be exact rather than approximate.
+const FLOOD_LINES: u64 = 100_000;
+
+/// The flood's exact size on disk. Exact rather than approximate on purpose: it
+/// lets a test assert that a poll accounted for *every* byte, some returned and
+/// the rest reported as skipped, with none quietly unaccounted for.
+const FLOOD_BYTES: usize = FLOOD_LINES as usize * 13;
+
+/// A step that does something harmless and is not a poll.
+///
+/// Used to put a turn between starting a flood and reading it, which buys the
+/// fixture a second pause to finish writing in. A margin, not a claim: the flood
+/// takes milliseconds and the pauses are seconds, and the reason for two rather
+/// than one is that a runner building and running the whole suite at once can
+/// make a process spawn take absurdly long. It has to be a *different* call from
+/// the poll that follows it, because repeated identical tool calls are a stalled
+/// agent as far as the run loop is concerned and end the run early.
+fn list_root() -> ToolCall {
+    ToolCall {
+        name: "list_dir".into(),
+        arguments: json!({ "path": "." }),
+    }
+}
+
+/// The gap one poll reported, read out of the observation the model was given.
+///
+/// Parsed from the text rather than taken from a return value because the claim
+/// is about what the *model* is told: a poll that bounded its window and kept
+/// the number to itself would satisfy any assertion made against an internal
+/// count while still hiding the gap from the only reader that matters.
+fn skipped_bytes(observation: &str) -> Option<u64> {
+    let at = observation.find(" bytes of older output skipped")?;
+    let head = &observation[..at];
+    let digits = head.len() - head.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    head[head.len() - digits..].parse().ok()
+}
+
+#[tokio::test]
+async fn a_handle_flooding_faster_than_anything_polls_it_keeps_its_process_and_stays_killable() {
+    let flood = example_binary("flood");
+    // Start, then poll once, then kill. Nothing polls during the flood itself:
+    // the mock's pause between turns is far longer than the fixture needs to
+    // write its two and a half megabytes, so by the time anything reads the
+    // handle the whole flood is already sitting in the capture file with no
+    // reader having consumed a byte of it. That is the scenario the criterion
+    // names — output accumulating while nobody is looking.
+    let (store, _dir) = run(
+        vec![
+            vec![start(&format!("{} {FLOOD_LINES}", word(&flood)))],
+            vec![poll(1)],
+            vec![kill(1)],
+        ],
+        allow_tick(),
+    )
+    .await;
+    let id = run_id(&store);
+    let text = transcript(&store, id);
+
+    assert!(
+        text.contains("shell_start handle 1"),
+        "the flood never started, so nothing below is about a flooding handle:\n{text}"
+    );
+    // Not a failure: two and a half megabytes of unread output is an ordinary
+    // amount for a build log and must not turn a poll into an error.
+    assert!(
+        !text.contains("[shell_poll error]"),
+        "polling a handle that had flooded failed:\n{text}"
+    );
+
+    let handles = store
+        .process_handles(id)
+        .expect("the run recorded its handle");
+    // The store rather than the registry, and the distinction is the whole
+    // point: this row says `killed` only if the kill found the handle live. A
+    // process that had died or been lost while flooding would have been noticed
+    // by its reaping task — which is watching the operating system, not the
+    // bookkeeping — and recorded as `exited`.
+    assert_eq!(
+        handles[0].state, "killed",
+        "the handle did not survive its own flood as a live process the run \
+         could still end: {handles:?}"
+    );
+    let pids = handles[0].pids.clone();
+    assert!(
+        !pids.is_empty(),
+        "no pid was recorded, so the check below cannot ask the operating system \
+         anything: {handles:?}"
+    );
+    // And the killing itself is asked of the operating system, for the reason
+    // this whole file gives: the registry believing it killed something is the
+    // failure mode, not the verdict.
+    for pid in pids {
+        let mut gone = false;
+        for _ in 0..100 {
+            if !alive(pid) {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            gone,
+            "pid {pid} outlived the kill; a handle that flooded must stay as \
+             killable as a quiet one"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_single_poll_after_a_flood_returns_one_window_of_the_newest_output_and_reports_the_gap() {
+    let flood = example_binary("flood");
+    // Start and poll, and deliberately no kill: `shell_kill` takes a final read
+    // of its own and records it, and this test wants the store to hold exactly
+    // one poll's return value and nothing else. The handle is ended by the
+    // registry's drop when the run finishes, which
+    // `a_handle_left_running_is_killed_when_the_run_ends` already proves against
+    // the operating system.
+    let (store, _dir) = run(
+        vec![
+            vec![start(&format!("{} {FLOOD_LINES}", word(&flood)))],
+            vec![list_root()],
+            vec![poll(1)],
+        ],
+        allow_tick(),
+    )
+    .await;
+    let id = run_id(&store);
+    let text = transcript(&store, id);
+
+    // The store's copy of a poll is that poll's return value verbatim — it is
+    // written before the observation is bounded for the prompt — so this
+    // measures what the poll handed back rather than what the context had room
+    // for. Which is what the memory claim is about: the poll's own footprint.
+    let captured = store.handle_output(id, 1).expect("the poll was recorded");
+    assert!(
+        !captured.is_empty(),
+        "the poll read nothing at all, so none of this proves anything:\n{text}"
+    );
+    assert!(
+        captured.len() <= POLL_BYTES,
+        "one poll returned {} bytes of a {FLOOD_BYTES} byte flood; the window is \
+         {POLL_BYTES}, and a poll that returns what the process produced rather \
+         than what the window allows is the unbounded case this criterion \
+         forbids",
+        captured.len()
+    );
+    // The end, not the start. A window that kept the beginning would show a
+    // reader the first sixteen kilobytes of a log forever and never the line
+    // that just went wrong.
+    let newest = format!("flood {FLOOD_LINES:06}");
+    assert!(
+        captured.trim_end().ends_with(&newest),
+        "the newest output is what a poll answers with, and this window ends \
+         {:?} instead of {newest:?} (if it ends mid-flood the fixture had not \
+         finished writing, which is a broken test rather than a broken window)",
+        &captured[captured.len().saturating_sub(40)..]
+    );
+    assert!(
+        !captured.contains("flood 000001"),
+        "the very first line of a {FLOOD_BYTES} byte flood came back inside a \
+         {POLL_BYTES} byte window, which cannot happen unless the window is not \
+         being applied"
+    );
+
+    // The gap is reported rather than hidden, and reported to the model. A poll
+    // that silently dropped the older output would leave a reader believing the
+    // sixteen kilobytes it just read were the whole of what the process said.
+    let skipped = skipped_bytes(&text).unwrap_or_else(|| {
+        panic!("the poll never told the model it had skipped anything:\n{text}")
+    });
+    assert_eq!(
+        skipped as usize + captured.len(),
+        FLOOD_BYTES,
+        "the poll accounted for {} of {FLOOD_BYTES} bytes; every byte the process \
+         wrote is either returned or reported as skipped, and the remainder is \
+         output that vanished without anyone being told",
+        skipped as usize + captured.len()
+    );
+}
+
+/// The other half of the window claim, and the one that says what "still
+/// recoverable" actually means here.
+///
+/// `Store::handle_output` holds what polls *read*, appended in order — so the
+/// whole of a handle's output survives the run exactly when no poll had to skip
+/// anything, which is the ordinary shape of a polled process and is what this
+/// asserts. It is deliberately not asserted of the flooding handle above,
+/// because there it would be false: a poll that skips advances the cursor past
+/// the gap, so bytes no poll ever read reach no store. The capture file holds
+/// them until the registry drops, and nothing carries them further.
+#[tokio::test]
+async fn the_whole_stream_is_in_the_trace_when_no_poll_had_to_skip_anything() {
+    let flood = example_binary("flood");
+    // Six and a half kilobytes: real output, comfortably inside one window.
+    const LINES: u64 = 500;
+    // Polled twice and then killed, which reads the handle three times in all —
+    // the kill takes a final read of its own. Not because the stream needs three
+    // reads, but because *which* read catches the output must not be part of the
+    // claim: a runner slow enough to spawn the fixture after the first poll
+    // would otherwise fail a test about recoverability for a reason that has
+    // nothing to do with recoverability. Every read appends to the same trace,
+    // so the assertions below hold whichever of them saw what.
+    let (store, _dir) = run(
+        vec![
+            vec![start(&format!("{} {LINES}", word(&flood)))],
+            vec![poll(1)],
+            vec![poll(1)],
+            vec![kill(1)],
+        ],
+        allow_tick(),
+    )
+    .await;
+    let id = run_id(&store);
+    let text = transcript(&store, id);
+
+    assert!(
+        !text.contains("older output skipped"),
+        "this test is about the case where nothing was skipped, and something \
+         was:\n{text}"
+    );
+    let captured = store.handle_output(id, 1).expect("the poll was recorded");
+    let lines: Vec<&str> = captured.lines().collect();
+    assert_eq!(
+        lines.len(),
+        LINES as usize,
+        "the trace holds {} of the {LINES} lines the process printed; the bound \
+         on a poll is a window on a stream that survives, not a truncation of it",
+        lines.len()
+    );
+    assert_eq!(lines.first().copied(), Some("flood 000001"));
+    assert_eq!(lines.last().copied(), Some("flood 000500"));
+    // In order and with nothing invented in the middle, which is what makes this
+    // a recovery of the stream rather than a count that happens to match.
+    for (i, line) in lines.iter().enumerate() {
+        assert_eq!(*line, format!("flood {:06}", i + 1), "at line {i}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// NF4 — the diagnostics pass is bounded, and never starts when there is
+// nothing to check
+// ---------------------------------------------------------------------------
+
+/// A workspace with one editable file, plus whatever marker files are named.
+fn project(markers: &[(&str, &str)]) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("notes.txt"), "one\n").unwrap();
+    for (path, body) in markers {
+        let p = dir.path().join(path);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, body).unwrap();
+    }
+    dir
+}
+
+/// One `edit_file` through the whole loop, with the run's exec timeout — which
+/// is the diagnostics pass's timeout too — set to `timeout`.
+///
+/// The pass has no timeout of its own and takes no hook: it is called by the
+/// loop with the contract's `exec_timeout`, so that is the only way in from out
+/// here, and it is the honest one — it is the bound a real run would apply.
+async fn run_one_edit(root: &std::path::Path, timeout: std::time::Duration) -> Store {
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![ToolCall {
+        name: "edit_file".into(),
+        arguments: json!({ "path": "notes.txt", "search": "one", "replace": "two" }),
+    }]]);
+    run_with(
+        &TaskContract::workspace("edit one file", root)
+            .with_max_steps(4)
+            .with_exec_timeout(timeout),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    store
+}
+
+#[tokio::test]
+async fn an_edit_whose_check_cannot_finish_in_time_is_reported_as_unchecked_rather_than_clean() {
+    // A real cargo project, so the run detects an ecosystem and the pass chooses
+    // `cargo check` — the most expensive checker in the table, over a cold tree
+    // with no `target/`.
+    //
+    // The timeout is zero, and that is what makes this test deterministic rather
+    // than a race. Zero is a deadline that has already passed when the child is
+    // spawned, so the kill lands on the first poll of that child on any machine:
+    // there is no runner fast enough for `cargo check` to beat it and no loaded
+    // runner for a margin to be too small on. A wall-clock timeout picked to be
+    // "slower than spawning, faster than cargo" would be exactly the flake the
+    // rest of this file avoids.
+    let dir = project(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+        ),
+        ("src/main.rs", "fn main() {}\n"),
+    ]);
+    let began = std::time::Instant::now();
+    let store = run_one_edit(dir.path(), std::time::Duration::ZERO).await;
+    let text = transcript(&store, run_id(&store));
+
+    assert!(
+        text.contains("[check did not run]"),
+        "a check that could not finish must say so; silence reads to a model as \
+         approval:\n{text}"
+    );
+    assert!(
+        text.contains("did not finish within"),
+        "the reason has to be the timeout — if this says `on PATH` instead then \
+         cargo is not reachable on this machine and the bound was never what was \
+         being exercised:\n{text}"
+    );
+    assert!(
+        text.contains("cargo check"),
+        "the model is told which checker went unanswered:\n{text}"
+    );
+    assert!(
+        !text.contains("Diagnostics from"),
+        "a check that never finished has no findings to report:\n{text}"
+    );
+
+    // The edit stands. Asked of the filesystem rather than of the trace: a pass
+    // that is allowed to fail a write is worse than no pass, and the write
+    // happened before the checker was ever spawned.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("notes.txt")).unwrap(),
+        "two\n",
+        "a checker that could not answer turned a successful edit into something else"
+    );
+
+    // A margin, not a claim. Nothing here measures how fast the pass is; what it
+    // catches is a pass that ignored its bound and waited for a real cold
+    // `cargo check`, which on a slow runner is minutes.
+    assert!(
+        began.elapsed() < std::time::Duration::from_secs(60),
+        "the edit took {:?}, which is not a bounded diagnostics pass",
+        began.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn an_edit_in_a_project_with_no_ecosystem_spawns_no_checker_at_all() {
+    // The same run as the test above in every respect but one: this workspace
+    // has no marker file, so detection finds nothing and the pass has no check
+    // command to choose.
+    //
+    // The zero timeout is what turns silence into evidence. Any checker spawned
+    // under it is killed before it can answer and comes back as a failure, which
+    // the loop appends to the observation as `[check did not run]` — the test
+    // above is that exact path in that exact shape, differing only by the marker
+    // files. So an observation with no note in it here is not "something ran and
+    // was happy"; it is a checker that was never started.
+    let dir = project(&[]);
+    let store = run_one_edit(dir.path(), std::time::Duration::ZERO).await;
+    let text = transcript(&store, run_id(&store));
+
+    assert!(
+        text.contains("[edited notes.txt]"),
+        "the edit has to have happened, or this is asserting the absence of \
+         diagnostics for an edit that never occurred:\n{text}"
+    );
+    assert!(
+        !text.contains("[check did not run]"),
+        "a checker was spawned in a workspace with nothing to check:\n{text}"
+    );
+    assert!(
+        !text.contains("Diagnostics from"),
+        "a checker ran and reported findings in a workspace with no ecosystem:\n{text}"
+    );
 }
