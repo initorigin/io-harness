@@ -1,0 +1,331 @@
+product: io-harness
+version: 0.30.0
+release_type: minor
+status: planned
+
+outcome:
+  user_can: >
+    Ask the store *why*, for three questions it can already answer the *what* of and cannot
+    currently answer the rest.
+
+    **Which layer set this setting.** `Config` merges defaults, user, project and local, and
+    `Config::sources()` (src/config.rs:716) returns the files it read — `&[(Scope, PathBuf)]`, the
+    list of inputs, not the decision. So a caller can print a resolved value and cannot print where
+    it came from, which is exactly the half a reader needs when a project scope has narrowed
+    something they set in their own file. After this release a resolved key carries the scope that
+    decided it and the path of the file within that scope.
+
+    **Why a fact is remembered.** `MemoryEntry` carries `key`, `value`, `run_id`, `step` and
+    `created_at`. It cannot say whether an entry is a decision somebody made or an incidental fact a
+    run observed; a human cannot pin one so later runs stop re-litigating it; and nothing records
+    that *this* run recalled it. The type gains a kind, a pinned flag that a run may not overwrite,
+    and a recall record, so a caller listing what the agent knows about a workspace can say which
+    of it was load-bearing this time.
+
+    **How often gates fail, and what recovery caught.** 0.18.0 shipped grouped raw rows for cost —
+    by model, by day, by run — and deliberately stopped there, leaving every rendering to the
+    consumer. Nothing groups *outcomes*. The verified-first-try rate, which criterion fails most
+    often, and how many runs a provider fallback, a stall replan or a crash resume rescued are all
+    recorded in the trace and none of them is queryable. Each becomes one grouped accessor beside
+    the ones `pricing` already ships, under the same rule: the crate returns rows and renders
+    nothing.
+  business_value: >
+    Every one of the three is a question an embedding application has to answer on a screen, and
+    every one of them currently forces that application to re-derive the answer from raw rows —
+    which means each application derives it slightly differently, and the crate that holds the data
+    has no way to be wrong out loud when one of them gets it subtly wrong.
+
+    The settings case is the sharpest. 0.27.0 made the project scope able to narrow a boundary and
+    never widen one, which is a real safety property and an invisible one: a user who set something
+    in their own file and finds it overridden has no way to learn that from the crate. "Where did
+    this value come from" is the question the four-scope design creates and the only one it does not
+    answer.
+
+    The memory case is smaller and the same shape. 0.10.0's argument for durable memory was that a
+    second run should not rediscover what the first established. A flat list of strings is enough
+    for the agent and not enough for the human deciding whether the agent has learned something
+    wrong — and there is currently no way for that human to pin a correction so a run stops arguing
+    with it.
+
+    The aggregates case is where the crate is closest to already doing it. `src/pricing.rs` grouped
+    cost three ways and drew the line correctly. But the same trace holds outcomes, gate results and
+    every recovery event, and re-deriving those in each consumer is the exact duplication the cost
+    grouping exists to avoid.
+
+    It lands first among the seven planned releases because it is the smallest, it breaks nothing,
+    and it is the only one whose absence makes an application *lie*. A panel showing a spend figure
+    whose provenance is unrecoverable, or a success rate computed differently by two callers, is
+    worse than a panel that is not there yet.
+  evidence_of_value: >
+    A single `io.toml` set written across all four scopes, where the same key is set in more than
+    one, resolving to a value whose reported origin is the scope and file that actually decided it —
+    verified against a fixture whose answer is known by construction rather than by reading the
+    implementation back.
+
+    A memory entry written as a decision, pinned by hand, and left unchanged by a subsequent run
+    that tries to overwrite it; and a recall record that names the run that recalled it.
+
+    And the aggregates computed over a trace with a known composition — a fixed number of runs, a
+    known number of first-try passes, a known distribution of gate failures, a known count of
+    fallbacks, replans and resumes — asserted against those known numbers. An aggregate checked
+    against itself proves nothing.
+
+scope:
+  included:
+  - >
+    **Per-key configuration provenance.** A resolved key reports the `Scope` that decided it and the
+    path of the file within that scope. It is an addition beside `Config::sources()`, not a change
+    to it — that method answers "which files were read" and stays answering it. The provenance
+    covers a key set in more than one scope, a key that only exists in defaults, and a key whose
+    value came from a `${env:}` or `${cmd:}` substitution, where the origin is the file the
+    substitution was written in rather than the environment it read.
+  - >
+    **`MemoryEntry` gains a kind, a pinned flag, and a recall record.** The kind distinguishes a
+    decision from a fact; it is `#[non_exhaustive]` from the line it exists, so a third kind later
+    is additive. The pinned flag is set by a caller and never by a run: a pinned entry is not
+    overwritten by `memory.write`, and the attempt is an observable event rather than a silent
+    no-op — a run that believes it corrected something and did not is the failure this flag exists
+    to prevent. The recall record is per run, so "what did this run actually use" is answerable
+    afterwards.
+  - >
+    **Outcome, gate and recovery aggregates.** Grouped accessors on `Store`, in the shape
+    `src/pricing.rs` already established: runs by outcome and by day; a first-try pass rate; gate
+    failures grouped by criterion; and recovery grouped by kind — fallback, replan, resume,
+    escalation. Rows out, no rendering, no derived opinion. Where a number cannot be computed
+    honestly from what the trace holds, the accessor does not exist rather than returning a
+    plausible one.
+  - >
+    **A store migration, additive.** The recall record and the pinned flag are stored state that
+    does not exist today. A new table and a nullable column rather than a rewrite, so a 0.29.0
+    database opens and resumes unchanged and a 0.29.0 binary reads a 0.30.0 store — the reason
+    0.25.0 gave for a new table over a `CHECKPOINT_FORMAT` bump applies here in the same words: an
+    older binary never queries it.
+  - >
+    **The public-surface snapshot and a worked example per added item**, as `docs/public-api.txt`
+    and the test behind it require of every release. Nothing here is renamed or removed, so no
+    deprecation cycle is needed and none is invented.
+  - >
+    **The guide pages that describe these three.** `guide/configuration.md`,
+    `guide/context-and-memory.md` and `guide/accounting.md` each gain the section that makes the new
+    surface findable — a capability documented only in rustdoc is a capability only a reader who
+    already knows it exists will find.
+
+  excluded:
+  - >
+    Any rendering. No streak, no heat map, no chart, no formatted report. The crate returns grouped
+    rows and the consuming application decides what they look like — the same line 0.18.0 drew, and
+    for the same reason.
+  - >
+    A memory *search*. Kind, pinned and recall are metadata on an entry; retrieval by similarity is
+    a different capability with a different argument and is not smuggled in behind this one.
+  - >
+    A configuration *writer*. Reporting which scope set a key is not the same as editing that file,
+    and an application that edits `io.toml` is doing something the crate deliberately does not do
+    for it.
+  - >
+    Anything from the six releases that follow. The plan gate, reasoning effort, the agent queue,
+    attaching to a live run, the review gate, plugins, and branch and worktree each belong to a
+    named later version.
+
+  fallback_scope:
+  - >
+    Per-key configuration provenance, and the memory kind and pinned flag.
+  - >
+    Dropped under the fallback and moved to 0.31.0: the recall record, and the outcome, gate and
+    recovery aggregates.
+  - >
+    This is still a coherent release, and the choice of what survives is not arbitrary. Provenance
+    and pinning are the two that change what a *person* can do — learn where a setting came from,
+    and correct something the agent has learned wrong. The aggregates change what an application can
+    *display*, which matters and matters later. The store migration shrinks to one nullable column,
+    which is the cheapest thing in the release to defer.
+
+acceptance:
+  functional:
+  - >
+    **F1 — provenance across four scopes.** A fixture setting the same key in defaults, user,
+    project and local resolves to the local value and reports the local scope and that file's path.
+    Removing the local file makes it report project, and so on down. Asserted at each of the four
+    steps, so the test discriminates between "reports the last scope" and "reports the deciding
+    scope" — which are the same answer only when the key is set everywhere.
+  - >
+    **F2 — provenance through substitution.** A key whose value came from `${env:}` reports the file
+    the substitution was written in, not the environment variable and not the process environment.
+    A key whose value came from `${cmd:}` does the same. The negative control is the same key
+    written literally, which must report the identical origin — if it does not, the implementation
+    is reporting the mechanism rather than the source.
+  - >
+    **F3 — a project scope that narrowed a user's setting is visible.** The case 0.27.0's trust rule
+    creates: a boundary set in the user scope and narrowed in the project scope resolves to the
+    project value and reports the project file. This is the specific question the whole feature
+    exists to answer and it gets its own named test.
+  - >
+    **F4 — kinds round-trip.** A decision written and read back is a decision; a fact is a fact. The
+    enum is `#[non_exhaustive]`, and a test asserts an exhaustive census of its variants against the
+    source the way `EVENT_NAMES` is asserted against `EventKind` — the 0.28.0 lesson that a match
+    arm proves exhaustiveness and a hand-written list does not.
+  - >
+    **F5 — a pinned entry survives a run that tries to overwrite it.** After the run, the value is
+    the pinned one, and the attempt is in the trace as an observable event. Both halves are
+    asserted: a silent refusal would leave the agent believing it had corrected something.
+  - >
+    **F6 — the recall record names the run.** A run that recalls three of six entries produces a
+    record naming those three and that run, and a second run over the same workspace produces its
+    own record without disturbing the first.
+  - >
+    **F7 — the aggregates are right against a known trace.** A fixture store built with a known
+    composition — a fixed number of runs, a known number of first-try passes, a known distribution
+    of gate failures, and a known count of fallbacks, replans and resumes — produces exactly those
+    numbers. The expected values come from the fixture's construction, never from running the
+    accessor and recording what it said.
+  - >
+    **F8 — cross-version compatibility, both directions.** A database written by a real 0.29.0 build
+    opens, resumes and replays under 0.30.0 with nothing to migrate; and a 0.30.0 store is read by a
+    0.29.0 build, which never queries the new table. Proven with a pinned 0.29.0 fixture generator,
+    the way `tests/cross_version.rs` already proves it for the 0.22.0 boundary — never with a
+    database this tree wrote and labelled.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` on macOS and Linux is unchanged. This release is three
+    accessors, two fields and a table; anything it needs is already here.
+  - >
+    **N2 — the aggregates do not scale with the trace.** Each is one indexed query, not a table
+    scan the caller pays for on every render. Measured against a store with a large trace and the
+    number recorded; the point is that a panel refreshing does not get slower as history grows.
+  - >
+    **N3 — nothing breaks.** No public item is renamed or removed, no signature changes, no default
+    changes. `docs/public-api.txt` gains lines and loses none, and the changelog carries no
+    `**BREAKING` entry. If one becomes necessary the release is wrong, not the rule.
+  - >
+    **N4 — every added public item carries a worked example**, enforced by the existing test that
+    enumerates the surface re-exported from `lib.rs` and fails on any item whose docs carry no
+    fenced example.
+  operational:
+  - >
+    **O1 — the three-OS matrix is green** on the commit being released, including the MSRV job.
+  - >
+    **O2 — docs.rs builds.** Checked by the nightly job, because a stable `cargo doc` passing is not
+    evidence that docs.rs does — the 0.16.2 lesson, which cost two releases without a rendered page.
+  - >
+    **O3 — `cargo package --locked` succeeds**, and the packaged crate's tests compile.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.30.0, GitHub at initorigin/io-harness with the tag `v0.30.0` and a
+    Release titled `io-harness 0.30.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.30.0` off `develop`, including the sealed UltraShip
+    release record. PR into `develop`, merged with the PR button. Release PR `develop` into `main`,
+    merged the same way. The GitHub Release is cut by `release.yml` — `gh workflow run release.yml
+    --ref main -f version=0.30.0` — which takes its notes verbatim from the changelog. `cargo publish
+    --locked` by hand afterwards, always last, after both merges and the Release exist. `develop`
+    synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    Nothing breaks. Every added item is a new name or a new field on a type the crate already
+    documents as constructed through `..Default::default()`. `Provider`, `Policy`, `Verification`
+    and every trait are untouched.
+  - >
+    One additive store change: a new table for the recall record and a nullable column for the
+    pinned flag. `CHECKPOINT_FORMAT` does not move, for the reason 0.25.0 recorded — an older binary
+    never queries the new table, so bumping the format would refuse a database that is in fact
+    readable.
+  - >
+    A 0.29.0 database opens, resumes and replays unchanged. A 0.29.0 binary reads a 0.30.0 store.
+    Both directions are asserted rather than assumed.
+  observability:
+  - >
+    A refused overwrite of a pinned memory entry is an observable event, not a silent no-op. This is
+    the one behaviour in the release a caller could otherwise be wrong about without noticing.
+  - >
+    The recall record is itself the observability for memory: which entries a run drew on is
+    answerable after the run from the store, without an observer attached at the time.
+  - >
+    The aggregates are read-only over data the trace already holds. This release records no new
+    event kind and emits nothing new during a run.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.30.1 and `cargo yank --version
+    0.30.0` is the escape hatch, leaving 0.29.0 as what `cargo install` resolves. A consumer
+    reverting to 0.29.0 keeps every database — the new table is simply never queried — and loses the
+    provenance accessor, the memory metadata and the aggregates. No file, no configuration and no
+    stored format has to be rewritten to go back, which is the property that makes this release safe
+    to try.
+
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - The `feat/0.30.0` → `develop` pull request
+  - The `develop` → `main` release pull request
+  - The crates.io publish, by hand, last
+
+resource_profile:
+  complexity: medium
+  uncertainty: low
+  likely_cost_drivers:
+  - >
+    Threading provenance through the merge. The merge itself is small; carrying the deciding scope
+    for every key through `${env:}` and `${cmd:}` substitution, through `[profile.<name>]` overlay,
+    and through the project-scope trust rule without changing what any of them resolve to is where
+    the work is.
+  - >
+    The cross-version fixtures. A pinned 0.29.0 generator has to be built and its output recorded
+    before the schema moves, and getting that ordering wrong means the fixtures measure this tree
+    against itself.
+  - >
+    Deciding which aggregates can be computed honestly. Several plausible ones — a per-model
+    verified rate, a cost-per-verified-run — need attribution the trace does not carry, and finding
+    that out costs more than writing the ones that do.
+  preferred_tools:
+  - The existing test suite and its fixture conventions
+  - A pinned 0.29.0 build as fixture generator, the way `tests/fixtures/gen-0.22.0` already works
+  - The three-OS CI matrix, including the MSRV job
+  constraints:
+  - No new runtime dependency
+  - No public item renamed or removed; no `**BREAKING` changelog entry
+  - No store format bump; additive schema only
+  - >
+    The crate returns rows and renders nothing — the line `src/pricing.rs` drew, held here without
+    exception
+
+risks:
+  - >
+    **Provenance may be a bigger change to the merge than it looks.** The merge currently produces a
+    value; producing a value *and* its origin, through substitution and profile overlay, may mean
+    touching every path rather than wrapping the result. Mitigation: the shape is decided against
+    the code before anything is built, and if it cannot be done without changing what a key resolves
+    to, the feature is wrong and the release is re-scoped rather than the resolution being altered
+    to fit it.
+  - >
+    **An aggregate that cannot be computed honestly is worse than a missing one.** The temptation is
+    to return a plausible number where attribution is incomplete. Mitigation: each accessor is
+    written against a fixture whose answer is known by construction, and one that cannot be made to
+    agree with a known-composition trace is not shipped. `Spend::unpriced_calls` is the precedent —
+    the crate already prefers reporting a gap to filling it.
+  - >
+    **A pinned entry is a new way for a run to be silently wrong.** If an overwrite is refused and
+    nothing says so, the agent proceeds believing it corrected something. Mitigation: the refusal is
+    an observable event and F5 asserts both halves.
+  - >
+    **Fixture ordering.** If the 0.29.0 generator is built after the schema moves, the cross-version
+    test measures this tree against itself and passes for the wrong reason. Mitigation: the pinned
+    generator and its recorded output are the first commit of the release, before any schema change.
+
+open_questions:
+  - >
+    Whether provenance is reported per key on demand or as a map produced once at load. On demand is
+    a smaller surface; a map is cheaper for a consumer rendering a whole settings list, which is the
+    known use. Decided against the merge code early in development and recorded either way.
+  - >
+    Whether the memory kind should carry a third variant now — an observation, distinct from a fact
+    somebody asserted. `#[non_exhaustive]` means it can arrive later without a break, which is the
+    argument for deciding it when there is a caller rather than now.
+  - >
+    Whether a recovery aggregate should count an escalation as recovery. An escalation is the
+    opposite of a rescue — it is the run giving the problem back to the caller — and grouping it
+    beside fallbacks and replans may read as success. Likely reported as its own row rather than
+    inside the recovery total; confirmed while writing the accessor.
