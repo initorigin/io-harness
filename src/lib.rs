@@ -332,6 +332,7 @@ pub mod containment;
 pub mod context;
 mod contract;
 mod error;
+pub mod hooks;
 pub mod mcp;
 mod net;
 pub mod observe;
@@ -359,6 +360,7 @@ pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
 pub use context::ContextBudget;
 pub use contract::TaskContract;
 pub use error::{Error, ProviderErrorKind, Result};
+pub use hooks::Hooks;
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // The `net` module itself stays private, so the default request deadline is
 // surfaced here as well as from each provider module. A caller overriding it with

@@ -239,6 +239,15 @@ struct File {
     profile: BTreeMap<String, File>,
     #[serde(default)]
     instructions: Option<InstructionsSection>,
+    // 0.28.0. Lifecycle hooks over the observer channel. Refused in the project
+    // scope whole rather than by action, for the reason `${cmd:}` is: `io.toml` is
+    // the file a `git clone` delivers, and both a hook that runs an argv and a hook
+    // that appends to a path the file chose are things a stranger should not be able
+    // to make this process do. Deliberately *not* in `APPENDING`: a later scope
+    // replaces the set whole, so the hooks that run are the hooks of one file rather
+    // than a pile assembled from three.
+    #[serde(default)]
+    hook: Vec<crate::hooks::Hook>,
 }
 
 /// Which provider a run uses, as a value a configuration can carry (0.27.0).
@@ -423,6 +432,13 @@ pub struct Config {
     /// [`Config::discover`], which is the caller's own call — the run loop never
     /// reads a file.
     instructions: Vec<String>,
+    /// The root a `[[hook]]`'s relative `append` path resolves against (0.28.0).
+    ///
+    /// The *discovery root*, not the declaring file's directory, and the two are the
+    /// same thing for a local-scope file. It matters for a user-scope one, where an
+    /// operator writing `append = "audit.jsonl"` means the project they are pointing
+    /// the harness at rather than their own home directory.
+    dir: PathBuf,
 }
 
 impl Config {
@@ -470,6 +486,7 @@ impl Config {
             sources,
             raw: merged,
             instructions,
+            dir: root.to_path_buf(),
         })
     }
 
@@ -498,11 +515,15 @@ impl Config {
         let path = Path::new(PROJECT_FILE);
         let table = parse(Scope::Project, text, path)?;
         refuse_widening(&table, path)?;
+        let file: File = deserialize(toml::Value::Table(table.clone()), path)?;
+        refuse_nested_profiles(&file, path)?;
+        crate::hooks::Hooks::check(&file.hook, path)?;
         Ok(Self {
-            file: deserialize(toml::Value::Table(table.clone()), path)?,
+            file,
             sources: Vec::new(),
             raw: table,
             instructions: Vec::new(),
+            dir: PathBuf::from("."),
         })
     }
 
@@ -559,6 +580,7 @@ impl Config {
             sources: self.sources.clone(),
             raw: merged,
             instructions: self.instructions.clone(),
+            dir: self.dir.clone(),
         })
     }
 
@@ -964,6 +986,42 @@ impl Config {
             .fold(crate::agent::Agents::new(), |roster, def| roster.with(def))
     }
 
+    /// The `[[hook]]` tables of this configuration, as an [`Observer`](crate::Observer)
+    /// (0.28.0).
+    ///
+    /// Empty where the file declared none, which is the rule every accessor in this
+    /// module holds: the file saying nothing stays distinguishable from the crate
+    /// choosing something. The caller installs the result — `run_observed`,
+    /// `resume_observed` or any of the tree forms — so a hook obeys the same
+    /// "nothing happens implicitly" rule as every other projection here.
+    ///
+    /// A relative `append` path resolves against the discovery root this
+    /// configuration was loaded for, so a user-scope hook writes its log beside the
+    /// project it is watching rather than beside itself.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// std::fs::write(
+    ///     dir.path().join("io.local.toml"),
+    ///     "[[hook]]\non = [\"finished\"]\nrun = [\"cargo\", \"fmt\"]\n",
+    /// )?;
+    ///
+    /// let config = Config::discover(dir.path())?;
+    /// assert!(!config.hooks().is_empty());
+    ///
+    /// // The same table in the committed file is refused: `io.toml` arrives with a clone.
+    /// let err = Config::from_toml("[[hook]]\nrun = [\"cargo\", \"fmt\"]\n").unwrap_err();
+    /// assert!(err.to_string().contains("may not declare hooks"), "{err}");
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn hooks(&self) -> crate::hooks::Hooks {
+        crate::hooks::Hooks::new(self.file.hook.clone(), &self.dir)
+    }
+
     /// The prompt-template directory this configuration points at, if any (0.21.0).
     ///
     /// Discovery is the caller's to do — [`Templates::discover`](crate::Templates) is
@@ -1147,6 +1205,7 @@ fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     // but an error found now can name this file rather than "<merged>".
     let file: File = deserialize(toml::Value::Table(table.clone()), path)?;
     refuse_nested_profiles(&file, path)?;
+    crate::hooks::Hooks::check(&file.hook, path)?;
     Ok(table)
 }
 
@@ -1188,11 +1247,23 @@ const PROJECT_WIDENING: &[(&[&str], &str)] = &[
 /// What this does **not** claim: that a cloned repository is safe. `[[mcp]]` still
 /// names a command and `[toolchain]` still names an argv, and the boundary against
 /// the agent is still the [`Policy`] the caller loaded. This is a specific narrowing
-/// of a specific hazard — four keys and `${cmd:}`, no more.
+/// of a specific hazard — four keys, `${cmd:}` and `[[hook]]`, no more.
 ///
 /// Profile bodies are checked too. A widening key hidden in `[profile.x.sandbox]`
 /// would otherwise reach the same place by a different path.
 fn refuse_widening(table: &toml::value::Table, path: &Path) -> Result<()> {
+    // 0.28.0. The whole array, not its executing half: `run` is the `${cmd:}`
+    // primitive by another name, and `append` is a write to a path the file chose,
+    // which is the same hazard by a shorter route. Refusing one and allowing the
+    // other would be a rule a reader has to hold two halves of.
+    if table.contains_key("hook") {
+        return Err(Error::Config(format!(
+            "{}: key `hook`: a project-scoped file may not declare hooks, because a hook \
+             runs or writes on this machine and `{PROJECT_FILE}` arrives with a `git clone`. \
+             Write it in `{LOCAL_FILE}` or the user-scope file instead.",
+            path.display()
+        )));
+    }
     for (keys, widening) in PROJECT_WIDENING {
         let mut node = table.get(keys[0]);
         for key in &keys[1..] {
