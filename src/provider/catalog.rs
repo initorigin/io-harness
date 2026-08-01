@@ -20,7 +20,7 @@
 //!
 //! **A reference price is not the vendor's price.** It is what the aggregator
 //! charges to serve that model, which tracks the vendor's rate closely and is not
-//! identical to it. So every price carries a [`PriceSource`](super::PriceSource)
+//! identical to it. So every price carries a [`PriceSource`]
 //! and an operator reading a cost can tell which they have.
 //!
 //! **A miss stays `None`.** Matching crosses naming schemes — the reference says

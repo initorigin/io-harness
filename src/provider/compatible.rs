@@ -4,7 +4,7 @@
 //!
 //! `openai.rs` is 159 lines and `openrouter.rs` is 161, and they are the same
 //! file apart from four strings: the endpoint, the `name()` literal, the
-//! [`WebFlavor`] variant, and two environment variable names. Everything that
+//! `WebFlavor` variant, and two environment variable names. Everything that
 //! does work — the request body, the SSE parsing, the tool-call accumulation —
 //! already lives in a shared, crate-private `openai_wire`.
 //!
@@ -428,7 +428,7 @@ impl Provider for Compatible {
 
 /// The named constructors.
 ///
-/// One line each over [`PRESETS`], so the table stays the single source of the
+/// One line each over the crate-private preset table, so it stays the single source of the
 /// base URL and the auth style while a misspelled vendor is a compile error
 /// rather than a runtime `Result`. They answer different questions and that is
 /// why both exist.
