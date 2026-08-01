@@ -521,7 +521,31 @@ record, and the text is live-only.
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.31.0.
+is fixed as of 0.32.0.
+
+**The concurrency cap is per tier, not per tree (0.32.0).**
+`Containment::max_concurrent_agents` bounds how many agents work at once *at one
+nesting level*. Each tier holds its own set of slots, which is what makes the cap
+safe rather than what makes it convenient: a parent holds a slot at its own tier
+while it waits for children at the tier below, so the wait graph runs strictly
+downward and cannot contain a cycle. One tree-global pool would deadlock the first
+time the agent holding the last slot spawned a child, because only that child
+could free it. The consequence, plainly: a tree of depth *d* can hold up to
+`max_concurrent_agents * d` agents working at once, not `max_concurrent_agents`.
+Bound the whole tree with `max_total_agents`, which refuses, and with
+`max_total_tokens`, which halts.
+
+**The queue is FIFO and has no other policy (0.32.0).** A child queued behind
+`max_concurrent_agents` starts when a slot frees, in the order it queued. There is
+no priority, no reordering, no way for an application to promote or cancel a
+waiting child, and no fairness rule between the parents feeding one tier. A queue
+with a policy is a scheduler; this is not one.
+
+**A queued child is a row, not an agent (0.32.0).** It has no run id, no steps and
+no spend, which is what "a queued child that never started is not charged" means —
+and also what it costs: `Store::children` will not list it, `Store::agent_events`
+has nothing to say about it, and it emits no events of its own until it is
+admitted. `Store::queued_agents` is the only place it appears, by goal.
 
 **The plan gate is a boundary on the agent, not on the caller (0.31.0).** The
 `plan-gate` policy layer holds for the duration of the run's own loop. The
@@ -1011,14 +1035,13 @@ runtime degrades to the portable floor — this is live on Ubuntu 24.04, where
 the floor honestly in the returned `Selected`, so read that value rather than
 assuming the platform's native backend is what ran.
 
-**What the trace says a tree ran under.** `run_tree` and the single-file and
-workspace loops record the policy they execute under, so the store answers "what
-boundary was in force". `resume_tree` does not: it takes a policy as an argument
-and executes under it, but leaves the recorded policy as whatever the run
-started with. A tree resumed under a *widened* policy therefore leaves an audit
-that understates what was permitted. `resume_tree_from_stored_policy` is
-unaffected — it reads that same row back, so what is recorded is what runs — and
-it is the entry point to prefer when the boundary matters.
+**What the trace says a tree ran under.** `run_tree`, `resume_tree` and the
+single-file and workspace loops all record the policy they execute under, so the
+store answers "what boundary was in force". `resume_tree` did not, until 0.32.0:
+it took a policy as an argument and executed under it while leaving the recorded
+policy as whatever the run started with, so a tree resumed under a *widened*
+policy left an audit that understated what was permitted. Fixed in 0.32.0, which
+was already in that function for the fleet queue.
 
 **What a plan is, and is not (0.21.0).** The `todo_write` tool holds the agent's
 plan in a `todos` table, replaced wholesale on every write.

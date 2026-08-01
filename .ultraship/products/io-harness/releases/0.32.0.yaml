@@ -1,0 +1,431 @@
+product: io-harness
+version: 0.32.0
+release_type: minor
+
+outcome:
+  user_can: >
+    Give a fleet a size and a shape, and have it hold the ceiling instead of hitting it.
+
+    Until now `Containment` had one agent limit that did two jobs badly. `max_total_agents` refused
+    the spawn that crossed it — `SpawnRefusal::AgentCap` — so a task that wanted a hundred agents
+    failed at its hundred-and-first child rather than running a hundred at a time until it was done;
+    and `max_concurrent` was only ever a per-step `buffered()` bound inside one parent's fan-out,
+    invisible to the rest of the tree.
+
+    0.32.0 separates the two. `max_concurrent_agents` **throttles**: a spawn past it does not fail,
+    it takes a place in a FIFO queue for its tier and starts when a slot frees. `max_total_agents`
+    still **refuses**, alongside the spend and the time ceilings, because some limits are meant to
+    stop a run and some are meant to shape it. A caller who wants a fleet of five hundred children
+    four at a time now writes `Containment { max_total_agents: 501, max_concurrent_agents: 4, .. }`
+    and gets exactly that.
+
+    The fleet is visible while it drains. `EventKind::Fleet { tier, working, queued, done }` reaches
+    the `Observer` on every admission, every enqueue and every completion, counted per tier, so an
+    application shows a number that is moving rather than one that stopped.
+
+    The queue is durable. Waiting is recorded in the store, not only in memory, so a process that
+    dies with four hundred children queued comes back up and reports the backlog it had — at the
+    tier it had — before it makes a single provider call. And a child that only ever waited is not
+    charged: it has no run row, no step row and no tokens against the tree's ceiling, because
+    nothing about it was started.
+
+  business_value: >
+    This is the difference between a harness that can express a fleet and one that can only express
+    a small team. Every application built on `run_tree` — a CLI running a repo-wide migration, a
+    studio fanning a review across three hundred files — wants the same two numbers: how many agents
+    may exist, and how many may work at once. Conflating them forced the operator to choose between
+    a cap so low the work does not finish and one so high the machine and the token budget are both
+    gone in a minute.
+
+    The per-tier counters are what makes a long fan-out watchable. An operator staring at a
+    twenty-minute fleet needs to know it is draining; a stalled number and a finished number look
+    identical, and only one of them is worth waiting for.
+
+    The durable queue is what makes a fleet worth starting on a machine that might reboot. Four
+    hundred queued children that vanish on a restart are four hundred decisions the model has to
+    make again, at full token price, and a backlog no operator can see.
+
+  evidence_of_value: >
+    Executed rather than argued. A fan-out of 120 children under `max_concurrent_agents: 8`
+    completes with every child run and a measured peak that never exceeds 8, where the same fan-out
+    under 0.31.0's `max_total_agents: 8` refuses 112 of them. A killed process leaves its queue in
+    the store and a second process, which never saw the first, reports the backlog before its
+    provider is called once. The queued children that never started have no rows in `runs` and
+    contribute nothing to `spent_tokens_tree`.
+
+scope:
+  included:
+  - >
+    `Containment::max_concurrent` renamed to `max_concurrent_agents` and given the meaning it never
+    had: a tree-wide, per-tier throttle rather than a per-step `buffered()` width. `#[serde(alias =
+    "max_concurrent")]` so an operator's stored configuration keeps deserialising.
+  - >
+    A FIFO admission queue in `Ledger`, one `tokio::sync::Semaphore` per tier, with the tier
+    structure as the deadlock argument: a parent holds a slot at its own tier and waits only on the
+    tier below it, so the wait graph cannot contain a cycle. A single tree-global semaphore would
+    deadlock the first time a depth-1 agent holding the last slot spawned a child.
+  - >
+    Per-tier `working` / `queued` / `done` counters, readable synchronously from the ledger
+    (`Ledger::tally`, returning the new `FleetTally`) and pushed to the observer as
+    `EventKind::Fleet`.
+  - >
+    A durable queue: an `agent_queue` table keyed uniquely by `(parent_run_id, step, goal)`, written
+    when a child starts waiting and deleted when it is admitted. `Store::queued_agents` reads a
+    tree's backlog back in FIFO order.
+  - >
+    Restoration on resume: `resume_tree_observed` reads the backlog from the store, seeds the
+    ledger's per-tier counts from it, and emits one `EventKind::Fleet` per non-empty tier before the
+    provider is authorised or called. A replayed spawn that re-queues an entry the store already
+    holds reuses the row and is not counted twice — the reuse is what makes the restored depth the
+    store's number and not a re-derived one.
+  - >
+    Admission covers adopted children too, not only fresh ones, so the throttle is the same number
+    before and after a restart.
+  - >
+    The standing defect that `resume_tree_observed` never called `record_run_policy`, fixed: this
+    release is already in that function.
+  excluded:
+  - >
+    Priority, fairness beyond FIFO, or a queue an application can reorder. A queue with a policy is
+    a scheduler, and a scheduler is a release of its own.
+  - >
+    Cross-tier borrowing of slots (a quiet tier lending capacity to a busy one). It makes the
+    deadlock argument a proof obligation instead of a structural fact, for a gain nobody has asked
+    for.
+  - >
+    A cancel-a-queued-child API. Dropping the tree already drops the waiters, and a queued child has
+    nothing to clean up because nothing about it was started.
+  - >
+    Making `max_total_cost` live. It is still inert for the reason it has always been inert: there
+    is no price telemetry.
+  fallback_scope:
+  - >
+    `max_concurrent_agents` throttles tree-wide per tier with a FIFO queue, `max_total_agents` still
+    refuses, and `EventKind::Fleet` carries the per-tier counters. Durability drops to the store
+    rows existing and being readable, without the resume-time restoration into the ledger. That is
+    still a coherent release: the cap does the thing the outcome names, and the backlog is a fact on
+    disk rather than a fact only in a dead process's memory.
+
+acceptance:
+  functional:
+  - >
+    **F1 — the concurrency cap throttles and does not refuse.** A 120-child fan-out under
+    `Containment { max_total_agents: 200, max_concurrent_agents: 8, .. }`: all 120 children run to
+    completion, `store.children(root)` holds 120 rows, no `EventKind::SpawnRefused` is emitted, and
+    an in-flight probe's measured peak is greater than one and never above eight. Its negative
+    control is the same fan-out under `max_total_agents: 8`, which must refuse 112 spawns with
+    `SpawnRefusal::AgentCap` — without it the test would pass against a harness that had simply
+    stopped enforcing anything.
+  - >
+    **F2 — the total cap still refuses, and the two caps are independent.** `max_total_agents: 8`
+    with `max_concurrent_agents: 64` refuses at eight; `max_total_agents: 200` with
+    `max_concurrent_agents: 1` refuses nothing and runs strictly one child at a time (measured peak
+    exactly one). Two named tests. A single test moving both numbers together could not tell which
+    cap produced the behaviour.
+  - >
+    **F3 — a queued child is not charged.** After a fan-out is killed mid-flight with the queue
+    non-empty: every goal named in `Store::queued_agents` has no row in `runs` — asserted as a set
+    difference against `Store::children`, so a queued goal appearing there fails — and
+    `Store::spent_tokens_tree` equals the sum of the `steps.tokens` rows of the children that
+    actually started, computed independently in the test. Asserted against the spend rows, not
+    against the ledger counter, because the counter and the rows are two different claims and only
+    the rows outlive the process.
+  - >
+    **F4 — the queue survives a real restart at the depth it had, and the depth comes from the
+    store.** `examples/fleet_fixture` runs a fan-out under `max_concurrent_agents: 1` whose admitted
+    child parks forever, then parks itself; the test kills it with SIGKILL and opens the store in
+    its own process. `Store::queued_agents` returns the waiting children, at their tier, in the
+    order they queued.
+
+    The discriminating assertion is an absence. Before resuming, the test deletes exactly one
+    `agent_queue` row. The resumed run's first `EventKind::Fleet` must report a backlog one smaller
+    than the fixture left — and it must arrive before the resumed provider has been handed a single
+    `CompletionRequest`. A depth silently re-derived from the replayed spawn calls would be
+    unchanged by the deletion and could not exist before the first provider call; both facts are
+    asserted, because either alone passes on a re-derivation.
+  - >
+    **F5 — a replayed spawn does not double the backlog.** After the resume in F4 completes, no two
+    `agent_queue` rows share a `(parent_run_id, step, goal)` — structurally impossible under the
+    unique index, so the assertion is on the *counter*: the ledger's queued tally after the replay
+    equals the restored depth rather than twice it. The re-queue path is what is being tested, and
+    it is the one place where "restored" and "re-derived" produce different numbers.
+  - >
+    **F6 — the counters reach the observer per tier and are internally consistent.** A recording
+    `Observer` over a two-tier fan-out receives `EventKind::Fleet` for tier 1 and tier 2 with
+    distinct `tier` values; for every event, `working` never exceeds `max_concurrent_agents`; and
+    the final event for each tier has `queued == 0` and `done` equal to the number of children that
+    tier ran. The last one is what catches a counter that is decremented on the happy path only.
+  - >
+    **F7 — `EVENT_NAMES` still equals the enum.** The census test in `src/observe.rs` passes with
+    `Fleet` added, and `every_kind()` still produces one of every tag and no others. The added
+    variant makes that test fail unless `EVENT_NAMES` gains its entry, which is the point of it.
+  - >
+    **F8 — an adopted child takes a slot.** A tree resumed with one mid-flight child and a
+    `max_concurrent_agents` of one: the adopted child runs, and the fresh siblings queue behind it
+    rather than running alongside it. Without this the throttle would be a different number before
+    and after a restart, which is the failure a durable queue exists to prevent.
+  - >
+    **F9 — cross-version compatibility, both directions.** A database written by a real 0.31.0 build
+    opens, resumes and replays under 0.32.0 with nothing to migrate; and a 0.32.0 store carrying
+    `agent_queue` rows is read by a 0.31.0 build, which never names the table. Proven with the
+    pinned-generator technique `tests/cross_version.rs` already uses. The 0.22.0 schema guard is fed
+    `agent_queue` and `agent_queue_entry` by name.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` on macOS and Linux still reads 402 lines. The queue is
+    `tokio::sync::Semaphore`, which the `sync` feature already in `Cargo.toml` provides, and one
+    SQLite table.
+  - >
+    **N2 — reading a tree's backlog is an indexed lookup per parent, not a scan of the queue.**
+    `EXPLAIN QUERY PLAN` for `Store::queued_agents` must name `agent_queue_entry` for the
+    `agent_queue` access, with a control statement filtering on `goal` alone — not a left prefix of
+    that index — which must not use it. The cost's shape is one index seek per run in the tree plus
+    the recursive walk of `runs` the tree queries already pay, and the measured wall time at the
+    backlog sizes this release cares about is recorded in the record rather than asserted, for the
+    reason 0.30.0's N2 recorded: a wall-clock threshold is flaky on a loaded runner and green on a
+    fast one running a full scan.
+  - >
+    **N3 — enqueue and admit cost one statement each, and neither is on the per-step path.** A child
+    that is admitted immediately writes nothing: the `agent_queue` row exists only for a child that
+    actually waits. Asserted by running a fan-out that never queues and requiring `agent_queue` to
+    be empty throughout and afterwards.
+  - >
+    **N4 — the break is exactly one, and it is in the changelog with a migration.**
+    `Containment::max_concurrent` becomes `max_concurrent_agents`. A caller who wrote a struct
+    literal renames one field; a caller who deserialises stored configuration changes nothing,
+    because `#[serde(alias = "max_concurrent")]` keeps the old key readable. `EventKind` gains a
+    variant, which is free under its `#[non_exhaustive]`. No public item is removed, so no
+    deprecation cycle is owed. `tests/changelog.rs` and `tests/public_api.rs` both pass.
+  - >
+    **N5 — every added public item carries a worked example**, enforced by the existing surface
+    test: `FleetTally` and the renamed field both appear in compiling doctests.
+  - >
+    **N6 — the wait graph is acyclic by construction, stated where a reader will find it.** The
+    per-tier semaphore and the reason for it are documented on `Containment::max_concurrent_agents`
+    and in `docs/CONTRACT.md`, including the honest consequence: the ceiling is per tier, so a tree
+    of depth *d* can hold up to `max_concurrent_agents * d` agents working at once. A reader must
+    not have to derive that from the source.
+  operational:
+  - >
+    **O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job.
+    The SIGKILL fixture is Unix-shaped; its test is gated so Windows runs the store-level assertions
+    rather than being skipped silently.
+  - >
+    **O2 — docs.rs builds**, checked by the nightly job rather than inferred from a local
+    `cargo doc`.
+  - >
+    **O3 — `cargo package --locked` succeeds** and the packaged crate compiles.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.32.0, GitHub at initorigin/io-harness with the tag `v0.32.0` and a
+    Release titled `io-harness 0.32.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.32.0` off `develop`, including the sealed UltraShip
+    release record. PR into `develop`, merged with the PR button. Release PR `develop` into `main`,
+    merged the same way. The GitHub Release is cut by `release.yml` — `gh workflow run release.yml
+    --ref main -f version=0.32.0` — which takes its notes verbatim from the changelog. `cargo publish
+    --locked` by hand afterwards, always last, after both merges and the Release exist. `develop`
+    synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    One additive store change: an `agent_queue` table and its unique index. `CHECKPOINT_FORMAT` does
+    not move, for the reason every addition since 0.13.0 has recorded — an older binary never
+    queries the new table, so bumping the format would make `check_resumable` refuse a database that
+    is in fact readable.
+  - >
+    One public break: `Containment::max_concurrent` becomes `max_concurrent_agents`, with a serde
+    alias so no stored configuration has to be rewritten. A struct literal renames one field. The
+    field's *meaning* also changes — it was a per-step fan-out width, it is now a tree-wide per-tier
+    throttle — and the changelog says so, because a rename a caller applies mechanically while the
+    semantics move underneath is the worse half of this break.
+  - >
+    A 0.31.0 database opens, resumes and replays unchanged, and a 0.31.0 binary reads a 0.32.0
+    store. Both directions are executed rather than argued.
+  observability:
+  - >
+    `EventKind::Fleet { tier, working, queued, done }` is the release's observability, and it is
+    per tier because a single tree-wide number cannot tell an operator whether the fan-out at depth
+    two is stuck behind the fan-out at depth one.
+  - >
+    The backlog is durable and therefore queryable after the fact: `Store::queued_agents` answers
+    "what was still waiting when this died" long after the process is gone, which no event stream
+    can.
+  - >
+    A queued child emits nothing of its own until it is admitted, and that is deliberate: it has no
+    run id yet, because giving it one would be the charge this release promises not to make.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.32.1 and `cargo yank --version
+    0.32.0` is the escape hatch, leaving 0.31.0 as what `cargo install` resolves. A consumer
+    reverting to 0.31.0 keeps every database — the `agent_queue` table is simply never queried — and
+    loses the throttle, the counters and the durable backlog. The one break reverses by renaming the
+    field back; the serde alias means no stored configuration has to move in either direction. No
+    file and no stored format has to be rewritten to go back.
+
+dependencies:
+  products: []
+  services:
+  - >
+    None at runtime. crates.io and GitHub Actions for the release itself, as every version.
+  human_approvals:
+  - >
+    The owner has pre-authorised the PR, both merges, the Release and the publish for this version.
+    Nothing here needs a second decision.
+
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    `src/run.rs` is 9,187 lines and `spawn_child` is the function being restructured. Admission has
+    to sit between the spawn-or-adopt lookup and the child's first store write, which moves code
+    both branches share.
+  - >
+    The SIGKILL fixture. `examples/crash_fixture` and `examples/plan_gate_fixture` are the pattern
+    and it works, but a third one joins the list of examples that `cargo test --all-features --lib
+    --tests` cannot build on a clean tree.
+  - >
+    Proving restoration rather than re-derivation. The outcome assertion passes either way; the
+    discriminating assertion had to be designed before the code was written, not after.
+  preferred_tools:
+  - >
+    `tokio::sync::Semaphore` for FIFO admission, already a dependency. `EXPLAIN QUERY PLAN` for N2.
+  constraints:
+  - >
+    No new runtime dependency; MSRV 1.95; edition 2021; every version stays 0.x and a break is a
+    minor bump.
+  - >
+    A project-scoped `io.toml` may narrow and may never widen. Nothing here is configured from
+    `io.toml`; `Containment` is constructed by the application.
+
+risks:
+- >
+  **Deadlock.** A concurrency cap that makes a parent wait on a resource only its own child can
+  release is the classic way to hang a tree. Mitigated structurally rather than by care: one
+  semaphore per tier, a parent waits only on the tier below its own, so the wait graph is a DAG.
+  F1's 120-child fan-out and F6's two-tier fan-out both run to completion, which is the executable
+  form of the argument.
+- >
+  **The rename lands mechanically while the meaning moves.** A caller sees `max_concurrent` become
+  `max_concurrent_agents`, renames it, and now has a tree-wide throttle where they had a per-step
+  width — with a *lower* effective concurrency than before if they were relying on several parents
+  fanning out at once. The changelog states the semantic change as loudly as the rename.
+- >
+  **Per-tier is not tree-global, and someone will read the field name as tree-global.** Documented
+  on the field, in `docs/CONTRACT.md` and in the changelog, with the number spelled out:
+  `max_concurrent_agents * max_depth` is the real worst case. Stated plainly under the
+  `known_limitations` discipline rather than implied.
+- >
+  **A durable queue is a new place for rows to leak.** A row is deleted on admission, so a tree that
+  finishes leaves none — but a tree that is killed leaves exactly the backlog it had, which is the
+  feature. N3 asserts the table stays empty for a fan-out that never queues, so the row is not
+  written on the fast path.
+
+open_questions:
+- >
+  Whether a future release should let a tier lend slots to another tier when it is idle. It would
+  raise utilisation on a deep, narrow tree and it turns the deadlock argument from a structural fact
+  into something that has to be proven. Not this release, and not without someone asking for it.
+- >
+  Whether `Store::queued_agents` should page. At the backlog sizes a tree can reach under
+  `max_total_agents` it returns one row per waiting child and is read once per resume, so the answer
+  today is no; if a later release raises the total cap into the tens of thousands, it becomes a
+  question again.
+
+status: released
+released_at: 2026-08-02T02:40:00Z
+mode: published
+delivered: >
+  A fleet holds the ceiling instead of hitting it. `max_concurrent_agents` throttles a spawn past it
+  into a durable per-tier FIFO queue and `max_total_agents` still refuses, so a hundred-agent task
+  runs a hundred at a time until it is done rather than failing at its hundred-and-first child.
+  `EventKind::Fleet { tier, working, queued, done }` reaches the observer on every enqueue, admission
+  and completion. A process killed mid-fleet leaves exactly the backlog it had and the next one
+  reports it — at the tier it had — before it authorises a provider; a child that only ever waited
+  has no run row, no step rows and no tokens against the tree's ceiling.
+
+evidence:
+  tests:
+  - >
+    `cargo test` — 64 result lines, all `ok`, 0 failed, including the 315 doctests (126.13s). Run
+    against the shipped tree after `cargo fmt`, with nothing touching the tree afterwards.
+  - >
+    `cargo test --all-features` — 56 result lines, all `ok`, 0 failed, no `FAILED` and no `error`
+    line. Run alone after `rm -rf target`, because the first attempt in the same invocation as
+    `cargo test` died with `linking with cc failed` on a full volume rather than on anything in the
+    code.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — clean. The one lint the release
+    raised (`type_complexity` on the two-value return from `restore_tree_ledger`) is resolved by the
+    `Backlog` alias rather than by an `allow`.
+  - >
+    `cargo fmt --check` — clean, after `cargo fmt` landed as its own commit ahead of the gate run.
+  - >
+    `cargo doc --no-deps --all-features` — 0 warnings, which is the standing bar here.
+  - >
+    Ten tests in `tests/fleet.rs`, ten unit tests across `src/containment.rs` and `src/state.rs`, and
+    the 14 pre-existing `tests/subagents.rs` tests unchanged and green — including
+    `concurrent_fanout_to_over_100_stays_bounded_and_completes`, whose 120-child fan-out now runs
+    through the tier queue and still measures a peak at or below its cap of 16.
+  - >
+    Eight sabotages, each run against the whole of `tests/fleet.rs`. S1 adoption takes another tier's
+    slot -> 5 named tests fail. S2 the replay counts a restored wait as fresh -> F5 fails. S3 the
+    backlog is never seeded into the ledger -> F4 and F5 fail. S4 `done` is never incremented -> F6
+    fails. S5 a restored row admitted immediately is never cleared -> the fast-path test fails. S6 an
+    admitted child's row is never deleted -> F5 fails. S7 the per-step `buffered` width caps the
+    fan-out again -> 5 named tests fail. S8 the slot is never released -> the 120-child fan-out under
+    8 slots never completes, detected as a hang rather than an assertion.
+  - >
+    Two of those sabotages were run before the tests were finished and passed everything, and each
+    exposed a real defect rather than a weak test. Recorded because the fix, not the test, is what
+    changed both times.
+  builds:
+  - >
+    `cargo package --locked` — exit 0, `target/package/io-harness-0.32.0.crate` at 1.2M, and the
+    packaged crate compiles (`Finished dev profile ... in 40.57s` for
+    `io-harness v0.32.0 (target/package/io-harness-0.32.0)`).
+  - >
+    `cargo tree | wc -l` — 402, unchanged since 0.23.0. The queue is `tokio::sync::Semaphore` from
+    the `sync` feature already in `Cargo.toml`, and one SQLite table.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **This record was sealed before the crates.io upload.** `mode: published` is the release's target
+  and the flow's last step: the develop merge, the main merge and the GitHub Release all come after
+  the record rides the `feat/0.32.0` commit, and `cargo publish --locked` comes after those. Sealing
+  it `release-ready` and correcting it later would mean editing an immutable record, which is worse.
+- >
+  **The concurrency ceiling is per tier, not per tree.** A tree of depth *d* can hold up to
+  `max_concurrent_agents * d` agents working at once. That is the deadlock argument rather than an
+  oversight — a parent holds a slot at its own tier and waits only on the tier below, so the wait
+  graph cannot contain a cycle — but a reader who takes the field name as tree-global will be wrong.
+  Stated on the field, in `docs/CONTRACT.md`, in the composition guide and in the changelog.
+- >
+  **The queue is FIFO and has no other policy.** No priority, no reordering, no way for an
+  application to promote or cancel a waiting child, and no fairness rule between the parents feeding
+  one tier. A queue with a policy is a scheduler and this is not one.
+- >
+  **A queued child is invisible everywhere except `Store::queued_agents`.** That is the other side of
+  "never started, never charged": it has no run id, so `Store::children` will not list it,
+  `Store::agent_events` has nothing to say about it, and it emits no events of its own until it is
+  admitted.
+- >
+  **N2's control column was wrong as written and the substance was met another way.** The criterion
+  named a control filtering on `goal` alone; `goal` is the index's last column and SQLite still uses
+  the index for it, skip-scanning `ANY(parent_run_id) AND ANY(step) AND goal=?` — a full read wearing
+  an index's name. The control is `queued_at`, which is in no index at all. The claim the criterion
+  exists to make (a control that proves the check discriminates an index from a scan) holds; its
+  example column did not.
+- >
+  **`Containment::max_total_cost` is still inert**, for the reason it has always been inert: there is
+  no price telemetry, so any figure the harness compared against would be one it invented.
+- >
+  **The 0.30.0 N2 wording is still over-claimed and still not silently re-claimed.** Counting every
+  row is what the aggregate answer is; the measured figures at 20k runs stand and materialised
+  counters remain a different release.
+supersedes: 0.31.0
+next_recommended_version: 0.33.0
+immutable: true

@@ -96,10 +96,12 @@
 //! **Agent composition.** [`run_tree`] runs a workspace contract as the root of
 //! a tree: the agent gains [`SPAWN_TOOL`], which launches a contained sub-agent
 //! over the same workspace, and the child's result composes back into the
-//! parent's next turn. Children nest, and many run at once up to
-//! [`Containment::max_concurrent`]. A child inherits its parent's policy and can
-//! only narrow it ([`Policy::contain`]: allows intersect, denies union, at any
-//! depth). [`run`] and [`run_with`] never expose the spawn tool.
+//! parent's next turn. Children nest, and many work at once up to
+//! [`Containment::max_concurrent_agents`] — a spawn past that cap queues rather
+//! than failing, and the queue survives a restart, while
+//! [`Containment::max_total_agents`] still refuses. A child inherits its parent's
+//! policy and can only narrow it ([`Policy::contain`]: allows intersect, denies
+//! union, at any depth). [`run`] and [`run_with`] never expose the spawn tool.
 //!
 //! **An execution sandbox.** Commands the verification gate runs execute in an
 //! ephemeral [`Sandbox`]: an isolated workdir, resource caps that *kill* rather
@@ -372,7 +374,7 @@ pub use approve::{
     ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
 };
 pub use config::{Config, ProviderSpec};
-pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
+pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::ContextBudget;
 pub use contract::TaskContract;
 pub use error::{Error, ProviderErrorKind, Result};
