@@ -59,7 +59,7 @@ tasks:
     Without it the release does not answer the first of the three questions, and it is the only one
     of the three whose absence makes a settings screen actively misleading rather than merely
     absent.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.30.0-T01
   acceptance_criteria:
@@ -82,9 +82,51 @@ tasks:
     exists to answer and it gets its own named test.
   files:
   - src/config.rs
-  - src/lib.rs
   - tests/config.rs
-  evidence: []
+  evidence:
+  - >
+    `Origin { scope, path }` and a `BTreeMap<String, Vec<Origin>>` on `Config`, filled by
+    `record_origins` walking each scope's own table *before* `merge` folds it into everything read
+    so far — after the merge there is nothing left to say which file a key came from. The walk
+    mirrors `merge`'s own notion of a leaf (a table recurses, anything else is a leaf), so the two
+    cannot disagree about what a key is.
+  - >
+    F1 — `origin_reports_the_deciding_scope_at_every_step_down` walks the same four steps
+    `f1_the_four_scopes_merge_in_order` walks, asserting the origin at each: local, then project,
+    then user, then empty. Taken at every step because "the last scope read" and "the deciding
+    scope" agree only while the key is set everywhere.
+    `origin_of_a_key_only_one_file_sets_is_that_file_not_the_last_one_read` is the sharper half: a
+    later file exists and names something else, and an implementation reporting the last file read
+    answers wrong.
+  - >
+    F2 — `origin_of_a_substituted_value_is_the_file_it_was_written_in` runs `${env:}`, `${cmd:}` and
+    the same key written literally through the same file and asserts all three report an identical
+    `Origin`. It needed no implementation work, and that is the finding worth keeping: `parse`
+    substitutes per file before anything merges, so a substituted value's origin is the declaring
+    file by construction. `${cmd:}` is written in the local scope because the project scope refuses
+    it — 0.27.0's rule, unchanged.
+  - >
+    F3 — `origin_shows_the_project_file_that_narrowed_a_user_setting` sets `policy.defaults.exec` to
+    allow in the user scope and deny in the project scope, and asserts both that the origin is the
+    project file and that `Policy::check` still returns `Deny`: the origin describes the resolution,
+    it does not alter it.
+  - >
+    Two cases the criteria did not name and the implementation had to decide. `policy.layers` and
+    `agent` append across scopes, so `origin` returns *every* contributing file in order rather than
+    inventing a winner — `origin_of_an_appending_key_lists_every_file_that_contributed`. And
+    `with_profile` moves each `profile.<name>.<key>` origin onto the key it now decides and drops
+    the `profile.` entries, since the returned configuration carries no `[profile]` section —
+    `origin_after_a_profile_overlay_names_the_file_the_profile_came_from`.
+  - >
+    The open question in the contract — provenance on demand or a map built once — is decided as a
+    map built at load, because the known consumer renders a whole settings list and a per-key walk
+    would re-read the tables once per row. `Config::origin(key)` and `Config::origins()` are both
+    lookups into it.
+  - >
+    `cargo test --test config origin_` 6 passed, 0 failed. `cargo test --doc config::` 24 passed, 0
+    failed, which includes the two new worked examples. `Config::from_toml` records nothing, exactly
+    as `sources()` returns nothing there: parsed text has no file behind it, and naming `io.toml`
+    for it would name a file that was never read.
 
 - id: US-IO-HARNESS-0.30.0-T03
   summary: >

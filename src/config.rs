@@ -180,6 +180,39 @@ pub enum Scope {
     Local,
 }
 
+/// Which file decided one key (0.30.0).
+///
+/// [`Scope`] answers "which files were read"; this answers "which of them won
+/// *this* key", which is the half a reader needs when a value is not the one they
+/// set. Reported by [`Config::origin`] and [`Config::origins`].
+///
+/// ```
+/// use io_harness::config::{Config, Scope};
+///
+/// # fn demo() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(dir.path().join("io.toml"), "[run]\nmax_steps = 30\n")?;
+/// std::fs::write(dir.path().join("io.local.toml"), "[run]\nmax_steps = 5\n")?;
+///
+/// let config = Config::discover(dir.path())?;
+/// let origin = &config.origin("run.max_steps")[0];
+/// assert_eq!(origin.scope, Scope::Local);
+/// assert!(origin.path.ends_with("io.local.toml"));
+///
+/// // A key no file named has no origin at all — that is the crate's default
+/// // speaking, and naming a file for it would be an invention.
+/// assert!(config.origin("run.max_retries").is_empty());
+/// # Ok(()) }
+/// # demo().unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Origin {
+    /// The scope whose file decided the key.
+    pub scope: Scope,
+    /// That file's path, as it was read.
+    pub path: PathBuf,
+}
+
 // ---------------------------------------------------------------------------
 // The file format
 // ---------------------------------------------------------------------------
@@ -551,6 +584,13 @@ pub struct Config {
     /// [`Config::discover`], which is the caller's own call — the run loop never
     /// reads a file.
     instructions: Vec<String>,
+    /// Which file decided each key, by dotted path (0.30.0).
+    ///
+    /// Built as the scopes merge rather than derived afterwards, because the
+    /// merged table has no memory of who wrote what. A `Vec` rather than one
+    /// `Origin` for the two keys in [`APPENDING`], where more than one file
+    /// genuinely contributed and naming a single winner would be a lie.
+    origins: BTreeMap<String, Vec<Origin>>,
     /// The root a `[[hook]]`'s relative `append` path resolves against (0.28.0).
     ///
     /// The *discovery root*, not the declaring file's directory, and the two are the
@@ -589,11 +629,24 @@ impl Config {
 
         let mut merged = toml::value::Table::new();
         let mut sources = Vec::new();
+        let mut origins = BTreeMap::new();
         for (scope, path) in candidates {
             if !path.is_file() {
                 continue;
             }
             let table = read_scope(scope, &path)?;
+            // Recorded from the scope's own table, before the merge folds it into
+            // everything read so far — afterwards there is nothing left to say
+            // which file a key came from.
+            record_origins(
+                &table,
+                &mut Vec::new(),
+                &Origin {
+                    scope,
+                    path: path.clone(),
+                },
+                &mut origins,
+            );
             merge(&mut merged, table, &mut Vec::new());
             sources.push((scope, path));
         }
@@ -605,6 +658,7 @@ impl Config {
             sources,
             raw: merged,
             instructions,
+            origins,
             dir: root.to_path_buf(),
         })
     }
@@ -643,6 +697,10 @@ impl Config {
             sources: Vec::new(),
             raw: table,
             instructions: Vec::new(),
+            // Empty for the same reason `sources` is: there is no file behind
+            // parsed text, and reporting `io.toml` here would name a file that was
+            // never read.
+            origins: BTreeMap::new(),
             dir: PathBuf::from("."),
         })
     }
@@ -693,13 +751,31 @@ impl Config {
 
         let mut merged = self.raw.clone();
         merged.remove("profile");
-        merge(&mut merged, overlay, &mut Vec::new());
+        merge(&mut merged, overlay.clone(), &mut Vec::new());
+
+        // A profile key's origin is the file the *profile* was written in, which is
+        // recorded under `profile.<name>.<key>`. Move each one onto the key it now
+        // decides, then drop the `profile.` entries — the returned configuration
+        // carries no `[profile]` section, so an origin for one would describe a key
+        // that is no longer there.
+        let mut origins = self.origins.clone();
+        let prefix = format!("profile.{name}.");
+        let overlaid: Vec<(String, Vec<Origin>)> = origins
+            .iter()
+            .filter_map(|(key, at)| {
+                key.strip_prefix(&prefix)
+                    .map(|rest| (rest.to_string(), at.clone()))
+            })
+            .collect();
+        origins.retain(|key, _| !key.starts_with("profile."));
+        origins.extend(overlaid);
 
         Ok(Self {
             file: deserialize(toml::Value::Table(merged.clone()), Path::new("<profile>"))?,
             sources: self.sources.clone(),
             raw: merged,
             instructions: self.instructions.clone(),
+            origins,
             dir: self.dir.clone(),
         })
     }
@@ -715,6 +791,69 @@ impl Config {
     /// ```
     pub fn sources(&self) -> &[(Scope, PathBuf)] {
         &self.sources
+    }
+
+    /// Which file decided `key`, by dotted path — `"run.max_steps"`,
+    /// `"sandbox.limits.max_wall_secs"`, `"toolchain.cargo.test"` (0.30.0).
+    ///
+    /// Empty when no file named the key, which is the crate's default answering
+    /// and is deliberately not dressed up as a file. Exactly one entry for every
+    /// key but the two whose arrays append across scopes — `policy.layers` and
+    /// `agent` — where every contributing file is listed in the order they were
+    /// applied, because a single winner there would be a lie about a value more
+    /// than one file built.
+    ///
+    /// This is the *deciding* scope, not the last scope read: a key set only in
+    /// the user file reports the user file even when a project file exists and
+    /// names other keys.
+    ///
+    /// ```
+    /// use io_harness::config::{Config, Scope};
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// std::fs::write(dir.path().join("io.toml"), "[run]\nmax_steps = 30\nmax_retries = 4\n")?;
+    /// std::fs::write(dir.path().join("io.local.toml"), "[run]\nmax_steps = 5\n")?;
+    ///
+    /// let config = Config::discover(dir.path())?;
+    /// assert_eq!(config.origin("run.max_steps")[0].scope, Scope::Local);
+    /// assert_eq!(
+    ///     config.origin("run.max_retries")[0].scope,
+    ///     Scope::Project,
+    ///     "a key the later file never named is still the earlier file's"
+    /// );
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn origin(&self, key: &str) -> &[Origin] {
+        self.origins.get(key).map_or(&[], Vec::as_slice)
+    }
+
+    /// Every key a file set, with the file that decided it, in key order
+    /// (0.30.0).
+    ///
+    /// The whole-settings-list form of [`Config::origin`], for a caller rendering
+    /// what a workspace resolved to rather than asking about one key. Keys a file
+    /// never named are absent rather than present-and-empty, so what this yields
+    /// is exactly the configuration that was written down.
+    ///
+    /// ```
+    /// use io_harness::config::Config;
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// std::fs::write(dir.path().join("io.toml"), "[run]\nmax_steps = 30\n")?;
+    ///
+    /// let config = Config::discover(dir.path())?;
+    /// let keys: Vec<_> = config.origins().map(|(key, _)| key).collect();
+    /// assert_eq!(keys, ["run.max_steps"]);
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn origins(&self) -> impl Iterator<Item = (&str, &[Origin])> {
+        self.origins
+            .iter()
+            .map(|(key, at)| (key.as_str(), at.as_slice()))
     }
 
     /// Does this configuration set anything at all?
@@ -1629,6 +1768,43 @@ fn bad_key(path: &Path, key: &[String], why: impl std::fmt::Display) -> Error {
 /// later scope adds a layer, it does not rewrite the boundary. Everything else
 /// replaces, because a half-merged MCP server definition is not a server.
 const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"]];
+
+/// Record `origin` against every leaf key of `table`, walking it the way
+/// [`merge`] walks it so the two cannot disagree about what a leaf is (0.30.0).
+///
+/// A table recurses; anything else — scalar, array, array of tables — is a leaf,
+/// because that is exactly the granularity the merge replaces at. The one
+/// exception is the [`APPENDING`] keys, where a later scope adds to the array
+/// instead of replacing it, so the origin is pushed rather than replacing what is
+/// there: `policy.layers` set in two files was genuinely built by two files.
+///
+/// Substitution needs no handling here and that is the point: `${env:}` and
+/// `${cmd:}` are resolved by [`parse`] before this ever sees the table, so a
+/// substituted value's origin is the file the substitution was written in without
+/// anything having to arrange it.
+fn record_origins(
+    table: &toml::value::Table,
+    at: &mut Vec<String>,
+    origin: &Origin,
+    into: &mut BTreeMap<String, Vec<Origin>>,
+) {
+    for (key, value) in table {
+        at.push(key.clone());
+        match value {
+            toml::Value::Table(inner) => record_origins(inner, at, origin, into),
+            _ => {
+                let path = at.join(".");
+                let appends = APPENDING.iter().any(|p| p == &at.as_slice());
+                let entry = into.entry(path).or_default();
+                if !appends {
+                    entry.clear();
+                }
+                entry.push(origin.clone());
+            }
+        }
+        at.pop();
+    }
+}
 
 /// Deep-merge `over` onto `base`, later winning key by key.
 fn merge(base: &mut toml::value::Table, over: toml::value::Table, at: &mut Vec<String>) {
