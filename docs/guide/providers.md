@@ -101,22 +101,55 @@ the client, so call it before handing the provider to a run.
 
 ## A base URL is not a scheme and a host
 
-Five of the twenty-one do not end in `/v1`, and they do not agree on what they
-end in instead:
+Six of the twenty-one are not `https://<host>/v1`, and they do not agree on what
+they are instead:
 
 | Vendor | Base |
 | --- | --- |
 | Groq | `https://api.groq.com/openai/v1` |
-| Zhipu | `https://open.bigmodel.cn/api/paas/v4` |
+| Fireworks | `https://api.fireworks.ai/inference/v1` |
 | Qwen | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
+| Zhipu | `https://open.bigmodel.cn/api/paas/v4` |
 | Gemini | `https://generativelanguage.googleapis.com/v1beta/openai` |
-| Perplexity | `https://api.perplexity.ai` — no `/v1` at all |
+| Perplexity | `https://api.perplexity.ai` — no version segment at all |
 
 So `base` is **the whole prefix the vendor documents**, and `/chat/completions`
 and `/models` are appended to it. A field that assumed `/v1` would silently drop
-the rest and 404 against five of the presets. `Compatible::base()` reads it back,
+the rest and 404 against six of the presets. `Compatible::base()` reads it back,
 and a trailing slash is trimmed at construction so a base written either way
 produces the same URL.
+
+## The local half costs nothing
+
+Eight of the presets are runtimes that run on the machine you are already sitting
+at, and each base is that project's own documented default bind:
+
+| Runtime | Default base |
+| --- | --- |
+| Ollama | `http://localhost:11434/v1` |
+| llama.cpp | `http://localhost:8080/v1` |
+| LocalAI | `http://localhost:8080/v1` |
+| vLLM | `http://localhost:8000/v1` |
+| LM Studio | `http://localhost:1234/v1` |
+| Jan | `http://localhost:1337/v1` |
+| KoboldCpp | `http://localhost:5001/v1` |
+| SGLang | `http://localhost:30000/v1` |
+
+A runtime bound somewhere else is `Compatible::new` with the URL, which is one
+line and not a release of this crate:
+
+```rust
+use io_harness::{Auth, Compatible};
+
+let local = Compatible::new("http://localhost:9001/v1", Auth::None, "", "my-model");
+```
+
+What this buys is not a cheaper provider. It is **the whole harness for nothing**:
+the [sandbox](sandbox.md), the [policy boundary](permissions.md), the [durable
+trace](durable-runs.md), [sub-agents](composition.md) and [hooks](hooks.md) are
+the same code against a model on your own laptop as against a vendor — no key, no
+invoice, and nothing leaving the machine. It is the cheapest way to find out
+whether this crate is for you, and a truer first run than a key and a hope.
 
 ## What is not reachable, and what nearly is
 
@@ -160,9 +193,9 @@ file and the variable is named by the person who chose it. `preset` and
 `base_url` are exactly-one — an entry with neither and an entry with both are
 each refused naming the entry's index — and `name`, `auth` and
 `reference_prices` are the optional rest. See
-[Configuration](configuration.md#provider--providerspec-via-configprovider_spec-0270)
-for the whole table and for how `Config::provider_spec()` and
-`Config::fallback_specs()` hand a chain back.
+[Configuration](configuration.md#kind--compatible--any-openai-shaped-endpoint-0290)
+for the whole table, and the section above it for how `Config::provider_spec()`
+and `Config::fallback_specs()` hand a chain back.
 
 ## The catalogue
 
@@ -174,8 +207,9 @@ use io_harness::Provider;
 # async fn demo(provider: &impl Provider) -> io_harness::Result<()> {
 for m in provider.models().await? {
     println!(
-        "{} — {:?} ctx, images {:?}, tools {:?}, price {:?} from {:?}",
-        m.id, m.context_length, m.accepts_images, m.accepts_tools, m.price, m.price_source,
+        "{} — {:?} ctx, {:?} out, images {:?}, tools {:?}, price {:?} from {:?}",
+        m.id, m.context_length, m.max_output_tokens,
+        m.accepts_images, m.accepts_tools, m.price, m.price_source,
     );
 }
 # Ok(()) }
@@ -185,10 +219,14 @@ Every field but `id` is an `Option` or an empty `Vec`, and the rule throughout i
 that **`None` means the vendor did not say**. `accepts_images: None` and
 `Some(false)` are different facts; so are `price: None` and a stated zero.
 
-The method is **defaulted to an empty list** on the `Provider` trait, so a
-provider written before this release keeps compiling and honestly reports no
-catalogue. `Compatible` reads the vendor's own `/models` once per instance and
-caches it, because `Provider::models` takes `&self` and nothing else.
+The method is **defaulted to an empty list** on the `Provider` trait, and that is
+a decision rather than a convenience. The trait is this crate's one extension
+point, and its own doc example is a user-written `impl Provider` — so a required
+method would have broken every out-of-tree provider *and* the documentation that
+invited people to write one. Defaulted, a provider written before this release
+keeps compiling and honestly reports no catalogue. `Compatible` reads the
+vendor's own `/models` once per instance and caches it, because `Provider::models`
+takes `&self` and nothing else.
 
 `accepts_tools: Some(true)` is the vendor's claim about the *model*. It is not a
 promise that the *server* was started in a configuration that emits tool calls —
@@ -264,6 +302,12 @@ cut, **44 of the 336 models the default reference catalogue carried priced by
 prompt length**, and the rate typically **doubles** past 200,000 tokens — so a
 long agentic run priced against the base row reports about half of what it cost.
 
+`google/gemini-2.5-pro` doubles past 200,000 prompt tokens and
+`anthropic/claude-sonnet-4.5` steps at the same floor; `qwen/qwen3-max` steps
+twice, at 32,000 and again at 128,000. A long agentic run — a repository in
+context, a conversation twenty steps deep — is exactly the shape that crosses
+those floors, which is why a base row on its own is not a price.
+
 ```rust
 use io_harness::pricing::{Price, PriceTable, PriceTier};
 use io_harness::Usage;
@@ -335,7 +379,8 @@ The divergences that matter to a caller — Groq's 400 on `messages[].name`,
 Mistral's nine-character tool-call ids, Zhipu's `finish_reason` values outside the
 OpenAI set, and the rest — are stated in [the contract](../CONTRACT.md) rather
 than papered over, because a boundary the caller believes in and nobody enforces
-is worse than none.
+is worse than none. **Read that list before you write a base URL**, not after a
+run behaves oddly against one.
 
 **vLLM and SGLang emit no tool calls at all** unless the server was started with
 a tool-call parser flag — `--enable-auto-tool-choice` and `--tool-call-parser` on
@@ -388,10 +433,19 @@ a price that moved during a long-lived process is not picked up until a new one 
 built. `PriceTable::as_of` carries the instant the read happened, which is the
 claim the table is allowed to make.
 
-**A preset's base URL and port are that project's own documented default.** A
-local runtime bound elsewhere, a vendor that moves a path, or a gateway in front
-of either is `Compatible::new` with the URL — one line, and the reason the
-constructor is public.
+**Twenty-one base URLs are twenty-one defaults that were right on the day this
+release was cut.** Each is that vendor's or that project's own documented
+endpoint, read once and frozen into a table. A vendor that moves a path, a local
+runtime bound elsewhere, or a gateway in front of either is one `base_url` line
+in your own file — or one `Compatible::new` in your own code — and never a
+release of this crate. That is the reason the constructor is public.
+
+**There is no `Compatible::from_env`.** The other three providers have one; this
+one would need twenty-one variable names, and each would be a guess this crate
+made on an operator's behalf. Write `api_key = "${env:GROQ_API_KEY}"` under
+`[[provider]] kind = "compatible"` instead, which names the variable in the file
+of the person who chose it. A preset constructor takes the key; where the key
+came from is the caller's business, and this crate does not need an opinion.
 
 **Bedrock, Vertex and Azure OpenAI are not reachable**, and Gemini here is its
 compatibility endpoint rather than its native API. An application that mints its

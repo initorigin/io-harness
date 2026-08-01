@@ -354,7 +354,7 @@ tasks:
   why_required: tests/public_api.rs fails on a public name with no line and no worked example, and the
     divergence section is the release's most important documentation obligation — a caller pointed at
     vLLM without a parser flag gets no tool calls and no error at all.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T04
   - US-IO-HARNESS-0.29.0-T05
@@ -391,7 +391,38 @@ tasks:
   - docs/CONTRACT.md
   - CHANGELOG.md
   - Cargo.toml
-  evidence: []
+  evidence:
+  - 'OP1 — `docs/public-api.txt` hand-edited in sorted position for all five new crate-root names: `enum
+    Auth`, `enum PriceSource`, `struct Compatible`, `struct ModelInfo`, `struct Reference`. `tests/public_api.rs`
+    — 9 passed, including `public_surface_matches_snapshot` and `every_public_item_has_a_worked_example`,
+    so each carries a fenced example that compiles as a doctest. No --bless was used because none exists.
+    `PriceTier` lives in the public `pricing` module rather than at the crate root, so like `Price`
+    beside it it carries a worked example and takes no snapshot line.'
+  - 'OP2 — `docs/CONTRACT.md` gains ''What Compatible does and does not translate (0.29.0)'', written
+    from primary sources rather than from the plan. It opens by stating the crate sends one wire and
+    will not grow per-vendor branches, then leads with the divergence that fails silently under its
+    own heading: vLLM and SGLang emit no tool calls without a server-side parser flag, no status code,
+    no warning, nothing in the trace — vLLM''s --enable-auto-tool-choice plus --tool-call-parser, SGLang''s
+    equivalent, both confirmed against the vendors'' own source in the scratchpad.'
+  - 'The per-vendor entries: Zhipu''s out-of-set finish_reason values, Groq''s 400 on messages[].name,
+    Mistral''s ^[a-zA-Z0-9]{9}$ tool-call ids and schema_definition field, DeepSeek''s 400 when reasoning_content
+    is not replayed (quoted from its own thinking-mode guide, which says it MUST participate in the
+    concatenation after a tool call), and Ollama silently ignoring tool_choice (listed unimplemented
+    in its own compatibility notes).'
+  - 'Every one of the 13 hosted preset base URLs was verified empirically rather than trusted: an unauthenticated
+    GET {base}/models returned 401/403 for 11 of them, proving host and path exist. The two 404s were
+    run down — Gemini returns 400 rather than 404 once a bearer header is present, so its path is right,
+    and Perplexity genuinely serves no /models endpoint, which is now stated in the contract as a fact
+    (its models() returns the vendor''s 404 rather than a false empty catalogue).'
+  - The contract also carries the five non-/v1 bases as a table, the Bedrock/Vertex/Azure exclusions
+    with the mint-your-own-bearer route, what a price means (None is never ZERO, reference is not the
+    vendor's, a miss stays None, the lookup refuses rather than skips), the tier rule, and that Fallback::models()
+    reports nothing rather than picking.
+  - '`CHANGELOG.md` — 0.29.0 section with an unlabelled 2-3 sentence prose opening, then Added/Changed/Security.
+    No **BREAKING entry, so no Migration: line is required; `tests/changelog.rs` 5 passed. Cargo.toml
+    bumped to 0.29.0.'
+  - '`cargo test --test changelog --test docs_drift --test readme --test guide_pages --test public_api`
+    — 5, 10, 8, 7 and 9 passed, 0 failed.'
 - id: US-IO-HARNESS-0.29.0-T09
   summary: 'The gates: the suite on the default and all-features sets, clippy, fmt, doc, cargo tree,
     cargo package, and the live reference-catalogue check.'

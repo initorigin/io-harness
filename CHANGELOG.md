@@ -26,6 +26,86 @@ notes are produced from it.
 
 ### Security
 
+## [0.29.0] - 2026-08-01
+
+The model a run uses stops being a choice between three vendors. A provider is a
+base URL, an auth style, a key and a model name, so every OpenAI-shaped endpoint
+is reachable without writing one — thirteen hosted vendors and eight runtimes a
+developer starts on their own machine, behind named constructors. A model on
+your laptop is the half that had no equivalent before, and it is the half that
+costs nothing to run.
+
+A connected provider also says what it can run and what that costs, fetched from
+the vendor at run time rather than compiled into this crate. Nothing here
+breaks: `Provider` gains a defaulted method, `ProviderSpec` gains the variant
+0.27.0's `#[non_exhaustive]` was added for, and `Price` is untouched.
+
+### Added
+
+- **`Compatible`, one provider for every OpenAI-shaped endpoint.** `openai.rs`
+  and `openrouter.rs` were the same 160 lines apart from four strings over a
+  wire module that was already shared, so a third vendor is a row in a table
+  rather than a file. Twenty-one presets behind named constructors —
+  `Compatible::groq(key, model)`, `Compatible::ollama(model)` — covering Groq,
+  xAI, Mistral, DeepSeek, Together, Fireworks, Cerebras, Perplexity, Gemini
+  through its compatibility endpoint, Moonshot, Zhipu, Qwen and MiniMax, plus
+  Ollama, llama.cpp, vLLM, LM Studio, LocalAI, Jan, SGLang and KoboldCpp.
+  `Compatible::new` reaches anything else that speaks the format.
+- **`Auth`**, `Bearer` or `None`, `#[non_exhaustive]`. A local runtime sends no
+  credential header at all rather than an empty bearer, which some servers
+  reject.
+- **`Provider::models()`**, returning the vendor's own catalogue: ids, and per
+  model whatever the vendor stated — context length, maximum output, whether it
+  takes images or tools, and the price. **Defaulted to an empty list**, so every
+  out-of-tree `Provider` keeps compiling; a required method here would have
+  broken the crate's one extension point.
+- **`ModelInfo` and `PriceSource`.** `ModelInfo::price` is `Option<Price>` and
+  `None` means the vendor did not say — never `Price::ZERO`, which would report
+  real spend as free. A local runtime is the one place zero is true and it is
+  recorded as a stated zero. `PriceSource` says whether a number came from the
+  vendor or from a named reference, so an operator reading a cost can tell which
+  they have.
+- **`Reference`, an opt-in reference price catalogue** for the vendors that
+  publish none, defaulting to a keyless public catalogue and configurable to a
+  mirror. Off by default: it dials a host the caller did not name, so when it is
+  on that host appears in `Provider::endpoints()` and a policy that denies it
+  makes the run **refuse** rather than silently skip the lookup. Matching is an
+  exact slug or one documented normalisation, and a miss stays `None` — never a
+  nearest guess.
+- **`pricing::PriceTier`, `PriceTable::with_tiers` and `PriceTable::tiers`.** A
+  model does not necessarily have one price: many vendors charge more once a
+  prompt passes a length threshold and the step is usually a doubling, which a
+  long agentic run crosses routinely. The highest floor a prompt reaches prices
+  the whole request, as the vendors bill it. A table with no tiers registered
+  prices exactly as it did in 0.28.0.
+- **`Compatible::price_table()`**, building a `PriceTable` dated by the moment it
+  was read — so a derived cost stops depending on a table maintained by hand
+  with an `as_of` somebody has to remember to update.
+- **`[[provider]] kind = "compatible"`** in `io.toml`, taking exactly one of
+  `preset` and `base_url` plus `model`, and optionally `api_key`, `auth`, `name`
+  and `reference_prices`. Naming both or neither is refused by the entry's
+  index; an unknown preset is refused listing the ones that exist.
+- **`docs/guide/providers.md`**, and a section in `docs/CONTRACT.md` stating each
+  vendor's divergence from the OpenAI wire plainly — including the one that
+  fails silently: **vLLM and SGLang emit no tool calls at all** unless the
+  server was started with a tool-call parser flag a client cannot set.
+
+### Changed
+
+- The README's provider paragraph named three vendors four lines under a tagline
+  that says "any provider". It now names what the crate actually reaches.
+
+### Deprecated
+
+### Removed
+
+### Security
+
+- The reference price catalogue is the first thing in this crate that would dial
+  a host the caller never configured. It is opt-in, and when enabled its host is
+  authorised through the same `Act::Net` boundary as every other endpoint before
+  the run's first step — refused rather than skipped.
+
 ## [0.28.0] - 2026-08-01
 
 An operator can now shape a run without writing Rust. `[[hook]]` tables in
