@@ -112,6 +112,59 @@ impl Price {
     };
 }
 
+/// A rate that replaces a model's base [`Price`] once the prompt is long enough
+/// (0.29.0).
+///
+/// A model does not necessarily have one price. Many vendors charge more per
+/// token once a request passes a prompt-length threshold, and the step is
+/// usually a doubling rather than a nudge — so a long agentic run priced against
+/// the base row reports about half of what it cost.
+///
+/// The threshold is compared against [`Usage::prompt_tokens`], the highest one
+/// at or below it wins, and that row prices the **whole** request. That is how
+/// the vendors bill it: crossing the line re-rates everything, rather than
+/// charging the first tranche at the old rate and the remainder at the new one.
+///
+/// `price` is a complete [`Price`], never a patch over the base — a tier that
+/// named only the dimensions it changed would silently price the others at zero.
+///
+/// ```
+/// use io_harness::pricing::{Price, PriceTable, PriceTier};
+/// use io_harness::Usage;
+///
+/// // $1.25 per million input tokens, doubling to $2.50 once the prompt reaches
+/// // 200k — the shape a long-context model is usually sold at.
+/// let base = Price { input: 1_250_000, output: 10_000_000, ..Price::ZERO };
+/// let prices = PriceTable::new("2026-08-01")
+///     .with("some-vendor/long-context", base)
+///     .with_tiers(
+///         "some-vendor/long-context",
+///         vec![PriceTier {
+///             min_prompt_tokens: 200_000,
+///             price: Price { input: 2_500_000, output: 15_000_000, ..Price::ZERO },
+///         }],
+///     );
+///
+/// let short = Usage { prompt_tokens: 100_000, total_tokens: 100_000, ..Default::default() };
+/// let long = Usage { prompt_tokens: 400_000, total_tokens: 400_000, ..Default::default() };
+///
+/// // 100k at $1.25/M is $0.125; 400k at $2.50/M is $1.00 — and it is the whole
+/// // 400k at the higher rate, not 200k at each.
+/// assert_eq!(prices.cost_micros("some-vendor/long-context", &short), Some(125_000));
+/// assert_eq!(prices.cost_micros("some-vendor/long-context", &long), Some(1_000_000));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PriceTier {
+    /// The prompt length, in tokens, at which this rate takes over. A request
+    /// whose [`Usage::prompt_tokens`] is greater than or equal to this is priced
+    /// by [`PriceTier::price`] unless a higher tier also applies.
+    pub min_prompt_tokens: u64,
+    /// The rate for a request that reaches the threshold, in the same
+    /// micro-units per million tokens as every other [`Price`] here.
+    pub price: Price,
+}
+
 /// Prices by model id, and the date they were accurate as of.
 ///
 /// The date is required at construction because a price list with no date is a
@@ -121,6 +174,15 @@ impl Price {
 pub struct PriceTable {
     as_of: String,
     prices: BTreeMap<String, Price>,
+    /// (0.29.0) Prompt-length tiers per model, held beside the base prices
+    /// rather than inside [`Price`]. A `Vec` in that type would cost it its
+    /// `Copy` impl, and `..Price::ZERO` and [`PriceTable::price`] both rest on
+    /// it — a public break bought for a data shape.
+    ///
+    /// Empty for every model that prices flat, which is most of them, and
+    /// `#[serde(default)]` so a table serialized by 0.28.0 still deserializes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    tiers: BTreeMap<String, Vec<PriceTier>>,
 }
 
 impl PriceTable {
@@ -130,6 +192,7 @@ impl PriceTable {
         Self {
             as_of: as_of.into(),
             prices: BTreeMap::new(),
+            tiers: BTreeMap::new(),
         }
     }
 
@@ -140,14 +203,54 @@ impl PriceTable {
         self
     }
 
+    /// Add or replace one model's prompt-length tiers (0.29.0).
+    ///
+    /// Sorted here rather than trusted from the caller, so the order they were
+    /// written in cannot decide which tier applies. An empty list removes the
+    /// model's tiers, which is how a table says "this one prices flat".
+    #[must_use]
+    pub fn with_tiers(mut self, model: impl Into<String>, mut tiers: Vec<PriceTier>) -> Self {
+        let model = model.into();
+        if tiers.is_empty() {
+            self.tiers.remove(&model);
+            return self;
+        }
+        tiers.sort_by_key(|t| t.min_prompt_tokens);
+        self.tiers.insert(model, tiers);
+        self
+    }
+
     /// When the operator says these prices were accurate.
     pub fn as_of(&self) -> &str {
         &self.as_of
     }
 
-    /// The price entered for `model`, or `None` if none was.
+    /// The base price entered for `model`, or `None` if none was.
+    ///
+    /// The *base* — a model with tiers costs this only while its prompt stays
+    /// under the lowest threshold. Ask [`PriceTable::cost_micros`] what a
+    /// particular request costs; this answers what the table holds.
     pub fn price(&self, model: &str) -> Option<Price> {
         self.prices.get(model).copied()
+    }
+
+    /// The prompt-length tiers entered for `model`, lowest threshold first, or
+    /// an empty slice when it prices flat (0.29.0).
+    pub fn tiers(&self, model: &str) -> &[PriceTier] {
+        self.tiers.get(model).map_or(&[], |t| t.as_slice())
+    }
+
+    /// The rate that prices a prompt of `prompt_tokens` on `model`: the highest
+    /// tier at or below it, or the base price when it reaches none.
+    fn rate(&self, model: &str, prompt_tokens: u64) -> Option<Price> {
+        let base = self.price(model)?;
+        Some(
+            self.tiers(model)
+                .iter()
+                .filter(|t| prompt_tokens >= t.min_prompt_tokens)
+                .next_back()
+                .map_or(base, |t| t.price),
+        )
     }
 
     /// What `usage` on `model` cost, in micro-units, or `None` when no price was
@@ -158,8 +261,13 @@ impl PriceTable {
     /// from and written to cache, so nothing is billed twice. A provider that
     /// reports cache figures larger than its own prompt total — which would be a
     /// vendor bug — saturates to zero fresh input rather than underflowing.
+    ///
+    /// (0.29.0) When the model has [`PriceTier`]s, the rate is the highest one
+    /// whose threshold [`Usage::prompt_tokens`] reaches, and it prices the whole
+    /// request. A model with no tiers is priced exactly as it was before they
+    /// existed.
     pub fn cost_micros(&self, model: &str, usage: &Usage) -> Option<u64> {
-        let p = self.price(model)?;
+        let p = self.rate(model, usage.prompt_tokens)?;
         let fresh_input = usage
             .prompt_tokens
             .saturating_sub(usage.cache_read_tokens)
@@ -297,6 +405,164 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(table().cost_micros("m", &usage), Some(270));
+    }
+
+    // -----------------------------------------------------------------------
+    // F11 — a tiered price is billed at the tier the prompt actually reached
+    // -----------------------------------------------------------------------
+
+    /// $1.25/M input doubling to $2.50/M at 200k — `google/gemini-2.5-pro`'s own
+    /// shape, and `anthropic/claude-sonnet-4.5`'s at the same floor.
+    fn tiered() -> PriceTable {
+        PriceTable::new("2026-08-01")
+            .with(
+                "long",
+                Price {
+                    input: 1_250_000,
+                    ..Price::ZERO
+                },
+            )
+            .with_tiers(
+                "long",
+                vec![PriceTier {
+                    min_prompt_tokens: 200_000,
+                    price: Price {
+                        input: 2_500_000,
+                        ..Price::ZERO
+                    },
+                }],
+            )
+    }
+
+    fn prompt(tokens: u64) -> Usage {
+        Usage {
+            prompt_tokens: tokens,
+            total_tokens: tokens,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_tier_boundary_is_exact_on_both_sides() {
+        let t = tiered();
+        // One token below the floor is still the base rate; the floor itself is
+        // already the tier. An off-by-one here under-reports every request that
+        // lands exactly on the line, which is why both sides are asserted rather
+        // than one value comfortably past it.
+        assert_eq!(t.cost_micros("long", &prompt(199_999)), Some(249_999));
+        assert_eq!(t.cost_micros("long", &prompt(200_000)), Some(500_000));
+        // And it re-rates the *whole* request rather than splitting it: 400k at
+        // $2.50/M is $1.00, not 200k at each rate.
+        assert_eq!(t.cost_micros("long", &prompt(400_000)), Some(1_000_000));
+    }
+
+    #[test]
+    fn a_prompt_below_every_floor_gets_the_base_row_not_the_lowest_tier() {
+        // The negative control for the test above. Without it, an implementation
+        // that always took the first tier would pass every assertion that only
+        // looked at long prompts.
+        assert_eq!(tiered().cost_micros("long", &prompt(1_000)), Some(1_250));
+    }
+
+    #[test]
+    fn the_highest_reached_floor_wins_whatever_order_the_tiers_were_written_in() {
+        // `qwen/qwen3-max`'s shape: two steps, at 32k and 128k. Registered
+        // highest-first on purpose, so the answer cannot come from input order.
+        let t = PriceTable::new("x")
+            .with(
+                "two",
+                Price {
+                    input: 1_000_000,
+                    ..Price::ZERO
+                },
+            )
+            .with_tiers(
+                "two",
+                vec![
+                    PriceTier {
+                        min_prompt_tokens: 128_000,
+                        price: Price {
+                            input: 3_000_000,
+                            ..Price::ZERO
+                        },
+                    },
+                    PriceTier {
+                        min_prompt_tokens: 32_000,
+                        price: Price {
+                            input: 2_000_000,
+                            ..Price::ZERO
+                        },
+                    },
+                ],
+            );
+        assert_eq!(t.cost_micros("two", &prompt(1_000_000)), Some(3_000_000));
+        assert_eq!(t.cost_micros("two", &prompt(64_000)), Some(128_000));
+        assert_eq!(t.cost_micros("two", &prompt(1_000)), Some(1_000));
+        assert_eq!(
+            t.tiers("two")
+                .iter()
+                .map(|x| x.min_prompt_tokens)
+                .collect::<Vec<_>>(),
+            vec![32_000, 128_000],
+            "stored lowest-first however they arrived"
+        );
+    }
+
+    #[test]
+    fn the_same_usage_costs_strictly_less_once_the_tiers_are_removed() {
+        // The control that the tiers are doing the work. Without it every
+        // assertion above would also pass against an implementation that ignored
+        // `with_tiers` entirely and priced everything at the base row.
+        let long = prompt(400_000);
+        let with = tiered().cost_micros("long", &long).unwrap();
+        let without = tiered()
+            .with_tiers("long", Vec::new())
+            .cost_micros("long", &long)
+            .unwrap();
+        assert!(
+            without < with,
+            "removing the tier must make the same request cheaper: {without} vs {with}"
+        );
+        assert_eq!(without, 500_000);
+    }
+
+    #[test]
+    fn a_table_with_no_tiers_prices_exactly_as_it_did_before_they_existed() {
+        // NF5's arithmetic half, asserted rather than argued: every figure in
+        // `a_hand_computed_million_token_figure_comes_out_exact` is produced by a
+        // table that registers no tier at all, through the same `cost_micros`.
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 1_000_000,
+            total_tokens: 2_000_000,
+            cache_read_tokens: 500_000,
+            cache_write_tokens: 100_000,
+            reasoning_tokens: 200_000,
+            server_tool_requests: 3,
+        };
+        assert!(table().tiers("m").is_empty());
+        assert_eq!(
+            table().cost_micros("m", &usage),
+            Some(1_200_000 + 15_000_000 + 150_000 + 375_000 + 30_000)
+        );
+    }
+
+    #[test]
+    fn a_tier_on_a_model_with_no_base_price_is_still_unpriced() {
+        // Tiers do not make a model priced. `cost_micros` reads the base first,
+        // so a table carrying a tier and no price answers None rather than
+        // pricing an unknown model from its tier.
+        let t = PriceTable::new("x").with_tiers(
+            "orphan",
+            vec![PriceTier {
+                min_prompt_tokens: 1,
+                price: Price {
+                    input: 9_000_000,
+                    ..Price::ZERO
+                },
+            }],
+        );
+        assert_eq!(t.cost_micros("orphan", &prompt(1_000)), None);
     }
 
     #[test]

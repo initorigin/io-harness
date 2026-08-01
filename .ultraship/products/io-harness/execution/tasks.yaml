@@ -8,7 +8,8 @@ tasks:
     declarations. The defaulted method is also the release''s one break risk: a required method here
     would break the crate''s only extension point.'
   status: todo
-  depends_on: []
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T10
   acceptance_criteria:
   - 'F3 — `Provider::models()` defaults to an empty list, and the default is what keeps the crate''s
     extension point open. A `Provider` implementation that overrides nothing but `complete` compiles
@@ -30,33 +31,8 @@ tasks:
   files:
   - src/provider/mod.rs
   - src/lib.rs
-  evidence: []
-- id: US-IO-HARNESS-0.29.0-T10
-  summary: 'Price tiers in src/pricing.rs: PriceTier, PriceTable::with_tiers/tiers, and tier selection
-    in cost_micros.'
-  why_required: Forty-four of the catalogue's models price by prompt length and the rate typically doubles
-    past 200k, so a catalogue that fetches a real price and applies the wrong tier under-reports a long
-    run by half — the confident wrong number this release exists to prevent. See iterations/US-IO-HARNESS-0.29.0-I01.
-  status: todo
-  depends_on:
-  - US-IO-HARNESS-0.29.0-T01
-  acceptance_criteria:
-  - 'F11 — a tiered price is billed at the tier the prompt actually reached, and a flat one is unchanged.
-    A model with a 200,000-token tier at double its base rate costs the base rate at 199,999 prompt
-    tokens and the tier rate at 200,000 and at 400,000 — the boundary asserted on both sides, because
-    an off-by-one on a floor is the whole defect. A two-tier model (32,000 and 128,000) selects the
-    **highest** floor it reaches and not the first, asserted with the tiers registered in reverse order
-    so the answer cannot come from input ordering. And an override that names only some keys inherits
-    the rest from its base row, asserted on a dimension the override omits. **Three negative controls:**
-    a model with no tiers priced identically to how 0.28.0 priced it, so the selection cannot have changed
-    the flat path; a prompt below every floor yielding the base row rather than the lowest tier; and
-    the same usage priced against a table with the tiers **removed**, which must produce a *different
-    and smaller* figure — without it the test would pass against an implementation that ignored tiers
-    entirely.
-
-    '
-  files:
-  - src/pricing.rs
+  - src/provider/catalog.rs
+  - src/provider/compatible.rs
   evidence: []
 - id: US-IO-HARNESS-0.29.0-T02
   summary: 'The reference catalogue reader: Reference, the exact decimal-string to micro-unit conversion,
@@ -66,7 +42,7 @@ tasks:
     place a defect in this release becomes money rather than an error.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.29.0-T10
+  - US-IO-HARNESS-0.29.0-T01
   acceptance_criteria:
   - 'F4 — a decimal price string becomes an exact integer, and no `f64` is on the path. `"0.0000002574"`
     becomes exactly `257_400` micro-units per million tokens, and a table of hand-computed cases covers
@@ -327,3 +303,45 @@ tasks:
     '
   files: []
   evidence: []
+- id: US-IO-HARNESS-0.29.0-T10
+  summary: 'Price tiers in src/pricing.rs: PriceTier, PriceTable::with_tiers/tiers, and tier selection
+    in cost_micros.'
+  why_required: Forty-four of the catalogue's models price by prompt length and the rate typically doubles
+    past 200k, so a catalogue that fetches a real price and applies the wrong tier under-reports a long
+    run by half — the confident wrong number this release exists to prevent. See iterations/US-IO-HARNESS-0.29.0-I01.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - 'F11 — a tiered price is billed at the tier the prompt actually reached, and a flat one is unchanged.
+    A model with a 200,000-token tier at double its base rate costs the base rate at 199,999 prompt
+    tokens and the tier rate at 200,000 and at 400,000 — the boundary asserted on both sides, because
+    an off-by-one on a floor is the whole defect. A two-tier model (32,000 and 128,000) selects the
+    **highest** floor it reaches and not the first, asserted with the tiers registered in reverse order
+    so the answer cannot come from input ordering. And an override that names only some keys inherits
+    the rest from its base row, asserted on a dimension the override omits. **Three negative controls:**
+    a model with no tiers priced identically to how 0.28.0 priced it, so the selection cannot have changed
+    the flat path; a prompt below every floor yielding the base row rather than the lowest tier; and
+    the same usage priced against a table with the tiers **removed**, which must produce a *different
+    and smaller* figure — without it the test would pass against an implementation that ignored tiers
+    entirely.
+
+    '
+  files:
+  - src/pricing.rs
+  evidence:
+  - F11 — `pricing::tests::the_tier_boundary_is_exact_on_both_sides` asserts 199,999 prompt tokens at
+    the base rate and 200,000 at the tier rate, then 400,000 priced wholly at the tier rate rather than
+    split across the floor. An off-by-one on the threshold under-reports every request landing on the
+    line, which is why both sides are asserted rather than one value past it.
+  - '`the_highest_reached_floor_wins_whatever_order_the_tiers_were_written_in` uses qwen3-max''s two-step
+    shape (32k, 128k) registered highest-first, so the answer cannot come from input ordering; `PriceTable::with_tiers`
+    sorts on the way in and `tiers()` is asserted to read back lowest-first.'
+  - 'The three named negative controls: `a_prompt_below_every_floor_gets_the_base_row_not_the_lowest_tier`;
+    `the_same_usage_costs_strictly_less_once_the_tiers_are_removed`, which fails against any implementation
+    that ignored `with_tiers`; and `a_table_with_no_tiers_prices_exactly_as_it_did_before_they_existed`,
+    which reproduces 0.28.0''s hand-computed figure through the new code path and is NF5''s arithmetic
+    half.'
+  - '`a_tier_on_a_model_with_no_base_price_is_still_unpriced` — tiers do not make a model priced; `cost_micros`
+    reads the base first and answers None.'
+  - '`cargo test --lib pricing` — 10 passed, 0 failed. `Price` gained no field and kept `Copy`; tiers
+    hang off `PriceTable` in a `#[serde(default)]` map, so a table serialized by 0.28.0 still deserializes.'
