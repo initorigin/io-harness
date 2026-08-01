@@ -20,7 +20,10 @@ async fn main() -> io_harness::Result<()> {
     // Every one of the five dimensions the mapping claims, seen on a real row.
     let full = models.iter().find(|m| {
         m.price.is_some_and(|p| {
-            p.input > 0 && p.output > 0 && p.cache_read > 0 && p.cache_write > 0
+            p.input > 0
+                && p.output > 0
+                && p.cache_read > 0
+                && p.cache_write > 0
                 && p.per_server_tool_request > 0
         })
     });
@@ -53,7 +56,10 @@ async fn main() -> io_harness::Result<()> {
     println!("attributed to the reference host: {referenced}");
 
     assert!(!models.is_empty(), "the catalogue must not be empty");
-    assert!(full.is_some(), "at least one model prices all five dimensions");
+    assert!(
+        full.is_some(),
+        "at least one model prices all five dimensions"
+    );
     assert!(tiered > 0, "at least one model carries a tier");
     assert_eq!(disagreeing, 0, "price and provenance must agree everywhere");
     println!("\nF10 OK");
