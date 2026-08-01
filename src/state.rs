@@ -1831,6 +1831,51 @@ impl Edit {
     }
 }
 
+/// The largest previous file kept as a restore point, in bytes (0.28.0).
+///
+/// A cap rather than no cap because the store is a SQLite file an operator keeps
+/// for the trace, and a run that rewrites a 200 MB fixture would otherwise put
+/// 200 MB into it for a rewind nobody asked for. A file over the cap is recorded
+/// as [`Kept::Unkept`] with its size, which is honest — the alternative,
+/// recording nothing at all, would make it indistinguishable from a path the run
+/// never touched, and a caller would then be told a rewritten file was untouched.
+pub(crate) const MAX_SNAPSHOT_BYTES: usize = 1 << 20;
+
+/// What was kept of a file's contents from before a run first wrote it
+/// (0.28.0).
+///
+/// Three cases and not two, because "there is no text to put back" has two
+/// causes that undo differently: a file that did not exist is put back by
+/// deleting it, and a file whose contents were too large or not text cannot be
+/// put back at all and must be left alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Kept {
+    /// The file's previous contents, verbatim.
+    Text(String),
+    /// The file did not exist before the run wrote it.
+    Absent,
+    /// The file existed and its contents were deliberately not kept. The payload
+    /// is the short human reason — over [`MAX_SNAPSHOT_BYTES`], or not UTF-8.
+    Unkept(String),
+}
+
+/// The state of one file before a run first wrote it (0.28.0).
+///
+/// One row per file per run, written at the *first* edit, which is what makes
+/// "the way it was" well-defined: a run that edits the same file five times has
+/// one restore point, the state before edit one, not the state before edit five.
+/// Storage is therefore bounded by how many files a run touched rather than how
+/// many edits it made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Snapshot {
+    /// The step that made the first write.
+    pub step: u32,
+    /// The path, as the agent named it (relative to the workspace root).
+    pub path: String,
+    /// What was there, or why it was not kept.
+    pub kept: Kept,
+}
+
 /// One background process the run started, as the store last knew it.
 ///
 /// A row is written when the handle starts and updated when it ends, so a handle
@@ -2450,6 +2495,40 @@ impl Store {
              CREATE INDEX IF NOT EXISTS handle_output_run ON handle_output(run_id, handle);",
         )?;
 
+        // 0.28.0 — file snapshots. One more additive table and, by the same rule
+        // every addition since 0.13.0 follows, deliberately NOT a
+        // `CHECKPOINT_FORMAT` bump: no checkpoint layout changed, and bumping it
+        // would make [`Store::check_resumable`] refuse every 0.27.0 store over a
+        // table an older binary never queries.
+        //
+        // One row per file per run, written at the *first* write to that path —
+        // the insert in [`Store::record_snapshot`] is guarded so a second edit
+        // does not move the restore point. That is what makes "the way it was"
+        // mean "before this run first touched it" rather than "before the last
+        // edit", and it bounds the store by the number of files a run touched
+        // instead of the number of edits it made.
+        //
+        // `state` carries which of three cases `before` holds, because the caller
+        // must be able to tell them apart: `text` (the previous contents),
+        // `absent` (`before` is NULL — the run created the file, so putting it
+        // back means deleting it), and `unkept` (`before` is the short reason the
+        // contents were not kept — over `MAX_SNAPSHOT_BYTES`, or not UTF-8). A
+        // NULL `before` alone could not distinguish "created" from "not kept",
+        // and a rewind that read the second as the first would delete a file the
+        // run had merely rewritten.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS snapshots (
+                 id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id INTEGER NOT NULL,
+                 step   INTEGER NOT NULL,
+                 path   TEXT NOT NULL,
+                 before TEXT,
+                 state  TEXT NOT NULL,
+                 at     TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE INDEX IF NOT EXISTS snapshots_run ON snapshots(run_id, path);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -2939,6 +3018,74 @@ impl Store {
             })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Record the state of a file before this run first wrote it (0.28.0).
+    ///
+    /// The insert is guarded on there being no row for this run and path yet, so
+    /// calling it at every write is correct and only the first one lands. The
+    /// guard lives in the SQL rather than in a read-then-insert in the caller
+    /// because the caller would then have a race between the check and the write
+    /// that a second writer on the same store could lose, and because a
+    /// `WHERE NOT EXISTS` is one statement where the alternative is two.
+    ///
+    /// A unique index would enforce the same thing by making the second insert an
+    /// error; that lost because the caller would then have to tell "already
+    /// snapshotted", which is the normal case, from a store that is actually
+    /// broken, which is the case worth a warning.
+    pub(crate) fn record_snapshot(&self, run_id: i64, snap: &Snapshot) -> Result<()> {
+        let (state, before) = match &snap.kept {
+            Kept::Text(text) => ("text", Some(text.as_str())),
+            Kept::Absent => ("absent", None),
+            Kept::Unkept(why) => ("unkept", Some(why.as_str())),
+        };
+        self.conn.execute(
+            "INSERT INTO snapshots (run_id, step, path, before, state)
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE NOT EXISTS (SELECT 1 FROM snapshots WHERE run_id = ?1 AND path = ?3)",
+            (run_id, snap.step, &snap.path, before, state),
+        )?;
+        Ok(())
+    }
+
+    /// The restore point for one path under one run, or `None` if this run never
+    /// wrote it (0.28.0).
+    ///
+    /// The earliest row wins. `ORDER BY id` and not `ORDER BY step`: the guard in
+    /// [`Store::record_snapshot`] means there is only ever one row, and ordering
+    /// by insertion is the answer that stays right if that ever stops being true,
+    /// where ordering by step would tie.
+    ///
+    /// `run_id` is part of the lookup and not a convenience. Two runs over the
+    /// same workspace hold different answers to "the way it was", and a lookup by
+    /// path alone would rewind one run's edit to the other run's starting point.
+    pub(crate) fn snapshot(&self, run_id: i64, path: &str) -> Result<Option<Snapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT step, path, before, state FROM snapshots
+             WHERE run_id = ?1 AND path = ?2 ORDER BY id LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map((run_id, path), |r| {
+            let before: Option<String> = r.get(2)?;
+            let state: String = r.get(3)?;
+            Ok(Snapshot {
+                step: r.get(0)?,
+                path: r.get(1)?,
+                kept: match state.as_str() {
+                    "text" => Kept::Text(before.unwrap_or_default()),
+                    "absent" => Kept::Absent,
+                    // `unkept`, and anything a later version writes that this
+                    // one does not know. The unknown case falls here and not
+                    // into `absent` deliberately: this table is additive and not
+                    // covered by `CHECKPOINT_FORMAT`, so a newer store can be
+                    // opened by this binary, and the two ways to be wrong are
+                    // "refuse to rewind a file" and "delete a file the run only
+                    // rewrote". Only the first is recoverable.
+                    "unkept" => Kept::Unkept(before.unwrap_or_default()),
+                    other => Kept::Unkept(format!("recorded as \"{other}\", which this version of the store does not understand")),
+                },
+            })
+        })?;
+        Ok(rows.next().transpose()?)
     }
 
     /// Record the policy a run was started under.

@@ -66,6 +66,11 @@ const GUIDES: &[(&str, bool)] = &[
     ("accounting.md", true),
     ("documents.md", true),
     ("images-and-git.md", false),
+    // 0.28.0. It carries a limits block because a hook is defined by what it costs
+    // and what it is not: it blocks the run loop it is called from, it is refused in
+    // the project scope without that making a cloned repository safe, and it grants
+    // nothing — it cannot approve or deny an action, and its output is discarded.
+    ("hooks.md", true),
 ];
 
 fn guide_dir() -> PathBuf {

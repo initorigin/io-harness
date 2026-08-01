@@ -90,6 +90,47 @@ a fresh 24 hours.
 
 Run it live: `cargo run --example durable_run` (kills itself mid-run and resumes).
 
+## Putting a file back (0.28.0)
+
+A resume restores the run. `rewind` undoes it.
+
+```rust
+use io_harness::{rewind, Rewind};
+
+match rewind(&workspace, &store, run_id, "src/lib.rs")? {
+    Rewind::Restored(_)      => println!("put back"),
+    Rewind::Removed          => println!("the run created it; it is gone"),
+    Rewind::NotKept(why)     => println!("the run changed it and we cannot undo that: {why}"),
+    Rewind::NotRecorded      => println!("this run never wrote it"),
+}
+```
+
+Every `write_file` and `edit_file` already read the file's previous contents to
+measure the edit. Since 0.28.0 the **first** one it sees per path is kept, as a row
+in the store — so the restore point is the state of the file before the run first
+touched it, and it survives a crash, a restart and a resume exactly the way the
+step count does. A run that edited one file five times rewinds to where it started,
+which is the only definition under which "undo what this run did" is one operation
+rather than five.
+
+It is a new table, so `CHECKPOINT_FORMAT` stays 7 and a store written by 0.27.0
+opens, resumes and replays unchanged. It simply has no snapshot rows, and `rewind`
+on a run from before this release is `NotRecorded` — the honest answer, and the
+reason that is a variant rather than an empty restore.
+
+Restoring writes through `Workspace::write_file`, so an undo cannot put bytes
+anywhere the run could not have written them. Removing is stricter: it refuses
+anything that is not an outright allow, because a write is content a human can
+inspect afterwards and a delete is not.
+
+**What one restore point per file per run does not offer.** There is no per-step
+undo, no rewind to step 4, and no redo. A previous file over 1 MiB or one that is
+not valid UTF-8 is `NotKept` — reported, and never guessed at, and never truncated.
+Only `write_file` and `edit_file` take a snapshot: a file changed by `shell`,
+`exec` or a git built-in has no restore point and answers `NotRecorded`. And
+`rewind` takes one path per call, so undoing a whole run is a loop the caller
+writes and can interrupt halfway.
+
 ## See also
 
 - [Permissions and approval](permissions.md) — the boundary a resume must not drop
