@@ -333,4 +333,99 @@ open_questions:
   today is no; if a later release raises the total cap into the tens of thousands, it becomes a
   question again.
 
-status: planned
+status: released
+released_at: 2026-08-02T02:40:00Z
+mode: published
+delivered: >
+  A fleet holds the ceiling instead of hitting it. `max_concurrent_agents` throttles a spawn past it
+  into a durable per-tier FIFO queue and `max_total_agents` still refuses, so a hundred-agent task
+  runs a hundred at a time until it is done rather than failing at its hundred-and-first child.
+  `EventKind::Fleet { tier, working, queued, done }` reaches the observer on every enqueue, admission
+  and completion. A process killed mid-fleet leaves exactly the backlog it had and the next one
+  reports it — at the tier it had — before it authorises a provider; a child that only ever waited
+  has no run row, no step rows and no tokens against the tree's ceiling.
+
+evidence:
+  tests:
+  - >
+    `cargo test` — 64 result lines, all `ok`, 0 failed, including the 315 doctests (126.13s). Run
+    against the shipped tree after `cargo fmt`, with nothing touching the tree afterwards.
+  - >
+    `cargo test --all-features` — 56 result lines, all `ok`, 0 failed, no `FAILED` and no `error`
+    line. Run alone after `rm -rf target`, because the first attempt in the same invocation as
+    `cargo test` died with `linking with cc failed` on a full volume rather than on anything in the
+    code.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — clean. The one lint the release
+    raised (`type_complexity` on the two-value return from `restore_tree_ledger`) is resolved by the
+    `Backlog` alias rather than by an `allow`.
+  - >
+    `cargo fmt --check` — clean, after `cargo fmt` landed as its own commit ahead of the gate run.
+  - >
+    `cargo doc --no-deps --all-features` — 0 warnings, which is the standing bar here.
+  - >
+    Ten tests in `tests/fleet.rs`, ten unit tests across `src/containment.rs` and `src/state.rs`, and
+    the 14 pre-existing `tests/subagents.rs` tests unchanged and green — including
+    `concurrent_fanout_to_over_100_stays_bounded_and_completes`, whose 120-child fan-out now runs
+    through the tier queue and still measures a peak at or below its cap of 16.
+  - >
+    Eight sabotages, each run against the whole of `tests/fleet.rs`. S1 adoption takes another tier's
+    slot -> 5 named tests fail. S2 the replay counts a restored wait as fresh -> F5 fails. S3 the
+    backlog is never seeded into the ledger -> F4 and F5 fail. S4 `done` is never incremented -> F6
+    fails. S5 a restored row admitted immediately is never cleared -> the fast-path test fails. S6 an
+    admitted child's row is never deleted -> F5 fails. S7 the per-step `buffered` width caps the
+    fan-out again -> 5 named tests fail. S8 the slot is never released -> the 120-child fan-out under
+    8 slots never completes, detected as a hang rather than an assertion.
+  - >
+    Two of those sabotages were run before the tests were finished and passed everything, and each
+    exposed a real defect rather than a weak test. Recorded because the fix, not the test, is what
+    changed both times.
+  builds:
+  - >
+    `cargo package --locked` — exit 0, `target/package/io-harness-0.32.0.crate` at 1.2M, and the
+    packaged crate compiles (`Finished dev profile ... in 40.57s` for
+    `io-harness v0.32.0 (target/package/io-harness-0.32.0)`).
+  - >
+    `cargo tree | wc -l` — 402, unchanged since 0.23.0. The queue is `tokio::sync::Semaphore` from
+    the `sync` feature already in `Cargo.toml`, and one SQLite table.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **This record was sealed before the crates.io upload.** `mode: published` is the release's target
+  and the flow's last step: the develop merge, the main merge and the GitHub Release all come after
+  the record rides the `feat/0.32.0` commit, and `cargo publish --locked` comes after those. Sealing
+  it `release-ready` and correcting it later would mean editing an immutable record, which is worse.
+- >
+  **The concurrency ceiling is per tier, not per tree.** A tree of depth *d* can hold up to
+  `max_concurrent_agents * d` agents working at once. That is the deadlock argument rather than an
+  oversight — a parent holds a slot at its own tier and waits only on the tier below, so the wait
+  graph cannot contain a cycle — but a reader who takes the field name as tree-global will be wrong.
+  Stated on the field, in `docs/CONTRACT.md`, in the composition guide and in the changelog.
+- >
+  **The queue is FIFO and has no other policy.** No priority, no reordering, no way for an
+  application to promote or cancel a waiting child, and no fairness rule between the parents feeding
+  one tier. A queue with a policy is a scheduler and this is not one.
+- >
+  **A queued child is invisible everywhere except `Store::queued_agents`.** That is the other side of
+  "never started, never charged": it has no run id, so `Store::children` will not list it,
+  `Store::agent_events` has nothing to say about it, and it emits no events of its own until it is
+  admitted.
+- >
+  **N2's control column was wrong as written and the substance was met another way.** The criterion
+  named a control filtering on `goal` alone; `goal` is the index's last column and SQLite still uses
+  the index for it, skip-scanning `ANY(parent_run_id) AND ANY(step) AND goal=?` — a full read wearing
+  an index's name. The control is `queued_at`, which is in no index at all. The claim the criterion
+  exists to make (a control that proves the check discriminates an index from a scan) holds; its
+  example column did not.
+- >
+  **`Containment::max_total_cost` is still inert**, for the reason it has always been inert: there is
+  no price telemetry, so any figure the harness compared against would be one it invented.
+- >
+  **The 0.30.0 N2 wording is still over-claimed and still not silently re-claimed.** Counting every
+  row is what the aggregate answer is; the measured figures at 20k runs stand and materialised
+  counters remain a different release.
+supersedes: 0.31.0
+next_recommended_version: 0.33.0
+immutable: true
