@@ -442,7 +442,7 @@ tasks:
   why_required: >
     Every one of these is a refusal `release.yml` performs anyway; failing them here costs a re-run,
     failing them there costs a release.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.30.0-T06
   - US-IO-HARNESS-0.30.0-T07
@@ -459,4 +459,39 @@ tasks:
     **O3 — `cargo package --locked` succeeds**, and the packaged crate's tests compile.
   files:
   - .ultraship/evidence/0.30.0
-  evidence: []
+  evidence:
+  - >
+    `cargo fmt --check` clean. `cargo clippy --all-targets -- -D warnings` clean, and both feature
+    legs CI runs separately — `--features documents` and `--features media` — clean too.
+  - >
+    `cargo test` (default features): every one of the 29 test binaries green, 279 doctests passed,
+    0 failed. `cargo test --all-features --lib --tests`: 52 green result lines, 0 failed.
+    `cargo test --all-features --doc`: 281 passed, 0 failed.
+  - >
+    N1 — `cargo tree` is **402 lines**, exactly what 0.23.0 through 0.29.0 recorded. `cargo tree
+    --all-features` is 842. No dependency was added; nothing in this release needed one.
+  - >
+    O3 — `cargo package --locked` succeeded: 197 files, 4.5MiB (1.1MiB compressed), and the packaged
+    crate compiled in `target/package/io-harness-0.30.0`.
+  - >
+    Two failures on the way, both real and both worth recording. `tests/cross_version.rs` failed
+    first: 0.30.0 is the first release to ALTER a table rather than only add one, and that test's
+    rule was "no statement 0.22.0 wrote may be altered". The rule was made precise rather than
+    relaxed — it now names the table and the exact columns added, and removing them from the new
+    statement must reproduce the old one character for character. `ALTER TABLE ADD COLUMN` also puts
+    the definition after the last column and before the table constraints, not at the end, which a
+    prefix-shaped first attempt got wrong and the test caught.
+  - >
+    The second was `checkpoint::crash_resume_after_a_real_sigkill_reaches_verified_success` failing
+    right after `cargo clean`, because `--lib --tests` does not build `examples/` and that test execs
+    one. Known trap, not a defect: CI's plain `cargo test` step builds the examples first.
+    `cargo build --all-features --examples` then a re-run: green.
+  - >
+    Disk: `target/` reached 14GiB before the all-features leg and `cargo clean` was run
+    pre-emptively before packaging (19.7GiB and 20.8GiB freed across two cleans), which is the
+    standing remedy for the ENOSPC failures this repository keeps paying for.
+  - >
+    O1 and O2 are the two gates a local run cannot close — the three-OS matrix including the MSRV job,
+    and the docs.rs nightly build — and both run on the pushed commit. Recorded here as pending CI at
+    seal time, and the release record states the ordering rather than implying these were green
+    before they had run.

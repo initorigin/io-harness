@@ -774,9 +774,9 @@ versions:
     status: released
   - version: 0.30.0
     outcome: >
-      An operator can ask the store *why*. Three things the crate does are currently only
-      answerable by re-deriving them by hand, and each is a question an embedding application has
-      to answer on a screen.
+      An operator can ask the store *why*. Three things the crate does are currently only answerable
+      by re-deriving them by hand, and each is a question an embedding application has to answer on
+      a screen.
 
       **Which layer set this setting.** `Config` merges four scopes and `Config::sources()`
       (src/config.rs:716) returns the files it read — not which of them decided any given key. So an
@@ -801,15 +801,15 @@ versions:
       application panels are false without it. A panel that shows a number nobody can source is
       worse than a panel that is missing.
     detail: specified
-    status: planned
+    status: released
   - version: 0.31.0
     outcome: >
       The agent proposes before it acts, and a caller can say how hard it is allowed to think.
 
       A **plan gate**: the agent produces a structured plan — ordered steps, each with the sub-agent
-      that will own it — and the run pauses on it durably, the way an approval already pauses,
-      until a human approves it, sends it back with a correction, or cancels. Nothing is written
-      before the approval. This is not the todo tool of 0.21.0, which lets an agent hold a plan the
+      that will own it — and the run pauses on it durably, the way an approval already pauses, until
+      a human approves it, sends it back with a correction, or cancels. Nothing is written before
+      the approval. This is not the todo tool of 0.21.0, which lets an agent hold a plan the
       operator can watch while it executes; it is a gate that executes nothing until an answer
       arrives, and it survives a restart while it waits.
 
@@ -840,9 +840,9 @@ versions:
     status: planned
   - version: 0.33.0
     outcome: >
-      Two processes, one run. Today a run belongs to the process that started it: `resume` reattaches
-      to a run that *stopped*, and there is no way to observe or answer one that is still going. An
-      unattended run holding an approval is unreachable until it is killed.
+      Two processes, one run. Today a run belongs to the process that started it: `resume`
+      reattaches to a run that *stopped*, and there is no way to observe or answer one that is still
+      going. An unattended run holding an approval is unreachable until it is killed.
 
       After this release a second process attaches to a live run, receives the same serialised
       events the owning process receives, and can answer the approval or the question it is holding.
@@ -863,7 +863,8 @@ versions:
       And **conditional routing**: escalate to a stronger model after repeated gate failures,
       downshift to a cheaper one when the change is small, and refuse to start at all when the
       primary provider is unreachable rather than quietly running an unattended job on the fallback.
-      Roles and a fallback chain exist; what does not is a rule that changes either one during a run.
+      Roles and a fallback chain exist; what does not is a rule that changes either one during a
+      run.
 
       Plus the smallest piece and the one an operator asks for first: **retry a single failed gate
       from its own checkpoint**, so a terminal transport failure on one gate does not cost the forty
