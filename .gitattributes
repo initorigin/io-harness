@@ -8,10 +8,30 @@
 # checkout boundary rather than in the parser.
 tests/fixtures/** text eol=lf
 
-# The cross-version fixture databases are BINARY, and the rule above would
-# otherwise treat them as text: a SQLite page whose bytes happen to contain
-# `0D 0A` gets rewritten to `0A` on `git add`, which silently corrupts the file
-# the moment one is written whose content lands on that pair. The 0.22.0
-# fixtures survived only because none of their pages contained it; the 0.29.0
-# ones did on their first write, which is how this was found.
+# Binary fixtures, which the rule above would otherwise treat as text: any byte
+# pair `0D 0A` inside one gets rewritten to `0A` on `git add`, silently
+# corrupting the committed file. This is not hypothetical — both 0.29.0
+# cross-version databases tripped it on their first write, and the 0.22.0 ones
+# survived only because no page of theirs happened to contain that pair.
+#
+# Listed by extension rather than as a blanket `-text` on the directory: the rule
+# above exists because the template fixtures ARE compared byte for byte as text
+# and must be LF on a Windows checkout, so turning the whole tree binary would
+# trade one silent corruption for another.
+#
+# Every extension a fixture could plausibly arrive as is here, not only the one
+# that bit. The failure mode is the reason: a corrupted `.docx` or `.png` fixture
+# does not report itself as a git problem, it reports itself as a broken parser,
+# and somebody spends an afternoon in the wrong file. The documents and media
+# tests generate their fixtures at run time today, which is why this has not bitten
+# there yet — the first committed one is when it would have.
 tests/fixtures/**/*.sqlite3 binary
+tests/fixtures/**/*.db binary
+tests/fixtures/**/*.png binary
+tests/fixtures/**/*.jpg binary
+tests/fixtures/**/*.jpeg binary
+tests/fixtures/**/*.pdf binary
+tests/fixtures/**/*.zip binary
+tests/fixtures/**/*.docx binary
+tests/fixtures/**/*.xlsx binary
+tests/fixtures/**/*.pptx binary
