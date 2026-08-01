@@ -625,12 +625,42 @@ versions:
     status: released
   - version: 0.28.0
     outcome: >
-      An operator shapes a run without writing Rust. Lifecycle hooks declared in `io.toml` fire on
-      the events the observer channel already emits, so an audit log, a formatter, a notification or
-      a local policy check is a line of configuration rather than a trait implementation. A file the
-      agent changed can be put back the way it was.
-    detail: hypothesis
-    status: planned
+      An operator shapes a run without writing Rust. `[[hook]]` tables in `io.toml` fire on the
+      events the observer channel already emits: an audit log is a path to append the event stream
+      to, a notification and a formatter are an argv to run, and a local policy check is that same
+      argv with the one extra key that lets a non-zero exit stop the run. Each is a table in a file
+      rather than a trait implementation, and each reaches the run through the `Observer` the crate
+      has had since 0.12.0 — `Config::hooks()` returns one, so nothing in the run loop changes and
+      nothing is installed the caller did not install.
+
+      And a file the agent changed can be put back the way it was. Every `write_file` and
+      `edit_file` already reads the previous contents to measure the edit (`src/run.rs:7185`); this
+      release keeps them, in the store the crate already keeps, so `rewind` restores a path to what
+      it was before the run first touched it — including deleting a file the run created — and does
+      so after a crash and a resume, because the record is durable rather than in memory. A new
+      table, not a `CHECKPOINT_FORMAT` bump, for the reason 0.25.0 recorded: an older binary never
+      queries it.
+
+      The trust rule of 0.27.0 is applied rather than weakened. `[[hook]]` is refused in the project
+      scope whole — not just the executing kind — because a hook that runs an argv is the `${cmd:}`
+      primitive arriving one release later, and a hook that appends to a path the file names is a
+      write to a path a cloned repository chose. `io.local.toml` and the user file are the stated
+      alternative, exactly as they are for `${cmd:}`. A hook's argv is a TOML array, never a string
+      split by a shell.
+
+      A formatter is a hook and not a second pass at the edit site. Attaching a writer to the write
+      path would leave the model reading `[wrote src/x.rs] (412 chars)` about bytes that are no
+      longer on disk, and would corrupt the workspace-changed signal that 0.11.0's stall detection
+      rests on. 0.25.0's diagnostics pass reads and may therefore run there; a formatter writes and
+      may not.
+
+      It also closes what 0.25.0 recorded: `every_kind()` in `src/observe.rs:808` proves its match
+      arms exhaustive and never that its vector mentions every variant, so `TodoWrote`,
+      `QuestionAsked` and `QuestionAnswered` have been round-trip-untested since 0.21.0. That is not
+      a tidy-up here, it is load-bearing: a hook filter names an event by its wire tag, so an
+      incomplete census is a filter an operator writes and that silently never fires.
+    detail: specified
+    status: released
   - version: 0.29.0
     outcome: >
       The model a run uses stops being a choice between three vendors. A provider is a base URL, a

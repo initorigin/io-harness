@@ -13,7 +13,7 @@ resource_profile:
     minimize_cost: true
     allow_additional_spend: false
     allow_model_routing: true
-    allow_parallel_agents: false
+    allow_parallel_agents: true
   telemetry:
     source: unknown
     confidence: low

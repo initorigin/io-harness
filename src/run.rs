@@ -33,11 +33,15 @@ use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall,
 use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
-use crate::state::{AgentEvent, ContextEvent, RunStatus, StepRecord, Store, TodoItem, TodoState};
+use crate::state::{
+    AgentEvent, ContextEvent, Kept, RunStatus, Snapshot, StepRecord, Store, TodoItem, TodoState,
+    MAX_SNAPSHOT_BYTES,
+};
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
 use crate::tools::git::{Git, GitCmd, GitOutcome};
 use crate::tools::shell::{Shell, ShellOutcome};
+use crate::tools::workspace::Wrote;
 #[cfg(feature = "barcode")]
 use crate::tools::BARCODE_DECODE_TOOL;
 #[cfg(feature = "pptx")]
@@ -354,6 +358,129 @@ impl RunResult {
     fn with_remembered(mut self, remembered: Vec<Rule>) -> Self {
         self.remembered = remembered;
         self
+    }
+}
+
+/// What [`rewind`] did about one file (0.28.0).
+///
+/// Four variants and not two, for the same reason
+/// `crate::tools::diagnostics::Outcome` has four: the caller must be able to tell
+/// **"nothing was changed because there was nothing to change" from "nothing was
+/// changed because the previous contents were not kept"**. Collapsing
+/// [`Rewind::NotKept`] into [`Rewind::NotRecorded`] would tell a caller a file was
+/// untouched when the run had in fact rewritten it and the harness simply cannot
+/// undo that — which is the one answer a human deciding whether to restore from
+/// their own backup needs. That distinction is the whole reason for four
+/// variants.
+///
+/// The same argument splits [`Rewind::Restored`] from [`Rewind::Removed`]: "the
+/// way it was" is not existing for a file the run created, and a caller writing a
+/// report cannot say "put back" about a file it deleted.
+///
+/// ```
+/// use io_harness::Rewind;
+///
+/// /// The one line a report writes about each file, which is only writable
+/// /// because the four cases stayed apart.
+/// fn line(path: &str, r: &Rewind) -> String {
+///     match r {
+///         Rewind::Restored(_) => format!("{path}: put back"),
+///         Rewind::Removed => format!("{path}: removed, the run created it"),
+///         Rewind::NotKept(why) => format!("{path}: LEFT AS THE RUN LEFT IT — {why}"),
+///         Rewind::NotRecorded => format!("{path}: untouched by this run"),
+///     }
+/// }
+///
+/// assert_eq!(line("a.rs", &Rewind::Removed), "a.rs: removed, the run created it");
+/// // The two that both changed nothing still read differently, which is the point.
+/// assert!(line("big.bin", &Rewind::NotKept("not valid UTF-8".into())).contains("LEFT AS"));
+/// assert!(line("other.rs", &Rewind::NotRecorded).contains("untouched"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rewind {
+    /// Put back. Carries the [`Wrote`] the workspace returned, so a caller can
+    /// see whether the file was already in that state — a rewind of a file the
+    /// run rewrote with what it already held reports
+    /// [`Wrote::Unchanged`](crate::tools::workspace::Wrote::Unchanged), and a
+    /// caller counting how much it actually undid needs to know that.
+    Restored(Wrote),
+    /// The run created it, so "the way it was" is not existing. Deleted.
+    Removed,
+    /// The run changed it and the previous contents were deliberately not kept —
+    /// over the 1 MiB cap, or not UTF-8. **Nothing was changed**, and the file is
+    /// exactly as the run left it. Carries the short reason.
+    NotKept(String),
+    /// This run never wrote this path. Nothing was changed.
+    NotRecorded,
+}
+
+/// Put a file back the way it was before this run first wrote it (0.28.0).
+///
+/// The restore point is the state of the file before the run's *first* write to
+/// it, not before its last: a run that edited one file five times rewinds to
+/// where it started, which is the only definition under which "undo what this run
+/// did" is one operation rather than five.
+///
+/// Restoring writes through [`Workspace::write_file`], so the same path policy the
+/// edit obeyed governs the undo — a rewind cannot put bytes anywhere the run could
+/// not have written them. Removing is stricter and checks
+/// [`Workspace::check_path`] itself, refusing anything that is not an outright
+/// [`Effect::Allow`]: a `write_file` is content a human can inspect afterwards,
+/// where a delete under an `Ask` verdict is not recoverable by inspecting
+/// anything.
+///
+/// Removing a file that is already gone is [`Rewind::Removed`], not an error, so
+/// calling this twice is safe.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind, Rewind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(dir.path().join("notes.md"), "the original\n")?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("tidy the notes", "notes.md")?;
+///
+/// // A run writes its own restore points as it edits. This one wrote none, so
+/// // there is nothing to put back — and, crucially, nothing is touched.
+/// assert_eq!(rewind(&ws, &store, run_id, "notes.md")?, Rewind::NotRecorded);
+/// assert_eq!(ws.read_file("notes.md")?, "the original\n");
+///
+/// // After a real run, the same call answers `Restored` for a file it rewrote,
+/// // `Removed` for one it created, and `NotKept` for one whose previous
+/// // contents were over the 1 MiB cap or were not text.
+/// # Ok(())
+/// # }
+/// ```
+pub fn rewind(ws: &Workspace, store: &Store, run_id: i64, path: &str) -> Result<Rewind> {
+    let Some(snap) = store.snapshot(run_id, path)? else {
+        return Ok(Rewind::NotRecorded);
+    };
+    match snap.kept {
+        Kept::Text(before) => Ok(Rewind::Restored(ws.write_file(path, &before)?)),
+        Kept::Unkept(why) => Ok(Rewind::NotKept(why)),
+        Kept::Absent => {
+            let verdict = ws.check_path(Act::Write, path);
+            if verdict.effect != Effect::Allow {
+                return Err(Error::Refused {
+                    act: "write".to_string(),
+                    target: path.to_string(),
+                    rule: verdict.rule,
+                    layer: verdict.layer,
+                });
+            }
+            let abs = ws.resolve(path)?;
+            match std::fs::remove_file(abs) {
+                Ok(()) => Ok(Rewind::Removed),
+                // Already gone is the state being asked for, so this is done,
+                // not failed. Reporting an error here would make a rewind of a
+                // whole run fail on the one file a human had already deleted.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Rewind::Removed),
+                Err(e) => Err(e.into()),
+            }
+        }
     }
 }
 
@@ -5228,14 +5355,11 @@ async fn dispatch(
                 } => {
                     let body = content.unwrap_or_default();
                     // What is there now, read before the write so the line counts
-                    // below have something to compare against. The write gate has
-                    // already passed at this point; this is measurement, and the
-                    // content never reaches the model.
-                    let before = ws
-                        .resolve(&target)
-                        .ok()
-                        .and_then(|abs| std::fs::read_to_string(abs).ok())
-                        .unwrap_or_default();
+                    // below have something to compare against and so the run has
+                    // a restore point. The write gate has already passed at this
+                    // point; this is measurement, and the content never reaches
+                    // the model.
+                    let (before, kept) = read_before(ws, &target);
                     match ws.write_file(&target, &body) {
                         Ok(wrote) => {
                             record_edit(
@@ -5247,6 +5371,7 @@ async fn dispatch(
                                 &before,
                                 &body,
                             );
+                            record_snapshot(store, run_id, step, &target, kept);
                             // The same check `edit_file` runs, for the same
                             // reason: a write is how most new code arrives, and
                             // a type error in a file the model just created is
@@ -5324,6 +5449,15 @@ async fn dispatch(
                     remember,
                 } => {
                     let replacement = content.unwrap_or_default();
+                    // The restore point, read here because nothing else on this
+                    // path reads the file: `record_edit` below compares `search`
+                    // against `replacement`, and `Workspace::edit_file` does its
+                    // own read internally and does not hand back what it found.
+                    // The measurement half is discarded for exactly that reason —
+                    // taking `before` here instead would change the line counts
+                    // this arm has reported since 0.18.0 from "the size of the
+                    // replacement" to "the size of the file".
+                    let (_, kept) = read_before(ws, &target);
                     match ws.edit_file(&target, search, &replacement) {
                         Ok(wrote) => {
                             // The replaced text against the text that replaced it.
@@ -5339,6 +5473,7 @@ async fn dispatch(
                                 search,
                                 &replacement,
                             );
+                            record_snapshot(store, run_id, step, &target, kept);
                             // The project's own checker, run against the edit
                             // that just happened. It cannot fail the edit: the
                             // write is already on disk by the time this runs, so
@@ -7194,6 +7329,78 @@ fn record_edit(
     let edit = crate::state::Edit::measure(step, tool, path, before, after);
     if let Err(e) = store.record_edit(run_id, &edit) {
         tracing::warn!("could not record the edit to {path} at step {step}: {e}");
+    }
+}
+
+/// What is in a file before a write, as both things the loop needs from one read
+/// (0.28.0).
+///
+/// The `String` is the measurement half, for [`crate::state::Edit::measure`], and
+/// is `""` for every case that is not readable text — exactly what the
+/// `read_to_string(..).ok().unwrap_or_default()` this replaced produced, so no
+/// line count changes. The [`Kept`] is the restore-point half, and is where the
+/// cases the `String` cannot express go.
+///
+/// Those cases are the reason this exists rather than one `read_to_string`.
+/// Reading a binary or unreadable file as an empty one is harmless for a line
+/// count and is data loss for a rewind: the restore point would say "this file
+/// was empty", and putting it back would truncate it.
+///
+/// One read, not two. A `metadata()` for the size followed by a read would be
+/// two syscalls and a race — the file can change between them — where reading the
+/// bytes and then measuring what came back cannot disagree with itself.
+fn read_before(ws: &Workspace, path: &str) -> (String, Kept) {
+    // A path that does not resolve and a path that does not exist are the same
+    // answer: there is nothing there, so putting it back means it should not be
+    // there. A resolve failure is an escape attempt the write gate is about to
+    // refuse anyway, so no restore point is lost by folding the two.
+    let Ok(abs) = ws.resolve(path) else {
+        return (String::new(), Kept::Absent);
+    };
+    let bytes = match std::fs::read(abs) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (String::new(), Kept::Absent),
+        // Something is there and could not be read — a directory, a permission,
+        // a device. Not `Absent`, deliberately: `Absent` means "putting this
+        // back means deleting it", and deleting a path whose contents could not
+        // even be read is the one outcome this feature must never produce.
+        Err(e) => {
+            return (
+                String::new(),
+                Kept::Unkept(format!("could not be read: {e}")),
+            )
+        }
+    };
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return (
+            String::new(),
+            Kept::Unkept(format!(
+                "{} bytes, over the 1 MiB snapshot cap",
+                bytes.len()
+            )),
+        );
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => (text.clone(), Kept::Text(text)),
+        Err(_) => (String::new(), Kept::Unkept("not valid UTF-8".to_string())),
+    }
+}
+
+/// Record what a file held before this run first wrote it (0.28.0).
+///
+/// Swallowed on a store failure for the same reason [`record_edit`] is: the write
+/// has already reached the disk by the time this runs, and reporting it as failed
+/// because a bookkeeping row would not land would lose the work as well as the
+/// row. The cost of the warning is that the file has no restore point, which
+/// [`rewind`] reports honestly as [`Rewind::NotRecorded`].
+fn record_snapshot(store: &Store, run_id: i64, step: u32, path: &str, kept: Kept) {
+    let snap = Snapshot {
+        step,
+        path: path.to_string(),
+        kept,
+    };
+    if let Err(e) = store.record_snapshot(run_id, &snap) {
+        tracing::warn!("could not record the state of {path} before step {step}: {e}");
     }
 }
 

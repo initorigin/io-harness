@@ -212,6 +212,20 @@ loaded implicitly: the caller reads the file, before the run, once. A **project*
 file may narrow the boundary and may never widen it — the keys that would make
 cloning a repository dangerous are refused in the one file a clone delivers.
 
+**Hooks, so an operator shapes a run without writing Rust.** A `[[hook]]` table
+names the events it wants and one thing to do with them: a path to append the
+event stream to is an audit log, an argv to run is a notification or a formatter,
+and that argv with `on_failure = "cancel"` is a local policy check that ends the
+run. `Config::hooks()` returns an `Observer` the caller installs like any other,
+so no run loop changed — and the whole array is refused in the committed project
+file, for the same reason `${cmd:...}` is. See the [hooks guide](docs/guide/hooks.md).
+
+**Undo.** Every write records what was there before the run first touched that
+file, in the store rather than in memory, so `rewind(&workspace, &store, run_id,
+path)` puts a file back — including deleting one the run created — after a crash
+and a resume. One restore point per file per run, and it says plainly when it has
+none rather than guessing.
+
 ## Guides
 
 | Guide | What it covers |
@@ -235,6 +249,7 @@ cloning a repository dangerous are refused in the one file a clone delivers.
 | [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
+| [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |
 
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md) indexes them.
 [docs/CONTRACT.md](docs/CONTRACT.md) is the public contract: what is stable, what

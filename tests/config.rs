@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use io_harness::config::{Config, Scope};
+use io_harness::observe::{Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
     run_with, Act, ApproveAll, Effect, Policy, Provider, RunOutcome, Store, TaskContract,
@@ -343,6 +344,16 @@ theme = "dark"
 [instructions]
 files = ["AGENTS.md"]
 
+[[hook]]
+on = ["refused"]
+append = "audit.jsonl"
+
+[[hook]]
+on = ["stalled"]
+run = ["io-harness-config-test-hook"]
+on_failure = "cancel"
+timeout_ms = 250
+
 [profile.cheap]
 run = { max_steps = 5 }
 "#;
@@ -407,6 +418,42 @@ fn f7_every_key_reaches_a_typed_field() {
             .apply_to(contract(project.path()))
             .max_steps,
         5
+    );
+
+    // 0.28.0's `[[hook]]`. Two tables, because a hook has exactly one action and
+    // the five keys do not fit in one: the first proves `on` and `append` reach
+    // typed fields, the second proves `run` and `on_failure` do. `timeout_ms` is
+    // reachable only by outliving it, which needs a real child and a real clock —
+    // `tests/hooks.rs::f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure`
+    // is where that is asserted, and this test deliberately spawns nothing slow.
+    let hooks = config.hooks();
+    assert!(!hooks.is_empty());
+    assert_eq!(
+        hooks.event(&RunEvent::new(
+            1,
+            1,
+            io_harness::EventKind::Refused {
+                act: "write".into(),
+                target: "x".into(),
+                rule: None,
+                layer: None,
+            },
+        )),
+        Flow::Continue,
+        "an append hook does not stop a run"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "`on` and `append` both reached a field"
+    );
+    assert_eq!(
+        hooks.event(&RunEvent::new(1, 2, io_harness::EventKind::Stalled)),
+        Flow::Cancel,
+        "`run` named a program that does not exist, and `on_failure` said what that means"
     );
 
     let policy = config.policy().unwrap();
@@ -494,6 +541,23 @@ fn f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default() {
         "the removed key falls back"
     );
     assert_eq!(applied.max_retries, 9, "its neighbour does not");
+
+    // 0.28.0, and the same control over one of the new keys: with the hook's `on`
+    // list removed the filter falls back to "every event", so the audit line the
+    // fixture above did *not* write is written here. The fixture proves the field is
+    // read rather than defaulted only if removing it visibly changes the answer.
+    let unfiltered = without.replace("on = [\"refused\"]\n", "");
+    write(project.path(), "io.local.toml", &unfiltered);
+    let hooks = Config::discover(project.path()).unwrap().hooks();
+    hooks.event(&RunEvent::new(1, 1, io_harness::EventKind::Stalled));
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "an absent `on` is every event"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1686,6 +1750,104 @@ fn an_unknown_key_inside_a_provider_or_instructions_table_is_rejected_naming_it(
         project.path(),
         "io.toml",
         "[[provider]]\nkind = \"openrouter\"\nmodel = \"x\"\n[instructions]\nfiles = []\n",
+    );
+    Config::discover(project.path()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// 0.28.0 — F6 and F9 for `[[hook]]`
+// ---------------------------------------------------------------------------
+
+/// F6 — a project-scoped file may not declare hooks, and the refusal is about
+/// hooks rather than about the project scope going strict.
+///
+/// The whole array, not its executing half. `run` is the `${cmd:}` primitive
+/// arriving one release later, and `append` is a write to a path a stranger chose,
+/// which is the same hazard by a shorter route.
+#[test]
+fn a_project_scoped_file_may_not_declare_hooks_and_a_local_one_may() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    for text in [
+        "[[hook]]\nappend = \"audit.jsonl\"\n",
+        "[[hook]]\nrun = [\"true\"]\n",
+        // And inside a profile, which is the path a rule like this forgets: a
+        // widening key hidden in `[profile.x]` reaches the same place by a
+        // different route, which is why `refuse_widening` already walks them.
+        "[profile.loud]\nhook = [{ append = \"audit.jsonl\" }]\n",
+    ] {
+        write(project.path(), "io.toml", text);
+        let err = Config::discover(project.path()).unwrap_err().to_string();
+        assert!(err.contains("hook"), "the error names the key: {err}");
+        assert!(err.contains("io.toml"), "and the file: {err}");
+        assert!(
+            err.contains("io.local.toml"),
+            "and where to write it instead: {err}"
+        );
+    }
+
+    // Control one: the byte-identical table in the local scope loads and produces a
+    // hook that works. Without it, a rule that refused hooks everywhere would pass.
+    std::fs::remove_file(project.path().join("io.toml")).unwrap();
+    write(
+        project.path(),
+        "io.local.toml",
+        "[[hook]]\nappend = \"audit.jsonl\"\n",
+    );
+    let hooks = Config::discover(project.path()).unwrap().hooks();
+    hooks.event(&RunEvent::new(1, 1, io_harness::EventKind::Stalled));
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    // Control two: an unrelated key in the same project file still loads, so the
+    // test cannot pass on an implementation that refused `io.toml` wholesale — the
+    // shape 0.27.0's F4 control exists to catch, available again here.
+    write(project.path(), "io.toml", "[run]\nmax_steps = 12\n");
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.apply_to(contract(project.path())).max_steps, 12);
+}
+
+/// F9 — the new table rejects what it does not know, and a table with no action or
+/// two actions is refused naming its index.
+#[test]
+fn an_unknown_key_inside_a_hook_table_is_rejected_naming_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    for (text, key) in [
+        (
+            "[[hook]]\nappend = \"a.jsonl\"\nonn = [\"stalled\"]\n",
+            "onn",
+        ),
+        ("[[hook]]\non = [\"stalled\"]\n", "needs an action"),
+        (
+            "[[hook]]\nappend = \"a.jsonl\"\nrun = [\"true\"]\n",
+            "not both",
+        ),
+        ("[[hook]]\nrun = []\n", "names no program"),
+        (
+            "[[hook]]\non = [\"finshed\"]\nappend = \"a.jsonl\"\n",
+            "finshed",
+        ),
+    ] {
+        write(project.path(), "io.local.toml", text);
+        let err = Config::discover(project.path()).unwrap_err().to_string();
+        assert!(err.contains(key), "must name `{key}`, got: {err}");
+    }
+
+    // The negative control: the correctly spelled version loads.
+    write(
+        project.path(),
+        "io.local.toml",
+        "[[hook]]\non = [\"stalled\"]\nappend = \"a.jsonl\"\n",
     );
     Config::discover(project.path()).unwrap();
 }

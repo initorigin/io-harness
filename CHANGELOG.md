@@ -26,6 +26,72 @@ notes are produced from it.
 
 ### Security
 
+## [0.28.0] - 2026-08-01
+
+An operator can now shape a run without writing Rust. `[[hook]]` tables in
+`io.toml` fire on the events the observer channel has emitted since 0.12.0, so an
+audit log is a path, a notification and a formatter are an argv, and a local
+policy check is that argv with one more key. Each reaches the run through the
+`Observer` the crate already had — `Config::hooks()` returns one and the caller
+installs it — so no run loop changed.
+
+And a file the agent changed can be put back the way it was. Every write already
+read the previous contents to measure the edit; this release keeps the first one
+it sees per file, in the store, so `rewind` restores a path to what it was before
+the run first touched it — including deleting a file the run created — and does so
+after a crash and a resume.
+
+### Added
+
+- **`[[hook]]` and `Hooks`.** An array of tables in `io.toml`, each naming the
+  events it wants and one thing to do with them. `on` names events by the wire tags
+  `EventKind` serializes to and an absent `on` is every event; `append` writes one
+  JSON line per matching event; `run` spawns a fixed argv with that JSON on its
+  stdin, bounded by `timeout_ms` and killed past it; `on_failure = "cancel"` turns a
+  failing hook into an ended run, which is the whole of a local policy check.
+  Exactly one of `append` and `run` is required. `Config::hooks()` returns a `Hooks`,
+  which implements `Observer`, and the caller passes it to `run_observed`,
+  `resume_observed` or any of the tree forms. There is no shell anywhere: a hook's
+  argv is a TOML array and reaches the process unsplit.
+- **`[[hook]]` is refused in a project-scoped `io.toml`, whole.** Not its executing
+  half. A hook that runs an argv is the `${cmd:...}` primitive 0.27.0 refused in that
+  scope, arriving one release later; a hook that appends is a write to a path a
+  cloned repository chose, which is the same hazard by a shorter route. Refused
+  inside a `[profile.<name>]` too. `io.local.toml` and the user-scope file take them
+  unchanged. This is 0.27.0's narrow-never-widen rule applied to a new key, and it
+  still does not claim that cloning a repository is safe.
+- **`rewind` and `Rewind`.** `rewind(&workspace, &store, run_id, path)` puts a file
+  back the way it was before that run first wrote it. Four answers, because a caller
+  must be able to tell them apart: `Restored` with the `Wrote` the workspace
+  returned, `Removed` for a file the run created, `NotKept` with a reason for one
+  whose previous contents were over the 1 MiB cap or were not UTF-8 — nothing is
+  changed and the file is never truncated — and `NotRecorded` for a path this run
+  never wrote. Restoring writes through `Workspace::write_file` and removing checks
+  `Act::Write` first, so an undo obeys the policy the edit obeyed.
+- **A durable restore point per file per run.** A new `snapshots` table records what
+  was there before the run's *first* write to each path, so a rewind survives a
+  crash and a resume rather than living in memory. A new table is additive:
+  `CHECKPOINT_FORMAT` stays 7, and an 0.27.0 store opens, resumes and replays
+  unchanged.
+- **A new guide page, [Hooks](docs/guide/hooks.md)**, and a `### [[hook]]` section in
+  the configuration guide.
+
+### Fixed
+
+- **The event census in `src/observe.rs` is now a census.** `every_kind()` matched on
+  the items of its own vector, which proves the match arms exhaustive and never
+  proves the vector complete — so `TodoWrote`, `QuestionAsked` and `QuestionAnswered`
+  had been absent from it, and therefore round-trip-untested, since 0.21.0. The
+  complete list of wire tags now lives beside the enum, is proven complete by a test
+  that reads `pub enum EventKind` out of the source, and `every_kind()`'s tags are
+  asserted **equal** to it rather than contained in it. It is load-bearing rather than
+  tidy: a hook names an event by its tag, so a tag the crate forgot would be a hook an
+  operator writes and that silently never fires.
+- **The pre-write read no longer reports an unreadable file as an empty one.** Both
+  write paths read the previous contents with `read_to_string(..).ok().unwrap_or_default()`,
+  which is harmless for a line count and would be data loss for a rewind. Existing
+  line counts are unchanged.
+
 ## [0.27.0] - 2026-08-01
 
 One file is now the whole configuration. `io.toml` gains the piece it has been
