@@ -142,18 +142,56 @@ impl Reference {
         if let Some(hit) = self.cached.get() {
             return Ok(hit.clone());
         }
-        let resp = self.client.get(&self.url).send().await?;
-        let body: Catalogue = super::ensure_success(resp).await?.json().await?;
         let host = self.host().unwrap_or(&self.url).to_string();
-        let models: Vec<ModelInfo> = body
-            .data
-            .into_iter()
-            .map(|entry| entry.into_model(&host))
-            .collect();
+        let models = fetch(&self.client, &self.url, &PriceSource::Reference(host)).await?;
         // A race between two callers costs a second request and the first result
         // wins, which is cheaper than holding a lock across an await.
         let _ = self.cached.set(models.clone());
         Ok(models)
+    }
+}
+
+/// Read an OpenAI-shaped `/models` document into [`ModelInfo`]s, attributing
+/// every price it carries to `source`.
+///
+/// One function for both paths on purpose. A vendor's own catalogue and the
+/// reference catalogue are the same document shape — `{"data": [...]}` — and
+/// differ only in whether the rows carry prices and in who to credit them to. Two
+/// parsers would be two chances to disagree about what a missing field means.
+pub(crate) async fn fetch(
+    client: &reqwest::Client,
+    url: &str,
+    source: &PriceSource,
+) -> Result<Vec<ModelInfo>> {
+    let resp = client.get(url).send().await?;
+    let body: Catalogue = super::ensure_success(resp).await?.json().await?;
+    Ok(body
+        .data
+        .into_iter()
+        .map(|entry| entry.into_model(source))
+        .collect())
+}
+
+/// Fill in prices `vendor` does not state from `reference`, marking each with
+/// where it came from.
+///
+/// A model the reference does not carry under an exact match or the one
+/// normalisation is **left alone** — still `None`, still counted by
+/// [`Spend::unpriced_calls`](crate::pricing::Spend::unpriced_calls). A vendor
+/// that stated its own price keeps it: a stated price always beats a reference
+/// one, including a stated zero, which is what a local runtime reports.
+pub(crate) fn fill_missing_prices(vendor: &mut [ModelInfo], reference: &[ModelInfo]) {
+    let index = Index::new(reference);
+    for model in vendor.iter_mut() {
+        if model.price.is_some() {
+            continue;
+        }
+        let Some(hit) = index.find(&model.id) else {
+            continue;
+        };
+        model.price = hit.price;
+        model.price_tiers = hit.price_tiers.clone();
+        model.price_source = hit.price_source.clone();
     }
 }
 
@@ -351,7 +389,7 @@ impl Override {
 }
 
 impl Entry {
-    fn into_model(self, host: &str) -> ModelInfo {
+    fn into_model(self, source: &PriceSource) -> ModelInfo {
         let pricing = self.pricing.unwrap_or_default();
         let price = pricing.price();
         let price_tiers = match price {
@@ -377,7 +415,10 @@ impl Entry {
             accepts_tools: self
                 .supported_parameters
                 .map(|p| p.iter().any(|x| x == "tools")),
-            price_source: price.map(|_| PriceSource::Reference(host.to_string())),
+            // `Some` exactly when there is a price to attribute: a number this
+            // crate reports always says its own origin, and an absent number
+            // attributes nothing.
+            price_source: price.map(|_| source.clone()),
             price,
             price_tiers,
         }

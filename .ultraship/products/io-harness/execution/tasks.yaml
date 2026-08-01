@@ -121,7 +121,7 @@ tasks:
     models(), and the opt-in reference lookup in endpoints().'
   why_required: It is the release. Twenty-one vendors are reachable without writing a provider, or the
     outcome sentence is false.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T02
   acceptance_criteria:
@@ -166,7 +166,44 @@ tasks:
     '
   files:
   - src/provider/compatible.rs
-  evidence: []
+  evidence:
+  - 'F1 — `f1_a_streamed_completion_arrives_through_the_real_http_and_sse_path` drives the whole HTTP+SSE
+    path against a local socket via `Compatible::at`, and asserts on the request head the socket actually
+    received: the bearer token and a path ending `/chat/completions`. Two named negative controls: `f1_an_auth_none_provider_sends_no_authorization_header_at_all`
+    proves the auth style reaches the wire rather than merely being stored, and `f1_a_base_that_already_carries_a_path_keeps_every_segment_of_it`
+    proves a nested base survives — the failure a scheme-and-host field would have had against four
+    presets.'
+  - '`a_failure_is_classified_exactly_as_the_three_original_providers_classify_it` — a 429 through Compatible
+    is RateLimited/Some(429), the same as the other three, because it funnels through the same `ensure_success`.
+    Asserted rather than assumed, since ''it shares the wire module'' is the release''s structural claim.'
+  - 'F2 — `f2_every_preset_names_a_distinct_vendor_with_a_well_formed_base` over 21 rows (13 hosted,
+    8 local). `f2_the_table_check_reports_a_broken_row_rather_than_always_passing` is the named negative
+    control: the validator run over a table with one relative base and one duplicated name must report
+    exactly those two. `f2_every_named_constructor_agrees_with_its_table_row` drives all 21 constructors
+    and asserts base, auth and trace label against the table, which is also what proves `Compatible::known`''s
+    expect unreachable.'
+  - '`f2_a_local_runtime_takes_no_key_and_a_hosted_one_takes_a_bearer` splits the table against a named
+    list of the eight runtimes rather than guessing from the URL. `f2_an_unknown_preset_is_refused_naming_the_ones_that_exist`
+    — ''grok'' is refused listing ''groq'' and ''ollama'' among the rest, with the accepted name as
+    the control.'
+  - F3's negative control — `f3_a_connected_provider_returns_a_non_empty_catalogue` returns 2 models
+    from a real body, so the defaulted-empty assertion in `provider::catalogue_default` cannot pass
+    against an implementation whose models() is empty for everyone. A vendor publishing identifiers
+    and no cost is None on price and price_source, never free.
+  - 'F7 — `f7_the_reference_lookup_is_off_until_it_is_asked_for` uses a recording reference server:
+    a provider that did not opt in leaves its log EMPTY (one endpoint, no second request), and one that
+    opted in reports two endpoints and dials it exactly once. An empty log is proof a return value alone
+    cannot give.'
+  - 'F6 — `f6_a_reference_price_fills_a_gap_and_says_it_is_a_reference_price`: deepseek-chat matches
+    deepseek/deepseek-chat by the one normalisation and is marked PriceSource::Reference; llama3.2,
+    which the reference does not carry, is left None rather than guessed; and price.is_some() == price_source.is_some()
+    across the whole list.'
+  - '`a_price_table_carries_the_moment_it_was_read_rather_than_a_typed_date` — price_table() dates itself
+    YYYY-MM-DD from the fetch. `crate::net::today_utc` was added rather than ungating the test-only
+    `http_date`, using Hinnant''s civil-from-days; `the_civil_date_is_exact_across_leap_years_and_century_rules`
+    covers the epoch, 2000-02-29 and the 2100 non-leap boundary. A model nobody priced is absent from
+    the table, never entered at zero.'
+  - '`cargo test --lib` — 356 passed, 0 failed. `cargo clippy --all-targets -- -D warnings` — clean.'
 - id: US-IO-HARNESS-0.29.0-T04
   summary: ProviderSpec::Compatible in the file format, its exactly-one base rule, and every key of
     it named in EVERY_KEY.

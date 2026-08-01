@@ -247,8 +247,7 @@ impl PriceTable {
         Some(
             self.tiers(model)
                 .iter()
-                .filter(|t| prompt_tokens >= t.min_prompt_tokens)
-                .next_back()
+                .rfind(|t| prompt_tokens >= t.min_prompt_tokens)
                 .map_or(base, |t| t.price),
         )
     }
