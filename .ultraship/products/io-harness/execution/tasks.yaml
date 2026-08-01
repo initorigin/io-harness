@@ -428,7 +428,7 @@ tasks:
     cargo package, and the live reference-catalogue check.'
   why_required: Every non-functional and operational criterion is proven here or is unproven, and a
     parser written against a shape nobody checked is the failure F10 exists to prevent.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T08
   acceptance_criteria:
@@ -477,7 +477,41 @@ tasks:
 
     '
   files: []
-  evidence: []
+  evidence:
+  - 'NF1 — `cargo test` on the default feature set: **1098 passed, 0 failed**, zero failing binaries,
+    no test skipped, ignored or made conditional. The standing Windows wall-clock exception was not
+    needed on this machine.'
+  - '`cargo build --all-features --examples` then `cargo test --all-features --lib --tests`: **913 passed,
+    0 failed**. The examples are built first deliberately — `--lib --tests` does not build them and
+    four binaries exec them, which is the failure 0.28.0 recorded.'
+  - 'NF2 — `cargo tree` reads **402 lines**, unchanged from 0.28.0. No new dependency on any platform:
+    the provider is reqwest and the existing openai_wire, the catalogue parse is serde_json, the decimal
+    shift is std string handling, and the date is std arithmetic (Hinnant''s civil-from-days) rather
+    than a date crate.'
+  - NF3 — no store schema change at all and `CHECKPOINT_FORMAT` stays 7. This release creates no table,
+    which follows from caching the catalogue on the provider instance rather than in the store; `tests/cross_version.rs`
+    passes unchanged with nothing added to ADDED_SINCE_0_22_0.
+  - NF4 — `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean;
+    `cargo doc --no-deps --all-features` **warning-free**. Three intra-doc warnings were found and fixed
+    in 2161ea7 — two links to crate-private items (WebFlavor, PRESETS) and one redundant explicit target
+    — rather than tolerated.
+  - 'OP5 — `cargo package --locked` exit 0, **190 files**. Tarball verified by listing rather than by
+    trusting the exclude list: zero entries matching `.env`, `.ultraship/` or `.github/`; `.env.example`
+    present and intended. `df -h .` read before packaging (36 GiB free after a clean) and again after
+    (35 GiB).'
+  - 'MSRV: 1.95 unchanged and not re-derived locally. The floor is set by a dependency (libsqlite3-sys''s
+    cfg_select, established in 0.23.0) which this release does not touch, and no std API above 1.95
+    was introduced. CI''s `msrv` job reads the floor from Cargo.toml rather than hardcoding it and runs
+    on the PR, which is the check — stated rather than claiming a local both-directions run that was
+    not performed.'
+  - 'F10 — the live reference host, read from the release machine through the shipped parser via `examples/live_catalogue.rs`:
+    **336 models, 336 priced, 44 carrying a prompt-length tier**, one row (anthropic/claude-opus-5-fast)
+    pricing all five dimensions, and **zero price/provenance disagreements**. The tier sample is qwen/qwen3.7-flash,
+    base input 30000 stepping to 100000 at 32000 prompt tokens — and 30000 is exactly the value an f64
+    multiply returns as 29999, so the live data confirms the conversion control was worth writing.'
+  - 'Disk was the live hazard this session: two agents building concurrently drove it to 9.6 GiB with
+    target/ at 26 GiB. `cargo clean` reclaimed 29 GiB and later 43 GiB, every cargo invocation from
+    the gates onward was serialised, and `df -h .` was read before package.'
 - id: US-IO-HARNESS-0.29.0-T10
   summary: 'Price tiers in src/pricing.rs: PriceTier, PriceTable::with_tiers/tiers, and tier selection
     in cost_micros.'
