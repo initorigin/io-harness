@@ -1,0 +1,6 @@
+cargo fmt --check — clean
+cargo clippy --all-targets -- -D warnings — clean
+cargo doc --no-deps — warning-free
+cargo tree — 402 lines, unchanged
+cargo package --locked — exit 0, 186 files, 3.9MiB (1.0MiB compressed)
+tarball listing — zero entries matching .env, .ultraship/ or .github/ (.env.example is deliberate)

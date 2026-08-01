@@ -648,11 +648,11 @@ versions:
       alternative, exactly as they are for `${cmd:}`. A hook's argv is a TOML array, never a string
       split by a shell.
 
-      A formatter is a hook and not a second pass at the edit site. Attaching a writer to the
-      write path would leave the model reading `[wrote src/x.rs] (412 chars)` about bytes that are
-      no longer on disk, and would corrupt the workspace-changed signal that 0.11.0's stall
-      detection rests on. 0.25.0's diagnostics pass reads and may therefore run there; a formatter
-      writes and may not.
+      A formatter is a hook and not a second pass at the edit site. Attaching a writer to the write
+      path would leave the model reading `[wrote src/x.rs] (412 chars)` about bytes that are no
+      longer on disk, and would corrupt the workspace-changed signal that 0.11.0's stall detection
+      rests on. 0.25.0's diagnostics pass reads and may therefore run there; a formatter writes and
+      may not.
 
       It also closes what 0.25.0 recorded: `every_kind()` in `src/observe.rs:808` proves its match
       arms exhaustive and never that its vector mentions every variant, so `TodoWrote`,
@@ -660,7 +660,7 @@ versions:
       a tidy-up here, it is load-bearing: a hook filter names an event by its wire tag, so an
       incomplete census is a filter an operator writes and that silently never fires.
     detail: specified
-    status: planned
+    status: released
   - version: 0.29.0
     outcome: >
       The model a run uses stops being a choice between three vendors. A provider is a base URL, a

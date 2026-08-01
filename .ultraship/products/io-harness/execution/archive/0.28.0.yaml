@@ -30,9 +30,9 @@ release_fit:
   major_cost_drivers:
     - >
       Spawning and bounding a child process from inside a synchronous trait method that is called
-      from an async run loop, on three platforms, without reaching for `tokio` or a timer crate.
-      The riskiest ten lines in the release, and the reason the contract writes Trigger B against
-      them specifically.
+      from an async run loop, on three platforms, without reaching for `tokio` or a timer crate. The
+      riskiest ten lines in the release, and the reason the contract writes Trigger B against them
+      specifically.
     - >
       Replacing the pre-write read at `src/run.rs:5229-5236` without moving a single existing line
       count. It is on the hot path of every edit and its current form loses the distinction between

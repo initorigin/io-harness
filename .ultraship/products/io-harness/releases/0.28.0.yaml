@@ -1,7 +1,7 @@
 product: io-harness
 version: 0.28.0
 release_type: minor
-status: planned
+status: released
 outcome:
   user_can: >
     Shape a run from `io.toml` instead of from Rust. `[[hook]]` declares what should happen when the
@@ -524,3 +524,219 @@ open_questions:
   Whether `rewind` takes a path or rewinds every path the run touched. One path is the smaller
   surface and composes with `Store::edits`; all paths is what an operator asking "undo it" means.
   Decided against what the return type has to say when half the paths are `NotKept`.
+released_at: 2026-08-01T18:30:00Z
+mode: published
+delivered: >
+  An operator can now shape a run from `io.toml` instead of from Rust. A `[[hook]]` table names the
+  events it wants and one thing to do with them: `append` writes one JSON line per matching event,
+  which is an audit log; `run` spawns a fixed argv with that JSON on its stdin, which is a
+  notification, a formatter, or — with `on_failure = "cancel"` — a local policy check that ends the
+  run. `Config::hooks()` returns a `Hooks`, which *is* the `Observer` this crate has had since
+  0.12.0, so the caller installs it exactly as it installs its own and no run loop changed. The
+  argv is a TOML array and stays one: there is no shell between the file and the process.
+
+  The rule that bounds it shipped with it rather than after it. The whole `[[hook]]` array is
+  refused in a project-scoped `io.toml`, inside a `[profile]` too — not its executing half, because
+  a hook that runs an argv is the `${cmd:}` primitive 0.27.0 refused there arriving one release
+  later, and a hook that appends is a write to a path a stranger chose, which is the same hazard by
+  a shorter route. `io.local.toml` and the user file are the stated alternative, in the words
+  0.27.0 already used. This is that release's narrow-never-widen rule applied to a new key, and it
+  still does not claim that cloning a repository is safe.
+
+  A formatter is a hook rather than a second pass at the edit site, and that is a property of the
+  code rather than a preference. 0.25.0's diagnostics pass runs after a successful edit and
+  **reads**; a formatter **writes**. A writer there would leave the model reading
+  `[wrote src/x.rs] (412 chars)` about bytes no longer on disk, and would run after
+  `Wrote::moved_the_workspace` — the signal 0.11.0's stall detection rests on — had already been
+  computed. At the `step` boundary both are settled, so three lines of TOML is where a formatter
+  belongs. `docs/guide/hooks.md` carries the example rather than a paragraph explaining an absence.
+
+  And a file the agent changed can be put back the way it was. Both write paths already read the
+  previous contents to measure the edit; the first one seen per path is now kept as a row, so
+  `rewind` restores a path to what it was before the run first touched it — including deleting a
+  file the run created — and survives a kill and a resume, which was the criterion rather than a
+  bonus. `Rewind` carries four answers because a caller must be able to tell them apart:
+  `NotKept` and `NotRecorded` both change nothing, and collapsing them would tell a caller a file
+  was untouched when the run had rewritten it and the harness cannot undo that. A new table, so
+  `CHECKPOINT_FORMAT` stays 7 and a 0.27.0 store opens, resumes and replays unchanged.
+
+  The release also closed what 0.25.0 recorded, and it was load-bearing rather than tidy.
+  `every_kind()` matched on the items of its own vector, which proves the arms exhaustive and never
+  proves the vector complete, so `TodoWrote`, `QuestionAsked` and `QuestionAnswered` had been
+  round-trip-untested since 0.21.0. A hook names an event by its wire tag, so a tag the crate had
+  forgotten would have been a hook an operator writes and that silently never fires. `EVENT_NAMES`
+  now lives beside the enum, is proven complete by a test that reads `pub enum EventKind` out of the
+  source, and `every_kind()`'s tags are asserted **equal** to it.
+
+  Nothing in this release breaks. No public item was renamed or removed, `EventKind` gained no
+  variant, and a file, a program and a database written for 0.27.0 all behave exactly as they did.
+evidence:
+  tests:
+  - >
+    `cargo test` — exit 0 on macOS. Every suite green, no test skipped, ignored or made
+    conditional; the standing `skills::discovery_over_a_32_skill_directory_is_under_50ms` exception
+    was not needed. 323 lib tests, 254 doctests, and every integration binary.
+  - >
+    `cargo test --all-features --lib --tests` — the second invocation CI and the release workflow
+    run. 393 lib tests with every feature on, and every integration binary green. Three binaries —
+    `context`, `mcp`, `observe` — and `checkpoint` first failed on a clean `target/` because
+    `--lib --tests` does not build the `examples/` fixtures they exec; CI never meets this because
+    its `cargo test` step builds them into the same directory first. `cargo build --all-features
+    --examples` then `cargo test --all-features --test context --test mcp --test observe` — 41
+    passed, 0 failed. Recorded rather than quietly re-run, because the first reading of it looked
+    like a regression and was not.
+  - >
+    F1 — `f1_a_hook_fires_on_the_events_it_names_and_on_no_others` drives a real `run_with_observed`
+    with three hook tables, teeing the run's own event stream beside them. The filtered hook
+    received exactly `refused` and `finished`; the unfiltered one's tag set is asserted **equal** to
+    the run's rather than merely non-empty; and the hook whose filter matched nothing left an
+    **empty file** rather than none, which is what keeps "matched nothing" distinguishable from
+    "never installed" and is why the path is created when the hooks are built.
+  - >
+    F2 — `f2_an_event_this_crate_does_not_emit_is_refused_naming_it` names the misspelling, the
+    table's index and the file. The control is
+    `hooks::tests::every_event_the_crate_emits_is_a_name_a_hook_may_use`, which puts every entry of
+    `EVENT_NAMES` in one `on` list — so a rule written against a hand-typed subset fails there
+    rather than on the first operator who hooks `todo_wrote`.
+  - >
+    F3 — `event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained` reads
+    `pub enum EventKind` out of `src/observe.rs`, with the helper run against a list one entry short
+    as the control that it can report an omission at all. `every_kind_produces_one_of_every_tag_and_no_others`
+    then asserts equality rather than containment, which is the assertion `src/observe.rs` had been
+    missing since 0.21.0. The three variants that were absent from the sample set now round-trip.
+  - >
+    F4 — `f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin`: the child creates a file
+    whose name carries `;` and `&&`, which proves the argv element arrived intact rather than split
+    or interpreted, and its contents parse as the JSON of the event that fired.
+    `f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure` has the control that
+    the same shape inside its timeout completes and does not stop the run, so "bounded" is not
+    satisfied by an implementation that kills everything. Both name each platform's own programs
+    rather than skipping on Windows.
+  - >
+    F5 — `f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to`, with the
+    byte-identical hook without `on_failure` reaching its own ending as the control. The default is
+    proven to be the safe one, and a notification that happens to fail is proven not to be a kill
+    switch.
+  - >
+    F6 — `a_project_scoped_file_may_not_declare_hooks_and_a_local_one_may` refuses both actions and
+    a hook hidden inside a `[profile]`, naming the key, the file and where to write it instead. Two
+    controls: the byte-identical table in `io.local.toml` loads and produces a hook that works, and
+    an unrelated key in the same project `io.toml` still loads — so the test cannot pass on an
+    implementation that refused the project scope wholesale, which is the shape 0.27.0's F4 control
+    exists to catch and was available again here.
+  - >
+    F7 — `a_file_the_run_rewrote_is_put_back_and_a_file_it_created_is_removed`, driven through a
+    real run. Three controls, each named:
+    `a_path_the_run_never_wrote_is_not_recorded_and_is_left_alone` asserts the bytes and not only
+    the return value; `a_second_edit_does_not_move_the_restore_point`; and
+    `contents_that_were_not_kept_are_reported_and_the_file_is_never_truncated`, over both a
+    non-UTF-8 file and one past the 1 MiB cap — the one way this feature could destroy work.
+  - >
+    F8 — `a_restore_point_survives_the_process_that_wrote_it` asserts through a `Store` dropped and
+    reopened at the same path, because an in-memory restore point passes every assertion in F7.
+    `a_resume_rewinds_under_the_run_id_the_snapshots_were_written_against` pins the premise, which
+    was checked before the table was written: every `resume*` form takes `run_id` as a parameter and
+    the only two `Store::start_run` calls in the crate are on the start path, so a resume
+    structurally cannot mint a new id. The control is
+    `another_runs_restore_point_is_not_reachable_from_this_run`.
+  - >
+    F9 — `EVERY_KEY` names two `[[hook]]` tables covering all five keys, because a hook has exactly
+    one action and they do not fit in one table. `f7_every_key_reaches_a_typed_field` asserts `on`,
+    `append`, `run` and `on_failure` each land; `timeout_ms` is reachable only by outliving it and
+    is asserted in F4, which is stated in the test rather than left to be noticed. The twin control
+    removes `on` and asserts the filter visibly falls back to every event.
+    `an_unknown_key_inside_a_hook_table_is_rejected_naming_it` covers strictness, the no-action and
+    two-action errors, an empty `run`, and an unknown event name.
+  builds:
+  - '`cargo clippy --all-targets -- -D warnings` — clean. `cargo fmt --check` — clean.'
+  - '`cargo doc --no-deps` — warning-free.'
+  - >
+    `cargo tree` unchanged at **402 lines** on the default feature set. No new dependency on any
+    platform: a hook is `std::process::Command` and `std::fs`, the audit line is `serde_json`
+    already serializing a `RunEvent`, the snapshot is a `rusqlite` row, and the bounded wait is
+    `try_wait` and `std::thread::sleep` rather than a timer crate — and never `tokio`, since
+    `Observer::event` is synchronous and reaching for a runtime inside it is how a nested-runtime
+    panic gets shipped.
+  - >
+    `cargo package --locked` — exit 0, 186 files, 3.9MiB (1.0MiB compressed). Verified by
+    **listing** rather than by trusting the `exclude` list: zero entries matching `.env`,
+    `.ultraship/` or `.github/`. `.env.example` is present and is meant to be.
+  - >
+    `CHECKPOINT_FORMAT` stays 7 and `tests/cross_version.rs` passes. The comparison refused
+    `snapshots` and its index until they were named in `ADDED_SINCE_0_22_0`, which is the mechanism
+    working: the schema may grow only by what a release documented, and the changelog says so under
+    Added.
+  reviews: []
+  deployments: []
+  health_checks:
+  - >
+    No live-provider run is claimed. Nothing in this release is reachable from a model's tool calls:
+    a hook is an `Observer` the caller installs and `rewind` is an operator's call after a run, so
+    both are exercised more precisely by the fixtures and their controls than a live run could. The
+    hook criteria are nonetheless driven through the real loop with the scripted provider the rest
+    of the suite uses, not against a mocked harness. Stated rather than quietly omitted, since
+    0.25.0's OP1 set the expectation.
+known_limitations:
+- >
+  **A hook blocks the run loop while it runs.** `Observer::event` is synchronous and returns a
+  `Flow` the loop acts on immediately, so the step that emitted the event waits for every matching
+  hook. That is the property that makes `on_failure = "cancel"` mean anything — a hook that answered
+  after the run had moved on could refuse nothing — and it means pointing a `run` hook at `token`,
+  which is emitted per streamed token, is a decision to spawn a process that often. The guide says
+  so beside the feature rather than in a footnote.
+- >
+  **Hooks do not accumulate across scopes.** Unlike `[[policy.layers]]` and `[[agent]]`, the array
+  is deliberately not in `APPENDING`, so a later scope replaces it whole: one `[[hook]]` in
+  `io.local.toml` silently discards every hook the user-scope file declared. A half-appended set of
+  hooks would be a set nobody wrote, and `Config::sources()` says which file won.
+- >
+  **An `append` hook is serialized within this process and nowhere else.** It opens its file per
+  event rather than holding a handle, and a lock keeps a sub-agent tree from interleaving halves of
+  two events. A second *process* appending to the same log is not coordinated by anything, and there
+  is no rotation and no size cap.
+- >
+  **A hook's output is discarded.** `stdout` and `stderr` go to `null`, because a library must not
+  write to its caller's terminal, so a hook talks by exiting non-zero. A failure is traced at warn
+  level with the hook's index and the event tag, and never with the event itself — a `started`
+  carries the goal.
+- >
+  **A hook grants nothing.** It is not a permission mechanism: it cannot approve an action, deny
+  one, alter an argument or answer an `approval_requested`. The only thing it can do to a run is end
+  it, and only when the operator wrote `on_failure = "cancel"`. The boundary is still the `Policy`
+  the caller loaded.
+- >
+  **Refusing `[[hook]]` in the project scope does not make a cloned repository safe.** `[[mcp]]`
+  still names a command, `[toolchain]` still names an argv, and a `[[policy.layers]]` entry can
+  still allow what the defaults did not. One specific hazard is narrowed, and the contract, the
+  guide and the changelog each say which array and no more.
+- >
+  **One restore point per file per run.** `rewind` is all-or-nothing back to the run's start: there
+  is no per-edit undo, no rewind to a chosen step, and no redo. That is what bounds the storage to
+  the number of files a run touched rather than the number of edits it made, and it is the only
+  definition under which "undo what this run did" is one operation rather than five.
+- >
+  **A previous file over 1 MiB or one that is not valid UTF-8 cannot be put back.** It is recorded
+  `Unkept`, `rewind` answers `NotKept` with the reason, and the file is left exactly as the run left
+  it — reported rather than guessed at, and never truncated. An existing path that could not be read
+  for any other reason is `Unkept` too rather than `Absent`, because folding a permission error into
+  "the file did not exist" would make a rewind *delete* something whose contents were never read.
+- >
+  **Only `write_file` and `edit_file` take a snapshot.** A file changed by `shell`, by `exec`, or by
+  a git built-in has no restore point and answers `NotRecorded`. So does one whose bookkeeping row
+  could not be written, which is warned about and swallowed exactly as an edit row is — so
+  `NotRecorded` means "no restore point", not "the run did not write it".
+- >
+  **`rewind` takes one path per call and is not transactional.** Undoing a whole run is a loop the
+  caller writes, and it can be interrupted halfway.
+- >
+  **`${cmd:}` still has no timeout.** 0.27.0's standing limitation, carried deliberately rather than
+  fixed by proximity because this release wrote a bounded wait ten lines away. `Config::discover` is
+  the caller's own call before any run exists; a hook fires inside a run loop. They are not the same
+  hazard and one bound does not follow from the other.
+- >
+  The record is sealed with `mode: published` before the crates.io upload, which follows the
+  `develop` → `main` merge and the GitHub Release. The record states the authorised target; the flow
+  makes it true.
+supersedes: 0.27.0
+next_recommended_version: 0.29.0
+immutable: true
