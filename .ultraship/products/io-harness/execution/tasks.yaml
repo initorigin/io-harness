@@ -74,7 +74,7 @@ tasks:
   why_required: A backlog that lives only in a dead process's memory is not a backlog anyone can act
     on. This is also the release's only schema change, so it lands before the code that writes to it
     and the cross-version evidence is taken against something that has stopped moving.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.32.0-T01
   acceptance_criteria:
@@ -96,7 +96,35 @@ tasks:
     '
   files:
   - src/state.rs
-  evidence: []
+  - tests/cross_version.rs
+  evidence:
+  - '`agent_queue` lands beside `plans` — `(parent_run_id, step, goal, depth, queued_at)` with a UNIQUE
+    index `agent_queue_entry` on the same `(parent_run_id, step, goal)` key `spawns` is adopted by.
+    `CHECKPOINT_FORMAT` does not move: a 0.31.0 binary never names the table, so bumping it would make
+    `check_resumable` refuse a database that is in fact readable. Both objects are declared in `ADDED_SINCE_0_22_0`,
+    which the 0.22.0 schema guard requires by name.'
+  - '`Store::enqueue_agent` returns whether the row is new — `INSERT OR IGNORE` against the unique index
+    — which is what lets the ledger tell a fresh wait from a replayed one without guessing. `a_replayed_wait_reuses_its_row_rather_than_adding_one`
+    asserts the second and third enqueue of the same key return `false` and leave one row, while a different
+    step or a different goal is a different wait.'
+  - 'N2, and it moved the implementation. The natural `FROM agent_queue q JOIN tree` reads `SCAN q`:
+    a recursive CTE is a co-routine SQLite cannot seek into, so the planner scans every tree''s backlog
+    and probes the CTE instead. `queued_agents` is `FROM tree CROSS JOIN agent_queue q INDEXED BY agent_queue_entry`,
+    and `reading_a_backlog_reaches_its_rows_through_an_index` asserts the plan contains `SEARCH q USING
+    INDEX agent_queue_entry` over a 32-tree fixture. Measured over 200 trees of 100 waiting children:
+    0.057 ms seeking against 0.593 ms scanning, a 10x difference that only appears once the file holds
+    more than one tree.'
+  - 'Deviation from N2 as written, stated rather than quietly worked around: the criterion named a control
+    filtering on `goal` alone. `goal` is the index''s last column and SQLite still uses the index for
+    it, skip-scanning `ANY(parent_run_id) AND ANY(step) AND goal=?` — a full read wearing an index''s
+    name. The control is `queued_at`, which is in no index at all and therefore genuinely cannot use
+    one. The criterion''s substance (a control that proves the check discriminates an index from a scan)
+    is met; its example column was wrong.'
+  - '`a_queued_child_has_no_run_and_therefore_no_spend` asserts the charge claim against the durable
+    rows: with one admitted child that spent 250 tokens and one waiting, `children` holds exactly the
+    admitted run, `queued_agents` holds exactly the waiting goal, `spent_tokens_tree` is 250 and `agent_count_tree`
+    is 2. Three doctests on `enqueue_agent`, `dequeue_agent` and `queued_agents` cover the FIFO order,
+    the reach into the tree, and the idempotent delete the never-queued fast path calls.'
 - id: US-IO-HARNESS-0.32.0-T03
   summary: Wire admission into `spawn_child` for fresh and adopted children alike, widen the per-step
     `buffered()` so the tree-wide throttle is the only bound, emit `EventKind::Fleet` per tier, and
