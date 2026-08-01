@@ -336,6 +336,10 @@ fn text_delta(value: &serde_json::Value) -> Option<&str> {
 #[derive(Default)]
 struct Accumulator {
     text: String,
+    /// 0.31.0 — the extended-thinking blocks, kept strictly apart from `text` for
+    /// the reason the OpenAI-wire accumulator keeps them apart: anything that joins
+    /// `text` joins the observation ledger and therefore every later prompt.
+    reasoning: String,
     /// block index -> (tool name, input-json fragments joined)
     tool_calls: BTreeMap<u64, (String, String)>,
     input_tokens: u64,
@@ -437,6 +441,17 @@ impl Accumulator {
                         if let Some(t) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
                         {
                             self.text.push_str(t);
+                        }
+                    }
+                    // 0.31.0 — extended thinking. `signature_delta` is deliberately
+                    // not read: it is the vendor's integrity token for replaying the
+                    // block back to it, not something a human or a trace wants.
+                    Some("thinking_delta") => {
+                        if let Some(t) = delta
+                            .and_then(|d| d.get("thinking"))
+                            .and_then(|t| t.as_str())
+                        {
+                            self.reasoning.push_str(t);
                         }
                     }
                     Some("input_json_delta") => {
@@ -628,7 +643,8 @@ impl Accumulator {
                 Some(self.text)
             },
             tool_calls,
-            reasoning: None,
+            // `None`, never `Some("")`. See the OpenAI-wire accumulator.
+            reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
             usage: (total > 0).then_some(Usage {
                 prompt_tokens: prompt,
                 completion_tokens: self.output_tokens,
@@ -749,6 +765,42 @@ mod tests {
         assert_eq!(out.finish_reason, None);
         // Nothing measured the stream, so TTFT is unknown rather than instant.
         assert_eq!(out.ttft_ms, None);
+    }
+
+    /// F8 — Anthropic's half: `thinking_delta` blocks accumulate into `reasoning`
+    /// and never into `text`.
+    #[test]
+    fn thinking_deltas_accumulate_and_stay_out_of_the_text() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"thinking"}}));
+        acc.ingest(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"thinking_delta","thinking":"the parser "}}));
+        acc.ingest(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"thinking_delta","thinking":"is the only caller"}}));
+        // The signature is the vendor's integrity token for replaying the block
+        // back to it. It is deliberately not read, so it must not leak into either.
+        acc.ingest(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"signature_delta","signature":"SIGNATURE-XYZ"}}));
+        acc.ingest(&json!({"type":"content_block_delta","index":1,
+            "delta":{"type":"text_delta","text":"answer"}}));
+
+        let out = acc.finish();
+        assert_eq!(
+            out.reasoning.as_deref(),
+            Some("the parser is the only caller")
+        );
+        assert_eq!(out.text.as_deref(), Some("answer"));
+        assert!(!out.reasoning.unwrap().contains("SIGNATURE-XYZ"));
+    }
+
+    /// F8's control: no thinking blocks, `None` rather than `Some("")`.
+    #[test]
+    fn a_stream_with_no_thinking_yields_none_rather_than_an_empty_string() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"type":"content_block_delta","index":0,
+            "delta":{"type":"text_delta","text":"answer"}}));
+        assert_eq!(acc.finish().reasoning, None);
     }
 
     /// F5, at the point of measurement: the clock stops on the FIRST

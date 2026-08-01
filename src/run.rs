@@ -3248,6 +3248,23 @@ async fn run_workspace_from<P: Provider>(
             store.record_context_reported(run_id, step, step_tokens)?;
         }
 
+        // 0.31.0 — the thinking, to whoever is watching and to nowhere else. It is
+        // deliberately NOT pushed onto `ledger`: the vendor charged for it once as
+        // output, and folding it into the ledger would put it in every prompt this
+        // run assembles from here on and be charged for it again as input, every
+        // turn. `Usage::reasoning_tokens` is already persisted and is the durable
+        // record of what it cost.
+        if let Some(thinking) = response.reasoning.as_deref() {
+            watch.emit(RunEvent::new(
+                run_id,
+                step,
+                EventKind::Reasoning {
+                    text: thinking.to_string(),
+                    tokens: response.usage.map(|u| u.reasoning_tokens).unwrap_or(0),
+                },
+            ));
+        }
+
         // Dispatch every tool call the model made this step, in order, folding
         // each result into the observation log the next turn will see.
         let mut decisions: Vec<String> = Vec::new();
@@ -4369,6 +4386,19 @@ fn run_agent<'f, P: Provider>(
             if step_tokens > 0 {
                 tree.store
                     .record_context_reported(run_id, step, step_tokens)?;
+            }
+
+            // See the workspace loop: visible to a watcher, and never on the ledger.
+            if let Some(thinking) = response.reasoning.as_deref() {
+                tree.watch.emit(RunEvent::at_depth(
+                    run_id,
+                    step,
+                    depth,
+                    EventKind::Reasoning {
+                        text: thinking.to_string(),
+                        tokens: response.usage.map(|u| u.reasoning_tokens).unwrap_or(0),
+                    },
+                ));
             }
 
             let mut decisions: Vec<String> = Vec::new();

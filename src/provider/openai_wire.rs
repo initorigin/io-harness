@@ -244,6 +244,11 @@ fn text_delta(value: &serde_json::Value) -> Option<&str> {
 #[derive(Default)]
 struct Accumulator {
     text: String,
+    /// 0.31.0 — the thinking, accumulated across deltas exactly as `text` is and
+    /// kept strictly apart from it. Folding it into `text` would put it on the
+    /// observation ledger and therefore into every later prompt, which is the one
+    /// thing this field exists to prevent.
+    reasoning: String,
     /// index -> (name, argument fragments joined)
     tool_calls: BTreeMap<u64, (String, String)>,
     usage: Option<Usage>,
@@ -311,6 +316,21 @@ impl Accumulator {
                 // zero where none does.
                 server_tool_requests: detail("/server_tool_use/web_search_requests"),
             });
+        }
+
+        // 0.31.0 — the thinking, where a vendor streams it. OpenRouter sends
+        // `reasoning`; several OpenAI-compatible endpoints send
+        // `reasoning_content` for the same thing. Both are read, because a
+        // `Compatible` provider pointed at either should behave the same way.
+        // OpenAI's own Chat Completions sends neither and this stays empty, which
+        // is the honest answer rather than a fabricated one.
+        for key in ["reasoning", "reasoning_content"] {
+            if let Some(r) = value
+                .pointer(&format!("/choices/0/delta/{key}"))
+                .and_then(|v| v.as_str())
+            {
+                self.reasoning.push_str(r);
+            }
         }
 
         // The model is on every chunk; keeping the first is enough, and a router
@@ -461,7 +481,9 @@ impl Accumulator {
                 Some(self.text)
             },
             tool_calls,
-            reasoning: None,
+            // `None`, never `Some("")`: "the model did not think" and "the model
+            // thought nothing" are different facts and only the first is true.
+            reasoning: (!self.reasoning.is_empty()).then_some(self.reasoning),
             usage: self.usage,
             model: self.model,
             finish_reason: self.finish_reason,
@@ -516,6 +538,37 @@ mod tests {
         assert_eq!(u.cache_write_tokens, 0);
         assert_eq!(out.model.as_deref(), Some("gpt-5"));
         assert_eq!(out.finish_reason.as_deref(), Some("length"));
+    }
+
+    /// F8 — the thinking, accumulated across chunks exactly as `text` is, under
+    /// either of the two spellings this wire is served with.
+    #[test]
+    fn reasoning_deltas_accumulate_and_stay_out_of_the_text() {
+        for key in ["reasoning", "reasoning_content"] {
+            let mut acc = Accumulator::default();
+            acc.ingest(&json!({"choices":[{"delta":{key: "the parser "}}]}));
+            acc.ingest(&json!({"choices":[{"delta":{"content":"answer "}}]}));
+            acc.ingest(&json!({"choices":[{"delta":{key: "is the only caller"}}]}));
+            let out = acc.finish();
+            assert_eq!(
+                out.reasoning.as_deref(),
+                Some("the parser is the only caller"),
+                "{key} was not accumulated"
+            );
+            // The half that matters: it did not join the text, which is what would
+            // put it on the observation ledger and in every later prompt.
+            assert_eq!(out.text.as_deref(), Some("answer "));
+        }
+    }
+
+    /// F8's control. A stream with no thinking yields `None`, never `Some("")`:
+    /// "the model did not think" and "the model thought nothing" are different
+    /// facts and only the first is true.
+    #[test]
+    fn a_stream_with_no_reasoning_yields_none_rather_than_an_empty_string() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&json!({"choices":[{"delta":{"content":"hello"}}]}));
+        assert_eq!(acc.finish().reasoning, None);
     }
 
     /// The negative control: a chunk with a bare usage object and no detail
