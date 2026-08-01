@@ -386,7 +386,7 @@ the runs, not a second execution path:
   ceilings, so `max_steps` on one turn does not bound the next. A conversation-wide
   limit is the caller's to enforce, per turn, from `Store::run_summary`.
 
-**What configuration is, and is not (0.19.0, extended in 0.27.0).** `io.toml` is
+**What configuration is, and is not (0.19.0, extended in 0.27.0 and 0.28.0).** `io.toml` is
 a projection onto the typed API and never a second path into the run loop:
 
 - **The typed API is the authority.** Every key lands in a type this crate
@@ -523,6 +523,31 @@ matters more than the figure:
 - **A run recorded before 0.18.0 has no rows at all**, in either new table.
   Nothing is backfilled, because the facts were never recorded. The queries
   return nothing rather than zeros.
+
+**What `rewind` puts back, and what it cannot (0.28.0).** `rewind` restores a path
+to the state it was in before *this run* first wrote it.
+
+- **One restore point per file per run**, taken at the first write. Not a per-step
+  history: there is no undo of the last edit, no rewind to step 4, and no redo.
+- **It is durable, and it is a new table.** `CHECKPOINT_FORMAT` stays 7, an older
+  store opens and resumes unchanged, and a run that predates the release answers
+  `NotRecorded` rather than restoring nothing quietly.
+- **Four answers, and the fourth is the point.** `Restored`, `Removed` for a file
+  the run created, `NotKept` for one whose previous contents were over the 1 MiB cap
+  or were not UTF-8, and `NotRecorded` for a path this run never wrote. `NotKept`
+  and `NotRecorded` change nothing at all, and a `NotKept` file is left exactly as
+  the run left it — never truncated. Collapsing the two would tell a caller a file
+  was untouched when the run had rewritten it and the harness cannot undo that.
+- **Only `write_file` and `edit_file` snapshot.** A file changed by `shell`, by
+  `exec`, or by a git built-in has no restore point. So does one whose bookkeeping
+  row could not be written, which is warned about and swallowed exactly as an edit
+  row is — `NotRecorded` means "no restore point", not "the run did not write it".
+- **It obeys the policy the edit obeyed.** Restoring goes through
+  `Workspace::write_file`; removing checks `Act::Write` itself and refuses anything
+  that is not an outright allow, because a write is inspectable afterwards and a
+  delete is not.
+- **One path per call.** Undoing a whole run is a loop the caller writes, and it is
+  not transactional.
 
 **Lines added and removed are not a minimal diff.** `Edit::measure` compares the
 file's lines before and after and trims the common head and tail. A one-line

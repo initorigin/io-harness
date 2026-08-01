@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, OnceLock};
 
 use io_harness::observe::{Flow, Observer, RunEvent};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
@@ -18,14 +18,21 @@ use io_harness::{
 };
 use serde_json::json;
 
-static ENV: Mutex<()> = Mutex::new(());
+/// One empty directory for the whole binary, so every test in it points the user
+/// scope at the same place.
+///
+/// `tests/config.rs` guards the same variable with a mutex because its tests set it
+/// to *different* directories and the process has one environment. Here every test
+/// wants the same answer — an empty user scope, so a config file on the developer's
+/// own machine cannot change what these tests measure — so one shared directory
+/// removes the race rather than serializing around it. Which matters: half of these
+/// tests are `async`, and a lock held across an `.await` is a lint and a deadlock
+/// waiting for a reason.
+static USER: OnceLock<tempfile::TempDir> = OnceLock::new();
 
-/// Hold the environment and point the user scope at somewhere empty, so a config
-/// file on the developer's own machine cannot change what these tests measure.
-fn env<'a>(user_dir: &Path) -> MutexGuard<'a, ()> {
-    let guard = ENV.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("IO_CONFIG_HOME", user_dir);
-    guard
+fn empty_user_scope() {
+    let dir = USER.get_or_init(|| tempfile::tempdir().unwrap());
+    std::env::set_var("IO_CONFIG_HOME", dir.path());
 }
 
 // ---------------------------------------------------------------- scaffolding
@@ -147,8 +154,7 @@ fn logged(at: &Path) -> Vec<String> {
 
 #[tokio::test]
 async fn f1_a_hook_fires_on_the_events_it_names_and_on_no_others() {
-    let user = tempfile::tempdir().unwrap();
-    let _guard = env(user.path());
+    empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
 
     std::fs::write(
@@ -218,8 +224,7 @@ async fn f1_a_hook_fires_on_the_events_it_names_and_on_no_others() {
 
 #[test]
 fn f2_an_event_this_crate_does_not_emit_is_refused_naming_it() {
-    let user = tempfile::tempdir().unwrap();
-    let _guard = env(user.path());
+    empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
 
     std::fs::write(
@@ -311,8 +316,7 @@ async fn run_under(ws: &Path, hook: &str) -> io_harness::RunOutcome {
 
 #[tokio::test]
 async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
-    let user = tempfile::tempdir().unwrap();
-    let _guard = env(user.path());
+    empty_user_scope();
     let ws = tempfile::tempdir().unwrap();
 
     run_under(
@@ -350,8 +354,7 @@ async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
 /// the two criteria are asserted through one another rather than through a log line.
 #[tokio::test]
 async fn f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure() {
-    let user = tempfile::tempdir().unwrap();
-    let _guard = env(user.path());
+    empty_user_scope();
 
     let slow = tempfile::tempdir().unwrap();
     let outcome = run_under(
@@ -390,8 +393,7 @@ async fn f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure
 
 #[tokio::test]
 async fn f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to() {
-    let user = tempfile::tempdir().unwrap();
-    let _guard = env(user.path());
+    empty_user_scope();
 
     let asked = tempfile::tempdir().unwrap();
     let outcome = run_under(
