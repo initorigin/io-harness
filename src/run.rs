@@ -2857,6 +2857,9 @@ async fn run_from<P: Provider>(
             // `None` for every contract that declared nothing, which is what the
             // three built-in providers read as "send the 0.21.0 body".
             web: contract.web.clone(),
+            // 0.31.0 — the tier the caller asked for, or `None` (every contract
+            // before 0.31.0) to leave the vendor's own default in place.
+            effort: contract.effort,
             // Single-file mode has no `view_image` tool, so only the caller's
             // images are in play here.
             #[cfg(feature = "media")]
@@ -3205,6 +3208,8 @@ async fn run_workspace_from<P: Provider>(
             tools: tools.clone(),
             // 0.22.0 — the run's web declaration, unchanged per step.
             web: contract.web.clone(),
+            // 0.31.0 — the root's tier, unchanged per step.
+            effort: contract.effort,
             #[cfg(feature = "media")]
             media: attach_media(contract, pending_media)?,
             ..Default::default()
@@ -4324,6 +4329,11 @@ fn run_agent<'f, P: Provider>(
                 // root's, copied in by `spawn_child` rather than taken from the
                 // spawn arguments.
                 web: contract.web.clone(),
+                // 0.31.0 — this role's tier, falling back to the run's. The
+                // definition wins because that is where "search cheaply, think hard
+                // only where thinking is the work" is said; the contract's is the
+                // root's own, and a child spawned without a definition inherits it.
+                effort: identity.and_then(|d| d.effort).or(contract.effort),
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()

@@ -134,7 +134,7 @@ impl Anthropic {
         // this crate a call to dispatch.
         tools.extend(Self::web_tools(request.web.as_ref()));
 
-        json!({
+        let mut body = json!({
             // 0.21.0 — a per-request model override, for a named agent definition
             // spawned into a tree that shares this one provider. `None` is the
             // model this provider was constructed with.
@@ -146,7 +146,23 @@ impl Anthropic {
                 { "role": "user", "content": Self::user_content(request) },
             ],
             "tools": tools,
-        })
+        });
+        // 0.31.0 — Anthropic is the vendor with no tiers: extended thinking is a
+        // token budget, so the tier is projected onto one. `max_tokens` is raised to
+        // clear the budget because Anthropic refuses a request whose budget is not
+        // strictly below it — the failure would otherwise be a 400 at run time
+        // rather than something a body test can catch, which is why
+        // `body_carries_the_thinking_budget_below_max_tokens` asserts the
+        // inequality.
+        //
+        // Absent entirely when no tier was asked for, which is what keeps every
+        // pre-0.31.0 request byte-identical to the body 0.30.0 sent.
+        if let Some(effort) = request.effort {
+            let budget = effort.thinking_budget();
+            body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+            body["max_tokens"] = json!(MAX_TOKENS + budget);
+        }
+        body
     }
 
     /// The server-tool entries a [`WebAccess`](crate::WebAccess) declaration adds
@@ -806,6 +822,52 @@ mod web_wire {
         assert_eq!(tools[1]["name"], "web_fetch");
         // A vendor rejects both lists at once, so only the narrower one is sent.
         assert!(tools[0].get("blocked_domains").is_none());
+    }
+
+    /// F6 — Anthropic is the vendor with no tiers, so the tier becomes a token
+    /// budget, and `max_tokens` is raised to clear it.
+    ///
+    /// The inequality is the assertion worth having: Anthropic refuses a request
+    /// whose `budget_tokens` is not strictly below `max_tokens`, and without this
+    /// the failure is a 400 on the wire rather than something that fails here.
+    #[test]
+    fn the_effort_tier_becomes_a_thinking_budget_below_max_tokens() {
+        use crate::provider::Effort;
+
+        for tier in [Effort::Low, Effort::Medium, Effort::High] {
+            let mut asked = req(None);
+            asked.effort = Some(tier);
+            let b = Anthropic::new("k", "claude-x").body(&asked);
+            assert_eq!(b["thinking"]["type"], "enabled");
+            let budget = b["thinking"]["budget_tokens"].as_u64().expect("a budget");
+            let max = b["max_tokens"].as_u64().expect("a cap");
+            assert_eq!(budget, tier.thinking_budget());
+            assert!(
+                budget < max,
+                "{tier:?}: Anthropic refuses a budget that is not below max_tokens \
+                 ({budget} vs {max})"
+            );
+        }
+
+        // Ordered, so a caller asking for more thinking gets more.
+        let budget = |t: Effort| {
+            let mut r = req(None);
+            r.effort = Some(t);
+            Anthropic::new("k", "claude-x").body(&r)["thinking"]["budget_tokens"]
+                .as_u64()
+                .unwrap()
+        };
+        assert!(budget(Effort::Low) < budget(Effort::Medium));
+        assert!(budget(Effort::Medium) < budget(Effort::High));
+    }
+
+    /// F6's control: no tier, no `thinking` key, and `max_tokens` back at the fixed
+    /// cap every release since 0.3.0 sent.
+    #[test]
+    fn no_effort_leaves_the_anthropic_body_exactly_as_it_was() {
+        let b = Anthropic::new("k", "claude-x").body(&req(None));
+        assert!(b.get("thinking").is_none());
+        assert_eq!(b["max_tokens"], MAX_TOKENS);
     }
 
     /// The block-list alone reaches the vendor when there is no allow-list.

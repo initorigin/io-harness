@@ -55,7 +55,37 @@ pub(crate) fn body(
     if let Some((key, value)) = web_key(flavor, request.web.as_ref()) {
         body[key] = value;
     }
+    // 0.31.0 — the second key the two vendors spell differently, added the same way
+    // and absent entirely when no tier was asked for, which is what keeps a
+    // request that asks for nothing byte-identical to the one 0.30.0 sent.
+    if let Some((key, value)) = effort_key(flavor, request.effort) {
+        body[key] = value;
+    }
     body
+}
+
+/// The vendor-specific key an [`Effort`] adds to the shared body, or `None` when
+/// none was asked for.
+///
+/// OpenAI's Chat Completions takes a bare `reasoning_effort` string; OpenRouter
+/// takes a `reasoning` object whose `effort` is the same three words. They are
+/// spelled differently and mean the same thing, which is the whole reason
+/// [`Effort`] is a tier rather than a vendor parameter.
+///
+/// Unlike [`web_key`] there is nothing here to refuse. A tier a model cannot
+/// honour is ignored by the model, not rejected by the vendor, and the crate has
+/// no way to know which models reason — so this is a request in exactly the sense
+/// `model` is, and [`Usage::reasoning_tokens`](crate::Usage::reasoning_tokens) is
+/// what says whether it happened.
+pub(crate) fn effort_key(
+    flavor: WebFlavor,
+    effort: Option<crate::provider::Effort>,
+) -> Option<(&'static str, serde_json::Value)> {
+    let effort = effort?;
+    Some(match flavor {
+        WebFlavor::OpenAi => ("reasoning_effort", json!(effort.as_str())),
+        WebFlavor::OpenRouter => ("reasoning", json!({ "effort": effort.as_str() })),
+    })
 }
 
 /// What each OpenAI-wire vendor can actually do with a
@@ -587,6 +617,59 @@ mod web_wire {
             b.get("web_search_options").is_none(),
             "that is OpenAI's key"
         );
+    }
+
+    /// F6 — the tier reaches each OpenAI-wire vendor in that vendor's own spelling:
+    /// a bare string for OpenAI, an object for OpenRouter.
+    #[test]
+    fn each_wire_vendor_gets_the_effort_tier_in_its_own_shape() {
+        use crate::provider::Effort;
+
+        let mut asked = req(None);
+        asked.effort = Some(Effort::Low);
+        let openai = body("gpt-x", &asked, WebFlavor::OpenAi);
+        assert_eq!(openai["reasoning_effort"], "low");
+        assert!(
+            openai.get("reasoning").is_none(),
+            "that is OpenRouter's key"
+        );
+
+        asked.effort = Some(Effort::High);
+        let openrouter = body("vendor/model", &asked, WebFlavor::OpenRouter);
+        assert_eq!(openrouter["reasoning"], json!({"effort": "high"}));
+        assert!(
+            openrouter.get("reasoning_effort").is_none(),
+            "that is OpenAI's key"
+        );
+    }
+
+    /// F6's control, and the assertion that matters most to an existing caller: a
+    /// request that asks for no tier produces the body 0.30.0 built, byte for byte.
+    /// Without this the test above would pass against an implementation that always
+    /// sent a default.
+    #[test]
+    fn no_effort_leaves_both_bodies_exactly_as_they_were() {
+        for flavor in [WebFlavor::OpenAi, WebFlavor::OpenRouter] {
+            let mut asked = req(None);
+            asked.effort = None;
+            let before = body("m", &asked, flavor);
+            assert!(before.get("reasoning_effort").is_none());
+            assert!(before.get("reasoning").is_none());
+            // The whole body, not only the absence of the two keys.
+            assert_eq!(
+                before,
+                json!({
+                    "model": "m",
+                    "stream": true,
+                    "stream_options": { "include_usage": true },
+                    "messages": [
+                        { "role": "system", "content": "sys" },
+                        { "role": "user", "content": "what shipped this week" },
+                    ],
+                    "tools": [],
+                })
+            );
+        }
     }
 
     /// NF3, the negative control: no declaration, no key, and the 0.21.0 body.
