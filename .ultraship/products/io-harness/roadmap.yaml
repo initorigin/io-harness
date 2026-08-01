@@ -760,5 +760,15 @@ versions:
       has always belonged. Azure is the closest call — it costs one auth-style variant and no
       dependency — and it is left out only because no consumer has asked for it; the shape admits it
       later without a break.
-    detail: outline
+
+      Three mechanisms were decided when this entry was promoted to `specified`, and each departs
+      from a sentence above rather than from its argument. The catalogue is cached on the provider
+      instance rather than in the store, because `Provider::models()` takes `&self` and reaching a
+      `Store` from it would put the store into the provider trait; the instant it was fetched lands
+      on `PriceTable::as_of`, which is the field that already exists to carry exactly that claim.
+      `Compatible` has no `from_env`, because twenty-one vendor variable names are twenty-one
+      guesses and `[[provider]]` with `${env:GROQ_API_KEY}` has resolved credentials from the
+      environment since 0.19.0. And `Fallback::models()` keeps the empty default, because which of
+      two vendors' catalogues a chain reports is a question with no right answer.
+    detail: specified
     status: planned
