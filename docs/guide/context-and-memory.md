@@ -70,6 +70,71 @@ a write a silent no-op. `Store` also exposes `memory_get` for a single key.
 `remember` is deliberately narrow: it writes one keyed note into the harness's
 own store, not into the workspace, so it is not a path act.
 
+## A correction that sticks
+
+A flat list of notes has one failure mode that matters: a person corrects
+something, the agent re-learns the wrong version on the next run, and the
+correction is gone. Since 0.30.0 an entry carries what kind of thing it is and
+whether a run may overwrite it.
+
+```rust
+use io_harness::MemoryKind;
+
+// A decision somebody took, pinned so a run cannot quietly reverse it.
+store.memory_write(&workspace, "retries", "three", run_id, step, MemoryKind::Decision)?;
+store.memory_pin(&workspace, "retries", true)?;
+```
+
+`MemoryKind` is `Fact` or `Decision` and defaults to `Fact`. Nothing in the run
+loop treats the two differently — the crate stores what it was told and reports
+it — because a decision is something a *person* took, and a harness inferring one
+from a tool call would be guessing at intent. What the agent writes through
+`remember` is therefore always a `Fact`, whatever the entry was before. Every
+entry written before 0.30.0 reads back as a `Fact`, unpinned, which is what it
+was. The enum is `#[non_exhaustive]`: match it with a `_ =>` arm.
+
+Pinning is the half with teeth, and it is **a caller's act, never a run's**. A
+pinned entry is not overwritten by a run and is exempt from cap eviction, so a
+correction does not disappear because the agent wrote twenty notes afterwards. It
+still counts toward the caps — pinning everything makes writes fail loudly rather
+than silently raising the ceiling.
+
+A refused write is not a silence. It is a `context_events` row with kind
+`memory_refused`, *and* it goes back to the model as an observation saying the key
+is pinned and the existing note stands. An agent that believes it corrected
+something and did not will act on the correction it thinks it made, which is the
+exact failure the flag exists to prevent — reporting the refusal to the trace and
+not to the model would fix it for the operator and leave it broken for the run.
+
+`Store::memory_write` is the full form and returns `MemoryWrite { refused,
+evicted }`. `Store::memory_put` is unchanged and is that call with `kind` fixed to
+`Fact` and the refusal dropped on the floor; prefer `memory_write` anywhere the
+answer matters.
+
+## Which notes a run actually used
+
+`memory_list` says what the agent knows about a workspace. That is not the same
+question as which of it was load-bearing on a given run, and only the second one
+tells you whether an entry is earning its place in every prompt.
+
+```rust
+for recall in store.memory_recalls(run_id)? {
+    println!("step {} recalled {}", recall.step, recall.key);
+}
+```
+
+The context assembler writes these at recall time, so they record what actually
+reached the model after the memory block was fitted to its share of the budget —
+not what was available to it. `Assembled::recalled_keys` is the same list for the
+turn in hand, beside the `recalled` count that was already there: the count says
+how much a turn leaned on memory, the keys say what it leaned on.
+
+One row per key per recall, never a replacement. A run that recalls the same entry
+on three turns is three rows, and a caller that wants the set deduplicates it —
+that is a decision about what is being counted, and the crate does not make it for
+you. A recall is a fact about a run rather than a flag on an entry, so two runs
+over one workspace each record their own and neither disturbs the other.
+
 ## The limits, stated plainly
 
 Assembly **bounds** what a request carries and applies exactly the two staleness
@@ -92,6 +157,13 @@ persists until someone removes it — which is why entries carry their origin, a
 rendered to the model as its own notes rather than as directives, and are
 listable and deletable through `Store`. An operator can always see and clear what
 the agent believes.
+
+**A pin stops a write, not a delete, and `MemoryKind` stops nothing at all.** The
+kind is a label the crate stores and reports; the pin is enforced, and only
+against the run — `memory_delete` and `memory_clear` are the caller's and remove a
+pinned entry like any other, because an operator who cannot clear their own store
+has been locked out by their own correction. Neither is a boundary against
+anything but the agent's own `remember`.
 
 ## See also
 

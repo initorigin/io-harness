@@ -1,7 +1,6 @@
 product: io-harness
 version: 0.30.0
 release_type: minor
-status: planned
 
 outcome:
   user_can: >
@@ -329,3 +328,204 @@ open_questions:
     opposite of a rescue — it is the run giving the problem back to the caller — and grouping it
     beside fallbacks and replans may read as success. Likely reported as its own row rather than
     inside the recovery total; confirmed while writing the accessor.
+
+status: released
+released_at: 2026-08-01T22:05:00Z
+mode: published
+delivered: >
+  The store answers *why*, for three questions it could already answer the *what* of.
+
+  **Which file decided this setting.** `Config::origin(key)` reports the scope and the path that won
+  a dotted key, and `Config::origins()` reports every key a file set, for a caller rendering a whole
+  settings list. It is an addition beside `Config::sources()`, which answered "which files were
+  read" and still answers exactly that. Three bounds are built in rather than discovered. An empty
+  answer is the crate's default speaking and is never dressed up as a file. `policy.layers` and
+  `agent` append across scopes, so they report *every* contributing file — naming one winner for a
+  value two files built would be false. And a `${env:}` or `${cmd:}` value reports the file the
+  substitution was written in, which needed no implementation work at all: `parse` substitutes per
+  file before anything merges, so the property falls out of where the code already was. The test
+  asserts it against a literal control anyway.
+
+  The case the whole feature exists for is 0.27.0's: an operator allows `exec` in their own file, a
+  cloned repository narrows it to `deny`, and until now nothing could say so. That is a named test,
+  and it asserts both the origin and that `Policy::check` still returns `Deny` — the origin
+  describes the resolution and does not alter it.
+
+  **Why a fact is remembered, and whether a run may change it.** `MemoryEntry` gains a
+  `#[non_exhaustive]` kind and a pinned flag. Pinning is a caller's act, never a run's: a pinned
+  entry is not overwritten by the agent and is exempt from cap eviction, so a correction does not
+  disappear because the agent wrote twenty notes afterwards. The refusal is the half that matters
+  and it is not a silence — it is a `memory_refused` row in the trace *and* an observation handed
+  back to the model, because an agent that believes it corrected something and did not will act on
+  the correction it thinks it made. `Store::memory_write` returns that refusal as a value;
+  `memory_put` is unchanged and is that call with the kind fixed to `Fact`, so there is one write
+  path rather than two that can drift.
+
+  `Store::memory_recalls` is the other half: which entries a run actually drew on, one row per key
+  per recall, in a table rather than a flag on the entry — an entry recalled by two runs is two
+  facts and a flag keeps only the later one. `Store::memory_list` says what the agent knows about a
+  workspace; this says what *this run* used, which is what tells a reader whether an entry was
+  load-bearing.
+
+  **How often gates fail, and what recovery caught.** Five grouped accessors in the shape 0.18.0
+  established for cost: `runs_by_outcome`, `runs_by_day` and `gate_failures_by_phase` returning
+  `Tally` rows, plus `first_try` and `recovery`. Rows out, no rendering, no derived opinion.
+
+  What they refuse to do is as much of the release as what they do. `first_try` returns three counts
+  and no rate, because *of the ones that worked* and *of everything we tried* are both legitimate
+  denominators and returning one number would pick between them invisibly. `Recovery` has no
+  escalation count: nothing records an escalation as an event, and an escalation is the opposite of
+  a rescue — it is the run handing the problem back. And gate failures group by the *phase* the
+  trace holds rather than by criterion text, which is stated plainly instead of dressing a column up
+  as something it is not.
+
+  **Nothing breaks, and both directions were executed rather than argued.** Two nullable columns on
+  `memory`, one `memory_recalls` table, six indexes, `CHECKPOINT_FORMAT` still 7. An entry written
+  before this release reads back as an unpinned `Fact`, which is what it was. A tree 0.29.0 stopped
+  mid-flight resumes here without re-running a committed step or re-charging the finished child. And
+  a real io-harness 0.29.0 from crates.io — built from a pinned generator, not this tree wearing a
+  label — opens a store carrying a pinned decision and the recall table and reads everything it
+  knows about, because its queries never name the new columns.
+
+  `cargo tree` reads 402 lines, exactly as it has since 0.23.0. No dependency was added; nothing
+  here needed one.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — every one of the 29 test binaries green and 279 doctests
+    passed, 0 failed. Full output at `.ultraship/evidence/0.30.0/tests-default.txt`.
+  - >
+    `cargo test --all-features --lib --tests` — 52 green result lines, 0 failed.
+    `.ultraship/evidence/0.30.0/tests-all-features.txt`.
+  - >
+    `cargo test --all-features --doc` — 281 passed, 0 failed.
+    `.ultraship/evidence/0.30.0/tests-doc.txt`.
+  - >
+    F1 — `origin_reports_the_deciding_scope_at_every_step_down` asserts the origin at each of four
+    steps down the scope stack (local, project, user, then empty), because "the last scope read" and
+    "the deciding scope" agree only while a key is set everywhere.
+    `origin_of_a_key_only_one_file_sets_is_that_file_not_the_last_one_read` is the sharper half.
+  - >
+    F2 — `origin_of_a_substituted_value_is_the_file_it_was_written_in` runs `${env:}`, `${cmd:}` and
+    the same key written literally through the same file and asserts all three report an identical
+    `Origin`. The literal is the control: without it the test passes against an implementation
+    reporting the mechanism instead of the source.
+  - >
+    F3 — `origin_shows_the_project_file_that_narrowed_a_user_setting`, plus the two cases the
+    criteria did not name: `origin_of_an_appending_key_lists_every_file_that_contributed` and
+    `origin_after_a_profile_overlay_names_the_file_the_profile_came_from`.
+  - >
+    F4 — `state::tests::memory_kind_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+    parses `pub enum MemoryKind` out of `src/state.rs`, CRLF normalised, and asserts the variants
+    equal the spellings `from_stored` reads back, then round-trips each through a real store. A
+    variant added without a `from_stored` arm would round-trip to `Fact` silently, which is 0.25.0's
+    `every_kind()` defect in a different table.
+  - >
+    F5 — `a_pinned_entry_survives_a_run_that_tries_to_overwrite_it` drives the real run loop with a
+    scripted `remember` call: the operator's value stands, the kind is still `Decision`,
+    `memory_refused` is in the trace and `memory_write` is not. Its control,
+    `the_same_write_lands_when_the_entry_is_not_pinned`, runs the identical script unpinned — without
+    it the first test passes against an implementation that refuses everything.
+  - >
+    F6 — `the_recall_record_names_which_entries_a_run_actually_used` writes six entries where the
+    three oldest are each `MEMORY_MAX_ENTRY_CHARS` long and asserts the record names exactly the
+    three that fit. "Three of six" is a property of the sizes and the newest-first fit rule rather
+    than of a token estimate the test would be pinned to. A second run records its own without
+    disturbing the first.
+  - >
+    F7 — `f7_the_aggregates_are_right_against_a_known_composition` asserts every accessor against
+    the `composition` literals in the 0.29.0 fixture's sidecar, never against what the accessor
+    returned. The fixture is built so runs (6), succeeded (4) and first_try (2) all differ, and the
+    test asserts they differ: with any two equal it would pass against an accessor that confused
+    them. `the_aggregates_over_an_empty_store_are_empty_rather_than_absent` is the other end.
+  - >
+    F8 forwards — `a_0_29_0_store_reads_back_identically_under_0_30_0` (every row against the
+    sidecar, the new fields at their defaults, `PRAGMA user_version` still 7) and
+    `a_0_29_0_tree_resumes_under_0_30_0` (no duplicate step number anywhere in the tree, the
+    finished child gains neither a step nor a token, the tree total is the two halves added up
+    exactly).
+  - >
+    F8 backwards — `a_0_30_0_store_is_read_by_a_0_29_0_binary` execs the pinned `=0.29.0` build over
+    a store this tree wrote: exit 0, `"reader": "io-harness 0.29.0"`, both entries and their
+    attribution read back. `#[ignore]` by default because it needs that binary built, and CI's new
+    `cross-version-0.29.0` job runs it with `-- --ignored --exact`.
+  - >
+    N2 — `state::tests::every_aggregate_reaches_its_rows_through_an_index` asserts the query plan of
+    all seven statements names an index, with a control that must NOT (a count over `runs.goal`,
+    which has no index). A wall-clock assertion was rejected deliberately: flaky on a loaded runner,
+    and it passes on a fast machine running a full scan.
+  - >
+    N4 — `tests/public_api.rs` `every_public_item_has_a_worked_example` passes over the six added
+    crate-root names.
+  builds:
+  - '`cargo fmt --check` — clean.'
+  - '`cargo clippy --all-targets -- -D warnings` — clean, as are the `--features documents` and
+    `--features media` legs CI runs separately.'
+  - '`cargo doc --no-deps --all-features` — no warnings.'
+  - '`cargo tree` — **402 lines**, identical to 0.23.0 through 0.29.0. `cargo tree --all-features` —
+    842. N1 holds: no dependency was added.'
+  - '`cargo package --locked` — 197 files, 4.5MiB (1.1MiB compressed), and the packaged crate
+    compiled in `target/package/io-harness-0.30.0`. `.ultraship/evidence/0.30.0/package.txt`.'
+  - >
+    N3 — `docs/public-api.txt` gains six lines and loses none; `tests/public_api.rs` (9 tests,
+    including `drift_reports_a_removal`) passes; the changelog carries no `**BREAKING` entry and
+    `tests/changelog.rs` passes.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **This record is sealed before the crates.io upload.** The authorized mode is `published` and the
+  flow makes it true: `feat/0.30.0` into `develop`, `develop` into `main`, the GitHub Release cut by
+  `release.yml`, then `cargo publish --locked` by hand, last. The record states the target; it does
+  not claim the upload has already happened.
+- >
+  **The gates ran before the record was written, and O1 and O2 cannot run locally at all.** The
+  three-OS matrix including the MSRV job, and the docs.rs nightly build, execute on the pushed
+  commit. This is stated rather than implied, and the record is not amended afterwards — an
+  immutable record that gets edited makes `immutable: true` a wish.
+- >
+  **N2's wording over-claims and the measurement is what shows it.** "The aggregates do not scale
+  with the trace" is not achievable for an aggregate over full history: counting every row is what
+  the answer *is*. Measured on a debug build over an in-memory store, twenty times the runs cost
+  roughly five times (runs_by_outcome) to twenty times (first_try) as long — at 20,000 finished
+  runs, 1.8ms, 2.5ms, 7.6ms and 1.2ms. What is true, and is what the criterion's own second sentence
+  asks for, is that each is one indexed query rather than a table scan, at roughly 90–380ns per run.
+  Raised for the owner rather than read as satisfied; making it literally true needs materialised
+  counters, which is a different release. `docs/CONTRACT.md` states the honest version.
+- >
+  **Gate failures group by phase, not by criterion.** The trace records which phase of the gate
+  failed — `compile`, `criterion-compile`, `test-run` — and not the text of the criterion. Counted
+  per failure rather than per run; "how many runs failed this phase" is a different question and is
+  not answered rather than answered ambiguously.
+- >
+  **`Recovery` has no escalation count**, because nothing records an escalation as an event. When
+  something does, it gets its own row rather than a place in the total.
+- >
+  **A pin binds a run, not the caller holding the store.** `memory_delete` and `memory_clear` have
+  no pin guard, so a pinned entry is not tamper-proof against the embedding program — only against
+  the agent. Found while documenting rather than while building, and written into
+  `docs/CONTRACT.md` rather than quietly left as an implied promise.
+- >
+  **`first_try` counts a run whose gate never ran.** A contract with `Verification::None` that
+  finishes successfully has no failed gate phase and is therefore a first-try pass. That is the
+  honest reading of "succeeded with nothing failing", and it means the number is not a
+  gate-pass-rate for a workspace that mixes verified and unverified runs.
+- >
+  **`MemoryEntry` gained two public fields.** It is a row this crate returns and nothing takes, so
+  this is additive for every reader — but a caller who constructs one in a struct literal has to
+  name `kind` and `pinned`. Two of this crate's own tests did, which is exactly the cost, and it is
+  in `docs/CONTRACT.md` beside the same warning for the two provider structs.
+- >
+  **The backwards cross-version test is `#[ignore]` by default.** It needs the pinned 0.29.0
+  generator built, which resolves `io-harness =0.29.0` from crates.io. A local `cargo test` reports
+  it as ignored rather than silently passing; the `cross-version-0.29.0` CI job is what runs it, and
+  that job also fails if the generator's pin ever drifts off `=0.29.0`.
+- >
+  **Provenance is a map built at load, not a per-key walk.** Decided against the merge code early:
+  the known consumer renders a whole settings list, and a per-key walk would re-read the tables once
+  per row. The cost is that every key a file set is held in memory for the life of the `Config`,
+  which for a configuration file is nothing.
+supersedes: 0.29.0
+next_recommended_version: 0.31.0
+immutable: true

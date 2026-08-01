@@ -7,3 +7,11 @@
 # `crlf_line_endings_parse` unit test in src/skills.rs), so the fix belongs at the
 # checkout boundary rather than in the parser.
 tests/fixtures/** text eol=lf
+
+# The cross-version fixture databases are BINARY, and the rule above would
+# otherwise treat them as text: a SQLite page whose bytes happen to contain
+# `0D 0A` gets rewritten to `0A` on `git add`, which silently corrupts the file
+# the moment one is written whose content lands on that pair. The 0.22.0
+# fixtures survived only because none of their pages contained it; the 0.29.0
+# ones did on their first write, which is how this was found.
+tests/fixtures/**/*.sqlite3 binary

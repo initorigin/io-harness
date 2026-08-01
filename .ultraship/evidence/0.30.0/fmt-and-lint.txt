@@ -1,0 +1,3 @@
+fmt exit=0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.40s
+clippy exit=0

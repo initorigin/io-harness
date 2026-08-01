@@ -226,6 +226,216 @@ fn f6_substitution_reaches_the_field_or_names_the_key_that_failed() {
 }
 
 // ---------------------------------------------------------------------------
+// 0.30.0 F1, F2, F3 — per-key provenance
+//
+// Named for what they assert rather than `f1_`/`f2_`, because 0.19.0's criteria
+// already own those prefixes in this file and two different F1s a hundred lines
+// apart is how a test ends up asserting the wrong release's claim.
+// ---------------------------------------------------------------------------
+
+/// 0.30.0 F1 — provenance across four scopes.
+#[test]
+fn origin_reports_the_deciding_scope_at_every_step_down() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(user_dir.path(), "io.toml", "[run]\nmax_steps = 1\n");
+    write(project.path(), "io.toml", "[run]\nmax_steps = 2\n");
+    write(project.path(), "io.local.toml", "[run]\nmax_steps = 3\n");
+
+    let origin = |root: &Path| {
+        let config = Config::discover(root).unwrap();
+        let at = config.origin("run.max_steps");
+        assert_eq!(at.len(), 1, "one file decides an ordinary key");
+        (at[0].scope, at[0].path.clone())
+    };
+
+    // The same four steps `f1_the_four_scopes_merge_in_order` walks, asserted on
+    // the *origin* rather than the value. Taken at every step because "reports
+    // the last scope read" and "reports the deciding scope" give the same answer
+    // when the key is set everywhere — which is only the first step.
+    let (scope, path) = origin(project.path());
+    assert_eq!(scope, Scope::Local);
+    assert_eq!(path, project.path().join("io.local.toml"));
+
+    std::fs::remove_file(project.path().join("io.local.toml")).unwrap();
+    let (scope, path) = origin(project.path());
+    assert_eq!(scope, Scope::Project);
+    assert_eq!(path, project.path().join("io.toml"));
+
+    std::fs::remove_file(project.path().join("io.toml")).unwrap();
+    let (scope, path) = origin(project.path());
+    assert_eq!(scope, Scope::User);
+    assert_eq!(path, user_dir.path().join("io.toml"));
+
+    std::fs::remove_file(user_dir.path().join("io.toml")).unwrap();
+    let config = Config::discover(project.path()).unwrap();
+    assert!(
+        config.origin("run.max_steps").is_empty(),
+        "with no file anywhere the value is the crate's default, and a default has \
+         no file — naming one would be an invention"
+    );
+}
+
+/// 0.30.0 F1 — the deciding scope is not the last scope read.
+#[test]
+fn origin_of_a_key_only_one_file_sets_is_that_file_not_the_last_one_read() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(user_dir.path(), "io.toml", "[run]\nmax_retries = 9\n");
+    // A later scope exists and names something else entirely. An implementation
+    // that reported "the last file read" would answer io.local.toml here.
+    write(project.path(), "io.local.toml", "[run]\nmax_steps = 3\n");
+
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.origin("run.max_retries")[0].scope, Scope::User);
+    assert_eq!(config.origin("run.max_steps")[0].scope, Scope::Local);
+}
+
+/// 0.30.0 F2 — provenance through substitution.
+#[test]
+fn origin_of_a_substituted_value_is_the_file_it_was_written_in() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    std::env::set_var("IO_HARNESS_ORIGIN_TEST_SKILLS", "skills");
+
+    // `${cmd:}` is refused in the project scope, so both substituted forms are
+    // written in the local one — where the question "which file said this" is
+    // exactly as live.
+    let cases = [
+        (
+            "${env:IO_HARNESS_ORIGIN_TEST_SKILLS}",
+            "an env substitution",
+        ),
+        ("${cmd:rustc --version}", "a cmd substitution"),
+        // The negative control: the same key, same file, written literally. If
+        // the substituted forms report anything different, the implementation is
+        // reporting the mechanism instead of the source.
+        ("skills", "a literal"),
+    ];
+
+    let mut answers = Vec::new();
+    for (value, what) in cases {
+        write(
+            project.path(),
+            "io.local.toml",
+            &format!("[run]\nskills = \"{value}\"\n"),
+        );
+        let config = Config::discover(project.path()).unwrap();
+        let at = config.origin("run.skills");
+        assert_eq!(at.len(), 1, "{what}");
+        assert_eq!(at[0].scope, Scope::Local, "{what}");
+        assert_eq!(at[0].path, project.path().join("io.local.toml"), "{what}");
+        answers.push(at[0].clone());
+    }
+    assert!(
+        answers.windows(2).all(|w| w[0] == w[1]),
+        "the substituted forms and the literal must report the identical origin: {answers:?}"
+    );
+}
+
+/// 0.30.0 F3 — a project scope that narrowed a user's setting is visible.
+#[test]
+fn origin_shows_the_project_file_that_narrowed_a_user_setting() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    // The case 0.27.0's trust rule creates and nothing could report until now:
+    // the operator allowed exec in their own file, the cloned repository narrowed
+    // it to deny, and the operator's setting silently stopped applying.
+    write(
+        user_dir.path(),
+        "io.toml",
+        "[policy.defaults]\nexec = \"allow\"\n",
+    );
+    write(
+        project.path(),
+        "io.toml",
+        "[policy.defaults]\nexec = \"deny\"\n",
+    );
+
+    let config = Config::discover(project.path()).unwrap();
+    let at = config.origin("policy.defaults.exec");
+    assert_eq!(at[0].scope, Scope::Project);
+    assert_eq!(at[0].path, project.path().join("io.toml"));
+
+    let policy = config.policy().expect("a [policy] section was read");
+    assert_eq!(
+        policy.check(Act::Exec, "cargo").effect,
+        Effect::Deny,
+        "the narrowed value is what actually applies — the origin describes the \
+         resolution, it does not change it"
+    );
+}
+
+/// 0.30.0 F1 — the two appending keys report every file that built them.
+#[test]
+fn origin_of_an_appending_key_lists_every_file_that_contributed() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    let layer = |name: &str| format!("[[policy.layers]]\nname = \"{name}\"\nrules = []\n");
+    write(user_dir.path(), "io.toml", &layer("ops"));
+    write(project.path(), "io.toml", &layer("repo"));
+
+    let config = Config::discover(project.path()).unwrap();
+    let at = config.origin("policy.layers");
+    assert_eq!(
+        at.iter().map(|o| o.scope).collect::<Vec<_>>(),
+        [Scope::User, Scope::Project],
+        "`policy.layers` appends across scopes, so both files decided it and \
+         naming one winner would be a lie"
+    );
+    let names: Vec<String> = config
+        .policy()
+        .unwrap()
+        .layers
+        .iter()
+        .map(|l| l.name.clone())
+        .collect();
+    assert!(
+        names.contains(&"ops".to_string()) && names.contains(&"repo".to_string()),
+        "and the value really is both of them: {names:?}"
+    );
+}
+
+/// 0.30.0 F1 — a profile's origin is the file the profile was written in.
+#[test]
+fn origin_after_a_profile_overlay_names_the_file_the_profile_came_from() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    write(project.path(), "io.toml", "[run]\nmax_steps = 30\n");
+    write(
+        project.path(),
+        "io.local.toml",
+        "[profile.cheap]\nrun = { max_steps = 5 }\n",
+    );
+
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.origin("run.max_steps")[0].scope, Scope::Project);
+
+    let cheap = config.with_profile("cheap").unwrap();
+    assert_eq!(
+        cheap.origin("run.max_steps")[0].path,
+        project.path().join("io.local.toml"),
+        "the profile decided it, so the file the profile is in is the origin"
+    );
+    assert!(
+        cheap.origins().all(|(key, _)| !key.starts_with("profile.")),
+        "the overlaid configuration carries no [profile] section, so it reports no \
+         origin for one either"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // F7 — every key reaches a typed field
 // ---------------------------------------------------------------------------
 
