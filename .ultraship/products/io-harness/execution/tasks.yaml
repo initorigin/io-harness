@@ -20,13 +20,43 @@ tasks:
     '
   - 'NF5 — no existing public item changes. `OpenRouter`, `Anthropic` and `OpenAi` keep every method
     and every behaviour; `Provider` gains one defaulted method and no required one; `ProviderSpec` gains
-    one variant behind the `#[non_exhaustive]` 0.27.0 put there for it. A program written against 0.28.0
-    compiles and behaves identically.
+    one variant behind the `#[non_exhaustive]` 0.27.0 put there for it. `Price` gains no field and keeps
+    `Copy`, so `..Price::ZERO` and `PriceTable::price` are untouched and tiers are a `PriceTable` method
+    rather than a change to the value type. A `PriceTable` with no tier registered returns exactly the
+    figure 0.28.0 returned, asserted rather than argued. A program written against 0.28.0 compiles and
+    behaves identically.
 
     '
   files:
   - src/provider/mod.rs
   - src/lib.rs
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T10
+  summary: 'Price tiers in src/pricing.rs: PriceTier, PriceTable::with_tiers/tiers, and tier selection
+    in cost_micros.'
+  why_required: Forty-four of the catalogue's models price by prompt length and the rate typically doubles
+    past 200k, so a catalogue that fetches a real price and applies the wrong tier under-reports a long
+    run by half — the confident wrong number this release exists to prevent. See iterations/US-IO-HARNESS-0.29.0-I01.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T01
+  acceptance_criteria:
+  - 'F11 — a tiered price is billed at the tier the prompt actually reached, and a flat one is unchanged.
+    A model with a 200,000-token tier at double its base rate costs the base rate at 199,999 prompt
+    tokens and the tier rate at 200,000 and at 400,000 — the boundary asserted on both sides, because
+    an off-by-one on a floor is the whole defect. A two-tier model (32,000 and 128,000) selects the
+    **highest** floor it reaches and not the first, asserted with the tiers registered in reverse order
+    so the answer cannot come from input ordering. And an override that names only some keys inherits
+    the rest from its base row, asserted on a dimension the override omits. **Three negative controls:**
+    a model with no tiers priced identically to how 0.28.0 priced it, so the selection cannot have changed
+    the flat path; a prompt below every floor yielding the base row rather than the lowest tier; and
+    the same usage priced against a table with the tiers **removed**, which must produce a *different
+    and smaller* figure — without it the test would pass against an implementation that ignored tiers
+    entirely.
+
+    '
+  files:
+  - src/pricing.rs
   evidence: []
 - id: US-IO-HARNESS-0.29.0-T02
   summary: 'The reference catalogue reader: Reference, the exact decimal-string to micro-unit conversion,
@@ -36,7 +66,7 @@ tasks:
     place a defect in this release becomes money rather than an error.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.29.0-T01
+  - US-IO-HARNESS-0.29.0-T10
   acceptance_criteria:
   - 'F4 — a decimal price string becomes an exact integer, and no `f64` is on the path. `"0.0000002574"`
     becomes exactly `257_400` micro-units per million tokens, and a table of hand-computed cases covers
@@ -215,7 +245,9 @@ tasks:
     `Auth`, `ModelInfo`, `PriceSource` and `Reference` — and each carries a doc comment with a worked
     example, because `tests/public_api.rs` fails otherwise and there is deliberately no `--bless`. This
     is real work rather than a formality: five items, five examples that compile as doctests. The preset
-    table is `pub(crate)` and adds no line; a named constructor is a method and adds none either.
+    table is `pub(crate)` and adds no line; a named constructor is a method and adds none either. `PriceTier`
+    lives in `pricing`, which is a public module rather than a crate-root re-export, so like `Price`
+    and `PriceTable` beside it it carries a worked example and takes no line in the snapshot.
 
     '
   - 'OP2 — **`docs/CONTRACT.md` states the vendor divergences plainly, from primary sources, and this
@@ -251,11 +283,12 @@ tasks:
   acceptance_criteria:
   - 'F10 — the live reference host serves the shape the parser was written against. A keyless `GET https://openrouter.ai/api/v1/models`
     from the release machine, parsed by the shipped parser, yielding a non-empty catalogue in which
-    at least one model carries a price in every one of the five dimensions the mapping claims. Run once,
-    at completion, and recorded as a health check with what it actually returned. It is not a unit test
-    and does not gate CI — a network test in the suite is a flaky suite — but a parser written against
-    a shape nobody checked is the failure this criterion exists to prevent, and `.env` carries real
-    OpenRouter credentials, so the check is genuinely available rather than aspirational.
+    at least one model carries a price in every one of the five dimensions the mapping claims **and
+    at least one carries a tier**, with the count of tiered models recorded. Run once, at completion,
+    and recorded as a health check with what it actually returned. It is not a unit test and does not
+    gate CI — a network test in the suite is a flaky suite — but a parser written against a shape nobody
+    checked is the failure this criterion exists to prevent, and `.env` carries real OpenRouter credentials,
+    so the check is genuinely available rather than aspirational.
 
     '
   - 'NF1 — the full suite passes on macOS, Linux and Windows with no test skipped, ignored or made conditional.

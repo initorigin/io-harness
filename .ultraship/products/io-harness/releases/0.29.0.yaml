@@ -119,11 +119,33 @@ scope:
     not identical to it, and an operator reading a cost must be able to tell which they have. A
     number whose origin is unrecoverable is what makes an invoice unarguable.
   - >
-    **No new price type.** `pricing::Price` already carries `input`, `output`, `cache_read`,
+    **No change to `pricing::Price`.** It already carries `input`, `output`, `cache_read`,
     `cache_write` and `per_server_tool_request` (`src/pricing.rs:86`) in micro-units per million
     tokens, and the reference catalogue's five pricing keys — `prompt`, `completion`,
     `input_cache_read`, `input_cache_write`, `web_search` — map onto them one for one. Verified
     against the live response, not assumed.
+  - >
+    **Price tiers, because a model does not have one price.** Forty-four of the three hundred and
+    thirty-six models the reference catalogue serves carry a `pricing.overrides` array keyed by
+    `min_prompt_tokens`, and the rate typically **doubles**: `google/gemini-2.5-pro` goes from
+    `0.00000125` to `0.0000025` past 200,000 prompt tokens, `anthropic/claude-sonnet-4.5` from
+    `0.000003` to `0.000006` at the same floor, and `qwen/qwen3-max` steps twice, at 32,000 and
+    128,000. A long agentic run is precisely what crosses those floors, so pricing one against the
+    base row under-reports the spend by up to half. See `iterations/US-IO-HARNESS-0.29.0-I01`.
+
+    It ships as **`PriceTier { min_prompt_tokens, price }`** and a per-model list on `PriceTable`,
+    deliberately **not** as a field inside `Price`: a `Vec` there would remove that type's `Copy`
+    impl and break `..Price::ZERO` and `PriceTable::price`, which is a public break bought for a
+    data shape. `cost_micros` selects the highest floor at or below `usage.prompt_tokens` and bills
+    the **whole request** at that row — which is how the vendors themselves bill it, not a marginal
+    split — and falls back to the base row when no floor is reached, so a table with no tiers
+    computes exactly as it did in 0.28.0. `ModelInfo` carries `price_tiers`, empty for the 292 flat
+    models, and `[prices.models.<id>.tiers]` lets a hand-maintained table say the same thing.
+
+    Each override is merged against its base row at parse time, so a stored tier is a complete
+    `Price` rather than a sparse patch. That is safe rather than assumed: **no override anywhere in
+    the 44 introduces a pricing key its own base row lacks**, checked across every override object
+    in the live response.
   - >
     **Exact decimal string to integer, with no `f64` on the path.** The catalogue states prices as
     decimal strings of dollars per token (`"0.0000002574"`). Micro-units per million tokens is that
@@ -260,6 +282,10 @@ scope:
     version with an UltraShip iteration recording which observation tripped. `ModelInfo::price_source`
     stays, with `Vendor` as its only reachable value, because provenance on a stated price is still
     worth having and removing the field later would be a break where narrowing its values is not.
+    `PriceTier` and the tier selection in `cost_micros` stay too: they are `src/pricing.rs`'s own,
+    they are reachable from a hand-maintained `[prices.models.<id>.tiers]` with no catalogue
+    anywhere, and a table that cannot express a 200,000-token tier prices a long run wrong whether
+    or not this release fetches the number.
 
     The release stays coherent: "a provider is a base URL, a key and a model name, and twenty-one
     vendors are reachable without writing one" is a complete sentence and is the half the roadmap
@@ -345,10 +371,24 @@ acceptance:
     listing the names that exist; and an unknown key inside the entry is rejected naming it, modelled
     on `an_unknown_key_inside_the_web_table_is_rejected_naming_it` (`:1242`).
   - >
+    F11 — a tiered price is billed at the tier the prompt actually reached, and a flat one is
+    unchanged. A model with a 200,000-token tier at double its base rate costs the base rate at
+    199,999 prompt tokens and the tier rate at 200,000 and at 400,000 — the boundary asserted on
+    both sides, because an off-by-one on a floor is the whole defect. A two-tier model
+    (32,000 and 128,000) selects the **highest** floor it reaches and not the first, asserted with
+    the tiers registered in reverse order so the answer cannot come from input ordering. And an
+    override that names only some keys inherits the rest from its base row, asserted on a dimension
+    the override omits. **Three negative controls:** a model with no tiers priced identically to how
+    0.28.0 priced it, so the selection cannot have changed the flat path; a prompt below every floor
+    yielding the base row rather than the lowest tier; and the same usage priced against a table
+    with the tiers **removed**, which must produce a *different and smaller* figure — without it the
+    test would pass against an implementation that ignored tiers entirely.
+  - >
     F10 — the live reference host serves the shape the parser was written against. A keyless
     `GET https://openrouter.ai/api/v1/models` from the release machine, parsed by the shipped parser,
     yielding a non-empty catalogue in which at least one model carries a price in every one of the
-    five dimensions the mapping claims. Run once, at completion, and recorded as a health check with
+    five dimensions the mapping claims **and at least one carries a tier**, with the count of tiered
+    models recorded. Run once, at completion, and recorded as a health check with
     what it actually returned. It is not a unit test and does not gate CI — a network test in the
     suite is a flaky suite — but a parser written against a shape nobody checked is the failure this
     criterion exists to prevent, and `.env` carries real OpenRouter credentials, so the check is
@@ -379,8 +419,11 @@ acceptance:
   - >
     NF5 — no existing public item changes. `OpenRouter`, `Anthropic` and `OpenAi` keep every method
     and every behaviour; `Provider` gains one defaulted method and no required one; `ProviderSpec`
-    gains one variant behind the `#[non_exhaustive]` 0.27.0 put there for it. A program written
-    against 0.28.0 compiles and behaves identically.
+    gains one variant behind the `#[non_exhaustive]` 0.27.0 put there for it. `Price` gains no field
+    and keeps `Copy`, so `..Price::ZERO` and `PriceTable::price` are untouched and tiers are a
+    `PriceTable` method rather than a change to the value type. A `PriceTable` with no tier
+    registered returns exactly the figure 0.28.0 returned, asserted rather than argued. A program
+    written against 0.28.0 compiles and behaves identically.
   operational:
   - >
     OP1 — `docs/public-api.txt` is hand-edited in sorted position for every new crate-root name —
@@ -388,7 +431,9 @@ acceptance:
     with a worked example, because `tests/public_api.rs` fails otherwise and there is deliberately no
     `--bless`. This is real work rather than a formality: five items, five examples that compile as
     doctests. The preset table is `pub(crate)` and adds no line; a named constructor is a method and
-    adds none either.
+    adds none either. `PriceTier` lives in `pricing`, which is a public module rather than a
+    crate-root re-export, so like `Price` and `PriceTable` beside it it carries a worked example and
+    takes no line in the snapshot.
   - >
     OP2 — **`docs/CONTRACT.md` states the vendor divergences plainly, from primary sources, and this
     is the release's most important documentation obligation.** A new section names each: Zhipu emits
@@ -532,6 +577,8 @@ resource_profile:
   - No store schema change; `CHECKPOINT_FORMAT` stays 7 and no table is created
   - No required method added to `Provider`; `models()` is defaulted or it is a break
   - '`ModelInfo::price` is never `Price::ZERO` for an unknown price, only for a stated one'
+  - '`pricing::Price` gains no field and keeps `Copy`; tiers hang off `PriceTable`, never inside it'
+  - A table with no tier registered prices exactly as 0.28.0 did
   - A price match is exact or one documented normalisation; a miss is `None` and never a guess
   - The reference lookup is off by default and appears in `endpoints()` when on
   - No vendor-shaped branch inside the shared body builder
@@ -546,6 +593,15 @@ risks:
   control that proves it. The residual risk is that the aggregator's price for a model differs from
   the vendor's own, which is *not* a defect and is exactly what `PriceSource::Reference` exists to
   say out loud.
+- >
+  **A tier boundary is an off-by-one that costs money in one direction only.** Selecting the base
+  row at exactly `min_prompt_tokens` under-reports every request that lands on the floor, and no
+  test that checks "a big prompt costs more" would catch it. The mitigation is that F11 asserts both
+  sides of the boundary — 199,999 and 200,000 — rather than a value comfortably past it, that the
+  highest matching floor is asserted with the tiers registered in reverse order so ordering cannot
+  supply the answer, and that the control prices the same usage against a tier-free table and
+  requires a *different and smaller* figure, so an implementation that ignored tiers fails rather
+  than passes quietly.
 - >
   **A third host dialled from inside a provider is an egress the caller did not ask for.** This crate
   authorises egress from `Provider::endpoints()` before a run starts, which is the whole reason that
