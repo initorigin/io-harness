@@ -429,6 +429,25 @@ impl Ledger {
         }
     }
 
+    /// Take a restored wait out of the count without having waited for it
+    /// (0.32.0).
+    ///
+    /// A queue restored from the store describes waits from a process that is
+    /// dead; the slots it was holding died with it. So a child whose wait was
+    /// restored can be admitted immediately by [`Self::try_admit`], and when it
+    /// is, it never passes through [`Self::admit`] — the only other place `queued`
+    /// comes down. Without this the counter would drift above the rows the store
+    /// actually holds, and a resumed fleet would report a backlog that never
+    /// reached zero.
+    ///
+    /// Call it only when the store confirmed a row was removed, so the count and
+    /// the rows move together.
+    pub(crate) fn drop_queued(&self, depth: u32) {
+        let tier = self.tier(depth);
+        let mut f = self.fleet.lock().unwrap();
+        f[tier].queued = f[tier].queued.saturating_sub(1);
+    }
+
     /// Wait for a concurrency slot at `depth`, FIFO. Call only after
     /// [`Self::mark_queued`]: acquiring the permit is what moves this child out
     /// of `queued` and into `working`.

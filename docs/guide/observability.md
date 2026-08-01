@@ -94,7 +94,8 @@ new trait method every implementer inherits.
 | `Replan { window }` | The agent changed nothing for a while and was told once to try something else |
 | `Stalled` | It had already been told and is still going in circles. Terminal |
 | `Spawned { child_run_id, goal }` | A sub-agent was started |
-| `SpawnRefused { cap }` | A spawn was refused by containment — `agents`, `depth` or `concurrency` |
+| `SpawnRefused { cap }` | A spawn was refused by containment — `agents`, `depth` or `budget`. Never concurrency: that queues |
+| `Fleet { tier, working, queued, done }` | One tier of the tree changed shape: a child queued, was admitted, or finished |
 | `MemoryWrote { key }` | The agent wrote to durable cross-run memory |
 | `Sandbox { kind, backend }` | `create`, `exec`, `cap_hit`, `destroy` or `gate_phase_failed` |
 | `Mcp { server, tool, ok, millis }` | An MCP server was reached, or one of its tools called |
@@ -138,9 +139,9 @@ panic in an observer.
 
 The trait is `Send + Sync` with `&self` methods, held as `&dyn Observer` — shaped
 after `Approver`, the crate's other inversion-of-control point. `&self` rather
-than `&mut self` is not a style choice: a tree runs up to `max_concurrent`
-children as concurrent futures on one task, and a `&mut self` observer could not
-be shared between them. Keep whatever state you need behind a `Mutex`, an atomic,
+than `&mut self` is not a style choice: a tree runs up to
+`max_concurrent_agents` children per tier as concurrent futures on one task, and
+a `&mut self` observer could not be shared between them. Keep whatever state you need behind a `Mutex`, an atomic,
 or a channel.
 
 ### Forwarding events to another process

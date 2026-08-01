@@ -107,6 +107,7 @@ struct Edit src/state.rs
 struct ExecGuard src/verify.rs
 struct FirstTry src/state.rs
 struct FixedResponder src/approve.rs
+struct FleetTally src/containment.rs
 struct Hooks src/hooks.rs
 struct Identity src/tools/git.rs
 struct Ignore src/observe.rs

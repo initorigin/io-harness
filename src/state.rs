@@ -4127,8 +4127,14 @@ impl Store {
     }
 
     /// Clear a wait because the child has been admitted and is now a real run
-    /// (0.32.0). Deleting a row that is not there is not an error: a child
-    /// admitted without ever queuing calls this on a path that wrote nothing.
+    /// (0.32.0). Returns whether a row was actually removed.
+    ///
+    /// Deleting a row that is not there is not an error, and the answer is what a
+    /// resumed tree needs: a wait restored from the store can be admitted without
+    /// ever waiting again — the slot the dead process held died with it — so the
+    /// immediate-admission path calls this too, and only decrements its count when
+    /// the store says a row went. That is what keeps the reported backlog and the
+    /// rows on disk moving together instead of drifting apart.
     ///
     /// ```
     /// use io_harness::Store;
@@ -4137,16 +4143,19 @@ impl Store {
     /// let parent = store.start_run("fan out", "/tmp/ws").unwrap();
     ///
     /// // Idempotent, so the fast path — admitted immediately, never queued —
-    /// // does not have to branch around it.
-    /// store.dequeue_agent(parent, 1, "never queued").unwrap();
+    /// // does not have to branch around it, and says so.
+    /// assert!(!store.dequeue_agent(parent, 1, "never queued").unwrap());
+    ///
+    /// store.enqueue_agent(parent, 1, "waited", 1).unwrap();
+    /// assert!(store.dequeue_agent(parent, 1, "waited").unwrap());
     /// assert!(store.queued_agents(parent).unwrap().is_empty());
     /// ```
-    pub fn dequeue_agent(&self, parent_run_id: i64, step: u32, goal: &str) -> Result<()> {
-        self.conn.execute(
+    pub fn dequeue_agent(&self, parent_run_id: i64, step: u32, goal: &str) -> Result<bool> {
+        let removed = self.conn.execute(
             "DELETE FROM agent_queue WHERE parent_run_id = ?1 AND step = ?2 AND goal = ?3",
             (parent_run_id, step, goal),
         )?;
-        Ok(())
+        Ok(removed == 1)
     }
 
     /// Every child still waiting anywhere in the tree rooted at `root`, as

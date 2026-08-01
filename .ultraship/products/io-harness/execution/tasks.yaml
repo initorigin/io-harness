@@ -219,7 +219,7 @@ tasks:
   why_required: Every outcome assertion in this release passes whether the queue was restored or silently
     rebuilt from the replayed spawn calls. Without the absence assertion the durability claim is unproven,
     and an unproven durability claim is the one this contract must not make.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.32.0-T03
   acceptance_criteria:
@@ -294,9 +294,40 @@ tasks:
   files:
   - examples/fleet_fixture.rs
   - tests/fleet.rs
-  - tests/subagents.rs
   - tests/cross_version.rs
-  evidence: []
+  evidence:
+  - '`examples/fleet_fixture` is shaped so the kill lands with the queue full and keeps it full: one
+    slot per tier, five children asked for in one step, and the child that wins the slot commits one
+    real 90-token step and then parks forever. Verified against the store while it ran — two `runs`
+    rows (the root and child-0), four `agent_queue` rows for child-1..4, and one `steps` row.'
+  - 'Nine tests in `tests/fleet.rs`, ten with the fast-path case. F1 (120 children under a cap of 8:
+    all 120 ran, zero refusals, measured peak 2..=8) is paired with its control (the same fan-out under
+    `max_total_agents: 8` refuses 113 spawns with cap `agents`), and F2 adds the independent axis (`max_total_agents:
+    200` with concurrency 1: nothing refused, measured peak exactly 1).'
+  - 'F3 asserts the charge claim against the durable rows after a real SIGKILL: `children` holds one
+    run, `queued_agents` holds exactly `child-1..4` in FIFO order at tier 1, `spent_tokens_tree` equals
+    the admitted child''s own step tokens computed independently, and `agent_count_tree` is 2.'
+  - F4 is the absence assertion. One `agent_queue` row is deleted from the killed fixture's store before
+    the resume; the resumed run's first `EventKind::Fleet` must report 3 rather than the 4 the fixture
+    left or the 5 the model is about to ask for, and it must precede the first `EventKind::Step`. A
+    re-derived depth is unchanged by the deletion and cannot exist before the first provider call; both
+    are asserted because either alone passes on a re-derivation.
+  - Eight sabotages, each run against the whole file. S1 adoption takes another tier's slot -> 5 named
+    tests fail. S2 the replay counts a restored wait as fresh -> F5 fails. S3 the backlog is never seeded
+    into the ledger -> F4 and F5 fail. S4 `done` is never incremented -> F6 fails. S5 a restored row
+    admitted immediately is never cleared -> the fast-path test fails. S6 an admitted child's row is
+    never deleted -> F5 fails. S7 the per-step buffered width caps the fan-out again -> 5 named tests
+    fail. S8 the slot is never released -> the 120-child fan-out under 8 slots never completes, which
+    CI detects as a timeout rather than an assertion.
+  - 'Two of those sabotages were run BEFORE the tests were finished and passed everything, and both
+    exposed a real defect rather than a weak test. S3 passing was trap 23 landing exactly as the brief
+    predicted: `emit_backlog` was reporting the row count it had just read instead of the restored ledger,
+    so the event was true whether or not the ledger had been seeded. S5 passing exposed a genuine bug
+    — a restored wait admitted through the immediate path never cleared its row, so a fully drained
+    tree left rows behind and the reported backlog never reached zero. Both are fixed and both now have
+    a named test that fails without the fix.'
+  - '`ADDED_SINCE_0_22_0` in `tests/cross_version.rs` names `agent_queue` and `agent_queue_entry`, which
+    the 0.22.0 schema guard requires by name — there is deliberately no prefix rule.'
 - id: US-IO-HARNESS-0.32.0-T05
   summary: 'Documentation as part of the release: the changelog section the workflow reads verbatim,
     the rename and its semantic change in `docs/CONTRACT.md` and the guides, the per-tier ceiling stated
@@ -304,7 +335,7 @@ tasks:
   why_required: '`release.yml` refuses a version with no changelog section, and the per-tier ceiling
     is a limitation a reader must not have to derive from the source. The public-API snapshot is a build
     failure until `FleetTally` is in it.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.32.0-T04
   acceptance_criteria:
@@ -347,4 +378,24 @@ tasks:
   - docs/guide/observability.md
   - Cargo.toml
   - Cargo.lock
-  evidence: []
+  evidence:
+  - 'The changelog section for 0.32.0 exists, which `release.yml` requires before it will cut anything,
+    and states the break twice over: the rename, and the semantic change underneath it. A caller relying
+    on several parents each getting the full per-step width will now see a LOWER effective concurrency,
+    and the entry says so and says to raise the number — a rename applied mechanically while the meaning
+    moves is the worse half of this break.'
+  - '`docs/CONTRACT.md` gains three entries under `Limits that hold today`: the per-tier ceiling with
+    `max_concurrent_agents * d` spelled out, the queue''s total absence of policy beyond FIFO, and what
+    a queued child costs in visibility (`Store::children` and `Store::agent_events` will not show it).
+    The standing `resume_tree` defect is rewritten as fixed rather than deleted, so the history of the
+    claim is still readable.'
+  - '`docs/guide/composition.md` gains the two-caps-different-in-kind section and a fleet-watching section;
+    `docs/guide/observability.md` gains the `Fleet` row in the event table and corrects `SpawnRefused`,
+    which claimed `concurrency` was one of the caps that refuses. README''s composition paragraph names
+    both caps and the durable queue.'
+  - '`docs/public-api.txt` gains `struct FleetTally src/containment.rs`, without which `public_surface_matches_snapshot`
+    fails — it did fail, and that is how the entry was found rather than remembered. `FleetTally` carries
+    a worked doctest, which the surface test also requires.'
+  - 'Gates run against the shipped tree after a `cargo clean` forced by a full disk: `cargo build --all-features
+    --examples` exits 0, and `public_api` (9), `docs_drift` (10), `readme` (8), `changelog` (5) and
+    `guide_pages` (7) all pass.'

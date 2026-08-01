@@ -26,6 +26,133 @@ notes are produced from it.
 
 ### Security
 
+## [0.32.0] - 2026-08-02
+
+A fleet holds the ceiling instead of hitting it.
+
+`Containment` had one agent limit doing two jobs badly. `max_total_agents`
+refused the spawn that crossed it, so a task that wanted a hundred agents failed
+at its hundred-and-first child rather than running a hundred at a time until it
+was done; and `max_concurrent` was never a tree-wide cap at all — it was the
+width of one `buffered()` inside one parent's step, so two parents fanning out at
+once got twice the concurrency they had asked for, and a child past the width was
+not queued, it simply never started, invisibly.
+
+0.32.0 separates the two. **`max_concurrent_agents` throttles.** A spawn past it
+does not fail: the child takes a place in a FIFO queue for its tier and starts
+when a slot frees. **`max_total_agents` still refuses**, alongside the spend and
+duration ceilings, because some limits are meant to stop a run and some are meant
+to shape it. A caller who wants five hundred children four at a time now writes
+`Containment { max_total_agents: 501, max_concurrent_agents: 4, .. }` and gets
+exactly that.
+
+**The cap is per tier, not tree-global, and that is the deadlock argument rather
+than an oversight.** Each nesting level has its own set of slots. A parent holds a
+slot at its own tier while it waits for children at the tier below, so the wait
+graph runs strictly downward and cannot contain a cycle; one global pool would
+hang the first time the agent holding the last slot spawned a child, because only
+that child could free it. The honest consequence, stated here because a reader
+should not have to derive it: a tree of depth *d* can hold up to
+`max_concurrent_agents * d` agents working at once.
+
+**The fleet is visible while it drains.** `EventKind::Fleet { tier, working,
+queued, done }` reaches an `Observer` on every enqueue, every admission and every
+completion. Per tier, because one tree-wide number cannot tell an operator
+whether the fan-out at depth two is stuck behind the one at depth one. The slot is
+released on the way out of *every* path — finished, paused for a human, or an
+error propagating — because a slot freed only on the happy path is a fleet that
+stops draining the first time something goes wrong.
+
+**The queue is durable, and a queued child is not charged.** Waiting is a row in a
+new `agent_queue` table, written when a child starts waiting and deleted when it
+is admitted, so a tree that drains leaves none and a tree that is killed leaves
+exactly the backlog it had. A process that comes up afterwards reports that
+backlog — at the tier it had — before it authorises a provider, let alone calls
+one. And a child that only ever waited has no run row, no step rows and no tokens
+against the tree's ceiling, because nothing about it was started.
+
+That last claim is tested for the shape of its failure rather than its outcome. A
+queue silently re-derived from the spawn calls the model repeats produces the same
+children, the same outcome and the same final state, so the test asserts an
+**absence**: one `agent_queue` row is deleted from a killed fixture's store, and
+the depth the resumed process reports must be one smaller — and must arrive before
+the resumed provider has been handed a single request. Either fact alone passes on
+a re-derivation.
+
+`cargo tree` still reads 402 lines. The queue is `tokio::sync::Semaphore`, which
+the `sync` feature already provided, and one SQLite table.
+
+### Breaking changes
+
+- **BREAKING** — `Containment::max_concurrent` is renamed
+  `max_concurrent_agents`, and its meaning changes with it: it was the width of a
+  per-step `buffered()` inside one parent, it is now a tree-wide, per-tier
+  throttle that queues rather than skipping. The rename is the smaller half of
+  this break — read the meaning, not just the name. A caller who was relying on
+  several parents each getting the full width at the same time will now see a
+  lower effective concurrency, and should raise the number.
+  *Migration:* rename the field in any struct literal. Stored configuration needs
+  no change at all: the field carries `#[serde(alias = "max_concurrent")]`, so a
+  file written for 0.31.0 still deserialises.
+
+  ```rust
+  let containment = Containment {
+      max_total_agents: 501,
+      max_concurrent_agents: 4, // was: max_concurrent
+      max_depth: 2,
+      max_total_tokens: 500_000,
+      max_total_cost: None,
+      max_total_duration: None,
+  };
+  ```
+
+- **BREAKING** — `EventKind` gains one variant, `Fleet`. `EventKind` has been
+  `#[non_exhaustive]` since 0.24.0, so an exhaustive `match` already carries a
+  wildcard arm and this costs it nothing.
+  *Migration:* none required. `EVENT_NAMES` gains `fleet`, so a `[[hook]]` may now
+  filter on it.
+
+### Added
+
+- `FleetTally { working, queued, done }` and `Ledger::tally(tier)`, so an
+  application holding the ledger can read a tier's shape without an observer.
+- `Store::enqueue_agent`, `Store::dequeue_agent` and `Store::queued_agents`. The
+  first two answer whether they changed a row, which is what lets a resumed tree
+  tell a fresh wait from a replayed one without guessing; `queued_agents` reads a
+  whole tree's backlog as `(tier, goal)` in FIFO order, and answers "what was
+  still waiting when this died" long after the process is gone.
+- An `agent_queue` table and its unique index on `(parent_run_id, step, goal)`.
+  Additive, `CHECKPOINT_FORMAT` still 7 — a 0.31.0 binary never queries it. The
+  unique key doubles as the dedupe: `INSERT OR IGNORE` is the whole of "re-queue
+  this only if the store does not already hold it", which is what stops a resumed
+  tree's replay from doubling the depth it just restored.
+- `examples/fleet_fixture`, a deterministic offline tree that fills its queue and
+  parks, so a test can `SIGKILL` a process that is unambiguously alive.
+- A fleet section in `docs/CONTRACT.md` and in the composition and observability
+  guides, including the per-tier ceiling stated as a limitation rather than
+  implied.
+
+### Changed
+
+- The per-step spawn fan-out is now `buffered(spawn_calls.len())` — every spawn
+  reaches the ledger, and the ledger decides how many run. The collection order is
+  still the order the model asked for them, so 0.12.0's deterministic replay is
+  unaffected.
+- Reading a tree's backlog is `CROSS JOIN ... INDEXED BY`, not a plain join. A
+  recursive CTE is a co-routine SQLite cannot seek into, so left to itself the
+  planner scans every tree's queue and probes the CTE — right for a file holding
+  one tree, wrong for a file holding a hundred, and the statistics cannot tell it
+  which it has. Measured over 200 trees of 100 waiting children: 0.057 ms seeking
+  against 0.593 ms scanning.
+
+### Fixed
+
+- `resume_tree_observed` never called `record_run_policy`, so a tree resumed in a
+  second process left no record of the boundary it was actually resumed under and
+  an audit could read only the boundary of the process that died. A standing
+  defect since 0.5.0, listed in `docs/CONTRACT.md`, fixed here because this
+  release was already in that function.
+
 ## [0.31.0] - 2026-08-01
 
 The agent proposes before it acts, and a caller can say how hard it is allowed to

@@ -5035,7 +5035,21 @@ async fn spawn_child<P: Provider>(
     // different number before and after a restart: a resumed tree would run every
     // mid-flight child at once and only queue the fresh ones.
     let slot = match tree.ledger.try_admit(child_depth) {
-        Some(slot) => slot,
+        Some(slot) => {
+            // A slot was free, so this child never waits. It may still HAVE
+            // waited, in a process that is now dead — a restored backlog
+            // describes waits whose slots died with it, and the replay can admit
+            // one of them straight away. Clear its row, and take it out of the
+            // count only if the store says a row went, so the two move together.
+            // A tree that never queued anything has nothing to clear and this
+            // costs it no statement at all.
+            if tree.ledger.tally(child_depth).queued > 0
+                && tree.store.dequeue_agent(parent_run_id, step, goal)?
+            {
+                tree.ledger.drop_queued(child_depth);
+            }
+            slot
+        }
         None => {
             let newly = tree
                 .store
@@ -5187,14 +5201,15 @@ fn restore_tree_ledger(
 /// Report an inherited backlog, before the provider is authorised and long
 /// before it is called, so an application that reconnects to a restarted tree
 /// sees the queue it is waiting on rather than a zero that fills in later.
-fn emit_backlog(
-    watch: &Watch<'_>,
-    root: i64,
-    step: u32,
-    ledger: &Ledger,
-    per_tier: &[(u32, u32)],
-) {
-    for &(tier, queued) in per_tier {
+fn emit_backlog(watch: &Watch<'_>, root: i64, step: u32, ledger: &Ledger, per_tier: &[(u32, u32)]) {
+    for &(tier, _) in per_tier {
+        // Every number here comes off the restored ledger, including the depth —
+        // deliberately, and not from the rows that were just counted. Reporting
+        // the row count directly would make this event true whether or not the
+        // ledger had actually been seeded, and a ledger that was not seeded
+        // reports a backlog of zero for the rest of the run while the store still
+        // holds the rows. Reading the ledger is what makes the event fail when the
+        // restoration does.
         let t = ledger.tally(tier);
         watch.emit(RunEvent::at_depth(
             root,
@@ -5203,7 +5218,7 @@ fn emit_backlog(
             EventKind::Fleet {
                 tier,
                 working: t.working,
-                queued,
+                queued: t.queued,
                 done: t.done,
             },
         ));
