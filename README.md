@@ -153,10 +153,18 @@ draw, and a checkpoint commit in one transaction. A crash resumes the whole tree
 where it stopped: completed steps are not re-run, the budget is not
 double-charged, and an irreversible action already taken is not taken twice.
 
-**Providers, with fallback.** OpenRouter, Anthropic, and OpenAI behind one trait,
-over the crate's own HTTP+SSE client. A provider that is down or rate-limited
-falls back to the next configured one; failures are classified so a caller can
-tell a retryable transport error from a terminal one.
+**Providers, with fallback.** OpenRouter, Anthropic and OpenAI behind one trait,
+over the crate's own HTTP+SSE client. Beside them one `Compatible` provider
+reaches any OpenAI-shaped endpoint from a base URL, an auth style, a key and a
+model, and 21 vendors of that shape have a named constructor so nobody types a
+URL: 13 hosted — Groq, xAI, Mistral, DeepSeek, Together, Fireworks, Cerebras,
+Perplexity, Gemini through its compatibility endpoint, Moonshot, Zhipu, Qwen,
+MiniMax — and 8 local runtimes — Ollama, llama.cpp, vLLM, LM Studio, LocalAI,
+Jan, SGLang, KoboldCpp — where a model on the developer's own laptop costs
+nothing to run. `Provider::models()` reports what a provider can run and what it
+costs. A provider that is down or rate-limited falls back to the next configured
+one; failures are classified so a caller can tell a retryable transport error
+from a terminal one.
 
 **Extensibility, in-process and out.** Implement the `Tool` trait for something
 your program already does, or point the harness at MCP servers over stdio or
@@ -250,6 +258,7 @@ none rather than guessing.
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |
+| [Providers](docs/guide/providers.md) | One compatible provider, the 21 vendor presets, running a model locally, and what a model costs |
 
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md) indexes them.
 [docs/CONTRACT.md](docs/CONTRACT.md) is the public contract: what is stable, what

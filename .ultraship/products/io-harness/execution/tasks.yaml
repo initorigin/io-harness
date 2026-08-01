@@ -256,7 +256,7 @@ tasks:
     no from_env.
   why_required: tests/guide_pages.rs fails without the page once it is named in GUIDES, and a capability
     with no guide page is the documentation defect 0.16.0 exists to prevent.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T03
   acceptance_criteria:
@@ -273,13 +273,24 @@ tasks:
   files:
   - docs/guide/providers.md
   - tests/guide_pages.rs
-  evidence: []
+  evidence:
+  - OP3 — `docs/guide/providers.md` created (~330 lines) and named in `tests/guide_pages.rs::GUIDES`
+    as `("providers.md", true)` with a 0.29.0 why-comment in the existing style. Written from the source
+    — compatible.rs, catalog.rs, mod.rs, pricing.rs — and from fallback.rs, where it was confirmed that
+    `Fallback` does not override `models()` and therefore inherits the empty default.
+  - 'The limits block states all seven required points, and the vLLM/SGLang paragraph is written as
+    the page''s most important line and says so: no tool calls at all without a server-side parser flag,
+    no error, the agent simply talks.'
+  - Covers the 21 presets split hosted/local, `Auth::None` sending no header at all, the five non-/v1
+    bases as a table, the no-`from_env` reason with the `${env:}` TOML, Bedrock/Vertex/Azure unreachable
+    with the mint-your-own-bearer route, matching, price tiers, and `price_table()` dated by the fetch.
+  - '`cargo test --test guide_pages` 7 passed, `--test readme` 8 passed, `--test docs_drift` 10 passed.'
 - id: US-IO-HARNESS-0.29.0-T06
   summary: The README providers paragraph and guide-table row, the CAPABILITIES entry, and the [[provider]]
     section in the configuration guide.
   why_required: The README names three vendors four lines under a tagline that says any provider. This
     release is what makes the tagline true and the paragraph is where a reader finds out.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T03
   acceptance_criteria:
@@ -293,14 +304,26 @@ tasks:
   - README.md
   - docs/CAPABILITIES.md
   - docs/guide/configuration.md
-  evidence: []
+  evidence:
+  - 'OP4 — README''s ''Providers, with fallback'' paragraph rewritten: the Compatible provider by base
+    URL + auth + key + model, 21 presets named in full (13 hosted, 8 local), a local model costing nothing
+    to run, and `Provider::models()`. The original fallback sentence is kept verbatim. A Providers row
+    added to the README guide table.'
+  - '`docs/CAPABILITIES.md` gains the guide/providers.md row, and its stale ''Providers — OpenRouter,
+    Anthropic, OpenAI'' bullet under ''Beyond the pillars'' was corrected — it named only three.'
+  - '`docs/guide/configuration.md` gains a `#### kind = "compatible"` subsection under the existing
+    0.27.0 [[provider]] section with the exact shipped schema and no invented keys: the exactly-one-of
+    rule reported by array index, the 21 preset names, the auth default, and the reference_prices/Act::Net
+    rule. Its limits block grew by two paragraphs — a preset base URL is a shipped default with base_url
+    as the escape hatch, and reference_prices is egress to a third host.'
+  - '`cargo test --test readme` 8 passed, `--test guide_pages` 7 passed.'
 - id: US-IO-HARNESS-0.29.0-T07
   summary: tests/parity.rs extended so the same task contract reaches verified success through Compatible
     beside the three built-ins.
   why_required: Provider-agnosticism is a property the loop either has or does not, and this file is
     the one that asserts it. A fourth provider that needed the contract changed would disprove the release's
     own claim.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T03
   acceptance_criteria:
@@ -312,7 +335,19 @@ tasks:
     '
   files:
   - tests/parity.rs
-  evidence: []
+  evidence:
+  - F8 — `tests/parity.rs` now drives four providers under the identical contract. The fourth loop entry
+    is produced by a real `Compatible::groq(..).name()` rather than a typed literal, and the three existing
+    names run unchanged in the same loop, which is the negative control the criterion asks for.
+  - '`f8_the_real_compatible_carries_the_trait_shape_the_loop_drives` passes a real `Compatible` through
+    a helper declaring exactly `run`''s `P: Provider` bound, so trait fit is compiler-checked; asserts
+    name, endpoint, `endpoints() == [base()]` (the set run authorises before step 1) and auth. No socket
+    — the wire proof lives in src/provider/compatible.rs and the module doc points there rather than
+    duplicating it.'
+  - The named negative control `f8_a_compatible_pointed_at_no_preset_claims_no_vendor_label` — a bare
+    `Compatible::new` reports "compatible", not "groq", ruling out a label that is constant or URL-derived.
+  - '`cargo test --test parity` 3 passed; `cargo fmt --check` clean; `cargo clippy --all-targets --
+    -D warnings` clean.'
 - id: US-IO-HARNESS-0.29.0-T08
   summary: 'The convergence files: public-api.txt in sorted position, the CONTRACT divergence section,
     the changelog entry and the manifest version.'

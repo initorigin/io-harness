@@ -1363,15 +1363,6 @@ const PROJECT_WIDENING: &[(&[&str], &str)] = &[
     (&["sandbox", "force_floor"], "false"),
 ];
 
-/// A project-scoped file may narrow the boundary and may never widen it.
-///
-/// What this does **not** claim: that a cloned repository is safe. `[[mcp]]` still
-/// names a command and `[toolchain]` still names an argv, and the boundary against
-/// the agent is still the [`Policy`] the caller loaded. This is a specific narrowing
-/// of a specific hazard — four keys, `${cmd:}` and `[[hook]]`, no more.
-///
-/// Profile bodies are checked too. A widening key hidden in `[profile.x.sandbox]`
-/// would otherwise reach the same place by a different path.
 /// Validate every `[[provider]]` entry, reporting the index of the one at fault
 /// (0.29.0).
 ///
@@ -1385,6 +1376,15 @@ fn check_providers(providers: &[ProviderSpec]) -> Result<()> {
     Ok(())
 }
 
+/// A project-scoped file may narrow the boundary and may never widen it.
+///
+/// What this does **not** claim: that a cloned repository is safe. `[[mcp]]` still
+/// names a command and `[toolchain]` still names an argv, and the boundary against
+/// the agent is still the [`Policy`] the caller loaded. This is a specific narrowing
+/// of a specific hazard — four keys, `${cmd:}` and `[[hook]]`, no more.
+///
+/// Profile bodies are checked too. A widening key hidden in `[profile.x.sandbox]`
+/// would otherwise reach the same place by a different path.
 fn refuse_widening(table: &toml::value::Table, path: &Path) -> Result<()> {
     // 0.28.0. The whole array, not its executing half: `run` is the `${cmd:}`
     // primitive by another name, and `append` is a write to a path the file chose,
