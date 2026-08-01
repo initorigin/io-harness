@@ -42,8 +42,10 @@ fn fixtures() -> PathBuf {
 
 fn sidecar(name: &str) -> Value {
     let path = fixtures().join(format!("{name}.json"));
-    serde_json::from_str(&std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}")))
-        .unwrap()
+    serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}")),
+    )
+    .unwrap()
 }
 
 /// A working copy of one fixture, and its workspace directory when it has one.
@@ -213,7 +215,10 @@ async fn a_0_29_0_tree_resumes_under_0_30_0() {
     let store = Store::open(&db).unwrap();
     let root = expected["root_run_id"].as_i64().unwrap();
 
-    assert_eq!(json!(store.outcome(root).unwrap()), expected["root_outcome"]);
+    assert_eq!(
+        json!(store.outcome(root).unwrap()),
+        expected["root_outcome"]
+    );
     assert_eq!(
         json!(store.last_step(root).unwrap()),
         expected["root_last_step"],
@@ -328,11 +333,25 @@ fn a_0_30_0_store_is_read_by_a_0_29_0_binary() {
         let store = Store::open(&db).unwrap();
         let run = store.start_run("goal", "/repo").unwrap();
         store
-            .memory_write("/repo", "parser", "stays in-crate", run, 2, MemoryKind::Decision)
+            .memory_write(
+                "/repo",
+                "parser",
+                "stays in-crate",
+                run,
+                2,
+                MemoryKind::Decision,
+            )
             .unwrap();
         store.memory_pin("/repo", "parser", true).unwrap();
         store
-            .memory_write("/repo", "test-command", "cargo test", run, 3, MemoryKind::Fact)
+            .memory_write(
+                "/repo",
+                "test-command",
+                "cargo test",
+                run,
+                3,
+                MemoryKind::Fact,
+            )
             .unwrap();
         store.finish_run(run, "success").unwrap();
     }

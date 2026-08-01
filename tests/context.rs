@@ -23,8 +23,8 @@ use io_harness::context::{
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
 use io_harness::{
-    run_with, ApproveAll, McpServer, MemoryEntry, Policy, Provider, Store, TaskContract, ToolSpec,
-    Verification,
+    run_with, ApproveAll, McpServer, MemoryEntry, MemoryKind, Policy, Provider, Store,
+    TaskContract, ToolSpec, Verification,
 };
 use serde_json::json;
 
@@ -848,6 +848,11 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
                 run_id,
                 step: 3,
                 created_at: "2026-01-01T00:00:00Z".into(),
+                // 0.30.0 added these two. A `MemoryEntry` is a row this crate
+                // returns and nothing takes, so naming them here is the whole
+                // cost of the addition to a caller that constructs one.
+                kind: MemoryKind::Fact,
+                pinned: false,
             },
             MemoryEntry {
                 key: "api-base".into(),
@@ -855,6 +860,8 @@ async fn the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_car
                 run_id: run_id + 40,
                 step: 7,
                 created_at: "2026-01-02T00:00:00Z".into(),
+                kind: MemoryKind::Fact,
+                pinned: false,
             },
         ]
     };
