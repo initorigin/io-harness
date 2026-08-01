@@ -709,7 +709,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
 /// Shaped after [`Approver`](crate::Approver), the crate's other
 /// inversion-of-control point: `Send + Sync` with `&self` methods, held as
 /// `&dyn Observer`. `&self` rather than `&mut self` is not a style choice — a
-/// tree runs up to `max_concurrent` children as concurrent futures on one task,
+/// tree runs up to `max_concurrent_agents` children as concurrent futures on one task,
 /// and a `&mut self` observer could not be shared between them. Keep whatever
 /// state you need behind a `Mutex`, an atomic, or a channel.
 ///

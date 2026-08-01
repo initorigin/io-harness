@@ -8,7 +8,7 @@ tasks:
   why_required: Every other task calls this API. Until the ledger can admit, queue and count, `spawn_child`
     has nothing to wait on and the observer has nothing to report — and the rename is the release's
     one break, so it lands first and everything downstream is written against the final name.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F2 — the total cap still refuses, and the two caps are independent.** `max_total_agents: 8` with
@@ -44,7 +44,29 @@ tasks:
   files:
   - src/containment.rs
   - src/lib.rs
-  evidence: []
+  - src/run.rs
+  - src/observe.rs
+  evidence:
+  - '`Containment::max_concurrent` is now `max_concurrent_agents`, carrying `#[serde(alias = "max_concurrent")]`.
+    `a_stored_config_written_before_the_rename_still_loads` deserializes a 0.31.0 JSON body and reads
+    7 back out of the new field, so the break costs a struct literal one rename and costs a stored configuration
+    file nothing.'
+  - '`Ledger` gained one `tokio::sync::Semaphore` per tier — `MAX_TIERS` clamps the allocation at 64
+    so a `max_depth` of `u32::MAX` cannot be a denial of service written by the API — plus `try_admit`,
+    `admit`, `mark_queued`, `restore_queue` and the public `tally`. `register_agent` is untouched and
+    still refuses on the total, depth and budget caps only; `the_concurrency_cap_queues_where_the_total_cap_refuses`
+    asserts both halves in one test: `try_admit` returns `None` while `register_agent` returns `Ok`.'
+  - 'The deadlock argument is executed rather than written down. `each_tier_holds_its_own_slots` fills
+    tier 1 with the single available slot and then admits at tier 2; a tree-global pool returns `None`
+    there and the tree hangs. `a_queued_child_waits_and_then_runs` drives the real async path: the waiter
+    stays queued across a `yield_now` while the slot is held, is admitted the moment it is dropped,
+    and the tally moves working -> done on `AgentSlot::drop` rather than on a happy-path call.'
+  - 'Negative control for the release''s load-bearing distinction: `mark_queued` was sabotaged to ignore
+    its `newly_recorded` flag and count every re-queue. `a_restored_backlog_is_not_counted_twice_by_the_replay`
+    failed by name and the other nine tests passed, which is what shows the assertion discriminates
+    a restored depth from a re-derived one rather than merely being present.'
+  - '`FleetTally` is exported from `src/lib.rs` with a worked example; the crate-root prose about composition
+    now names both caps and says which one queues.'
 - id: US-IO-HARNESS-0.32.0-T02
   summary: 'Make the queue durable: an `agent_queue` table keyed uniquely by `(parent_run_id, step,
     goal)`, `Store::enqueue_agent` / `dequeue_agent` / `queued_agents`, and the indexed read that answers

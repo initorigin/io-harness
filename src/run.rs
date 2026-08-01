@@ -3709,7 +3709,7 @@ struct Tree<'a, P: Provider> {
 /// // is something it could raise.
 /// let containment = Containment {
 ///     max_total_agents: 12,
-///     max_concurrent: 4,   // the fan-out bound
+///     max_concurrent_agents: 4,   // the fan-out bound
 ///     max_depth: 2,
 ///     max_total_tokens: 500_000, // drawn down by the whole tree together
 ///     max_total_cost: None,      // reserved and inert; bound money in tokens
@@ -3771,7 +3771,7 @@ pub async fn run_tree<P: Provider>(
 ///                 println!("{pad}+ run {child_run_id}: {goal}");
 ///             }
 ///             // Containment refused the spawn — the tree hit `max_total_agents`,
-///             // `max_depth` or `max_concurrent`. The parent adapts; nothing fails.
+///             // `max_depth` or `max_concurrent_agents`. The parent adapts; nothing fails.
 ///             EventKind::SpawnRefused { cap } => println!("{pad}! spawn refused: {cap} cap"),
 ///             // What the tree has left of its ONE shared ceiling, after this draw.
 ///             EventKind::SpendDraw { remaining, .. } => {
@@ -4434,7 +4434,7 @@ fn run_agent<'f, P: Provider>(
             }
             // Non-spawn tools mutate the workspace and the observation log, so
             // they run in order. Spawn calls are independent sub-agents, so they
-            // fan out concurrently, bounded by the tree's `max_concurrent`.
+            // fan out concurrently, bounded by the tree's `max_concurrent_agents`.
             let mut paused: Option<i64> = None;
             // 0.21.0 — the other reason a step can stop short: a question nobody here
             // would answer. Kept separate from `paused` so the two pauses cannot be
@@ -4551,7 +4551,7 @@ fn run_agent<'f, P: Provider>(
             }
             if paused.is_none() && !spawn_calls.is_empty() {
                 use futures_util::stream::{self, StreamExt};
-                let max_c = tree.containment.max_concurrent.max(1) as usize;
+                let max_c = tree.containment.max_concurrent_agents.max(1) as usize;
                 // `buffered`, not `buffer_unordered`: up to `max_c` children still
                 // run at once, but their results are collected in the order the
                 // model asked for them rather than the order they happen to finish.
