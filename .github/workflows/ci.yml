@@ -284,8 +284,11 @@ jobs:
   # Linux only, like `links-consumer`: this is a schema question and the schema
   # does not vary by OS, and the three-OS matrix above already runs the forward
   # half everywhere.
-  cross-version-0.29.0:
-    name: cross-version (0.29.0 reads a 0.30.0 store)
+  # The id is hyphenated because a job id may not contain a dot — GitHub rejects
+  # the whole workflow file at parse time, which is a 0-second run and not a test
+  # failure. The displayed name carries the version.
+  cross-version-0-29-0:
+    name: cross-version-0.29.0 (0.29.0 reads a 0.30.0 store)
     runs-on: ubuntu-latest
     # Compiles the previous release from crates.io with a bundled SQLite, then
     # this tree's test binary. 20 minutes, in line with the other single-OS jobs.
