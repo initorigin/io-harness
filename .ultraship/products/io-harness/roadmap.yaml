@@ -821,7 +821,7 @@ versions:
 
       The two ride together because they are the same moment: both change the request before the
       agent acts, and both are what a caller adjusts when a run is about to do something expensive.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.32.0
     outcome: >

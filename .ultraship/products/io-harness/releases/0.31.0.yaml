@@ -1,0 +1,390 @@
+product: io-harness
+version: 0.31.0
+release_type: minor
+
+outcome:
+  user_can: >
+    Make the agent propose before it acts, and say how hard it is allowed to think. Two knobs on the
+    same moment — the request, before the agent does anything.
+
+    **The plan gate.** A caller hands the contract a `PlanGate`. The run then opens in a planning
+    phase: the agent may read the workspace and may change nothing in it, and the only way out is to
+    call `propose_plan` with an ordered list of steps, each naming the sub-agent that will own it.
+    That plan goes to the gate, which approves it, sends it back with a correction, or cancels the
+    run. When nothing in this process can answer, the plan is persisted and the run stops with
+    `RunOutcome::AwaitingPlan` — the process may exit, and `resume_with_plan_decision` continues it
+    later under the same run id. Whether the gate has been satisfied is read back from the store at
+    every loop entry, so a run that was approved in one process and killed in the next does not plan
+    again, and a run that was never approved does not start writing because the approval lived in a
+    variable that died with the process.
+
+    This is not 0.21.0's `todo_write`. That tool lets an agent state a plan the operator watches
+    while it executes; this one executes nothing until an answer arrives.
+
+    **Reasoning effort per role.** `AgentDef` gains an `Effort` — `Low`, `Medium` or `High` —
+    alongside the role, the model and the narrowed boundary it already carries, and `TaskContract`
+    carries one for the root agent. It reaches the wire as `CompletionRequest::effort`, projected
+    onto whatever the vendor calls it: `reasoning.effort` on OpenRouter, `reasoning_effort` on the
+    OpenAI wire, and `thinking.budget_tokens` with `max_tokens` raised to fit on Anthropic, which
+    has no tier at all. The thinking the model produced comes back as `CompletionResponse::reasoning`
+    and reaches an `Observer` as `EventKind::Reasoning`, and it is never appended to the observation
+    ledger — so it is visible to whoever is watching and is not re-sent, and re-billed, as prompt
+    tokens on the next turn.
+  business_value: >
+    Both halves are what a caller reaches for when a run is about to do something expensive, and
+    neither is reachable today.
+
+    The plan gate is the one the crate is furthest from. `Approver` pauses on a single *action*
+    after the agent has already decided to take it, and `Responder` asks what the operator *meant*.
+    Neither can stop a run before it begins to see whether the approach is right, and an operator who
+    wants that today has exactly one option: watch the trace and cancel, by which point files have
+    been written. For a sub-agent tree — the case 0.5.0 exists for, where one approval decides what a
+    hundred children will do — that is the difference between reviewing one plan and reviewing a
+    hundred writes.
+
+    The durability is the part that cannot be bolted on afterwards. 0.7.0's argument for a durable
+    approval was that a human decision must be allowed to outlive the process, because an unattended
+    run that could only be approved by someone sitting at the terminal is not unattended. A plan gate
+    that held the pending plan in memory would reintroduce exactly that, one release after the crate
+    proved it did not have to.
+
+    Reasoning effort is smaller and overdue. The crate has recorded `Usage::reasoning_tokens` since
+    0.18.0 and has never had a way to *ask* for them, so every run gets whatever the vendor's default
+    is — which for a reasoning model is the expensive setting on a task that may be a one-line grep,
+    and the cheap setting on the one step of a run that actually needed thought. `AgentDef` already
+    says "search with the cheap model, write with the strong one"; this is the same sentence about
+    effort, and it belongs on the same type.
+
+    And the thinking has to be visible without being paid for twice. A vendor that returns thinking
+    text charges for it once as output; a harness that then folds it into the next prompt charges for
+    it again as input, every turn, for the rest of the run. Keeping it out of the ledger is not a
+    tidiness decision, it is the difference between an observable run and a run that gets quadratically
+    more expensive the longer it thinks.
+  evidence_of_value: >
+    A run that is killed with SIGKILL while holding an unanswered plan, restarted in a fresh process,
+    approved from that second process, and completing its work — with the workspace proven untouched
+    at the moment of the kill, and with no second planning turn after the approval.
+
+    A cancelled plan producing a run that stopped with nothing written, and a returned plan producing
+    a second proposal that is different from the first, so the correction is shown to have reached
+    the model rather than merely been recorded.
+
+    A completion carrying reasoning text where the text reaches a recording `Observer` and appears in
+    no row of the run's observation ledger and in no prompt the next turn assembles — asserted
+    against the bytes actually sent, not against an intention.
+
+    And each of the three vendor bodies asserted key by key against the shape that vendor documents,
+    with a control request carrying no effort whose body is byte-identical to the one 0.30.0 sent.
+
+scope:
+  included:
+  - >
+    **A durable plan gate.** `Plan` and `PlanStep` (an intent plus the sub-agent that will own it),
+    `PlanVerdict` (`Approve`, `Revise { correction }`, `Cancel`), and the `PlanGate` trait whose
+    review returns `Option<PlanVerdict>` — `None` meaning "nobody in this process can answer", which
+    is what makes the run pause rather than guess. The shape is `Responder`'s, deliberately: a caller
+    who knows how a question pauses a run already knows how a plan does.
+  - >
+    **The planning phase, enforced by the policy rather than by good manners.** While the gate is
+    unsatisfied the run's effective policy carries a `plan-gate` layer denying `Write` and `Exec` for
+    every target. `Policy::explain` resolves deny-first across all layers, so this covers `write_file`,
+    `edit_file`, `exec`, the shell tools, `git`, every registered `Tool` and every MCP tool through
+    the one choke point they already share — rather than a list of tool names that would be wrong the
+    day a tool is added. `remember` writes to the harness's own store rather than through the policy,
+    so it is refused explicitly for the same phase. Reads stay open: a plan written without looking
+    at the workspace is not worth gating.
+  - >
+    **A durable pause and its resume.** A `plans` table beside `pending_questions`, which it mirrors
+    field for field; `RunOutcome::AwaitingPlan { plan_id, steps }` and `RunOutcome::PlanRejected
+    { steps }`; `Store::put_plan`, `plan`, `pending_plan`, `decide_plan` and `plans`; and
+    `resume_with_plan_decision` / `resume_tree_with_plan_decision`, each with an `_observed` twin,
+    matching the four `resume_*_with_answer` entry points exactly.
+  - >
+    **Approval read from the store, never from memory.** The loop asks the store whether this run has
+    an approved plan. That single decision is what makes the gate survive a restart in both
+    directions — an approved run does not re-plan, and an unapproved one does not start writing.
+  - >
+    **`Effort`, a three-tier enum, on `AgentDef` and `TaskContract`,** reaching the wire as
+    `CompletionRequest::effort`. `None` — every caller before this release — sends exactly the body
+    0.30.0 sent.
+  - >
+    **The projection onto each vendor.** OpenRouter `reasoning: { effort }`; the OpenAI wire
+    `reasoning_effort`; Anthropic `thinking: { type: enabled, budget_tokens }` with `max_tokens`
+    raised above the budget, because Anthropic requires it and the crate's `MAX_TOKENS` is a fixed
+    8192 that a thinking budget would otherwise exceed. Where a vendor cannot honour a tier the
+    behaviour is stated in `docs/CONTRACT.md` rather than silently pretended.
+  - >
+    **`CompletionResponse::reasoning` and `EventKind::Reasoning`,** parsed from `delta.reasoning` on
+    the OpenAI wire and from `thinking_delta` blocks on Anthropic, emitted to the `Observer`, and
+    kept out of the observation ledger and therefore out of every assembled prompt.
+  - >
+    **`EVENT_NAMES` gains the three new spellings** beside the enum, because the list is what a
+    `[[hook]]`'s `on` is validated against and a variant missing from it is a filter that can be
+    written and will never fire.
+  - >
+    **The documentation, in this release and not after it.** `docs/CONTRACT.md` gains the plan-gate
+    section and the per-vendor effort table including what each vendor does not do; `README.md` and
+    the guide gain the plan gate; `docs/public-api.txt` gains a line per added item, each with a
+    worked example; `CHANGELOG.md` carries the breaking entries in the shape 0.21.0 and 0.22.0
+    already used for exactly these two types.
+
+  excluded:
+  - >
+    Any change to `todo_write`. The two coexist: one is a plan the operator watches, the other is a
+    plan the operator answers. Merging them would make every existing run stop for approval.
+  - >
+    A plan gate for a child agent. The gate is the root's, at depth 0, in workspace mode. A child
+    that could hold its own plan open would mean a hundred pending plans from one `run_tree`, which
+    is the problem the gate exists to prevent rather than a feature of it.
+  - >
+    Editing the plan on approval. A verdict approves, returns or cancels; it does not hand back a
+    rewritten plan. `Revise { correction }` puts the correction in front of the model and lets it
+    write the next one, because a plan the operator wrote and the model never read is a plan the
+    model will not follow.
+  - >
+    Persisting reasoning text. It reaches the `Observer` and `Usage::reasoning_tokens` remains the
+    durable record. Storing every thinking block would grow the trace by the most verbose thing a
+    model produces, for a value nobody has asked for.
+  - >
+    Refusing an effort tier a model cannot honour. The crate cannot know which model reasons, and
+    `catalog` does not carry it. `effort` is a request in exactly the sense `model` is a request, and
+    `Usage::reasoning_tokens` is what says whether it happened.
+  - >
+    A `minimal` or `none` tier. Three tiers is the vocabulary every vendor shares; `None` already
+    means "do not ask", which is off.
+
+  fallback_scope:
+  - >
+    The plan gate, whole: types, planning phase, durable pause, both resume paths, and the store
+    migration.
+  - >
+    Dropped under the fallback and moved to 0.32.0: reasoning effort in its entirety — `Effort`,
+    `CompletionRequest::effort`, the three vendor projections, `CompletionResponse::reasoning` and
+    `EventKind::Reasoning`.
+  - >
+    This is still a coherent release and the choice is not arbitrary. The plan gate is the half that
+    cannot be added later without a second durable-pause mechanism to get wrong; effort is four
+    additive fields and a body key per vendor, which is as cheap to ship next time as this time. It
+    is also the half with no breaking change: dropping effort leaves `CompletionRequest` and
+    `CompletionResponse` untouched, so the fallback release breaks strictly less than the full one.
+
+acceptance:
+  functional:
+  - >
+    **F1 — nothing is written before the approval, proven against the workspace.** A run under a gate
+    that never answers, driven by a scripted provider whose very first turn calls `write_file`,
+    `exec` and a registered tool: the run stops with `RunOutcome::AwaitingPlan`, and the workspace
+    directory tree is byte-identical to what it was before the run started. Its negative control is
+    the identical script under an approving gate, which must write the file — without it the test
+    passes against a harness that refuses everything.
+  - >
+    **F2 — the pause survives a real restart.** A run paused on a plan, its process killed with
+    SIGKILL, the plan read back from the store by a second process that never saw the first, approved
+    there, and the run resumed to completion under its original run id. Asserted: the plan text read
+    in the second process equals what the first proposed; no step number occurs twice in the trace;
+    and no second `propose_plan` call is made after the approval, which is what proves the approval
+    was read from the store rather than re-derived.
+  - >
+    **F3 — the three verdicts do three different things.** `Approve` continues the run and the
+    approved plan is in the next assembled prompt. `Revise { correction }` does not continue: the run
+    stays in the planning phase, the correction reaches the model as an observation, and the model's
+    second proposal differs from its first. `Cancel` stops the run with `RunOutcome::PlanRejected`
+    and nothing written. Three named tests; a shared one would pass on any two of the three.
+  - >
+    **F4 — the plan names sub-agents that exist.** A proposal naming an agent absent from the
+    contract's roster is refused back to the model as an observation naming the roster, and the run
+    stays in the planning phase; a proposal naming a roster member is accepted. Both asserted, and
+    the accepted case is the control that shows the check discriminates.
+  - >
+    **F5 — `EVENT_NAMES` still equals the enum.** The census test in `src/observe.rs` passes with the
+    three added variants, and `every_kind()` still produces one of every tag and no others. This is
+    an existing test that must not be allowed to pass by having been forgotten — the added variants
+    make it fail unless the names are added, which is the point.
+  - >
+    **F6 — each vendor body carries the tier in that vendor's own shape.** Three body tests asserting
+    exact keys: OpenRouter `body["reasoning"]["effort"] == "high"`; OpenAI
+    `body["reasoning_effort"] == "low"`; Anthropic `body["thinking"]["type"] == "enabled"` with a
+    `budget_tokens` strictly below `body["max_tokens"]`, since Anthropic rejects the request
+    otherwise. Each has a control with `effort: None` whose body must contain no such key and must
+    equal the body 0.30.0 built — the assertion that an existing caller's bytes did not move.
+  - >
+    **F7 — reasoning reaches the observer and never reaches the next prompt.** A scripted provider
+    returns a distinctive reasoning string on step 1. A recording `Observer` sees it in
+    `EventKind::Reasoning`. The string appears in no `observations` row for the run, and in no
+    `CompletionRequest::user` the provider is handed on any later step — asserted against the
+    requests the double actually received, because asserting on the ledger alone would not catch a
+    loop that re-added it at assembly time.
+  - >
+    **F8 — reasoning parses from both wire shapes.** The OpenAI-wire accumulator fed `delta.reasoning`
+    fragments across chunks yields the concatenated text; the Anthropic accumulator fed
+    `thinking_delta` blocks does the same; and in both cases a stream carrying no reasoning yields
+    `None` rather than `Some("")`, because "the model did not think" and "the model thought nothing"
+    are different facts and only the first is true.
+  - >
+    **F9 — cross-version compatibility, both directions.** A database written by a real 0.30.0 build
+    opens, resumes and replays under 0.31.0 with nothing to migrate; and a 0.31.0 store carrying a
+    decided plan is read by a 0.30.0 build, which never queries the `plans` table. Proven with the
+    pinned-generator technique `tests/cross_version.rs` already uses, never with a database this tree
+    wrote and labelled.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` on macOS and Linux still reads 402 lines. Everything
+    here is a table, four fields, an enum and a trait.
+  - >
+    **N2 — the store lookup the gate depends on is an indexed lookup, not a scan.** The loop asks
+    "does this run have an approved plan" at every entry, so `EXPLAIN QUERY PLAN` for that statement
+    must name an index on `plans(run_id)`, with a control statement over an unindexed column that
+    must not. The measured time is recorded; no wall-clock threshold is asserted, for the reason
+    0.30.0's N2 recorded.
+  - >
+    **N3 — the breaks are exactly four and each is in the changelog with a migration.**
+    `CompletionRequest` gains `effort`, `CompletionResponse` gains `reasoning`, `RunOutcome` gains
+    two variants, and `EventKind` gains three (additive under its `#[non_exhaustive]`, so it costs an
+    exhaustive match nothing). No public item is renamed or removed, so no deprecation cycle is owed.
+    `tests/changelog.rs` and `tests/public_api.rs` both pass.
+  - >
+    **N4 — every added public item carries a worked example**, enforced by the existing surface test.
+  - >
+    **N5 — an out-of-tree `Provider` that ignores `effort` still compiles and is honestly
+    non-thinking**, and one that never sets `reasoning` returns `None` rather than an empty string.
+    Asserted by a test double in `tests/` that does exactly that.
+  operational:
+  - >
+    **O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job.
+  - >
+    **O2 — docs.rs builds**, checked by the nightly job rather than inferred from a local `cargo doc`.
+  - >
+    **O3 — `cargo package --locked` succeeds** and the packaged crate compiles.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.31.0, GitHub at initorigin/io-harness with the tag `v0.31.0` and a
+    Release titled `io-harness 0.31.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.31.0` off `develop`, including the sealed UltraShip
+    release record. PR into `develop`, merged with the PR button. Release PR `develop` into `main`,
+    merged the same way. The GitHub Release is cut by `release.yml` — `gh workflow run release.yml
+    --ref main -f version=0.31.0` — which takes its notes verbatim from the changelog. `cargo publish
+    --locked` by hand afterwards, always last, after both merges and the Release exist. `develop`
+    synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    One additive store change: a `plans` table. `CHECKPOINT_FORMAT` does not move, for the reason
+    every addition since 0.13.0 has recorded — an older binary never queries the new table, so
+    bumping the format would make `check_resumable` refuse a database that is in fact readable.
+  - >
+    Four public breaks, all additive-field or additive-variant, each with a migration note in the
+    changelog. A caller who followed the documented `..Default::default()` construction is unaffected;
+    a caller who wrote an exhaustive struct literal or an exhaustive `match` on `RunOutcome` adds a
+    field or an arm. This is the same cost 0.21.0 and 0.22.0 charged for the same two types.
+  - >
+    A 0.30.0 database opens, resumes and replays unchanged, and a 0.30.0 binary reads a 0.31.0 store.
+    Both directions are executed rather than argued.
+  observability:
+  - >
+    `EventKind::PlanProposed` and `EventKind::PlanDecided` reach an `Observer` in flight, and both are
+    recorded so the trace answers what was proposed and who decided it after the fact. Who decided is
+    kept: a gate in the process and a human after a pause are different facts about a run, exactly as
+    `answered_by` distinguishes them for a question.
+  - >
+    `EventKind::Reasoning` is the only way the thinking is visible. It is deliberately not stored;
+    `Usage::reasoning_tokens` is the durable record and is already persisted.
+  - >
+    A refusal during the planning phase is an ordinary policy refusal, so it lands in the trace with
+    the `plan-gate` layer named — an operator reading the trace can see why a write was refused
+    without knowing this feature exists.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.31.1 and `cargo yank --version
+    0.31.0` is the escape hatch, leaving 0.30.0 as what `cargo install` resolves. A consumer
+    reverting to 0.30.0 keeps every database — the `plans` table is simply never queried — and loses
+    the plan gate and the effort tier. The four breaks reverse cleanly: removing a field from a
+    literal and an arm from a match. No file, no configuration and no stored format has to be
+    rewritten to go back.
+
+dependencies:
+  products: []
+  services:
+  - GitHub Actions runners for macOS, Linux and Windows
+  - crates.io, for publication
+  - docs.rs, for the rendered API reference
+  human_approvals:
+  - The `feat/0.31.0` → `develop` pull request
+  - The `develop` → `main` release pull request
+  - The crates.io publish, by hand, last
+
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    Threading the planning phase through the workspace loop without a second loop. The effective
+    policy is already rebuilt mid-run when an approver remembers a rule, so the mechanism exists; the
+    work is making the phase's start and end read from the store rather than from a local variable,
+    which is the whole of the durability claim.
+  - >
+    The restart test. F2 needs a real process kill and a second process, which the repository already
+    does for `checkpoint::crash_resume_after_a_real_sigkill` — the cost is in the fixture, not in the
+    idea.
+  - >
+    Anthropic's `max_tokens`. Extended thinking requires `max_tokens` strictly above `budget_tokens`,
+    and the crate's `MAX_TOKENS` is a fixed 8192 with a standing note saying so. Raising it only when
+    a budget is present is the small change; proving the no-effort body did not move is the test that
+    has to be written.
+  preferred_tools:
+  - The existing test suite and its fixture conventions
+  - A pinned 0.30.0 build as fixture generator, the way `tests/fixtures/gen-0.29.0` already works
+  - The three-OS CI matrix, including the MSRV job
+  constraints:
+  - No new runtime dependency; `cargo tree` stays at 402 lines
+  - MSRV 1.95, edition 2021
+  - No public item renamed or removed
+  - No store format bump; additive schema only
+  - A project-scoped `io.toml` may narrow and may never widen
+  - The crate returns rows and renders nothing
+
+risks:
+  - >
+    **The planning phase could be enforced in the wrong place.** A list of tool names would be
+    complete on the day it was written and wrong the next time a tool is added, and it would miss
+    every registered and MCP tool. Mitigation: the enforcement is a policy layer at the one choke
+    point every mutating path already goes through, and F1 drives a registered tool as well as a
+    built-in specifically to prove the coverage is not per-tool.
+  - >
+    **The approval could live in memory and look durable in every test that does not restart.** This
+    is the failure mode the whole feature exists to avoid and it passes every in-process test.
+    Mitigation: F2 is a real SIGKILL and a second process, and asserts the *absence* of a second
+    planning turn — the observable that distinguishes "read the approval from the store" from
+    "planned again and was approved again".
+  - >
+    **Anthropic will reject a body whose thinking budget is not below `max_tokens`**, and the failure
+    is a 400 at run time rather than a compile error. Mitigation: F6 asserts the inequality in the
+    body test, so it fails locally rather than on the wire.
+  - >
+    **Reasoning could reach the next prompt by a path the ledger test does not see.** The context
+    assembler is not the only thing that builds a prompt. Mitigation: F7 asserts against the
+    `CompletionRequest`s the provider double actually received, which is the last point before the
+    wire and covers every path into it.
+  - >
+    **Four breaks in one release is the most this crate has charged since 0.22.0.** Mitigation: the
+    fallback scope drops the two struct-field breaks entirely, so if the effort half runs long the
+    release ships with strictly fewer breaks rather than with a half-built one.
+
+open_questions:
+  - >
+    Whether `Revise` should re-run the planning phase from the start or append the correction to the
+    existing conversation. Appending is cheaper and keeps what the agent already read; restarting is
+    cleaner and costs a second pass over the workspace. Decided against the loop code early in
+    development and recorded either way.
+  - >
+    Whether a plan should be offered to the gate again if the agent proposes a second one after an
+    approval. It cannot today — the tool is withdrawn once the phase ends — but a long run that
+    genuinely changes approach is the case for allowing it. Left out until there is a caller, because
+    a second gate mid-run is a second way for an unattended run to stop.
+  - >
+    Whether `Effort` should be `#[non_exhaustive]`. A vendor adding a fourth tier is foreseeable, and
+    the cost is a wildcard arm on every caller that matches it. Likely closed, since the three tiers
+    are the shared vocabulary and a fourth would be a vendor detail the projection absorbs rather
+    than a tier the caller names.
+
+status: planned
