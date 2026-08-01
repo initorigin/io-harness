@@ -383,8 +383,35 @@ pub enum EventKind {
     },
     /// A spawn was refused by containment rather than performed.
     SpawnRefused {
-        /// Which cap refused it — agents, depth or concurrency.
+        /// Which cap refused it — agents, depth or budget. Never concurrency:
+        /// crossing [`Containment::max_concurrent_agents`](crate::Containment)
+        /// queues the child instead of refusing it, and reports
+        /// [`Fleet`](Self::Fleet).
         cap: String,
+    },
+    /// One tier of the agent tree changed shape (0.32.0): a child queued for a
+    /// concurrency slot, was admitted to one, or finished and gave one back.
+    ///
+    /// This is what lets an application show a fleet *draining* rather than a
+    /// number that stopped moving. It is per tier because a single tree-wide
+    /// count cannot tell an operator whether the fan-out at depth two is stuck
+    /// behind the one at depth one.
+    ///
+    /// A resumed tree emits one of these per non-empty tier before its provider
+    /// is authorised or called, carrying the backlog read back out of the store —
+    /// so a restart reports the queue it inherited rather than starting from
+    /// zero and spiking.
+    Fleet {
+        /// The nesting level being counted. The root is 0, so a fleet of children
+        /// spawned by the root is tier 1.
+        tier: u32,
+        /// Agents at this tier holding a slot and running.
+        working: u32,
+        /// Agents at this tier waiting for one. Nothing about them is started and
+        /// nothing about them is charged.
+        queued: u32,
+        /// Agents at this tier that have finished and released their slot.
+        done: u32,
     },
     /// The agent wrote something to durable cross-run memory.
     MemoryWrote {
@@ -685,6 +712,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "stalled",
     "spawned",
     "spawn_refused",
+    "fleet",
     "memory_wrote",
     "todo_wrote",
     "question_asked",
@@ -709,7 +737,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
 /// Shaped after [`Approver`](crate::Approver), the crate's other
 /// inversion-of-control point: `Send + Sync` with `&self` methods, held as
 /// `&dyn Observer`. `&self` rather than `&mut self` is not a style choice — a
-/// tree runs up to `max_concurrent` children as concurrent futures on one task,
+/// tree runs up to `max_concurrent_agents` children as concurrent futures on one task,
 /// and a `&mut self` observer could not be shared between them. Keep whatever
 /// state you need behind a `Mutex`, an atomic, or a channel.
 ///
@@ -1068,6 +1096,12 @@ mod tests {
             EventKind::SpawnRefused {
                 cap: "depth".into(),
             },
+            EventKind::Fleet {
+                tier: 1,
+                working: 4,
+                queued: 116,
+                done: 0,
+            },
             EventKind::MemoryWrote { key: "k".into() },
             EventKind::Sandbox {
                 kind: "create".into(),
@@ -1163,6 +1197,7 @@ mod tests {
                 | EventKind::Stalled
                 | EventKind::Spawned { .. }
                 | EventKind::SpawnRefused { .. }
+                | EventKind::Fleet { .. }
                 | EventKind::MemoryWrote { .. }
                 | EventKind::Sandbox { .. }
                 | EventKind::Mcp { .. }

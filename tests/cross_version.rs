@@ -166,6 +166,12 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // `tests/cross_version_0_29_0.rs` executes rather than asserts on paper.
     "plans",
     "plans_run",
+    // 0.32.0 — the fleet's durable backlog. One table and its unique index, added
+    // and nothing altered: a 0.29.0 binary opens a store carrying both and never
+    // names either, which `tests/cross_version_0_29_0.rs` executes rather than
+    // asserts on paper.
+    "agent_queue",
+    "agent_queue_entry",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].

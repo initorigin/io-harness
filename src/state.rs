@@ -2958,6 +2958,37 @@ impl Store {
              CREATE INDEX IF NOT EXISTS plans_run ON plans (run_id, verdict);",
         )?;
 
+        // 0.32.0: the fleet's backlog. A child that meets
+        // `Containment::max_concurrent_agents` is queued rather than refused, and
+        // this is where the wait is durable — a row written when it starts
+        // waiting and deleted when it is admitted, so a tree that finishes leaves
+        // none and a tree that is killed leaves exactly the backlog it had.
+        //
+        // A queued child has no `runs` row on purpose. That is the whole "a
+        // queued child that never started is not charged" claim: nothing to spend
+        // against, nothing to resume, nothing to count.
+        //
+        // The index is UNIQUE on the same key `spawns` is adopted by,
+        // (parent_run_id, step, goal), and it does two jobs for one write. It
+        // makes `INSERT OR IGNORE` the whole of "re-queue this only if the store
+        // does not already hold it", which is what stops a resumed tree's replay
+        // from doubling the backlog it just restored; and its leading column
+        // serves the per-parent lookup `queued_agents` does once per run in the
+        // tree, so reading a backlog is an index seek per run rather than a scan
+        // of the queue.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS agent_queue (
+                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                 parent_run_id INTEGER NOT NULL,
+                 step          INTEGER NOT NULL,
+                 goal          TEXT NOT NULL,
+                 depth         INTEGER NOT NULL,
+                 queued_at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS agent_queue_entry
+                 ON agent_queue (parent_run_id, step, goal);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4047,6 +4078,142 @@ impl Store {
             |r| r.get(0),
         )?;
         Ok(n as u32)
+    }
+
+    /// Record that a child is waiting for a concurrency slot (0.32.0).
+    ///
+    /// Returns whether the entry is new. `false` means the store already held
+    /// this wait — a resumed tree replaying the step that queued it — and the
+    /// caller must not count it a second time, because the depth it restored
+    /// already includes it. The `INSERT OR IGNORE` and the unique index are what
+    /// make that answer the store's rather than the caller's guess.
+    ///
+    /// Nothing else about the child is written. It has no run row, no step rows
+    /// and no spend, and if the process dies here it never had any.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// let store = Store::memory().unwrap();
+    /// let parent = store.start_run("fan out", "/tmp/ws").unwrap();
+    ///
+    /// // The first wait is new; replaying the same spawn step is not.
+    /// assert!(store.enqueue_agent(parent, 3, "summarise chapter 7", 1).unwrap());
+    /// assert!(!store.enqueue_agent(parent, 3, "summarise chapter 7", 1).unwrap());
+    ///
+    /// // The backlog reads back as (tier, goal), oldest first.
+    /// assert_eq!(
+    ///     store.queued_agents(parent).unwrap(),
+    ///     vec![(1, "summarise chapter 7".to_string())]
+    /// );
+    ///
+    /// // Admission clears it, so a tree that drains leaves nothing behind.
+    /// store.dequeue_agent(parent, 3, "summarise chapter 7").unwrap();
+    /// assert!(store.queued_agents(parent).unwrap().is_empty());
+    /// ```
+    pub fn enqueue_agent(
+        &self,
+        parent_run_id: i64,
+        step: u32,
+        goal: &str,
+        depth: u32,
+    ) -> Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT OR IGNORE INTO agent_queue (parent_run_id, step, goal, depth)
+             VALUES (?1, ?2, ?3, ?4)",
+            (parent_run_id, step, goal, depth),
+        )?;
+        Ok(changed == 1)
+    }
+
+    /// Clear a wait because the child has been admitted and is now a real run
+    /// (0.32.0). Returns whether a row was actually removed.
+    ///
+    /// Deleting a row that is not there is not an error, and the answer is what a
+    /// resumed tree needs: a wait restored from the store can be admitted without
+    /// ever waiting again — the slot the dead process held died with it — so the
+    /// immediate-admission path calls this too, and only decrements its count when
+    /// the store says a row went. That is what keeps the reported backlog and the
+    /// rows on disk moving together instead of drifting apart.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// let store = Store::memory().unwrap();
+    /// let parent = store.start_run("fan out", "/tmp/ws").unwrap();
+    ///
+    /// // Idempotent, so the fast path — admitted immediately, never queued —
+    /// // does not have to branch around it, and says so.
+    /// assert!(!store.dequeue_agent(parent, 1, "never queued").unwrap());
+    ///
+    /// store.enqueue_agent(parent, 1, "waited", 1).unwrap();
+    /// assert!(store.dequeue_agent(parent, 1, "waited").unwrap());
+    /// assert!(store.queued_agents(parent).unwrap().is_empty());
+    /// ```
+    pub fn dequeue_agent(&self, parent_run_id: i64, step: u32, goal: &str) -> Result<bool> {
+        let removed = self.conn.execute(
+            "DELETE FROM agent_queue WHERE parent_run_id = ?1 AND step = ?2 AND goal = ?3",
+            (parent_run_id, step, goal),
+        )?;
+        Ok(removed == 1)
+    }
+
+    /// Every child still waiting anywhere in the tree rooted at `root`, as
+    /// `(tier, goal)` in the order they queued (0.32.0).
+    ///
+    /// This is what a process that comes up after a crash reads to report the
+    /// backlog it inherited before it makes a single provider call, and what an
+    /// operator reads long afterwards to answer "what was still waiting when this
+    /// died" — a question no event stream can answer once the process is gone.
+    ///
+    /// The cost is one index seek on `agent_queue_entry` per run in the tree,
+    /// plus the recursive walk of `runs` every tree-wide query here already pays,
+    /// plus a sort of this tree's own waiting rows to put them back in FIFO
+    /// order. It is `CROSS JOIN ... INDEXED BY` rather than a plain join on
+    /// purpose: a recursive CTE is a co-routine SQLite cannot seek into, so left
+    /// to itself the planner scans `agent_queue` — every tree's backlog, not this
+    /// one's — and probes the CTE instead. That is the right choice for a file
+    /// holding one tree and the wrong one for a file holding a hundred, and the
+    /// statistics cannot tell it which it has. Measured over 200 trees with 100
+    /// waiting children each: 0.057 ms seeking, 0.593 ms scanning.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// let store = Store::memory().unwrap();
+    /// let root = store.start_run("fan out", "/tmp/ws").unwrap();
+    /// let child = store.start_child_run("a sub-task", "/tmp/ws", root, 1).unwrap();
+    ///
+    /// store.enqueue_agent(root, 2, "second", 1).unwrap();
+    /// store.enqueue_agent(root, 2, "first", 1).unwrap();
+    /// store.enqueue_agent(child, 1, "a grandchild", 2).unwrap();
+    ///
+    /// // FIFO, and it reaches into the tree rather than stopping at the root.
+    /// assert_eq!(
+    ///     store.queued_agents(root).unwrap(),
+    ///     vec![
+    ///         (1, "second".to_string()),
+    ///         (1, "first".to_string()),
+    ///         (2, "a grandchild".to_string()),
+    ///     ]
+    /// );
+    /// ```
+    pub fn queued_agents(&self, root: i64) -> Result<Vec<(u32, String)>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT q.depth, q.goal
+             FROM tree CROSS JOIN agent_queue q INDEXED BY agent_queue_entry
+                 ON q.parent_run_id = tree.id
+             ORDER BY q.id ASC",
+        )?;
+        let rows = stmt.query_map([root], |r| {
+            Ok((r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Persist a spawned child's contract so a crashed tree can rebuild and
@@ -5819,6 +5986,127 @@ mod tests {
         assert!(
             !scan.contains("USING INDEX"),
             "the check cannot tell an index from a scan: {scan}"
+        );
+    }
+
+    /// N2. Reading a tree's backlog is an index seek per run in the tree, not a
+    /// scan of the queue. The shape matters more than any number: the queue grows
+    /// with the fleet, and a resume that scanned every waiting child in the file
+    /// would get slower exactly as the feature got more useful.
+    ///
+    /// A query-plan assertion rather than a stopwatch, for the reason 0.30.0's N2
+    /// recorded: a wall-clock threshold is flaky on a loaded runner and green on a
+    /// fast machine running a full scan. The measured time is recorded in the
+    /// release record instead.
+    #[test]
+    fn reading_a_backlog_reaches_its_rows_through_an_index() {
+        let store = Store::memory().unwrap();
+        // Not empty, and not one tree: a plan is chosen against the tables as
+        // they stand, and a file holding a single tree is exactly the shape that
+        // makes scanning the whole queue look free.
+        let mut root = 0;
+        for t in 0..32 {
+            let r = store.start_run("fan out", "/repo").unwrap();
+            if t == 0 {
+                root = r;
+            }
+            for i in 0..32 {
+                store.enqueue_agent(r, 1, &format!("child {i}"), 1).unwrap();
+            }
+        }
+        assert_eq!(store.queued_agents(root).unwrap().len(), 32);
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan_for = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let backlog = plan_for(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = 1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT q.depth, q.goal
+             FROM tree CROSS JOIN agent_queue q INDEXED BY agent_queue_entry
+                 ON q.parent_run_id = tree.id
+             ORDER BY q.id ASC",
+        );
+        assert!(
+            backlog.contains("SEARCH q USING INDEX agent_queue_entry"),
+            "the backlog read does not reach agent_queue through its index, so it \
+             scans the whole queue once per run in the tree: {backlog}"
+        );
+
+        // The control, and it is `queued_at` rather than the obvious `goal`.
+        // `goal` is the index's *last* column and not a left prefix of it, and it
+        // still uses the index: SQLite skip-scans
+        // `ANY(parent_run_id) AND ANY(step) AND goal=?`, which reads every row
+        // through the index and is a scan wearing an index's name. `queued_at` is
+        // in no index at all, so this one genuinely cannot — without a control
+        // that genuinely cannot, a plan string naming an index for everything
+        // would pass the assertion above and prove nothing.
+        let scan = plan_for("SELECT COUNT(*) FROM agent_queue WHERE queued_at = 'x'");
+        assert!(
+            !scan.contains("agent_queue_entry"),
+            "the check cannot tell an index from a scan: {scan}"
+        );
+    }
+
+    /// The unique index is what makes `INSERT OR IGNORE` mean "only if the store
+    /// does not already hold this wait", which is the whole of the difference
+    /// between a restored backlog and a re-derived one.
+    #[test]
+    fn a_replayed_wait_reuses_its_row_rather_than_adding_one() {
+        let store = Store::memory().unwrap();
+        let root = store.start_run("fan out", "/repo").unwrap();
+
+        assert!(store.enqueue_agent(root, 4, "chapter 7", 1).unwrap());
+        assert!(!store.enqueue_agent(root, 4, "chapter 7", 1).unwrap());
+        assert!(!store.enqueue_agent(root, 4, "chapter 7", 1).unwrap());
+        assert_eq!(store.queued_agents(root).unwrap().len(), 1);
+
+        // A different step, or a different goal, is a different wait.
+        assert!(store.enqueue_agent(root, 5, "chapter 7", 1).unwrap());
+        assert!(store.enqueue_agent(root, 4, "chapter 8", 1).unwrap());
+        assert_eq!(store.queued_agents(root).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn a_queued_child_has_no_run_and_therefore_no_spend() {
+        // The "not charged" claim, asserted where it is durable: against the rows.
+        let store = Store::memory().unwrap();
+        let root = store.start_run("fan out", "/repo").unwrap();
+        let started = store.start_child_run("admitted", "/repo", root, 1).unwrap();
+        store
+            .record(
+                started,
+                &StepRecord::new(1, "did the work", "out").with_trace("u", "t", 250),
+            )
+            .unwrap();
+        store.enqueue_agent(root, 1, "waiting", 1).unwrap();
+
+        // Two children were asked for; one is a run.
+        assert_eq!(store.children(root).unwrap(), vec![started]);
+        assert_eq!(
+            store.queued_agents(root).unwrap(),
+            vec![(1, "waiting".to_string())]
+        );
+        // And the tree's spend is the admitted child's alone: the waiting one has
+        // no run row, so there is nothing of its to sum.
+        assert_eq!(store.spent_tokens_tree(root).unwrap(), 250);
+        assert_eq!(
+            store.agent_count_tree(root).unwrap(),
+            2,
+            "the root and one child"
         );
     }
 

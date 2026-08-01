@@ -836,8 +836,8 @@ versions:
       Working, queued and done are counted per tier and reach the observer, so an application can
       show a fleet draining rather than a number that stopped moving. The queue is durable: a
       restart rebuilds it at the depth it had, and a queued child that never started is not charged.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.33.0
     outcome: >
       Two processes, one run. Today a run belongs to the process that started it: `resume`

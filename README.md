@@ -140,8 +140,13 @@ capped. A tree of agents draws from one shared ledger no spawned contract can
 raise.
 
 **Agent composition.** A root run can spawn contained sub-agents over a shared
-workspace, nested, many at once. A child inherits its parent's policy and can
-only narrow it — never grant itself what the parent lacks.
+workspace, nested, many at once. Two caps, different in kind:
+`max_total_agents` refuses the spawn that crosses it, `max_concurrent_agents`
+queues it — so a hundred-agent task runs sixteen at a time until it is done
+rather than failing at its seventeenth child. The queue is durable, counted per
+tier and reported to an `Observer`, and a child that only ever waited is never
+charged. A child inherits its parent's policy and can only narrow it — never
+grant itself what the parent lacks.
 
 **An execution sandbox.** Model-produced code runs in an ephemeral sandbox with
 an isolated workdir, resource caps that kill rather than throttle, and network
