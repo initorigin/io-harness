@@ -583,3 +583,292 @@ async fn remember_is_refused_while_the_plan_is_pending() {
         "a note was written before the plan was approved"
     );
 }
+
+// ---------------------------------------------------------------- F2
+
+/// Locate the compiled `plan_gate_fixture` example next to this test binary.
+/// Standard cargo layout: `target/<profile>/deps/<test>` and
+/// `target/<profile>/examples/<name>`.
+fn fixture_bin() -> std::path::PathBuf {
+    let me = std::env::current_exe().unwrap();
+    let profile_dir = me.parent().unwrap().parent().unwrap();
+    let mut p = profile_dir.join("examples").join("plan_gate_fixture");
+    if cfg!(windows) {
+        p.set_extension("exe");
+    }
+    p
+}
+
+/// A provider for the resume side that can *only* write, and that records the
+/// tool list it was handed on every turn.
+///
+/// Its inability to propose is the point. If the resumed run re-entered the
+/// planning phase, this model would be offered `propose_plan`, and
+/// `offered_plan_tool` would say so.
+struct Finisher {
+    offered: Mutex<Vec<bool>>,
+}
+
+impl Provider for Finisher {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        self.offered
+            .lock()
+            .unwrap()
+            .push(req.tools.iter().any(|t| t.name == PROPOSE_PLAN_TOOL));
+        Ok(CompletionResponse {
+            tool_calls: vec![call(
+                "write_file",
+                json!({"path": "out.txt", "content": "SOLUTION-DONE\n"}),
+            )],
+            ..Default::default()
+        })
+    }
+}
+
+/// F2. A plan proposed in one process, that process killed with SIGKILL, the plan
+/// read and approved in a second process that never saw the first, and the run
+/// carried to completion under its original id.
+///
+/// The assertion that matters is an *absence*: the resumed run is never offered
+/// `propose_plan`. That is the observable that distinguishes "the approval was
+/// read from the store" from "it planned again and was approved again", and it is
+/// the only one that does.
+#[tokio::test]
+async fn a_plan_survives_a_real_sigkill_and_is_approved_by_a_second_process() {
+    let bin = fixture_bin();
+    assert!(
+        bin.exists(),
+        "plan_gate_fixture example not built at {bin:?} — run `cargo test`, which builds examples"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("runs.db");
+    let root = dir.path().join("ws");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("notes.txt"), "read me").unwrap();
+    let before = snapshot(&root);
+
+    let mut child = tokio::process::Command::new(&bin)
+        .arg(&db)
+        .arg(&root)
+        .spawn()
+        .expect("spawn plan_gate_fixture");
+
+    // Wait until the plan is durable and the run has stopped on it.
+    let mut plan_id = 0i64;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if let Ok(store) = Store::open(&db) {
+            if let Ok(plans) = store.plans(1) {
+                if let Some(p) = plans.first() {
+                    plan_id = p.id;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(plan_id > 0, "the fixture never persisted a plan");
+    child.kill().await.expect("SIGKILL the fixture");
+
+    // A fresh process — this one — reads what the dead one proposed.
+    let store = Store::open(&db).unwrap();
+    let pending = store.plan(plan_id).unwrap().expect("the persisted plan");
+    assert_eq!(
+        pending
+            .plan
+            .steps
+            .iter()
+            .map(|s| s.intent.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "read the existing notes",
+            "write SOLUTION-DONE into out.txt"
+        ],
+        "the plan read back is not the one that was proposed"
+    );
+    assert!(
+        !pending.resolved,
+        "the plan was decided by the process that died"
+    );
+    assert_eq!(
+        snapshot(&root),
+        before,
+        "the workspace was written to before anyone approved the plan"
+    );
+    let before_steps = store.last_step(pending.run_id).unwrap();
+
+    let contract = TaskContract::workspace("write SOLUTION-DONE into out.txt", &root)
+        .with_plan_gate(Arc::new(PlanGateNone))
+        .with_max_steps(6);
+    let finisher = Finisher {
+        offered: Mutex::new(Vec::new()),
+    };
+    let result = io_harness::resume_with_plan_decision(
+        &contract,
+        &finisher,
+        &store,
+        pending.run_id,
+        plan_id,
+        PlanVerdict::Approve,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.run_id, pending.run_id, "the run id did not survive");
+    assert!(
+        !matches!(result.outcome, RunOutcome::AwaitingPlan { .. }),
+        "the run paused on a plan again: {:?}",
+        result.outcome
+    );
+    let offered = finisher.offered.lock().unwrap().clone();
+    assert!(
+        !offered.is_empty() && offered.iter().all(|o| !o),
+        "the resumed run planned again instead of reading the approval: {offered:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("out.txt")).unwrap(),
+        "SOLUTION-DONE\n",
+        "the approved plan was never carried out"
+    );
+    assert_eq!(
+        store.plan(plan_id).unwrap().unwrap().decided_by.as_deref(),
+        Some("human"),
+        "a decision that arrived through a resume must not be filed as the gate's"
+    );
+
+    // Committed steps were not re-run.
+    let steps: Vec<u32> = store
+        .steps(pending.run_id)
+        .unwrap()
+        .iter()
+        .map(|s| s.step)
+        .collect();
+    let mut sorted = steps.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), steps.len(), "a committed step was re-run");
+    assert!(
+        store.last_step(pending.run_id).unwrap() > before_steps,
+        "the resume made no progress"
+    );
+}
+
+/// The other two verdicts, delivered through a resume rather than in process.
+#[tokio::test]
+async fn a_cancel_through_a_resume_finishes_the_run_without_re_entering_the_loop() {
+    let dir = tempfile::tempdir().unwrap();
+    let contract =
+        TaskContract::workspace("write out.txt", dir.path()).with_plan_gate(Arc::new(PlanGateNone));
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![call(
+        PROPOSE_PLAN_TOOL,
+        json!({"steps": [{"intent": "rewrite the world"}]}),
+    )]]);
+    let paused = run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+    let RunOutcome::AwaitingPlan { plan_id, .. } = paused.outcome else {
+        panic!("expected a pause, got {:?}", paused.outcome);
+    };
+
+    let turns_before = provider.turns();
+    let result = io_harness::resume_with_plan_decision(
+        &contract,
+        &provider,
+        &store,
+        paused.run_id,
+        plan_id,
+        PlanVerdict::Cancel,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(result.outcome, RunOutcome::PlanRejected { .. }));
+    assert_eq!(
+        provider.turns(),
+        turns_before,
+        "a cancelled plan re-entered the loop and asked the model again"
+    );
+    assert_eq!(
+        store.outcome(paused.run_id).unwrap().as_deref(),
+        Some("plan_rejected")
+    );
+}
+
+/// A correction delivered through a resume reaches the model and leaves the phase
+/// on, exactly as an in-process one does.
+#[tokio::test]
+async fn a_correction_through_a_resume_reaches_the_model_and_keeps_the_phase_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let contract =
+        TaskContract::workspace("write out.txt", dir.path()).with_plan_gate(Arc::new(PlanGateNone));
+    let store = Store::memory().unwrap();
+    let first = MockScript::new(vec![vec![call(
+        PROPOSE_PLAN_TOOL,
+        json!({"steps": [{"intent": "rewrite the world"}]}),
+    )]]);
+    let paused = run_with(&contract, &first, &store, &open_policy(), &ApproveAll)
+        .await
+        .unwrap();
+    let RunOutcome::AwaitingPlan { plan_id, .. } = paused.outcome else {
+        panic!("expected a pause, got {:?}", paused.outcome);
+    };
+
+    let second = MockScript::new(vec![vec![call(
+        PROPOSE_PLAN_TOOL,
+        json!({"steps": [{"intent": "write out.txt only"}]}),
+    )]]);
+    let result = io_harness::resume_with_plan_decision(
+        &contract,
+        &second,
+        &store,
+        paused.run_id,
+        plan_id,
+        PlanVerdict::revise("smaller, and do not touch anything generated"),
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let prompts = second.prompts();
+    assert!(
+        prompts[0].contains("smaller, and do not touch anything generated"),
+        "the correction did not reach the model: {}",
+        prompts[0]
+    );
+    assert!(second.offered_plan_tool()[0], "the phase ended on a revise");
+    assert!(matches!(result.outcome, RunOutcome::AwaitingPlan { .. }));
+    assert_eq!(store.plans(paused.run_id).unwrap().len(), 2);
+}
+
+/// Approving somebody else's plan is an error, not a silent no-op: it would leave
+/// this run planning forever, which reads as a hang.
+#[tokio::test]
+async fn a_plan_belonging_to_another_run_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let other = store.start_run("something else", "test").unwrap();
+    let plan_id = store
+        .put_plan(other, 1, &Plan::new([io_harness::PlanStep::new("theirs")]))
+        .unwrap();
+
+    let contract =
+        TaskContract::workspace("write out.txt", dir.path()).with_plan_gate(Arc::new(PlanGateNone));
+    let provider = MockScript::new(vec![]);
+    let err = io_harness::resume_with_plan_decision(
+        &contract,
+        &provider,
+        &store,
+        other + 1,
+        plan_id,
+        PlanVerdict::Approve,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await;
+    assert!(err.is_err(), "another run's plan was accepted");
+}

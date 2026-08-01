@@ -162,6 +162,14 @@ const OBS_LIST_DIR_CAP: usize = 200;
 ///     // answer, which reaches the model as text and authorizes nothing.
 ///     RunOutcome::AwaitingAnswer { question_id: _, .. } => "answer it, then resume",
 ///
+///     // (0.31.0) Paused before it did anything at all: the agent proposed an
+///     // approach and is waiting. Show the plan, then `resume_with_plan_decision`.
+///     // Nothing in the workspace has been written at this point.
+///     RunOutcome::AwaitingPlan { plan_id: _, .. } => "review the plan, then resume",
+///     // A human refused the approach. As final as a `Denied`, and cheaper: the
+///     // run stopped having read and thought and written nothing.
+///     RunOutcome::PlanRejected { .. } => "the approach was refused; rewrite the goal",
+///
 ///     // Ceilings, and they mean different things. More steps or more time is a
 ///     // knob; a token ceiling that keeps being hit is usually a task too big
 ///     // for one contract.
@@ -1292,6 +1300,258 @@ fn record_answer(store: &Store, run_id: i64, question_id: i64, answer: &str) -> 
         )],
     )?;
     Ok(())
+}
+
+/// Record a human's verdict on a plan and put it where the model will read it
+/// (0.31.0).
+///
+/// The counterpart of [`record_answer`], and thin for the same reason: the step
+/// that proposed **was** committed — a paused step commits and the resume starts
+/// after it — so the `propose_plan` call is not replayed and cannot be handed its
+/// own verdict. It arrives as an observation instead, which is what puts it in the
+/// next assembled prompt.
+///
+/// A plan belonging to a different run is an [`Error::Resume`] rather than a
+/// silent no-op, for the reason [`record_answer`] refuses one: approving somebody
+/// else's plan would leave this run planning forever, which reads as a hang.
+fn record_plan_decision(
+    store: &Store,
+    run_id: i64,
+    plan_id: i64,
+    verdict: &PlanVerdict,
+) -> Result<()> {
+    let pending = store.plan(plan_id)?.ok_or_else(|| Error::Resume {
+        reason: format!("no plan {plan_id} to decide"),
+    })?;
+    if pending.run_id != run_id {
+        return Err(Error::Resume {
+            reason: format!(
+                "plan {plan_id} belongs to run {}, not {run_id}",
+                pending.run_id
+            ),
+        });
+    }
+    store.decide_plan(plan_id, verdict, "human")?;
+
+    // `ObsKind::Message` and no target, exactly as an answer is, so the assembler
+    // cannot stub it away as stale when a later read touches the same path.
+    let text = match verdict {
+        PlanVerdict::Approve => format!(
+            "\n[plan approved]\n{}\n(This is the approach you agreed to. Carry it out.)\n",
+            pending.plan.render()
+        ),
+        PlanVerdict::Revise { correction } => format!(
+            "\n[plan not approved] {correction}\n(Propose a different plan with \
+             `{PROPOSE_PLAN_TOOL}`. Nothing has been done yet and nothing will be until a \
+             plan is approved.)\n"
+        ),
+        // A cancelled run is not resumed, so nothing reads this. It is written
+        // anyway: the ledger is the run's own account of itself and a run that
+        // stopped because a human said no should say so in it.
+        PlanVerdict::Cancel => "\n[plan cancelled] the operator stopped this run.\n".to_string(),
+    };
+    store.record_observations(
+        run_id,
+        &[Observation::new(pending.step, ObsKind::Message, None, text)],
+    )?;
+    Ok(())
+}
+
+/// Continue a run that paused on a plan, with a human's verdict (0.31.0).
+///
+/// The counterpart of [`resume_with_answer`], and the half of the plan gate that
+/// makes it a gate rather than a prompt: the deciding process need not be the one
+/// that proposed, need not be on the same machine, and need not have started yet
+/// when the run stopped.
+///
+/// [`PlanVerdict::Approve`] ends the planning phase — the loop reads that from the
+/// store, so it stays ended across every later restart — and the plan reaches the
+/// model as an observation. [`PlanVerdict::Revise`] leaves the phase on and puts
+/// the correction in front of the model. [`PlanVerdict::Cancel`] does **not**
+/// resume: the run is finished as [`RunOutcome::PlanRejected`], because a human
+/// refusing the approach is as final as a human denying an action.
+///
+/// ```no_run
+/// use io_harness::{resume_with_plan_decision, ApproveAll, OpenRouter, PlanVerdict, Policy,
+///                  RunOutcome, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract, outcome: RunOutcome) -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+/// if let RunOutcome::AwaitingPlan { plan_id, .. } = outcome {
+///     // Show the human what was actually proposed, read back from the store.
+///     // Nothing in the workspace has been touched at this point.
+///     let pending = store.plan(plan_id)?.expect("a pending plan");
+///     println!("{}", pending.plan.render());
+///
+///     resume_with_plan_decision(
+///         contract, &OpenRouter::from_env()?, &store, pending.run_id, plan_id,
+///         PlanVerdict::Approve, &Policy::permissive(), &ApproveAll,
+///     )
+///     .await?;
+/// }
+/// # Ok(()) }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_plan_decision<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    plan_id: i64,
+    verdict: PlanVerdict,
+    policy: &Policy,
+    approver: &dyn Approver,
+) -> Result<RunResult> {
+    resume_with_plan_decision_observed(
+        contract, provider, store, run_id, plan_id, verdict, policy, approver, &Ignore,
+    )
+    .await
+}
+
+/// [`resume_with_plan_decision`] with an [`Observer`].
+///
+/// ```no_run
+/// use io_harness::{resume_with_plan_decision_observed, ApproveAll, Ignore, OpenRouter,
+///                  PlanVerdict, Policy, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract) -> io_harness::Result<()> {
+/// let result = resume_with_plan_decision_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, 7, 2,
+///     PlanVerdict::revise("start with the tests"), &Policy::permissive(), &ApproveAll,
+///     &Ignore,
+/// ).await?;
+/// # let _ = result;
+/// # Ok(()) }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_with_plan_decision_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    plan_id: i64,
+    verdict: PlanVerdict,
+    policy: &Policy,
+    approver: &dyn Approver,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    record_plan_decision(store, run_id, plan_id, &verdict)?;
+    if verdict == PlanVerdict::Cancel {
+        return cancel_the_run(store, run_id, observer);
+    }
+    resume_with_observed(
+        contract, provider, store, run_id, policy, approver, observer,
+    )
+    .await
+}
+
+/// Finish a run whose plan a human cancelled, without re-entering the loop.
+///
+/// Separate from the resume path because there is nothing to resume: a cancelled
+/// plan means the approach was refused, so driving the loop again would ask the
+/// model to propose the same thing to the same person.
+fn cancel_the_run(store: &Store, run_id: i64, observer: &dyn Observer) -> Result<RunResult> {
+    let watch = Watch::new(observer);
+    let steps = store.last_step(run_id)?;
+    finish(store, &watch, run_id, 0, steps, "plan_rejected")?;
+    Ok(RunResult::new(RunOutcome::PlanRejected { steps }, run_id))
+}
+
+/// Continue a tree that paused on its root's plan (0.31.0).
+///
+/// The tree's counterpart to [`resume_with_plan_decision`]. Only the root holds a
+/// plan — a child that could hold its own would mean a hundred pending plans from
+/// one [`run_tree`] — so `run_id` is the root's and is also the plan's owner.
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_plan_decision, ApproveAll, Containment, OpenRouter,
+///                  PlanVerdict, Policy, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract) -> io_harness::Result<()> {
+/// let store = Store::open("runs.db")?;
+///
+/// // What a hundred-agent run is really being approved on: which definitions the
+/// // root intends to spend on, before a single one is spawned.
+/// let plan = store.plan(2)?.expect("proposed earlier");
+/// println!("this will spawn: {:?}", plan.plan.agents().collect::<Vec<_>>());
+///
+/// let result = resume_tree_with_plan_decision(
+///     contract, &OpenRouter::from_env()?, &store, 7, 2, PlanVerdict::Approve,
+///     &Policy::permissive(), &ApproveAll, &Containment::new(10, 4, 3, 1_000_000),
+/// ).await?;
+/// # let _ = result;
+/// # Ok(()) }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_with_plan_decision<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    plan_id: i64,
+    verdict: PlanVerdict,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+) -> Result<RunResult> {
+    resume_tree_with_plan_decision_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        plan_id,
+        verdict,
+        policy,
+        approver,
+        containment,
+        &Ignore,
+    )
+    .await
+}
+
+/// [`resume_tree_with_plan_decision`] with an [`Observer`].
+///
+/// ```no_run
+/// use io_harness::{resume_tree_with_plan_decision_observed, ApproveAll, Containment,
+///                  Ignore, OpenRouter, PlanVerdict, Policy, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract) -> io_harness::Result<()> {
+/// let result = resume_tree_with_plan_decision_observed(
+///     contract, &OpenRouter::from_env()?, &Store::open("runs.db")?, 7, 2,
+///     PlanVerdict::Cancel, &Policy::permissive(), &ApproveAll,
+///     &Containment::new(10, 4, 3, 1_000_000), &Ignore,
+/// ).await?;
+/// # let _ = result;
+/// # Ok(()) }
+/// ```
+#[allow(clippy::too_many_arguments)]
+pub async fn resume_tree_with_plan_decision_observed<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    run_id: i64,
+    plan_id: i64,
+    verdict: PlanVerdict,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+    observer: &dyn Observer,
+) -> Result<RunResult> {
+    record_plan_decision(store, run_id, plan_id, &verdict)?;
+    if verdict == PlanVerdict::Cancel {
+        return cancel_the_run(store, run_id, observer);
+    }
+    resume_tree_observed(
+        contract,
+        provider,
+        store,
+        run_id,
+        policy,
+        approver,
+        containment,
+        observer,
+    )
+    .await
 }
 
 /// Resume a run under the policy it was started with, read back from the store.

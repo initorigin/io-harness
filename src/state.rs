@@ -5761,6 +5761,67 @@ mod tests {
         );
     }
 
+    /// N2. The loop asks "does this run have an approved plan" at every entry, so
+    /// that lookup has to be an indexed one — a run under a gate would otherwise pay
+    /// a scan of every plan ever proposed, once per step, forever.
+    ///
+    /// The control is the same shape the aggregates test uses and is the whole
+    /// reason this is a query-plan assertion rather than a stopwatch: a wall-clock
+    /// threshold is flaky on a loaded runner and passes on a fast machine running a
+    /// full scan.
+    #[test]
+    fn the_approved_plan_lookup_reaches_its_row_through_an_index() {
+        let store = Store::memory().unwrap();
+        // A plan is chosen against the tables as they stand, so this one cannot be
+        // empty: SQLite scans a handful of rows whatever the index says.
+        for i in 0..64 {
+            let run = store.start_run("goal", "/repo").unwrap();
+            let id = store
+                .put_plan(
+                    run,
+                    1,
+                    &crate::approve::Plan::new([crate::approve::PlanStep::new("go")]),
+                )
+                .unwrap();
+            if i % 2 == 0 {
+                store
+                    .decide_plan(id, &crate::approve::PlanVerdict::Approve, "human")
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan_for = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let approved = plan_for(
+            "SELECT id, run_id, step, steps, verdict, correction, decided_by, resolved
+             FROM plans WHERE run_id = 7 AND verdict = 'approve' ORDER BY id DESC LIMIT 1",
+        );
+        assert!(
+            approved.contains("USING INDEX") || approved.contains("USING COVERING INDEX"),
+            "the gate's per-step lookup is a scan: {approved}"
+        );
+
+        // The control. `plans` has no index on `steps`, so this one must NOT report
+        // an index — without it, a plan string that said "USING INDEX" for anything
+        // would pass the assertion above and prove nothing.
+        let scan = plan_for("SELECT COUNT(*) FROM plans WHERE steps = 'x'");
+        assert!(
+            !scan.contains("USING INDEX"),
+            "the check cannot tell an index from a scan: {scan}"
+        );
+    }
+
     #[test]
     fn refusals_record_action_target_rule_and_layer() {
         let store = Store::memory().unwrap();
