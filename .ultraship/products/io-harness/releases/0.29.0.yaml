@@ -1,7 +1,7 @@
 product: io-harness
 version: 0.29.0
 release_type: minor
-status: planned
+status: released
 outcome:
   user_can: >
     Run against any OpenAI-shaped endpoint by naming a base URL, a key and a model — so Groq, xAI,
@@ -652,3 +652,273 @@ open_questions:
   `Compatible::groq(key)` a one-argument call, and it would be a guessed model slug — the thing
   `OpenRouter::from_env` explicitly refuses to do (`src/provider/openrouter.rs:86-87`). Almost
   certainly no; recorded so the decision is visible rather than assumed.
+released_at: 2026-08-01T21:40:00Z
+mode: published
+delivered: >
+  The model a run uses is no longer a choice between three vendors. A provider is a base URL, an
+  auth style, a key and a model name, so every OpenAI-shaped endpoint is reachable without writing
+  one: thirteen hosted vendors — Groq, xAI, Mistral, DeepSeek, Together, Fireworks, Cerebras,
+  Perplexity, Gemini through its compatibility endpoint, Moonshot, Zhipu, Qwen and MiniMax — and
+  eight runtimes a developer starts on their own machine: Ollama, llama.cpp, vLLM, LM Studio,
+  LocalAI, Jan, SGLang and KoboldCpp. The local half is the one that had no equivalent before, and
+  it is the half that costs nothing per token.
+
+  It is one type, and that was the whole structural argument. `openai.rs` and `openrouter.rs` were
+  159 and 161 lines differing in four strings over a wire module that was already shared and
+  already `pub(crate)`, so a third OpenAI-shaped vendor is a row in a table rather than a file.
+  `Compatible` reuses `openai_wire` verbatim — the same body builder, the same SSE parser, the same
+  `ensure_success`, asserted by a test that a 429 through the new provider classifies exactly as it
+  does through the three original ones. The base is the *whole* prefix each vendor documents, which
+  matters more than it sounds: six of the twenty-one presets are not a host plus `/v1`, and a field
+  that had assumed otherwise would 404 against every one of them.
+
+  A connected provider also says what it can run. `Provider::models()` returns the vendor's own
+  catalogue — ids, context length, maximum output, whether it takes images or tools, and the price —
+  and it is **defaulted to an empty list**, because a required method on the crate's one
+  externally-implementable trait would have broken every out-of-tree implementation. The default is
+  proven by a test that implements `Provider` with `complete` and nothing else, which is a
+  compile-time assertion as much as a runtime one.
+
+  What the release refuses to do is as much of it as what it does. `ModelInfo::price` is
+  `Option<Price>` and `None` means the vendor did not say — never `Price::ZERO`, which would report
+  real spend as free. Nearly every vendor returns identifiers and no cost at all, so that
+  distinction is the common case rather than an edge. A local runtime is the one place zero is
+  *true* and it is recorded as a stated zero. Every price carries a `PriceSource`, because a
+  reference price is what an aggregator charges to serve a model rather than what the vendor
+  charges, and a number whose origin is unrecoverable is what makes an invoice unarguable.
+
+  The opt-in reference catalogue fills the gap for the vendors that publish nothing, and its three
+  bounds were built in rather than discovered. Matching is an exact slug or one documented
+  normalisation and a miss stays `None` — an ambiguous normalisation resolves to nothing rather
+  than to a coin toss, because a wrong match is a wrong invoice and is worse than the gap it
+  filled. The lookup dials a host the caller never named, so it is off by default, and when it is on
+  that host appears in `Provider::endpoints()` where the run's existing egress authorisation governs
+  it: a policy that denies it makes the run refuse rather than silently skip. That boundary needed no
+  new code, which was the point of `endpoints()` existing.
+
+  Price tiers were not in the plan and are in the release. Reading the live catalogue showed 44 of
+  its 336 models pricing by prompt length, with the rate typically **doubling** past 200k — and a
+  long agentic run is exactly what crosses that floor, so pricing one against the base row reports
+  about half of what it cost. `PriceTier` hangs off `PriceTable` rather than living inside `Price`,
+  because a `Vec` there would have cost that type its `Copy` impl and broken `..Price::ZERO`, which
+  is a public break bought for a data shape. A table with no tiers registered prices exactly as
+  0.28.0 did, asserted rather than argued. See `iterations/US-IO-HARNESS-0.29.0-I01`.
+
+  The one thing a caller genuinely cannot discover for themselves is now in the contract, under its
+  own heading: **vLLM and SGLang emit no tool calls at all** unless the server was started with a
+  tool-call parser flag a client cannot set. No status code, no warning, nothing in the trace — the
+  agent simply talks, and it looks exactly like a model that chose not to act.
+
+  Nothing breaks. `Provider` gained a defaulted method, `ProviderSpec` gained the variant 0.27.0's
+  `#[non_exhaustive]` was added for, `Price` gained no field and kept `Copy`, no store schema
+  changed and `CHECKPOINT_FORMAT` stays 7. `cargo tree` reads 402 lines, exactly as before.
+evidence:
+  tests:
+  - >
+    `cargo test` on the default feature set — **1098 passed, 0 failed**, zero failing binaries. No
+    test skipped, ignored or made conditional; the standing
+    `skills::discovery_over_a_32_skill_directory_is_under_50ms` exception was not needed.
+  - >
+    `cargo build --all-features --examples` then `cargo test --all-features --lib --tests` —
+    **913 passed, 0 failed**. The examples are built first deliberately: `--lib --tests` does not
+    build them and four integration binaries exec them, which is the failure 0.28.0 recorded.
+  - >
+    F1 — `f1_a_streamed_completion_arrives_through_the_real_http_and_sse_path` drives the whole
+    HTTP and SSE path against a local socket and asserts on the request head the socket actually
+    received. Two named controls: `f1_an_auth_none_provider_sends_no_authorization_header_at_all`
+    proves the auth style reaches the wire rather than merely being stored, and
+    `f1_a_base_that_already_carries_a_path_keeps_every_segment_of_it` proves a nested base survives.
+    `a_failure_is_classified_exactly_as_the_three_original_providers_classify_it` pins that a 429
+    means through `Compatible` what it means through the other three.
+  - >
+    F2 — `f2_every_preset_names_a_distinct_vendor_with_a_well_formed_base` over 21 rows, with
+    `f2_the_table_check_reports_a_broken_row_rather_than_always_passing` as the named control: the
+    validator run over a table carrying one relative base and one duplicated name must report
+    exactly those two. `f2_every_named_constructor_agrees_with_its_table_row` drives all 21
+    constructors against the table, which is also what proves `Compatible::known`'s expect
+    unreachable. `f2_an_unknown_preset_is_refused_naming_the_ones_that_exist` — "grok" surfaces
+    "groq".
+  - >
+    F3 — `provider::catalogue_default::a_provider_that_overrides_nothing_reports_an_empty_catalogue`
+    implements `Provider` with `complete` and nothing else, exactly the shape the trait's own doc
+    example ships. Its named control is
+    `compatible::tests::f3_a_connected_provider_returns_a_non_empty_catalogue`, without which the
+    assertion would pass against an implementation whose `models()` is empty for everyone.
+  - >
+    F4 — `f4_a_decimal_rate_becomes_an_exact_integer` over a 19-case hand-computed table.
+    **The named negative control earned its keep and is the most useful thing in the release's test
+    suite:** the first discriminating case chosen survived an f64 round trip, so
+    `f4_the_conversion_is_not_a_float_multiply` **failed**, correctly reporting that the table did
+    not discriminate. Ten live catalogue values were then found where
+    `(s.parse::<f64>()? * 1e12) as u64` truncates one micro-unit low — `0.00000003` is
+    qwen/qwen3.7-flash's own prompt rate — and the control now asserts the disagreeing set equals
+    `FLOAT_TRAPS` exactly and that `naive + 1 == exact` for each. A control that discriminates on
+    nothing now fails.
+  - >
+    F5 — exact slug, case-insensitive, plus the one normalisation, with three named controls:
+    `f5_a_model_the_reference_does_not_carry_stays_none` (the roadmap's own `deepseek-v4-flash`
+    example), `f5_an_ambiguous_normalisation_is_a_miss_not_a_first_wins` (both entries still
+    reachable by exact slug), and `f5_normalisation_is_not_applied_in_the_other_direction`.
+  - >
+    F6 — `f6_a_reference_price_fills_a_gap_and_says_it_is_a_reference_price`, and
+    `every_price_carries_its_provenance_and_the_two_cannot_disagree` asserts
+    `price.is_some() == price_source.is_some()` across a whole parsed catalogue rather than on one
+    row. The control is a model the reference does not carry, left `None` rather than guessed.
+  - >
+    F7 — `f7_the_reference_lookup_is_off_until_it_is_asked_for` uses a recording reference server: a
+    provider that did not opt in leaves the log **empty** and reports one endpoint, and one that
+    opted in reports two and dials it exactly once. An empty log is proof a return value cannot give.
+  - >
+    F8 — `tests/parity.rs` drives four providers under the identical contract, the fourth name
+    produced by a real `Compatible::groq(..).name()` rather than typed in, with the three existing
+    ones running unchanged in the same loop as the control.
+    `f8_the_real_compatible_carries_the_trait_shape_the_loop_drives` passes a real provider through a
+    helper declaring exactly `run`'s `P: Provider` bound, so trait fit is compiler-checked;
+    `f8_a_compatible_pointed_at_no_preset_claims_no_vendor_label` rules out a label that is constant
+    or URL-derived.
+  - >
+    F9 — `tests/config.rs::EVERY_KEY` names every key of the new variant and
+    `f7_every_key_reaches_a_typed_field` asserts the whole value lands. Its existing twin control is
+    extended to `reference_prices`, which falls back to off while its neighbour does not. Exactly-one
+    is refused by entry index in both directions, an unknown preset is refused listing the real ones,
+    an unknown key inside the table is rejected naming it, and
+    `each_valid_shape_of_a_compatible_provider_loads` is the control that the rule did not simply
+    refuse every compatible entry — the shape 0.27.0's F4 control exists to catch.
+  - >
+    F11 — `the_tier_boundary_is_exact_on_both_sides` asserts 199,999 prompt tokens at the base rate
+    and 200,000 at the tier rate, then 400,000 priced wholly at the tier rate rather than split.
+    `the_highest_reached_floor_wins_whatever_order_the_tiers_were_written_in` registers qwen3-max's
+    two floors highest-first so ordering cannot supply the answer. Three controls:
+    `a_prompt_below_every_floor_gets_the_base_row_not_the_lowest_tier`,
+    `the_same_usage_costs_strictly_less_once_the_tiers_are_removed` (which fails against any
+    implementation ignoring `with_tiers`), and
+    `a_table_with_no_tiers_prices_exactly_as_it_did_before_they_existed`, which reproduces 0.28.0's
+    hand-computed figure through the new code path.
+  builds:
+  - '`cargo fmt --check` — clean. `cargo clippy --all-targets --all-features -- -D warnings` — clean.'
+  - >
+    `cargo doc --no-deps --all-features` — **warning-free**. Three intra-doc warnings were found and
+    fixed rather than tolerated: two links to crate-private items (`WebFlavor`, `PRESETS`) and one
+    redundant explicit target.
+  - >
+    `cargo tree` unchanged at **402 lines** on the default feature set. No new dependency on any
+    platform: the provider is `reqwest` and the existing `openai_wire`, the catalogue parse is
+    `serde_json`, the decimal shift is `std` string handling, and the `as_of` date is `std`
+    arithmetic — Hinnant's civil-from-days, tested against the epoch, 2000-02-29 and the 2100
+    non-leap boundary — rather than a date crate.
+  - >
+    `cargo package --locked` — exit 0, **190 files**. Verified by **listing** rather than by trusting
+    the `exclude` list: zero entries matching `.env`, `.ultraship/` or `.github/`; `.env.example`
+    present and intended. `df -h .` read before packaging and before publishing.
+  - >
+    No store schema change at all. `git diff develop..HEAD -- src/state.rs` is **empty**,
+    `CHECKPOINT_FORMAT` stays 7, and `tests/cross_version.rs` passes with nothing added to
+    `ADDED_SINCE_0_22_0` — a direct consequence of caching the catalogue on the provider instance
+    rather than in the store.
+  - >
+    Scope exclusions verified as still absent rather than assumed: no `Compatible::from_env`,
+    `Fallback` does not override `models()`, `openai_wire` names no vendor anywhere (so there is no
+    per-vendor branch in the shared body builder), and no Azure, Bedrock or Vertex preset exists.
+  reviews: []
+  deployments:
+  - >
+    Published to crates.io as `io-harness` 0.29.0 after both merges and the GitHub Release, by hand
+    and last, per the standing flow.
+  health_checks:
+  - >
+    **F10, the live reference catalogue, read from the release machine through the shipped parser**
+    (`examples/live_catalogue.rs`, output stored under `evidence/0.29.0/live-catalogue.txt`):
+    `GET https://openrouter.ai/api/v1/models` with no API key returned **336 models, 336 priced, 44
+    carrying a prompt-length tier**, one row (`anthropic/claude-opus-5-fast`) pricing all five
+    dimensions the mapping claims, and **zero price/provenance disagreements** across the whole
+    catalogue. The tier sample is `qwen/qwen3.7-flash`, base input 30000 stepping to 100000 at 32000
+    prompt tokens — and 30000 is precisely the value an `f64` multiply returns as 29999, so the live
+    data independently confirms the F4 control was worth writing.
+  - >
+    Every hosted preset base URL was verified empirically rather than trusted. An unauthenticated
+    `GET {base}/models` returned 401 or 403 for eleven of the thirteen, proving host and path exist.
+    The two 404s were run down rather than accepted: Gemini returns 400 rather than 404 once a bearer
+    header is present, so its path is correct, and Perplexity genuinely serves no `/models` endpoint
+    at all — which is now stated in the contract as a fact, with `models()` returning the vendor's
+    404 rather than a false empty catalogue.
+  - >
+    No live *completion* is claimed against any new vendor. `.env` carries real OpenRouter
+    credentials only, so a live chat run through `Compatible` against Groq, DeepSeek or a local
+    runtime was not available. The wire path is proven against a real socket in
+    `src/provider/compatible.rs` instead, which exercises the same HTTP, SSE, auth and status
+    handling. Stated rather than quietly omitted.
+known_limitations:
+- >
+  **`Compatible` is not a compatibility layer, and every vendor behind it diverges somewhere.** The
+  crate sends one wire and will not grow per-vendor branches — that is the structural claim the
+  single type rests on. The divergences are stated in `docs/CONTRACT.md` rather than absorbed:
+  Zhipu's out-of-set `finish_reason` values, Groq's 400 on `messages[].name`, Mistral's
+  nine-character tool-call ids and `schema_definition` field, DeepSeek's 400 when `reasoning_content`
+  is not replayed on a request carrying tools, and Ollama silently ignoring `tool_choice`.
+- >
+  **vLLM and SGLang emit no tool calls at all unless the server was started with a tool-call parser
+  flag, and this is the failure mode that does not announce itself.** No status code, no warning and
+  nothing in the trace distinguishes it from a model that chose to answer in prose. vLLM needs
+  `--enable-auto-tool-choice` with a `--tool-call-parser`; SGLang needs its equivalent. Both are
+  server launch arguments this crate cannot supply, cannot detect, and will not guess at.
+- >
+  **Nearly every vendor's `/models` returns identifiers and no prices.** That is why
+  `ModelInfo::price` is an `Option` and why the reference catalogue exists at all. Perplexity serves
+  no `/models` endpoint whatsoever, so `Compatible::perplexity(..).models()` returns the vendor's 404
+  as a provider error rather than an empty list — reporting an empty catalogue there would say "this
+  vendor serves no models", which is a different and false claim.
+- >
+  **A reference price is the aggregator's price, not the vendor's.** It tracks the vendor's rate and
+  is not identical to it. `PriceSource::Reference(host)` is how an operator tells; a figure derived
+  from it is close rather than authoritative, and the crate does not pretend otherwise.
+- >
+  **A model the reference does not carry stays unpriced.** Matching is an exact slug or one
+  documented normalisation — drop a single leading `vendor/` segment, case-insensitively — and
+  nothing else. An ambiguous normalisation resolves to nothing rather than to either candidate.
+  `Spend::unpriced_calls` is where the gap surfaces, and it is a floor rather than a total.
+- >
+  **The catalogue is cached on the provider instance, not in the store, and this departs from the
+  roadmap entry deliberately.** That entry said "cached in the store with the instant it was
+  fetched". `Provider::models()` takes `&self` and nothing else, so reaching a `Store` from it would
+  have meant putting the store into the provider trait — the one type this crate has kept out of it.
+  The fetch instant is not lost by the choice: it lands on `PriceTable::as_of`, which already exists
+  to carry exactly that claim. A second process re-reads one free keyless request.
+- >
+  **`Compatible` has no `from_env()`, unlike the three original providers.** Twenty-one vendor
+  environment variable names would be twenty-one guesses made on the operator's behalf.
+  `[[provider]]` with `api_key = "${env:GROQ_API_KEY}"` names the variable in the operator's own
+  file and has resolved credentials from the environment since 0.19.0. The guide says so in one
+  line, because the absence will otherwise read as an oversight.
+- >
+  **`Fallback::models()` returns an empty list.** Which of two vendors' catalogues a chain should
+  report is a question with no right answer, and inventing one would freeze it. A caller who wants a
+  chain's catalogue asks each provider.
+- >
+  **A preset's base URL is a default this crate ships, and a vendor that moves one makes it wrong
+  until the next release.** Every one was verified against the live host at release time, but no test
+  can dial them and none does. The mitigation is that `base_url` overrides any preset in one line of
+  configuration, so a moved endpoint is an operator's edit rather than a release.
+- >
+  **A preset's local-runtime port is that project's documented default and nothing more.** A runtime
+  started on another port is `Compatible::new` with the URL.
+- >
+  **`Auth` carries no Azure variant.** Azure OpenAI needs an `api-key` header, a deployment name in
+  the path and an `api-version` query parameter. It is excluded on demand rather than on cost, and
+  `Auth` is `#[non_exhaustive]` so it can arrive later without a break. Bedrock's SigV4 and Vertex's
+  service-account JWT are likewise unreachable, though both are usable today by an application that
+  mints a bearer token itself and passes it as the key.
+- >
+  **Price tiers are keyed on prompt length only.** `min_prompt_tokens` is the single selector the
+  observed catalogue uses, and the highest floor a prompt reaches prices the whole request. A vendor
+  pricing on some other axis — output length, time of day, committed throughput — is not
+  representable, and would be a new selector rather than a new value.
+- >
+  **`${cmd:}` still has no timeout**, and `rusqlite::Error` is still in the public API. Both are
+  standing limitations carried deliberately from earlier releases rather than fixed by proximity.
+- >
+  The record is sealed with `mode: published` before the crates.io upload, which follows the
+  `develop` → `main` merge and the GitHub Release. The record states the authorised target; the flow
+  makes it true.
+supersedes: 0.28.0
+next_recommended_version: null
+immutable: true

@@ -771,4 +771,4 @@ versions:
       environment since 0.19.0. And `Fallback::models()` keeps the empty default, because which of
       two vendors' catalogues a chain reports is a question with no right answer.
     detail: specified
-    status: planned
+    status: released

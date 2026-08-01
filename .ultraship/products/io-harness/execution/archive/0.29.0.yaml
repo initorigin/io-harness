@@ -36,9 +36,9 @@ release_fit:
       those tests are best at catching.
     - >
       The reference catalogue's single largest unknown — whether the live host serves the shape the
-      parser assumes — was resolved before planning rather than during development: a keyless
-      `GET https://openrouter.ai/api/v1/models` returned 336 models with a pricing object whose five
-      keys map one-for-one onto `pricing::Price`. The parser is being written against an observed
+      parser assumes — was resolved before planning rather than during development: a keyless `GET
+      https://openrouter.ai/api/v1/models` returned 336 models with a pricing object whose five keys
+      map one-for-one onto `pricing::Price`. The parser is being written against an observed
       response, not a remembered one.
   major_cost_drivers:
     - >
