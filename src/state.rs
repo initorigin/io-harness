@@ -1096,6 +1096,224 @@ pub struct MemoryEntry {
     pub step: u32,
     /// UTC write time, refreshed on every overwrite so ordering is by recency.
     pub created_at: String,
+    /// Whether this is something somebody decided or something a run observed
+    /// (0.30.0). An entry written before the column existed reads as
+    /// [`MemoryKind::Fact`], which is what it was.
+    pub kind: MemoryKind,
+    /// Whether a run may overwrite it (0.30.0).
+    ///
+    /// Set by a caller and never by a run: this is how a human makes a correction
+    /// stick when the agent keeps re-learning something wrong.
+    pub pinned: bool,
+}
+
+/// What kind of thing a [`MemoryEntry`] is (0.30.0).
+///
+/// The distinction a flat list of strings cannot make: a decision somebody took
+/// and a run must not quietly reverse, versus a fact a run observed and a later
+/// run may correct. Nothing in the run loop treats the two differently — the
+/// crate stores what it was told and reports it — because the difference is one a
+/// person makes, and a harness inferring it would be guessing at intent.
+///
+/// `#[non_exhaustive]` from the line it exists, so the third kind the contract
+/// leaves open (an observation, distinct from an asserted fact) arrives later
+/// without a break.
+///
+/// ```
+/// use io_harness::{MemoryKind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+///
+/// store.memory_write("/repo", "parser", "stays in-crate", run, 4, MemoryKind::Decision)?;
+/// let entry = store.memory_get("/repo", "parser")?.expect("written above");
+/// assert_eq!(entry.kind, MemoryKind::Decision);
+///
+/// // The default for everything the agent writes itself, and for every entry
+/// // written before this release: what a run observed is a fact, not a ruling.
+/// store.memory_put("/repo", "test-command", "cargo test", run, 5)?;
+/// assert_eq!(store.memory_get("/repo", "test-command")?.unwrap().kind, MemoryKind::Fact);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MemoryKind {
+    /// Something a run observed. The default, and what every pre-0.30.0 entry is.
+    #[default]
+    Fact,
+    /// Something somebody decided. Carries no enforcement of its own; what stops
+    /// a run overwriting one is [`MemoryEntry::pinned`].
+    Decision,
+}
+
+impl MemoryKind {
+    /// Its stored spelling, which is also what a consumer renders.
+    fn as_str(self) -> &'static str {
+        match self {
+            MemoryKind::Fact => "fact",
+            MemoryKind::Decision => "decision",
+        }
+    }
+
+    /// Read a stored spelling back. An unknown one — or `NULL`, which is every
+    /// entry written before 0.30.0 — is [`MemoryKind::Fact`]: a row this crate
+    /// cannot classify is not a reason to refuse a database, and a fact is the
+    /// weaker claim of the two.
+    fn from_stored(text: Option<String>) -> Self {
+        match text.as_deref() {
+            Some("decision") => MemoryKind::Decision,
+            _ => MemoryKind::Fact,
+        }
+    }
+}
+
+/// One group of an aggregate: what it is, and how many (0.30.0).
+///
+/// One row type for every grouped count this crate returns, so a caller reads
+/// `key`/`count` whether it asked for outcomes, days or gate phases. What the key
+/// *means* is the accessor's business and is documented there.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("goal", "/repo")?;
+/// store.finish_run(run, "success")?;
+///
+/// let rows = store.runs_by_outcome()?;
+/// assert_eq!((rows[0].key.as_str(), rows[0].count), ("success", 1));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tally {
+    /// What this group is — an outcome, a day, a gate phase.
+    pub key: String,
+    /// How many rows fell into it.
+    pub count: u64,
+}
+
+/// How often a run was verified without a gate failing first (0.30.0).
+///
+/// Counts, never a rate: which denominator is the right one is the consumer's
+/// judgement, and returning a single number would make that choice invisibly.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("goal", "/repo")?;
+/// store.finish_run(run, "success")?;
+///
+/// let first = store.first_try()?;
+/// assert_eq!((first.runs, first.succeeded, first.first_try), (1, 1, 1));
+/// // "of the ones that worked" and "of everything we tried" are both legitimate,
+/// // and the crate declines to pick.
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FirstTry {
+    /// Runs that finished, whatever the ending.
+    pub runs: u64,
+    /// Of those, the ones that succeeded.
+    pub succeeded: u64,
+    /// Of those, the ones with no failed gate phase recorded against them.
+    pub first_try: u64,
+}
+
+/// How many times each recovery mechanism carried a run through (0.30.0).
+///
+/// ```
+/// use io_harness::{ContextEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("goal", "/repo")?;
+/// store.record_context_event(run, &ContextEvent::replan(2, "no progress"))?;
+///
+/// let recovery = store.recovery()?;
+/// assert_eq!(recovery.replans, 1);
+/// assert_eq!(recovery.fallbacks, 0, "no provider fell over");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recovery {
+    /// Steps served by a fallback provider after the first one failed.
+    pub fallbacks: u64,
+    /// Times an agent making no progress was told once to change approach.
+    pub replans: u64,
+    /// Times a run was resumed from its checkpoint.
+    pub resumes: u64,
+}
+
+/// One recall: a run drew on one memory entry at one step (0.30.0).
+///
+/// Returned by [`Store::memory_recalls`]. Per (run, key, step) rather than a flag
+/// on the entry, because an entry recalled by two runs is two facts and a flag
+/// would keep only the later one.
+///
+/// ```
+/// use io_harness::{MemoryRecall, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+/// // The context assembler writes these; a run that recalled nothing has none.
+/// let recalls: Vec<MemoryRecall> = store.memory_recalls(run)?;
+/// assert!(recalls.is_empty());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRecall {
+    /// The run that drew on the entry.
+    pub run_id: i64,
+    /// The step whose context it was carried into.
+    pub step: u32,
+    /// The workspace the entry belongs to.
+    pub workspace: String,
+    /// The entry's key.
+    pub key: String,
+    /// UTC time of the recall, from the database clock.
+    pub at: String,
+}
+
+/// What a write to memory did (0.30.0).
+///
+/// Returned by [`Store::memory_write`]. The `refused` flag is the half that
+/// matters: an agent that believes it corrected something and did not is the
+/// failure the pinned flag exists to prevent, so the refusal is a value the
+/// caller has to receive rather than a silence it has to notice.
+///
+/// ```
+/// use io_harness::{MemoryKind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("fix the flake", "/repo")?;
+///
+/// store.memory_write("/repo", "retries", "three", run, 1, MemoryKind::Decision)?;
+/// store.memory_pin("/repo", "retries", true)?;
+///
+/// let wrote = store.memory_write("/repo", "retries", "one", run, 7, MemoryKind::Fact)?;
+/// assert!(wrote.refused, "a pinned entry is not a run's to overwrite");
+/// assert_eq!(store.memory_get("/repo", "retries")?.unwrap().value, "three");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryWrite {
+    /// True when the entry was pinned and the write did not happen.
+    pub refused: bool,
+    /// Keys dropped to hold the workspace's caps, oldest first. Empty on a
+    /// refused write, which evicts nothing because it stored nothing.
+    pub evicted: Vec<String>,
 }
 
 /// One turn of a conversation: what was asked, which run answered it, and which
@@ -1148,6 +1366,23 @@ pub struct Turn {
     pub outcome: Option<String>,
     /// UTC creation time.
     pub created_at: String,
+}
+
+/// Read one `memory` row. One place, so the two queries that read the table
+/// cannot drift in their column order — which is exactly how a nullable column
+/// added late ends up read as the wrong field in one of them.
+fn memory_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    Ok(MemoryEntry {
+        key: r.get(0)?,
+        value: r.get(1)?,
+        run_id: r.get(2)?,
+        step: r.get::<_, i64>(3)? as u32,
+        created_at: r.get(4)?,
+        kind: MemoryKind::from_stored(r.get(5)?),
+        // NULL for every entry written before 0.30.0, and false is what those
+        // entries were: nobody had pinned anything.
+        pinned: r.get::<_, Option<i64>>(6)?.unwrap_or(0) == 1,
+    })
 }
 
 /// Read one `session_turns` row. One place, so the two queries that read the
@@ -1593,6 +1828,17 @@ impl ContextEvent {
     /// Notes from earlier runs were carried into this turn's context.
     pub fn memory_recall(step: u32, detail: impl Into<String>) -> Self {
         Self::of("memory_recall", step, detail)
+    }
+
+    /// A run tried to overwrite a pinned note and was refused (0.30.0).
+    ///
+    /// Recorded rather than silently dropped: an agent that believes it corrected
+    /// something and did not will act on the correction it thinks it made. A
+    /// trace row rather than a new [`EventKind`](crate::observe::EventKind)
+    /// variant, because the question this answers — *did my pin hold* — is asked
+    /// after the run by somebody reading the store, not during it by an observer.
+    pub fn memory_refused(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_refused", step, detail)
     }
 
     /// The agent wrote down its plan at this step (0.21.0). The detail is the shape
@@ -2175,6 +2421,37 @@ impl Store {
              );",
         )?;
 
+        // 0.30.0: what kind of thing an entry is, and whether a run may overwrite
+        // it. Two NULLable columns rather than a rewrite, so a 0.29.0 database
+        // gains them without touching a row and a 0.29.0 binary — whose every
+        // memory query names its columns explicitly — still reads it. A `NULL`
+        // kind is `Fact` and a `NULL` pinned is false, which is what every entry
+        // written before this release actually was. Deliberately NOT a
+        // `CHECKPOINT_FORMAT` bump, for the reason 0.10.0 through 0.28.0 each
+        // recorded: no checkpoint layout changed, and bumping it would make
+        // [`Store::check_resumable`] refuse a database that is in fact readable.
+        //
+        // `let _ =` on both: `ALTER TABLE ADD COLUMN` errors when the column is
+        // already there, which is the normal case on every open after the first.
+        let _ = conn.execute("ALTER TABLE memory ADD COLUMN kind TEXT", []);
+        let _ = conn.execute("ALTER TABLE memory ADD COLUMN pinned INTEGER", []);
+
+        // 0.30.0: which entries a run actually drew on. A new table, because it is
+        // per (run, key) and the memory row is per (workspace, key) — recording it
+        // on the entry would keep only the last run that read it, which is the one
+        // fact nobody is asking for. Same additive rules as every table above.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_recalls (
+                 id        INTEGER PRIMARY KEY,
+                 run_id    INTEGER NOT NULL,
+                 step      INTEGER NOT NULL,
+                 workspace TEXT NOT NULL,
+                 key       TEXT NOT NULL,
+                 at        TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE INDEX IF NOT EXISTS memory_recalls_run ON memory_recalls (run_id);",
+        )?;
+
         // 0.10.0: what the context assembler decided each turn — one row per turn
         // plus one per re-read. New table only, so a 0.9.1 database gains it and a
         // 0.9.1 binary, which never queries it, still opens and resumes a migrated
@@ -2527,6 +2804,22 @@ impl Store {
                  at     TEXT NOT NULL DEFAULT (datetime('now'))
              );
              CREATE INDEX IF NOT EXISTS snapshots_run ON snapshots(run_id, path);",
+        )?;
+
+        // 0.30.0: the indexes the aggregates rest on, created last because they
+        // name tables every block above declares. Each one is what turns its
+        // accessor from a scan the caller pays for on every render into a lookup
+        // that stays flat as the trace grows — the whole of N2, and the reason
+        // these are declared rather than left to SQLite's judgement. Indexes
+        // only: no column, no row, nothing an older binary would notice.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS run_outcomes_outcome ON run_outcomes (outcome);
+             CREATE INDEX IF NOT EXISTS run_outcomes_finished ON run_outcomes (finished_at);
+             CREATE INDEX IF NOT EXISTS sandbox_events_kind_detail
+                 ON sandbox_events (kind, detail);
+             CREATE INDEX IF NOT EXISTS sandbox_events_run_kind ON sandbox_events (run_id, kind);
+             CREATE INDEX IF NOT EXISTS context_events_kind ON context_events (kind);
+             CREATE INDEX IF NOT EXISTS checkpoint_events_kind ON checkpoint_events (kind);",
         )?;
 
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
@@ -2983,6 +3276,224 @@ impl Store {
             .into_iter()
             .map(|(k, calls)| crate::pricing::group(k, &calls, prices))
             .collect())
+    }
+
+    // ---- 0.30.0: outcome, gate and recovery aggregates ----
+    //
+    // The shape `src/pricing.rs` established in 0.18.0 and this release holds to
+    // without exception: grouped rows out, no rendering, no derived opinion. What
+    // is different from the spend groupings is where the work happens — those read
+    // every call row and group in Rust because the price table is a Rust value the
+    // SQL cannot see, and these have no such excuse, so each is one indexed
+    // `GROUP BY` and stays flat as the trace grows.
+
+    /// Finished runs grouped by the outcome they ended with (0.30.0).
+    ///
+    /// The raw outcome strings, not a success/failure collapse: "ran out of
+    /// steps", "stalled" and "a human refused" are different endings and the
+    /// distinction is the reason [`RunSummary`] keeps both the string and the
+    /// flag. Rows come back ordered by outcome, which is the only ordering
+    /// promised.
+    ///
+    /// A run that has not finished is not here — it has no ending yet — and a run
+    /// that crashed mid-loop never reached one at all.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// for outcome in ["success", "success", "stalled"] {
+    ///     let run = store.start_run("goal", "/repo")?;
+    ///     store.finish_run(run, outcome)?;
+    /// }
+    ///
+    /// let tally = store.runs_by_outcome()?;
+    /// assert_eq!(tally[0].key, "stalled");
+    /// assert_eq!(tally[0].count, 1);
+    /// assert_eq!(tally[1].key, "success");
+    /// assert_eq!(tally[1].count, 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn runs_by_outcome(&self) -> Result<Vec<Tally>> {
+        self.tally("SELECT outcome, COUNT(*) FROM run_outcomes GROUP BY outcome ORDER BY outcome")
+    }
+
+    /// Finished runs grouped by the day they finished (`YYYY-MM-DD`, UTC, from
+    /// the database clock) (0.30.0).
+    ///
+    /// The same clock `spend_by_day` groups on, so a cost row and an outcome row
+    /// for one day describe the same day rather than two that can disagree.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("goal", "/repo")?;
+    /// store.finish_run(run, "success")?;
+    ///
+    /// let days = store.runs_by_day()?;
+    /// assert_eq!(days.len(), 1, "one run, one day");
+    /// assert_eq!(days[0].count, 1);
+    /// assert_eq!(days[0].key.len(), 10, "YYYY-MM-DD");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn runs_by_day(&self) -> Result<Vec<Tally>> {
+        self.tally(
+            "SELECT date(finished_at), COUNT(*) FROM run_outcomes
+             GROUP BY date(finished_at) ORDER BY date(finished_at)",
+        )
+    }
+
+    /// How often a run was verified without a gate ever failing first (0.30.0).
+    ///
+    /// Three counts rather than a rate, because the denominator is a judgement
+    /// the consumer makes: *first_try / succeeded* is "when we got there, how
+    /// often first time", *first_try / runs* is "how often does this work at all
+    /// on the first attempt", and both are legitimate. Returning one number would
+    /// be picking for them and hiding which was picked.
+    ///
+    /// "First try" means finished successfully with no `gate_phase_failed` event
+    /// recorded against the run. A run whose gate never ran at all — a contract
+    /// with [`Verification::None`](crate::Verification::None) — counts as first
+    /// try, because it is a run that succeeded with nothing failing.
+    ///
+    /// ```
+    /// use io_harness::{SandboxEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let clean = store.start_run("goal", "/repo")?;
+    /// store.finish_run(clean, "success")?;
+    ///
+    /// let retried = store.start_run("goal", "/repo")?;
+    /// store.record_sandbox_event(&SandboxEvent::gate_phase_failed(retried, 2, "test-run"))?;
+    /// store.finish_run(retried, "success")?;
+    ///
+    /// let first = store.first_try()?;
+    /// assert_eq!((first.runs, first.succeeded, first.first_try), (2, 2, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn first_try(&self) -> Result<FirstTry> {
+        // A `NOT EXISTS` correlated per finished run, and measured against the
+        // alternatives rather than assumed: a LEFT JOIN onto a DISTINCT subquery
+        // reads far worse (25s at 20,000 runs against 7.6ms here), because the
+        // subquery is materialised without an index and every outcome row then
+        // probes it linearly. The correlated form probes
+        // `sandbox_events (run_id, kind)` instead, which is one index seek per run.
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(success), 0),
+                    COALESCE(SUM(success = 1 AND NOT EXISTS (
+                        SELECT 1 FROM sandbox_events e
+                        WHERE e.run_id = run_outcomes.run_id
+                          AND e.kind = 'gate_phase_failed')), 0)
+             FROM run_outcomes",
+            [],
+            |r| {
+                Ok(FirstTry {
+                    runs: r.get(0)?,
+                    succeeded: r.get(1)?,
+                    first_try: r.get(2)?,
+                })
+            },
+        )?)
+    }
+
+    /// Failed verification gates grouped by the phase that failed (0.30.0).
+    ///
+    /// The phase, not the criterion's text: `"compile"`, `"criterion-compile"`,
+    /// `"test-run"` are what the gate records, and reporting them as criteria
+    /// would be dressing up a column as something it is not. `criterion-compile`
+    /// is the one to look for — see
+    /// [`SandboxEvent::gate_phase_failed`](SandboxEvent::gate_phase_failed).
+    ///
+    /// Counted per event, so a run that failed the same phase three times is
+    /// three. "How many *runs* failed this phase" is a different question and is
+    /// deliberately not answered here rather than answered ambiguously.
+    ///
+    /// ```
+    /// use io_harness::{SandboxEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("goal", "/repo")?;
+    /// store.record_sandbox_event(&SandboxEvent::gate_phase_failed(run, 1, "test-run"))?;
+    /// store.record_sandbox_event(&SandboxEvent::gate_phase_failed(run, 4, "test-run"))?;
+    ///
+    /// let failures = store.gate_failures_by_phase()?;
+    /// assert_eq!(failures[0].key, "test-run");
+    /// assert_eq!(failures[0].count, 2, "per failure, not per run");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn gate_failures_by_phase(&self) -> Result<Vec<Tally>> {
+        // Grouped on `detail` itself rather than on a `COALESCE` of it: a function
+        // in the GROUP BY makes the (kind, detail) index unusable and SQLite falls
+        // back to a scan plus a temp B-tree. The NULL is handled where it costs
+        // nothing, in `tally`.
+        self.tally(
+            "SELECT detail, COUNT(*) FROM sandbox_events
+             WHERE kind = 'gate_phase_failed'
+             GROUP BY detail ORDER BY detail",
+        )
+    }
+
+    /// How many runs a recovery mechanism carried through something (0.30.0).
+    ///
+    /// Three counts, and deliberately not a fourth. An **escalation** is recorded
+    /// nowhere as an event and is in any case the opposite of a rescue — it is
+    /// the run handing the problem back — so it is neither counted here nor
+    /// smuggled into the total. An aggregate that cannot be computed honestly is
+    /// worse than a missing one; `Spend::unpriced_calls` is the precedent.
+    ///
+    /// ```
+    /// use io_harness::{CheckpointEvent, ContextEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("goal", "/repo")?;
+    /// store.record_context_event(run, &ContextEvent::served(1, "anthropic"))?;
+    /// store.record_context_event(run, &ContextEvent::replan(3, "no progress"))?;
+    /// store.record_checkpoint_event(&CheckpointEvent::resume(run, 4, "after a crash"))?;
+    ///
+    /// let recovery = store.recovery()?;
+    /// assert_eq!((recovery.fallbacks, recovery.replans, recovery.resumes), (1, 1, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn recovery(&self) -> Result<Recovery> {
+        let count = |sql: &str| -> Result<u64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
+        Ok(Recovery {
+            // `served` is written only when a `Fallback` moved off its first
+            // provider, so the row's existence *is* the fallback.
+            fallbacks: count("SELECT COUNT(*) FROM context_events WHERE kind = 'served'")?,
+            replans: count("SELECT COUNT(*) FROM context_events WHERE kind = 'replan'")?,
+            resumes: count("SELECT COUNT(*) FROM checkpoint_events WHERE kind = 'resume'")?,
+        })
+    }
+
+    /// The shared body of the three groupings that are one `GROUP BY`: run it,
+    /// read `(key, count)`. One place, so a caller cannot get a differently
+    /// shaped row from one of them.
+    fn tally(&self, sql: &str) -> Result<Vec<Tally>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Tally {
+                // A NULL group key is a row the trace holds with nothing to name
+                // it by. `(none)` says that; dropping the row would quietly lose
+                // a count, and inventing a name would be worse.
+                key: r
+                    .get::<_, Option<String>>(0)?
+                    .unwrap_or_else(|| "(none)".into()),
+                count: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Record one file change and its line counts (0.18.0).
@@ -4102,20 +4613,171 @@ impl Store {
         run_id: i64,
         step: u32,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .memory_write(workspace, key, value, run_id, step, MemoryKind::Fact)?
+            .evicted)
+    }
+
+    /// Write or replace `key` for `workspace` as `kind`, refusing a pinned entry
+    /// (0.30.0).
+    ///
+    /// The full form of [`Store::memory_put`], which is this with `kind` fixed to
+    /// [`MemoryKind::Fact`] and the refusal dropped on the floor. Prefer this one
+    /// anywhere the answer matters: a caller that cannot tell a write from a
+    /// refusal will tell the model it corrected something it did not.
+    ///
+    /// Pinning is a caller's act ([`Store::memory_pin`]), never a run's, and this
+    /// is the method that respects it. Everything else — the entry cap, the
+    /// character cap, oldest-first eviction, the truncation marker — behaves
+    /// exactly as it did in 0.10.0.
+    ///
+    /// ```
+    /// use io_harness::{MemoryKind, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("make the tests pass", "/repo")?;
+    ///
+    /// let wrote = store.memory_write(
+    ///     "/repo", "test-command", "cargo test --features documents", run, 6,
+    ///     MemoryKind::Fact,
+    /// )?;
+    /// assert!(!wrote.refused);
+    /// assert!(wrote.evicted.is_empty(), "nothing had to go to hold the caps");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_write(
+        &self,
+        workspace: &str,
+        key: &str,
+        value: &str,
+        run_id: i64,
+        step: u32,
+        kind: MemoryKind,
+    ) -> Result<MemoryWrite> {
         let value = truncate_memory_value(value);
-        // An overwrite re-attributes the entry and refreshes `created_at`, so
-        // recency ordering reflects the latest write rather than the first.
-        self.conn.execute(
-            "INSERT INTO memory (workspace, key, value, run_id, step, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        // The guard is in the SQL rather than a read-then-write in the caller, so
+        // two writers on one store cannot interleave between the check and the
+        // write. `IS NOT 1` rather than `!= 1` because a pre-0.30.0 row's `pinned`
+        // is NULL, and NULL != 1 is NULL, which SQLite reads as false — that
+        // comparison would refuse every entry written before this release.
+        let n = self.conn.execute(
+            "INSERT INTO memory (workspace, key, value, run_id, step, created_at, kind, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?6, 0)
              ON CONFLICT(workspace, key) DO UPDATE SET
                  value      = excluded.value,
                  run_id     = excluded.run_id,
                  step       = excluded.step,
-                 created_at = excluded.created_at",
-            (workspace, key, &value, run_id, step),
+                 created_at = excluded.created_at,
+                 kind       = excluded.kind
+             WHERE memory.pinned IS NOT 1",
+            (workspace, key, &value, run_id, step, kind.as_str()),
         )?;
-        self.enforce_memory_caps(workspace, key)
+        if n == 0 {
+            return Ok(MemoryWrite {
+                refused: true,
+                evicted: Vec::new(),
+            });
+        }
+        Ok(MemoryWrite {
+            refused: false,
+            evicted: self.enforce_memory_caps(workspace, key)?,
+        })
+    }
+
+    /// Pin or unpin one entry, so a run cannot overwrite it (0.30.0). True when
+    /// an entry was there to change.
+    ///
+    /// A pinned entry is also exempt from cap eviction, for the same reason it is
+    /// exempt from overwriting: a correction a person made should not disappear
+    /// because the agent wrote twenty notes afterwards.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("fix the flake", "/repo")?;
+    /// store.memory_put("/repo", "retries", "three", run, 1)?;
+    ///
+    /// assert!(store.memory_pin("/repo", "retries", true)?);
+    /// assert!(store.memory_get("/repo", "retries")?.unwrap().pinned);
+    /// assert!(
+    ///     !store.memory_pin("/repo", "never-written", true)?,
+    ///     "there is nothing to pin, and inventing an entry would be worse"
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_pin(&self, workspace: &str, key: &str, pinned: bool) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memory SET pinned = ?1 WHERE workspace = ?2 AND key = ?3",
+            (pinned as i64, workspace, key),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record that `run_id` drew on these keys of `workspace` at `step` (0.30.0).
+    ///
+    /// Written by the context assembler at recall time. One row per key per
+    /// recall, never a replacement, so a run that recalls the same entry on three
+    /// turns is three rows and the same entry recalled by two runs is two records
+    /// that do not disturb each other.
+    pub(crate) fn record_memory_recall(
+        &self,
+        run_id: i64,
+        step: u32,
+        workspace: &str,
+        keys: &[String],
+    ) -> Result<()> {
+        for key in keys {
+            self.conn.execute(
+                "INSERT INTO memory_recalls (run_id, step, workspace, key)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (run_id, step, workspace, key),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Which memory entries a run drew on, in the order they were recalled
+    /// (0.30.0).
+    ///
+    /// "What does the agent know about this workspace" is
+    /// [`Store::memory_list`]; this is "what did *this run* actually use", which
+    /// is the question that says whether an entry was load-bearing. A key appears
+    /// once per recall, so a caller wanting the set deduplicates — the crate does
+    /// not decide that for it.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("port the parser", "/repo")?;
+    /// // Written by the context assembler during a real run; shown here directly
+    /// // because the assembler needs a whole turn to reach.
+    /// # store.memory_put("/repo", "test-command", "cargo test", run, 1)?;
+    /// assert!(store.memory_recalls(run)?.is_empty(), "nothing recalled yet");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_recalls(&self, run_id: i64) -> Result<Vec<MemoryRecall>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, step, workspace, key, at FROM memory_recalls
+             WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(MemoryRecall {
+                run_id: r.get(0)?,
+                step: r.get::<_, i64>(1)? as u32,
+                workspace: r.get(2)?,
+                key: r.get(3)?,
+                at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Evict this workspace's oldest entries until both caps hold, never the
@@ -4123,23 +4785,35 @@ impl Store {
     /// silent no-op). Returns the evicted keys in eviction order.
     fn enforce_memory_caps(&self, workspace: &str, keep: &str) -> Result<Vec<String>> {
         // LENGTH() on TEXT counts characters, not bytes — the cap is in chars.
-        let rows: Vec<(String, i64)> = {
+        let rows: Vec<(String, i64, bool)> = {
+            // 0.30.0: a pinned entry is not a candidate. It is exempt from
+            // eviction for the same reason it is exempt from overwriting — a
+            // correction a person made must not vanish because the agent wrote
+            // twenty notes afterwards. It still counts towards the caps, so
+            // pinning everything makes writes fail loudly rather than silently
+            // raising the ceiling.
             let mut stmt = self.conn.prepare(
-                "SELECT key, LENGTH(value) FROM memory WHERE workspace = ?1
+                "SELECT key, LENGTH(value), pinned FROM memory WHERE workspace = ?1
                  ORDER BY created_at ASC, id ASC",
             )?;
-            let rows = stmt.query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let rows = stmt.query_map([workspace], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0) == 1,
+                ))
+            })?;
             rows.collect::<std::result::Result<_, _>>()?
         };
 
         let mut count = rows.len();
-        let mut chars: i64 = rows.iter().map(|(_, n)| *n).sum();
+        let mut chars: i64 = rows.iter().map(|(_, n, _)| *n).sum();
         let mut evicted = Vec::new();
-        for (key, n) in &rows {
+        for (key, n, pinned) in &rows {
             if count <= MEMORY_MAX_ENTRIES && chars <= MEMORY_MAX_CHARS as i64 {
                 break;
             }
-            if key == keep {
+            if key == keep || *pinned {
                 continue;
             }
             self.conn.execute(
@@ -4156,18 +4830,10 @@ impl Store {
     /// Every entry for `workspace`, oldest first. Never another workspace's.
     pub fn memory_list(&self, workspace: &str) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT key, value, run_id, step, created_at FROM memory
+            "SELECT key, value, run_id, step, created_at, kind, pinned FROM memory
              WHERE workspace = ?1 ORDER BY created_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map([workspace], |r| {
-            Ok(MemoryEntry {
-                key: r.get(0)?,
-                value: r.get(1)?,
-                run_id: r.get(2)?,
-                step: r.get::<_, i64>(3)? as u32,
-                created_at: r.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map([workspace], memory_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -4298,18 +4964,10 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT key, value, run_id, step, created_at FROM memory
+                "SELECT key, value, run_id, step, created_at, kind, pinned FROM memory
                  WHERE workspace = ?1 AND key = ?2",
                 (workspace, key),
-                |r| {
-                    Ok(MemoryEntry {
-                        key: r.get(0)?,
-                        value: r.get(1)?,
-                        run_id: r.get(2)?,
-                        step: r.get::<_, i64>(3)? as u32,
-                        created_at: r.get(4)?,
-                    })
-                },
+                memory_row,
             )
             .ok())
     }
@@ -4601,6 +5259,191 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.30.0 F4, first half. [`MEMORY_KIND_NAMES`] is what
+    /// [`MemoryKind::from_stored`] matches on, so a variant missing from it
+    /// round-trips to `Fact` silently — a stored `decision` read back as a fact is
+    /// the same defect class as 0.25.0's `every_kind()`, which cost three event
+    /// kinds seven releases of silence.
+    ///
+    /// The census reads the enum out of this file rather than trusting a
+    /// hand-written list, and the control is the point: `variants_in_source` run
+    /// against a list with one entry removed must name exactly that entry, or the
+    /// helper is one that always answers "complete".
+    /// The stored spelling of every variant `from_stored` knows how to read back.
+    /// Deliberately a list in the *test* rather than a constant in the module:
+    /// nothing at runtime needs it (unlike `EVENT_NAMES`, which a `[[hook]]`'s
+    /// `on` is validated against), and a constant no code reads is a constant
+    /// that drifts.
+    const KNOWN_KINDS: &[&str] = &["fact", "decision"];
+
+    #[test]
+    fn memory_kind_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained() {
+        let declared = variants_in_source();
+        assert_eq!(
+            declared,
+            KNOWN_KINDS.to_vec(),
+            "`pub enum MemoryKind` and the kinds `from_stored` reads back disagree"
+        );
+
+        // And every one of them survives a write and a read, which the list alone
+        // cannot promise: a name in the list whose `as_str`/`from_stored` pair
+        // disagrees is a note that changes kind on its way to disk.
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        for (kind, name) in [
+            (MemoryKind::Fact, "fact"),
+            (MemoryKind::Decision, "decision"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+            store
+                .memory_write("/repo", name, "value", run, 1, kind)
+                .unwrap();
+            assert_eq!(store.memory_get("/repo", name).unwrap().unwrap().kind, kind);
+        }
+        assert_eq!(
+            declared.len(),
+            2,
+            "a new variant needs a row in the round-trip above, not only a name in \
+             KNOWN_KINDS"
+        );
+    }
+
+    /// The variants declared by `pub enum MemoryKind` in this file, lowercased the
+    /// way [`MemoryKind::as_str`] spells them.
+    ///
+    /// A text parse, safe because of the enum's shape: a variant sits at four
+    /// spaces and starts with an uppercase letter, where a doc line starts with
+    /// `/` and an attribute with `#`. Line endings are normalised first — a
+    /// Windows checkout holds this file with CRLF, and a parse looking for `"\n}"`
+    /// would find nothing there and fail on one platform only.
+    fn variants_in_source() -> Vec<&'static str> {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/state.rs"),
+        )
+        .expect("this file is readable from its own test")
+        .replace("\r\n", "\n");
+        let body = src
+            .split_once("pub enum MemoryKind {")
+            .expect("the enum is declared in this file")
+            .1;
+        let body = body.split_once("\n}\n").expect("the enum is closed").0;
+
+        let mut found = Vec::new();
+        for line in body.lines() {
+            let Some(rest) = line.strip_prefix("    ") else {
+                continue;
+            };
+            if !rest.starts_with(|c: char| c.is_ascii_uppercase()) {
+                continue;
+            }
+            let variant: String = rest
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            // Leaked rather than returned as `String`, so the comparison above is
+            // against `&'static str` like the constant it is checking. One leak
+            // per variant per test process is nothing.
+            found.push(&*Box::leak(variant.to_ascii_lowercase().into_boxed_str()));
+        }
+        assert!(
+            !found.is_empty(),
+            "the parse found nothing, so it is measuring itself rather than the enum"
+        );
+        found
+    }
+
+    /// 0.30.0 N2. The claim is that an aggregate does not get slower as the trace
+    /// grows, and a wall-clock assertion is the wrong way to hold it: it is a
+    /// flaky test on a loaded CI runner, and it passes on a fast machine running
+    /// a full scan. The plan is the property — every one of these must reach its
+    /// rows through an index rather than reading the table.
+    #[test]
+    fn every_aggregate_reaches_its_rows_through_an_index() {
+        let store = Store::memory().unwrap();
+        // A plan is chosen against the tables as they stand, so they cannot be
+        // empty: SQLite will scan three rows whatever the indexes say.
+        for i in 0..64 {
+            let run = store.start_run("goal", "/repo").unwrap();
+            store
+                .record_sandbox_event(&SandboxEvent::gate_phase_failed(run, 1, "test-run"))
+                .unwrap();
+            store
+                .record_context_event(run, &ContextEvent::replan(1, "no progress"))
+                .unwrap();
+            store
+                .record_checkpoint_event(&CheckpointEvent::resume(run, 1, "after a crash"))
+                .unwrap();
+            store
+                .finish_run(run, if i % 2 == 0 { "success" } else { "stalled" })
+                .unwrap();
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows.join(" | ")
+        };
+
+        for (what, sql) in [
+            (
+                "runs_by_outcome",
+                "SELECT outcome, COUNT(*) FROM run_outcomes GROUP BY outcome ORDER BY outcome",
+            ),
+            (
+                "runs_by_day",
+                "SELECT date(finished_at), COUNT(*) FROM run_outcomes
+                 GROUP BY date(finished_at) ORDER BY date(finished_at)",
+            ),
+            (
+                "gate_failures_by_phase",
+                "SELECT detail, COUNT(*) FROM sandbox_events
+                 WHERE kind = 'gate_phase_failed'
+                 GROUP BY detail ORDER BY detail",
+            ),
+            (
+                "recovery: fallbacks",
+                "SELECT COUNT(*) FROM context_events WHERE kind = 'served'",
+            ),
+            (
+                "recovery: replans",
+                "SELECT COUNT(*) FROM context_events WHERE kind = 'replan'",
+            ),
+            (
+                "recovery: resumes",
+                "SELECT COUNT(*) FROM checkpoint_events WHERE kind = 'resume'",
+            ),
+            (
+                "first_try: the correlated existence check",
+                "SELECT COUNT(*) FROM sandbox_events e WHERE e.run_id = 1
+                 AND e.kind = 'gate_phase_failed'",
+            ),
+        ] {
+            let plan = plan(sql);
+            assert!(
+                plan.contains("USING INDEX") || plan.contains("USING COVERING INDEX"),
+                "{what} does not use an index, so it is a scan the caller pays for on \
+                 every render: {plan}"
+            );
+        }
+
+        // The control. `runs` has no index on `goal`, so this one must NOT report
+        // an index — without it, a plan string that said "USING INDEX" for
+        // everything would pass the loop above and prove nothing.
+        let scan = plan("SELECT COUNT(*) FROM runs WHERE goal = 'goal'");
+        assert!(
+            !scan.contains("USING INDEX"),
+            "the check cannot tell an index from a scan: {scan}"
+        );
+    }
 
     #[test]
     fn refusals_record_action_target_rule_and_layer() {

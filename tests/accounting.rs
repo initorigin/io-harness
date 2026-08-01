@@ -854,3 +854,129 @@ async fn the_web_tables_carry_no_credential_and_no_prompt_derived_query() {
         "the rows must still hold what the provider did return, got {stored:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 0.30.0 F7 — outcome, gate and recovery aggregates over a known trace
+// ---------------------------------------------------------------------------
+
+/// A working copy of a committed fixture database. Never the fixture itself:
+/// opening a store migrates it, and a fixture a test mutates passes once.
+fn fixture_copy(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let from = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/store-0.29.0")
+        .join(name);
+    let to = dir.path().join(name);
+    std::fs::copy(&from, &to).unwrap();
+    (dir, to)
+}
+
+/// The `composition` half of a fixture's sidecar: the literals the generator
+/// chose, which is where every expectation below comes from. The `read_back`
+/// half is what 0.29.0 saw and is the cross-version test's business, not this
+/// one's.
+fn composition(name: &str) -> serde_json::Value {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/store-0.29.0")
+        .join(name);
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    json["composition"].clone()
+}
+
+/// 0.30.0 F7 — every aggregate, against a trace whose composition was decided
+/// before the accessors existed.
+///
+/// The expectations are the generator's literals, read out of the sidecar. An
+/// aggregate checked against what the accessor returned proves nothing, and a
+/// fixture written by this tree would prove less than that.
+#[test]
+fn f7_the_aggregates_are_right_against_a_known_composition() {
+    let (_dir, db) = fixture_copy("aggregates.sqlite3");
+    let want = composition("aggregates.json");
+    let store = Store::open(&db).unwrap();
+
+    let by_outcome: Vec<(String, u64)> = store
+        .runs_by_outcome()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.key, t.count))
+        .collect();
+    assert_eq!(
+        by_outcome,
+        vec![
+            (
+                "stalled".to_string(),
+                want["by_outcome"]["stalled"].as_u64().unwrap()
+            ),
+            (
+                "step_cap_reached".to_string(),
+                want["by_outcome"]["step_cap_reached"].as_u64().unwrap()
+            ),
+            (
+                "success".to_string(),
+                want["by_outcome"]["success"].as_u64().unwrap()
+            ),
+        ],
+        "grouped by ending, ordered by outcome"
+    );
+
+    let days = store.runs_by_day().unwrap();
+    assert_eq!(
+        days.iter().map(|d| d.count).sum::<u64>(),
+        want["runs"].as_u64().unwrap(),
+        "every finished run falls into exactly one day"
+    );
+
+    let first = store.first_try().unwrap();
+    assert_eq!(first.runs, want["runs"].as_u64().unwrap());
+    assert_eq!(first.succeeded, want["succeeded"].as_u64().unwrap());
+    assert_eq!(
+        first.first_try,
+        want["verified_first_try"].as_u64().unwrap(),
+        "two of the four successes reached the gate clean; an implementation that \
+         counted successes would read four"
+    );
+    assert!(
+        first.first_try < first.succeeded && first.succeeded < first.runs,
+        "the fixture is built so all three counts differ — if any two were equal \
+         this test could pass on an accessor that confused them"
+    );
+
+    let gates: Vec<(String, u64)> = store
+        .gate_failures_by_phase()
+        .unwrap()
+        .into_iter()
+        .map(|t| (t.key, t.count))
+        .collect();
+    let want_gates = want["gate_failures_by_phase"].as_object().unwrap();
+    assert_eq!(gates.len(), want_gates.len());
+    for (phase, count) in &gates {
+        assert_eq!(
+            *count,
+            want_gates[phase].as_u64().unwrap(),
+            "gate phase {phase}"
+        );
+    }
+
+    let recovery = store.recovery().unwrap();
+    let want_recovery = &want["recovery"];
+    assert_eq!(
+        recovery.fallbacks,
+        want_recovery["fallbacks"].as_u64().unwrap()
+    );
+    assert_eq!(recovery.replans, want_recovery["replans"].as_u64().unwrap());
+    assert_eq!(recovery.resumes, want_recovery["resumes"].as_u64().unwrap());
+}
+
+/// 0.30.0 F7, the negative control. An empty store answers zero everywhere and
+/// no row anywhere — not an error, and not a plausible-looking number.
+#[test]
+fn the_aggregates_over_an_empty_store_are_empty_rather_than_absent() {
+    let store = Store::memory().unwrap();
+    assert!(store.runs_by_outcome().unwrap().is_empty());
+    assert!(store.runs_by_day().unwrap().is_empty());
+    assert!(store.gate_failures_by_phase().unwrap().is_empty());
+    assert_eq!(store.first_try().unwrap(), io_harness::FirstTry::default());
+    assert_eq!(store.recovery().unwrap(), io_harness::Recovery::default());
+}

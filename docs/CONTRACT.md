@@ -437,7 +437,50 @@ additive and no checkpoint layout changed, so **`CHECKPOINT_FORMAT` stays 7**: a
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.23.0.
+is fixed as of 0.30.0.
+
+**An aggregate is one indexed query, not a constant-time one (0.30.0).**
+`runs_by_outcome`, `runs_by_day`, `gate_failures_by_phase`, `first_try` and
+`recovery` each reach their rows through an index rather than scanning a table,
+which is asserted on the query plan rather than on a clock. What they are *not*
+is independent of how much history the store holds: counting every row is what
+the answer is, so the cost is linear in rows however it is served. Measured on a
+debug build over an in-memory store, at 20,000 finished runs: 1.8ms, 2.5ms,
+7.6ms and 1.2ms respectively — roughly 90 to 380 nanoseconds per run. A caller
+refreshing a panel every second over a very large trace should cache the answer;
+this crate does not cache it for them.
+
+**A pin binds a run, not a person, and not another process's caller (0.30.0).**
+`MemoryEntry::pinned` stops the *agent* overwriting an entry through the
+`remember` tool, and stops the caps evicting it. It is not access control:
+`Store::memory_write` from the embedding program is refused the same way, but
+`Store::memory_pin(.., false)`, `memory_delete` and `memory_clear` are the
+caller's and are not refused — the pin is a statement about what a run may
+change, and the program holding the store is not the run. A refused write is
+recorded as a `memory_refused` row and handed back to the model, so the failure
+mode the flag exists to prevent — an agent proceeding as though its correction
+landed — is visible in the trace and to the agent itself.
+
+**Gate failures group by phase, not by criterion (0.30.0).** The trace records
+which *phase* of the gate failed — `compile`, `criterion-compile`, `test-run` —
+and not the text of the criterion that failed, so `gate_failures_by_phase`
+reports phases. Counted per failure, not per run: a run that failed the same
+phase three times contributes three. "How many runs failed this phase" is a
+different question and is not answered rather than answered ambiguously.
+
+**`Recovery` has no escalation count (0.30.0).** Nothing in the trace records an
+escalation as an event, and an escalation is in any case the opposite of a
+rescue — it is the run handing the problem back to the caller. Counting it beside
+fallbacks and replans would read as a success. When something records it, it gets
+its own row rather than a place in the total.
+
+**A `MemoryEntry` is a returned row, and it gained two fields in 0.30.0.**
+`kind` and `pinned` are additive for every caller that reads one, which is what
+this crate does with the type — it is returned by `memory_get` and `memory_list`
+and taken by nothing. A caller who nonetheless *constructs* one in a struct
+literal has to name the two new fields. Stated here rather than left to be
+found; the same warning as the two provider structs below, at a much smaller
+blast radius.
 
 **`CompletionRequest` and `CompletionResponse` are not `#[non_exhaustive]`, and
 adding a field to either is a break (0.24.0).** `EventKind`, `Backend` and `Cap`
@@ -571,6 +614,20 @@ a projection onto the typed API and never a second path into the run loop:
   endpoint where the other three name a vendor, and it arrives behind the
   `#[non_exhaustive]` 0.27.0 put on that enum for exactly this, so a caller who
   wrote the `_ =>` arm is unbroken.
+- **A resolved key can say which file decided it, and that is all it says
+  (0.30.0).** `Config::origin(key)` reports the scope and the path that won a
+  dotted key; `Config::origins()` reports every key a file set. It is an addition
+  beside `Config::sources()`, which answers "which files were read" and keeps
+  answering exactly that. Three bounds, each deliberate. **An empty answer is the
+  crate's default** — no file named the key — and is never dressed up as a file.
+  **`policy.layers` and `agent` report every contributing file**, because those
+  arrays append across scopes and naming one winner for a value three files built
+  would be false. And **a substituted value reports the file the substitution was
+  written in**, not the environment variable or the command it read, because the
+  file is what a reader can go and change. Provenance describes the resolution and
+  never alters it, and there is still **no configuration writer**: reporting which
+  scope set a key is not editing that file, and this crate does not edit `io.toml`
+  for you.
 - **The file is read once, by the caller, before the run, and never again.**
   Nothing in this crate discovers a config on its own: `Config::discover` is the
   caller's own call. That is what makes the one guarantee here true — a config

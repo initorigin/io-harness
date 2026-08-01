@@ -173,6 +173,69 @@ Rows come back ordered by key, which is the only ordering promised. Streaks,
 leaderboards, heat maps, per-day charts and every other rendering are the
 consuming application's decision, not the harness's.
 
+## What the runs did, not just what they cost
+
+Money is one question about a trace and it is not the first one an operator asks
+after a week of runs. Since 0.30.0 the same store answers five more, over the rows
+it was already writing:
+
+```rust
+use io_harness::Store;
+
+# fn demo(store: &Store) -> io_harness::Result<()> {
+for row in store.runs_by_outcome()? {
+    println!("{}: {}", row.key, row.count);      // success: 41, stalled: 6, …
+}
+
+let first = store.first_try()?;
+println!("{} runs, {} succeeded, {} clean first time", first.runs, first.succeeded, first.first_try);
+
+let recovery = store.recovery()?;
+println!("{} fallbacks, {} replans, {} resumes", recovery.fallbacks, recovery.replans, recovery.resumes);
+# Ok(()) }
+```
+
+`runs_by_outcome`, `runs_by_day` and `gate_failures_by_phase` all return
+`Vec<Tally>` — one `{ key, count }` shape for every grouped count this crate
+returns, so a caller reads the same row whether it asked about outcomes, days or
+phases. `runs_by_day` keys `YYYY-MM-DD` from the database clock, the same clock
+`spend_by_day` groups on, so a cost row and an outcome row for one day describe
+the same day rather than two that can disagree.
+
+**`first_try` returns three counts and no rate.** *first_try / succeeded* is "when
+we got there, how often first time"; *first_try / runs* is "how often does this
+work at all on the first attempt". Both are legitimate, the difference between
+them is large, and returning one number would be picking for the caller and hiding
+which was picked. "First try" means finished successfully with no
+`gate_phase_failed` event recorded against the run.
+
+**Gate failures group by the phase the gate records** — `compile`,
+`criterion-compile`, `test-run` — not by criterion text, because the phase is what
+the column holds and reporting it as a criterion would be dressing a column up as
+something it is not. Counted per failure, so a run that failed the same phase
+three times is three; "how many *runs* failed this phase" is a different question
+and is left unanswered rather than answered ambiguously.
+
+**`recovery` counts three mechanisms and deliberately not a fourth.** There is no
+escalation count: nothing records an escalation as an event, and an escalation is
+in any case the opposite of a rescue — it is the run handing the problem back.
+An aggregate that cannot be computed honestly is worse than a missing one, and
+`unpriced_calls` above is the precedent.
+
+Same line 0.18.0 drew: **rows out, and the crate renders nothing.** A rate, a
+trend line, a colour for a bad week — all of it is the consuming application's.
+
+An empty store answers zero everywhere and no row anywhere, not an error and not a
+plausible-looking number: `runs_by_outcome` and its two siblings return an empty
+`Vec`, `first_try` and `recovery` return their zeroed structs.
+
+Each is one indexed query rather than a scan over the trace. Measured on a debug
+build against an in-memory store at 20,000 finished runs: `runs_by_outcome` 1.8ms,
+`gate_failures_by_phase` 2.5ms, `first_try` 7.6ms, `recovery` 1.2ms. None of them
+is constant-time — the cost is linear in rows, roughly 90–380ns per run — so a
+store an order of magnitude larger costs an order of magnitude more, and a caller
+polling one of these on every frame should cache it.
+
 ## Edits
 
 Every file change a run makes records the lines it added and removed, for

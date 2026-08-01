@@ -1,0 +1,42 @@
+{
+  "children": [
+    {
+      "depth": 1,
+      "last_step": 1,
+      "outcome": "success",
+      "run_id": 2,
+      "spent_tokens": 80,
+      "status": "completed",
+      "wrote": [
+        "a.txt"
+      ]
+    },
+    {
+      "depth": 1,
+      "last_step": 2,
+      "outcome": "step_cap_reached",
+      "run_id": 3,
+      "spent_tokens": 160,
+      "status": "completed",
+      "wrote": [
+        "b.txt",
+        "b.txt"
+      ]
+    }
+  ],
+  "root_last_step": 1,
+  "root_outcome": "step_cap_reached",
+  "root_run_id": 1,
+  "root_status": "completed",
+  "spent_tokens_tree": 400,
+  "tree_run_ids": [
+    1,
+    2,
+    3
+  ],
+  "workspace": "interrupted-workspace",
+  "workspace_files": {
+    "a.txt": "ALPHA\n",
+    "b.txt": "DRAFT\n"
+  }
+}

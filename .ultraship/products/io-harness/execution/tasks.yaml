@@ -1,556 +1,497 @@
 product: io-harness
-version: 0.29.0
+version: 0.30.0
 tasks:
-- id: US-IO-HARNESS-0.29.0-T01
-  summary: 'Provider plumbing: ModelInfo, PriceSource, the defaulted Provider::models(), the two new
-    module declarations and the crate-root re-exports.'
-  why_required: 'Every other task in the release names one of these types or is compiled by one of these
-    declarations. The defaulted method is also the release''s one break risk: a required method here
-    would break the crate''s only extension point.'
+- id: US-IO-HARNESS-0.30.0-T01
+  summary: >
+    Pin a 0.29.0 fixture generator and record its output, before any schema change: a
+    known-composition aggregates store, a resumable interrupted tree, and a `read` mode the
+    reverse-direction check execs.
+  why_required: >
+    The release's one ordering risk. If the generator is built after the schema moves, the
+    cross-version evidence measures this tree against itself and passes for the wrong reason. It is
+    the first commit of the release for that reason alone.
   status: done
-  depends_on:
-  - US-IO-HARNESS-0.29.0-T10
+  depends_on: []
   acceptance_criteria:
-  - 'F3 — `Provider::models()` defaults to an empty list, and the default is what keeps the crate''s
-    extension point open. A `Provider` implementation that overrides nothing but `complete` compiles
-    and returns an empty catalogue — written as the minimal out-of-tree implementer, which is the exact
-    shape `src/provider/mod.rs:674` documents. **The negative control is `Compatible::models()` against
-    a socket serving a real catalogue body, returning a non-empty list** — without it the test passes
-    against an implementation whose `models()` returns empty for everyone.
-
-    '
-  - 'NF5 — no existing public item changes. `OpenRouter`, `Anthropic` and `OpenAi` keep every method
-    and every behaviour; `Provider` gains one defaulted method and no required one; `ProviderSpec` gains
-    one variant behind the `#[non_exhaustive]` 0.27.0 put there for it. `Price` gains no field and keeps
-    `Copy`, so `..Price::ZERO` and `PriceTable::price` are untouched and tiers are a `PriceTable` method
-    rather than a change to the value type. A `PriceTable` with no tier registered returns exactly the
-    figure 0.28.0 returned, asserted rather than argued. A program written against 0.28.0 compiles and
-    behaves identically.
-
-    '
+  - >
+    **F8 — cross-version compatibility, both directions.** A database written by a real 0.29.0 build
+    opens, resumes and replays under 0.30.0 with nothing to migrate; and a 0.30.0 store is read by a
+    0.29.0 build, which never queries the new table. Proven with a pinned 0.29.0 fixture generator,
+    the way `tests/cross_version.rs` already proves it for the 0.22.0 boundary — never with a
+    database this tree wrote and labelled.
   files:
-  - src/provider/mod.rs
-  - src/lib.rs
-  - src/provider/catalog.rs
-  - src/provider/compatible.rs
+  - tests/fixtures/gen-0.29.0/Cargo.toml
+  - tests/fixtures/gen-0.29.0/Cargo.lock
+  - tests/fixtures/gen-0.29.0/src/main.rs
+  - tests/fixtures/store-0.29.0
+  - .gitattributes
+  - Cargo.toml
   evidence:
-  - 'F3 — `provider::catalogue_default::a_provider_that_overrides_nothing_reports_an_empty_catalogue`
-    implements `Provider` with `complete` and nothing else, which is exactly the shape the trait''s
-    own doc example ships and exactly what an out-of-tree implementation written before 0.29.0 looks
-    like. It is a compile-time assertion as much as a runtime one: making `models()` required stops
-    this file compiling.'
-  - '`Provider::models()` is defaulted to `async { Ok(Vec::new()) }` and carries a worked example that
-    is itself the minimal out-of-tree implementer. The negative control — a non-empty catalogue from
-    a provider pointed at a real body — lands with T03.'
-  - '`ModelInfo` and `PriceSource` added to `src/provider/mod.rs`. Every field but `id` is an Option
-    or an empty Vec and `None` means the vendor did not say; the doc example contrasts a local runtime''s
-    stated `Price::ZERO` against a hosted vendor''s `None` for the same apparent ''no cost'', which
-    is the distinction the type exists for. `price_source` is `#[non_exhaustive]`.'
-  - The socket harness at `src/provider/mod.rs::failures` is now `pub(crate)` with `serve`, `stream_response`,
-    a new `json_response` for length-delimited catalogue bodies, and a new `serve_recording` that returns
-    the request heads it was sent — so a test can assert what went onto the wire rather than what the
-    constructor stored, and an empty log proves no request was made. `drain_request` returns the head
-    verbatim and lowercases only for parsing the length.
-  - NF5 — `cargo test --doc` 261 passed, 0 failed (254 before), and `cargo build` clean. No existing
-    public item changed.
-- id: US-IO-HARNESS-0.29.0-T02
-  summary: 'The reference catalogue reader: Reference, the exact decimal-string to micro-unit conversion,
-    and the match rule.'
-  why_required: Without it the release prices nothing for the vendors that publish no prices, which
-    is the half of the outcome the fallback trigger is written against. The conversion is also the only
-    place a defect in this release becomes money rather than an error.
+  - >
+    `tests/fixtures/gen-0.29.0` resolves `io-harness =0.29.0` from crates.io and builds clean. It is
+    the previous release compiling, not this tree: it failed first against
+    `TaskContract::workspace(goal, root, verify)` and against `io_harness::state::{..}`, because
+    0.29.0 takes two arguments there and re-exports those types at the crate root. Both are facts
+    about 0.29.0's API that the current tree could not have told me.
+  - >
+    `gen-0-29-0 write ../store-0.29.0` produced `aggregates.sqlite3` (six finished runs — four
+    successes of which two have no gate failure, one step cap, one stall; gate phases 2 test-run /
+    1 criterion-compile / 1 compile; 3 fallbacks, 2 replans, 2 resumes; three memory entries) and
+    `interrupted.sqlite3` with its workspace (root stopped at the step cap, child 2 finished having
+    written `a.txt` = ALPHA, child 3 out of steps with `b.txt` = DRAFT, tree spend 400 tokens).
+  - >
+    Each sidecar carries `composition` — the literals this generator chose, which is where F7's
+    expectations come from — beside `read_back`, which is what 0.29.0's own API returned from the
+    finished store and is what the forwards half of F8 compares against.
+  - >
+    A defect found and fixed while committing: `.gitattributes` matched `tests/fixtures/**` as
+    `text eol=lf`, so `git add` rewrote `0D 0A` to `0A` inside a database file. Both new fixtures
+    tripped it. `tests/fixtures/**/*.sqlite3 binary` now overrides it, and the staged blobs are
+    byte-identical to the working files (155,648 = 155,648 for both). The 0.22.0 fixtures survived
+    only because no page of theirs contained that byte pair.
+
+- id: US-IO-HARNESS-0.30.0-T02
+  summary: >
+    Per-key configuration provenance: an `Origin` recorded for every leaf key as each scope is
+    merged, surviving substitution and the `[profile.<name>]` overlay, read back by
+    `Config::origin` and `Config::origins`.
+  why_required: >
+    Without it the release does not answer the first of the three questions, and it is the only one
+    of the three whose absence makes a settings screen actively misleading rather than merely
+    absent.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.29.0-T01
+  - US-IO-HARNESS-0.30.0-T01
   acceptance_criteria:
-  - 'F4 — a decimal price string becomes an exact integer, and no `f64` is on the path. `"0.0000002574"`
-    becomes exactly `257_400` micro-units per million tokens, and a table of hand-computed cases covers
-    a value with fewer fraction digits than the shift, one with more (rounded half-up at the twelfth
-    place), `"0"`, an integer with no point, and a malformed string that yields `None` rather than a
-    zero. **The named negative control is `f4_the_conversion_is_not_a_float_multiply`: the same inputs
-    run through an `f64` multiply must produce a value that differs from the exact result for at least
-    one case in the table**, so the test proves the implementation is not the float one rather than
-    merely agreeing with it on easy inputs. A second control asserts a malformed price is `None` and
-    never `Some(0)`.
-
-    '
-  - 'F5 — a reference price is matched exactly or by one documented normalisation, and a miss stays
-    `None`. An exact slug matches; `deepseek/deepseek-chat` matches a vendor id of `deepseek-chat` by
-    dropping the single leading segment, case-insensitively. **Three negative controls:** a vendor id
-    the reference does not carry under either rule is `None` and never a nearest entry — asserted with
-    the roadmap''s own example, a reference carrying `deepseek/deepseek-chat` and a vendor asking for
-    `deepseek-v4-flash`; two reference entries normalising to the same key make that key ambiguous and
-    therefore `None`, not first-wins; and a two-segment vendor id is not matched against a one-segment
-    reference entry by stripping in the other direction, because one normalisation means one.
-
-    '
-  files:
-  - src/provider/catalog.rs
-  evidence:
-  - 'F4 — `f4_a_decimal_rate_becomes_an_exact_integer` runs a 19-case hand-computed table: deepseek/deepseek-chat''s
-    own 0.0000002574 -> 257_400, gemini-2.5-pro''s base and its 200k override, fewer fraction digits
-    than the shift, an integer with no point, a stated zero, and half-up rounding at the twelfth place
-    asserted on both sides.'
-  - F4's named negative control — `f4_the_conversion_is_not_a_float_multiply` — earned its keep. The
-    first discriminating case chosen (0.0000006000000000000001) turned out to survive an f64 round trip,
-    so the control FAILED and the table did not discriminate. Ten live catalogue values were then found
-    where `(s.parse::<f64>()? * 1e12) as u64` truncates one micro-unit low — 0.00000003 is qwen/qwen3.7-flash's
-    own prompt rate — and the control now asserts the disagreeing set equals `FLOAT_TRAPS` exactly and
-    that `naive + 1 == exact` for each. A control that discriminates on nothing now fails.
-  - '`f4_a_malformed_rate_is_absent_rather_than_free` — a negative rate, an unparseable string and an
-    empty one all yield 0 at the digit level, while `Pricing::price()` returns None when no dimension
-    was named at all and `Some(Price::ZERO)` when exactly one was stated as zero. The rule is ''nothing
-    was named'', not ''everything came out zero''.'
-  - 'F5 — exact slug, case-insensitive; the one normalisation (drop a single leading `vendor/` segment)
-    proven on deepseek/deepseek-chat -> deepseek-chat. Three named negative controls: the roadmap''s
-    own `deepseek-v4-flash` miss stays None; two entries normalising to one key make it ambiguous and
-    therefore None rather than first-wins, while both stay reachable by exact slug; and the normalisation
-    is not applied in the other direction.'
-  - '`the_live_shape_parses_into_model_info` parses a body trimmed verbatim from the live response.
-    gemini-2.5-pro''s 200k override carries no `input_cache_write`, and the tier is asserted to keep
-    the base 375_000 rather than zero — the sparse-merge half of F11, and the difference between a tier
-    and a truncation. A row that priced nothing is None on both price and price_source.'
-  - F6's catalogue half — `every_price_carries_its_provenance_and_the_two_cannot_disagree` asserts `price.is_some()
-    == price_source.is_some()` across every entry, and that a reference price names the host it came
-    from. `the_catalogue_is_read_once_per_instance` pins the instance cache; `the_host_is_knowable_before_any_request_is_made`
-    pins the property the egress boundary rests on.
-  - '`cargo test --lib provider::catalog` — 14 passed, 0 failed. No new dependency: serde_json and reqwest
-    only, and the decimal shift is std string handling.'
-- id: US-IO-HARNESS-0.29.0-T03
-  summary: 'The Compatible provider: the base URL and auth style, the preset table and its named constructors,
-    models(), and the opt-in reference lookup in endpoints().'
-  why_required: It is the release. Twenty-one vendors are reachable without writing a provider, or the
-    outcome sentence is false.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.29.0-T02
-  acceptance_criteria:
-  - 'F1 — one `Compatible` reaches a vendor''s chat endpoint through the real HTTP and SSE path, and
-    the preset decides the URL and the auth. A `Compatible` pointed at a local socket completes a streamed
-    response with text and a tool call, asserted through `Compatible::at`, and the request the socket
-    received carries `Authorization: Bearer <key>` and a path ending `/chat/completions`. **Two negative
-    controls:** an `Auth::None` provider''s request carries **no** `Authorization` header at all, asserted
-    on the received head rather than on the constructor — so "auth style" is proven to reach the wire
-    and not merely to be stored; and a base URL already ending in a path segment (`/openai/v1`, `/api/paas/v4`)
-    produces that segment plus `/chat/completions` rather than a URL with the segment lost, which is
-    the failure mode a scheme-and-host field would have had.
-
-    '
-  - 'F2 — every preset in the table names a distinct vendor with a well-formed absolute base, and the
-    named constructors and the table cannot disagree. Each entry''s `base_url` parses as an absolute
-    `https`/`http` URL with a host, no entry''s name repeats, and each of the twenty-one named constructors
-    is asserted to produce the base and the auth style its table row states. **The negative control
-    is the check run against a table with one row''s base replaced by a relative path and another row
-    duplicated, which must report exactly those two rows** — a validator that always answers "fine"
-    is the failure mode, and it must be seen answering otherwise.
-
-    '
-  - 'F6 — a price carries its provenance, and the two fields cannot disagree. A model priced from the
-    vendor''s own catalogue is `PriceSource::Vendor`; the same model filled from the reference is `PriceSource::Reference(host)`
-    naming the host that was dialled. Across a whole parsed catalogue, `price.is_some()` and `price_source.is_some()`
-    are asserted **equal for every entry**. **The negative control is a vendor catalogue with no pricing
-    object at all** — every entry `None` on both, which is the state that must not be reported as a
-    free model.
-
-    '
-  - 'F7 — the reference lookup is off by default, and when on its host is governed like every other
-    endpoint. A `Compatible` built normally reports exactly one endpoint and makes no second request,
-    asserted by a reference server that records whether it was ever connected to. With `with_reference_prices`,
-    `endpoints()` reports both, and a run under a policy that denies the reference host **fails** rather
-    than proceeding with prices missing — asserted on the run''s error through the existing authorisation
-    at `src/run.rs:4630`. **Two negative controls:** the byte-identical run under a policy that allows
-    the host reaches its own ending, so the refusal is proven to be about the policy and not about the
-    feature being broken; and the default-off provider under the same denying policy still runs, so
-    the deny is proven to be about the second host and not about the provider''s own.
-
-    '
-  files:
-  - src/provider/compatible.rs
-  evidence:
-  - 'F1 — `f1_a_streamed_completion_arrives_through_the_real_http_and_sse_path` drives the whole HTTP+SSE
-    path against a local socket via `Compatible::at`, and asserts on the request head the socket actually
-    received: the bearer token and a path ending `/chat/completions`. Two named negative controls: `f1_an_auth_none_provider_sends_no_authorization_header_at_all`
-    proves the auth style reaches the wire rather than merely being stored, and `f1_a_base_that_already_carries_a_path_keeps_every_segment_of_it`
-    proves a nested base survives — the failure a scheme-and-host field would have had against four
-    presets.'
-  - '`a_failure_is_classified_exactly_as_the_three_original_providers_classify_it` — a 429 through Compatible
-    is RateLimited/Some(429), the same as the other three, because it funnels through the same `ensure_success`.
-    Asserted rather than assumed, since ''it shares the wire module'' is the release''s structural claim.'
-  - 'F2 — `f2_every_preset_names_a_distinct_vendor_with_a_well_formed_base` over 21 rows (13 hosted,
-    8 local). `f2_the_table_check_reports_a_broken_row_rather_than_always_passing` is the named negative
-    control: the validator run over a table with one relative base and one duplicated name must report
-    exactly those two. `f2_every_named_constructor_agrees_with_its_table_row` drives all 21 constructors
-    and asserts base, auth and trace label against the table, which is also what proves `Compatible::known`''s
-    expect unreachable.'
-  - '`f2_a_local_runtime_takes_no_key_and_a_hosted_one_takes_a_bearer` splits the table against a named
-    list of the eight runtimes rather than guessing from the URL. `f2_an_unknown_preset_is_refused_naming_the_ones_that_exist`
-    — ''grok'' is refused listing ''groq'' and ''ollama'' among the rest, with the accepted name as
-    the control.'
-  - F3's negative control — `f3_a_connected_provider_returns_a_non_empty_catalogue` returns 2 models
-    from a real body, so the defaulted-empty assertion in `provider::catalogue_default` cannot pass
-    against an implementation whose models() is empty for everyone. A vendor publishing identifiers
-    and no cost is None on price and price_source, never free.
-  - 'F7 — `f7_the_reference_lookup_is_off_until_it_is_asked_for` uses a recording reference server:
-    a provider that did not opt in leaves its log EMPTY (one endpoint, no second request), and one that
-    opted in reports two endpoints and dials it exactly once. An empty log is proof a return value alone
-    cannot give.'
-  - 'F6 — `f6_a_reference_price_fills_a_gap_and_says_it_is_a_reference_price`: deepseek-chat matches
-    deepseek/deepseek-chat by the one normalisation and is marked PriceSource::Reference; llama3.2,
-    which the reference does not carry, is left None rather than guessed; and price.is_some() == price_source.is_some()
-    across the whole list.'
-  - '`a_price_table_carries_the_moment_it_was_read_rather_than_a_typed_date` — price_table() dates itself
-    YYYY-MM-DD from the fetch. `crate::net::today_utc` was added rather than ungating the test-only
-    `http_date`, using Hinnant''s civil-from-days; `the_civil_date_is_exact_across_leap_years_and_century_rules`
-    covers the epoch, 2000-02-29 and the 2100 non-leap boundary. A model nobody priced is absent from
-    the table, never entered at zero.'
-  - '`cargo test --lib` — 356 passed, 0 failed. `cargo clippy --all-targets -- -D warnings` — clean.'
-- id: US-IO-HARNESS-0.29.0-T04
-  summary: ProviderSpec::Compatible in the file format, its exactly-one base rule, and every key of
-    it named in EVERY_KEY.
-  why_required: An operator has configured the harness in a file rather than in Rust since 0.19.0, and
-    a provider kind the file cannot name is a provider io-cli and io-studio cannot select.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.29.0-T03
-  acceptance_criteria:
-  - 'F9 — the config variant reaches a typed field, is exactly-one about its base, and rejects what
-    it does not know. `EVERY_KEY` (`tests/config.rs:233`) gains a `kind = "compatible"` entry covering
-    every key, and `f7_every_key_reaches_a_typed_field` (`:362`) asserts each lands. **The negative
-    control is its existing twin** (`:525`), extended to one new key, so the fixture proves the field
-    is read rather than defaulted. Plus: an entry with **neither** `base_url` nor `preset`, and one
-    with **both**, are each refused naming the entry''s index; an unknown `preset` name is refused listing
-    the names that exist; and an unknown key inside the entry is rejected naming it, modelled on `an_unknown_key_inside_the_web_table_is_rejected_naming_it`
-    (`:1242`).
-
-    '
+  - >
+    **F1 — provenance across four scopes.** A fixture setting the same key in defaults, user,
+    project and local resolves to the local value and reports the local scope and that file's path.
+    Removing the local file makes it report project, and so on down. Asserted at each of the four
+    steps, so the test discriminates between "reports the last scope" and "reports the deciding
+    scope" — which are the same answer only when the key is set everywhere.
+  - >
+    **F2 — provenance through substitution.** A key whose value came from `${env:}` reports the file
+    the substitution was written in, not the environment variable and not the process environment.
+    A key whose value came from `${cmd:}` does the same. The negative control is the same key
+    written literally, which must report the identical origin — if it does not, the implementation
+    is reporting the mechanism rather than the source.
+  - >
+    **F3 — a project scope that narrowed a user's setting is visible.** The case 0.27.0's trust rule
+    creates: a boundary set in the user scope and narrowed in the project scope resolves to the
+    project value and reports the project file. This is the specific question the whole feature
+    exists to answer and it gets its own named test.
   files:
   - src/config.rs
   - tests/config.rs
   evidence:
-  - 'F9 — `EVERY_KEY` (tests/config.rs) gains a `kind = "compatible"` entry naming all seven keys, and
-    `f7_every_key_reaches_a_typed_field` asserts the whole `ProviderSpec::Compatible` value including
-    `auth: Some(Auth::None)`, `name`, and `reference_prices: true` — so each key is proven to reach
-    a typed field rather than being accepted and dropped.'
-  - 'The negative-control twin `f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default`
-    is extended to `reference_prices`: with the key removed the flag falls back to false while its neighbour
-    `auth` does not. That is the difference between a provider that dials a second host and one that
-    does not, so the fixture proves the key is read.'
-  - 'Exactly-one enforced in code, reported by entry index: `a_compatible_provider_naming_neither_base_nor_preset_is_refused_by_index`
-    (names #1, both key names, and lists the presets), `a_compatible_provider_naming_both_base_and_preset_is_refused`
-    (#0, and says one would be silently ignored), `an_unknown_preset_is_refused_listing_the_ones_that_exist`
-    (''grok'' surfaces ''groq'').'
-  - '`each_valid_shape_of_a_compatible_provider_loads` is the named negative control for all three refusals:
-    a preset alone, a base_url alone, and a second preset name all load, and the three original kinds
-    still load unchanged — so the rule cannot be satisfied by an implementation that refused every compatible
-    entry or refused [[provider]] wholesale, which is the shape 0.27.0''s F4 control exists to catch.'
-  - '`an_unknown_key_inside_a_compatible_provider_is_rejected_naming_it` — `reference_price` (singular)
-    is rejected naming the key and the file. Exactly-one is enforced in code rather than through a nested
-    tagged enum precisely so `deny_unknown_fields` survives; a `#[serde(flatten)]` for the shared keys
-    would have inherited the standing [[mcp]] hole.'
-  - Validation runs at both load paths — `Config::from_toml` and `read_scope` — through one `check_providers`
-    helper beside `Hooks::check`, so a scope-merged file and a single-string file are held to the same
-    rule.
-  - '`cargo test --test config` — 42 passed, 0 failed (37 before).'
-- id: US-IO-HARNESS-0.29.0-T05
-  summary: docs/guide/providers.md, with its limits block and the line explaining why Compatible has
-    no from_env.
-  why_required: tests/guide_pages.rs fails without the page once it is named in GUIDES, and a capability
-    with no guide page is the documentation defect 0.16.0 exists to prevent.
+  - >
+    `Origin { scope, path }` and a `BTreeMap<String, Vec<Origin>>` on `Config`, filled by
+    `record_origins` walking each scope's own table *before* `merge` folds it into everything read
+    so far — after the merge there is nothing left to say which file a key came from. The walk
+    mirrors `merge`'s own notion of a leaf (a table recurses, anything else is a leaf), so the two
+    cannot disagree about what a key is.
+  - >
+    F1 — `origin_reports_the_deciding_scope_at_every_step_down` walks the same four steps
+    `f1_the_four_scopes_merge_in_order` walks, asserting the origin at each: local, then project,
+    then user, then empty. Taken at every step because "the last scope read" and "the deciding
+    scope" agree only while the key is set everywhere.
+    `origin_of_a_key_only_one_file_sets_is_that_file_not_the_last_one_read` is the sharper half: a
+    later file exists and names something else, and an implementation reporting the last file read
+    answers wrong.
+  - >
+    F2 — `origin_of_a_substituted_value_is_the_file_it_was_written_in` runs `${env:}`, `${cmd:}` and
+    the same key written literally through the same file and asserts all three report an identical
+    `Origin`. It needed no implementation work, and that is the finding worth keeping: `parse`
+    substitutes per file before anything merges, so a substituted value's origin is the declaring
+    file by construction. `${cmd:}` is written in the local scope because the project scope refuses
+    it — 0.27.0's rule, unchanged.
+  - >
+    F3 — `origin_shows_the_project_file_that_narrowed_a_user_setting` sets `policy.defaults.exec` to
+    allow in the user scope and deny in the project scope, and asserts both that the origin is the
+    project file and that `Policy::check` still returns `Deny`: the origin describes the resolution,
+    it does not alter it.
+  - >
+    Two cases the criteria did not name and the implementation had to decide. `policy.layers` and
+    `agent` append across scopes, so `origin` returns *every* contributing file in order rather than
+    inventing a winner — `origin_of_an_appending_key_lists_every_file_that_contributed`. And
+    `with_profile` moves each `profile.<name>.<key>` origin onto the key it now decides and drops
+    the `profile.` entries, since the returned configuration carries no `[profile]` section —
+    `origin_after_a_profile_overlay_names_the_file_the_profile_came_from`.
+  - >
+    The open question in the contract — provenance on demand or a map built once — is decided as a
+    map built at load, because the known consumer renders a whole settings list and a per-key walk
+    would re-read the tables once per row. `Config::origin(key)` and `Config::origins()` are both
+    lookups into it.
+  - >
+    `cargo test --test config origin_` 6 passed, 0 failed. `cargo test --doc config::` 24 passed, 0
+    failed, which includes the two new worked examples. `Config::from_toml` records nothing, exactly
+    as `sources()` returns nothing there: parsed text has no file behind it, and naming `io.toml`
+    for it would name a file that was never read.
+
+- id: US-IO-HARNESS-0.30.0-T03
+  summary: >
+    `MemoryEntry` gains a `#[non_exhaustive]` kind and a pinned flag, with a pinned entry refusing an
+    overwrite by a run and the refusal recorded as an observable event.
+  why_required: >
+    The second question. A human who cannot correct what the agent has learned, and cannot make the
+    correction stick, has a memory they can only read.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.29.0-T03
+  - US-IO-HARNESS-0.30.0-T01
   acceptance_criteria:
-  - 'OP3 — `docs/guide/providers.md` exists, is named in `tests/guide_pages.rs::GUIDES` with `limits_block:
-    true`, is listed in `docs/CAPABILITIES.md` and in the README''s guide table, and its "The limits,
-    stated plainly" block states what this release creates: that `Compatible` is one wire and not a
-    compatibility layer, that a vendor catalogue mostly carries no prices, that a reference price is
-    the aggregator''s and not the vendor''s, that a match that is not exact or the one normalisation
-    stays unpriced rather than guessed, and that the reference lookup dials a host the caller did not
-    name and is therefore off until asked for. It also carries the one line explaining why `Compatible`
-    has no `from_env` and what to write instead.
-
-    '
+  - >
+    **F4 — kinds round-trip.** A decision written and read back is a decision; a fact is a fact. The
+    enum is `#[non_exhaustive]`, and a test asserts an exhaustive census of its variants against the
+    source the way `EVENT_NAMES` is asserted against `EventKind` — the 0.28.0 lesson that a match
+    arm proves exhaustiveness and a hand-written list does not.
+  - >
+    **F5 — a pinned entry survives a run that tries to overwrite it.** After the run, the value is
+    the pinned one, and the attempt is in the trace as an observable event. Both halves are
+    asserted: a silent refusal would leave the agent believing it had corrected something.
   files:
-  - docs/guide/providers.md
-  - tests/guide_pages.rs
+  - src/state.rs
+  - src/run.rs
+  - src/lib.rs
+  - tests/memory.rs
   evidence:
-  - OP3 — `docs/guide/providers.md` created (~330 lines) and named in `tests/guide_pages.rs::GUIDES`
-    as `("providers.md", true)` with a 0.29.0 why-comment in the existing style. Written from the source
-    — compatible.rs, catalog.rs, mod.rs, pricing.rs — and from fallback.rs, where it was confirmed that
-    `Fallback` does not override `models()` and therefore inherits the empty default.
-  - 'The limits block states all seven required points, and the vLLM/SGLang paragraph is written as
-    the page''s most important line and says so: no tool calls at all without a server-side parser flag,
-    no error, the agent simply talks.'
-  - Covers the 21 presets split hosted/local, `Auth::None` sending no header at all, the five non-/v1
-    bases as a table, the no-`from_env` reason with the `${env:}` TOML, Bedrock/Vertex/Azure unreachable
-    with the mint-your-own-bearer route, matching, price tiers, and `price_table()` dated by the fetch.
-  - '`cargo test --test guide_pages` 7 passed, `--test readme` 8 passed, `--test docs_drift` 10 passed.'
-- id: US-IO-HARNESS-0.29.0-T06
-  summary: The README providers paragraph and guide-table row, the CAPABILITIES entry, and the [[provider]]
-    section in the configuration guide.
-  why_required: The README names three vendors four lines under a tagline that says any provider. This
-    release is what makes the tagline true and the paragraph is where a reader finds out.
+  - >
+    `MemoryKind` (`#[non_exhaustive]`, `Fact` by default), `MemoryEntry::kind` and
+    `MemoryEntry::pinned`, `MemoryWrite`, `Store::memory_write` and `Store::memory_pin`. Two
+    nullable columns on `memory` rather than a rewrite: `NULL` kind reads as `Fact` and `NULL`
+    pinned as false, which is what every pre-0.30.0 entry actually was. `memory_put` is now a
+    wrapper over `memory_write` with the kind fixed to `Fact`, so its signature and behaviour are
+    unchanged and there is one write path rather than two that can drift.
+  - >
+    The guard is `WHERE memory.pinned IS NOT 1` inside the upsert, not a read-then-write in the
+    caller, so two writers on one store cannot interleave between the check and the write. `IS NOT`
+    rather than `!=` is load-bearing: `NULL != 1` is `NULL`, which SQLite reads as false, and that
+    comparison would have refused every entry written before this release.
+  - >
+    F4 — `state::tests::memory_kind_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+    parses `pub enum MemoryKind` out of `src/state.rs` (CRLF normalised first, the 0.28.0 Windows
+    lesson) and asserts the variants equal the list `from_stored` reads back, then round-trips each
+    one through a real store. A variant added without a `from_stored` arm would round-trip to `Fact`
+    silently, which is the 0.25.0 `every_kind()` defect in a different table.
+  - >
+    F5 — `a_pinned_entry_survives_a_run_that_tries_to_overwrite_it` runs the real loop with a
+    scripted `remember` call against a pinned entry: the value is still the operator's, the kind is
+    still `Decision`, `memory_refused` is in the trace and `memory_write` is not. Its control,
+    `the_same_write_lands_when_the_entry_is_not_pinned`, runs the identical script against an
+    unpinned entry and asserts the write lands — without it the first test passes against an
+    implementation that refuses everything.
+  - >
+    The refusal also reaches the model as an observation rather than only the trace, so the agent
+    learns its correction did not take. It is a `ContextEvent` kind rather than a new `EventKind`
+    variant, because the question it answers — did my pin hold — is asked after the run by somebody
+    reading the store, and the contract's observability note says this release adds no event kind.
+  - >
+    A pinned entry is also exempt from cap eviction, which the criteria did not name and the feature
+    requires: a correction that survives an overwrite and then disappears because the agent wrote
+    twenty notes afterwards has not survived. It still counts towards the caps, so pinning
+    everything fails loudly instead of quietly raising the ceiling.
+
+- id: US-IO-HARNESS-0.30.0-T04
+  summary: >
+    The per-run recall record: a new table, a write at recall time, and an accessor answering which
+    entries a given run actually drew on.
+  why_required: >
+    "What does the agent know" and "what did this run use" are different questions, and only the
+    second tells a reader whether a memory entry was load-bearing.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.29.0-T03
+  - US-IO-HARNESS-0.30.0-T03
   acceptance_criteria:
-  - 'OP4 — README''s "Providers, with fallback" paragraph (`README.md:156`) is rewritten. It names only
-    OpenRouter, Anthropic and OpenAI today, while the tagline four lines above says "any provider" —
-    this release is what makes that true and the paragraph is where a reader finds out. `docs/guide/configuration.md`
-    gains a `### [[provider]]` subsection covering the new kind, and its limits block grows.
-
-    '
+  - >
+    **F6 — the recall record names the run.** A run that recalls three of six entries produces a
+    record naming those three and that run, and a second run over the same workspace produces its
+    own record without disturbing the first.
   files:
-  - README.md
-  - docs/CAPABILITIES.md
+  - src/state.rs
+  - src/context.rs
+  - tests/memory.rs
+  evidence:
+  - >
+    A `memory_recalls` table indexed on `run_id`, `Store::record_memory_recall` (crate-internal, so
+    only the assembler writes it) and `Store::memory_recalls` with a `MemoryRecall` row. One row per
+    key per recall rather than a flag on the entry: an entry recalled by two runs is two facts, and
+    a flag keeps only the later one.
+  - >
+    `render_notes` now returns the keys it kept rather than a count, `Assembled` gains
+    `recalled_keys`, and both run loops — single-workspace and tree — record the recall for their
+    own run. `Assembled` already derives `Default`, which is the type shape the contract's migration
+    note names as safe to add a field to; `Assembly` was deliberately left alone, since it has no
+    `Default` and a new field there would break a struct literal.
+  - >
+    F6 — `the_recall_record_names_which_entries_a_run_actually_used` writes six entries where the
+    three oldest are each `MEMORY_MAX_ENTRY_CHARS` long, runs with a 2,000-token prompt ceiling, and
+    asserts the record names exactly `small-0..2` for that run. "Three of six" is a property of the
+    sizes and the newest-first fit rule, not of a token estimate the test would otherwise be pinned
+    to. A second run over the same workspace produces its own identical record with the first
+    untouched, and a run id that never existed recalls nothing.
+  - >
+    First attempt failed for the right reason: with the default 24,000-token budget every note fit
+    and the assertion read six of six. The fix was to shrink the contract's context budget, not to
+    weaken the assertion.
+
+- id: US-IO-HARNESS-0.30.0-T05
+  summary: >
+    Outcome, gate and recovery aggregates on `Store`, in the shape `src/pricing.rs` established:
+    grouped rows out, no rendering, and no accessor for a number the trace cannot answer honestly.
+  why_required: >
+    The third question, and the one every consumer currently re-derives from raw rows — which is the
+    duplication the 0.18.0 cost grouping exists to prevent.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.30.0-T01
+  acceptance_criteria:
+  - >
+    **F7 — the aggregates are right against a known trace.** A fixture store built with a known
+    composition — a fixed number of runs, a known number of first-try passes, a known distribution
+    of gate failures, and a known count of fallbacks, replans and resumes — produces exactly those
+    numbers. The expected values come from the fixture's construction, never from running the
+    accessor and recording what it said.
+  - >
+    **N2 — the aggregates do not scale with the trace.** Each is one indexed query, not a table
+    scan the caller pays for on every render. Measured against a store with a large trace and the
+    number recorded; the point is that a panel refreshing does not get slower as history grows.
+  files:
+  - src/state.rs
+  - src/lib.rs
+  - tests/accounting.rs
+  evidence:
+  - >
+    Five accessors and three row types: `runs_by_outcome`, `runs_by_day`, `gate_failures_by_phase`
+    (all returning `Tally`), `first_try` (`FirstTry`) and `recovery` (`Recovery`). Each is one SQL
+    `GROUP BY` or count — unlike the 0.18.0 spend groupings, which read every call row into Rust
+    because the price table is a Rust value the SQL cannot see. Rows out, no rendering, no rate.
+  - >
+    Two things are deliberately NOT shipped, which is the honest half of the task. `first_try`
+    returns three counts and no rate, because *first_try / succeeded* and *first_try / runs* are
+    both legitimate and picking one silently would decide for the caller. And `Recovery` has no
+    escalation count: nothing records an escalation as an event, and an escalation is the opposite
+    of a rescue anyway — the contract's open question is answered "its own row, and not until
+    something records it".
+  - >
+    F7 — `f7_the_aggregates_are_right_against_a_known_composition` reads the committed 0.29.0
+    fixture, on a copy, and asserts every accessor against the `composition` literals in its
+    sidecar. The fixture is built so runs (6), succeeded (4) and first_try (2) all differ, and the
+    test asserts they differ: with any two equal it would pass against an accessor that confused
+    them. `the_aggregates_over_an_empty_store_are_empty_rather_than_absent` is the other end — zero
+    rows and zeroed counts, not an error and not a plausible number.
+  - >
+    N2 — `state::tests::every_aggregate_reaches_its_rows_through_an_index` asserts the *query plan*
+    of all seven statements names an index, with a control that must NOT (a `COUNT(*)` over
+    `runs.goal`, which has no index) so the check can be seen answering no. A wall-clock assertion
+    was rejected on purpose: it is flaky on a loaded runner and it passes on a fast machine running
+    a full scan. Five indexes were added — `run_outcomes (outcome)`, `run_outcomes (finished_at)`,
+    `sandbox_events (kind, detail)`, `sandbox_events (run_id, kind)`, `context_events (kind)`,
+    `checkpoint_events (kind)` — created after every table, since the first attempt declared them
+    beside the memory table and named `run_outcomes` before it existed.
+  - >
+    N2's measurement, recorded rather than asserted. Store built in memory, macOS, debug build.
+    At 1,000 finished runs: runs_by_outcome 325µs, gate_failures_by_phase 135µs, first_try 353µs,
+    recovery 79µs. At 20,000 runs: 1.81ms, 2.47ms, 7.64ms, 1.19ms.
+  - >
+    **N2's wording over-claims and the measurement is what shows it.** "The aggregates do not scale
+    with the trace" is not achievable for an aggregate over full history — counting every row is
+    what the answer *is*, so the cost is linear in rows no matter which index serves it. Twenty
+    times the runs cost roughly five times (runs_by_outcome) to twenty times (first_try) as long.
+    What IS true, and is what the criterion's own second sentence asks for, is that each is one
+    indexed query rather than a table scan, at roughly 90–380ns per run. Raising it for the owner
+    rather than quietly reading the criterion as satisfied; making it literally true would need
+    materialised counters, which is a different release.
+  - >
+    One optimisation attempt was measured and reverted: rewriting `first_try`'s correlated
+    `NOT EXISTS` as a LEFT JOIN onto a `DISTINCT` subquery made it **25 seconds** at 20,000 runs
+    against 7.6ms, because the subquery materialises without an index and every outcome row then
+    probes it linearly. The comment beside the query records the number so nobody re-proposes it.
+  - >
+    `gate_failures_by_phase` groups on `detail` directly rather than on a `COALESCE` of it — a
+    function in the GROUP BY makes the (kind, detail) index unusable and SQLite falls back to a scan
+    plus a temp B-tree, which the plan test caught. The NULL is handled in `tally`, where it costs
+    nothing, as the key `(none)`.
+
+- id: US-IO-HARNESS-0.30.0-T06
+  summary: >
+    The cross-version test over the committed 0.29.0 fixtures — read-back, resume, and the reverse
+    direction where a 0.29.0 binary reads a store this tree wrote — plus the CI job that runs it.
+  why_required: >
+    Without it the additive-migration claim is an assertion. Both directions have to be executed by
+    the release that makes the claim, and one of them can only be executed by the previous binary.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.30.0-T04
+  - US-IO-HARNESS-0.30.0-T05
+  acceptance_criteria:
+  - >
+    **F8 — cross-version compatibility, both directions.** A database written by a real 0.29.0 build
+    opens, resumes and replays under 0.30.0 with nothing to migrate; and a 0.30.0 store is read by a
+    0.29.0 build, which never queries the new table. Proven with a pinned 0.29.0 fixture generator,
+    the way `tests/cross_version.rs` already proves it for the 0.22.0 boundary — never with a
+    database this tree wrote and labelled.
+  files:
+  - tests/cross_version_0_29_0.rs
+  - .github/workflows/ci.yml
+  evidence:
+  - >
+    F8 forwards — `a_0_29_0_store_reads_back_identically_under_0_30_0` opens a copy of the
+    0.29.0-written `aggregates.sqlite3` and asserts every memory entry, run summary, gate event and
+    context event against the sidecar's `read_back`, which is what 0.29.0's own API returned. The
+    two new fields arrive at their documented defaults — every entry is `MemoryKind::Fact` and
+    unpinned, which is what those entries actually were — and `PRAGMA user_version` on the file is
+    still 7, so no format bump slipped in.
+  - >
+    F8 forwards, the half rows cannot cover — `a_0_29_0_tree_resumes_under_0_30_0` resumes the tree
+    0.29.0 stopped at its step cap and drives it to verified success. No run in the tree gains a
+    duplicate step number, the child that had already finished gains neither a step nor a token, the
+    tree total is exactly what 0.29.0 drew plus what this release drew, and `a.txt` still holds one
+    `ALPHA`.
+  - >
+    F8 backwards — `a_0_30_0_store_is_read_by_a_0_29_0_binary` writes a store using every 0.30.0
+    surface (a pinned decision, a plain fact, a finished run) and then execs the pinned 0.29.0
+    binary's `read` mode over it. Ran locally: exit 0, `"reader": "io-harness 0.29.0"`, both keys and
+    both values read back, attribution intact. What it does not see is the kind and the pinned flag,
+    which is the point — those are columns its queries never name.
+  - >
+    That test is `#[ignore]` by default, because it needs `tests/fixtures/gen-0.29.0` built and a
+    test that silently passes when its subject is missing is worse than one visibly not run. CI's
+    new `cross-version-0.29.0` job builds the generator and runs it with `-- --ignored --exact`.
+  - >
+    The job carries a control of its own: it greps `tests/fixtures/gen-0.29.0/Cargo.toml` for
+    `io-harness = "=0.29.0"` and fails if the pin has drifted. That is the one way this job could
+    quietly stop proving anything — an "older binary" that is not older — and the failure would
+    otherwise be silent by construction. Same instinct as the `links-consumer` job's negative
+    control.
+  - >
+    `cargo test --test cross_version_0_29_0` 2 passed, 1 ignored; with `-- --ignored`, 1 passed.
+    The CI file parses and its job list is test, msrv, lint, links-consumer, cross-version-0.29.0,
+    docs.
+
+- id: US-IO-HARNESS-0.30.0-T07
+  summary: >
+    Documentation: the three guide pages, `docs/CONTRACT.md`, `CHANGELOG.md`, `docs/public-api.txt`,
+    the version bump, and a worked example on every added public item.
+  why_required: >
+    A capability documented only in rustdoc is a capability only a reader who already knows it exists
+    will find, and the public-surface snapshot is enforced by a test rather than by habit.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.30.0-T02
+  - US-IO-HARNESS-0.30.0-T04
+  - US-IO-HARNESS-0.30.0-T05
+  acceptance_criteria:
+  - >
+    **N3 — nothing breaks.** No public item is renamed or removed, no signature changes, no default
+    changes. `docs/public-api.txt` gains lines and loses none, and the changelog carries no
+    `**BREAKING` entry. If one becomes necessary the release is wrong, not the rule.
+  - >
+    **N4 — every added public item carries a worked example**, enforced by the existing test that
+    enumerates the surface re-exported from `lib.rs` and fails on any item whose docs carry no
+    fenced example.
+  files:
   - docs/guide/configuration.md
-  evidence:
-  - 'OP4 — README''s ''Providers, with fallback'' paragraph rewritten: the Compatible provider by base
-    URL + auth + key + model, 21 presets named in full (13 hosted, 8 local), a local model costing nothing
-    to run, and `Provider::models()`. The original fallback sentence is kept verbatim. A Providers row
-    added to the README guide table.'
-  - '`docs/CAPABILITIES.md` gains the guide/providers.md row, and its stale ''Providers — OpenRouter,
-    Anthropic, OpenAI'' bullet under ''Beyond the pillars'' was corrected — it named only three.'
-  - '`docs/guide/configuration.md` gains a `#### kind = "compatible"` subsection under the existing
-    0.27.0 [[provider]] section with the exact shipped schema and no invented keys: the exactly-one-of
-    rule reported by array index, the 21 preset names, the auth default, and the reference_prices/Act::Net
-    rule. Its limits block grew by two paragraphs — a preset base URL is a shipped default with base_url
-    as the escape hatch, and reference_prices is egress to a third host.'
-  - '`cargo test --test readme` 8 passed, `--test guide_pages` 7 passed.'
-- id: US-IO-HARNESS-0.29.0-T07
-  summary: tests/parity.rs extended so the same task contract reaches verified success through Compatible
-    beside the three built-ins.
-  why_required: Provider-agnosticism is a property the loop either has or does not, and this file is
-    the one that asserts it. A fourth provider that needed the contract changed would disprove the release's
-    own claim.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.29.0-T03
-  acceptance_criteria:
-  - 'F8 — `Compatible` runs a real task contract to verified success, beside the three built-ins. `tests/parity.rs`
-    gains it as a fourth provider under the same contract, and the trace records its name. **The negative
-    control is the existing three still passing unchanged in the same loop**, which is what proves the
-    addition is a fourth path and not a rewrite of the three.
-
-    '
-  files:
-  - tests/parity.rs
-  evidence:
-  - F8 — `tests/parity.rs` now drives four providers under the identical contract. The fourth loop entry
-    is produced by a real `Compatible::groq(..).name()` rather than a typed literal, and the three existing
-    names run unchanged in the same loop, which is the negative control the criterion asks for.
-  - '`f8_the_real_compatible_carries_the_trait_shape_the_loop_drives` passes a real `Compatible` through
-    a helper declaring exactly `run`''s `P: Provider` bound, so trait fit is compiler-checked; asserts
-    name, endpoint, `endpoints() == [base()]` (the set run authorises before step 1) and auth. No socket
-    — the wire proof lives in src/provider/compatible.rs and the module doc points there rather than
-    duplicating it.'
-  - The named negative control `f8_a_compatible_pointed_at_no_preset_claims_no_vendor_label` — a bare
-    `Compatible::new` reports "compatible", not "groq", ruling out a label that is constant or URL-derived.
-  - '`cargo test --test parity` 3 passed; `cargo fmt --check` clean; `cargo clippy --all-targets --
-    -D warnings` clean.'
-- id: US-IO-HARNESS-0.29.0-T08
-  summary: 'The convergence files: public-api.txt in sorted position, the CONTRACT divergence section,
-    the changelog entry and the manifest version.'
-  why_required: tests/public_api.rs fails on a public name with no line and no worked example, and the
-    divergence section is the release's most important documentation obligation — a caller pointed at
-    vLLM without a parser flag gets no tool calls and no error at all.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.29.0-T04
-  - US-IO-HARNESS-0.29.0-T05
-  - US-IO-HARNESS-0.29.0-T06
-  - US-IO-HARNESS-0.29.0-T07
-  acceptance_criteria:
-  - 'OP1 — `docs/public-api.txt` is hand-edited in sorted position for every new crate-root name — `Compatible`,
-    `Auth`, `ModelInfo`, `PriceSource` and `Reference` — and each carries a doc comment with a worked
-    example, because `tests/public_api.rs` fails otherwise and there is deliberately no `--bless`. This
-    is real work rather than a formality: five items, five examples that compile as doctests. The preset
-    table is `pub(crate)` and adds no line; a named constructor is a method and adds none either. `PriceTier`
-    lives in `pricing`, which is a public module rather than a crate-root re-export, so like `Price`
-    and `PriceTable` beside it it carries a worked example and takes no line in the snapshot.
-
-    '
-  - 'OP2 — **`docs/CONTRACT.md` states the vendor divergences plainly, from primary sources, and this
-    is the release''s most important documentation obligation.** A new section names each: Zhipu emits
-    `finish_reason` values outside the OpenAI set (`sensitive`, `network_error`, `model_context_window_exceeded`)
-    which this crate records verbatim because the field is an open `String`; Groq returns 400 on `messages[].name`;
-    Mistral requires tool-call ids matching `^[a-zA-Z0-9]{9}$` and names its schema field `schema_definition`;
-    DeepSeek returns 400 if `reasoning_content` is not replayed on a request carrying tools; Ollama
-    accepts and silently drops `tool_choice`.
-
-    **And the sentence that matters most: vLLM and SGLang emit no tool calls at all unless the server
-    was started with a tool-call parser flag, which a client cannot set.** A caller who points `Compatible`
-    at a vLLM server started without `--tool-call-parser` gets a run that quietly never calls a tool
-    and never errors — the agent simply talks. That must be findable in the contract by someone searching
-    for "vLLM" or "no tool calls", not discovered after an afternoon of debugging. It is stated in those
-    words, in the section a reader reaches before writing the base URL.
-
-    '
-  files:
-  - docs/public-api.txt
+  - docs/guide/context-and-memory.md
+  - docs/guide/accounting.md
   - docs/CONTRACT.md
+  - docs/public-api.txt
   - CHANGELOG.md
+  - README.md
+  - src/lib.rs
   - Cargo.toml
+  - Cargo.lock
   evidence:
-  - 'OP1 — `docs/public-api.txt` hand-edited in sorted position for all five new crate-root names: `enum
-    Auth`, `enum PriceSource`, `struct Compatible`, `struct ModelInfo`, `struct Reference`. `tests/public_api.rs`
-    — 9 passed, including `public_surface_matches_snapshot` and `every_public_item_has_a_worked_example`,
-    so each carries a fenced example that compiles as a doctest. No --bless was used because none exists.
-    `PriceTier` lives in the public `pricing` module rather than at the crate root, so like `Price`
-    beside it it carries a worked example and takes no snapshot line.'
-  - 'OP2 — `docs/CONTRACT.md` gains ''What Compatible does and does not translate (0.29.0)'', written
-    from primary sources rather than from the plan. It opens by stating the crate sends one wire and
-    will not grow per-vendor branches, then leads with the divergence that fails silently under its
-    own heading: vLLM and SGLang emit no tool calls without a server-side parser flag, no status code,
-    no warning, nothing in the trace — vLLM''s --enable-auto-tool-choice plus --tool-call-parser, SGLang''s
-    equivalent, both confirmed against the vendors'' own source in the scratchpad.'
-  - 'The per-vendor entries: Zhipu''s out-of-set finish_reason values, Groq''s 400 on messages[].name,
-    Mistral''s ^[a-zA-Z0-9]{9}$ tool-call ids and schema_definition field, DeepSeek''s 400 when reasoning_content
-    is not replayed (quoted from its own thinking-mode guide, which says it MUST participate in the
-    concatenation after a tool call), and Ollama silently ignoring tool_choice (listed unimplemented
-    in its own compatibility notes).'
-  - 'Every one of the 13 hosted preset base URLs was verified empirically rather than trusted: an unauthenticated
-    GET {base}/models returned 401/403 for 11 of them, proving host and path exist. The two 404s were
-    run down — Gemini returns 400 rather than 404 once a bearer header is present, so its path is right,
-    and Perplexity genuinely serves no /models endpoint, which is now stated in the contract as a fact
-    (its models() returns the vendor''s 404 rather than a false empty catalogue).'
-  - The contract also carries the five non-/v1 bases as a table, the Bedrock/Vertex/Azure exclusions
-    with the mint-your-own-bearer route, what a price means (None is never ZERO, reference is not the
-    vendor's, a miss stays None, the lookup refuses rather than skips), the tier rule, and that Fallback::models()
-    reports nothing rather than picking.
-  - '`CHANGELOG.md` — 0.29.0 section with an unlabelled 2-3 sentence prose opening, then Added/Changed/Security.
-    No **BREAKING entry, so no Migration: line is required; `tests/changelog.rs` 5 passed. Cargo.toml
-    bumped to 0.29.0.'
-  - '`cargo test --test changelog --test docs_drift --test readme --test guide_pages --test public_api`
-    — 5, 10, 8, 7 and 9 passed, 0 failed.'
-- id: US-IO-HARNESS-0.29.0-T09
-  summary: 'The gates: the suite on the default and all-features sets, clippy, fmt, doc, cargo tree,
-    cargo package, and the live reference-catalogue check.'
-  why_required: Every non-functional and operational criterion is proven here or is unproven, and a
-    parser written against a shape nobody checked is the failure F10 exists to prevent.
+  - >
+    N3 — `docs/public-api.txt` gains six lines and loses none: `enum MemoryKind`, `struct FirstTry`,
+    `struct MemoryRecall`, `struct MemoryWrite`, `struct Recovery`, `struct Tally`. `config::Origin`
+    is deliberately NOT there, because it is not re-exported from `lib.rs` — same as `config::Scope`,
+    which it sits beside. `tests/public_api.rs` 9 passed, including `public_surface_matches_snapshot`
+    and `drift_reports_a_removal`.
+  - >
+    N4 — `every_public_item_has_a_worked_example` passes, so each of the six carries a fenced example
+    that compiles. `cargo test --doc` 271 passed at the point the memory work landed and the new
+    aggregate examples were added after it; the full-suite run under T08 is the one that covers them
+    all at once.
+  - >
+    The changelog's 0.30.0 section carries no `**BREAKING` entry and
+    `tests/changelog.rs` 5 passed. Version bumped to 0.30.0 in `Cargo.toml` and `Cargo.lock`.
+  - >
+    `docs/CONTRACT.md` gains the provenance bullet in the configuration section and four new entries
+    under "Limits that hold today": that an aggregate is one indexed query and NOT constant-time,
+    with the measured numbers; that gate failures group by phase and not by criterion; that
+    `Recovery` has no escalation count; that a pin binds a run and not the caller holding the store;
+    and that `MemoryEntry` gained two fields, which a caller constructing one in a literal must name.
+  - >
+    The three guide pages gain a section each — "Which file decided one key", "A correction that
+    sticks" and "Which notes a run actually used", "What the runs did, not just what they cost" —
+    plus a limits paragraph on each page. Written by a subagent against a brief and reviewed here.
+    It found one thing the brief had wrong and documented it rather than papering over it:
+    `memory_delete` and `memory_clear` have no pin guard, so a pinned entry is not tamper-proof
+    against the caller — which is the same bound `docs/CONTRACT.md` now states.
+  - >
+    `README.md` and the crate-root rustdoc updated in the same commit stream rather than later: the
+    memory paragraph, the configuration paragraph, a new "What the trace adds up to" paragraph
+    naming the five grouped accessors, and two guide-index rows. `cargo doc --no-deps
+    --all-features` is warning-free and `tests/readme.rs`, `tests/docs_drift.rs`,
+    `tests/guide_pages.rs` all pass.
+
+- id: US-IO-HARNESS-0.30.0-T08
+  summary: >
+    The release gates: `cargo fmt --check`, clippy `-D warnings`, the three test invocations,
+    `cargo tree` unchanged, `cargo package --locked`, and the three-OS matrix green on the commit
+    being released.
+  why_required: >
+    Every one of these is a refusal `release.yml` performs anyway; failing them here costs a re-run,
+    failing them there costs a release.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.29.0-T08
+  - US-IO-HARNESS-0.30.0-T06
+  - US-IO-HARNESS-0.30.0-T07
   acceptance_criteria:
-  - 'F10 — the live reference host serves the shape the parser was written against. A keyless `GET https://openrouter.ai/api/v1/models`
-    from the release machine, parsed by the shipped parser, yielding a non-empty catalogue in which
-    at least one model carries a price in every one of the five dimensions the mapping claims **and
-    at least one carries a tier**, with the count of tiered models recorded. Run once, at completion,
-    and recorded as a health check with what it actually returned. It is not a unit test and does not
-    gate CI — a network test in the suite is a flaky suite — but a parser written against a shape nobody
-    checked is the failure this criterion exists to prevent, and `.env` carries real OpenRouter credentials,
-    so the check is genuinely available rather than aspirational.
-
-    '
-  - 'NF1 — the full suite passes on macOS, Linux and Windows with no test skipped, ignored or made conditional.
-    The standing exception is `skills::discovery_over_a_32_skill_directory_is_under_50ms`, a wall-clock
-    assertion that fails intermittently on the Windows runner under load and is re-run rather than investigated.
-    No test in this release reaches the network.
-
-    '
-  - 'NF2 — **no new dependency, on any platform.** `cargo tree` on the default feature set reads 402
-    lines after this release as before it. The provider is `reqwest` and `openai_wire`, both present;
-    the catalogue parse is `serde_json`, present; the decimal shift is `std` string handling and `u64`.
-    This is the constraint the product now states, so it is a criterion and it is checked rather than
-    asserted.
-
-    '
-  - 'NF3 — **`CHECKPOINT_FORMAT` stays 7 and no store schema changes at all.** This release creates
-    no table, which is the direct consequence of the catalogue being cached on the provider instance
-    rather than in the store. `tests/cross_version.rs` passes unchanged, and it passes without anything
-    being added to `ADDED_SINCE_0_22_0`.
-
-    '
-  - 'NF4 — `cargo doc` is warning-free, docs.rs builds with all features, `cargo fmt --check` is clean,
-    and `cargo clippy --all-targets -- -D warnings` is clean on every platform in the matrix. Doc examples
-    use literals rather than `${env:HOME}`, which is unset on `windows-latest` and cost 0.27.0 a CI
-    round. Any test that reads this crate''s own source normalises line endings, because a Windows checkout
-    is CRLF and that cost 0.28.0 a round.
-
-    '
-  - 'OP5 — `cargo package --locked` exits 0 and the tarball is verified by **listing** rather than by
-    trusting the `exclude` list: no `.env`, no `.ultraship`, no `.github`. MSRV 1.95 re-checked in both
-    directions rather than read off the manifest, which is the lesson 0.23.0 paid for. `df -h .` is
-    read before packaging and before publishing, because a full disk on this machine surfaces as `ld:
-    cc failed` or an `ENOSPC` in a query-cache write and reads like a toolchain bug — 0.28.0 took `target/`
-    to 23 GiB.
-
-    '
-  files: []
-  evidence:
-  - 'NF1 — `cargo test` on the default feature set: **1098 passed, 0 failed**, zero failing binaries,
-    no test skipped, ignored or made conditional. The standing Windows wall-clock exception was not
-    needed on this machine.'
-  - '`cargo build --all-features --examples` then `cargo test --all-features --lib --tests`: **913 passed,
-    0 failed**. The examples are built first deliberately — `--lib --tests` does not build them and
-    four binaries exec them, which is the failure 0.28.0 recorded.'
-  - 'NF2 — `cargo tree` reads **402 lines**, unchanged from 0.28.0. No new dependency on any platform:
-    the provider is reqwest and the existing openai_wire, the catalogue parse is serde_json, the decimal
-    shift is std string handling, and the date is std arithmetic (Hinnant''s civil-from-days) rather
-    than a date crate.'
-  - NF3 — no store schema change at all and `CHECKPOINT_FORMAT` stays 7. This release creates no table,
-    which follows from caching the catalogue on the provider instance rather than in the store; `tests/cross_version.rs`
-    passes unchanged with nothing added to ADDED_SINCE_0_22_0.
-  - NF4 — `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings` clean;
-    `cargo doc --no-deps --all-features` **warning-free**. Three intra-doc warnings were found and fixed
-    in 2161ea7 — two links to crate-private items (WebFlavor, PRESETS) and one redundant explicit target
-    — rather than tolerated.
-  - 'OP5 — `cargo package --locked` exit 0, **190 files**. Tarball verified by listing rather than by
-    trusting the exclude list: zero entries matching `.env`, `.ultraship/` or `.github/`; `.env.example`
-    present and intended. `df -h .` read before packaging (36 GiB free after a clean) and again after
-    (35 GiB).'
-  - 'MSRV: 1.95 unchanged and not re-derived locally. The floor is set by a dependency (libsqlite3-sys''s
-    cfg_select, established in 0.23.0) which this release does not touch, and no std API above 1.95
-    was introduced. CI''s `msrv` job reads the floor from Cargo.toml rather than hardcoding it and runs
-    on the PR, which is the check — stated rather than claiming a local both-directions run that was
-    not performed.'
-  - 'F10 — the live reference host, read from the release machine through the shipped parser via `examples/live_catalogue.rs`:
-    **336 models, 336 priced, 44 carrying a prompt-length tier**, one row (anthropic/claude-opus-5-fast)
-    pricing all five dimensions, and **zero price/provenance disagreements**. The tier sample is qwen/qwen3.7-flash,
-    base input 30000 stepping to 100000 at 32000 prompt tokens — and 30000 is exactly the value an f64
-    multiply returns as 29999, so the live data confirms the conversion control was worth writing.'
-  - 'Disk was the live hazard this session: two agents building concurrently drove it to 9.6 GiB with
-    target/ at 26 GiB. `cargo clean` reclaimed 29 GiB and later 43 GiB, every cargo invocation from
-    the gates onward was serialised, and `df -h .` was read before package.'
-- id: US-IO-HARNESS-0.29.0-T10
-  summary: 'Price tiers in src/pricing.rs: PriceTier, PriceTable::with_tiers/tiers, and tier selection
-    in cost_micros.'
-  why_required: Forty-four of the catalogue's models price by prompt length and the rate typically doubles
-    past 200k, so a catalogue that fetches a real price and applies the wrong tier under-reports a long
-    run by half — the confident wrong number this release exists to prevent. See iterations/US-IO-HARNESS-0.29.0-I01.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - 'F11 — a tiered price is billed at the tier the prompt actually reached, and a flat one is unchanged.
-    A model with a 200,000-token tier at double its base rate costs the base rate at 199,999 prompt
-    tokens and the tier rate at 200,000 and at 400,000 — the boundary asserted on both sides, because
-    an off-by-one on a floor is the whole defect. A two-tier model (32,000 and 128,000) selects the
-    **highest** floor it reaches and not the first, asserted with the tiers registered in reverse order
-    so the answer cannot come from input ordering. And an override that names only some keys inherits
-    the rest from its base row, asserted on a dimension the override omits. **Three negative controls:**
-    a model with no tiers priced identically to how 0.28.0 priced it, so the selection cannot have changed
-    the flat path; a prompt below every floor yielding the base row rather than the lowest tier; and
-    the same usage priced against a table with the tiers **removed**, which must produce a *different
-    and smaller* figure — without it the test would pass against an implementation that ignored tiers
-    entirely.
-
-    '
+  - >
+    **N1 — no new dependency.** `cargo tree` on macOS and Linux is unchanged. This release is three
+    accessors, two fields and a table; anything it needs is already here.
+  - >
+    **O1 — the three-OS matrix is green** on the commit being released, including the MSRV job.
+  - >
+    **O2 — docs.rs builds.** Checked by the nightly job, because a stable `cargo doc` passing is not
+    evidence that docs.rs does — the 0.16.2 lesson, which cost two releases without a rendered page.
+  - >
+    **O3 — `cargo package --locked` succeeds**, and the packaged crate's tests compile.
   files:
-  - src/pricing.rs
+  - .ultraship/evidence/0.30.0
   evidence:
-  - F11 — `pricing::tests::the_tier_boundary_is_exact_on_both_sides` asserts 199,999 prompt tokens at
-    the base rate and 200,000 at the tier rate, then 400,000 priced wholly at the tier rate rather than
-    split across the floor. An off-by-one on the threshold under-reports every request landing on the
-    line, which is why both sides are asserted rather than one value past it.
-  - '`the_highest_reached_floor_wins_whatever_order_the_tiers_were_written_in` uses qwen3-max''s two-step
-    shape (32k, 128k) registered highest-first, so the answer cannot come from input ordering; `PriceTable::with_tiers`
-    sorts on the way in and `tiers()` is asserted to read back lowest-first.'
-  - 'The three named negative controls: `a_prompt_below_every_floor_gets_the_base_row_not_the_lowest_tier`;
-    `the_same_usage_costs_strictly_less_once_the_tiers_are_removed`, which fails against any implementation
-    that ignored `with_tiers`; and `a_table_with_no_tiers_prices_exactly_as_it_did_before_they_existed`,
-    which reproduces 0.28.0''s hand-computed figure through the new code path and is NF5''s arithmetic
-    half.'
-  - '`a_tier_on_a_model_with_no_base_price_is_still_unpriced` — tiers do not make a model priced; `cost_micros`
-    reads the base first and answers None.'
-  - '`cargo test --lib pricing` — 10 passed, 0 failed. `Price` gained no field and kept `Copy`; tiers
-    hang off `PriceTable` in a `#[serde(default)]` map, so a table serialized by 0.28.0 still deserializes.'
+  - >
+    `cargo fmt --check` clean. `cargo clippy --all-targets -- -D warnings` clean, and both feature
+    legs CI runs separately — `--features documents` and `--features media` — clean too.
+  - >
+    `cargo test` (default features): every one of the 29 test binaries green, 279 doctests passed,
+    0 failed. `cargo test --all-features --lib --tests`: 52 green result lines, 0 failed.
+    `cargo test --all-features --doc`: 281 passed, 0 failed.
+  - >
+    N1 — `cargo tree` is **402 lines**, exactly what 0.23.0 through 0.29.0 recorded. `cargo tree
+    --all-features` is 842. No dependency was added; nothing in this release needed one.
+  - >
+    O3 — `cargo package --locked` succeeded: 197 files, 4.5MiB (1.1MiB compressed), and the packaged
+    crate compiled in `target/package/io-harness-0.30.0`.
+  - >
+    Two failures on the way, both real and both worth recording. `tests/cross_version.rs` failed
+    first: 0.30.0 is the first release to ALTER a table rather than only add one, and that test's
+    rule was "no statement 0.22.0 wrote may be altered". The rule was made precise rather than
+    relaxed — it now names the table and the exact columns added, and removing them from the new
+    statement must reproduce the old one character for character. `ALTER TABLE ADD COLUMN` also puts
+    the definition after the last column and before the table constraints, not at the end, which a
+    prefix-shaped first attempt got wrong and the test caught.
+  - >
+    The second was `checkpoint::crash_resume_after_a_real_sigkill_reaches_verified_success` failing
+    right after `cargo clean`, because `--lib --tests` does not build `examples/` and that test execs
+    one. Known trap, not a defect: CI's plain `cargo test` step builds the examples first.
+    `cargo build --all-features --examples` then a re-run: green.
+  - >
+    Disk: `target/` reached 14GiB before the all-features leg and `cargo clean` was run
+    pre-emptively before packaging (19.7GiB and 20.8GiB freed across two cleans), which is the
+    standing remedy for the ENOSPC failures this repository keeps paying for.
+  - >
+    O1 and O2 are the two gates a local run cannot close — the three-OS matrix including the MSRV job,
+    and the docs.rs nightly build — and both run on the pushed commit. Recorded here as pending CI at
+    seal time, and the release record states the ordering rather than implying these were green
+    before they had run.

@@ -26,6 +26,72 @@ notes are produced from it.
 
 ### Security
 
+## [0.30.0] - 2026-08-01
+
+The store can answer *why*, for three questions it could already answer the
+*what* of. Which file decided a setting, when four scopes merge and a project
+file may narrow what you set in your own. Whether a remembered fact is something
+somebody decided — and whether a run may overwrite it, or is refused and told so.
+And how often a run was verified first try, which gate phase fails most, and how
+many runs a fallback, a replan or a resume rescued.
+
+Nothing breaks. Two nullable columns, one new table and six indexes: a 0.29.0
+database opens, resumes and replays unchanged, and a 0.29.0 binary still reads a
+store this release wrote — both directions executed against a real 0.29.0 build
+rather than argued.
+
+### Added
+
+- **`Config::origin(key)` and `Config::origins()`**, reporting the scope and the
+  file that decided each key by dotted path — `run.max_steps`,
+  `policy.defaults.exec`. `Config::sources()` answers which files were read and
+  keeps answering exactly that; this answers which of them won, which is the half
+  a reader needs when a value is not the one they set. An empty answer means no
+  file named the key: that is the crate's default speaking, and naming a file for
+  it would be an invention.
+- **`config::Origin`**, the scope and path pair those return. Ordinary keys have
+  exactly one; `policy.layers` and `agent` append across scopes and report every
+  file that contributed, in order, because naming a single winner for a value
+  three files built would be a lie.
+- **`MemoryKind`** (`Fact` or `Decision`, `#[non_exhaustive]`) and
+  **`MemoryEntry::pinned`**. A pinned entry is not overwritten by a run and is
+  not evicted to hold the caps; pinning is a caller's act, never an agent's.
+- **`Store::memory_write`** and **`MemoryWrite`**, the full form of `memory_put`:
+  it takes the kind and it *reports the refusal*. A caller that cannot tell a
+  write from a refusal will tell the model it corrected something it did not.
+- **`Store::memory_pin`**, which is how a human makes a correction stick when the
+  agent keeps re-learning something wrong.
+- **`Store::memory_recalls` and `MemoryRecall`**, the per-run record of which
+  entries a run actually drew on. `Store::memory_list` says what the agent knows
+  about a workspace; this says what *this run* used, which is the half that tells
+  a reader whether an entry was load-bearing. `Assembled::recalled_keys` carries
+  the same list during the run.
+- **`Store::runs_by_outcome`, `Store::runs_by_day` and
+  `Store::gate_failures_by_phase`**, returning `Tally` rows. Grouped counts, in
+  the shape 0.18.0's spend groupings established: rows out, the crate renders
+  nothing.
+- **`Store::first_try` and `FirstTry`** — runs, successes, and successes with no
+  failed gate phase. Three counts and deliberately no rate: *of the ones that
+  worked* and *of everything we tried* are both legitimate denominators, and
+  returning one number would pick between them invisibly.
+- **`Store::recovery` and `Recovery`** — fallbacks, replans and resumes. There is
+  no escalation count, because nothing records an escalation as an event and an
+  escalation is the opposite of a rescue: it is the run handing the problem back.
+
+### Changed
+
+- **A run that tries to overwrite a pinned memory entry is refused, told so, and
+  the attempt is recorded** as a `memory_refused` row in the trace. The refusal
+  also reaches the model as an observation, so an agent cannot proceed believing
+  it corrected something it did not.
+- **The memory table gains two nullable columns and the store gains a
+  `memory_recalls` table and six indexes.** Additive only: `CHECKPOINT_FORMAT`
+  stays 7, an entry written before this release reads back as an unpinned `Fact`
+  — which is what it was — and a 0.29.0 binary, whose queries never name the new
+  columns, still opens and reads a migrated database.
+- **`Assembled` gains `recalled_keys`.** The type is constructed through
+  `..Default::default()`, so this is additive for any caller building one.
+
 ## [0.29.0] - 2026-08-01
 
 The model a run uses stops being a choice between three vendors. A provider is a

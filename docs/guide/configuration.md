@@ -80,6 +80,64 @@ Appending layers does not weaken anything. The `Policy` type's own rule still
 holds across the seam: a later layer may add capability and may **never**
 re-allow an earlier deny.
 
+## Which file decided one key (0.30.0)
+
+`Config::sources()` answers "what was read". The question an operator actually
+arrives with is narrower — *the value is not the one I set, so who won it?* — and
+four files merging key by key means the answer is per key, not per file.
+
+```rust
+use io_harness::config::Origin;
+
+let at: &[Origin] = config.origin("policy.defaults.exec");
+for o in at {
+    println!("{:?} — {}", o.scope, o.path.display());
+}
+```
+
+The key is a dotted path, spelled the way the file spells it:
+`run.max_steps`, `sandbox.limits.max_wall_secs`, `policy.defaults.exec`,
+`toolchain.cargo.test`. `Origin` is `{ scope, path }` and lives in
+`io_harness::config` beside `Scope`, not at the crate root — it describes a file,
+and the crate root is where the run's own types live.
+
+**An empty slice is an answer.** No file set the key, so the value is this
+crate's default, and a default has no file. Naming one would be an invention, and
+"the harness decided this" is exactly what the operator needs to be told.
+
+**One entry, except where a key genuinely has more than one author.**
+`[[policy.layers]]` and `[[agent]]` append across scopes rather than replace, so
+`origin("policy.layers")` lists **every** contributing file in apply order. Both
+files built that value; picking one as the winner would be a lie about a boundary
+assembled from two.
+
+**The deciding scope, not the last file read.** A key set only in the user file
+reports the user file, even when a project file exists further down the merge and
+names other keys entirely. The distinction is invisible when a key is set
+everywhere and is the whole point when it is not — the case this exists for is
+0.27.0's: an operator allowed `exec` in their own file, a cloned repository
+narrowed it to `deny`, and until now nothing said so.
+
+A `${env:...}` or `${cmd:...}` value reports **the file the substitution was
+written in**, not the environment variable and not the helper. The file is what
+decided to ask; the answer arriving from elsewhere is the mechanism. A literal and
+a substituted value written at the same key in the same file report the identical
+origin.
+
+After `with_profile(name)`, a key the profile set reports the file the
+`[profile.<name>]` block was written in — the profile decided it, so the profile's
+file is the origin. The overlaid configuration reports no `profile.*` keys at all,
+because it is no longer a configuration with a profile in it; it is the result of
+applying one.
+
+`Config::origins()` is the whole-list form, yielding `(&str, &[Origin])` in key
+order, for a caller rendering every setting a workspace resolved to with the file
+beside each. Keys no file named are absent rather than present-and-empty, so what
+it yields is exactly what somebody wrote down.
+
+`Config::from_toml` reports no origins, for the same reason `Config::sources()`
+returns none: parsed text has no file behind it.
+
 ## Every key
 
 ### `[policy]` → [`Policy`](permissions.md)
@@ -549,6 +607,12 @@ not read the way you would treat any other text a stranger wrote into your promp
 
 **A project file may narrow and never widen, and that is all it does.** See the
 section above for the four keys, and for the sentence it is not.
+
+**An origin reports the merge and does not take part in it.** `Config::origin`
+changed what a caller can *see* about a resolution in 0.30.0 and changed no
+resolution: every key still lands on the value it landed on before. Nor is it half
+of a writer — there is still nothing in this crate that edits an `io.toml`, so
+"which file would I change" is a question it answers and not one it acts on.
 
 **A hook runs inside the run loop and blocks it.** `Observer::event` is synchronous,
 which is what lets `on_failure = "cancel"` stop anything at all — and it means a

@@ -1,0 +1,129 @@
+{
+  "composition": {
+    "by_outcome": {
+      "stalled": 1,
+      "step_cap_reached": 1,
+      "success": 4
+    },
+    "gate_failures_by_phase": {
+      "compile": 1,
+      "criterion-compile": 1,
+      "test-run": 2
+    },
+    "memory_keys": [
+      "test-command",
+      "build-dir",
+      "owner-decision"
+    ],
+    "recovery": {
+      "fallbacks": 3,
+      "replans": 2,
+      "resumes": 2
+    },
+    "run_ids": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6
+    ],
+    "runs": 6,
+    "succeeded": 4,
+    "verified_first_try": 2,
+    "workspace": "/repo"
+  },
+  "read_back": {
+    "memory": [
+      {
+        "key": "test-command",
+        "run_id": 1,
+        "step": 3,
+        "value": "cargo test --features documents"
+      },
+      {
+        "key": "build-dir",
+        "run_id": 1,
+        "step": 3,
+        "value": "target/ is on the external disk"
+      },
+      {
+        "key": "owner-decision",
+        "run_id": 1,
+        "step": 3,
+        "value": "the parser stays in-crate"
+      }
+    ],
+    "runs": [
+      {
+        "context_kinds": [],
+        "gate_failures": [],
+        "outcome": "success",
+        "resumes": 0,
+        "run_id": 1,
+        "success": true,
+        "tokens": 0
+      },
+      {
+        "context_kinds": [
+          "served",
+          "replan"
+        ],
+        "gate_failures": [
+          "test-run",
+          "test-run"
+        ],
+        "outcome": "success",
+        "resumes": 0,
+        "run_id": 2,
+        "success": true,
+        "tokens": 0
+      },
+      {
+        "context_kinds": [],
+        "gate_failures": [
+          "criterion-compile"
+        ],
+        "outcome": "success",
+        "resumes": 1,
+        "run_id": 3,
+        "success": true,
+        "tokens": 0
+      },
+      {
+        "context_kinds": [
+          "served",
+          "replan"
+        ],
+        "gate_failures": [
+          "compile"
+        ],
+        "outcome": "step_cap_reached",
+        "resumes": 0,
+        "run_id": 4,
+        "success": false,
+        "tokens": 0
+      },
+      {
+        "context_kinds": [],
+        "gate_failures": [],
+        "outcome": "stalled",
+        "resumes": 1,
+        "run_id": 5,
+        "success": false,
+        "tokens": 0
+      },
+      {
+        "context_kinds": [
+          "served"
+        ],
+        "gate_failures": [],
+        "outcome": "success",
+        "resumes": 0,
+        "run_id": 6,
+        "success": true,
+        "tokens": 0
+      }
+    ]
+  }
+}

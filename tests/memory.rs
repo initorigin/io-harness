@@ -7,7 +7,12 @@
 //! tests (they need the private connection and the cap constants). These are the
 //! promises a caller sees: recall across runs, isolation, overwrite, forget.
 
-use io_harness::{Store, MEMORY_MAX_ENTRIES as MAX_ENTRIES};
+use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
+use io_harness::{
+    run_with, ApproveAll, ContextBudget, MemoryKind, Policy, Provider, Store, TaskContract,
+    MEMORY_MAX_ENTRIES as MAX_ENTRIES,
+};
+use serde_json::json;
 
 #[test]
 fn a_fact_written_by_one_run_is_readable_by_another() {
@@ -394,4 +399,201 @@ mod live {
             "the newest notes are the ones kept, got:\n{prompt}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 0.30.0 — kind, pinned, and the recall record
+// ---------------------------------------------------------------------------
+
+/// Plays a fixed list of tool calls, one per turn, then answers with nothing.
+struct Script(Vec<Vec<ToolCall>>, std::sync::atomic::AtomicUsize);
+
+impl Provider for Script {
+    async fn complete(&self, _req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        let i = self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(CompletionResponse {
+            tool_calls: self.0.get(i).cloned().unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+    fn name(&self) -> &str {
+        "script"
+    }
+}
+
+fn remember(key: &str, value: &str) -> ToolCall {
+    ToolCall {
+        // The tool's wire name, spelled as the model spells it.
+        name: "remember".into(),
+        arguments: json!({ "key": key, "value": value }),
+    }
+}
+
+/// The workspace key the run loop stores memory under: the canonical root.
+fn ws_key(root: &std::path::Path) -> String {
+    std::fs::canonicalize(root)
+        .unwrap_or_else(|_| root.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+async fn run_in(root: &std::path::Path, store: &Store, script: Vec<Vec<ToolCall>>) -> i64 {
+    let contract = TaskContract::workspace("write a note", root)
+        .with_max_steps(2)
+        // A small prompt ceiling, so the memory block's quarter of it is small
+        // enough that a full-size note does not fit beside three short ones.
+        // Without it every note fits and the recall test asserts nothing.
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_000,
+            share: 0.5,
+        });
+    run_with(
+        &contract,
+        &Script(script, std::sync::atomic::AtomicUsize::new(0)),
+        store,
+        &Policy::permissive(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the run itself must not error")
+    .run_id
+}
+
+/// 0.30.0 F5 — a pinned entry survives a run that tries to overwrite it.
+#[tokio::test]
+async fn a_pinned_entry_survives_a_run_that_tries_to_overwrite_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let ws = ws_key(dir.path());
+
+    store
+        .memory_write(&ws, "retries", "three", 1, 1, MemoryKind::Decision)
+        .unwrap();
+    assert!(store.memory_pin(&ws, "retries", true).unwrap());
+
+    let run = run_in(dir.path(), &store, vec![vec![remember("retries", "one")]]).await;
+
+    // Half one: the operator's value is what a later reader gets.
+    let entry = store.memory_get(&ws, "retries").unwrap().unwrap();
+    assert_eq!(entry.value, "three");
+    assert_eq!(
+        entry.kind,
+        MemoryKind::Decision,
+        "and it is still a decision"
+    );
+    assert!(entry.pinned);
+
+    // Half two: the attempt is in the trace. A silent refusal would leave the
+    // agent believing it had corrected something — which is the whole failure
+    // this flag exists to prevent, and it is invisible without this row.
+    let kinds: Vec<String> = store
+        .context_events(run)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(
+        kinds.iter().any(|k| k == "memory_refused"),
+        "the refusal must be recorded: {kinds:?}"
+    );
+    assert!(
+        !kinds.iter().any(|k| k == "memory_write"),
+        "and a write that did not happen must not be recorded as one: {kinds:?}"
+    );
+}
+
+/// 0.30.0 F5, the control. The same run against the same key *unpinned* writes.
+#[tokio::test]
+async fn the_same_write_lands_when_the_entry_is_not_pinned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let ws = ws_key(dir.path());
+
+    store
+        .memory_write(&ws, "retries", "three", 1, 1, MemoryKind::Decision)
+        .unwrap();
+
+    let run = run_in(dir.path(), &store, vec![vec![remember("retries", "one")]]).await;
+
+    assert_eq!(
+        store.memory_get(&ws, "retries").unwrap().unwrap().value,
+        "one"
+    );
+    assert_eq!(
+        store.memory_get(&ws, "retries").unwrap().unwrap().kind,
+        MemoryKind::Fact,
+        "a run's own write is a fact, whatever the entry was before"
+    );
+    let kinds: Vec<String> = store
+        .context_events(run)
+        .unwrap()
+        .iter()
+        .map(|e| e.kind.clone())
+        .collect();
+    assert!(kinds.iter().any(|k| k == "memory_write"), "{kinds:?}");
+}
+
+/// 0.30.0 F6 — the recall record names the run and the entries it drew on.
+#[tokio::test]
+async fn the_recall_record_names_which_entries_a_run_actually_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::memory().unwrap();
+    let ws = ws_key(dir.path());
+
+    // Six entries. The three oldest are each individually larger than the memory
+    // block's whole ceiling, so the newest-first fit stops at the first of them —
+    // which makes "three of six" a property of the sizes rather than of a token
+    // estimate this test would otherwise be pinned to.
+    for i in 0..3 {
+        store
+            .memory_put(
+                &ws,
+                &format!("huge-{i}"),
+                &"x".repeat(io_harness::MEMORY_MAX_ENTRY_CHARS),
+                1,
+                1,
+            )
+            .unwrap();
+    }
+    for i in 0..3 {
+        store
+            .memory_put(&ws, &format!("small-{i}"), "short", 1, 1)
+            .unwrap();
+    }
+
+    let first = run_in(dir.path(), &store, vec![vec![]]).await;
+    let recalled: Vec<String> = store
+        .memory_recalls(first)
+        .unwrap()
+        .iter()
+        .map(|r| r.key.clone())
+        .collect();
+    assert_eq!(
+        recalled,
+        ["small-0", "small-1", "small-2"],
+        "the three that fit, named — not counted"
+    );
+    for r in store.memory_recalls(first).unwrap() {
+        assert_eq!(r.run_id, first);
+        assert_eq!(r.workspace, ws);
+    }
+
+    // A second run over the same workspace records its own, and does not disturb
+    // the first: a recall is a fact about a run, not a flag on an entry.
+    let second = run_in(dir.path(), &store, vec![vec![]]).await;
+    assert_ne!(first, second);
+    assert_eq!(store.memory_recalls(first).unwrap().len(), 3);
+    assert_eq!(
+        store
+            .memory_recalls(second)
+            .unwrap()
+            .iter()
+            .map(|r| r.key.clone())
+            .collect::<Vec<_>>(),
+        ["small-0", "small-1", "small-2"]
+    );
+    assert!(
+        store.memory_recalls(second + 999).unwrap().is_empty(),
+        "a run that never happened recalled nothing"
+    );
 }

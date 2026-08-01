@@ -65,6 +65,7 @@ enum Error src/error.rs
 enum EventKind src/observe.rs
 enum Flow src/observe.rs
 enum McpTransport src/mcp.rs
+enum MemoryKind src/state.rs
 enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
 enum ProviderErrorKind src/error.rs
@@ -96,6 +97,7 @@ struct Defaults src/policy.rs
 struct DenyAll src/approve.rs
 struct Edit src/state.rs
 struct ExecGuard src/verify.rs
+struct FirstTry src/state.rs
 struct FixedResponder src/approve.rs
 struct Hooks src/hooks.rs
 struct Identity src/tools/git.rs
@@ -106,6 +108,8 @@ struct McpEvent src/state.rs
 struct McpServer src/mcp.rs
 struct Media src/provider/mod.rs (feature = "media")
 struct MemoryEntry src/state.rs
+struct MemoryRecall src/state.rs
+struct MemoryWrite src/state.rs
 struct ModelInfo src/provider/mod.rs
 struct OpenAi src/provider/openai.rs
 struct OpenRouter src/provider/openrouter.rs
@@ -117,6 +121,7 @@ struct ProcessHandle src/state.rs
 struct Progress src/resilience.rs
 struct ProviderCall src/state.rs
 struct Question src/approve.rs
+struct Recovery src/state.rs
 struct Reference src/provider/catalog.rs
 struct Request src/approve.rs
 struct ResponderNone src/approve.rs
@@ -141,6 +146,7 @@ struct Steer src/session.rs
 struct SteerInbox src/session.rs
 struct StepRecord src/state.rs
 struct Store src/state.rs
+struct Tally src/state.rs
 struct TaskContract src/contract.rs
 struct Template src/template.rs
 struct Templates src/template.rs

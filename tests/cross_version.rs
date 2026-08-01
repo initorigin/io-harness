@@ -143,6 +143,9 @@ fn schema(db: &Path) -> Vec<String> {
 /// 0.28.0's restore points, one row per file per run: a new table, so
 /// `CHECKPOINT_FORMAT` stays 7 and a 0.22.0 binary opens a store this release has
 /// written without ever querying it. The changelog says so under Added.
+/// 0.30.0 adds `memory_recalls` with its index, and six indexes over tables that
+/// already existed. An index is not a column and not a row: an older binary never
+/// names one, so adding them is invisible to it.
 const ADDED_SINCE_0_22_0: &[&str] = &[
     "process_handles",
     "process_handles_run",
@@ -150,6 +153,14 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     "handle_output_run",
     "snapshots",
     "snapshots_run",
+    "memory_recalls",
+    "memory_recalls_run",
+    "run_outcomes_outcome",
+    "run_outcomes_finished",
+    "sandbox_events_kind_detail",
+    "sandbox_events_run_kind",
+    "context_events_kind",
+    "checkpoint_events_kind",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
@@ -157,6 +168,58 @@ fn is_added_since_0_22_0(stmt: &str) -> bool {
     ADDED_SINCE_0_22_0
         .iter()
         .any(|name| stmt.contains(&format!(" {name} ")) || stmt.contains(&format!(" {name}(")))
+}
+
+/// The tables a release has altered by adding a nullable column, the columns it
+/// added, and nothing else.
+///
+/// 0.30.0 is the first release to alter a table at all: `memory` gains `kind` and
+/// `pinned`. `ALTER TABLE ADD COLUMN` rewrites the table's stored `CREATE TABLE`
+/// text — and inserts the new definition after the last *column* rather than at
+/// the end, before any table constraint — so an equality sees an alteration where
+/// the substance is an addition. Every original column is still there, in order,
+/// with its type and constraints untouched, and a previous binary's queries name
+/// none of the new ones. That claim is not taken on trust here:
+/// `tests/cross_version_0_29_0.rs` has a real 0.29.0 binary read a store this
+/// release wrote.
+///
+/// The columns are listed by name, not merely the table, for the same reason
+/// `ADDED_SINCE_0_22_0` names objects rather than matching a prefix: a rule that
+/// permitted "some columns were added to `memory`" would absorb the next column
+/// somebody adds without a word about it, and absorbing the next one is exactly
+/// what these tests exist to prevent.
+const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] =
+    &[("memory", &["kind TEXT", "pinned INTEGER"])];
+
+/// Whether `new` is `old` with exactly the declared columns added, and nothing
+/// else changed.
+///
+/// Both statements are already whitespace-normalised. Removing each declared
+/// column definition from `new` must reproduce `old` character for character, so
+/// a changed type, a dropped column, a renamed table or a loosened constraint
+/// fails — only the exact additions this release documented survive the
+/// comparison.
+fn is_only_added_columns(new: &str, old: &str) -> bool {
+    let Some((table, columns)) = COLUMNS_ADDED_SINCE_0_22_0
+        .iter()
+        .find(|(name, _)| old.starts_with(&format!("CREATE TABLE {name} (")))
+    else {
+        return false;
+    };
+    if !new.starts_with(&format!("CREATE TABLE {table} (")) {
+        return false;
+    }
+    let mut stripped = new.to_string();
+    for column in *columns {
+        let fragment = format!(", {column}");
+        match stripped.find(&fragment) {
+            Some(at) => {
+                stripped.replace_range(at..at + fragment.len(), "");
+            }
+            None => return false,
+        }
+    }
+    stripped == old
 }
 
 /// Assert that `new` contains everything `old` had, unchanged, and that whatever
@@ -169,10 +232,17 @@ fn is_added_since_0_22_0(stmt: &str) -> bool {
 /// changed", which stopped being true; this says "nothing changed except these
 /// four things", which is what the contract actually promises.
 fn assert_additive_only(new: &[String], old: &[String], what: &str) {
-    let missing: Vec<&String> = old.iter().filter(|s| !new.contains(s)).collect();
+    let matched = |old_stmt: &String| {
+        new.contains(old_stmt) || new.iter().any(|n| is_only_added_columns(n, old_stmt))
+    };
+    let missing: Vec<&String> = old.iter().filter(|s| !matched(s)).collect();
     let extra: Vec<&String> = new
         .iter()
-        .filter(|s| !old.contains(*s) && !is_added_since_0_22_0(s))
+        .filter(|s| {
+            !old.contains(*s)
+                && !is_added_since_0_22_0(s)
+                && !old.iter().any(|o| is_only_added_columns(s, o))
+        })
         .collect();
     assert!(
         missing.is_empty(),
