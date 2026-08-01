@@ -19,10 +19,10 @@ release_fit:
   reasons:
     - >
       The durable half of the plan gate is not new machinery, it is the machinery 0.21.0 already
-      built for a question: `pending_questions` persists, `RunOutcome::AwaitingAnswer` stops the run,
-      `resume_with_answer` records the answer and resumes normally, and the answer reaches the model
-      as a ledger observation because the step that asked was already committed. Every one of those
-      four moves has an exact counterpart here. The release copies a working shape rather than
+      built for a question: `pending_questions` persists, `RunOutcome::AwaitingAnswer` stops the
+      run, `resume_with_answer` records the answer and resumes normally, and the answer reaches the
+      model as a ledger observation because the step that asked was already committed. Every one of
+      those four moves has an exact counterpart here. The release copies a working shape rather than
       inventing a second one, which is what the roadmap outcome asked for in the words "the way an
       approval already pauses".
     - >
@@ -41,22 +41,22 @@ release_fit:
     - >
       The effort half is four additive fields and one body key per vendor, in three `body()`
       functions that are already the single place each vendor's request is built.
-    - >
+    - |
       The deployment path exists and has been walked 34 times.
   major_cost_drivers:
     - >
-      Making the phase's start and end read from the store rather than from a local variable. This is
-      the whole of the durability claim and it is the one thing that passes every in-process test
+      Making the phase's start and end read from the store rather than from a local variable. This
+      is the whole of the durability claim and it is the one thing that passes every in-process test
       whether it is right or wrong.
     - >
       The restart evidence. F2 needs a real SIGKILL and a second process that never saw the first,
       and it has to assert an absence — that no second planning turn happened — which is a harder
       thing to observe than a presence.
     - >
-      Anthropic's `max_tokens`. Extended thinking requires it strictly above `budget_tokens`, and the
-      crate's `MAX_TOKENS` is a fixed 8192 carrying a standing note that says so. Raising it only
-      when a budget is present is small; proving the no-effort body is byte-identical to 0.30.0's is
-      the test that has to exist.
+      Anthropic's `max_tokens`. Extended thinking requires it strictly above `budget_tokens`, and
+      the crate's `MAX_TOKENS` is a fixed 8192 carrying a standing note that says so. Raising it
+      only when a budget is present is small; proving the no-effort body is byte-identical to
+      0.30.0's is the test that has to exist.
     - >
       Reasoning could reach the next prompt by a path the ledger does not see, so F7 has to assert
       against the requests a provider double actually received rather than against stored rows.

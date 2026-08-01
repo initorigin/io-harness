@@ -822,7 +822,7 @@ versions:
       The two ride together because they are the same moment: both change the request before the
       agent acts, and both are what a caller adjusts when a run is about to do something expensive.
     detail: specified
-    status: planned
+    status: released
   - version: 0.32.0
     outcome: >
       The fleet holds the ceiling instead of hitting it. `Containment` treats the agent cap as a
