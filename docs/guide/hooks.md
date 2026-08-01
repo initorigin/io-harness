@@ -157,9 +157,10 @@ handle_exited        handle_orphaned      finished
 A name this crate does not emit is an **error at load**, naming the name and
 listing the ones that exist. A misspelled tag would otherwise be a hook that
 loads, installs, and never fires — a silence, which is the failure this feature
-can least afford. The list is checked against the enum by a test rather than
-maintained by hand, so a variant added in a later release is a name a hook may use
-in that release.
+can least afford. The list is written down in the crate and then *checked against
+the enum* by a test that reads the source, so a variant added in a later release
+cannot ship without becoming a name a hook may use — which is the half that had
+been missing since 0.21.0 and that 0.28.0 closed.
 
 ## Installing it
 
