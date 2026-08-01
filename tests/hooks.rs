@@ -259,49 +259,52 @@ fn f2_an_event_this_crate_does_not_emit_is_refused_naming_it() {
 /// Windows, which is the lesson 0.27.0's F4 paid for. The shell here is the
 /// *operator's* choice of program, which is a different thing from this crate
 /// inserting one.
-#[cfg(unix)]
-const CAPTURE: [&str; 3] = ["sh", "-c", "cat > 'a;b && c.jsonl'"];
-#[cfg(windows)]
-const CAPTURE: [&str; 3] = ["cmd", "/c", "findstr /r .* > \"a;b c.jsonl\""];
-
-/// The file the capture hook writes, which is also the proof.
+/// PowerShell rather than `cmd` on Windows, and the reason is a property of `cmd`
+/// rather than of this crate: `cmd /c` strips the quotes a spawn adds around a
+/// single argument only when that argument contains no other quotes, and keeps them
+/// otherwise — so a `/c` string carrying a quoted redirect target is read as the
+/// name of a program. PowerShell parses its own command line and does not have that
+/// rule, which lets the same script text carry `;`, `&&` and a space on both
+/// platforms and keeps this test asserting the same thing everywhere.
 ///
-/// Windows drops the `&&`: `cmd` owns the parsing of the string an operator handed
-/// it, and `&` is a separator there in ways that vary with quoting — which is a fact
-/// about `cmd` and not about this crate. The space and the semicolon prove what this
-/// test is for either way, because an argv split on whitespace or on `;` would
-/// produce some other file, or several.
+/// The shell here is the *operator's* choice of program, which is a different thing
+/// from this crate inserting one.
 #[cfg(unix)]
-const CAPTURE_FILE: &str = "a;b && c.jsonl";
+const CAPTURE: &[&str] = &["sh", "-c", "cat > 'a;b && c.jsonl'"];
 #[cfg(windows)]
-const CAPTURE_FILE: &str = "a;b c.jsonl";
+const CAPTURE: &[&str] = &[
+    "powershell",
+    "-NoProfile",
+    "-NonInteractive",
+    "-Command",
+    "[Console]::In.ReadToEnd() | Set-Content -LiteralPath 'a;b && c.jsonl'",
+];
+
+/// The file the capture hook writes, which is also the proof: an argv split on
+/// whitespace, on `;` or on `&&` would produce some other file, or several.
+const CAPTURE_FILE: &str = "a;b && c.jsonl";
 
 /// Sleeps well past any timeout this test sets.
 #[cfg(unix)]
-const SLOW: [&str; 2] = ["sleep", "30"];
+const SLOW: &[&str] = &["sleep", "30"];
 #[cfg(windows)]
-const SLOW: [&str; 3] = ["cmd", "/c", "ping -n 31 127.0.0.1 > NUL"];
+const SLOW: &[&str] = &["ping", "-n", "31", "127.0.0.1"];
 
 /// Returns at once, and successfully.
 #[cfg(unix)]
-const FAST: [&str; 2] = ["true", ""];
+const FAST: &[&str] = &["true"];
 #[cfg(windows)]
-const FAST: [&str; 3] = ["cmd", "/c", "exit 0"];
+const FAST: &[&str] = &["cmd", "/c", "exit 0"];
 
 /// Returns at once, and unsuccessfully.
 #[cfg(unix)]
-const FAILS: [&str; 2] = ["false", ""];
+const FAILS: &[&str] = &["false"];
 #[cfg(windows)]
-const FAILS: [&str; 3] = ["cmd", "/c", "exit 1"];
+const FAILS: &[&str] = &["cmd", "/c", "exit 1"];
 
-/// A TOML array literal for one of the tables above, dropping the padding entry the
-/// unix forms carry so the two platforms can share a fixed-size constant.
+/// A TOML array literal for one of the tables above.
 fn argv(parts: &[&str]) -> String {
-    let items: Vec<String> = parts
-        .iter()
-        .filter(|p| !p.is_empty())
-        .map(|p| format!("{p:?}"))
-        .collect();
+    let items: Vec<String> = parts.iter().map(|p| format!("{p:?}")).collect();
     format!("[{}]", items.join(", "))
 }
 
@@ -335,7 +338,7 @@ async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
         ws.path(),
         &format!(
             "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 20000\n",
-            argv(&CAPTURE)
+            argv(CAPTURE)
         ),
     )
     .await;
@@ -355,7 +358,10 @@ async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
     // And what reached its stdin is the event that fired, as JSON rather than as a
     // rendering of one.
     let text = std::fs::read_to_string(&at).unwrap();
-    let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    // A byte-order mark first: PowerShell's `Set-Content` may write one, and a BOM
+    // is whitespace to nobody, least of all to a JSON parser.
+    let v: serde_json::Value =
+        serde_json::from_str(text.trim_start_matches('\u{feff}').trim()).unwrap();
     assert_eq!(v["event"], "started");
     assert_eq!(v["run_id"], 1);
 }
@@ -373,7 +379,7 @@ async fn f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure
         slow.path(),
         &format!(
             "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 50\non_failure = \"cancel\"\n",
-            argv(&SLOW)
+            argv(SLOW)
         ),
     )
     .await;
@@ -389,7 +395,7 @@ async fn f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure
         fast.path(),
         &format!(
             "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 30000\non_failure = \"cancel\"\n",
-            argv(&FAST)
+            argv(FAST)
         ),
     )
     .await;
@@ -412,7 +418,7 @@ async fn f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to() {
         asked.path(),
         &format!(
             "[[hook]]\non = [\"started\"]\nrun = {}\non_failure = \"cancel\"\n",
-            argv(&FAILS)
+            argv(FAILS)
         ),
     )
     .await;
@@ -427,7 +433,7 @@ async fn f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to() {
     let unasked = tempfile::tempdir().unwrap();
     let outcome = run_under(
         unasked.path(),
-        &format!("[[hook]]\non = [\"started\"]\nrun = {}\n", argv(&FAILS)),
+        &format!("[[hook]]\non = [\"started\"]\nrun = {}\n", argv(FAILS)),
     )
     .await;
     assert!(
