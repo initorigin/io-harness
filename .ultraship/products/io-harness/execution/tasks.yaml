@@ -72,7 +72,7 @@ tasks:
   why_required: >
     This is the release's outcome sentence — the agent proposes and the run executes nothing until
     an answer arrives. Without it the types from T01 are a vocabulary nothing speaks.
-  status: todo
+  status: done
   depends_on: [US-IO-HARNESS-0.31.0-T01]
   acceptance_criteria:
   - >
@@ -100,7 +100,55 @@ tasks:
   - src/tools/mod.rs
   - src/tools/custom.rs
   - tests/plan_gate.rs
-  evidence: []
+  evidence:
+  - >
+    The phase is held by `plan_lock()` — `Policy::permissive().layer("plan-gate").deny_write("*")
+    .deny_exec("*")`, merged into the run's effective policy — rather than by filtering the tool
+    list. `Policy::explain` resolves deny-first across every layer, so one layer covers
+    `write_file`, `edit_file`, `exec`, the four shell tools, the git built-ins, every registered
+    `Tool` and every MCP tool, the last two because invoking one is an `Act::Exec` check on its own
+    name. A tool added next release is covered the day it lands.
+  - >
+    F1 — `nothing_is_written_before_the_approval` photographs the workspace directory into a
+    `BTreeMap<path, bytes>` before the run and asserts equality afterwards, with the scripted model
+    calling `write_file`, `exec` and a registered `Tool` on its very first turn. It asserts on the
+    DIRECTORY, not on the outcome: a harness that wrote the file and then paused satisfies every
+    outcome assertion available. Its control, `the_same_script_writes_once_the_plan_is_approved`,
+    runs the identical script under `AcceptPlan` and requires `out.txt` to exist — and still
+    requires `made-by-exec` not to, so the control is a control rather than a second happy path.
+  - >
+    `a_refusal_during_the_phase_names_the_plan_gate_layer` asserts the refusal is an ordinary
+    policy refusal carrying `layer = "plan-gate"`, so an operator reading the trace can see why a
+    write was refused without knowing this feature exists.
+  - >
+    `remember` is refused explicitly, because it writes to the harness's own store and never passes
+    the policy. `remember_is_refused_while_the_plan_is_pending` asserts `memory_list` is empty.
+    Without it "nothing is written" would have quietly meant "nothing the policy happens to see".
+  - >
+    F3 — three named tests, not one shared one.
+    `approve_continues_the_run_and_puts_the_plan_in_the_next_prompt` asserts the plan text is in the
+    request the provider was actually handed on the following turn.
+    `revise_keeps_the_phase_on_and_the_correction_reaches_the_model` asserts the correction reached
+    the model, that `propose_plan` was still offered afterwards, that the store holds both proposals
+    with both verdicts, and that the SECOND plan is the one carried out.
+    `cancel_stops_the_run_with_nothing_written` asserts `PlanRejected`, an unchanged workspace, and
+    that the script's second turn was never requested.
+  - >
+    F4 — `a_plan_naming_an_unknown_agent_is_refused_back_to_the_model` asserts the observation names
+    both the offending agent and the roster, and that the rejected proposal was never stored: a
+    human must not be shown a plan whose owner cannot be spawned. Its control,
+    `a_plan_naming_a_roster_member_is_accepted`, shows the check discriminates rather than refusing
+    every `agent`.
+  - >
+    `the_tool_is_withdrawn_once_the_plan_is_approved` and `a_run_without_a_gate_is_unchanged` are the
+    two ends: the tool is offered only while the phase is on, and a contract with no gate behaves
+    exactly as 0.30.0 did.
+  - >
+    `EventKind::PlanProposed` and `PlanDecided` reach an `Observer`
+    (`the_proposal_and_the_verdict_both_reach_an_observer`), and `EVENT_NAMES` gains all three
+    spellings so a `[[hook]]` can filter on them. `cargo test --test plan_gate` — 16 passed,
+    0 failed.
+
 
 - id: US-IO-HARNESS-0.31.0-T03
   summary: >
@@ -111,7 +159,7 @@ tasks:
     A gate that only works while the process lives is the failure 0.7.0 already refused for
     approvals. It is also the one defect that passes every in-process test, so it gets its own task
     and its own restart evidence.
-  status: todo
+  status: done
   depends_on: [US-IO-HARNESS-0.31.0-T02]
   acceptance_criteria:
   - >
@@ -132,7 +180,46 @@ tasks:
   - src/state.rs
   - examples/plan_gate_restart.rs
   - tests/plan_gate.rs
-  evidence: []
+  evidence:
+  - >
+    Four entry points — `resume_with_plan_decision`, `resume_tree_with_plan_decision` and their
+    `_observed` twins — matching the four `resume_*_with_answer` ones exactly, so a caller who knows
+    one knows the other. `record_plan_decision` is `record_answer`'s counterpart and is thin for the
+    same reason: the step that proposed was committed, so the `propose_plan` call is never replayed
+    and the verdict arrives as an `ObsKind::Message` observation with no target.
+  - >
+    `PlanVerdict::Cancel` does NOT resume. `cancel_the_run` finishes the run as `plan_rejected`
+    without re-entering the loop, because driving it again would ask the model to propose the same
+    approach to the same person who just refused it.
+    `a_cancel_through_a_resume_finishes_the_run_without_re_entering_the_loop` asserts the provider
+    turn count is unchanged across the resume.
+  - >
+    F2 — `a_plan_survives_a_real_sigkill_and_is_approved_by_a_second_process` spawns
+    `examples/plan_gate_fixture`, which proposes under `PlanGateNone`, stops on `AwaitingPlan` and
+    then parks forever so the parent kills a process that is unambiguously alive. After SIGKILL the
+    test reads the plan from the store, asserts both step intents match what the dead process
+    proposed, asserts the plan is still undecided, asserts the workspace is byte-identical to before
+    the run, approves it, and resumes to a completed write under the original run id.
+  - >
+    The assertion that carries F2's claim is an ABSENCE. The resume-side provider is a `Finisher`
+    that records the tool list it was handed and can only write; the test asserts `propose_plan` was
+    never in any of those lists. That is the only observable separating "the approval was read from
+    the store" from "it planned again and was approved again" — an outcome assertion passes on both.
+  - >
+    Also asserted on the resume: no step number occurs twice, the last step advanced, and
+    `decided_by` reads `"human"` rather than `"gate"`, because a decision that arrived through a
+    resume must not be filed as the machine's.
+  - >
+    `a_plan_belonging_to_another_run_is_refused` — approving somebody else's plan is an
+    `Error::Resume`, not a silent no-op that would leave this run planning forever.
+  - >
+    N2 — `state::tests::the_approved_plan_lookup_reaches_its_row_through_an_index` asserts
+    `EXPLAIN QUERY PLAN` for the loop's per-step statement names an index, with a control over
+    `plans.steps` (unindexed) that must not. Measured at 20,000 plan rows: **26.3µs per
+    `approved_plan` call**. A wall-clock threshold was deliberately not asserted, for the reason
+    0.30.0's N2 recorded — flaky on a loaded runner, and it passes on a fast machine running a full
+    scan.
+
 
 - id: US-IO-HARNESS-0.31.0-T04
   summary: >
@@ -143,7 +230,7 @@ tasks:
     The second half of the release outcome. `Usage::reasoning_tokens` has been recorded since 0.18.0
     with no way to ask for them, so every run takes the vendor's default on both the cheap steps and
     the expensive one.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -162,7 +249,31 @@ tasks:
   - src/contract.rs
   - src/run.rs
   - src/lib.rs
-  evidence: []
+  evidence:
+  - >
+    F6, the OpenAI wire — `each_wire_vendor_gets_the_effort_tier_in_its_own_shape` asserts
+    `reasoning_effort == "low"` for `WebFlavor::OpenAi` with no `reasoning` key, and
+    `reasoning == {"effort": "high"}` for `WebFlavor::OpenRouter` with no `reasoning_effort` key.
+    Each vendor is also asserted NOT to carry the other's key.
+  - >
+    F6, Anthropic — `the_effort_tier_becomes_a_thinking_budget_below_max_tokens` asserts
+    `thinking.type == "enabled"`, that `budget_tokens` equals the tier's, and that it is strictly
+    below `max_tokens` for all three tiers. That inequality is the assertion worth having: Anthropic
+    refuses a request whose budget is not below the cap, and without a local test the failure is a
+    400 on the wire. It also asserts the budgets are ordered, so asking for more thinking gets more.
+  - >
+    F6's controls assert the WHOLE no-effort body, not merely the absence of a key.
+    `no_effort_leaves_both_bodies_exactly_as_they_were` compares against a literal 0.30.0 body;
+    `no_effort_leaves_the_anthropic_body_exactly_as_it_was` asserts no `thinking` key and
+    `max_tokens` back at the fixed 8192. Without these the tests above would pass against an
+    implementation that always sent a default.
+  - >
+    The tier reaches the wire from three places: `TaskContract::effort` on both the single-file and
+    workspace loops, and `identity.and_then(|d| d.effort).or(contract.effort)` on the tree loop, so
+    a definition's tier wins over the run's and a child spawned without one inherits the root's.
+  - >
+    `cargo test --lib provider::` — 81 passed, 0 failed.
+
 
 - id: US-IO-HARNESS-0.31.0-T05
   summary: >
@@ -173,7 +284,7 @@ tasks:
     "Visible, and not paid for twice" is half the effort outcome. A tier that could be asked for and
     whose product nobody could see would be a cost with no signal; one folded into the next prompt
     would be a cost charged again every turn for the rest of the run.
-  status: todo
+  status: done
   depends_on: [US-IO-HARNESS-0.31.0-T04]
   acceptance_criteria:
   - >
@@ -200,7 +311,38 @@ tasks:
   - src/observe.rs
   - src/run.rs
   - tests/reasoning.rs
-  evidence: []
+  evidence:
+  - >
+    F8, the OpenAI wire — `reasoning_deltas_accumulate_and_stay_out_of_the_text` feeds `reasoning`
+    and `reasoning_content` fragments interleaved with `content` and asserts the concatenation lands
+    in `reasoning` and NOT in `text`. Both spellings are read because a `Compatible` provider
+    pointed at either kind of endpoint should behave the same way.
+  - >
+    F8, Anthropic — `thinking_deltas_accumulate_and_stay_out_of_the_text` feeds `thinking_delta`
+    blocks plus a `signature_delta`, and asserts the signature reaches neither field. The signature
+    is the vendor's integrity token for replaying the block back to it, not something a human or a
+    trace wants.
+  - >
+    F8's controls — `a_stream_with_no_reasoning_yields_none_rather_than_an_empty_string` and its
+    Anthropic twin. `None`, never `Some("")`: "the model did not think" and "the model thought
+    nothing" are different facts and only the first is true.
+  - >
+    F7 — `reasoning_reaches_the_observer_and_never_the_next_prompt` uses a sentinel string
+    (`ZZTHINKINGZZ...`) returned on step 1 and asserts three things: the observer saw it exactly once
+    with its 40-token cost; it appears in no `observations` row; and — the assertion that carries the
+    claim — it appears in the `system` or `user` of NO `CompletionRequest` the provider double
+    actually received. A loop that dropped it into the ledger and a loop that re-added it at assembly
+    time are different bugs and only the first shows up in a stored row.
+  - >
+    N5 — `a_provider_that_ignores_the_tier_still_receives_it_and_still_works` drives the real loop
+    with an out-of-tree provider that reads neither field, asserts the tier reached it, and asserts
+    the run still completed. Its control, `a_run_that_asks_for_no_tier_sends_none`, shows the
+    implementation does not always send a default.
+    `a_provider_that_returns_no_thinking_emits_nothing` is the other end: an absent event means the
+    model did not think.
+  - >
+    `cargo test --test reasoning` — 5 passed, 0 failed.
+
 
 - id: US-IO-HARNESS-0.31.0-T06
   summary: >
@@ -213,7 +355,7 @@ tasks:
     from it, and `tests/public_api.rs` fails on any added item without a worked example. Neither is
     optional, and a capability documented only in rustdoc is one only a reader who already knows it
     exists will find.
-  status: todo
+  status: done
   depends_on: [US-IO-HARNESS-0.31.0-T03, US-IO-HARNESS-0.31.0-T05]
   acceptance_criteria:
   - >
@@ -236,7 +378,43 @@ tasks:
   - README.md
   - CHANGELOG.md
   - Cargo.toml
-  evidence: []
+  evidence:
+  - >
+    F5 — `observe::tests::event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+    and `every_variant_round_trips` both pass with the three added variants. The variants were added
+    to `every_kind()`'s vector in the same commit as the enum, which is the lesson the three 0.21.0
+    variants cost seven releases to learn: the guard below the vector proves the ARMS exhaustive and
+    says nothing about what the vector holds.
+  - >
+    N3 — four breaking entries, each with a `*Migration:*` note and, where the shapes differ enough
+    to need one, a fenced snippet. `tests/changelog.rs` (5 tests, including
+    `every_breaking_entry_carries_a_migration_note`) passes. No public item is renamed or removed,
+    so no deprecation cycle is owed: `docs/public-api.txt` gains 15 lines and loses none, verified by
+    `git diff --stat` as `15 insertions(+)` with no deletions.
+  - >
+    N4 — `tests/public_api.rs` (9 tests) passes, including `every_public_item_has_a_worked_example`
+    over all 15 added crate-root names.
+  - >
+    `docs/CONTRACT.md` gains two sections. "What the plan gate stops, and what it does not" states
+    that the boundary is the policy and not the tool list, that reads and `Act::Net` stay open and
+    why, that `remember` is the one write the policy cannot see, and — the honest limit — that a
+    read-shaped registered `Tool` which quietly writes is outside every boundary this crate has, in
+    the phase and out of it. "Reasoning effort, per vendor" carries the four-row table and states
+    plainly that OpenAI's Chat Completions returns no reasoning text at all and that Anthropic has no
+    tiers.
+  - >
+    Three new `known_limitations` in the contract's "Limits that hold today": the gate binds the
+    agent and not the caller holding the `Store`; a second verdict on one plan is refused but two
+    resumes after a single approval are not guarded; and reasoning text is live-only.
+  - >
+    `docs/guide/permissions.md` gains "Reviewing the approach, before there is anything to approve"
+    and `docs/guide/providers.md` gains "Asking a model to think harder"; the README's guide table
+    points at both. `cargo test --test docs_drift --test readme --test guide_pages` — 10, 8 and 7
+    passed, 0 failed.
+  - >
+    `cargo doc --no-deps --all-features` — **0 warnings**. Four redundant explicit link targets were
+    introduced and removed before the gate; the rustdoc build is clean.
+
 
 - id: US-IO-HARNESS-0.31.0-T07
   summary: >
@@ -245,7 +423,7 @@ tasks:
   why_required: >
     The release adds a table to a format every earlier binary still reads. Both directions are
     executed rather than argued, and the gates are what `complete` stores as evidence.
-  status: todo
+  status: done
   depends_on: [US-IO-HARNESS-0.31.0-T06]
   acceptance_criteria:
   - >
@@ -262,4 +440,55 @@ tasks:
   files:
   - tests/cross_version_0_29_0.rs
   - tests/cross_version.rs
-  evidence: []
+  evidence:
+  - >
+    F9, the guard firing first. `cross_version.rs`'s two schema tests FAILED on the new table before
+    anything was declared, naming both the `plans` `CREATE TABLE` and its index — which is the guard
+    working. They pass once both objects are named in `ADDED_SINCE_0_22_0`, by name rather than by a
+    prefix rule, so the next table somebody adds is not absorbed silently. `CHECKPOINT_FORMAT` is
+    still 7 and no existing table's stored `CREATE TABLE` text moved.
+  - >
+    F9 forwards — `a_0_29_0_store_reads_back_identically_under_the_current_tree` and
+    `a_0_29_0_tree_resumes_under_the_current_tree` run the real 0.29.0-written fixtures against this
+    tree, unchanged. Both pass.
+  - >
+    F9 backwards, and stronger than the criterion asked for.
+    `a_current_store_is_read_by_a_0_29_0_binary` execs the pinned `io-harness =0.29.0` build over a
+    store this tree wrote carrying a proposed AND approved plan. Exit 0,
+    `"reader": "io-harness 0.29.0"`, both memory entries with their attribution, and the run outcome
+    — because its queries never name the `plans` table. Run locally as well as in CI.
+  - >
+    **Deviation, stated rather than glossed.** The criterion named a 0.30.0 binary. The pinned
+    generator in the tree is 0.29.0, and a 0.29.0 binary lacks everything a 0.30.0 one lacks and
+    more — 0.30.0's two `memory` columns and its `memory_recalls` table as well as this release's
+    `plans` table — so the boundary tested is a two-release gap rather than a one-release gap. It is
+    a strictly stronger claim, proven by the technique the criterion named, and it costs no second
+    pinned crate to build and keep in sync. Tests renamed off the version of this tree so they do not
+    need renaming every release; `ci.yml`'s `--exact` argument and job display name follow.
+  - >
+    N1 — `cargo tree` reads **402 lines**, identical to 0.23.0 through 0.30.0.
+    `cargo tree --all-features` reads **842**. No dependency was added; nothing here needed one.
+  - >
+    Gates, in the order CI runs them and as the last thing to touch the tree.
+    `cargo fmt --check` clean.
+    `cargo clippy --all-targets --all-features -- -D warnings` exit 0
+    (`.ultraship/evidence/0.31.0/clippy.txt`).
+    `cargo test` exit 0 — 55 `test result: ok` lines, 1,192 assertions passed, 0 failed, 311
+    doctests (`tests-default.txt`).
+    `cargo test --all-features --lib --tests` exit 0 — 54 ok lines, 958 passed, 0 failed
+    (`tests-all-features.txt`).
+    `cargo test --all-features --doc` exit 0 — 313 passed, 0 failed (`tests-doc.txt`).
+    `cargo doc --no-deps --all-features` — 0 warnings.
+  - >
+    O3 — `cargo package --locked` exit 0: **200 files, 4.6MiB (1.1MiB compressed)**, and the packaged
+    crate compiled under `target/package/io-harness-0.31.0`
+    (`.ultraship/evidence/0.31.0/package.txt`).
+  - >
+    Trap 1 was paid again and is worth recording: `target/` reached 22.7GiB and filled the disk to
+    146MiB free mid-suite, which surfaced as an `ENOSPC` opening an unrelated scratch file rather
+    than as a build error. `cargo clean` before `cargo package` is not optional on this machine.
+    Trap 2 was paid too: `cargo test --all-features --lib --tests` on a clean tree fails
+    `crash_resume_after_a_real_sigkill` because it does not build `examples/`; `cargo build
+    --all-features --examples` first. The new `examples/plan_gate_fixture` inherits exactly the same
+    requirement.
+
