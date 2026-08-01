@@ -18,6 +18,7 @@ use tracing::info;
 
 use crate::agent::{AgentDef, Agents};
 use crate::approve::{ApproveAll, Approver, Decision, Request};
+use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
 use crate::context::{
@@ -56,8 +57,9 @@ const GIT_DIR: &str = ".git";
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
     Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
-    GREP_TOOL, LIST_DIR_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL, SHELL_KILL_TOOL,
-    SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL, WRITE_FILE_TOOL,
+    GREP_TOOL, LIST_DIR_TOOL, PROPOSE_PLAN_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL,
+    SHELL_KILL_TOOL, SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL,
+    WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
@@ -221,6 +223,26 @@ pub enum RunOutcome {
     /// two questions differ: that one asks whether an action is permitted, this one
     /// asks what was wanted. An answer to this one authorizes nothing.
     AwaitingAnswer { question_id: i64, steps: u32 },
+    /// (0.31.0) The agent proposed a plan and no [`PlanGate`](crate::PlanGate) in
+    /// this process would decide on it. The run is paused, not finished: the plan
+    /// is persisted under `plan_id` and survives this process, so
+    /// [`resume_with_plan_decision`] continues it once a human answers. `steps` is
+    /// how many steps completed.
+    ///
+    /// Nothing in the workspace has been written at this point, and that is the
+    /// difference from every other pause in this enum: the planning phase denies
+    /// every [`Act::Write`](crate::Act::Write) and [`Act::Exec`](crate::Act::Exec),
+    /// so a run that stops here stops having read and thought and done nothing else.
+    AwaitingPlan { plan_id: i64, steps: u32 },
+    /// (0.31.0) A [`PlanGate`](crate::PlanGate) cancelled the plan, so the run
+    /// stopped without doing the work. `steps` is how many steps completed —
+    /// reading and proposing, never writing.
+    ///
+    /// Distinct from [`Cancelled`](RunOutcome::Cancelled), which is an
+    /// [`Observer`](crate::Observer) stopping a run already under way, and from
+    /// [`Denied`](RunOutcome::Denied), which is a human refusing one *action* a run
+    /// had already decided to take. This one is a human refusing the approach.
+    PlanRejected { steps: u32 },
     /// The agent stopped making progress: for `StallPolicy::window` consecutive
     /// steps it changed nothing in the workspace while repeating a tool call it had
     /// already made, and it had already been told once. The run stops here rather
@@ -2314,6 +2336,10 @@ fn terminal_outcome(store: &Store, run_id: i64) -> Result<Option<RunOutcome>> {
         // there is no criterion left to re-check, so a resume reports it rather
         // than driving the loop again to watch the agent say nothing twice.
         "finished" => Some(RunOutcome::Finished { steps: last }),
+        // 0.31.0: a plan a human cancelled. Final for the reason `denied` and
+        // `cancelled` are — a person said no — so a resume reports it rather than
+        // asking the model to propose the same approach again.
+        "plan_rejected" => Some(RunOutcome::PlanRejected { steps: last }),
         _ => None,
     }))
 }
@@ -2706,6 +2732,14 @@ async fn run_workspace_from<P: Provider>(
     // merge so a remembered allow can still never defeat a deny beneath it.
     let mut effective = policy.clone();
     let mut remembered: Vec<Rule> = Vec::new();
+    // 0.31.0 — the plan gate. Whether the phase is still on is asked of the STORE,
+    // not of a local: a run approved in one process and killed in the next must not
+    // plan again, and one that was never approved must not start writing because the
+    // approval died with the process that held it.
+    let mut planning = contract.plan_gate.is_some() && store.approved_plan(run_id)?.is_none();
+    if planning {
+        effective = effective.merge(plan_lock());
+    }
     let mut ws = Workspace::with_policy(root, effective.clone());
     // MCP tools sit beside the built-ins under their namespaced names, so the
     // model chooses between them the same way it chooses between grep and find.
@@ -2715,9 +2749,20 @@ async fn run_workspace_from<P: Provider>(
     let mut extra = contract.tools.specs();
     extra.extend(mcp.tool_specs());
     extra.extend(skill_tool(skills));
-    let system = with_skill_catalog(with_extra_tools(workspace_system_prompt(), &extra), skills);
+    let base_system =
+        with_skill_catalog(with_extra_tools(workspace_system_prompt(), &extra), skills);
+    let mut system = match planning {
+        true => format!("{base_system}{}", planning_directive(&contract.agents)),
+        false => base_system.clone(),
+    };
     let mut tools = workspace_tools();
     tools.extend(extra);
+    // Offered only while the phase is on, and withdrawn the moment it ends: a tool
+    // that proposes a plan on a run that already has an approved one would be a
+    // second gate mid-run, which is a second way for an unattended run to stop.
+    if planning {
+        tools.push(propose_plan_spec());
+    }
     // Durable budget: restored from the store so a resume continues the same
     // token and wall-clock budget rather than restarting it at zero.
     let mut tokens_used: u64 = store.spent_tokens(run_id)?;
@@ -2980,6 +3025,12 @@ async fn run_workspace_from<P: Provider>(
         // would answer. Kept separate from `paused` so the two pauses cannot be
         // confused for one another in the outcome.
         let mut asked: Option<i64> = None;
+        // 0.31.0 — the third: a plan nobody here would decide on, and a plan somebody
+        // cancelled. Separate from the two above for the same reason they are
+        // separate from each other.
+        let mut plan_pending: Option<i64> = None;
+        let mut plan_cancelled = false;
+        let mut plan_approved = false;
         let mut new_rules: Vec<Rule> = Vec::new();
         for call in &response.tool_calls {
             calls_json.push(format!("{}:{}", call.name, call.arguments));
@@ -3003,6 +3054,11 @@ async fn run_workspace_from<P: Provider>(
                 contract.exec_timeout,
                 toolchain.as_ref(),
                 handles,
+                PlanPhase {
+                    gate: contract.plan_gate.as_deref(),
+                    agents: &contract.agents,
+                    active: planning,
+                },
             )
             .await?
             {
@@ -3029,6 +3085,54 @@ async fn run_workspace_from<P: Provider>(
                     asked = Some(question_id);
                     break;
                 }
+                Dispatched::Plan { plan_id, verdict } => match verdict {
+                    Some(PlanVerdict::Approve) => {
+                        decisions.push(format!("plan {plan_id} approved"));
+                        plan_approved = true;
+                    }
+                    Some(PlanVerdict::Cancel) => {
+                        decisions.push(format!("plan {plan_id} cancelled"));
+                        plan_cancelled = true;
+                        break;
+                    }
+                    // A `Revise` never reaches here; see the dispatch arm.
+                    _ => {
+                        decisions.push(format!("awaiting plan decision (plan {plan_id})"));
+                        plan_pending = Some(plan_id);
+                        break;
+                    }
+                },
+            }
+        }
+
+        // 0.31.0 — the phase ends here, mid-step, and the observation that carries
+        // the approved plan is what puts it in the next assembled prompt. The policy
+        // is rebuilt from the base rather than edited, so the `plan-gate` layer goes
+        // and every rule an approver remembered stays.
+        if plan_approved {
+            planning = false;
+            effective = policy.clone();
+            if !remembered.is_empty() {
+                effective = effective.merge(remembered_layer(&remembered));
+            }
+            ws = Workspace::with_policy(root, effective.clone());
+            tools.retain(|t| t.name != PROPOSE_PLAN_TOOL);
+            system = base_system.clone();
+            if let Some(approved) = store.approved_plan(run_id)? {
+                ledger.push(Observation::new(
+                    step,
+                    ObsKind::Message,
+                    None,
+                    bound(
+                        &format!(
+                            "\n[plan approved]\n{}\n(This is the approach you agreed to. \
+                             Carry it out.)\n",
+                            approved.render()
+                        ),
+                        entry_cap,
+                        ObsKind::Message,
+                    ),
+                ));
             }
         }
 
@@ -3114,6 +3218,28 @@ async fn run_workspace_from<P: Provider>(
                 return Ok(RunResult::new(RunOutcome::Stalled { steps: step }, run_id)
                     .with_remembered(remembered));
             }
+        }
+
+        // 0.31.0 — the plan stops. Checked before the two below because a run that
+        // reached either of these has written nothing at all, which is a stronger
+        // statement than "it stopped", and the outcome should say so.
+        if let Some(plan_id) = plan_pending {
+            finish(store, watch, run_id, 0, step, "awaiting_plan")?;
+            return Ok(RunResult::new(
+                RunOutcome::AwaitingPlan {
+                    plan_id,
+                    steps: step,
+                },
+                run_id,
+            )
+            .with_remembered(remembered));
+        }
+        if plan_cancelled {
+            finish(store, watch, run_id, 0, step, "plan_rejected")?;
+            return Ok(
+                RunResult::new(RunOutcome::PlanRejected { steps: step }, run_id)
+                    .with_remembered(remembered),
+            );
         }
 
         // An approver deferred: persist nothing further, stop, and let the
@@ -3809,7 +3935,18 @@ fn run_agent<'f, P: Provider>(
 ) -> Pin<Box<dyn Future<Output = Result<RunOutcome>> + 'f>> {
     // Boxed so the loop can recurse into itself when an agent spawns a child.
     Box::pin(async move {
-        let ws = Workspace::with_policy(&tree.root, policy.clone());
+        // 0.31.0 — the plan gate, at the root only. A child that could hold its own
+        // plan open would mean a hundred pending plans from one `run_tree`, which is
+        // the problem the gate exists to prevent rather than a feature of it. As in
+        // the workspace loop, the phase's state is read from the store.
+        let mut planning = depth == 0
+            && contract.plan_gate.is_some()
+            && tree.store.approved_plan(run_id)?.is_none();
+        let mut effective = policy.clone();
+        if planning {
+            effective = effective.merge(plan_lock());
+        }
+        let mut ws = Workspace::with_policy(&tree.root, effective);
         // The tree shares one MCP session, so every agent in it — root or child —
         // is offered the same server tools beside its built-ins. Connecting a
         // session and then not offering its tools would leave the model unable to
@@ -3823,12 +3960,19 @@ fn run_agent<'f, P: Provider>(
         // agent how to use its tools and that its result composes back into its
         // parent, and a role that replaced it would produce an agent that did not
         // know how to be one.
-        let system = match identity.and_then(|d| d.role.as_deref()) {
+        let base_system = match identity.and_then(|d| d.role.as_deref()) {
             Some(role) => format!("{}\n\n{system}", role.trim()),
             None => system,
         };
+        let mut system = match planning {
+            true => format!("{base_system}{}", planning_directive(&contract.agents)),
+            false => base_system.clone(),
+        };
         let mut tools = tree_tools(tree.agents);
         tools.extend(extra);
+        if planning {
+            tools.push(propose_plan_spec());
+        }
         // The budget this agent runs under is the smaller of what its contract
         // asked for and what the tree has left — a contract cannot raise it.
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
@@ -3996,6 +4140,9 @@ fn run_agent<'f, P: Provider>(
             // would answer. Kept separate from `paused` so the two pauses cannot be
             // confused for one another in the outcome.
             let mut asked: Option<i64> = None;
+            let mut plan_pending: Option<i64> = None;
+            let mut plan_cancelled = false;
+            let mut plan_approved = false;
             let mut paused_by_child = false;
             let mut spawn_calls: Vec<&ToolCall> = Vec::new();
             for call in &response.tool_calls {
@@ -4024,6 +4171,11 @@ fn run_agent<'f, P: Provider>(
                     contract.exec_timeout,
                     toolchain.as_ref(),
                     handles,
+                    PlanPhase {
+                        gate: contract.plan_gate.as_deref().filter(|_| depth == 0),
+                        agents: &contract.agents,
+                        active: planning,
+                    },
                 )
                 .await?
                 {
@@ -4049,7 +4201,53 @@ fn run_agent<'f, P: Provider>(
                         asked = Some(question_id);
                         break;
                     }
+                    Dispatched::Plan { plan_id, verdict } => match verdict {
+                        Some(PlanVerdict::Approve) => {
+                            decisions.push(format!("plan {plan_id} approved"));
+                            plan_approved = true;
+                        }
+                        Some(PlanVerdict::Cancel) => {
+                            decisions.push(format!("plan {plan_id} cancelled"));
+                            plan_cancelled = true;
+                            break;
+                        }
+                        _ => {
+                            decisions.push(format!("awaiting plan decision (plan {plan_id})"));
+                            plan_pending = Some(plan_id);
+                            break;
+                        }
+                    },
                 }
+            }
+            // The phase ends here, and the spawn calls below are the reason it must:
+            // an approved plan names the agents it hands work to, and until it is
+            // approved a spawn is an `Act::Exec` the `plan-gate` layer refuses.
+            if plan_approved {
+                planning = false;
+                ws = Workspace::with_policy(&tree.root, policy.clone());
+                tools.retain(|t| t.name != PROPOSE_PLAN_TOOL);
+                system = base_system.clone();
+                if let Some(approved) = tree.store.approved_plan(run_id)? {
+                    ledger.push(Observation::new(
+                        step,
+                        ObsKind::Message,
+                        None,
+                        bound(
+                            &format!(
+                                "\n[plan approved]\n{}\n(This is the approach you agreed to. \
+                                 Carry it out.)\n",
+                                approved.render()
+                            ),
+                            entry_cap,
+                            ObsKind::Message,
+                        ),
+                    ));
+                }
+            }
+            if plan_pending.is_some() || plan_cancelled {
+                // Nothing has been written and no child was spawned, so there is no
+                // composition to do: commit what was read and stop.
+                spawn_calls.clear();
             }
             if paused.is_none() && !spawn_calls.is_empty() {
                 use futures_util::stream::{self, StreamExt};
@@ -4213,6 +4411,22 @@ fn run_agent<'f, P: Provider>(
                     question_id,
                     steps: step,
                 });
+            }
+
+            // 0.31.0 — the root's plan. Checked beside the two pauses above rather
+            // than before them because a plan call and an approval cannot happen in
+            // the same step: while the phase is on, every act that could be approved
+            // is refused.
+            if let Some(plan_id) = plan_pending {
+                finish(tree.store, tree.watch, run_id, depth, step, "awaiting_plan")?;
+                return Ok(RunOutcome::AwaitingPlan {
+                    plan_id,
+                    steps: step,
+                });
+            }
+            if plan_cancelled {
+                finish(tree.store, tree.watch, run_id, depth, step, "plan_rejected")?;
+                return Ok(RunOutcome::PlanRejected { steps: step });
             }
 
             if let Some(request_id) = paused {
@@ -4729,6 +4943,153 @@ fn responder_of(contract: &TaskContract) -> &dyn Responder {
 }
 
 /// The result of dispatching one tool call.
+/// What the dispatch needs to know about the plan gate, in one parameter rather
+/// than three.
+///
+/// `active` is read from the store at every loop entry rather than carried in a
+/// local, which is the whole of the durability claim: a run approved in one
+/// process and killed in the next does not plan again, and one that was never
+/// approved does not start writing because the approval died with the process
+/// that held it.
+#[derive(Clone, Copy)]
+pub(crate) struct PlanPhase<'a> {
+    /// Who reviews a proposal, or `None` when no gate is registered.
+    gate: Option<&'a dyn PlanGate>,
+    /// The roster a proposed step's owner must be on.
+    agents: &'a crate::agent::Agents,
+    /// Whether the run is still waiting for an approved plan.
+    active: bool,
+}
+
+/// The policy layer that holds a run still while its plan is unreviewed.
+///
+/// Denying rather than filtering the tool list, because [`Policy::explain`]
+/// resolves deny-first across every layer and every mutating path in the crate
+/// already goes through it: `write_file`, `edit_file`, `exec`, the shell tools and
+/// `git` are `Write` or `Exec` checks, and a registered [`Tool`](crate::Tool) and
+/// an MCP tool are `Exec` checks on their own names. A list of tool names would be
+/// complete on the day it was written and wrong the next time one was added.
+///
+/// `Read` and `Net` are untouched. Reads stay open because a plan written without
+/// looking at the workspace is not worth gating, and the provider is reached over
+/// the network — denying `Net` here would stop the run from asking the model for
+/// the plan in the first place.
+fn plan_lock() -> Policy {
+    Policy::permissive()
+        .layer("plan-gate")
+        .deny_write("*")
+        .deny_exec("*")
+}
+
+/// The system prompt while a plan is unreviewed.
+fn planning_directive(agents: &crate::agent::Agents) -> String {
+    let roster = match agents.len() {
+        0 => {
+            "There are no sub-agents on this run, so leave `agent` unset on every step.".to_string()
+        }
+        _ => format!(
+            "The agents you may hand a step to are: {}. Leave `agent` unset for a step you \
+             will do yourself; naming one that is not on that list is refused.",
+            agents.names().join(", ")
+        ),
+    };
+    format!(
+        " Before you do anything else you must call `{PROPOSE_PLAN_TOOL}` with the ordered \
+         steps you intend to take, and wait. Until that plan is approved you may read, search \
+         and think, and every attempt to write a file, run a command or call any other tool \
+         WILL be refused — so read what you need first, then propose. {roster}"
+    )
+}
+
+/// The `propose_plan` tool, offered only while the phase is active.
+fn propose_plan_spec() -> ToolSpec {
+    ToolSpec {
+        name: PROPOSE_PLAN_TOOL.to_string(),
+        description: "Propose the ordered steps you intend to take, then wait for a human to \
+                      approve them. Nothing you propose here is done by proposing it, and \
+                      nothing else you can do will work until this is approved — writes, \
+                      commands and every other tool are refused while a plan is outstanding. \
+                      Read enough of the workspace first that the plan is worth reviewing."
+            .to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "steps": {
+                    "type": "array",
+                    "description": "The plan, in the order you intend to carry it out.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "intent": { "type": "string", "description": "What this step does, in a short phrase." },
+                            "agent": { "type": "string", "description": "Optional: the sub-agent that will own this step. Omit for a step you will do yourself." }
+                        },
+                        "required": ["intent"]
+                    }
+                }
+            },
+            "required": ["steps"]
+        }),
+    }
+}
+
+/// Read a `propose_plan` argument object into a [`Plan`], or say what was wrong.
+///
+/// Strict for the reason [`parse_todo_items`] is, and more so: this is the object
+/// a human is about to be shown and asked to approve, and a step whose owner the
+/// crate silently dropped would be approved on false terms.
+fn parse_plan(
+    args: &serde_json::Value,
+    agents: &crate::agent::Agents,
+) -> std::result::Result<Plan, String> {
+    let list = args
+        .get("steps")
+        .ok_or_else(|| "`steps` is required: send the whole plan as a list".to_string())?
+        .as_array()
+        .ok_or_else(|| "`steps` must be a list of {intent, agent} objects".to_string())?;
+    if list.is_empty() {
+        return Err("a plan with no steps is not a plan; say what you intend to do".to_string());
+    }
+    let mut steps = Vec::with_capacity(list.len());
+    for (i, raw) in list.iter().enumerate() {
+        let intent = raw
+            .get("intent")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .ok_or_else(|| format!("step {} needs a non-empty `intent`", i + 1))?;
+        let mut step = PlanStep::new(intent);
+        if let Some(agent) = raw
+            .get("agent")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+        {
+            // The check the whole `agent` field exists for. A plan naming an owner
+            // that cannot be spawned is a plan that cannot be carried out, and
+            // finding that out at approval time costs one step instead of a run.
+            if agents.get(agent).is_none() {
+                let known: Vec<&str> = agents.names();
+                return Err(match known.is_empty() {
+                    true => format!(
+                        "step {} names agent `{agent}`, and this run has no agents at all; \
+                         leave `agent` unset",
+                        i + 1
+                    ),
+                    false => format!(
+                        "step {} names agent `{agent}`, which is not on this run's roster; \
+                         the agents are: {}",
+                        i + 1,
+                        known.join(", ")
+                    ),
+                });
+            }
+            step = step.by(agent);
+        }
+        steps.push(step);
+    }
+    Ok(Plan::new(steps))
+}
+
 enum Dispatched {
     /// The call resolved; fold `obs` into the observation log and carry any
     /// rules an approver asked to remember.
@@ -4754,6 +5115,18 @@ enum Dispatched {
     /// process would answer. The question is persisted under `question_id` and the
     /// run stops until a human answers it.
     Ask { question_id: i64 },
+    /// (0.31.0) The agent proposed a plan and the gate answered — or did not.
+    ///
+    /// `verdict` is `None` when no [`PlanGate`](crate::PlanGate) in this process
+    /// would decide, which stops the run with
+    /// [`RunOutcome::AwaitingPlan`](RunOutcome::AwaitingPlan). A
+    /// [`PlanVerdict::Revise`] never reaches here: the correction is text the model
+    /// reads and the run stays in its planning phase, so it comes back as an
+    /// ordinary `Continue`.
+    Plan {
+        plan_id: i64,
+        verdict: Option<PlanVerdict>,
+    },
 }
 
 impl Dispatched {
@@ -4903,6 +5276,9 @@ async fn dispatch(
     // because a handle outlives the call that started it — which is the whole
     // point of one, and the reason every guard in `handles` exists.
     handles: &std::sync::Arc<crate::tools::handles::Handles>,
+    // 0.31.0 — the plan gate, in one parameter rather than three. `active` was read
+    // from the store at this loop's entry, never carried from a previous process.
+    plan: PlanPhase<'_>,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -4965,6 +5341,21 @@ async fn dispatch(
             }
         }
         REMEMBER_TOOL => {
+            // 0.31.0 — the one write that does not pass through the policy, because
+            // it lands in the harness's own store rather than in the workspace. The
+            // `plan-gate` layer therefore cannot cover it and it is refused here, so
+            // "nothing is written before the approval" means nothing at all rather
+            // than nothing the policy happens to see.
+            if plan.active {
+                return Ok(Dispatched::go(
+                    "remember refused (planning)",
+                    format!(
+                        "\n[remember refused] the plan has not been approved yet, so nothing \
+                         is being written — including notes. Call `{PROPOSE_PLAN_TOOL}` \
+                         first.\n"
+                    ),
+                ));
+            }
             let key = s("key").unwrap_or_default();
             let value = s("value").unwrap_or_default();
             if key.is_empty() || value.is_empty() {
@@ -5181,6 +5572,103 @@ async fn dispatch(
                     info!(run_id, step, question_id, "run paused for an answer");
                     Dispatched::Ask { question_id }
                 }
+            }
+        }
+        PROPOSE_PLAN_TOOL => {
+            // Not gated, for the sharpest version of the reason `ask_question` is
+            // not: this is the call that asks permission to do anything at all, and
+            // putting a permission rule in front of it would leave the agent with no
+            // legal move. It is also the one tool that is *only* offered while
+            // everything else is refused — see `plan_lock`.
+            let Some(gate) = plan.gate.filter(|_| plan.active) else {
+                return Ok(Dispatched::go(
+                    "plan error",
+                    format!(
+                        "\n[plan error] there is no plan to propose on this run; \
+                         `{PROPOSE_PLAN_TOOL}` is not available here.\n"
+                    ),
+                ));
+            };
+            let proposed = match parse_plan(a, plan.agents) {
+                Ok(p) => p,
+                Err(why) => {
+                    return Ok(Dispatched::go(
+                        "plan error",
+                        format!("\n[plan error] {why}\n"),
+                    ))
+                }
+            };
+
+            // Persisted BEFORE the gate is consulted, not after. A process that dies
+            // between the proposal and the verdict leaves a row a human can still
+            // answer, which is the whole of the durability claim.
+            let plan_id = store.put_plan(run_id, step, &proposed)?;
+            watch.emit(RunEvent::at_depth(
+                run_id,
+                step,
+                depth,
+                EventKind::PlanProposed {
+                    plan_id,
+                    steps: proposed.steps.clone(),
+                },
+            ));
+            store.record_context_event(
+                run_id,
+                &ContextEvent::plan_proposed(step, format!("{} steps", proposed.steps.len())),
+            )?;
+
+            // Only the in-process gate is consulted here. A human's verdict does NOT
+            // arrive through this path, for the reason an answer does not: the step
+            // that proposes is committed before the run pauses, so a resume starts
+            // after it and this call is never replayed.
+            // `resume_with_plan_decision` delivers the verdict as an observation.
+            let verdict = gate.review(&proposed).await;
+            if let Some(v) = &verdict {
+                store.decide_plan(plan_id, v, "gate")?;
+                watch.emit(RunEvent::at_depth(
+                    run_id,
+                    step,
+                    depth,
+                    EventKind::PlanDecided {
+                        plan_id,
+                        verdict: v.as_str().to_string(),
+                        by: "gate".to_string(),
+                    },
+                ));
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::plan_decided(step, format!("gate: {}", v.as_str())),
+                )?;
+            }
+            info!(
+                run_id,
+                step,
+                plan_id,
+                verdict = verdict
+                    .as_ref()
+                    .map(PlanVerdict::as_str)
+                    .unwrap_or("pending"),
+                "plan proposed"
+            );
+
+            match verdict {
+                // A correction is text the model reads and re-plans from. The run
+                // stays in its planning phase and still writes nothing, so this is an
+                // ordinary observation rather than a control-flow event.
+                Some(PlanVerdict::Revise { correction }) => Dispatched::seen(
+                    "plan sent back",
+                    format!(
+                        "\n[plan not approved] {correction}\n(Propose a different plan with \
+                         `{PROPOSE_PLAN_TOOL}`. Nothing has been done yet and nothing will be \
+                         until a plan is approved.)\n"
+                    ),
+                    ObsKind::Message,
+                    None,
+                ),
+                other => Dispatched::Plan {
+                    plan_id,
+                    verdict: other,
+                },
             }
         }
         LIST_DIR_TOOL => {

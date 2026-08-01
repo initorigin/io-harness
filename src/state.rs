@@ -1947,6 +1947,20 @@ impl ContextEvent {
         Self::of("question_answered", step, detail)
     }
 
+    /// The agent proposed a plan at this step and did nothing else (0.31.0). The
+    /// detail is the plan's shape rather than its text, which is already in the
+    /// `plans` table and would otherwise be stored twice.
+    pub fn plan_proposed(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("plan_proposed", step, detail)
+    }
+
+    /// A verdict on that plan entered the run (0.31.0). The detail names who
+    /// decided — a `PlanGate` in the process, or a human after a pause — and what
+    /// they decided.
+    pub fn plan_decided(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("plan_decided", step, detail)
+    }
+
     /// An operator's mid-turn message entered the conversation at this step
     /// (0.20.0). Recorded rather than only delivered: a turn that changed course
     /// because a human said something must be readable as that afterwards, and the
@@ -4151,7 +4165,10 @@ impl Store {
     /// resumable.
     pub fn finish_run(&self, run_id: i64, outcome: &str) -> Result<()> {
         let status = match outcome {
-            "awaiting_approval" => "paused",
+            // 0.31.0 — a run holding an undecided plan is waiting for a human in
+            // exactly the sense a run holding a deferred approval is, so it takes
+            // the same status and gets no summary until it really ends.
+            "awaiting_approval" | "awaiting_plan" => "paused",
             _ => "completed",
         };
         self.conn.execute(

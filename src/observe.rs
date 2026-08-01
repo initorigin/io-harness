@@ -429,6 +429,53 @@ pub enum EventKind {
         /// through [`resume_with_answer`](crate::resume_with_answer) after a pause.
         by: String,
     },
+    /// The agent proposed a plan and has done nothing yet (0.31.0).
+    ///
+    /// Not [`TodoWrote`](EventKind::TodoWrote), and the difference is the whole
+    /// point: that one is a plan the agent is executing while an operator watches,
+    /// this one is a plan the run will not act on until an answer comes back. At
+    /// the moment this is emitted the workspace has not been written to.
+    PlanProposed {
+        /// The plan's row id, and what
+        /// [`resume_with_plan_decision`](crate::resume_with_plan_decision) takes if
+        /// the run pauses on it.
+        plan_id: i64,
+        /// The steps, in the order the agent intends them.
+        steps: Vec<crate::approve::PlanStep>,
+    },
+    /// The plan was decided and the run acted on that decision (0.31.0).
+    ///
+    /// `verdict` is `"approve"`, `"revise"` or `"cancel"`. A `"revise"` leaves the
+    /// run in its planning phase, still writing nothing, so this event is not
+    /// necessarily the end of the negotiation — [`Store::plans`](crate::Store::plans)
+    /// is the whole of it.
+    PlanDecided {
+        /// The plan this decided.
+        plan_id: i64,
+        /// `"approve"`, `"revise"` or `"cancel"`.
+        verdict: String,
+        /// `"gate"` for a [`PlanGate`](crate::PlanGate) in this process, `"human"`
+        /// for a decision that arrived through a resume after a pause.
+        by: String,
+    },
+    /// The thinking the model produced before answering this step (0.31.0).
+    ///
+    /// The **only** place it is visible. It is deliberately not written to the
+    /// observation ledger and therefore never appears in the prompt assembled for
+    /// the next turn — a vendor charges for thinking once as output, and a harness
+    /// that folded it into the next request would be charged for it again as input
+    /// every turn for the rest of the run. It is not stored either;
+    /// [`Usage::reasoning_tokens`](crate::Usage::reasoning_tokens) is the durable
+    /// record of what it cost.
+    ///
+    /// A provider that returns no thinking emits nothing, so an absent event means
+    /// "the model did not think", never "the model thought nothing".
+    Reasoning {
+        /// What the model thought, as the provider returned it.
+        text: String,
+        /// The tokens the provider billed for it, or 0 when it did not say.
+        tokens: u64,
+    },
     /// The provider ran a web search or fetch for the model (0.22.0).
     ///
     /// Emitted once per call the provider reported, wherever the answer came from
@@ -642,6 +689,9 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "todo_wrote",
     "question_asked",
     "question_answered",
+    "plan_proposed",
+    "plan_decided",
+    "reasoning",
     "server_tool_used",
     "token",
     "sandbox",
@@ -1080,6 +1130,21 @@ mod tests {
                 answer: "sqlite".into(),
                 by: "human".into(),
             },
+            // 0.31.0. Added to the vector in the same commit as the enum, which is
+            // the lesson the three above cost seven releases to learn.
+            EventKind::PlanProposed {
+                plan_id: 1,
+                steps: vec![crate::approve::PlanStep::new("read the call sites")],
+            },
+            EventKind::PlanDecided {
+                plan_id: 1,
+                verdict: "approve".into(),
+                by: "human".into(),
+            },
+            EventKind::Reasoning {
+                text: "the parser is the only caller".into(),
+                tokens: 120,
+            },
         ];
         // Exhaustiveness guard. Never executed for its result; it exists so the
         // compiler refuses a new variant that `all` does not mention.
@@ -1116,6 +1181,9 @@ mod tests {
                 | EventKind::TodoWrote { .. }
                 | EventKind::QuestionAsked { .. }
                 | EventKind::QuestionAnswered { .. }
+                | EventKind::PlanProposed { .. }
+                | EventKind::PlanDecided { .. }
+                | EventKind::Reasoning { .. }
                 | EventKind::ServerToolUsed { .. }
                 | EventKind::Finished { .. } => {}
             }

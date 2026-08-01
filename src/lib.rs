@@ -429,7 +429,8 @@ pub use state::{
 pub use template::{Template, Templates};
 pub use tools::git::Identity;
 pub use tools::{
-    Tool, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, TODO_WRITE_TOOL,
+    Tool, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, PROPOSE_PLAN_TOOL,
+    TODO_WRITE_TOOL,
 };
 pub use verify::{ExecGuard, Verification, TEST_BINARY};
 pub use web::{Citation, ServerToolCall, WebAccess};
