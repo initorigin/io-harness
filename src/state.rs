@@ -1096,6 +1096,141 @@ pub struct MemoryEntry {
     pub step: u32,
     /// UTC write time, refreshed on every overwrite so ordering is by recency.
     pub created_at: String,
+    /// Whether this is something somebody decided or something a run observed
+    /// (0.30.0). An entry written before the column existed reads as
+    /// [`MemoryKind::Fact`], which is what it was.
+    pub kind: MemoryKind,
+    /// Whether a run may overwrite it (0.30.0).
+    ///
+    /// Set by a caller and never by a run: this is how a human makes a correction
+    /// stick when the agent keeps re-learning something wrong.
+    pub pinned: bool,
+}
+
+/// What kind of thing a [`MemoryEntry`] is (0.30.0).
+///
+/// The distinction a flat list of strings cannot make: a decision somebody took
+/// and a run must not quietly reverse, versus a fact a run observed and a later
+/// run may correct. Nothing in the run loop treats the two differently — the
+/// crate stores what it was told and reports it — because the difference is one a
+/// person makes, and a harness inferring it would be guessing at intent.
+///
+/// `#[non_exhaustive]` from the line it exists, so the third kind the contract
+/// leaves open (an observation, distinct from an asserted fact) arrives later
+/// without a break.
+///
+/// ```
+/// use io_harness::{MemoryKind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+///
+/// store.memory_write("/repo", "parser", "stays in-crate", run, 4, MemoryKind::Decision)?;
+/// let entry = store.memory_get("/repo", "parser")?.expect("written above");
+/// assert_eq!(entry.kind, MemoryKind::Decision);
+///
+/// // The default for everything the agent writes itself, and for every entry
+/// // written before this release: what a run observed is a fact, not a ruling.
+/// store.memory_put("/repo", "test-command", "cargo test", run, 5)?;
+/// assert_eq!(store.memory_get("/repo", "test-command")?.unwrap().kind, MemoryKind::Fact);
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum MemoryKind {
+    /// Something a run observed. The default, and what every pre-0.30.0 entry is.
+    #[default]
+    Fact,
+    /// Something somebody decided. Carries no enforcement of its own; what stops
+    /// a run overwriting one is [`MemoryEntry::pinned`].
+    Decision,
+}
+
+impl MemoryKind {
+    /// Its stored spelling, which is also what a consumer renders.
+    fn as_str(self) -> &'static str {
+        match self {
+            MemoryKind::Fact => "fact",
+            MemoryKind::Decision => "decision",
+        }
+    }
+
+    /// Read a stored spelling back. An unknown one — or `NULL`, which is every
+    /// entry written before 0.30.0 — is [`MemoryKind::Fact`]: a row this crate
+    /// cannot classify is not a reason to refuse a database, and a fact is the
+    /// weaker claim of the two.
+    fn from_stored(text: Option<String>) -> Self {
+        match text.as_deref() {
+            Some("decision") => MemoryKind::Decision,
+            _ => MemoryKind::Fact,
+        }
+    }
+}
+
+/// One recall: a run drew on one memory entry at one step (0.30.0).
+///
+/// Returned by [`Store::memory_recalls`]. Per (run, key, step) rather than a flag
+/// on the entry, because an entry recalled by two runs is two facts and a flag
+/// would keep only the later one.
+///
+/// ```
+/// use io_harness::{MemoryRecall, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("port the parser", "/repo")?;
+/// // The context assembler writes these; a run that recalled nothing has none.
+/// let recalls: Vec<MemoryRecall> = store.memory_recalls(run)?;
+/// assert!(recalls.is_empty());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq)]
+pub struct MemoryRecall {
+    /// The run that drew on the entry.
+    pub run_id: i64,
+    /// The step whose context it was carried into.
+    pub step: u32,
+    /// The workspace the entry belongs to.
+    pub workspace: String,
+    /// The entry's key.
+    pub key: String,
+    /// UTC time of the recall, from the database clock.
+    pub at: String,
+}
+
+/// What a write to memory did (0.30.0).
+///
+/// Returned by [`Store::memory_write`]. The `refused` flag is the half that
+/// matters: an agent that believes it corrected something and did not is the
+/// failure the pinned flag exists to prevent, so the refusal is a value the
+/// caller has to receive rather than a silence it has to notice.
+///
+/// ```
+/// use io_harness::{MemoryKind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("fix the flake", "/repo")?;
+///
+/// store.memory_write("/repo", "retries", "three", run, 1, MemoryKind::Decision)?;
+/// store.memory_pin("/repo", "retries", true)?;
+///
+/// let wrote = store.memory_write("/repo", "retries", "one", run, 7, MemoryKind::Fact)?;
+/// assert!(wrote.refused, "a pinned entry is not a run's to overwrite");
+/// assert_eq!(store.memory_get("/repo", "retries")?.unwrap().value, "three");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MemoryWrite {
+    /// True when the entry was pinned and the write did not happen.
+    pub refused: bool,
+    /// Keys dropped to hold the workspace's caps, oldest first. Empty on a
+    /// refused write, which evicts nothing because it stored nothing.
+    pub evicted: Vec<String>,
 }
 
 /// One turn of a conversation: what was asked, which run answered it, and which
@@ -1148,6 +1283,23 @@ pub struct Turn {
     pub outcome: Option<String>,
     /// UTC creation time.
     pub created_at: String,
+}
+
+/// Read one `memory` row. One place, so the two queries that read the table
+/// cannot drift in their column order — which is exactly how a nullable column
+/// added late ends up read as the wrong field in one of them.
+fn memory_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<MemoryEntry> {
+    Ok(MemoryEntry {
+        key: r.get(0)?,
+        value: r.get(1)?,
+        run_id: r.get(2)?,
+        step: r.get::<_, i64>(3)? as u32,
+        created_at: r.get(4)?,
+        kind: MemoryKind::from_stored(r.get(5)?),
+        // NULL for every entry written before 0.30.0, and false is what those
+        // entries were: nobody had pinned anything.
+        pinned: r.get::<_, Option<i64>>(6)?.unwrap_or(0) == 1,
+    })
 }
 
 /// Read one `session_turns` row. One place, so the two queries that read the
@@ -1593,6 +1745,17 @@ impl ContextEvent {
     /// Notes from earlier runs were carried into this turn's context.
     pub fn memory_recall(step: u32, detail: impl Into<String>) -> Self {
         Self::of("memory_recall", step, detail)
+    }
+
+    /// A run tried to overwrite a pinned note and was refused (0.30.0).
+    ///
+    /// Recorded rather than silently dropped: an agent that believes it corrected
+    /// something and did not will act on the correction it thinks it made. A
+    /// trace row rather than a new [`EventKind`](crate::observe::EventKind)
+    /// variant, because the question this answers — *did my pin hold* — is asked
+    /// after the run by somebody reading the store, not during it by an observer.
+    pub fn memory_refused(step: u32, detail: impl Into<String>) -> Self {
+        Self::of("memory_refused", step, detail)
     }
 
     /// The agent wrote down its plan at this step (0.21.0). The detail is the shape
@@ -2173,6 +2336,37 @@ impl Store {
                  created_at TEXT NOT NULL,
                  UNIQUE(workspace, key)
              );",
+        )?;
+
+        // 0.30.0: what kind of thing an entry is, and whether a run may overwrite
+        // it. Two NULLable columns rather than a rewrite, so a 0.29.0 database
+        // gains them without touching a row and a 0.29.0 binary — whose every
+        // memory query names its columns explicitly — still reads it. A `NULL`
+        // kind is `Fact` and a `NULL` pinned is false, which is what every entry
+        // written before this release actually was. Deliberately NOT a
+        // `CHECKPOINT_FORMAT` bump, for the reason 0.10.0 through 0.28.0 each
+        // recorded: no checkpoint layout changed, and bumping it would make
+        // [`Store::check_resumable`] refuse a database that is in fact readable.
+        //
+        // `let _ =` on both: `ALTER TABLE ADD COLUMN` errors when the column is
+        // already there, which is the normal case on every open after the first.
+        let _ = conn.execute("ALTER TABLE memory ADD COLUMN kind TEXT", []);
+        let _ = conn.execute("ALTER TABLE memory ADD COLUMN pinned INTEGER", []);
+
+        // 0.30.0: which entries a run actually drew on. A new table, because it is
+        // per (run, key) and the memory row is per (workspace, key) — recording it
+        // on the entry would keep only the last run that read it, which is the one
+        // fact nobody is asking for. Same additive rules as every table above.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_recalls (
+                 id        INTEGER PRIMARY KEY,
+                 run_id    INTEGER NOT NULL,
+                 step      INTEGER NOT NULL,
+                 workspace TEXT NOT NULL,
+                 key       TEXT NOT NULL,
+                 at        TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE INDEX IF NOT EXISTS memory_recalls_run ON memory_recalls (run_id);",
         )?;
 
         // 0.10.0: what the context assembler decided each turn — one row per turn
@@ -4102,20 +4296,171 @@ impl Store {
         run_id: i64,
         step: u32,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .memory_write(workspace, key, value, run_id, step, MemoryKind::Fact)?
+            .evicted)
+    }
+
+    /// Write or replace `key` for `workspace` as `kind`, refusing a pinned entry
+    /// (0.30.0).
+    ///
+    /// The full form of [`Store::memory_put`], which is this with `kind` fixed to
+    /// [`MemoryKind::Fact`] and the refusal dropped on the floor. Prefer this one
+    /// anywhere the answer matters: a caller that cannot tell a write from a
+    /// refusal will tell the model it corrected something it did not.
+    ///
+    /// Pinning is a caller's act ([`Store::memory_pin`]), never a run's, and this
+    /// is the method that respects it. Everything else — the entry cap, the
+    /// character cap, oldest-first eviction, the truncation marker — behaves
+    /// exactly as it did in 0.10.0.
+    ///
+    /// ```
+    /// use io_harness::{MemoryKind, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("make the tests pass", "/repo")?;
+    ///
+    /// let wrote = store.memory_write(
+    ///     "/repo", "test-command", "cargo test --features documents", run, 6,
+    ///     MemoryKind::Fact,
+    /// )?;
+    /// assert!(!wrote.refused);
+    /// assert!(wrote.evicted.is_empty(), "nothing had to go to hold the caps");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_write(
+        &self,
+        workspace: &str,
+        key: &str,
+        value: &str,
+        run_id: i64,
+        step: u32,
+        kind: MemoryKind,
+    ) -> Result<MemoryWrite> {
         let value = truncate_memory_value(value);
-        // An overwrite re-attributes the entry and refreshes `created_at`, so
-        // recency ordering reflects the latest write rather than the first.
-        self.conn.execute(
-            "INSERT INTO memory (workspace, key, value, run_id, step, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        // The guard is in the SQL rather than a read-then-write in the caller, so
+        // two writers on one store cannot interleave between the check and the
+        // write. `IS NOT 1` rather than `!= 1` because a pre-0.30.0 row's `pinned`
+        // is NULL, and NULL != 1 is NULL, which SQLite reads as false — that
+        // comparison would refuse every entry written before this release.
+        let n = self.conn.execute(
+            "INSERT INTO memory (workspace, key, value, run_id, step, created_at, kind, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?6, 0)
              ON CONFLICT(workspace, key) DO UPDATE SET
                  value      = excluded.value,
                  run_id     = excluded.run_id,
                  step       = excluded.step,
-                 created_at = excluded.created_at",
-            (workspace, key, &value, run_id, step),
+                 created_at = excluded.created_at,
+                 kind       = excluded.kind
+             WHERE memory.pinned IS NOT 1",
+            (workspace, key, &value, run_id, step, kind.as_str()),
         )?;
-        self.enforce_memory_caps(workspace, key)
+        if n == 0 {
+            return Ok(MemoryWrite {
+                refused: true,
+                evicted: Vec::new(),
+            });
+        }
+        Ok(MemoryWrite {
+            refused: false,
+            evicted: self.enforce_memory_caps(workspace, key)?,
+        })
+    }
+
+    /// Pin or unpin one entry, so a run cannot overwrite it (0.30.0). True when
+    /// an entry was there to change.
+    ///
+    /// A pinned entry is also exempt from cap eviction, for the same reason it is
+    /// exempt from overwriting: a correction a person made should not disappear
+    /// because the agent wrote twenty notes afterwards.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("fix the flake", "/repo")?;
+    /// store.memory_put("/repo", "retries", "three", run, 1)?;
+    ///
+    /// assert!(store.memory_pin("/repo", "retries", true)?);
+    /// assert!(store.memory_get("/repo", "retries")?.unwrap().pinned);
+    /// assert!(
+    ///     !store.memory_pin("/repo", "never-written", true)?,
+    ///     "there is nothing to pin, and inventing an entry would be worse"
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_pin(&self, workspace: &str, key: &str, pinned: bool) -> Result<bool> {
+        let n = self.conn.execute(
+            "UPDATE memory SET pinned = ?1 WHERE workspace = ?2 AND key = ?3",
+            (pinned as i64, workspace, key),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Record that `run_id` drew on these keys of `workspace` at `step` (0.30.0).
+    ///
+    /// Written by the context assembler at recall time. One row per key per
+    /// recall, never a replacement, so a run that recalls the same entry on three
+    /// turns is three rows and the same entry recalled by two runs is two records
+    /// that do not disturb each other.
+    pub(crate) fn record_memory_recall(
+        &self,
+        run_id: i64,
+        step: u32,
+        workspace: &str,
+        keys: &[String],
+    ) -> Result<()> {
+        for key in keys {
+            self.conn.execute(
+                "INSERT INTO memory_recalls (run_id, step, workspace, key)
+                 VALUES (?1, ?2, ?3, ?4)",
+                (run_id, step, workspace, key),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Which memory entries a run drew on, in the order they were recalled
+    /// (0.30.0).
+    ///
+    /// "What does the agent know about this workspace" is
+    /// [`Store::memory_list`]; this is "what did *this run* actually use", which
+    /// is the question that says whether an entry was load-bearing. A key appears
+    /// once per recall, so a caller wanting the set deduplicates — the crate does
+    /// not decide that for it.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("port the parser", "/repo")?;
+    /// // Written by the context assembler during a real run; shown here directly
+    /// // because the assembler needs a whole turn to reach.
+    /// # store.memory_put("/repo", "test-command", "cargo test", run, 1)?;
+    /// assert!(store.memory_recalls(run)?.is_empty(), "nothing recalled yet");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn memory_recalls(&self, run_id: i64) -> Result<Vec<MemoryRecall>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT run_id, step, workspace, key, at FROM memory_recalls
+             WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(MemoryRecall {
+                run_id: r.get(0)?,
+                step: r.get::<_, i64>(1)? as u32,
+                workspace: r.get(2)?,
+                key: r.get(3)?,
+                at: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Evict this workspace's oldest entries until both caps hold, never the
@@ -4123,23 +4468,35 @@ impl Store {
     /// silent no-op). Returns the evicted keys in eviction order.
     fn enforce_memory_caps(&self, workspace: &str, keep: &str) -> Result<Vec<String>> {
         // LENGTH() on TEXT counts characters, not bytes — the cap is in chars.
-        let rows: Vec<(String, i64)> = {
+        let rows: Vec<(String, i64, bool)> = {
+            // 0.30.0: a pinned entry is not a candidate. It is exempt from
+            // eviction for the same reason it is exempt from overwriting — a
+            // correction a person made must not vanish because the agent wrote
+            // twenty notes afterwards. It still counts towards the caps, so
+            // pinning everything makes writes fail loudly rather than silently
+            // raising the ceiling.
             let mut stmt = self.conn.prepare(
-                "SELECT key, LENGTH(value) FROM memory WHERE workspace = ?1
+                "SELECT key, LENGTH(value), pinned FROM memory WHERE workspace = ?1
                  ORDER BY created_at ASC, id ASC",
             )?;
-            let rows = stmt.query_map([workspace], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let rows = stmt.query_map([workspace], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get::<_, Option<i64>>(2)?.unwrap_or(0) == 1,
+                ))
+            })?;
             rows.collect::<std::result::Result<_, _>>()?
         };
 
         let mut count = rows.len();
-        let mut chars: i64 = rows.iter().map(|(_, n)| *n).sum();
+        let mut chars: i64 = rows.iter().map(|(_, n, _)| *n).sum();
         let mut evicted = Vec::new();
-        for (key, n) in &rows {
+        for (key, n, pinned) in &rows {
             if count <= MEMORY_MAX_ENTRIES && chars <= MEMORY_MAX_CHARS as i64 {
                 break;
             }
-            if key == keep {
+            if key == keep || *pinned {
                 continue;
             }
             self.conn.execute(
@@ -4156,18 +4513,10 @@ impl Store {
     /// Every entry for `workspace`, oldest first. Never another workspace's.
     pub fn memory_list(&self, workspace: &str) -> Result<Vec<MemoryEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT key, value, run_id, step, created_at FROM memory
+            "SELECT key, value, run_id, step, created_at, kind, pinned FROM memory
              WHERE workspace = ?1 ORDER BY created_at ASC, id ASC",
         )?;
-        let rows = stmt.query_map([workspace], |r| {
-            Ok(MemoryEntry {
-                key: r.get(0)?,
-                value: r.get(1)?,
-                run_id: r.get(2)?,
-                step: r.get::<_, i64>(3)? as u32,
-                created_at: r.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map([workspace], memory_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
@@ -4298,18 +4647,10 @@ impl Store {
         Ok(self
             .conn
             .query_row(
-                "SELECT key, value, run_id, step, created_at FROM memory
+                "SELECT key, value, run_id, step, created_at, kind, pinned FROM memory
                  WHERE workspace = ?1 AND key = ?2",
                 (workspace, key),
-                |r| {
-                    Ok(MemoryEntry {
-                        key: r.get(0)?,
-                        value: r.get(1)?,
-                        run_id: r.get(2)?,
-                        step: r.get::<_, i64>(3)? as u32,
-                        created_at: r.get(4)?,
-                    })
-                },
+                memory_row,
             )
             .ok())
     }
@@ -4601,6 +4942,99 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0.30.0 F4, first half. [`MEMORY_KIND_NAMES`] is what
+    /// [`MemoryKind::from_stored`] matches on, so a variant missing from it
+    /// round-trips to `Fact` silently — a stored `decision` read back as a fact is
+    /// the same defect class as 0.25.0's `every_kind()`, which cost three event
+    /// kinds seven releases of silence.
+    ///
+    /// The census reads the enum out of this file rather than trusting a
+    /// hand-written list, and the control is the point: `variants_in_source` run
+    /// against a list with one entry removed must name exactly that entry, or the
+    /// helper is one that always answers "complete".
+    /// The stored spelling of every variant `from_stored` knows how to read back.
+    /// Deliberately a list in the *test* rather than a constant in the module:
+    /// nothing at runtime needs it (unlike `EVENT_NAMES`, which a `[[hook]]`'s
+    /// `on` is validated against), and a constant no code reads is a constant
+    /// that drifts.
+    const KNOWN_KINDS: &[&str] = &["fact", "decision"];
+
+    #[test]
+    fn memory_kind_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained() {
+        let declared = variants_in_source();
+        assert_eq!(
+            declared,
+            KNOWN_KINDS.to_vec(),
+            "`pub enum MemoryKind` and the kinds `from_stored` reads back disagree"
+        );
+
+        // And every one of them survives a write and a read, which the list alone
+        // cannot promise: a name in the list whose `as_str`/`from_stored` pair
+        // disagrees is a note that changes kind on its way to disk.
+        let store = Store::memory().unwrap();
+        let run = store.start_run("goal", "/repo").unwrap();
+        for (kind, name) in [
+            (MemoryKind::Fact, "fact"),
+            (MemoryKind::Decision, "decision"),
+        ] {
+            assert_eq!(kind.as_str(), name);
+            store
+                .memory_write("/repo", name, "value", run, 1, kind)
+                .unwrap();
+            assert_eq!(store.memory_get("/repo", name).unwrap().unwrap().kind, kind);
+        }
+        assert_eq!(
+            declared.len(),
+            2,
+            "a new variant needs a row in the round-trip above, not only a name in \
+             KNOWN_KINDS"
+        );
+    }
+
+    /// The variants declared by `pub enum MemoryKind` in this file, lowercased the
+    /// way [`MemoryKind::as_str`] spells them.
+    ///
+    /// A text parse, safe because of the enum's shape: a variant sits at four
+    /// spaces and starts with an uppercase letter, where a doc line starts with
+    /// `/` and an attribute with `#`. Line endings are normalised first — a
+    /// Windows checkout holds this file with CRLF, and a parse looking for `"\n}"`
+    /// would find nothing there and fail on one platform only.
+    fn variants_in_source() -> Vec<&'static str> {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/state.rs"),
+        )
+        .expect("this file is readable from its own test")
+        .replace("\r\n", "\n");
+        let body = src
+            .split_once("pub enum MemoryKind {")
+            .expect("the enum is declared in this file")
+            .1;
+        let body = body.split_once("\n}\n").expect("the enum is closed").0;
+
+        let mut found = Vec::new();
+        for line in body.lines() {
+            let Some(rest) = line.strip_prefix("    ") else {
+                continue;
+            };
+            if !rest.starts_with(|c: char| c.is_ascii_uppercase()) {
+                continue;
+            }
+            let variant: String = rest
+                .chars()
+                .take_while(char::is_ascii_alphanumeric)
+                .collect();
+            // Leaked rather than returned as `String`, so the comparison above is
+            // against `&'static str` like the constant it is checking. One leak
+            // per variant per test process is nothing.
+            found.push(&*Box::leak(variant.to_ascii_lowercase().into_boxed_str()));
+        }
+        assert!(
+            !found.is_empty(),
+            "the parse found nothing, so it is measuring itself rather than the enum"
+        );
+        found
+    }
 
     #[test]
     fn refusals_record_action_target_rule_and_layer() {

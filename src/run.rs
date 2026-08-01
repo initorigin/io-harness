@@ -34,8 +34,8 @@ use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
-    AgentEvent, ContextEvent, Kept, RunStatus, Snapshot, StepRecord, Store, TodoItem, TodoState,
-    MAX_SNAPSHOT_BYTES,
+    AgentEvent, ContextEvent, Kept, MemoryKind, RunStatus, Snapshot, StepRecord, Store, TodoItem,
+    TodoState, MAX_SNAPSHOT_BYTES,
 };
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
@@ -2888,6 +2888,10 @@ async fn run_workspace_from<P: Provider>(
             },
         )
         .await?;
+        // 0.30.0: which notes this turn actually leaned on, recorded per run. The
+        // trace already said how many were carried; it could not say which, and a
+        // count cannot tell a load-bearing entry from a passenger.
+        store.record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
         let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
         #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
@@ -3898,6 +3902,10 @@ fn run_agent<'f, P: Provider>(
                 },
             )
             .await?;
+            // Same record on the tree path: a sub-agent's run is a run, and its
+            // recalls belong to it rather than to whoever spawned it.
+            tree.store
+                .record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
             let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
@@ -4968,7 +4976,32 @@ async fn dispatch(
             // The store bounds the entry and evicts oldest-first to hold the caps;
             // it writes no trace rows of its own, so the write and every eviction
             // are recorded here, where the run_id and step are known.
-            let evicted = store.memory_put(memory_key, key, value, run_id, step)?;
+            // 0.30.0: what a run writes is a fact — a decision is somebody's, and
+            // a harness inferring one from a tool call would be guessing at
+            // intent. A pinned entry refuses the write, and the refusal is
+            // recorded and handed back to the model: an agent that believes it
+            // corrected something and did not will act on the correction it
+            // thinks it made.
+            let wrote =
+                store.memory_write(memory_key, key, value, run_id, step, MemoryKind::Fact)?;
+            if wrote.refused {
+                store.record_context_event(
+                    run_id,
+                    &ContextEvent::memory_refused(
+                        step,
+                        format!("{key} (pinned; the earlier value stands)"),
+                    ),
+                )?;
+                info!(run_id, step, key, "remember refused: pinned");
+                return Ok(Dispatched::go(
+                    format!("remember refused {key}"),
+                    format!(
+                        "\n[remember refused] `{key}` is pinned by the operator and was not \
+                         overwritten. The existing note stands.\n"
+                    ),
+                ));
+            }
+            let evicted = wrote.evicted;
             store.record_context_event(
                 run_id,
                 &ContextEvent::memory_write(

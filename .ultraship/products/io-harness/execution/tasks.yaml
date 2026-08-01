@@ -135,7 +135,7 @@ tasks:
   why_required: >
     The second question. A human who cannot correct what the agent has learned, and cannot make the
     correction stick, has a memory they can only read.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.30.0-T01
   acceptance_criteria:
@@ -150,11 +150,45 @@ tasks:
     asserted: a silent refusal would leave the agent believing it had corrected something.
   files:
   - src/state.rs
-  - src/observe.rs
   - src/run.rs
   - src/lib.rs
   - tests/memory.rs
-  evidence: []
+  evidence:
+  - >
+    `MemoryKind` (`#[non_exhaustive]`, `Fact` by default), `MemoryEntry::kind` and
+    `MemoryEntry::pinned`, `MemoryWrite`, `Store::memory_write` and `Store::memory_pin`. Two
+    nullable columns on `memory` rather than a rewrite: `NULL` kind reads as `Fact` and `NULL`
+    pinned as false, which is what every pre-0.30.0 entry actually was. `memory_put` is now a
+    wrapper over `memory_write` with the kind fixed to `Fact`, so its signature and behaviour are
+    unchanged and there is one write path rather than two that can drift.
+  - >
+    The guard is `WHERE memory.pinned IS NOT 1` inside the upsert, not a read-then-write in the
+    caller, so two writers on one store cannot interleave between the check and the write. `IS NOT`
+    rather than `!=` is load-bearing: `NULL != 1` is `NULL`, which SQLite reads as false, and that
+    comparison would have refused every entry written before this release.
+  - >
+    F4 — `state::tests::memory_kind_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+    parses `pub enum MemoryKind` out of `src/state.rs` (CRLF normalised first, the 0.28.0 Windows
+    lesson) and asserts the variants equal the list `from_stored` reads back, then round-trips each
+    one through a real store. A variant added without a `from_stored` arm would round-trip to `Fact`
+    silently, which is the 0.25.0 `every_kind()` defect in a different table.
+  - >
+    F5 — `a_pinned_entry_survives_a_run_that_tries_to_overwrite_it` runs the real loop with a
+    scripted `remember` call against a pinned entry: the value is still the operator's, the kind is
+    still `Decision`, `memory_refused` is in the trace and `memory_write` is not. Its control,
+    `the_same_write_lands_when_the_entry_is_not_pinned`, runs the identical script against an
+    unpinned entry and asserts the write lands — without it the first test passes against an
+    implementation that refuses everything.
+  - >
+    The refusal also reaches the model as an observation rather than only the trace, so the agent
+    learns its correction did not take. It is a `ContextEvent` kind rather than a new `EventKind`
+    variant, because the question it answers — did my pin hold — is asked after the run by somebody
+    reading the store, and the contract's observability note says this release adds no event kind.
+  - >
+    A pinned entry is also exempt from cap eviction, which the criteria did not name and the feature
+    requires: a correction that survives an overwrite and then disappears because the agent wrote
+    twenty notes afterwards has not survived. It still counts towards the caps, so pinning
+    everything fails loudly instead of quietly raising the ceiling.
 
 - id: US-IO-HARNESS-0.30.0-T04
   summary: >
@@ -163,7 +197,7 @@ tasks:
   why_required: >
     "What does the agent know" and "what did this run use" are different questions, and only the
     second tells a reader whether a memory entry was load-bearing.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.30.0-T03
   acceptance_criteria:
@@ -175,7 +209,29 @@ tasks:
   - src/state.rs
   - src/context.rs
   - tests/memory.rs
-  evidence: []
+  evidence:
+  - >
+    A `memory_recalls` table indexed on `run_id`, `Store::record_memory_recall` (crate-internal, so
+    only the assembler writes it) and `Store::memory_recalls` with a `MemoryRecall` row. One row per
+    key per recall rather than a flag on the entry: an entry recalled by two runs is two facts, and
+    a flag keeps only the later one.
+  - >
+    `render_notes` now returns the keys it kept rather than a count, `Assembled` gains
+    `recalled_keys`, and both run loops — single-workspace and tree — record the recall for their
+    own run. `Assembled` already derives `Default`, which is the type shape the contract's migration
+    note names as safe to add a field to; `Assembly` was deliberately left alone, since it has no
+    `Default` and a new field there would break a struct literal.
+  - >
+    F6 — `the_recall_record_names_which_entries_a_run_actually_used` writes six entries where the
+    three oldest are each `MEMORY_MAX_ENTRY_CHARS` long, runs with a 2,000-token prompt ceiling, and
+    asserts the record names exactly `small-0..2` for that run. "Three of six" is a property of the
+    sizes and the newest-first fit rule, not of a token estimate the test would otherwise be pinned
+    to. A second run over the same workspace produces its own identical record with the first
+    untouched, and a run id that never existed recalls nothing.
+  - >
+    First attempt failed for the right reason: with the default 24,000-token budget every note fit
+    and the assertion read six of six. The fix was to shrink the contract's context budget, not to
+    weaken the assertion.
 
 - id: US-IO-HARNESS-0.30.0-T05
   summary: >
