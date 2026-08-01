@@ -95,10 +95,6 @@ breaks: `Provider` gains a defaulted method, `ProviderSpec` gains the variant
 - The README's provider paragraph named three vendors four lines under a tagline
   that says "any provider". It now names what the crate actually reaches.
 
-### Deprecated
-
-### Removed
-
 ### Security
 
 - The reference price catalogue is the first thing in this crate that would dial

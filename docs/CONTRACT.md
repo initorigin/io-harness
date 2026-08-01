@@ -11,7 +11,7 @@ itself, and that is precisely when a dependent needs the explanation most.
 The public surface is everything re-exported from the crate root plus the items
 reachable through the public modules it names.
 
-The re-exported half — the 145 items a caller reaches as `io_harness::Thing` —
+The re-exported half — the 150 items a caller reaches as `io_harness::Thing` —
 is enumerated in [public-api.txt](public-api.txt), which a test compares against
 the live crate on every run. That is the surface the deprecation cycle below
 covers and the surface every item of which carries a worked example.
@@ -257,8 +257,8 @@ cannot keep one.
 
 ### Base URLs are not uniformly shaped
 
-The preset carries the whole prefix the vendor documents, and five of the
-twenty-one are not `/v1`:
+The preset carries the whole prefix the vendor documents, and six of the
+twenty-one are not a host plus `/v1`:
 
 | Vendor | Base |
 | --- | --- |
@@ -540,7 +540,7 @@ the runs, not a second execution path:
   it. The committed step is the settled fact.
 - **A `Provider` that does not override `complete_streaming` streams nothing.**
   The default emits the finished text as one delta, which keeps a consumer
-  rendering, and is not incremental. The three built-in providers and `Fallback`
+  rendering, and is not incremental. The four built-in providers and `Fallback`
   override it.
 - **Steering is text, not authorization.** An operator's mid-turn message reaches
   the model exactly as a `TaskContract` constraint does, and every tool call it
@@ -556,7 +556,7 @@ the runs, not a second execution path:
   ceilings, so `max_steps` on one turn does not bound the next. A conversation-wide
   limit is the caller's to enforce, per turn, from `Store::run_summary`.
 
-**What configuration is, and is not (0.19.0, extended in 0.27.0 and 0.28.0).** `io.toml` is
+**What configuration is, and is not (0.19.0, extended in 0.27.0, 0.28.0 and 0.29.0).** `io.toml` is
 a projection onto the typed API and never a second path into the run loop:
 
 - **The typed API is the authority.** Every key lands in a type this crate
@@ -566,7 +566,11 @@ a projection onto the typed API and never a second path into the run loop:
   is the same rule and not an exception to it: it yields a **`ProviderSpec`**, a
   value the application constructs a provider from, never a provider. `Provider::complete`
   returns `impl Future`, so the trait is not dyn-compatible and there is no
-  `Box<dyn Provider>` for an accessor to return.
+  `Box<dyn Provider>` for an accessor to return. `kind = "compatible"` (0.29.0) is
+  a fourth `ProviderSpec` variant and not a fourth mechanism — it names an
+  endpoint where the other three name a vendor, and it arrives behind the
+  `#[non_exhaustive]` 0.27.0 put on that enum for exactly this, so a caller who
+  wrote the `_ =>` arm is unbroken.
 - **The file is read once, by the caller, before the run, and never again.**
   Nothing in this crate discovers a config on its own: `Config::discover` is the
   caller's own call. That is what makes the one guarantee here true — a config
