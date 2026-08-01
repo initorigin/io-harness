@@ -59,7 +59,7 @@ tasks:
   why_required: Without it the release prices nothing for the vendors that publish no prices, which
     is the half of the outcome the fallback trigger is written against. The conversion is also the only
     place a defect in this release becomes money rather than an error.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T01
   acceptance_criteria:
@@ -86,7 +86,36 @@ tasks:
     '
   files:
   - src/provider/catalog.rs
-  evidence: []
+  evidence:
+  - 'F4 — `f4_a_decimal_rate_becomes_an_exact_integer` runs a 19-case hand-computed table: deepseek/deepseek-chat''s
+    own 0.0000002574 -> 257_400, gemini-2.5-pro''s base and its 200k override, fewer fraction digits
+    than the shift, an integer with no point, a stated zero, and half-up rounding at the twelfth place
+    asserted on both sides.'
+  - F4's named negative control — `f4_the_conversion_is_not_a_float_multiply` — earned its keep. The
+    first discriminating case chosen (0.0000006000000000000001) turned out to survive an f64 round trip,
+    so the control FAILED and the table did not discriminate. Ten live catalogue values were then found
+    where `(s.parse::<f64>()? * 1e12) as u64` truncates one micro-unit low — 0.00000003 is qwen/qwen3.7-flash's
+    own prompt rate — and the control now asserts the disagreeing set equals `FLOAT_TRAPS` exactly and
+    that `naive + 1 == exact` for each. A control that discriminates on nothing now fails.
+  - '`f4_a_malformed_rate_is_absent_rather_than_free` — a negative rate, an unparseable string and an
+    empty one all yield 0 at the digit level, while `Pricing::price()` returns None when no dimension
+    was named at all and `Some(Price::ZERO)` when exactly one was stated as zero. The rule is ''nothing
+    was named'', not ''everything came out zero''.'
+  - 'F5 — exact slug, case-insensitive; the one normalisation (drop a single leading `vendor/` segment)
+    proven on deepseek/deepseek-chat -> deepseek-chat. Three named negative controls: the roadmap''s
+    own `deepseek-v4-flash` miss stays None; two entries normalising to one key make it ambiguous and
+    therefore None rather than first-wins, while both stay reachable by exact slug; and the normalisation
+    is not applied in the other direction.'
+  - '`the_live_shape_parses_into_model_info` parses a body trimmed verbatim from the live response.
+    gemini-2.5-pro''s 200k override carries no `input_cache_write`, and the tier is asserted to keep
+    the base 375_000 rather than zero — the sparse-merge half of F11, and the difference between a tier
+    and a truncation. A row that priced nothing is None on both price and price_source.'
+  - F6's catalogue half — `every_price_carries_its_provenance_and_the_two_cannot_disagree` asserts `price.is_some()
+    == price_source.is_some()` across every entry, and that a reference price names the host it came
+    from. `the_catalogue_is_read_once_per_instance` pins the instance cache; `the_host_is_knowable_before_any_request_is_made`
+    pins the property the egress boundary rests on.
+  - '`cargo test --lib provider::catalog` — 14 passed, 0 failed. No new dependency: serde_json and reqwest
+    only, and the decimal shift is std string handling.'
 - id: US-IO-HARNESS-0.29.0-T03
   summary: 'The Compatible provider: the base URL and auth style, the preset table and its named constructors,
     models(), and the opt-in reference lookup in endpoints().'
