@@ -1,0 +1,63 @@
+product: io-harness
+version: 0.31.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: null
+  budget: >
+    The owner watches the five-hour usage block; redundancy is what is cut, never completeness. At
+    most two concurrent subagents, and none dispatched to re-verify something already established.
+  capacity: >
+    `allow_parallel_agents` is true in the workspace resource profile as a standing decision, not a
+    per-release one. This release is one continuous edit across `src/run.rs`, `src/state.rs` and the
+    three providers, so the declared `files` of almost every task overlap and a wave would hold all
+    but one of them anyway. Sequential by the nature of the work rather than by preference.
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The durable half of the plan gate is not new machinery, it is the machinery 0.21.0 already
+      built for a question: `pending_questions` persists, `RunOutcome::AwaitingAnswer` stops the run,
+      `resume_with_answer` records the answer and resumes normally, and the answer reaches the model
+      as a ledger observation because the step that asked was already committed. Every one of those
+      four moves has an exact counterpart here. The release copies a working shape rather than
+      inventing a second one, which is what the roadmap outcome asked for in the words "the way an
+      approval already pauses".
+    - >
+      The enforcement point already exists too. `Policy::explain` resolves deny-first across all
+      layers, and the loop already rebuilds the effective policy and the `Workspace` mid-run when an
+      approver remembers a rule. A `plan-gate` layer denying `Write` and `Exec` therefore needs no
+      new concept and covers registered and MCP tools, both of which are `Act::Exec` checks, through
+      the choke point they already share.
+    - >
+      The recorded constraint "no new runtime dependency; `cargo tree` stays at 402 lines" is met by
+      construction: a table, four fields, an enum and a trait need nothing that is not already
+      linked. The recorded constraint "no store format bump; additive schema only" is met by the
+      change being one new table with no column touched, which is the lowest-risk shape this
+      repository has for a migration — trap 5, where `ALTER TABLE ADD COLUMN` rewrites the stored
+      `CREATE TABLE` text, is not reached at all.
+    - >
+      The effort half is four additive fields and one body key per vendor, in three `body()`
+      functions that are already the single place each vendor's request is built.
+    - >
+      The deployment path exists and has been walked 34 times.
+  major_cost_drivers:
+    - >
+      Making the phase's start and end read from the store rather than from a local variable. This is
+      the whole of the durability claim and it is the one thing that passes every in-process test
+      whether it is right or wrong.
+    - >
+      The restart evidence. F2 needs a real SIGKILL and a second process that never saw the first,
+      and it has to assert an absence — that no second planning turn happened — which is a harder
+      thing to observe than a presence.
+    - >
+      Anthropic's `max_tokens`. Extended thinking requires it strictly above `budget_tokens`, and the
+      crate's `MAX_TOKENS` is a fixed 8192 carrying a standing note that says so. Raising it only
+      when a budget is present is small; proving the no-effort body is byte-identical to 0.30.0's is
+      the test that has to exist.
+    - >
+      Reasoning could reach the next prompt by a path the ledger does not see, so F7 has to assert
+      against the requests a provider double actually received rather than against stored rows.
+  recommended_scope_change: null
