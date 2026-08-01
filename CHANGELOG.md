@@ -26,6 +26,156 @@ notes are produced from it.
 
 ### Security
 
+## [0.31.0] - 2026-08-01
+
+The agent proposes before it acts, and a caller can say how hard it is allowed to
+think. Two knobs on the same moment — the request, before the agent does
+anything — which is why they ship together.
+
+**The plan gate.** Hand a `TaskContract` a `PlanGate` and the run opens in a
+planning phase: the agent may read the workspace and may change nothing in it, and
+the only way out is a `Plan` — ordered steps, each optionally naming the sub-agent
+that will own it — that a human approves, sends back with a correction, or
+cancels. When nothing in the process will answer, the plan is persisted and the
+run stops with `RunOutcome::AwaitingPlan`. That process may then exit;
+`resume_with_plan_decision` continues the run under its original id, from
+anywhere, later.
+
+The enforcement is the part worth reading. The phase is held by a `plan-gate`
+policy layer denying every `Act::Write` and `Act::Exec`, not by a list of tool
+names — so `write_file`, `edit_file`, `exec`, the shell tools, `git`, every
+registered `Tool` and every MCP tool are covered by the one deny-first resolution
+they already share, and a tool added tomorrow is covered the day it lands. A
+refusal during the phase appears in the trace attributed to the `plan-gate`
+layer, legible to someone who has never heard of this feature. `remember` is the
+single write the policy cannot see — it lands in this crate's own store — and is
+refused explicitly, so "nothing is written" means nothing rather than nothing the
+policy happens to see.
+
+Whether the gate has been satisfied is asked of the **store**, at every loop
+entry, never carried in memory. That one decision is the whole of the durability
+claim: a run approved in one process and killed in the next does not plan again,
+and one that was never approved does not start writing because the approval died
+with the process that held it. Proven against a real `SIGKILL`, with the
+resumed run asserted never to be offered `propose_plan` again — the only
+observable that separates "read the approval from the store" from "planned again
+and was approved again".
+
+This is **not** the 0.21.0 `todo_write` tool. That one records a plan the agent is
+already executing so an operator can watch it. This one executes nothing until an
+answer arrives. Both exist and neither replaces the other.
+
+**Reasoning effort per role.** `AgentDef` carried a role, a model and a narrowed
+boundary and could not say how hard the model should think, so a `searcher` doing
+lookups and a `critic` looking for what is missing paid the same reasoning bill.
+`Effort` — `Low`, `Medium`, `High` — sits on `AgentDef` and on `TaskContract`, and
+reaches the wire projected onto whatever each vendor calls it:
+`reasoning.effort` on OpenRouter, `reasoning_effort` on OpenAI and `Compatible`,
+and on Anthropic — which has no tiers at all — a `thinking` budget with
+`max_tokens` raised to clear it, because Anthropic refuses a request whose budget
+is not strictly below the cap.
+
+Where a vendor cannot honour a tier the crate says so rather than pretending.
+**OpenAI's Chat Completions returns no reasoning text**, so `Effort` changes how
+the model behaves and leaves `CompletionResponse::reasoning` at `None`;
+`Usage::reasoning_tokens` is the only visibility on that path. The whole per-vendor
+table, including what each one does not do, is in `docs/CONTRACT.md`.
+
+Where the thinking *is* returned it reaches an `Observer` as
+`EventKind::Reasoning` and goes nowhere else. It is never appended to the
+observation ledger and therefore never enters the prompt assembled for the next
+turn: a vendor bills thinking once as output, and a harness that folded it into
+the next request would be billed for it again as input, every turn, for the rest
+of the run.
+
+`cargo tree` still reads 402 lines. Nothing here needed a dependency.
+
+### Breaking changes
+
+- **BREAKING** — `CompletionRequest` gains `effort: Option<Effort>`, how hard the
+  model should think. Every existing caller meant `None`, which is the body every
+  release before 0.31.0 sent — asserted, not assumed: the vendor body tests
+  compare a no-effort request against the whole 0.30.0 body rather than only
+  against the absence of the key. This affects only code that builds a
+  `CompletionRequest` with a struct literal listing every field.
+  *Migration:* add the field, or spread the default.
+
+  ```rust
+  let request = CompletionRequest {
+      system: system.into(),
+      user: user.into(),
+      tools,
+      ..Default::default() // or: effort: None,
+  };
+  ```
+
+  An out-of-tree `Provider` that ignores the field keeps compiling and is honestly
+  non-thinking, which is the same bargain `model` (0.21.0) and `web` (0.22.0)
+  offered.
+
+- **BREAKING** — `CompletionResponse` gains `reasoning: Option<String>`, the
+  thinking the provider returned. This affects only code that constructs a
+  `CompletionResponse` with an exhaustive struct literal — which every out-of-tree
+  `Provider` does, since `complete` must return one.
+  *Migration:* spread the default, or set `reasoning: None`, which is what a
+  provider that returns no thinking honestly means.
+
+  ```rust
+  Ok(CompletionResponse {
+      text: Some(answer),
+      tool_calls,
+      ..Default::default() // or: reasoning: None,
+  })
+  ```
+
+- **BREAKING** — `RunOutcome` gains two variants, `AwaitingPlan { plan_id, steps }`
+  and `PlanRejected { steps }`, so an exhaustive `match` on it needs two more arms.
+  *Migration:* handle `AwaitingPlan` by showing `Store::plan(plan_id)` to a human
+  and calling `resume_with_plan_decision`; treat `PlanRejected` as terminal, the
+  way `Denied` and `Cancelled` are. A caller that never registers a `PlanGate` can
+  never receive either.
+
+- **BREAKING** — `EventKind` gains three variants, `PlanProposed`, `PlanDecided`
+  and `Reasoning`. `EventKind` has been `#[non_exhaustive]` since 0.24.0, so an
+  exhaustive `match` already carries a wildcard arm and this costs it nothing.
+  *Migration:* none required. `EVENT_NAMES` gains the three spellings, so a
+  `[[hook]]` may now filter on `plan_proposed`, `plan_decided` or `reasoning`.
+
+### Added
+
+- `Plan`, `PlanStep`, `PlanVerdict`, the `PlanGate` trait and `PlanReview`, in
+  `src/approve.rs` beside `Question` and `Responder`, whose shape they copy: the
+  review returns `Option<PlanVerdict>` and `None` means "nobody in this process can
+  answer", which is what makes the run persist and pause rather than guess.
+- `PlanGateNone` (the honest unattended default — every plan pauses for a human),
+  `AcceptPlan` (tests, and callers who want the shape without the wait) and
+  `StdinPlanGate` (a CLI: `y` approves, `n` cancels, an empty line defers, anything
+  else is taken as the correction).
+- `TaskContract::with_plan_gate` and `TaskContract::with_effort`;
+  `AgentDef::with_effort`, which also deserialises from an `io.toml` roster.
+- `PROPOSE_PLAN_TOOL` (`propose_plan`), offered only while a gate is registered and
+  unsatisfied, and withdrawn the moment a plan is approved.
+- `resume_with_plan_decision`, `resume_tree_with_plan_decision` and their
+  `_observed` twins, matching the four `resume_*_with_answer` entry points.
+- `PendingPlan` and five `Store` accessors — `put_plan`, `plan`, `approved_plan`,
+  `decide_plan`, `plans` — mirroring the question accessors. `decide_plan` refuses
+  a second verdict with `Error::Resume`, the way `answer_question` refuses a second
+  answer.
+- `Effort`, with `Ord` so "at least Medium" needs no `match`, `FromStr` for a
+  configuration file, and `thinking_budget()` for the one vendor that has no tiers.
+- A `plans` table. Additive, `CHECKPOINT_FORMAT` still 7 — a 0.30.0 binary never
+  queries it — indexed on `(run_id, verdict)`, which is the shape of the question
+  the loop asks at every step. Measured at 26µs per lookup over 20,000 plan rows.
+- The plan-gate and reasoning-effort sections of `docs/CONTRACT.md`, including the
+  per-vendor table and what each vendor does not do, and new sections in the
+  permissions and providers guides.
+
+### Changed
+
+- Anthropic's `max_tokens` is no longer unconditionally 8,192: it is raised to
+  clear the thinking budget when, and only when, a tier was asked for. A request
+  with no tier sends exactly the body 0.30.0 sent.
+
 ## [0.30.0] - 2026-08-01
 
 The store can answer *why*, for three questions it could already answer the

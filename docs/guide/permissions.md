@@ -170,6 +170,83 @@ pending and the run paused.
 An agent *tree* pauses the same way and continues with
 `resume_tree_with_decision`; see [durable runs](durable-runs.md).
 
+## Reviewing the approach, before there is anything to approve (0.31.0)
+
+An `Approver` is asked about one action, after the agent has decided to take it.
+A **plan gate** is asked about the whole approach, before the agent has done
+anything at all:
+
+```rust
+use io_harness::{PlanGateNone, TaskContract};
+use std::sync::Arc;
+
+let contract = TaskContract::workspace("port the parser", "/repo")
+    .with_plan_gate(Arc::new(PlanGateNone));
+```
+
+The run now opens in a planning phase. The agent may `grep`, `find` and
+`read_file` as much as it likes and may change nothing: a `plan-gate` layer denies
+every `Act::Write` and every `Act::Exec` for the duration, which covers the
+built-ins, every registered `Tool` and every MCP tool through the same deny-first
+resolution as everything else. The only tool that works is `propose_plan`.
+
+What comes back is a `Plan` — ordered steps, each optionally naming the
+`AgentDef` that will own it — and a `PlanGate` answers with one of three
+verdicts:
+
+```rust
+use io_harness::{Plan, PlanGate, PlanReview, PlanVerdict};
+
+#[derive(Debug)]
+struct Frugal;
+
+impl PlanGate for Frugal {
+    fn review<'a>(&'a self, plan: &'a Plan) -> PlanReview<'a> {
+        Box::pin(async move {
+            Some(match plan.agents().any(|a| a == "deep-thinker") {
+                true => PlanVerdict::revise("do not spawn `deep-thinker` for this"),
+                false => PlanVerdict::Approve,
+            })
+        })
+    }
+}
+```
+
+`Approve` ends the phase and hands the plan back to the model as the approach it
+agreed to. `Revise` puts the correction in front of it and leaves the phase on,
+so it proposes again with nothing written. `Cancel` stops the run with
+`RunOutcome::PlanRejected`.
+
+Returning `None` — which is what `PlanGateNone` always does, and the honest
+default for unattended work — persists the plan and pauses the run with
+`RunOutcome::AwaitingPlan`. This process may then exit:
+
+```rust
+match result.outcome {
+    RunOutcome::AwaitingPlan { plan_id, .. } => {
+        // ...another day, another process, same rusqlite file
+        let store = Store::open("runs.db")?;
+        let pending = store.plan(plan_id)?.expect("proposed earlier");
+        println!("{}", pending.plan.render());
+
+        io_harness::resume_with_plan_decision(
+            &contract, &provider, &store, pending.run_id, plan_id,
+            PlanVerdict::Approve, &policy, &approver,
+        ).await?
+    }
+    _ => result,
+};
+```
+
+Whether the gate has been satisfied is read back from the store at every loop
+entry, never carried in memory — so a run approved in one process and killed in
+the next does not plan again, and one that was never approved does not start
+writing because the approval died with the process that held it.
+
+This is **not** the `todo_write` tool. That one records a plan the agent is
+already executing so an operator can watch it; see
+[agency](agency.md). This one executes nothing until an answer arrives.
+
 ## Sharing one policy between apps
 
 `Policy` is `serde`-serializable, so io-cli and io-studio read the same format
