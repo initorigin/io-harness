@@ -271,6 +271,60 @@ jobs:
           fi
           echo "0.22.0 rejected at resolution, on the links conflict, as expected."
 
+  # 0.30.0 — the store migration is additive, proven backwards. The forward half
+  # (a 0.29.0-written database opens, reads and resumes here) runs in the ordinary
+  # test job, because the fixtures are committed and this crate is the reader.
+  # The BACKWARD half cannot: it needs a real 0.29.0 binary to open a database
+  # this tree wrote, and no job above ever compiles the previous release.
+  #
+  # Without it "additive" is an assertion. 0.30.0 adds two nullable columns to
+  # `memory` and a `memory_recalls` table; the claim that an older binary still
+  # reads such a store is only evidence when the older binary says so.
+  #
+  # Linux only, like `links-consumer`: this is a schema question and the schema
+  # does not vary by OS, and the three-OS matrix above already runs the forward
+  # half everywhere.
+  cross-version-0.29.0:
+    name: cross-version (0.29.0 reads a 0.30.0 store)
+    runs-on: ubuntu-latest
+    # Compiles the previous release from crates.io with a bundled SQLite, then
+    # this tree's test binary. 20 minutes, in line with the other single-OS jobs.
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # The pinned generator: `io-harness = "=0.29.0"` from crates.io, in its own
+      # workspace with its own target directory, so it never drags a second
+      # `libsqlite3-sys` into this crate's build.
+      - name: build the pinned 0.29.0 binary
+        working-directory: tests/fixtures/gen-0.29.0
+        run: cargo build
+      # `--ignored` because that test is ignored by default — it needs the binary
+      # the step above just produced, and a test that silently passes when its
+      # subject is missing is worse than one that is visibly not run.
+      - name: a 0.29.0 binary reads a store this tree wrote
+        run: cargo test --test cross_version_0_29_0 -- --ignored --exact a_0_30_0_store_is_read_by_a_0_29_0_binary
+      # The control. The generator is supposed to be the PREVIOUS release, and the
+      # one way this job quietly stops proving anything is that pin drifting to a
+      # version that already knows about the new schema. Checked here rather than
+      # trusted, because the failure is silent by construction.
+      - name: the generator is still pinned to 0.29.0
+        run: |
+          set -uo pipefail
+          if ! grep -q '^io-harness = "=0.29.0"$' tests/fixtures/gen-0.29.0/Cargo.toml; then
+            echo "::error::tests/fixtures/gen-0.29.0 is no longer pinned to =0.29.0."
+            echo "That pin is what makes this job evidence rather than a label:"
+            echo "with it drifted, the 'older binary' is not older and the"
+            echo "backwards-compatibility claim is unproven."
+            exit 1
+          fi
+          echo "still pinned to =0.29.0"
+
   # OP1 — the docs.rs build, reproduced. This job exists because of a defect no
   # other job in this file could see.
   #

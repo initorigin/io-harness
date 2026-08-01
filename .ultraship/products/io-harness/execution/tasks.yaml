@@ -10,7 +10,7 @@ tasks:
     The release's one ordering risk. If the generator is built after the schema moves, the
     cross-version evidence measures this tree against itself and passes for the wrong reason. It is
     the first commit of the release for that reason alone.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -318,7 +318,7 @@ tasks:
   why_required: >
     Without it the additive-migration claim is an assertion. Both directions have to be executed by
     the release that makes the claim, and one of them can only be executed by the previous binary.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.30.0-T04
   - US-IO-HARNESS-0.30.0-T05
@@ -332,7 +332,40 @@ tasks:
   files:
   - tests/cross_version_0_29_0.rs
   - .github/workflows/ci.yml
-  evidence: []
+  evidence:
+  - >
+    F8 forwards — `a_0_29_0_store_reads_back_identically_under_0_30_0` opens a copy of the
+    0.29.0-written `aggregates.sqlite3` and asserts every memory entry, run summary, gate event and
+    context event against the sidecar's `read_back`, which is what 0.29.0's own API returned. The
+    two new fields arrive at their documented defaults — every entry is `MemoryKind::Fact` and
+    unpinned, which is what those entries actually were — and `PRAGMA user_version` on the file is
+    still 7, so no format bump slipped in.
+  - >
+    F8 forwards, the half rows cannot cover — `a_0_29_0_tree_resumes_under_0_30_0` resumes the tree
+    0.29.0 stopped at its step cap and drives it to verified success. No run in the tree gains a
+    duplicate step number, the child that had already finished gains neither a step nor a token, the
+    tree total is exactly what 0.29.0 drew plus what this release drew, and `a.txt` still holds one
+    `ALPHA`.
+  - >
+    F8 backwards — `a_0_30_0_store_is_read_by_a_0_29_0_binary` writes a store using every 0.30.0
+    surface (a pinned decision, a plain fact, a finished run) and then execs the pinned 0.29.0
+    binary's `read` mode over it. Ran locally: exit 0, `"reader": "io-harness 0.29.0"`, both keys and
+    both values read back, attribution intact. What it does not see is the kind and the pinned flag,
+    which is the point — those are columns its queries never name.
+  - >
+    That test is `#[ignore]` by default, because it needs `tests/fixtures/gen-0.29.0` built and a
+    test that silently passes when its subject is missing is worse than one visibly not run. CI's
+    new `cross-version-0.29.0` job builds the generator and runs it with `-- --ignored --exact`.
+  - >
+    The job carries a control of its own: it greps `tests/fixtures/gen-0.29.0/Cargo.toml` for
+    `io-harness = "=0.29.0"` and fails if the pin has drifted. That is the one way this job could
+    quietly stop proving anything — an "older binary" that is not older — and the failure would
+    otherwise be silent by construction. Same instinct as the `links-consumer` job's negative
+    control.
+  - >
+    `cargo test --test cross_version_0_29_0` 2 passed, 1 ignored; with `-- --ignored`, 1 passed.
+    The CI file parses and its job list is test, msrv, lint, links-consumer, cross-version-0.29.0,
+    docs.
 
 - id: US-IO-HARNESS-0.30.0-T07
   summary: >
