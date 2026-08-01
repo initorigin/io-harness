@@ -1,339 +1,296 @@
 product: io-harness
-version: 0.28.0
+version: 0.29.0
 tasks:
-  - id: US-IO-HARNESS-0.28.0-T01
-    summary: Make the EventKind census real — EVENT_NAMES, proven complete by a source read, with
-      every_kind() asserted equal to it.
-    why_required: A hook filter names an event by its wire tag, so an incomplete census is a filter
-      an operator writes and that silently never fires. Every later task in this release depends on
-      the list being true.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        F3 — the event census is a census, and the 0.25.0 defect is closed. Three assertions, and each
-        one is load-bearing for the one after it. `EVENT_NAMES` is proven complete by reading
-        `pub enum EventKind` out of `src/observe.rs` and comparing the snake_cased variant names against
-        it — the source-assertion style `tests/public_api.rs` and 0.27.0's F2 already use, because
-        `#[non_exhaustive]` and `strum` are each unavailable for the reasons those releases recorded.
-        `every_kind()`'s serialized tags are then asserted **equal to** `EVENT_NAMES` rather than
-        contained in it, which is the exact assertion `src/observe.rs:808` has been missing since
-        0.21.0. And `TodoWrote`, `QuestionAsked` and `QuestionAnswered` round-trip, which they have
-        never done. **The negative control is the completeness helper run against `EVENT_NAMES` with one
-        entry removed, which must report exactly that name** — a helper that always answers "complete"
-        is the failure mode that produced the defect in the first place, and it must be seen answering
-        no.
-    files:
-      - src/observe.rs
-    evidence:
-      - >
-        `observe::tests::event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
-        reads `pub enum EventKind` out of `src/observe.rs` and asserts `EVENT_NAMES` names every
-        variant, with the helper run against a list with one entry removed as the control that it
-        can report an omission at all.
-      - >
-        `observe::tests::every_kind_produces_one_of_every_tag_and_no_others` asserts the sample
-        set's serialized tags **equal** `EVENT_NAMES`, which is the assertion `src/observe.rs:808`
-        has been missing since 0.21.0. `TodoWrote`, `QuestionAsked` and `QuestionAnswered` now
-        round-trip for the first time.
+- id: US-IO-HARNESS-0.29.0-T01
+  summary: 'Provider plumbing: ModelInfo, PriceSource, the defaulted Provider::models(), the two new
+    module declarations and the crate-root re-exports.'
+  why_required: 'Every other task in the release names one of these types or is compiled by one of these
+    declarations. The defaulted method is also the release''s one break risk: a required method here
+    would break the crate''s only extension point.'
+  status: todo
+  depends_on: []
+  acceptance_criteria:
+  - 'F3 — `Provider::models()` defaults to an empty list, and the default is what keeps the crate''s
+    extension point open. A `Provider` implementation that overrides nothing but `complete` compiles
+    and returns an empty catalogue — written as the minimal out-of-tree implementer, which is the exact
+    shape `src/provider/mod.rs:674` documents. **The negative control is `Compatible::models()` against
+    a socket serving a real catalogue body, returning a non-empty list** — without it the test passes
+    against an implementation whose `models()` returns empty for everyone.
 
-  - id: US-IO-HARNESS-0.28.0-T02
-    summary: "`[[hook]]` in the file format, a Hooks observer, the append action, and the `on` filter."
-    why_required: Without it there is no way to shape a run from the file, which is the release's
-      headline claim and the half the fallback scope keeps.
-    status: done
-    depends_on: [US-IO-HARNESS-0.28.0-T01]
-    acceptance_criteria:
-      - >
-        F1 — a hook declared in a file fires on the events it names and on no others. An
-        `io.local.toml` with `on = ["refused", "finished"]` and an `append` path, installed through
-        `run_observed`, leaves an audit file holding one JSON line per matching event and no line for
-        any other. **Two negative controls, and the criterion is worthless without both:** a hook with
-        **no** `on` key receives every event, asserted by the set of tags in its file being equal to the
-        set the run emitted rather than merely non-empty; and a hook naming one event that the run never
-        reaches produces an empty file rather than no file, so "the filter matched nothing" stays
-        distinguishable from "the hook never ran".
-      - >
-        F2 — an event name this crate does not emit is refused at load, naming it. `on = ["finshed"]`
-        fails the load naming the key and the misspelling, in the shape every other strictness error in
-        the module uses (`src/config.rs:1178` is the pattern). **The negative control is every name in
-        `EVENT_NAMES` accepted in a single `on` list**, so a rule that refused anything it did not
-        recognise from a hand-typed subset is caught here rather than by the first operator who hooked
-        `todo_wrote`.
-    files:
-      - src/hooks.rs
-      - src/lib.rs
-      - src/config.rs
-      - src/observe.rs
-      - tests/hooks.rs
-    evidence:
-      - >
-        `tests/hooks.rs::f1_a_hook_fires_on_the_events_it_names_and_on_no_others` drives a real
-        `run_with_observed` with three hook tables, teeing the run's own event stream beside them:
-        the filtered hook received exactly the two tags it named, the unfiltered one's set is
-        asserted **equal** to the run's, and the one that matched nothing left an empty file rather
-        than no file.
-      - >
-        `tests/hooks.rs::f2_an_event_this_crate_does_not_emit_is_refused_naming_it` plus
-        `hooks::tests::every_event_the_crate_emits_is_a_name_a_hook_may_use`, which is the control
-        that a rule written against a hand-typed subset would fail.
+    '
+  - 'NF5 — no existing public item changes. `OpenRouter`, `Anthropic` and `OpenAi` keep every method
+    and every behaviour; `Provider` gains one defaulted method and no required one; `ProviderSpec` gains
+    one variant behind the `#[non_exhaustive]` 0.27.0 put there for it. A program written against 0.28.0
+    compiles and behaves identically.
 
-  - id: US-IO-HARNESS-0.28.0-T03
-    summary: The run action — a fixed argv with the event on stdin, bounded by timeout_ms, with
-      on_failure deciding whether a failure cancels.
-    why_required: A notification, a formatter and a local policy check are all this one action; the
-      contract's outcome names three of the four uses and each is a `run` hook.
-    status: done
-    depends_on: [US-IO-HARNESS-0.28.0-T02]
-    acceptance_criteria:
-      - >
-        F4 — an executing hook runs a fixed argv with no shell, is handed the event, and is bounded. A
-        `run` hook receives the event JSON on stdin and the JSON parses to the event that fired. A hook
-        whose argv contains `;`, `&&` or `$(…)` receives them as **arguments** — asserted by the child
-        echoing its own argv back, not by asserting the absence of a shell. A hook that sleeps past
-        `timeout_ms` is killed and reported as a failure. **The negative control is the same command
-        inside the timeout, which must complete and not be reported as a failure**, so "bounded" is not
-        satisfied by an implementation that kills everything. Written cross-platform by naming each
-        platform's own sleep and echo rather than by skipping on Windows, which is the lesson 0.27.0's
-        F4 paid for.
-      - >
-        F5 — a hook can stop a run, and by default cannot. A `run` hook with `on_failure = "cancel"`
-        whose command exits non-zero ends the run, asserted on the run's outcome rather than on the
-        event stream. **The negative control is the byte-identical hook with `on_failure` absent**,
-        after which the run reaches its own ending — so the default is proven to be the safe one, and a
-        notification that happens to fail is proven not to be a kill switch.
-    files:
-      - src/hooks.rs
-      - tests/hooks.rs
-    evidence:
-      - >
-        `tests/hooks.rs::f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin` — the
-        child creates a file whose name carries `;` and `&&`, which proves the argv element arrived
-        intact, and its contents parse as the JSON of the event that fired.
-      - >
-        `tests/hooks.rs::f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure`,
-        with the control that the same shape inside its timeout completes and does not stop the run
-        — so "bounded" is not satisfied by an implementation that kills everything.
-      - >
-        `tests/hooks.rs::f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to`, with
-        the byte-identical hook without `on_failure` reaching its own ending as the control.
+    '
+  files:
+  - src/provider/mod.rs
+  - src/lib.rs
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T02
+  summary: 'The reference catalogue reader: Reference, the exact decimal-string to micro-unit conversion,
+    and the match rule.'
+  why_required: Without it the release prices nothing for the vendors that publish no prices, which
+    is the half of the outcome the fallback trigger is written against. The conversion is also the only
+    place a defect in this release becomes money rather than an error.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T01
+  acceptance_criteria:
+  - 'F4 — a decimal price string becomes an exact integer, and no `f64` is on the path. `"0.0000002574"`
+    becomes exactly `257_400` micro-units per million tokens, and a table of hand-computed cases covers
+    a value with fewer fraction digits than the shift, one with more (rounded half-up at the twelfth
+    place), `"0"`, an integer with no point, and a malformed string that yields `None` rather than a
+    zero. **The named negative control is `f4_the_conversion_is_not_a_float_multiply`: the same inputs
+    run through an `f64` multiply must produce a value that differs from the exact result for at least
+    one case in the table**, so the test proves the implementation is not the float one rather than
+    merely agreeing with it on easy inputs. A second control asserts a malformed price is `None` and
+    never `Some(0)`.
 
-  - id: US-IO-HARNESS-0.28.0-T04
-    summary: Refuse the whole `[[hook]]` array in the project scope, inside a profile too, and add
-      the table's strictness and EVERY_KEY obligations.
-    why_required: A hook that runs an argv is the `${cmd:}` primitive arriving one release later.
-      Shipping the mechanism without the rule that bounds it would make 0.27.0's boundary worthless.
-    status: done
-    depends_on: [US-IO-HARNESS-0.28.0-T03]
-    acceptance_criteria:
-      - >
-        F6 — `[[hook]]` is refused in the project scope, whole, and the refusal is about hooks. A
-        `[[hook]]` in `io.toml` fails the load naming the key, the file and the scope, and the same
-        inside `[profile.x]` fails too — the path `refuse_widening` (`src/config.rs:1195`) already walks
-        and the one a rule like this forgets. **Two negative controls:** the byte-identical table in
-        `io.local.toml` loads and produces a working hook, and an unrelated key in the same project
-        `io.toml` still loads, so the test cannot pass on an implementation that refused the project
-        scope wholesale — which is the shape 0.27.0's F4 control exists to catch and the same mistake is
-        available here.
-      - >
-        F9 — every new key reaches a typed field, and the new table rejects what it does not know.
-        `tests/config.rs::EVERY_KEY` (`:232`) names `[[hook]]` and every key inside it and
-        `f7_every_key_reaches_a_typed_field` (`:351`) asserts each lands. **The negative control is its
-        existing twin** `f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default`
-        (`:478`), extended to one new key so the fixture proves the field is read rather than defaulted.
-        Plus a strictness test modelled on `an_unknown_key_inside_the_web_table_is_rejected_naming_it`
-        (`:1178`), and one asserting that a hook table with **neither** `append` nor `run`, or with
-        **both**, is refused naming the table's index.
-    files:
-      - src/config.rs
-      - src/hooks.rs
-      - tests/config.rs
-    evidence:
-      - >
-        `tests/config.rs::a_project_scoped_file_may_not_declare_hooks_and_a_local_one_may` refuses
-        both actions and a hook hidden in a `[profile]`, with two controls: the byte-identical
-        table in `io.local.toml` loads and produces a working hook, and an unrelated key in the
-        same project file still loads — so the test cannot pass on an implementation that refused
-        `io.toml` wholesale.
-      - >
-        `EVERY_KEY` gains two hook tables covering all five keys and
-        `f7_every_key_reaches_a_typed_field` asserts `on`, `append`, `run` and `on_failure` each
-        land; the twin control removes `on` and asserts the filter visibly falls back to every
-        event. `an_unknown_key_inside_a_hook_table_is_rejected_naming_it` covers strictness, both
-        the no-action and the two-action errors, and an unknown event name.
+    '
+  - 'F5 — a reference price is matched exactly or by one documented normalisation, and a miss stays
+    `None`. An exact slug matches; `deepseek/deepseek-chat` matches a vendor id of `deepseek-chat` by
+    dropping the single leading segment, case-insensitively. **Three negative controls:** a vendor id
+    the reference does not carry under either rule is `None` and never a nearest entry — asserted with
+    the roadmap''s own example, a reference carrying `deepseek/deepseek-chat` and a vendor asking for
+    `deepseek-v4-flash`; two reference entries normalising to the same key make that key ambiguous and
+    therefore `None`, not first-wins; and a two-segment vendor id is not matched against a one-segment
+    reference entry by stripping in the other direction, because one normalisation means one.
 
-  - id: US-IO-HARNESS-0.28.0-T05
-    summary: The snapshots table, an honest pre-write read, and rewind with its four answers.
-    why_required: Without it a file the agent changed cannot be put back, which is the second half
-      of the outcome sentence.
-    status: done
-    depends_on: [US-IO-HARNESS-0.28.0-T01]
-    acceptance_criteria:
-      - >
-        F7 — a file the agent changed is put back the way it was, including one it created. After a run
-        that rewrites one file and creates another, `rewind` restores the first to its original bytes
-        and removes the second, reporting `Restored` and `Removed` respectively. **Three negative
-        controls:** a path the run never touched is `NotRecorded` and is **not modified**, asserted on
-        the file's contents and not only on the return value; a second edit to the same path does not
-        move the restore point, so rewinding after two edits yields the bytes from before the first; and
-        a file whose prior contents were not kept — over the cap, or not UTF-8 — is `NotKept` with a
-        reason and is left exactly as it is, never truncated, which is the one way this feature could
-        destroy something.
-    files:
-      - src/state.rs
-      - src/run.rs
-      - src/lib.rs
-      - tests/rewind.rs
-    evidence:
-      - >
-        `tests/rewind.rs::a_file_the_run_rewrote_is_put_back_and_a_file_it_created_is_removed`,
-        driven through a real run. Three controls, each named:
-        `a_path_the_run_never_wrote_is_not_recorded_and_is_left_alone` asserts the bytes rather
-        than the return value; `a_second_edit_does_not_move_the_restore_point`;
-        `contents_that_were_not_kept_are_reported_and_the_file_is_never_truncated`, over both a
-        non-UTF-8 file and one past the 1 MiB cap.
-      - >
-        `cargo test --test edit_file --test edit_tool --test accounting` unchanged, which is the
-        property the replaced pre-write read could have broken.
+    '
+  files:
+  - src/provider/catalog.rs
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T03
+  summary: 'The Compatible provider: the base URL and auth style, the preset table and its named constructors,
+    models(), and the opt-in reference lookup in endpoints().'
+  why_required: It is the release. Twenty-one vendors are reachable without writing a provider, or the
+    outcome sentence is false.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T02
+  acceptance_criteria:
+  - 'F1 — one `Compatible` reaches a vendor''s chat endpoint through the real HTTP and SSE path, and
+    the preset decides the URL and the auth. A `Compatible` pointed at a local socket completes a streamed
+    response with text and a tool call, asserted through `Compatible::at`, and the request the socket
+    received carries `Authorization: Bearer <key>` and a path ending `/chat/completions`. **Two negative
+    controls:** an `Auth::None` provider''s request carries **no** `Authorization` header at all, asserted
+    on the received head rather than on the constructor — so "auth style" is proven to reach the wire
+    and not merely to be stored; and a base URL already ending in a path segment (`/openai/v1`, `/api/paas/v4`)
+    produces that segment plus `/chat/completions` rather than a URL with the segment lost, which is
+    the failure mode a scheme-and-host field would have had.
 
-  - id: US-IO-HARNESS-0.28.0-T06
-    summary: Prove a rewind survives a crash and a resume, and that a store keeps CHECKPOINT_FORMAT
-      at 7.
-    why_required: An in-memory restore point passes every assertion in F7. This is the class of
-      defect 0.12.0 and 0.25.0 were both caught by, and Trigger A is written against it.
-    status: done
-    depends_on: [US-IO-HARNESS-0.28.0-T05]
-    acceptance_criteria:
-      - >
-        F8 — a rewind survives a crash and a resume. A store written by one process, dropped, and
-        reopened at the same path still rewinds to the pre-run bytes, and the run id a resume continues
-        under is the one the snapshots were written against. Asserted through a reopened `Store` rather
-        than a reused handle, because an in-memory restore point passes every other assertion in F7.
-        **The negative control is a snapshot written under a different `run_id` in the same store, which
-        must not be reachable from the first run's rewind** — so "durable" is not satisfied by a lookup
-        that ignores which run asked.
-      - >
-        NF3 — **`CHECKPOINT_FORMAT` stays 7 and a 0.27.0 store still opens, resumes and replays.**
-        `snapshots` is a new table, which is additive, and bumping the format would make
-        `check_resumable` (`src/state.rs:3329`) refuse every existing store over a table an older binary
-        never queries — the reasoning 0.25.0 recorded and the property `tests/cross_version.rs` exists
-        to hold. Proven by the existing cross-version suite passing unchanged, not by argument.
-    files:
-      - tests/rewind.rs
-    evidence:
-      - >
-        `tests/rewind.rs::a_restore_point_survives_the_process_that_wrote_it` asserts through a
-        `Store` dropped and reopened at the same path, because an in-memory restore point passes
-        every assertion in F7.
-      - >
-        `a_resume_rewinds_under_the_run_id_the_snapshots_were_written_against`. The premise was
-        checked before the table was written: every `resume*` form takes `run_id` as a parameter
-        and the only two `Store::start_run` calls in the crate are on the start path, so a resume
-        structurally cannot mint a new id. The control is
-        `another_runs_restore_point_is_not_reachable_from_this_run`.
-      - >
-        `CHECKPOINT_FORMAT` stays 7 and `cargo test --test cross_version --test checkpoint` passes
-        unchanged, 18 tests.
+    '
+  - 'F2 — every preset in the table names a distinct vendor with a well-formed absolute base, and the
+    named constructors and the table cannot disagree. Each entry''s `base_url` parses as an absolute
+    `https`/`http` URL with a host, no entry''s name repeats, and each of the twenty-one named constructors
+    is asserted to produce the base and the auth style its table row states. **The negative control
+    is the check run against a table with one row''s base replaced by a relative path and another row
+    duplicated, which must report exactly those two rows** — a validator that always answers "fine"
+    is the failure mode, and it must be seen answering otherwise.
 
-  - id: US-IO-HARNESS-0.28.0-T07
-    summary: Every documentation surface — the hooks guide page and its wiring, the configuration
-      and durable-runs sections, CONTRACT, public-api.txt and the changelog.
-    why_required: Four of this repository's tests fail on a documentation surface that is added
-      without being wired in, and a public name without a worked example fails a fifth.
-    status: done
-    depends_on: [US-IO-HARNESS-0.28.0-T04, US-IO-HARNESS-0.28.0-T06]
-    acceptance_criteria:
-      - >
-        OP1 — `docs/public-api.txt` is hand-edited in sorted position for `Hooks`, `Rewind` and
-        `rewind`, and each carries a doc comment with a worked example. `tests/public_api.rs` fails
-        otherwise, and there is deliberately no `--bless`. No other name is added: `EVENT_NAMES` is
-        `pub(crate)` and the snapshot row is not public, because the caller's question is "put it back",
-        not "show me the row".
-      - >
-        OP2 — `docs/CONTRACT.md` updated **from the code**, in two places rather than one. The
-        configuration block gains `[[hook]]` as the third scope-dependent refusal beside `${cmd:}` and
-        the four widening keys, stated as a refusal of the whole array rather than of its executing half
-        — a reader who infers the narrower rule will write a project file that does not load. The
-        observability section gains the fact that an `Observer` can now come from a file, and that a
-        hook is still the caller's to install. This is 0.25.0's, 0.26.0's and 0.27.0's OP2 recurring,
-        and it recurs because the defect class is a document written from the plan rather than from the
-        source.
-      - >
-        OP3 — `docs/guide/hooks.md` exists, is named in `tests/guide_pages.rs::GUIDES` with
-        `limits_block: true`, is listed in `docs/CAPABILITIES.md` and in the README's guide table, and
-        its "The limits, stated plainly" block states the five this release creates: a hook blocks the
-        run loop while it runs, a hook is refused in the project scope, an `append` hook opens its file
-        per event, a hook's failure is only fatal when the operator asked for it, and a hook receives
-        events and grants nothing — the boundary is still the `Policy` the caller loaded.
-      - >
-        OP4 — `docs/guide/configuration.md` gains a `### [[hook]]` section and its limits block (`:422`)
-        grows; `docs/guide/durable-runs.md` gains a rewind section stating what one restore point per
-        file per run does and does not offer. The formatter example lives in `hooks.md` as three lines
-        of TOML, which is the release's own claim about formatters and the cheapest possible way to
-        make it.
-    files:
-      - docs/guide/hooks.md
-      - docs/guide/configuration.md
-      - docs/guide/durable-runs.md
-      - docs/CONTRACT.md
-      - docs/CAPABILITIES.md
-      - docs/public-api.txt
-      - tests/guide_pages.rs
-      - README.md
-      - CHANGELOG.md
-    evidence:
-      - >
-        `docs/guide/hooks.md` written from `src/hooks.rs` rather than from the contract, wired into
-        `tests/guide_pages.rs::GUIDES` with `limits_block: true`, `docs/CAPABILITIES.md` and the
-        README guide table. Its limits block carries six, not five: hooks are not accumulated
-        across scopes, which the source shows and the plan had missed.
-      - >
-        `docs/CONTRACT.md` gains "What a lifecycle hook is, and is not" and "What `rewind` puts
-        back, and what it cannot", and names `[[hook]]` as the third scope-dependent refusal beside
-        `${cmd:}` and the four widening keys. Its stale "110 items" count is corrected to 145.
-      - >
-        `docs/guide/configuration.md` gains a `### [[hook]]` section and two limits;
-        `docs/guide/durable-runs.md` gains "Putting a file back".
-        `docs/public-api.txt` hand-edited in sorted position for `Hooks`, `Rewind` and `rewind`.
-        `CHANGELOG.md` opens with prose and carries Added and Fixed; nothing in this release breaks.
-      - >
-        Writing the page from the source caught two stale doc comments in `src/hooks.rs`, which
-        said an `append` path resolves against the declaring file's directory when it resolves
-        against the discovery root. Corrected in the source.
+    '
+  - 'F6 — a price carries its provenance, and the two fields cannot disagree. A model priced from the
+    vendor''s own catalogue is `PriceSource::Vendor`; the same model filled from the reference is `PriceSource::Reference(host)`
+    naming the host that was dialled. Across a whole parsed catalogue, `price.is_some()` and `price_source.is_some()`
+    are asserted **equal for every entry**. **The negative control is a vendor catalogue with no pricing
+    object at all** — every entry `None` on both, which is the state that must not be reported as a
+    free model.
 
-  - id: US-IO-HARNESS-0.28.0-T08
-    summary: The release gates — the full suite, no new dependency, a clean doc, fmt and clippy, and
-      a verified package.
-    why_required: Every non-functional and operational claim in the contract is checked here or
-      nowhere, and a published crate cannot be recalled.
-    status: done
-    depends_on: [US-IO-HARNESS-0.28.0-T07]
-    acceptance_criteria:
-      - >
-        NF1 — the full suite passes on macOS, Linux and Windows with no test skipped, ignored or made
-        conditional. The standing exception is
-        `skills::discovery_over_a_32_skill_directory_is_under_50ms`, a wall-clock assertion that fails
-        intermittently on the Windows runner under load and is re-run rather than investigated.
-      - >
-        NF2 — **no new dependency, on any platform.** `cargo tree` on the default feature set reads 402
-        lines after this release as before it. A hook is `std::process::Command` and `std::fs`; the
-        event line is `serde_json`, already a dependency and already what serializes a `RunEvent`; the
-        snapshot is a `rusqlite` row. The bounded wait is `try_wait` and `std::thread::sleep`, not a
-        timer crate, and not `tokio` — `Observer::event` is synchronous and reaching for a runtime
-        inside it is how a nested-runtime panic gets shipped.
-      - >
-        NF4 — `cargo doc` is warning-free, docs.rs builds with all features, `cargo fmt --check` is
-        clean, and `cargo clippy --all-targets -- -D warnings` is clean on every platform in the matrix.
-        Doc examples use literals rather than `${env:HOME}`, which is unset on `windows-latest` and cost
-        0.27.0 a CI round.
-      - >
-        OP5 — `cargo package --locked` exits 0 and the tarball is verified by **listing** rather than by
-        trusting the `exclude` list: no `.env`, no `.ultraship`, no `.github`. MSRV 1.95 re-checked in
-        both directions rather than read off the manifest, which is the lesson 0.23.0 paid for.
-        `df -h .` is read before packaging and before publishing, because a full disk on this machine
-        surfaces as a linker error and reads like a toolchain bug.
-    files:
-      - Cargo.toml
-    evidence:
-      - >
-        Recorded at completion.
+    '
+  - 'F7 — the reference lookup is off by default, and when on its host is governed like every other
+    endpoint. A `Compatible` built normally reports exactly one endpoint and makes no second request,
+    asserted by a reference server that records whether it was ever connected to. With `with_reference_prices`,
+    `endpoints()` reports both, and a run under a policy that denies the reference host **fails** rather
+    than proceeding with prices missing — asserted on the run''s error through the existing authorisation
+    at `src/run.rs:4630`. **Two negative controls:** the byte-identical run under a policy that allows
+    the host reaches its own ending, so the refusal is proven to be about the policy and not about the
+    feature being broken; and the default-off provider under the same denying policy still runs, so
+    the deny is proven to be about the second host and not about the provider''s own.
+
+    '
+  files:
+  - src/provider/compatible.rs
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T04
+  summary: ProviderSpec::Compatible in the file format, its exactly-one base rule, and every key of
+    it named in EVERY_KEY.
+  why_required: An operator has configured the harness in a file rather than in Rust since 0.19.0, and
+    a provider kind the file cannot name is a provider io-cli and io-studio cannot select.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T03
+  acceptance_criteria:
+  - 'F9 — the config variant reaches a typed field, is exactly-one about its base, and rejects what
+    it does not know. `EVERY_KEY` (`tests/config.rs:233`) gains a `kind = "compatible"` entry covering
+    every key, and `f7_every_key_reaches_a_typed_field` (`:362`) asserts each lands. **The negative
+    control is its existing twin** (`:525`), extended to one new key, so the fixture proves the field
+    is read rather than defaulted. Plus: an entry with **neither** `base_url` nor `preset`, and one
+    with **both**, are each refused naming the entry''s index; an unknown `preset` name is refused listing
+    the names that exist; and an unknown key inside the entry is rejected naming it, modelled on `an_unknown_key_inside_the_web_table_is_rejected_naming_it`
+    (`:1242`).
+
+    '
+  files:
+  - src/config.rs
+  - tests/config.rs
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T05
+  summary: docs/guide/providers.md, with its limits block and the line explaining why Compatible has
+    no from_env.
+  why_required: tests/guide_pages.rs fails without the page once it is named in GUIDES, and a capability
+    with no guide page is the documentation defect 0.16.0 exists to prevent.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T03
+  acceptance_criteria:
+  - 'OP3 — `docs/guide/providers.md` exists, is named in `tests/guide_pages.rs::GUIDES` with `limits_block:
+    true`, is listed in `docs/CAPABILITIES.md` and in the README''s guide table, and its "The limits,
+    stated plainly" block states what this release creates: that `Compatible` is one wire and not a
+    compatibility layer, that a vendor catalogue mostly carries no prices, that a reference price is
+    the aggregator''s and not the vendor''s, that a match that is not exact or the one normalisation
+    stays unpriced rather than guessed, and that the reference lookup dials a host the caller did not
+    name and is therefore off until asked for. It also carries the one line explaining why `Compatible`
+    has no `from_env` and what to write instead.
+
+    '
+  files:
+  - docs/guide/providers.md
+  - tests/guide_pages.rs
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T06
+  summary: The README providers paragraph and guide-table row, the CAPABILITIES entry, and the [[provider]]
+    section in the configuration guide.
+  why_required: The README names three vendors four lines under a tagline that says any provider. This
+    release is what makes the tagline true and the paragraph is where a reader finds out.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T03
+  acceptance_criteria:
+  - 'OP4 — README''s "Providers, with fallback" paragraph (`README.md:156`) is rewritten. It names only
+    OpenRouter, Anthropic and OpenAI today, while the tagline four lines above says "any provider" —
+    this release is what makes that true and the paragraph is where a reader finds out. `docs/guide/configuration.md`
+    gains a `### [[provider]]` subsection covering the new kind, and its limits block grows.
+
+    '
+  files:
+  - README.md
+  - docs/CAPABILITIES.md
+  - docs/guide/configuration.md
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T07
+  summary: tests/parity.rs extended so the same task contract reaches verified success through Compatible
+    beside the three built-ins.
+  why_required: Provider-agnosticism is a property the loop either has or does not, and this file is
+    the one that asserts it. A fourth provider that needed the contract changed would disprove the release's
+    own claim.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T03
+  acceptance_criteria:
+  - 'F8 — `Compatible` runs a real task contract to verified success, beside the three built-ins. `tests/parity.rs`
+    gains it as a fourth provider under the same contract, and the trace records its name. **The negative
+    control is the existing three still passing unchanged in the same loop**, which is what proves the
+    addition is a fourth path and not a rewrite of the three.
+
+    '
+  files:
+  - tests/parity.rs
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T08
+  summary: 'The convergence files: public-api.txt in sorted position, the CONTRACT divergence section,
+    the changelog entry and the manifest version.'
+  why_required: tests/public_api.rs fails on a public name with no line and no worked example, and the
+    divergence section is the release's most important documentation obligation — a caller pointed at
+    vLLM without a parser flag gets no tool calls and no error at all.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T04
+  - US-IO-HARNESS-0.29.0-T05
+  - US-IO-HARNESS-0.29.0-T06
+  - US-IO-HARNESS-0.29.0-T07
+  acceptance_criteria:
+  - 'OP1 — `docs/public-api.txt` is hand-edited in sorted position for every new crate-root name — `Compatible`,
+    `Auth`, `ModelInfo`, `PriceSource` and `Reference` — and each carries a doc comment with a worked
+    example, because `tests/public_api.rs` fails otherwise and there is deliberately no `--bless`. This
+    is real work rather than a formality: five items, five examples that compile as doctests. The preset
+    table is `pub(crate)` and adds no line; a named constructor is a method and adds none either.
+
+    '
+  - 'OP2 — **`docs/CONTRACT.md` states the vendor divergences plainly, from primary sources, and this
+    is the release''s most important documentation obligation.** A new section names each: Zhipu emits
+    `finish_reason` values outside the OpenAI set (`sensitive`, `network_error`, `model_context_window_exceeded`)
+    which this crate records verbatim because the field is an open `String`; Groq returns 400 on `messages[].name`;
+    Mistral requires tool-call ids matching `^[a-zA-Z0-9]{9}$` and names its schema field `schema_definition`;
+    DeepSeek returns 400 if `reasoning_content` is not replayed on a request carrying tools; Ollama
+    accepts and silently drops `tool_choice`.
+
+    **And the sentence that matters most: vLLM and SGLang emit no tool calls at all unless the server
+    was started with a tool-call parser flag, which a client cannot set.** A caller who points `Compatible`
+    at a vLLM server started without `--tool-call-parser` gets a run that quietly never calls a tool
+    and never errors — the agent simply talks. That must be findable in the contract by someone searching
+    for "vLLM" or "no tool calls", not discovered after an afternoon of debugging. It is stated in those
+    words, in the section a reader reaches before writing the base URL.
+
+    '
+  files:
+  - docs/public-api.txt
+  - docs/CONTRACT.md
+  - CHANGELOG.md
+  - Cargo.toml
+  evidence: []
+- id: US-IO-HARNESS-0.29.0-T09
+  summary: 'The gates: the suite on the default and all-features sets, clippy, fmt, doc, cargo tree,
+    cargo package, and the live reference-catalogue check.'
+  why_required: Every non-functional and operational criterion is proven here or is unproven, and a
+    parser written against a shape nobody checked is the failure F10 exists to prevent.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.29.0-T08
+  acceptance_criteria:
+  - 'F10 — the live reference host serves the shape the parser was written against. A keyless `GET https://openrouter.ai/api/v1/models`
+    from the release machine, parsed by the shipped parser, yielding a non-empty catalogue in which
+    at least one model carries a price in every one of the five dimensions the mapping claims. Run once,
+    at completion, and recorded as a health check with what it actually returned. It is not a unit test
+    and does not gate CI — a network test in the suite is a flaky suite — but a parser written against
+    a shape nobody checked is the failure this criterion exists to prevent, and `.env` carries real
+    OpenRouter credentials, so the check is genuinely available rather than aspirational.
+
+    '
+  - 'NF1 — the full suite passes on macOS, Linux and Windows with no test skipped, ignored or made conditional.
+    The standing exception is `skills::discovery_over_a_32_skill_directory_is_under_50ms`, a wall-clock
+    assertion that fails intermittently on the Windows runner under load and is re-run rather than investigated.
+    No test in this release reaches the network.
+
+    '
+  - 'NF2 — **no new dependency, on any platform.** `cargo tree` on the default feature set reads 402
+    lines after this release as before it. The provider is `reqwest` and `openai_wire`, both present;
+    the catalogue parse is `serde_json`, present; the decimal shift is `std` string handling and `u64`.
+    This is the constraint the product now states, so it is a criterion and it is checked rather than
+    asserted.
+
+    '
+  - 'NF3 — **`CHECKPOINT_FORMAT` stays 7 and no store schema changes at all.** This release creates
+    no table, which is the direct consequence of the catalogue being cached on the provider instance
+    rather than in the store. `tests/cross_version.rs` passes unchanged, and it passes without anything
+    being added to `ADDED_SINCE_0_22_0`.
+
+    '
+  - 'NF4 — `cargo doc` is warning-free, docs.rs builds with all features, `cargo fmt --check` is clean,
+    and `cargo clippy --all-targets -- -D warnings` is clean on every platform in the matrix. Doc examples
+    use literals rather than `${env:HOME}`, which is unset on `windows-latest` and cost 0.27.0 a CI
+    round. Any test that reads this crate''s own source normalises line endings, because a Windows checkout
+    is CRLF and that cost 0.28.0 a round.
+
+    '
+  - 'OP5 — `cargo package --locked` exits 0 and the tarball is verified by **listing** rather than by
+    trusting the `exclude` list: no `.env`, no `.ultraship`, no `.github`. MSRV 1.95 re-checked in both
+    directions rather than read off the manifest, which is the lesson 0.23.0 paid for. `df -h .` is
+    read before packaging and before publishing, because a full disk on this machine surfaces as `ld:
+    cc failed` or an `ENOSPC` in a query-cache write and reads like a toolchain bug — 0.28.0 took `target/`
+    to 23 GiB.
+
+    '
+  files: []
+  evidence: []
