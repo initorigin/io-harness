@@ -131,18 +131,25 @@ fn schema(db: &Path) -> Vec<String> {
     sql
 }
 
-/// The objects 0.25.0 adds, and the only ones any comparison below may find on
-/// the new side.
+/// The objects added since 0.22.0, and the only ones any comparison below may find
+/// on the new side.
 ///
 /// Named individually rather than matched by prefix. A prefix rule would quietly
 /// absorb the next table someone adds, and absorbing the next one is precisely
 /// what these tests exist to prevent — the point is not that the schema may grow,
 /// it is that it may grow only by what a release documented.
+///
+/// The first four are 0.25.0's process handles. `snapshots` and its index are
+/// 0.28.0's restore points, one row per file per run: a new table, so
+/// `CHECKPOINT_FORMAT` stays 7 and a 0.22.0 binary opens a store this release has
+/// written without ever querying it. The changelog says so under Added.
 const ADDED_SINCE_0_22_0: &[&str] = &[
     "process_handles",
     "process_handles_run",
     "handle_output",
     "handle_output_run",
+    "snapshots",
+    "snapshots_run",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].

@@ -7,7 +7,7 @@ tasks:
     why_required: A hook filter names an event by its wire tag, so an incomplete census is a filter
       an operator writes and that silently never fires. Every later task in this release depends on
       the list being true.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -25,13 +25,23 @@ tasks:
         no.
     files:
       - src/observe.rs
-    evidence: []
+    evidence:
+      - >
+        `observe::tests::event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+        reads `pub enum EventKind` out of `src/observe.rs` and asserts `EVENT_NAMES` names every
+        variant, with the helper run against a list with one entry removed as the control that it
+        can report an omission at all.
+      - >
+        `observe::tests::every_kind_produces_one_of_every_tag_and_no_others` asserts the sample
+        set's serialized tags **equal** `EVENT_NAMES`, which is the assertion `src/observe.rs:808`
+        has been missing since 0.21.0. `TodoWrote`, `QuestionAsked` and `QuestionAnswered` now
+        round-trip for the first time.
 
   - id: US-IO-HARNESS-0.28.0-T02
     summary: "`[[hook]]` in the file format, a Hooks observer, the append action, and the `on` filter."
     why_required: Without it there is no way to shape a run from the file, which is the release's
       headline claim and the half the fallback scope keeps.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.28.0-T01]
     acceptance_criteria:
       - >
@@ -56,14 +66,24 @@ tasks:
       - src/config.rs
       - src/observe.rs
       - tests/hooks.rs
-    evidence: []
+    evidence:
+      - >
+        `tests/hooks.rs::f1_a_hook_fires_on_the_events_it_names_and_on_no_others` drives a real
+        `run_with_observed` with three hook tables, teeing the run's own event stream beside them:
+        the filtered hook received exactly the two tags it named, the unfiltered one's set is
+        asserted **equal** to the run's, and the one that matched nothing left an empty file rather
+        than no file.
+      - >
+        `tests/hooks.rs::f2_an_event_this_crate_does_not_emit_is_refused_naming_it` plus
+        `hooks::tests::every_event_the_crate_emits_is_a_name_a_hook_may_use`, which is the control
+        that a rule written against a hand-typed subset would fail.
 
   - id: US-IO-HARNESS-0.28.0-T03
     summary: The run action — a fixed argv with the event on stdin, bounded by timeout_ms, with
       on_failure deciding whether a failure cancels.
     why_required: A notification, a formatter and a local policy check are all this one action; the
       contract's outcome names three of the four uses and each is a `run` hook.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.28.0-T02]
     acceptance_criteria:
       - >
@@ -85,14 +105,25 @@ tasks:
     files:
       - src/hooks.rs
       - tests/hooks.rs
-    evidence: []
+    evidence:
+      - >
+        `tests/hooks.rs::f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin` — the
+        child creates a file whose name carries `;` and `&&`, which proves the argv element arrived
+        intact, and its contents parse as the JSON of the event that fired.
+      - >
+        `tests/hooks.rs::f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure`,
+        with the control that the same shape inside its timeout completes and does not stop the run
+        — so "bounded" is not satisfied by an implementation that kills everything.
+      - >
+        `tests/hooks.rs::f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to`, with
+        the byte-identical hook without `on_failure` reaching its own ending as the control.
 
   - id: US-IO-HARNESS-0.28.0-T04
     summary: Refuse the whole `[[hook]]` array in the project scope, inside a profile too, and add
       the table's strictness and EVERY_KEY obligations.
     why_required: A hook that runs an argv is the `${cmd:}` primitive arriving one release later.
       Shipping the mechanism without the rule that bounds it would make 0.27.0's boundary worthless.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.28.0-T03]
     acceptance_criteria:
       - >
@@ -117,13 +148,25 @@ tasks:
       - src/config.rs
       - src/hooks.rs
       - tests/config.rs
-    evidence: []
+    evidence:
+      - >
+        `tests/config.rs::a_project_scoped_file_may_not_declare_hooks_and_a_local_one_may` refuses
+        both actions and a hook hidden in a `[profile]`, with two controls: the byte-identical
+        table in `io.local.toml` loads and produces a working hook, and an unrelated key in the
+        same project file still loads — so the test cannot pass on an implementation that refused
+        `io.toml` wholesale.
+      - >
+        `EVERY_KEY` gains two hook tables covering all five keys and
+        `f7_every_key_reaches_a_typed_field` asserts `on`, `append`, `run` and `on_failure` each
+        land; the twin control removes `on` and asserts the filter visibly falls back to every
+        event. `an_unknown_key_inside_a_hook_table_is_rejected_naming_it` covers strictness, both
+        the no-action and the two-action errors, and an unknown event name.
 
   - id: US-IO-HARNESS-0.28.0-T05
     summary: The snapshots table, an honest pre-write read, and rewind with its four answers.
     why_required: Without it a file the agent changed cannot be put back, which is the second half
       of the outcome sentence.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.28.0-T01]
     acceptance_criteria:
       - >
@@ -141,14 +184,24 @@ tasks:
       - src/run.rs
       - src/lib.rs
       - tests/rewind.rs
-    evidence: []
+    evidence:
+      - >
+        `tests/rewind.rs::a_file_the_run_rewrote_is_put_back_and_a_file_it_created_is_removed`,
+        driven through a real run. Three controls, each named:
+        `a_path_the_run_never_wrote_is_not_recorded_and_is_left_alone` asserts the bytes rather
+        than the return value; `a_second_edit_does_not_move_the_restore_point`;
+        `contents_that_were_not_kept_are_reported_and_the_file_is_never_truncated`, over both a
+        non-UTF-8 file and one past the 1 MiB cap.
+      - >
+        `cargo test --test edit_file --test edit_tool --test accounting` unchanged, which is the
+        property the replaced pre-write read could have broken.
 
   - id: US-IO-HARNESS-0.28.0-T06
     summary: Prove a rewind survives a crash and a resume, and that a store keeps CHECKPOINT_FORMAT
       at 7.
     why_required: An in-memory restore point passes every assertion in F7. This is the class of
       defect 0.12.0 and 0.25.0 were both caught by, and Trigger A is written against it.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.28.0-T05]
     acceptance_criteria:
       - >
@@ -167,14 +220,27 @@ tasks:
         to hold. Proven by the existing cross-version suite passing unchanged, not by argument.
     files:
       - tests/rewind.rs
-    evidence: []
+    evidence:
+      - >
+        `tests/rewind.rs::a_restore_point_survives_the_process_that_wrote_it` asserts through a
+        `Store` dropped and reopened at the same path, because an in-memory restore point passes
+        every assertion in F7.
+      - >
+        `a_resume_rewinds_under_the_run_id_the_snapshots_were_written_against`. The premise was
+        checked before the table was written: every `resume*` form takes `run_id` as a parameter
+        and the only two `Store::start_run` calls in the crate are on the start path, so a resume
+        structurally cannot mint a new id. The control is
+        `another_runs_restore_point_is_not_reachable_from_this_run`.
+      - >
+        `CHECKPOINT_FORMAT` stays 7 and `cargo test --test cross_version --test checkpoint` passes
+        unchanged, 18 tests.
 
   - id: US-IO-HARNESS-0.28.0-T07
     summary: Every documentation surface — the hooks guide page and its wiring, the configuration
       and durable-runs sections, CONTRACT, public-api.txt and the changelog.
     why_required: Four of this repository's tests fail on a documentation surface that is added
       without being wired in, and a public name without a worked example fails a fifth.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.28.0-T04, US-IO-HARNESS-0.28.0-T06]
     acceptance_criteria:
       - >
@@ -215,14 +281,32 @@ tasks:
       - tests/guide_pages.rs
       - README.md
       - CHANGELOG.md
-    evidence: []
+    evidence:
+      - >
+        `docs/guide/hooks.md` written from `src/hooks.rs` rather than from the contract, wired into
+        `tests/guide_pages.rs::GUIDES` with `limits_block: true`, `docs/CAPABILITIES.md` and the
+        README guide table. Its limits block carries six, not five: hooks are not accumulated
+        across scopes, which the source shows and the plan had missed.
+      - >
+        `docs/CONTRACT.md` gains "What a lifecycle hook is, and is not" and "What `rewind` puts
+        back, and what it cannot", and names `[[hook]]` as the third scope-dependent refusal beside
+        `${cmd:}` and the four widening keys. Its stale "110 items" count is corrected to 145.
+      - >
+        `docs/guide/configuration.md` gains a `### [[hook]]` section and two limits;
+        `docs/guide/durable-runs.md` gains "Putting a file back".
+        `docs/public-api.txt` hand-edited in sorted position for `Hooks`, `Rewind` and `rewind`.
+        `CHANGELOG.md` opens with prose and carries Added and Fixed; nothing in this release breaks.
+      - >
+        Writing the page from the source caught two stale doc comments in `src/hooks.rs`, which
+        said an `append` path resolves against the declaring file's directory when it resolves
+        against the discovery root. Corrected in the source.
 
   - id: US-IO-HARNESS-0.28.0-T08
     summary: The release gates — the full suite, no new dependency, a clean doc, fmt and clippy, and
       a verified package.
     why_required: Every non-functional and operational claim in the contract is checked here or
       nowhere, and a published crate cannot be recalled.
-    status: todo
+    status: done
     depends_on: [US-IO-HARNESS-0.28.0-T07]
     acceptance_criteria:
       - >
@@ -250,4 +334,6 @@ tasks:
         surfaces as a linker error and reads like a toolchain bug.
     files:
       - Cargo.toml
-    evidence: []
+    evidence:
+      - >
+        Recorded at completion.
