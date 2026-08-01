@@ -373,8 +373,76 @@ pub(crate) fn unix_now() -> u64 {
         .as_secs()
 }
 
+/// Today, UTC, as `YYYY-MM-DD` (0.29.0).
+///
+/// For [`PriceTable::as_of`](crate::pricing::PriceTable::as_of), which wants a
+/// date a human reads and this crate never parses back. Written here rather than
+/// taken from a date crate because this release adds no dependency, and computed
+/// with the civil-from-days algorithm rather than approximated — a date that is
+/// wrong one day in four years is worse than no date, since the whole point of it
+/// is telling an operator how stale a price is.
+pub(crate) fn today_utc() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Days since 1970-01-01 to a civil `(year, month, day)`.
+///
+/// Howard Hinnant's `civil_from_days`, which is exact for every date in range
+/// including leap years and century rules. Taken whole rather than reinvented:
+/// the leap-year edge cases are precisely what a hand-rolled version gets wrong.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 mod tests {
+    /// The civil-from-days conversion, on the dates a hand-rolled version gets
+    /// wrong: the epoch, both kinds of century boundary, and a leap day.
+    #[test]
+    fn the_civil_date_is_exact_across_leap_years_and_century_rules() {
+        use super::civil_from_days;
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(1), (1970, 1, 2));
+        // 2000 is a leap year (divisible by 400); 1900 was not (by 100).
+        assert_eq!(civil_from_days(11_016), (2000, 2, 29));
+        assert_eq!(civil_from_days(11_017), (2000, 3, 1));
+        // 2100 is not a leap year: 28 February is followed by 1 March.
+        assert_eq!(civil_from_days(47_540), (2100, 2, 28));
+        assert_eq!(civil_from_days(47_541), (2100, 3, 1));
+        assert_eq!(civil_from_days(20_454), (2026, 1, 1));
+    }
+
+    #[test]
+    fn today_is_a_well_formed_iso_date() {
+        let today = super::today_utc();
+        assert_eq!(today.len(), 10, "{today}");
+        let parts: Vec<&str> = today.split('-').collect();
+        assert_eq!(parts.len(), 3);
+        assert!(parts[0].parse::<u32>().unwrap() >= 2026, "{today}");
+        assert!(
+            (1..=12).contains(&parts[1].parse::<u32>().unwrap()),
+            "{today}"
+        );
+        assert!(
+            (1..=31).contains(&parts[2].parse::<u32>().unwrap()),
+            "{today}"
+        );
+    }
+
     use super::*;
 
     #[test]

@@ -5,6 +5,8 @@
 //! Anthropic, and OpenAI are implementation details behind the trait.
 
 pub mod anthropic;
+pub mod catalog;
+pub mod compatible;
 pub mod openai;
 pub(crate) mod openai_wire;
 pub mod openrouter;
@@ -13,6 +15,8 @@ pub mod fallback;
 pub mod record;
 pub mod replay;
 pub use anthropic::Anthropic;
+pub use catalog::Reference;
+pub use compatible::{Auth, Compatible};
 pub use fallback::Fallback;
 pub use openai::OpenAi;
 pub use openrouter::OpenRouter;
@@ -599,6 +603,110 @@ pub struct CompletionResponse {
     pub server_tools: Vec<crate::web::ServerToolCall>,
 }
 
+/// Where a [`ModelInfo`]'s price came from (0.29.0).
+///
+/// A price with no recoverable origin is what makes an invoice unarguable, so
+/// every price this crate reports says which of these it is. The distinction is
+/// not pedantry: a reference price is what an aggregator charges to serve a
+/// model, which tracks the vendor's own rate closely and is not identical to it.
+///
+/// ```
+/// use io_harness::provider::PriceSource;
+///
+/// // What an operator needs to be able to ask of any figure they are shown.
+/// fn caveat(source: &PriceSource) -> String {
+///     match source {
+///         PriceSource::Vendor => "the vendor's own published rate".into(),
+///         PriceSource::Reference(host) => format!("{host}'s rate to serve this model, not the vendor's"),
+///         // `#[non_exhaustive]`: a later release may name a third origin, and a
+///         // consumer that matched exhaustively would break on it.
+///         _ => "an origin this build does not know".into(),
+///     }
+/// }
+///
+/// assert_eq!(caveat(&PriceSource::Vendor), "the vendor's own published rate");
+/// assert!(caveat(&PriceSource::Reference("openrouter.ai".into())).contains("not the vendor's"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[non_exhaustive]
+pub enum PriceSource {
+    /// The vendor's own catalogue stated this price for its own model.
+    Vendor,
+    /// Taken from a reference catalogue at this host, because the vendor
+    /// published none. Close to the vendor's rate and not the same number.
+    Reference(String),
+}
+
+/// One model a [`Provider`] can run, as the vendor described it (0.29.0).
+///
+/// Every field but `id` is an `Option` or an empty `Vec`, and the reason is the
+/// same throughout: **`None` means the vendor did not say.** `GET /v1/models` is
+/// near-universal and returns *identifiers* — OpenAI, Anthropic, Groq, DeepSeek,
+/// Mistral, Fireworks and every local runtime return no cost data whatsoever —
+/// so a type that defaulted the unknown to zero would report a real spend as
+/// free. That is the confident wrong answer [`crate::pricing`] refuses to ship a
+/// built-in price list to avoid.
+///
+/// Construct with `..Default::default()`: fields are added in minor releases,
+/// and an exhaustive struct literal is what a widening breaks.
+///
+/// ```
+/// use io_harness::pricing::Price;
+/// use io_harness::provider::{ModelInfo, PriceSource};
+///
+/// // A local runtime is the one place zero is *true* rather than unknown, so it
+/// // is recorded as a stated zero — priced, by the vendor, at nothing.
+/// let local = ModelInfo {
+///     id: "llama3.2".into(),
+///     price: Some(Price::ZERO),
+///     price_source: Some(PriceSource::Vendor),
+///     ..Default::default()
+/// };
+///
+/// // A hosted vendor that publishes identifiers and nothing else.
+/// let unknown = ModelInfo { id: "some-hosted-model".into(), ..Default::default() };
+///
+/// // Both read as "no cost" if you only look at the number, and they are
+/// // completely different facts. This is the distinction the type exists for.
+/// assert_eq!(local.price, Some(Price::ZERO));
+/// assert_eq!(unknown.price, None);
+/// assert!(unknown.price_source.is_none(), "nothing was stated, so nothing is attributed");
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ModelInfo {
+    /// The model id, spelled the way this provider's own API spells it — which
+    /// is what [`CompletionRequest::model`] takes and what
+    /// [`CompletionResponse::model`] reports back.
+    pub id: String,
+    /// Maximum context, in tokens, or `None` where the vendor did not state one.
+    pub context_length: Option<u64>,
+    /// Maximum tokens the model will generate in one completion, or `None`.
+    /// Distinct from [`ModelInfo::context_length`]: most vendors cap output far
+    /// below the window.
+    pub max_output_tokens: Option<u64>,
+    /// Whether the model accepts image input. `None` is "the vendor did not
+    /// say", which is not the same as `Some(false)`.
+    pub accepts_images: Option<bool>,
+    /// Whether the model can be offered tools. `None` is "the vendor did not
+    /// say" — and note that a vendor saying yes is not a promise the *server*
+    /// was configured for it: see the contract on vLLM and SGLang.
+    pub accepts_tools: Option<bool>,
+    /// The base rate, or `None` where nothing was stated. **Never
+    /// [`Price::ZERO`](crate::pricing::Price::ZERO) to mean unknown** — an
+    /// unpriced call is counted by
+    /// [`Spend::unpriced_calls`](crate::pricing::Spend::unpriced_calls), which is
+    /// the honest surface for the gap.
+    pub price: Option<crate::pricing::Price>,
+    /// Rates that replace [`ModelInfo::price`] once the prompt is long enough,
+    /// lowest threshold first. Empty for a model that prices flat, which is most
+    /// of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub price_tiers: Vec<crate::pricing::PriceTier>,
+    /// Where [`ModelInfo::price`] came from. `Some` exactly when `price` is
+    /// `Some`: a number this crate reports always says its own origin.
+    pub price_source: Option<PriceSource>,
+}
+
 /// Anything that can turn a [`CompletionRequest`] into a [`CompletionResponse`].
 ///
 /// Implemented by [`OpenRouter`], [`Anthropic`], and [`OpenAi`]; tests supply
@@ -727,6 +835,46 @@ pub trait Provider {
         }
     }
 
+    /// What this provider can run, as its own catalogue describes it (0.29.0).
+    ///
+    /// **Defaulted to an empty list, and the default is the point.** This trait
+    /// is the one extension point the crate has — the doc example above ships a
+    /// user-written `impl Provider` — so adding a *required* method here would
+    /// break every out-of-tree implementation. An empty catalogue is also the
+    /// honest answer for a provider that has no such endpoint, which includes
+    /// every mock in this repository's own test suite.
+    ///
+    /// It is a live call. Vendors change what they serve, so this asks rather
+    /// than reads a table compiled into the crate — the same argument
+    /// [`crate::pricing`] makes for shipping no prices.
+    ///
+    /// What comes back is uneven by nature: nearly every vendor returns model
+    /// *identifiers*, and few return cost. See [`ModelInfo`] for what `None`
+    /// means, and [`Reference`] for filling the gap from a catalogue that does
+    /// publish prices.
+    ///
+    /// ```
+    /// use io_harness::{CompletionRequest, CompletionResponse, Provider, Result};
+    ///
+    /// // The minimal out-of-tree implementer, written before 0.29.0 existed. It
+    /// // overrides nothing but `complete` and it still compiles — which is the
+    /// // property this method's default exists to preserve.
+    /// struct Mine;
+    /// impl Provider for Mine {
+    ///     async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse> {
+    ///         Ok(CompletionResponse::default())
+    ///     }
+    /// }
+    ///
+    /// # async fn demo() -> Result<()> {
+    /// // An empty catalogue, not an error: this provider has nothing to ask.
+    /// assert!(Mine.models().await?.is_empty());
+    /// # Ok(()) }
+    /// ```
+    fn models(&self) -> impl std::future::Future<Output = Result<Vec<ModelInfo>>> + Send {
+        async { Ok(Vec::new()) }
+    }
+
     /// A short label recorded in the run's trace so an audit shows which
     /// provider ran. Defaults to `"provider"` so existing implementers keep
     /// compiling; the built-in providers override it.
@@ -794,7 +942,7 @@ pub trait Provider {
 /// vendor's URL, and a test that mocked the error instead of serving it would not
 /// exercise the status parsing, the header parsing, or the deadline.
 #[cfg(test)]
-mod failures {
+pub(crate) mod failures {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::time::Duration;
@@ -805,13 +953,17 @@ mod failures {
 
     /// A local HTTP server that answers every connection with one canned raw
     /// response, then closes.
-    fn serve(response: String) -> String {
+    ///
+    /// `pub(crate)` since 0.29.0 so `compatible.rs` tests the new provider
+    /// against a real socket the way the three original ones already are,
+    /// rather than growing a second harness beside this one.
+    pub(crate) fn serve(response: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/v1", listener.local_addr().unwrap());
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                drain_request(&mut stream);
+                let _ = drain_request(&mut stream);
                 let _ = stream.write_all(response.as_bytes());
                 let _ = stream.flush();
             }
@@ -822,7 +974,12 @@ mod failures {
     /// Read the request head and its body, so the client is never answered before
     /// its own write has been consumed — an unread body can surface as a reset
     /// instead of the status under test.
-    fn drain_request(stream: &mut std::net::TcpStream) {
+    ///
+    /// Returns the head verbatim, which is what `serve_recording` asserts on. The
+    /// lowercased copy is for parsing the length only: HTTP header names are
+    /// case-insensitive, but a test asking "was a bearer token sent" wants the
+    /// bytes as they were written.
+    fn drain_request(stream: &mut std::net::TcpStream) -> String {
         let mut seen = Vec::new();
         let mut byte = [0u8; 1];
         while stream.read(&mut byte).unwrap_or(0) == 1 {
@@ -831,14 +988,16 @@ mod failures {
                 break;
             }
         }
-        let head = String::from_utf8_lossy(&seen).to_ascii_lowercase();
+        let head = String::from_utf8_lossy(&seen).into_owned();
         let len: usize = head
+            .to_ascii_lowercase()
             .lines()
             .find_map(|l| l.strip_prefix("content-length:"))
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(0);
         let mut body = vec![0u8; len];
         let _ = stream.read_exact(&mut body);
+        head
     }
 
     /// A status response with `extra` header lines (each already `\r\n`-free).
@@ -854,8 +1013,45 @@ mod failures {
 
     /// A 200 whose body is `events`, delimited by the close rather than a length —
     /// what a real streamed response looks like.
-    fn stream_response(events: &str) -> String {
+    pub(crate) fn stream_response(events: &str) -> String {
         format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{events}")
+    }
+
+    /// A 200 carrying one JSON document, length-delimited (0.29.0).
+    ///
+    /// The catalogue endpoints are plain request/response rather than SSE, so
+    /// they need the one thing `stream_response` deliberately does not do: state
+    /// a `Content-Length`.
+    pub(crate) fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A local server that records the head of every request it was sent, so a
+    /// test can assert on what actually went onto the wire — the auth header, the
+    /// path — rather than on what the constructor stored (0.29.0).
+    ///
+    /// Returns the URL and the shared log. A server nobody connected to leaves
+    /// the log empty, which is how "no second request was made" is asserted.
+    pub(crate) fn serve_recording(
+        response: String,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let head = drain_request(&mut stream);
+                sink.lock().unwrap().push(head);
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        (url, seen)
     }
 
     #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
@@ -1090,6 +1286,37 @@ mod failures {
                 );
             }
         }
+    }
+}
+
+/// F3 — the catalogue method is defaulted, so the crate's one extension point
+/// stays open.
+#[cfg(test)]
+mod catalogue_default {
+    use super::*;
+
+    /// Exactly the shape `Provider`'s own doc example ships, and exactly what an
+    /// out-of-tree implementation written before 0.29.0 looks like: `complete`
+    /// and nothing else. If `models()` were ever made required, this stops
+    /// compiling — which is the break this test exists to prevent, and it is a
+    /// compile-time assertion as much as a runtime one.
+    struct WrittenBefore0_29_0;
+
+    impl Provider for WrittenBefore0_29_0 {
+        async fn complete(&self, _r: CompletionRequest) -> Result<CompletionResponse> {
+            Ok(CompletionResponse::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_overrides_nothing_reports_an_empty_catalogue() {
+        // Empty and `Ok`, not an error: a provider with no catalogue endpoint has
+        // nothing to say, and saying nothing is not a failure. The negative
+        // control is `compatible::tests`, where a provider pointed at a real
+        // catalogue body returns a non-empty list — without it this passes
+        // against an implementation whose `models()` is empty for everyone.
+        let models = WrittenBefore0_29_0.models().await.unwrap();
+        assert!(models.is_empty());
     }
 }
 

@@ -71,6 +71,13 @@ const GUIDES: &[(&str, bool)] = &[
     // the project scope without that making a cloned repository safe, and it grants
     // nothing — it cannot approve or deny an action, and its output is discarded.
     ("hooks.md", true),
+    // 0.29.0. It carries a limits block because twenty-one vendors behind one type
+    // is a claim that has to state what it is not: one wire and no per-vendor
+    // rewriting, a vendor catalogue that returns identifiers and no prices, a
+    // reference price that is the aggregator's rather than the vendor's — and vLLM
+    // and SGLang emitting no tool calls at all unless the server was started for
+    // them, which is the failure that reports nothing and errors nowhere.
+    ("providers.md", true),
 ];
 
 fn guide_dir() -> PathBuf {

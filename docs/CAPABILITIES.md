@@ -33,6 +33,7 @@ the limits that capability actually has.
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
+| [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, and what `Provider::models()` reports |
 
 ## The twelve pillars
 
@@ -57,8 +58,10 @@ it, not when a release merely touched it.
 
 ## Beyond the pillars
 
-- **Providers** — OpenRouter, Anthropic, OpenAI, over the crate's own HTTP+SSE
-  client, with fallback between them
+- **Providers** — OpenRouter, Anthropic and OpenAI, plus one `Compatible`
+  provider reaching any OpenAI-shaped endpoint and 21 vendor presets behind named
+  constructors — 13 hosted and 8 local runtimes — all over the crate's own
+  HTTP+SSE client, with fallback between them
 - **Provider-executed web search and fetch** — one `WebAccess` declaration each
   vendor translates into its own shape, with the sources cited recorded in the
   trace; the provider dials the URL, so the domain filter is the vendor's

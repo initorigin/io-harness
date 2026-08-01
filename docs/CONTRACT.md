@@ -11,7 +11,7 @@ itself, and that is precisely when a dependent needs the explanation most.
 The public surface is everything re-exported from the crate root plus the items
 reachable through the public modules it names.
 
-The re-exported half — the 145 items a caller reaches as `io_harness::Thing` —
+The re-exported half — the 150 items a caller reaches as `io_harness::Thing` —
 is enumerated in [public-api.txt](public-api.txt), which a test compares against
 the live crate on every run. That is the surface the deprecation cycle below
 covers and the surface every item of which carries a worked example.
@@ -166,6 +166,176 @@ well, so the cap is weaker on Windows for a kernel-heavy workload. And
 `JOB_OBJECT_LIMIT_PROCESS_MEMORY` makes an allocation *fail* rather than
 terminating the process: a payload over the cap is never allowed to hold the
 memory, and typically dies of its own failed allocation rather than being killed.
+
+## What `Compatible` does and does not translate (0.29.0)
+
+`Compatible` reaches any endpoint that speaks the OpenAI chat/completions format
+— twenty-one of them behind named presets, from hosted vendors to a runtime on
+your own laptop. What it is **not** is a compatibility layer.
+
+This crate sends **one wire**. There is no per-vendor request rewriting, and
+there is deliberately not going to be: the whole structural claim of the
+provider layer is that there is one `openai_wire` and not twenty, and a
+vendor-shaped branch inside the shared body builder is how that stops being
+true. Every vendor below diverges from the OpenAI wire somewhere. Those
+divergences are stated here rather than papered over, because a boundary the
+caller believes in and nobody enforces is worse than none.
+
+Two of them the crate absorbs for free, and they are why the rest are
+survivable: `finish_reason` is parsed as an open `String` and recorded verbatim,
+and no response type uses `deny_unknown_fields`. So a vendor inventing a stop
+reason or adding a field costs nothing.
+
+### The one that fails silently — vLLM and SGLang make no tool calls
+
+**vLLM and SGLang emit no tool calls at all unless the server was started with a
+tool-call parser flag, and a client cannot set it.**
+
+Point `Compatible::vllm(..)` or `Compatible::sglang(..)` at a server started
+without it and nothing errors. The request is accepted, the model answers in
+prose, `tool_calls` is empty, and the run simply never uses a tool — it looks
+exactly like a model that chose to talk. There is no status code, no warning and
+nothing in the trace to distinguish it from a model that declined to act.
+
+vLLM needs `--enable-auto-tool-choice` together with a `--tool-call-parser`
+naming the parser for the model being served (`--tool-parser-plugin` for a
+custom one). SGLang needs its equivalent `--tool-call-parser`. Both are server
+launch arguments. This crate cannot supply them, cannot detect them, and will
+not guess: if an agent against a local vLLM never calls a tool, check how the
+server was started before anything else.
+
+### The rest, per vendor
+
+**Zhipu** returns `finish_reason` values outside the OpenAI set — `sensitive`,
+`network_error` and `model_context_window_exceeded` among them. They reach
+`CompletionResponse::finish_reason` verbatim and the trace records them as
+given. Nothing normalises them into `stop` or `length`, because a vendor's own
+word for why it stopped is what its documentation explains.
+
+**Groq** returns **HTTP 400** on a request carrying `messages[].name`. This crate
+does not send that field, so it does not arise from the harness itself — it is
+stated because a caller building a request by hand around this provider will
+meet it.
+
+**Mistral** requires tool-call ids matching `^[a-zA-Z0-9]{9}$` — exactly nine
+alphanumeric characters — and names its JSON-schema field `schema_definition`
+rather than `schema`. A tool-call id this crate did not originate is echoed as
+received.
+
+**DeepSeek** returns **HTTP 400** if `reasoning_content` is dropped from a
+request that carries tools. Its own documentation is explicit: between two user
+messages, when the model performed a tool call, the intermediate assistant's
+`reasoning_content` *must* be passed back in every subsequent turn. This crate
+sends one flattened user turn rather than a growing message array, so it does
+not currently construct the shape that triggers this — but a caller assembling
+multi-turn tool-calling traffic against DeepSeek must replay it.
+
+**Ollama** accepts `tool_choice` and silently ignores it. It is listed as
+unimplemented in Ollama's own OpenAI-compatibility notes. A request that pins a
+particular tool is accepted and the model chooses freely anyway.
+
+**Perplexity** serves no `/models` endpoint at all — its base has no `/v1`
+segment and `GET /models` is a 404. `Compatible::perplexity(..).models()`
+therefore returns the vendor's 404 as a provider error rather than an empty
+catalogue, because "this vendor has no catalogue" and "this vendor serves no
+models" are different facts and reporting the second would be a lie.
+
+**What this crate deliberately does not do about any of it.** It does not strip
+`messages[].name` for Groq, does not regenerate a tool-call id for Mistral, and
+does not replay `reasoning_content` for DeepSeek. Each would be a vendor-shaped
+branch inside the one body builder every vendor shares, and one such branch is
+how twenty-one endpoints become twenty-one wires. Any one of them becomes a
+change on evidence — when a consumer actually meets it — rather than on a list
+somebody read.
+
+**None of the above is a compatibility matrix.** Each is an observation of a
+vendor's behaviour at the time of writing, not a support table this crate
+promises to maintain, re-test each release, or keep current as twenty-one
+endpoints it does not control change underneath it. There is deliberately no
+such table here, because a table reads as an ongoing guarantee and this crate
+cannot keep one.
+
+### Base URLs are not uniformly shaped
+
+The preset carries the whole prefix the vendor documents, and six of the
+twenty-one are not a host plus `/v1`:
+
+| Vendor | Base |
+| --- | --- |
+| Groq | `https://api.groq.com/openai/v1` |
+| Zhipu | `https://open.bigmodel.cn/api/paas/v4` |
+| Qwen (DashScope international) | `https://dashscope-intl.aliyuncs.com/compatible-mode/v1` |
+| Gemini (OpenAI-compatibility) | `https://generativelanguage.googleapis.com/v1beta/openai` |
+| Fireworks | `https://api.fireworks.ai/inference/v1` |
+| Perplexity | `https://api.perplexity.ai` (no path segment at all) |
+
+`/chat/completions` and `/models` are appended to that base. A field that
+assumed a scheme and a host would silently drop the rest and 404 against every
+row above.
+
+**A preset's base URL is a default this crate ships, not a promise the vendor
+made.** Each was correct on the day this release was cut, and the vendor is under
+no obligation to keep it so. `base_url` exists beside `preset` for exactly that
+reason: a vendor that moves its endpoint is one line in the operator's own file,
+today, rather than a release of this crate. The preset list is a convenience over
+the general key and never a gate in front of it.
+
+### What is not reachable here
+
+**AWS Bedrock**, **Google Vertex** and **Azure OpenAI** are not. Bedrock's SigV4
+signing and Vertex's service-account JWT are credential-minting protocols rather
+than a header, and Gemini's *native* `interactions` API is a different wire
+shape — the preset above is its OpenAI-compatibility endpoint and nothing more.
+Bedrock and Vertex are nonetheless reachable today by an application that mints
+a bearer token itself and passes it as the key, which is where OAuth has always
+belonged in this crate. Azure is excluded on demand rather than on cost: it
+needs one `Auth` variant for its `api-key` header plus a deployment name in the
+path and an `api-version` query parameter, and `Auth` is `#[non_exhaustive]`
+precisely so it can arrive later without a break.
+
+### What a price means (0.29.0)
+
+`ModelInfo::price` is `Option<Price>` and **`None` means the vendor did not
+say** — it is never `Price::ZERO`. Nearly every vendor's `/models` returns
+identifiers and no cost data at all, so a type that defaulted the unknown to
+zero would report real spend as free. A local runtime is the one place zero is
+*true*, and it is recorded as a stated zero with `PriceSource::Vendor`.
+
+A price taken from the reference catalogue is marked
+`PriceSource::Reference(host)` and **is not the vendor's price** — it is what
+that aggregator charges to serve the model, which tracks the vendor's rate and
+is not identical to it. Matching is an exact slug or one documented
+normalisation (drop a single leading `vendor/` segment, case-insensitively) and
+nothing else; a miss stays `None` and an ambiguous normalisation resolves to
+nothing, because a wrong match is a wrong invoice and is worse than the gap it
+filled. `Spend::unpriced_calls` is where the gap surfaces.
+
+The reference lookup is **off by default and dials a host the caller did not
+name**. When `Compatible::with_reference_prices` is set, that host appears in
+`Provider::endpoints()` and the run authorises it against the policy's
+`Act::Net` rules before the first step — a policy that denies it makes the run
+**refuse**, not silently skip the lookup.
+
+**A model may have more than one price.** Many vendors charge a higher rate once
+a prompt passes a length threshold, and the step is usually a doubling: at the
+time of writing, 44 of the 336 models the default reference catalogue serves
+carry such tiers, with floors at 32k, 128k, 200k, 256k and 272k prompt tokens. A
+long agentic run is exactly what crosses them. `PriceTable` carries
+`PriceTier`s, the highest floor a prompt reaches prices the **whole** request —
+which is how the vendors bill it, not a marginal split — and a table with no
+tiers registered prices exactly as it did before they existed.
+
+**`Fallback::models()` returns an empty list.** Which of two vendors' catalogues
+a chain should report has no right answer, so it reports none rather than
+picking.
+
+**Every addition in 0.29.0 is additive.** `Provider` gains one method and
+requires none: `models()` is defaulted to an empty catalogue, so an
+implementation written before this release compiles unchanged and reports having
+nothing to list. `ProviderSpec` gains a fourth variant behind the
+`#[non_exhaustive]` 0.27.0 put on it for exactly this, so a caller who wrote the
+`_ =>` arm that attribute asks for is untouched. Nothing here breaks. See the
+[configuration guide](guide/configuration.md).
 
 ## What the `shell` tool will and will not run (0.24.0)
 
@@ -370,7 +540,7 @@ the runs, not a second execution path:
   it. The committed step is the settled fact.
 - **A `Provider` that does not override `complete_streaming` streams nothing.**
   The default emits the finished text as one delta, which keeps a consumer
-  rendering, and is not incremental. The three built-in providers and `Fallback`
+  rendering, and is not incremental. The four built-in providers and `Fallback`
   override it.
 - **Steering is text, not authorization.** An operator's mid-turn message reaches
   the model exactly as a `TaskContract` constraint does, and every tool call it
@@ -386,7 +556,7 @@ the runs, not a second execution path:
   ceilings, so `max_steps` on one turn does not bound the next. A conversation-wide
   limit is the caller's to enforce, per turn, from `Store::run_summary`.
 
-**What configuration is, and is not (0.19.0, extended in 0.27.0 and 0.28.0).** `io.toml` is
+**What configuration is, and is not (0.19.0, extended in 0.27.0, 0.28.0 and 0.29.0).** `io.toml` is
 a projection onto the typed API and never a second path into the run loop:
 
 - **The typed API is the authority.** Every key lands in a type this crate
@@ -396,7 +566,11 @@ a projection onto the typed API and never a second path into the run loop:
   is the same rule and not an exception to it: it yields a **`ProviderSpec`**, a
   value the application constructs a provider from, never a provider. `Provider::complete`
   returns `impl Future`, so the trait is not dyn-compatible and there is no
-  `Box<dyn Provider>` for an accessor to return.
+  `Box<dyn Provider>` for an accessor to return. `kind = "compatible"` (0.29.0) is
+  a fourth `ProviderSpec` variant and not a fourth mechanism — it names an
+  endpoint where the other three name a vendor, and it arrives behind the
+  `#[non_exhaustive]` 0.27.0 put on that enum for exactly this, so a caller who
+  wrote the `_ =>` arm is unbroken.
 - **The file is read once, by the caller, before the run, and never again.**
   Nothing in this crate discovers a config on its own: `Config::discover` is the
   caller's own call. That is what makes the one guarantee here true — a config

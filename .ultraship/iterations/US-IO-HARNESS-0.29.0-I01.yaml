@@ -1,0 +1,128 @@
+id: US-IO-HARNESS-0.29.0-I01
+timestamp: 2026-08-01T20:10:00Z
+category:
+  - release-level
+  - implementation-level
+trigger: >
+  A price in the reference catalogue is not one number per model. Forty-four of the three hundred
+  and thirty-six models it serves carry a `pricing.overrides` array keyed by `min_prompt_tokens`,
+  and pricing a long run against the base row under-reports the spend by up to a factor of two on
+  exactly the models an agent harness reaches for.
+evidence:
+  - >
+    A live keyless `GET https://openrouter.ai/api/v1/models` from the release machine, parsed:
+    **44 of 336 models carry `pricing.overrides`**. Not an edge case and not a deprecated field.
+  - >
+    The magnitude is a doubling, on flagship long-context models. `google/gemini-2.5-pro` prices
+    `prompt` at `0.00000125` and its 200,000-token override at `0.0000025`.
+    `anthropic/claude-sonnet-4.5` goes `0.000003` to `0.000006` at the same floor. A 250,000-token
+    prompt priced against the base row reports half of what it cost.
+  - >
+    The selector is single and uniform. Every override object in all 44 models is keyed by
+    `min_prompt_tokens` and nothing else; the floors observed are 32000, 128000, 200000, 256000 and
+    272000; no model carries more than two tiers.
+  - >
+    The merge rule is well defined rather than assumed. **No override anywhere in the 44 introduces
+    a pricing key that its own base row lacks**, checked across every override object, so "a field
+    absent from the override keeps the base value" is total rather than a convention that happens to
+    hold today.
+  - >
+    A long agentic run is the case that crosses these floors. This crate's own context assembler
+    (0.10.0) targets a stated share of a token budget and `Containment::max_tokens` is routinely set
+    in the hundreds of thousands, so the tiered band is the operating range rather than an outlier.
+  - >
+    The gap is invisible from inside the release as contracted. F4 proves the decimal conversion is
+    exact and F6 proves provenance is carried; a per-token rate that is exactly converted, correctly
+    attributed, and taken from the wrong tier passes both.
+before:
+  scope:
+    - A reference catalogue parsed into `ModelInfo`, one `Price` per model
+    - '`Compatible::price_table()` filling the existing `PriceTable` from that catalogue'
+    - '`pricing::Price` needs no change; the five dimensions map one for one'
+  assumptions:
+    - >
+      A model has one price. The roadmap entry states "a vendor's pricing object maps onto those
+      five almost exactly", which is true of the object's *keys* and not of its cardinality — the
+      overrides array was not read when that sentence was written.
+  implementation: >
+    `PriceTable` holds one `Price` per model id and `cost_micros` reads it directly
+    (`src/pricing.rs:161`).
+change:
+  summary: >
+    Price tiers become part of the release. `PriceTable` gains a per-model list of prompt-length
+    tiers and `cost_micros` bills the whole request at the highest floor the prompt reaches, falling
+    back to the base row when none does. `pricing::Price` is not touched, so nothing breaks.
+
+    0.29.0 has not shipped, so this is a contract corrected before release rather than a change to a
+    published claim, and the consequence is `no-version-change`. It is additive to a public type set
+    with no consumers yet and touches no existing signature: `Price` keeps every field, keeps
+    `Copy`, and keeps `..Price::ZERO`, and a `PriceTable` with no tiers registered computes
+    byte-identically to 0.28.0.
+
+    Taken into this release rather than deferred for one reason: 0.29.0 is what makes the harness
+    fetch prices at all, and shipping a catalogue that fetches a real price and then applies the
+    wrong one creates the precise failure the release is built to prevent — a confident wrong number
+    an operator believes — in the same release that argues `None` is better than a guess. A wrong
+    tier is a wrong invoice by another route. It is also the cheapest it will ever be: `PriceTable`
+    has one shape today and one caller of `cost_micros`, so adding tiers once a consumer depends on
+    the flat lookup would be a migration rather than an addition.
+  added:
+    - >
+      **`PriceTier { min_prompt_tokens: u64, price: Price }`**, a new public type. `Copy`, two
+      fields, serde-round-tripping like every other value in `src/pricing.rs`.
+    - >
+      **`PriceTable::with_tiers(model, Vec<PriceTier>)`** beside the existing `with`, and
+      **`PriceTable::tiers(model)`** to read them back.
+    - >
+      **Tier selection in `cost_micros`** — the highest `min_prompt_tokens` less than or equal to
+      `usage.prompt_tokens` wins and its row prices the entire request; no floor matched means the
+      base row, which is what every existing table does and continues to do.
+    - >
+      **`ModelInfo::price_tiers: Vec<PriceTier>`**, empty for the 292 flat models, and the parser
+      that fills it — each override merged against the base at parse time so a stored tier is always
+      a complete `Price` rather than a sparse patch.
+    - >
+      **`[prices.models.<id>.tiers]` in the file format**, so an operator's hand-maintained table can
+      express a tier the same way the catalogue does.
+    - >
+      **F11**, a new functional criterion with named negative controls, covering selection at, below
+      and above a floor, two-tier ordering, and the sparse-override merge.
+  removed: []
+  deferred: []
+  replaced:
+    - >
+      The contract's "**No new price type.** `pricing::Price` already carries ... and the reference
+      catalogue's five pricing keys map onto them one for one" now reads that no *change* to `Price`
+      is needed and that the cardinality, not the dimensions, is what was missing.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.29.0
+  tasks:
+    - US-IO-HARNESS-0.29.0-T02
+    - US-IO-HARNESS-0.29.0-T04
+    - US-IO-HARNESS-0.29.0-T08
+    - US-IO-HARNESS-0.29.0-T10
+  dependencies: []
+  resource_effect: >
+    Small and contained. Roughly twenty-five lines in `src/pricing.rs` plus a table-driven test, one
+    parser branch in `src/provider/catalog.rs`, one optional key in `src/config.rs`, and one line in
+    `docs/public-api.txt` with its worked example. It adds no dependency and no store schema, so
+    NF2 and NF3 are unaffected. A new task T10 carries the `src/pricing.rs` half so the change is
+    reviewable on its own rather than buried inside the catalogue parser.
+versioning:
+  previous_target: 0.29.0
+  new_target: 0.29.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Requested by the owner in session on 2026-08-01, mid-development: "some models provide different
+    pricing for 200k context window and 1M context. can we research and manage this as well". The
+    research was performed against the live catalogue before the change was accepted, and the
+    magnitude and uniformity above are what justified taking it into this release rather than
+    deferring it.
+canonical_updates:
+  - products/io-harness/releases/0.29.0.yaml
+  - products/io-harness/execution/tasks.yaml

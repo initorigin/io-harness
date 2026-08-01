@@ -189,7 +189,7 @@ file omits is an explicit zero.
 
 ```toml
 [[provider]]                              # the first entry is the provider
-kind = "openrouter"                       # "openrouter" | "anthropic" | "openai"
+kind = "openrouter"                       # "openrouter" | "anthropic" | "openai" | "compatible"
 model = "anthropic/claude-sonnet-4"
 api_key = "${env:OPENROUTER_API_KEY}"     # optional: absent means the provider's own variable
 
@@ -221,6 +221,53 @@ release adds a variant.
 
 Unlike `[[policy.layers]]` and `[[agent]]`, the chain is **replaced** by a later
 scope rather than appended to. A half-appended fallback chain is not a chain.
+
+#### `kind = "compatible"` — any OpenAI-shaped endpoint (0.29.0)
+
+A fourth kind names an endpoint instead of a vendor: a base URL, an auth style, a
+key and a model are the whole of what an OpenAI-shaped API needs, so a hosted
+vendor nobody has heard of and a model running on this laptop are the same entry
+with different values.
+
+```toml
+[[provider]]
+kind = "compatible"
+model = "llama-3.3-70b-versatile"        # required
+preset = "groq"                          # exactly one of preset / base_url
+base_url = "http://localhost:8000/v1"    # exactly one of preset / base_url
+api_key = "${env:GROQ_API_KEY}"          # optional; omit for a local runtime
+auth = "bearer"                          # optional: "bearer" | "none"
+name = "lab"                             # optional trace label
+reference_prices = false                 # optional, default false
+```
+
+Those two middle lines are a choice and not a pair. **Exactly one of `preset` and
+`base_url` is required**: writing both, or neither, is refused naming the entry's
+index in the array, because "a provider entry is wrong" is not something an
+operator with four of them can act on.
+
+`preset` is a vendor this crate already knows the endpoint of:
+
+```
+cerebras deepseek fireworks gemini groq minimax mistral moonshot perplexity
+qwen together xai zhipu jan koboldcpp llamacpp lmstudio localai ollama sglang
+vllm
+```
+
+An unknown `preset` is refused **listing the ones that exist**, so a typo is one
+read away from its own fix rather than a search through this page.
+
+`auth` says how the key is presented and defaults to `"bearer"`; a preset supplies
+its own, so a local runtime that wants no `Authorization` header at all is already
+`"none"` without the key being written. `api_key` is optional for the same reason —
+a runtime on `localhost` has nothing to authenticate to. `name` is a label for the
+trace and changes no behaviour.
+
+`reference_prices = true` opts into an outbound request to a host **the file did
+not name**, to ask what the endpoint's models cost. That host is governed by the
+same `Act::Net` rules as every other endpoint this crate dials: a policy that does
+not allow it means the run refuses, rather than the lookup quietly not happening.
+It is off by default.
 
 ### `[app]` — stored, never validated (0.27.0)
 
@@ -513,6 +560,20 @@ many events you point one at. See [Hooks](hooks.md) for the rest.
 that `[[policy.layers]]` and `[[agent]]` are in, so a later scope replaces the array
 whole: one hook in `io.local.toml` discards every hook your user-scope file
 declared.
+
+**A `preset`'s base URL is a default this crate ships, not a fact about the
+vendor.** It was right on the day the release was cut and the vendor is under no
+obligation to keep it so. That is why `base_url` exists beside `preset` and takes
+the same entry: a vendor that moves its endpoint is one line in your own file,
+today, rather than a release of this crate and a version bump you wait for. The
+preset list is a convenience over the general key, never a gate in front of it.
+
+**`reference_prices = true` turns on egress to a third host.** The file names one
+endpoint; this key dials a different one to ask what that endpoint's models cost,
+and a price it returns is that host's opinion rather than an invoice. It is off by
+default, it is `Act::Net`-checked like anything else this crate dials, and a policy
+that denies that host fails the run instead of silently reporting every call
+unpriced.
 
 **`${` always begins a substitution.** There is no escape, so a literal `${` in a
 value — in a glob pattern, say — is not expressible. An unknown prefix is an
