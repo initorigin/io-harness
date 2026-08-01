@@ -2295,7 +2295,13 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let (ledger, backlog) = restore_tree_ledger(store, run_id, containment)?;
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
-            emit_backlog(watch, run_id, start_step.saturating_sub(1), &ledger, &backlog);
+            emit_backlog(
+                watch,
+                run_id,
+                start_step.saturating_sub(1),
+                &ledger,
+                &backlog,
+            );
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
@@ -2371,7 +2377,13 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             let (ledger, backlog) = restore_tree_ledger(store, run_id, containment)?;
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
-            emit_backlog(watch, run_id, start_step.saturating_sub(1), &ledger, &backlog);
+            emit_backlog(
+                watch,
+                run_id,
+                start_step.saturating_sub(1),
+                &ledger,
+                &backlog,
+            );
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
@@ -4018,7 +4030,13 @@ pub async fn resume_tree_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
-    emit_backlog(watch, run_id, start_step.saturating_sub(1), &ledger, &backlog);
+    emit_backlog(
+        watch,
+        run_id,
+        start_step.saturating_sub(1),
+        &ledger,
+        &backlog,
+    );
     // Re-authorized on resume rather than trusted from the crashed run: the
     // policy handed to the resume is the one that governs it, and a host allowed
     // before a crash may not be allowed after.

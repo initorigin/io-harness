@@ -6103,7 +6103,11 @@ mod tests {
         // And the tree's spend is the admitted child's alone: the waiting one has
         // no run row, so there is nothing of its to sum.
         assert_eq!(store.spent_tokens_tree(root).unwrap(), 250);
-        assert_eq!(store.agent_count_tree(root).unwrap(), 2, "the root and one child");
+        assert_eq!(
+            store.agent_count_tree(root).unwrap(),
+            2,
+            "the root and one child"
+        );
     }
 
     #[test]

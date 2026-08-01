@@ -295,10 +295,7 @@ async fn the_tiers_are_counted_separately_and_every_tier_drains() {
     // A two-tier tree: the root spawns three, and each of those spawns two.
     struct TwoTiers;
     impl Provider for TwoTiers {
-        async fn complete(
-            &self,
-            req: CompletionRequest,
-        ) -> io_harness::Result<CompletionResponse> {
+        async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
             let usage = Some(Usage {
                 total_tokens: 1,
                 ..Default::default()

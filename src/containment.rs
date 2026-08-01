@@ -381,7 +381,9 @@ impl Ledger {
             max_total_tokens: c.max_total_tokens,
             max_total_agents: c.max_total_agents,
             max_depth: c.max_depth,
-            tiers: (0..tiers).map(|_| Arc::new(Semaphore::new(slots))).collect(),
+            tiers: (0..tiers)
+                .map(|_| Arc::new(Semaphore::new(slots)))
+                .collect(),
             fleet: Arc::new(Mutex::new(vec![FleetTally::default(); tiers])),
             state: Mutex::new(State {
                 spent_tokens,
@@ -667,7 +669,14 @@ mod tests {
 
         // A slot frees and the queue drains into it.
         drop(a);
-        assert_eq!(led.tally(1), FleetTally { working: 1, queued: 0, done: 1 });
+        assert_eq!(
+            led.tally(1),
+            FleetTally {
+                working: 1,
+                queued: 0,
+                done: 1
+            }
+        );
         assert!(led.try_admit(1).is_some(), "the freed slot is reusable");
     }
 
@@ -692,7 +701,14 @@ mod tests {
         let led = Arc::new(Ledger::new(&Containment::new(10, 1, 3, 100)));
         let held = led.try_admit(1).expect("the only slot");
         led.mark_queued(1, true);
-        assert_eq!(led.tally(1), FleetTally { working: 1, queued: 1, done: 0 });
+        assert_eq!(
+            led.tally(1),
+            FleetTally {
+                working: 1,
+                queued: 1,
+                done: 0
+            }
+        );
 
         let waiter = {
             let l = Arc::clone(&led);
@@ -704,9 +720,23 @@ mod tests {
 
         drop(held);
         let slot = waiter.await.unwrap();
-        assert_eq!(led.tally(1), FleetTally { working: 1, queued: 0, done: 1 });
+        assert_eq!(
+            led.tally(1),
+            FleetTally {
+                working: 1,
+                queued: 0,
+                done: 1
+            }
+        );
         drop(slot);
-        assert_eq!(led.tally(1), FleetTally { working: 0, queued: 0, done: 2 });
+        assert_eq!(
+            led.tally(1),
+            FleetTally {
+                working: 0,
+                queued: 0,
+                done: 2
+            }
+        );
     }
 
     #[test]
@@ -721,7 +751,11 @@ mod tests {
         for _ in 0..4 {
             led.mark_queued(1, false); // the store already held the row
         }
-        assert_eq!(led.tally(1).queued, 4, "the replay did not double the queue");
+        assert_eq!(
+            led.tally(1).queued,
+            4,
+            "the replay did not double the queue"
+        );
 
         // A genuinely new wait still counts.
         led.mark_queued(1, true);

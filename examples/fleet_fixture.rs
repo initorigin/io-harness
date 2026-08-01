@@ -114,6 +114,14 @@ async fn main() -> io_harness::Result<()> {
 
     // Never returns: the admitted child parks and the root is awaiting it.
     let provider = ParkingFleet::default();
-    let _ = run_tree(&contract, &provider, &store, &policy, &ApproveAll, &containment).await?;
+    let _ = run_tree(
+        &contract,
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+        &containment,
+    )
+    .await?;
     Ok(())
 }
