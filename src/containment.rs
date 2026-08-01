@@ -368,8 +368,10 @@ impl Ledger {
     ///
     /// A child that was only ever *queued* is deliberately not among them: it has
     /// no run row, so it was never counted and was never charged. Its place in
-    /// the queue is restored separately, from the store, by
-    /// [`Self::restore_queue`].
+    /// the queue is restored separately, from the store, by machinery
+    /// [`run_tree`](crate::run_tree) drives — not a plain link, because the
+    /// method doing it is crate-internal and a public page must not link into
+    /// what a reader cannot open.
     pub fn from_state(c: &Containment, spent_tokens: u64, agents: u32) -> Self {
         Self::build(c, spent_tokens, agents.max(1))
     }
