@@ -7,7 +7,7 @@ tasks:
   why_required: 'Every other task in the release names one of these types or is compiled by one of these
     declarations. The defaulted method is also the release''s one break risk: a required method here
     would break the crate''s only extension point.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T10
   acceptance_criteria:
@@ -33,7 +33,26 @@ tasks:
   - src/lib.rs
   - src/provider/catalog.rs
   - src/provider/compatible.rs
-  evidence: []
+  evidence:
+  - 'F3 — `provider::catalogue_default::a_provider_that_overrides_nothing_reports_an_empty_catalogue`
+    implements `Provider` with `complete` and nothing else, which is exactly the shape the trait''s
+    own doc example ships and exactly what an out-of-tree implementation written before 0.29.0 looks
+    like. It is a compile-time assertion as much as a runtime one: making `models()` required stops
+    this file compiling.'
+  - '`Provider::models()` is defaulted to `async { Ok(Vec::new()) }` and carries a worked example that
+    is itself the minimal out-of-tree implementer. The negative control — a non-empty catalogue from
+    a provider pointed at a real body — lands with T03.'
+  - '`ModelInfo` and `PriceSource` added to `src/provider/mod.rs`. Every field but `id` is an Option
+    or an empty Vec and `None` means the vendor did not say; the doc example contrasts a local runtime''s
+    stated `Price::ZERO` against a hosted vendor''s `None` for the same apparent ''no cost'', which
+    is the distinction the type exists for. `price_source` is `#[non_exhaustive]`.'
+  - The socket harness at `src/provider/mod.rs::failures` is now `pub(crate)` with `serve`, `stream_response`,
+    a new `json_response` for length-delimited catalogue bodies, and a new `serve_recording` that returns
+    the request heads it was sent — so a test can assert what went onto the wire rather than what the
+    constructor stored, and an empty log proves no request was made. `drain_request` returns the head
+    verbatim and lowercases only for parsing the length.
+  - NF5 — `cargo test --doc` 261 passed, 0 failed (254 before), and `cargo build` clean. No existing
+    public item changed.
 - id: US-IO-HARNESS-0.29.0-T02
   summary: 'The reference catalogue reader: Reference, the exact decimal-string to micro-unit conversion,
     and the match rule.'

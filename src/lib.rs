@@ -370,8 +370,8 @@ pub use net::REQUEST_TIMEOUT;
 pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
-    Anthropic, CompletionRequest, CompletionResponse, OpenAi, OpenRouter, Provider, ToolCall,
-    ToolSpec, Usage,
+    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, ModelInfo, OpenAi,
+    OpenRouter, PriceSource, Provider, Reference, ToolCall, ToolSpec, Usage,
 };
 #[cfg(feature = "media")]
 pub use provider::{Media, IMAGE_MEDIA_TYPES};
