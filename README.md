@@ -235,6 +235,7 @@ cloning a repository dangerous are refused in the one file a clone delivers.
 | [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
+| [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |
 
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md) indexes them.
 [docs/CONTRACT.md](docs/CONTRACT.md) is the public contract: what is stable, what

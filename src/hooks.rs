@@ -99,11 +99,12 @@ pub(crate) struct Hook {
     #[serde(default)]
     on: Vec<String>,
     /// A file to append one JSON line per matching event to, relative to the
-    /// directory of the configuration that declared it.
+    /// discovery root the configuration was loaded for — so a user-scope hook
+    /// writes its log beside the project it is watching rather than beside itself.
     #[serde(default)]
     append: Option<PathBuf>,
-    /// An argv to spawn with the event JSON on its stdin. Never a string, so there
-    /// is nothing for a shell to interpret.
+    /// An argv to spawn with the event JSON on its stdin, in the discovery root.
+    /// Never a string, so there is nothing for a shell to interpret.
     #[serde(default)]
     run: Option<Vec<String>>,
     /// What a failure of this hook does to the run.
@@ -158,9 +159,9 @@ impl Hook {
 
     /// Do the hook's one thing, and say why if it did not happen.
     ///
-    /// `dir` is the directory of the configuration that declared the hook, which is
-    /// what `${file:...}` already resolves against — a relative path in a file means
-    /// a path beside that file.
+    /// `dir` is the discovery root the configuration was loaded for, which is also
+    /// the child's working directory — so `run = ["cargo", "fmt"]` runs against the
+    /// project rather than against wherever the caller happened to be.
     fn fire(&self, dir: &Path, line: &str, lock: &Mutex<()>) -> Result<()> {
         if let Some(rel) = &self.append {
             let at = dir.join(rel);

@@ -412,12 +412,16 @@ a projection onto the typed API and never a second path into the run loop:
   written is the widening one: `policy.defaults.exec = "allow"`,
   `policy.defaults.net = "allow"`, `sandbox.allow_network = true`, and
   `sandbox.force_floor = false`. So is `${cmd:...}` anywhere in that file, including
-  inside a `[profile]`. Each is accepted unchanged in `io.local.toml` and in the
-  user scope, and the narrowing value of each stays legal in `io.toml`. **This does
-  not claim that a cloned repository is safe** — `[[mcp]]` still names a command,
-  `[toolchain]` still names an argv, and a policy layer can still allow what the
-  defaults did not. It is a specific narrowing of a specific hazard: the keys whose
-  effect is to remove containment from a file that arrives with a `git clone`.
+  inside a `[profile]`. **So is the whole `[[hook]]` array (0.28.0)** — not its
+  executing half: a hook that runs an argv is the `${cmd:...}` primitive arriving one
+  release later, and a hook that appends is a write to a path a stranger chose, which
+  is the same hazard by a shorter route. Each is accepted unchanged in
+  `io.local.toml` and in the user scope, and the narrowing value of each of the four
+  keys stays legal in `io.toml`. **This does not claim that a cloned repository is
+  safe** — `[[mcp]]` still names a command, `[toolchain]` still names an argv, and a
+  policy layer can still allow what the defaults did not. It is a specific narrowing
+  of a specific hazard: the keys whose effect is to remove containment from a file
+  that arrives with a `git clone`.
 - **An unknown key is an error**, naming the key and the file, rather than being
   ignored. There are exactly two exceptions and they are stated together: a key
   inside a `[[mcp]]` table, because `McpServer` is `#[serde(flatten)]`-based and
@@ -449,6 +453,38 @@ a projection onto the typed API and never a second path into the run loop:
   still wins the keys it names and the count stays four. A `[profile.<name>]` is an
   overlay of the same file that was already read, applied by an explicit
   `Config::with_profile` call: not a fifth scope, not a second file, not a reload.
+
+**What a lifecycle hook is, and is not (0.28.0).** A `[[hook]]` table is an
+`Observer` that came from a file instead of from a Rust program. It changes nothing
+about how a run is watched; it changes who can write one.
+
+- **It is the caller's to install.** `Config::hooks()` builds a `Hooks` and hands it
+  back; the caller passes it to `run_observed`, `resume_observed`, or any of the tree
+  forms, exactly as it passes its own. Nothing in this crate installs an observer the
+  caller did not install, and that is the same "nothing is loaded implicitly" rule
+  every other projection in `io.toml` obeys.
+- **It fires on the events the channel already emits**, named by the wire tags
+  `EventKind` serializes to. The list of valid names is a census of the enum, asserted
+  by a test that reads the source, so a name that is not there is a load error rather
+  than a hook that installs and never fires.
+- **It runs inside the run loop and blocks it.** `Observer::event` is synchronous and
+  returns a `Flow` the loop acts on immediately. That is what makes
+  `on_failure = "cancel"` able to stop anything at all, and it is why an executing
+  hook is bounded by `timeout_ms` and killed past it. Hooking a hot event — `token`
+  is emitted per streamed token — with a `run` action is a decision to spawn a
+  process that often.
+- **There is no shell.** A hook's `run` is a TOML array and reaches the process as
+  argv, unsplit and uninterpreted, which is the discipline `${cmd:...}` and the `exec`
+  tool already hold.
+- **It grants nothing.** A hook is not a permission mechanism: it cannot approve or
+  deny an action, and the boundary is still the `Policy` the caller loaded. It can
+  only end the run, and only when the operator wrote `on_failure = "cancel"`.
+- **A hook's output is discarded.** `stdout` and `stderr` go to `null`, so a hook
+  talks by exiting non-zero. A failure is traced at warn level with the hook's index
+  and the reason, and never with the event, which may carry a goal or a target.
+- **Hooks do not accumulate across scopes.** Unlike `[[policy.layers]]` and
+  `[[agent]]`, the array is not in `APPENDING`: a later scope replaces it whole, so
+  one `[[hook]]` in `io.local.toml` discards every hook the user-scope file declared.
 
 **What every recorded number is, and is not (0.18.0).** The trace now answers
 what a run cost and which model spent it, and the provenance of each figure

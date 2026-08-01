@@ -291,6 +291,37 @@ A named file that does not exist is **skipped**. This is discovery, not
 substitution: the "resolve or fail" rule that governs `${...}` deliberately does
 not apply here.
 
+### `[[hook]]` → `Hooks`, via `Config::hooks` (0.28.0)
+
+```toml
+[[hook]]                       # an audit log: every event, one JSON line each
+append = "audit.jsonl"
+
+[[hook]]                       # a formatter, after every step that changed a file
+on = ["step"]
+run = ["cargo", "fmt"]
+
+[[hook]]                       # a local policy check that can stop the run
+on = ["tool_call"]
+run = ["./scripts/allowed.sh"]
+on_failure = "cancel"
+timeout_ms = 2000
+```
+
+Each table names the events it wants and one thing to do with them. `Config::hooks()`
+returns a `Hooks`, which **is** an `Observer`, so you install it exactly as you would
+install your own — and nothing in the run loop changed to make that work.
+
+`on` names events by the wire tags `EventKind` serializes to, and an absent `on` is
+every event. `append` writes one JSON line per matching event, `run` spawns a fixed
+argv with that JSON on the child's stdin, and exactly one of the two is required.
+Both resolve against the discovery root, which is also the child's working
+directory. There is no shell: the argv is an array and reaches the process unsplit.
+
+**`[[hook]]` is refused in the project scope**, whole, for the reasons in
+[A project file may narrow, and may never widen](#a-project-file-may-narrow-and-may-never-widen-0270)
+below. The full page is [Hooks](hooks.md).
+
 ### `[[mcp]]` → [`McpServer`](mcp-and-network.md)
 
 ```toml
@@ -394,11 +425,15 @@ written is the one that widens:
 | `sandbox.allow_network` | `true` | `false` |
 | `sandbox.force_floor` | `false` | `true` |
 
-Plus `${cmd:...}` anywhere in the file. The refusal names the key, the file, and
-where to write it instead — `io.local.toml` or your user-scope file, where all five
-are accepted unchanged. A widening key hidden inside `[profile.<name>]` is refused
-too; the profile is applied later, and a check that only looked at the base would
-let it reach the same place by a different path.
+Plus `${cmd:...}` anywhere in the file, and — since 0.28.0 — the whole `[[hook]]`
+array. Not the executing half of it: a hook that runs an argv is the `${cmd:...}`
+primitive arriving one release later, and a hook that appends is a write to a path
+a cloned repository chose, which is the same hazard by a shorter route. The refusal
+names the key, the file, and where to write it instead — `io.local.toml` or your
+user-scope file, where all of them are accepted unchanged. A widening key or a hook
+hidden inside `[profile.<name>]` is refused too; the profile is applied later, and a
+check that only looked at the base would let it reach the same place by a different
+path.
 
 Value-dependent rather than key-dependent, deliberately: a project file *denying*
 `exec` is exactly what the project scope is for, and a rule that refused the key
@@ -407,8 +442,8 @@ outright would forbid the good half to stop the bad one.
 **What this does not claim.** Not that a cloned repository is safe. `[[mcp]]` still
 names a command, `[toolchain]` still names an argv, and a `[[policy.layers]]` entry
 can still allow what the defaults did not. This is a specific narrowing of a
-specific hazard — four keys and one substitution, no more — and it is the file half
-of a boundary whose enforcing half is still the `Policy` you loaded.
+specific hazard — four keys, one substitution and one array, no more — and it is the
+file half of a boundary whose enforcing half is still the `Policy` you loaded.
 
 ## An unknown key is an error
 
@@ -467,6 +502,17 @@ not read the way you would treat any other text a stranger wrote into your promp
 
 **A project file may narrow and never widen, and that is all it does.** See the
 section above for the four keys, and for the sentence it is not.
+
+**A hook runs inside the run loop and blocks it.** `Observer::event` is synchronous,
+which is what lets `on_failure = "cancel"` stop anything at all — and it means a
+`run` hook on a hot event, `token` above all, spawns a process that often. An
+executing hook is bounded by `timeout_ms` and killed past it; nothing bounds how
+many events you point one at. See [Hooks](hooks.md) for the rest.
+
+**Hooks do not accumulate across scopes.** `[[hook]]` is not in the appending set
+that `[[policy.layers]]` and `[[agent]]` are in, so a later scope replaces the array
+whole: one hook in `io.local.toml` discards every hook your user-scope file
+declared.
 
 **`${` always begins a substitution.** There is no escape, so a literal `${` in a
 value — in a glob pattern, say — is not expressible. An unknown prefix is an

@@ -32,6 +32,7 @@ the limits that capability actually has.
 | [Accounting](guide/accounting.md) | One row per provider call, the cache and reasoning breakdown, latency and TTFT, and cost derived from a price table you own |
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
+| [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
 
 ## The twelve pillars
 
