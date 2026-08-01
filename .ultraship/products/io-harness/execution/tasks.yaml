@@ -209,7 +209,7 @@ tasks:
     it named in EVERY_KEY.
   why_required: An operator has configured the harness in a file rather than in Rust since 0.19.0, and
     a provider kind the file cannot name is a provider io-cli and io-studio cannot select.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.29.0-T03
   acceptance_criteria:
@@ -226,7 +226,31 @@ tasks:
   files:
   - src/config.rs
   - tests/config.rs
-  evidence: []
+  evidence:
+  - 'F9 — `EVERY_KEY` (tests/config.rs) gains a `kind = "compatible"` entry naming all seven keys, and
+    `f7_every_key_reaches_a_typed_field` asserts the whole `ProviderSpec::Compatible` value including
+    `auth: Some(Auth::None)`, `name`, and `reference_prices: true` — so each key is proven to reach
+    a typed field rather than being accepted and dropped.'
+  - 'The negative-control twin `f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default`
+    is extended to `reference_prices`: with the key removed the flag falls back to false while its neighbour
+    `auth` does not. That is the difference between a provider that dials a second host and one that
+    does not, so the fixture proves the key is read.'
+  - 'Exactly-one enforced in code, reported by entry index: `a_compatible_provider_naming_neither_base_nor_preset_is_refused_by_index`
+    (names #1, both key names, and lists the presets), `a_compatible_provider_naming_both_base_and_preset_is_refused`
+    (#0, and says one would be silently ignored), `an_unknown_preset_is_refused_listing_the_ones_that_exist`
+    (''grok'' surfaces ''groq'').'
+  - '`each_valid_shape_of_a_compatible_provider_loads` is the named negative control for all three refusals:
+    a preset alone, a base_url alone, and a second preset name all load, and the three original kinds
+    still load unchanged — so the rule cannot be satisfied by an implementation that refused every compatible
+    entry or refused [[provider]] wholesale, which is the shape 0.27.0''s F4 control exists to catch.'
+  - '`an_unknown_key_inside_a_compatible_provider_is_rejected_naming_it` — `reference_price` (singular)
+    is rejected naming the key and the file. Exactly-one is enforced in code rather than through a nested
+    tagged enum precisely so `deny_unknown_fields` survives; a `#[serde(flatten)]` for the shared keys
+    would have inherited the standing [[mcp]] hole.'
+  - Validation runs at both load paths — `Config::from_toml` and `read_scope` — through one `check_providers`
+    helper beside `Hooks::check`, so a scope-merged file and a single-string file are held to the same
+    rule.
+  - '`cargo test --test config` — 42 passed, 0 failed (37 before).'
 - id: US-IO-HARNESS-0.29.0-T05
   summary: docs/guide/providers.md, with its limits block and the line explaining why Compatible has
     no from_env.
