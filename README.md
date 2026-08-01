@@ -182,7 +182,9 @@ policy's: that bound is stated in full in the [web guide](docs/guide/web.md).
 **Context that stays relevant.** Each turn is assembled to fit a stated share of
 the token budget: superseded observations are compacted, and an observation a
 later write invalidated is re-read rather than trusted. Durable memory keyed to
-the workspace survives between runs.
+the workspace survives between runs — as a fact or a decision, pinnable so a run
+cannot overwrite a correction, with a per-run record of which entries it actually
+drew on.
 
 **Observation and replay.** Register an observer and be called as the run
 happens — steps, tool calls, approvals, refusals, spend draws, retries,
@@ -247,14 +249,14 @@ none rather than guessing.
 | [Durable runs](docs/guide/durable-runs.md) | Checkpoints, resume, approvals that survive a restart |
 | [MCP and network egress](docs/guide/mcp-and-network.md) | Stdio and HTTP servers, `Act::Net`, what the policy does not govern |
 | [Tools and skills](docs/guide/tools-and-skills.md) | The `Tool` trait, the toolbox, skill discovery and its boundary |
-| [Context and memory](docs/guide/context-and-memory.md) | Per-turn assembly, compaction, invalidation, durable memory |
+| [Context and memory](docs/guide/context-and-memory.md) | Per-turn assembly, compaction, invalidation, durable memory, pinning and recall |
 | [Resilience](docs/guide/resilience.md) | Failure classification, retry, provider fallback, stall detection |
 | [Observability and replay](docs/guide/observability.md) | Observers, events, outcome records, deterministic replay |
 | [Sessions](docs/guide/sessions.md) | Durable conversations: a turn is a run, token streaming, steering, branching |
 | [Agency](docs/guide/agency.md) | A visible plan, a question about intent, named agents, prompt templates |
 | [Web search and fetch](docs/guide/web.md) | Provider-executed lookups, the three vendor translations, citations, and where the boundary is not |
-| [Configuration](docs/guide/configuration.md) | One `io.toml`, four layered scopes, projected onto the typed API |
-| [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost |
+| [Configuration](docs/guide/configuration.md) | One `io.toml`, four layered scopes, projected onto the typed API, and which file decided each key |
+| [Accounting](docs/guide/accounting.md) | Per-call rows, cache and reasoning tokens, latency, derived cost, and grouped outcome, gate and recovery counts |
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |

@@ -374,7 +374,7 @@ tasks:
   why_required: >
     A capability documented only in rustdoc is a capability only a reader who already knows it exists
     will find, and the public-surface snapshot is enforced by a test rather than by habit.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.30.0-T02
   - US-IO-HARNESS-0.30.0-T04
@@ -395,8 +395,44 @@ tasks:
   - docs/CONTRACT.md
   - docs/public-api.txt
   - CHANGELOG.md
+  - README.md
+  - src/lib.rs
   - Cargo.toml
-  evidence: []
+  - Cargo.lock
+  evidence:
+  - >
+    N3 — `docs/public-api.txt` gains six lines and loses none: `enum MemoryKind`, `struct FirstTry`,
+    `struct MemoryRecall`, `struct MemoryWrite`, `struct Recovery`, `struct Tally`. `config::Origin`
+    is deliberately NOT there, because it is not re-exported from `lib.rs` — same as `config::Scope`,
+    which it sits beside. `tests/public_api.rs` 9 passed, including `public_surface_matches_snapshot`
+    and `drift_reports_a_removal`.
+  - >
+    N4 — `every_public_item_has_a_worked_example` passes, so each of the six carries a fenced example
+    that compiles. `cargo test --doc` 271 passed at the point the memory work landed and the new
+    aggregate examples were added after it; the full-suite run under T08 is the one that covers them
+    all at once.
+  - >
+    The changelog's 0.30.0 section carries no `**BREAKING` entry and
+    `tests/changelog.rs` 5 passed. Version bumped to 0.30.0 in `Cargo.toml` and `Cargo.lock`.
+  - >
+    `docs/CONTRACT.md` gains the provenance bullet in the configuration section and four new entries
+    under "Limits that hold today": that an aggregate is one indexed query and NOT constant-time,
+    with the measured numbers; that gate failures group by phase and not by criterion; that
+    `Recovery` has no escalation count; that a pin binds a run and not the caller holding the store;
+    and that `MemoryEntry` gained two fields, which a caller constructing one in a literal must name.
+  - >
+    The three guide pages gain a section each — "Which file decided one key", "A correction that
+    sticks" and "Which notes a run actually used", "What the runs did, not just what they cost" —
+    plus a limits paragraph on each page. Written by a subagent against a brief and reviewed here.
+    It found one thing the brief had wrong and documented it rather than papering over it:
+    `memory_delete` and `memory_clear` have no pin guard, so a pinned entry is not tamper-proof
+    against the caller — which is the same bound `docs/CONTRACT.md` now states.
+  - >
+    `README.md` and the crate-root rustdoc updated in the same commit stream rather than later: the
+    memory paragraph, the configuration paragraph, a new "What the trace adds up to" paragraph
+    naming the five grouped accessors, and two guide-index rows. `cargo doc --no-deps
+    --all-features` is warning-free and `tests/readme.rs`, `tests/docs_drift.rs`,
+    `tests/guide_pages.rs` all pass.
 
 - id: US-IO-HARNESS-0.30.0-T08
   summary: >

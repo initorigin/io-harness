@@ -174,7 +174,20 @@
 //! of the token budget ([`ContextBudget`]): superseded observations are
 //! compacted, and an observation a later write invalidated is re-read rather
 //! than trusted. Durable memory keyed to the workspace ([`MemoryEntry`],
-//! [`Store::memory_list`]) survives between runs.
+//! [`Store::memory_list`]) survives between runs, as a fact or a decision
+//! ([`MemoryKind`]) and pinnable ([`Store::memory_pin`]) so a run cannot
+//! overwrite a correction — a refused write is recorded and told to the agent
+//! rather than swallowed. [`Store::memory_recalls`] says which entries a given
+//! run actually drew on, which is a different question from what it knew.
+//!
+//! **What the trace adds up to.** One row per provider call and one per file
+//! change, with money derived at query time from a [`pricing::PriceTable`] the
+//! operator owns rather than stored. [`Store::spend_by_model`] and its two
+//! siblings group the cost; [`Store::runs_by_outcome`], [`Store::first_try`],
+//! [`Store::gate_failures_by_phase`] and [`Store::recovery`] group what the runs
+//! *did* — how often a gate passed first time, which phase fails most, and how
+//! many runs a fallback, a replan or a resume carried through. Grouped rows out;
+//! the rendering is the consuming application's.
 //!
 //! **Observation and replay.** Register an [`Observer`] and be called as the run
 //! happens — [`RunEvent`]s covering steps, tool calls, approvals, refusals,
@@ -204,7 +217,9 @@
 //! `${env:...}` and `${file:...}` keep a credential out of the file, an unknown
 //! key is an error rather than a shrug, and nothing is loaded implicitly — the
 //! caller reads the file, before the run, once, which is what stops an agent
-//! widening the boundary it is running under.
+//! widening the boundary it is running under. [`Config::origin`] reports which
+//! scope and which file decided a given key, for the operator whose setting did
+//! not take effect.
 //! **Documents and images**, behind opt-in features: spreadsheets, Word,
 //! PowerPoint text, PDF, and barcode decoding, each gated on [`Act::Read`] or
 //! [`Act::Write`] against the real path the model named, and verified with
