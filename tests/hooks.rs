@@ -262,7 +262,19 @@ fn f2_an_event_this_crate_does_not_emit_is_refused_naming_it() {
 #[cfg(unix)]
 const CAPTURE: [&str; 3] = ["sh", "-c", "cat > 'a;b && c.jsonl'"];
 #[cfg(windows)]
-const CAPTURE: [&str; 3] = ["cmd", "/c", "findstr /r .* > \"a;b && c.jsonl\""];
+const CAPTURE: [&str; 3] = ["cmd", "/c", "findstr /r .* > \"a;b c.jsonl\""];
+
+/// The file the capture hook writes, which is also the proof.
+///
+/// Windows drops the `&&`: `cmd` owns the parsing of the string an operator handed
+/// it, and `&` is a separator there in ways that vary with quoting — which is a fact
+/// about `cmd` and not about this crate. The space and the semicolon prove what this
+/// test is for either way, because an argv split on whitespace or on `;` would
+/// produce some other file, or several.
+#[cfg(unix)]
+const CAPTURE_FILE: &str = "a;b && c.jsonl";
+#[cfg(windows)]
+const CAPTURE_FILE: &str = "a;b c.jsonl";
 
 /// Sleeps well past any timeout this test sets.
 #[cfg(unix)]
@@ -330,7 +342,7 @@ async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
 
     // The argument arrived whole. A harness that split on whitespace, or handed the
     // string to a shell, would have produced some other file — or several.
-    let at = ws.path().join("a;b && c.jsonl");
+    let at = ws.path().join(CAPTURE_FILE);
     assert!(
         at.is_file(),
         "the argv element did not reach the child intact: {:?}",

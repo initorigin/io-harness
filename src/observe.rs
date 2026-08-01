@@ -845,11 +845,17 @@ mod tests {
     /// at exactly four spaces of indentation and begins with an uppercase letter,
     /// where a doc line begins with `/`, an attribute with `#`, a field is indented
     /// eight, and a variant's closing brace begins with `}`.
+    ///
+    /// Line endings are normalised first. A Windows checkout may hold this file with
+    /// CRLF, and a parse that looked for `"\n}\n"` would find nothing there and fail
+    /// on one platform only — which is precisely the class of thing this repository
+    /// keeps paying for.
     fn missing_from(names: &[&str]) -> Vec<String> {
         let src = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/observe.rs"),
         )
-        .expect("this file is readable from its own test");
+        .expect("this file is readable from its own test")
+        .replace("\r\n", "\n");
         let body = src
             .split_once("pub enum EventKind {")
             .expect("the enum is declared in this file")
