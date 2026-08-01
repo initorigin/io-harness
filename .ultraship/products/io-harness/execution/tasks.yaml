@@ -1,497 +1,494 @@
 product: io-harness
-version: 0.30.0
+version: 0.31.0
 tasks:
-- id: US-IO-HARNESS-0.30.0-T01
+- id: US-IO-HARNESS-0.31.0-T01
   summary: >
-    Pin a 0.29.0 fixture generator and record its output, before any schema change: a
-    known-composition aggregates store, a resumable interrupted tree, and a `read` mode the
-    reverse-direction check execs.
+    The plan gate's vocabulary and its durable half: `Plan`, `PlanStep`, `PlanVerdict`, the
+    `PlanGate` trait and its three implementations, a `plans` table beside `pending_questions`, and
+    the `Store` accessors that read and decide one.
   why_required: >
-    The release's one ordering risk. If the generator is built after the schema moves, the
-    cross-version evidence measures this tree against itself and passes for the wrong reason. It is
-    the first commit of the release for that reason alone.
+    Nothing else in the plan half can be written until the types exist and a plan can outlive the
+    process. The table is also the only schema change in the release, so it lands first and the
+    cross-version evidence is taken against it rather than against a moving target.
   status: done
   depends_on: []
   acceptance_criteria:
   - >
-    **F8 — cross-version compatibility, both directions.** A database written by a real 0.29.0 build
-    opens, resumes and replays under 0.30.0 with nothing to migrate; and a 0.30.0 store is read by a
-    0.29.0 build, which never queries the new table. Proven with a pinned 0.29.0 fixture generator,
-    the way `tests/cross_version.rs` already proves it for the 0.22.0 boundary — never with a
-    database this tree wrote and labelled.
+    **F1 — nothing is written before the approval, proven against the workspace.** A run under a gate
+    that never answers, driven by a scripted provider whose very first turn calls `write_file`,
+    `exec` and a registered tool: the run stops with `RunOutcome::AwaitingPlan`, and the workspace
+    directory tree is byte-identical to what it was before the run started. Its negative control is
+    the identical script under an approving gate, which must write the file — without it the test
+    passes against a harness that refuses everything.
   files:
-  - tests/fixtures/gen-0.29.0/Cargo.toml
-  - tests/fixtures/gen-0.29.0/Cargo.lock
-  - tests/fixtures/gen-0.29.0/src/main.rs
-  - tests/fixtures/store-0.29.0
-  - .gitattributes
-  - Cargo.toml
-  evidence:
-  - >
-    `tests/fixtures/gen-0.29.0` resolves `io-harness =0.29.0` from crates.io and builds clean. It is
-    the previous release compiling, not this tree: it failed first against
-    `TaskContract::workspace(goal, root, verify)` and against `io_harness::state::{..}`, because
-    0.29.0 takes two arguments there and re-exports those types at the crate root. Both are facts
-    about 0.29.0's API that the current tree could not have told me.
-  - >
-    `gen-0-29-0 write ../store-0.29.0` produced `aggregates.sqlite3` (six finished runs — four
-    successes of which two have no gate failure, one step cap, one stall; gate phases 2 test-run /
-    1 criterion-compile / 1 compile; 3 fallbacks, 2 replans, 2 resumes; three memory entries) and
-    `interrupted.sqlite3` with its workspace (root stopped at the step cap, child 2 finished having
-    written `a.txt` = ALPHA, child 3 out of steps with `b.txt` = DRAFT, tree spend 400 tokens).
-  - >
-    Each sidecar carries `composition` — the literals this generator chose, which is where F7's
-    expectations come from — beside `read_back`, which is what 0.29.0's own API returned from the
-    finished store and is what the forwards half of F8 compares against.
-  - >
-    A defect found and fixed while committing: `.gitattributes` matched `tests/fixtures/**` as
-    `text eol=lf`, so `git add` rewrote `0D 0A` to `0A` inside a database file. Both new fixtures
-    tripped it. `tests/fixtures/**/*.sqlite3 binary` now overrides it, and the staged blobs are
-    byte-identical to the working files (155,648 = 155,648 for both). The 0.22.0 fixtures survived
-    only because no page of theirs contained that byte pair.
-
-- id: US-IO-HARNESS-0.30.0-T02
-  summary: >
-    Per-key configuration provenance: an `Origin` recorded for every leaf key as each scope is
-    merged, surviving substitution and the `[profile.<name>]` overlay, read back by
-    `Config::origin` and `Config::origins`.
-  why_required: >
-    Without it the release does not answer the first of the three questions, and it is the only one
-    of the three whose absence makes a settings screen actively misleading rather than merely
-    absent.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.30.0-T01
-  acceptance_criteria:
-  - >
-    **F1 — provenance across four scopes.** A fixture setting the same key in defaults, user,
-    project and local resolves to the local value and reports the local scope and that file's path.
-    Removing the local file makes it report project, and so on down. Asserted at each of the four
-    steps, so the test discriminates between "reports the last scope" and "reports the deciding
-    scope" — which are the same answer only when the key is set everywhere.
-  - >
-    **F2 — provenance through substitution.** A key whose value came from `${env:}` reports the file
-    the substitution was written in, not the environment variable and not the process environment.
-    A key whose value came from `${cmd:}` does the same. The negative control is the same key
-    written literally, which must report the identical origin — if it does not, the implementation
-    is reporting the mechanism rather than the source.
-  - >
-    **F3 — a project scope that narrowed a user's setting is visible.** The case 0.27.0's trust rule
-    creates: a boundary set in the user scope and narrowed in the project scope resolves to the
-    project value and reports the project file. This is the specific question the whole feature
-    exists to answer and it gets its own named test.
-  files:
-  - src/config.rs
-  - tests/config.rs
-  evidence:
-  - >
-    `Origin { scope, path }` and a `BTreeMap<String, Vec<Origin>>` on `Config`, filled by
-    `record_origins` walking each scope's own table *before* `merge` folds it into everything read
-    so far — after the merge there is nothing left to say which file a key came from. The walk
-    mirrors `merge`'s own notion of a leaf (a table recurses, anything else is a leaf), so the two
-    cannot disagree about what a key is.
-  - >
-    F1 — `origin_reports_the_deciding_scope_at_every_step_down` walks the same four steps
-    `f1_the_four_scopes_merge_in_order` walks, asserting the origin at each: local, then project,
-    then user, then empty. Taken at every step because "the last scope read" and "the deciding
-    scope" agree only while the key is set everywhere.
-    `origin_of_a_key_only_one_file_sets_is_that_file_not_the_last_one_read` is the sharper half: a
-    later file exists and names something else, and an implementation reporting the last file read
-    answers wrong.
-  - >
-    F2 — `origin_of_a_substituted_value_is_the_file_it_was_written_in` runs `${env:}`, `${cmd:}` and
-    the same key written literally through the same file and asserts all three report an identical
-    `Origin`. It needed no implementation work, and that is the finding worth keeping: `parse`
-    substitutes per file before anything merges, so a substituted value's origin is the declaring
-    file by construction. `${cmd:}` is written in the local scope because the project scope refuses
-    it — 0.27.0's rule, unchanged.
-  - >
-    F3 — `origin_shows_the_project_file_that_narrowed_a_user_setting` sets `policy.defaults.exec` to
-    allow in the user scope and deny in the project scope, and asserts both that the origin is the
-    project file and that `Policy::check` still returns `Deny`: the origin describes the resolution,
-    it does not alter it.
-  - >
-    Two cases the criteria did not name and the implementation had to decide. `policy.layers` and
-    `agent` append across scopes, so `origin` returns *every* contributing file in order rather than
-    inventing a winner — `origin_of_an_appending_key_lists_every_file_that_contributed`. And
-    `with_profile` moves each `profile.<name>.<key>` origin onto the key it now decides and drops
-    the `profile.` entries, since the returned configuration carries no `[profile]` section —
-    `origin_after_a_profile_overlay_names_the_file_the_profile_came_from`.
-  - >
-    The open question in the contract — provenance on demand or a map built once — is decided as a
-    map built at load, because the known consumer renders a whole settings list and a per-key walk
-    would re-read the tables once per row. `Config::origin(key)` and `Config::origins()` are both
-    lookups into it.
-  - >
-    `cargo test --test config origin_` 6 passed, 0 failed. `cargo test --doc config::` 24 passed, 0
-    failed, which includes the two new worked examples. `Config::from_toml` records nothing, exactly
-    as `sources()` returns nothing there: parsed text has no file behind it, and naming `io.toml`
-    for it would name a file that was never read.
-
-- id: US-IO-HARNESS-0.30.0-T03
-  summary: >
-    `MemoryEntry` gains a `#[non_exhaustive]` kind and a pinned flag, with a pinned entry refusing an
-    overwrite by a run and the refusal recorded as an observable event.
-  why_required: >
-    The second question. A human who cannot correct what the agent has learned, and cannot make the
-    correction stick, has a memory they can only read.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.30.0-T01
-  acceptance_criteria:
-  - >
-    **F4 — kinds round-trip.** A decision written and read back is a decision; a fact is a fact. The
-    enum is `#[non_exhaustive]`, and a test asserts an exhaustive census of its variants against the
-    source the way `EVENT_NAMES` is asserted against `EventKind` — the 0.28.0 lesson that a match
-    arm proves exhaustiveness and a hand-written list does not.
-  - >
-    **F5 — a pinned entry survives a run that tries to overwrite it.** After the run, the value is
-    the pinned one, and the attempt is in the trace as an observable event. Both halves are
-    asserted: a silent refusal would leave the agent believing it had corrected something.
-  files:
+  - src/approve.rs
   - src/state.rs
+  - src/lib.rs
+  - src/contract.rs
+  - src/agent.rs
+  - src/provider/mod.rs
+  - src/provider/anthropic.rs
+  - src/provider/openai_wire.rs
+  evidence:
+  - >
+    `Plan`, `PlanStep`, `PlanVerdict`, `PlanReview` and the `PlanGate` trait land in `src/approve.rs`
+    beside `Question`/`Responder`, whose shape they copy exactly: the review returns
+    `Option<PlanVerdict>` and `None` means "nobody in this process can answer", which is what makes
+    the run persist and pause rather than guess. Three implementations — `PlanGateNone` (the honest
+    unattended default), `AcceptPlan` (tests) and `StdinPlanGate` (a CLI) — mirror `ResponderNone`,
+    `FixedResponder` and `StdinResponder` one for one.
+  - >
+    `PlanVerdict::Revise { correction }` is the variant an `Approver` has no counterpart for, and it
+    is why a gate is not an approver: a plan that is nearly right is the common case and the useful
+    answer to it is a correction, not a refusal.
+  - >
+    The `plans` table lands in `Store::open`'s migration block, additive, `CHECKPOINT_FORMAT` still
+    7. Its index is `plans (run_id, verdict)` rather than `run_id` alone, because the loop's question
+    is "does this run have an *approved* plan" and both columns are in it.
+  - >
+    `plan_row` reads an unrecognised `verdict` spelling back as **undecided** rather than as a guess.
+    That is deliberate and is the safe direction: a row a binary does not understand must never be
+    reported as an approval, because an approval is precisely what lets the run write.
+  - >
+    Five `Store` accessors — `put_plan`, `plan`, `approved_plan`, `decide_plan`, `plans` — mirroring
+    the question accessors, `decide_plan` refusing a second verdict with `Error::Resume` the way
+    `answer_question` refuses a second answer. `cargo test --doc state::` — 60 passed, 0 failed,
+    including the `PendingPlan`, `put_plan`, `plan`, `approved_plan`, `decide_plan` and `plans`
+    worked examples. `cargo test --lib state::` — 38 passed, 0 failed.
+  - >
+    `Effort` lands in `src/provider/mod.rs` as a closed three-tier enum with `Ord`, so "at least
+    Medium" is expressible without a match, plus `FromStr` for an `io.toml` roster and
+    `thinking_budget()` for the one vendor that has no tiers. `CompletionRequest::effort` and
+    `CompletionResponse::reasoning` are declared here; the projections and the parsing are T04 and
+    T05. `cargo test --doc approve::` 31 passed, `agent::` 16 passed, `contract::` 8 passed,
+    `provider::Effort` 3 passed, all 0 failed.
+
+- id: US-IO-HARNESS-0.31.0-T02
+  summary: >
+    The planning phase in the workspace loop: `TaskContract::with_plan_gate`, the `propose_plan`
+    tool, the `plan-gate` policy layer that denies `Write` and `Exec` while the gate is unsatisfied,
+    the explicit refusal of `remember` in the same phase, the `PlanProposed` and `PlanDecided`
+    events, and the `AwaitingPlan` and `PlanRejected` outcomes.
+  why_required: >
+    This is the release's outcome sentence — the agent proposes and the run executes nothing until
+    an answer arrives. Without it the types from T01 are a vocabulary nothing speaks.
+  status: done
+  depends_on: [US-IO-HARNESS-0.31.0-T01]
+  acceptance_criteria:
+  - >
+    **F1 — nothing is written before the approval, proven against the workspace.** A run under a gate
+    that never answers, driven by a scripted provider whose very first turn calls `write_file`,
+    `exec` and a registered tool: the run stops with `RunOutcome::AwaitingPlan`, and the workspace
+    directory tree is byte-identical to what it was before the run started. Its negative control is
+    the identical script under an approving gate, which must write the file — without it the test
+    passes against a harness that refuses everything.
+  - >
+    **F3 — the three verdicts do three different things.** `Approve` continues the run and the
+    approved plan is in the next assembled prompt. `Revise { correction }` does not continue: the run
+    stays in the planning phase, the correction reaches the model as an observation, and the model's
+    second proposal differs from its first. `Cancel` stops the run with `RunOutcome::PlanRejected`
+    and nothing written. Three named tests; a shared one would pass on any two of the three.
+  - >
+    **F4 — the plan names sub-agents that exist.** A proposal naming an agent absent from the
+    contract's roster is refused back to the model as an observation naming the roster, and the run
+    stays in the planning phase; a proposal naming a roster member is accepted. Both asserted, and
+    the accepted case is the control that shows the check discriminates.
+  files:
+  - src/run.rs
+  - src/contract.rs
+  - src/observe.rs
+  - src/tools/mod.rs
+  - src/tools/custom.rs
+  - tests/plan_gate.rs
+  evidence:
+  - >
+    The phase is held by `plan_lock()` — `Policy::permissive().layer("plan-gate").deny_write("*")
+    .deny_exec("*")`, merged into the run's effective policy — rather than by filtering the tool
+    list. `Policy::explain` resolves deny-first across every layer, so one layer covers
+    `write_file`, `edit_file`, `exec`, the four shell tools, the git built-ins, every registered
+    `Tool` and every MCP tool, the last two because invoking one is an `Act::Exec` check on its own
+    name. A tool added next release is covered the day it lands.
+  - >
+    F1 — `nothing_is_written_before_the_approval` photographs the workspace directory into a
+    `BTreeMap<path, bytes>` before the run and asserts equality afterwards, with the scripted model
+    calling `write_file`, `exec` and a registered `Tool` on its very first turn. It asserts on the
+    DIRECTORY, not on the outcome: a harness that wrote the file and then paused satisfies every
+    outcome assertion available. Its control, `the_same_script_writes_once_the_plan_is_approved`,
+    runs the identical script under `AcceptPlan` and requires `out.txt` to exist — and still
+    requires `made-by-exec` not to, so the control is a control rather than a second happy path.
+  - >
+    `a_refusal_during_the_phase_names_the_plan_gate_layer` asserts the refusal is an ordinary
+    policy refusal carrying `layer = "plan-gate"`, so an operator reading the trace can see why a
+    write was refused without knowing this feature exists.
+  - >
+    `remember` is refused explicitly, because it writes to the harness's own store and never passes
+    the policy. `remember_is_refused_while_the_plan_is_pending` asserts `memory_list` is empty.
+    Without it "nothing is written" would have quietly meant "nothing the policy happens to see".
+  - >
+    F3 — three named tests, not one shared one.
+    `approve_continues_the_run_and_puts_the_plan_in_the_next_prompt` asserts the plan text is in the
+    request the provider was actually handed on the following turn.
+    `revise_keeps_the_phase_on_and_the_correction_reaches_the_model` asserts the correction reached
+    the model, that `propose_plan` was still offered afterwards, that the store holds both proposals
+    with both verdicts, and that the SECOND plan is the one carried out.
+    `cancel_stops_the_run_with_nothing_written` asserts `PlanRejected`, an unchanged workspace, and
+    that the script's second turn was never requested.
+  - >
+    F4 — `a_plan_naming_an_unknown_agent_is_refused_back_to_the_model` asserts the observation names
+    both the offending agent and the roster, and that the rejected proposal was never stored: a
+    human must not be shown a plan whose owner cannot be spawned. Its control,
+    `a_plan_naming_a_roster_member_is_accepted`, shows the check discriminates rather than refusing
+    every `agent`.
+  - >
+    `the_tool_is_withdrawn_once_the_plan_is_approved` and `a_run_without_a_gate_is_unchanged` are the
+    two ends: the tool is offered only while the phase is on, and a contract with no gate behaves
+    exactly as 0.30.0 did.
+  - >
+    `EventKind::PlanProposed` and `PlanDecided` reach an `Observer`
+    (`the_proposal_and_the_verdict_both_reach_an_observer`), and `EVENT_NAMES` gains all three
+    spellings so a `[[hook]]` can filter on them. `cargo test --test plan_gate` — 16 passed,
+    0 failed.
+
+
+- id: US-IO-HARNESS-0.31.0-T03
+  summary: >
+    The durable resume: `resume_with_plan_decision` and `resume_tree_with_plan_decision`, each with
+    an `_observed` twin, and the loop reading the gate's satisfaction from the store at every entry
+    rather than from a variable.
+  why_required: >
+    A gate that only works while the process lives is the failure 0.7.0 already refused for
+    approvals. It is also the one defect that passes every in-process test, so it gets its own task
+    and its own restart evidence.
+  status: done
+  depends_on: [US-IO-HARNESS-0.31.0-T02]
+  acceptance_criteria:
+  - >
+    **F2 — the pause survives a real restart.** A run paused on a plan, its process killed with
+    SIGKILL, the plan read back from the store by a second process that never saw the first, approved
+    there, and the run resumed to completion under its original run id. Asserted: the plan text read
+    in the second process equals what the first proposed; no step number occurs twice in the trace;
+    and no second `propose_plan` call is made after the approval, which is what proves the approval
+    was read from the store rather than re-derived.
+  - >
+    **N2 — the store lookup the gate depends on is an indexed lookup, not a scan.** The loop asks
+    "does this run have an approved plan" at every entry, so `EXPLAIN QUERY PLAN` for that statement
+    must name an index on `plans(run_id)`, with a control statement over an unindexed column that
+    must not. The measured time is recorded; no wall-clock threshold is asserted, for the reason
+    0.30.0's N2 recorded.
+  files:
+  - src/run.rs
+  - src/state.rs
+  - examples/plan_gate_restart.rs
+  - tests/plan_gate.rs
+  evidence:
+  - >
+    Four entry points — `resume_with_plan_decision`, `resume_tree_with_plan_decision` and their
+    `_observed` twins — matching the four `resume_*_with_answer` ones exactly, so a caller who knows
+    one knows the other. `record_plan_decision` is `record_answer`'s counterpart and is thin for the
+    same reason: the step that proposed was committed, so the `propose_plan` call is never replayed
+    and the verdict arrives as an `ObsKind::Message` observation with no target.
+  - >
+    `PlanVerdict::Cancel` does NOT resume. `cancel_the_run` finishes the run as `plan_rejected`
+    without re-entering the loop, because driving it again would ask the model to propose the same
+    approach to the same person who just refused it.
+    `a_cancel_through_a_resume_finishes_the_run_without_re_entering_the_loop` asserts the provider
+    turn count is unchanged across the resume.
+  - >
+    F2 — `a_plan_survives_a_real_sigkill_and_is_approved_by_a_second_process` spawns
+    `examples/plan_gate_fixture`, which proposes under `PlanGateNone`, stops on `AwaitingPlan` and
+    then parks forever so the parent kills a process that is unambiguously alive. After SIGKILL the
+    test reads the plan from the store, asserts both step intents match what the dead process
+    proposed, asserts the plan is still undecided, asserts the workspace is byte-identical to before
+    the run, approves it, and resumes to a completed write under the original run id.
+  - >
+    The assertion that carries F2's claim is an ABSENCE. The resume-side provider is a `Finisher`
+    that records the tool list it was handed and can only write; the test asserts `propose_plan` was
+    never in any of those lists. That is the only observable separating "the approval was read from
+    the store" from "it planned again and was approved again" — an outcome assertion passes on both.
+  - >
+    Also asserted on the resume: no step number occurs twice, the last step advanced, and
+    `decided_by` reads `"human"` rather than `"gate"`, because a decision that arrived through a
+    resume must not be filed as the machine's.
+  - >
+    `a_plan_belonging_to_another_run_is_refused` — approving somebody else's plan is an
+    `Error::Resume`, not a silent no-op that would leave this run planning forever.
+  - >
+    N2 — `state::tests::the_approved_plan_lookup_reaches_its_row_through_an_index` asserts
+    `EXPLAIN QUERY PLAN` for the loop's per-step statement names an index, with a control over
+    `plans.steps` (unindexed) that must not. Measured at 20,000 plan rows: **26.3µs per
+    `approved_plan` call**. A wall-clock threshold was deliberately not asserted, for the reason
+    0.30.0's N2 recorded — flaky on a loaded runner, and it passes on a fast machine running a full
+    scan.
+
+
+- id: US-IO-HARNESS-0.31.0-T04
+  summary: >
+    `Effort` on `CompletionRequest`, `AgentDef` and `TaskContract`, and its projection onto each of
+    the three vendors: `reasoning.effort`, `reasoning_effort`, and `thinking.budget_tokens` with
+    `max_tokens` raised to clear it.
+  why_required: >
+    The second half of the release outcome. `Usage::reasoning_tokens` has been recorded since 0.18.0
+    with no way to ask for them, so every run takes the vendor's default on both the cheap steps and
+    the expensive one.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - >
+    **F6 — each vendor body carries the tier in that vendor's own shape.** Three body tests asserting
+    exact keys: OpenRouter `body["reasoning"]["effort"] == "high"`; OpenAI
+    `body["reasoning_effort"] == "low"`; Anthropic `body["thinking"]["type"] == "enabled"` with a
+    `budget_tokens` strictly below `body["max_tokens"]`, since Anthropic rejects the request
+    otherwise. Each has a control with `effort: None` whose body must contain no such key and must
+    equal the body 0.30.0 built — the assertion that an existing caller's bytes did not move.
+  files:
+  - src/provider/mod.rs
+  - src/provider/openai_wire.rs
+  - src/provider/anthropic.rs
+  - src/provider/compatible.rs
+  - src/agent.rs
+  - src/contract.rs
   - src/run.rs
   - src/lib.rs
-  - tests/memory.rs
   evidence:
   - >
-    `MemoryKind` (`#[non_exhaustive]`, `Fact` by default), `MemoryEntry::kind` and
-    `MemoryEntry::pinned`, `MemoryWrite`, `Store::memory_write` and `Store::memory_pin`. Two
-    nullable columns on `memory` rather than a rewrite: `NULL` kind reads as `Fact` and `NULL`
-    pinned as false, which is what every pre-0.30.0 entry actually was. `memory_put` is now a
-    wrapper over `memory_write` with the kind fixed to `Fact`, so its signature and behaviour are
-    unchanged and there is one write path rather than two that can drift.
+    F6, the OpenAI wire — `each_wire_vendor_gets_the_effort_tier_in_its_own_shape` asserts
+    `reasoning_effort == "low"` for `WebFlavor::OpenAi` with no `reasoning` key, and
+    `reasoning == {"effort": "high"}` for `WebFlavor::OpenRouter` with no `reasoning_effort` key.
+    Each vendor is also asserted NOT to carry the other's key.
   - >
-    The guard is `WHERE memory.pinned IS NOT 1` inside the upsert, not a read-then-write in the
-    caller, so two writers on one store cannot interleave between the check and the write. `IS NOT`
-    rather than `!=` is load-bearing: `NULL != 1` is `NULL`, which SQLite reads as false, and that
-    comparison would have refused every entry written before this release.
+    F6, Anthropic — `the_effort_tier_becomes_a_thinking_budget_below_max_tokens` asserts
+    `thinking.type == "enabled"`, that `budget_tokens` equals the tier's, and that it is strictly
+    below `max_tokens` for all three tiers. That inequality is the assertion worth having: Anthropic
+    refuses a request whose budget is not below the cap, and without a local test the failure is a
+    400 on the wire. It also asserts the budgets are ordered, so asking for more thinking gets more.
   - >
-    F4 — `state::tests::memory_kind_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
-    parses `pub enum MemoryKind` out of `src/state.rs` (CRLF normalised first, the 0.28.0 Windows
-    lesson) and asserts the variants equal the list `from_stored` reads back, then round-trips each
-    one through a real store. A variant added without a `from_stored` arm would round-trip to `Fact`
-    silently, which is the 0.25.0 `every_kind()` defect in a different table.
+    F6's controls assert the WHOLE no-effort body, not merely the absence of a key.
+    `no_effort_leaves_both_bodies_exactly_as_they_were` compares against a literal 0.30.0 body;
+    `no_effort_leaves_the_anthropic_body_exactly_as_it_was` asserts no `thinking` key and
+    `max_tokens` back at the fixed 8192. Without these the tests above would pass against an
+    implementation that always sent a default.
   - >
-    F5 — `a_pinned_entry_survives_a_run_that_tries_to_overwrite_it` runs the real loop with a
-    scripted `remember` call against a pinned entry: the value is still the operator's, the kind is
-    still `Decision`, `memory_refused` is in the trace and `memory_write` is not. Its control,
-    `the_same_write_lands_when_the_entry_is_not_pinned`, runs the identical script against an
-    unpinned entry and asserts the write lands — without it the first test passes against an
-    implementation that refuses everything.
+    The tier reaches the wire from three places: `TaskContract::effort` on both the single-file and
+    workspace loops, and `identity.and_then(|d| d.effort).or(contract.effort)` on the tree loop, so
+    a definition's tier wins over the run's and a child spawned without one inherits the root's.
   - >
-    The refusal also reaches the model as an observation rather than only the trace, so the agent
-    learns its correction did not take. It is a `ContextEvent` kind rather than a new `EventKind`
-    variant, because the question it answers — did my pin hold — is asked after the run by somebody
-    reading the store, and the contract's observability note says this release adds no event kind.
-  - >
-    A pinned entry is also exempt from cap eviction, which the criteria did not name and the feature
-    requires: a correction that survives an overwrite and then disappears because the agent wrote
-    twenty notes afterwards has not survived. It still counts towards the caps, so pinning
-    everything fails loudly instead of quietly raising the ceiling.
+    `cargo test --lib provider::` — 81 passed, 0 failed.
 
-- id: US-IO-HARNESS-0.30.0-T04
+
+- id: US-IO-HARNESS-0.31.0-T05
   summary: >
-    The per-run recall record: a new table, a write at recall time, and an accessor answering which
-    entries a given run actually drew on.
+    `CompletionResponse::reasoning`, parsed from `delta.reasoning` on the OpenAI wire and
+    `thinking_delta` on Anthropic, emitted as `EventKind::Reasoning`, and kept out of the observation
+    ledger and out of every prompt the loop assembles afterwards.
   why_required: >
-    "What does the agent know" and "what did this run use" are different questions, and only the
-    second tells a reader whether a memory entry was load-bearing.
+    "Visible, and not paid for twice" is half the effort outcome. A tier that could be asked for and
+    whose product nobody could see would be a cost with no signal; one folded into the next prompt
+    would be a cost charged again every turn for the rest of the run.
   status: done
-  depends_on:
-  - US-IO-HARNESS-0.30.0-T03
+  depends_on: [US-IO-HARNESS-0.31.0-T04]
   acceptance_criteria:
   - >
-    **F6 — the recall record names the run.** A run that recalls three of six entries produces a
-    record naming those three and that run, and a second run over the same workspace produces its
-    own record without disturbing the first.
+    **F7 — reasoning reaches the observer and never reaches the next prompt.** A scripted provider
+    returns a distinctive reasoning string on step 1. A recording `Observer` sees it in
+    `EventKind::Reasoning`. The string appears in no `observations` row for the run, and in no
+    `CompletionRequest::user` the provider is handed on any later step — asserted against the
+    requests the double actually received, because asserting on the ledger alone would not catch a
+    loop that re-added it at assembly time.
+  - >
+    **F8 — reasoning parses from both wire shapes.** The OpenAI-wire accumulator fed `delta.reasoning`
+    fragments across chunks yields the concatenated text; the Anthropic accumulator fed
+    `thinking_delta` blocks does the same; and in both cases a stream carrying no reasoning yields
+    `None` rather than `Some("")`, because "the model did not think" and "the model thought nothing"
+    are different facts and only the first is true.
+  - >
+    **N5 — an out-of-tree `Provider` that ignores `effort` still compiles and is honestly
+    non-thinking**, and one that never sets `reasoning` returns `None` rather than an empty string.
+    Asserted by a test double in `tests/` that does exactly that.
   files:
-  - src/state.rs
-  - src/context.rs
-  - tests/memory.rs
+  - src/provider/mod.rs
+  - src/provider/openai_wire.rs
+  - src/provider/anthropic.rs
+  - src/observe.rs
+  - src/run.rs
+  - tests/reasoning.rs
   evidence:
   - >
-    A `memory_recalls` table indexed on `run_id`, `Store::record_memory_recall` (crate-internal, so
-    only the assembler writes it) and `Store::memory_recalls` with a `MemoryRecall` row. One row per
-    key per recall rather than a flag on the entry: an entry recalled by two runs is two facts, and
-    a flag keeps only the later one.
+    F8, the OpenAI wire — `reasoning_deltas_accumulate_and_stay_out_of_the_text` feeds `reasoning`
+    and `reasoning_content` fragments interleaved with `content` and asserts the concatenation lands
+    in `reasoning` and NOT in `text`. Both spellings are read because a `Compatible` provider
+    pointed at either kind of endpoint should behave the same way.
   - >
-    `render_notes` now returns the keys it kept rather than a count, `Assembled` gains
-    `recalled_keys`, and both run loops — single-workspace and tree — record the recall for their
-    own run. `Assembled` already derives `Default`, which is the type shape the contract's migration
-    note names as safe to add a field to; `Assembly` was deliberately left alone, since it has no
-    `Default` and a new field there would break a struct literal.
+    F8, Anthropic — `thinking_deltas_accumulate_and_stay_out_of_the_text` feeds `thinking_delta`
+    blocks plus a `signature_delta`, and asserts the signature reaches neither field. The signature
+    is the vendor's integrity token for replaying the block back to it, not something a human or a
+    trace wants.
   - >
-    F6 — `the_recall_record_names_which_entries_a_run_actually_used` writes six entries where the
-    three oldest are each `MEMORY_MAX_ENTRY_CHARS` long, runs with a 2,000-token prompt ceiling, and
-    asserts the record names exactly `small-0..2` for that run. "Three of six" is a property of the
-    sizes and the newest-first fit rule, not of a token estimate the test would otherwise be pinned
-    to. A second run over the same workspace produces its own identical record with the first
-    untouched, and a run id that never existed recalls nothing.
+    F8's controls — `a_stream_with_no_reasoning_yields_none_rather_than_an_empty_string` and its
+    Anthropic twin. `None`, never `Some("")`: "the model did not think" and "the model thought
+    nothing" are different facts and only the first is true.
   - >
-    First attempt failed for the right reason: with the default 24,000-token budget every note fit
-    and the assertion read six of six. The fix was to shrink the contract's context budget, not to
-    weaken the assertion.
+    F7 — `reasoning_reaches_the_observer_and_never_the_next_prompt` uses a sentinel string
+    (`ZZTHINKINGZZ...`) returned on step 1 and asserts three things: the observer saw it exactly once
+    with its 40-token cost; it appears in no `observations` row; and — the assertion that carries the
+    claim — it appears in the `system` or `user` of NO `CompletionRequest` the provider double
+    actually received. A loop that dropped it into the ledger and a loop that re-added it at assembly
+    time are different bugs and only the first shows up in a stored row.
+  - >
+    N5 — `a_provider_that_ignores_the_tier_still_receives_it_and_still_works` drives the real loop
+    with an out-of-tree provider that reads neither field, asserts the tier reached it, and asserts
+    the run still completed. Its control, `a_run_that_asks_for_no_tier_sends_none`, shows the
+    implementation does not always send a default.
+    `a_provider_that_returns_no_thinking_emits_nothing` is the other end: an absent event means the
+    model did not think.
+  - >
+    `cargo test --test reasoning` — 5 passed, 0 failed.
 
-- id: US-IO-HARNESS-0.30.0-T05
+
+- id: US-IO-HARNESS-0.31.0-T06
   summary: >
-    Outcome, gate and recovery aggregates on `Store`, in the shape `src/pricing.rs` established:
-    grouped rows out, no rendering, and no accessor for a number the trace cannot answer honestly.
+    The documentation and the public surface, in this release: `EVENT_NAMES`, `docs/public-api.txt`
+    with a worked example per added item, the plan-gate section and the per-vendor effort table in
+    `docs/CONTRACT.md`, the README and guide pages, and the changelog with its four breaking entries
+    and their migrations.
   why_required: >
-    The third question, and the one every consumer currently re-derives from raw rows — which is the
-    duplication the 0.18.0 cost grouping exists to prevent.
+    `release.yml` refuses a version with no changelog section and takes the release notes verbatim
+    from it, and `tests/public_api.rs` fails on any added item without a worked example. Neither is
+    optional, and a capability documented only in rustdoc is one only a reader who already knows it
+    exists will find.
   status: done
-  depends_on:
-  - US-IO-HARNESS-0.30.0-T01
+  depends_on: [US-IO-HARNESS-0.31.0-T03, US-IO-HARNESS-0.31.0-T05]
   acceptance_criteria:
   - >
-    **F7 — the aggregates are right against a known trace.** A fixture store built with a known
-    composition — a fixed number of runs, a known number of first-try passes, a known distribution
-    of gate failures, and a known count of fallbacks, replans and resumes — produces exactly those
-    numbers. The expected values come from the fixture's construction, never from running the
-    accessor and recording what it said.
+    **F5 — `EVENT_NAMES` still equals the enum.** The census test in `src/observe.rs` passes with the
+    three added variants, and `every_kind()` still produces one of every tag and no others. This is
+    an existing test that must not be allowed to pass by having been forgotten — the added variants
+    make it fail unless the names are added, which is the point.
   - >
-    **N2 — the aggregates do not scale with the trace.** Each is one indexed query, not a table
-    scan the caller pays for on every render. Measured against a store with a large trace and the
-    number recorded; the point is that a panel refreshing does not get slower as history grows.
+    **N3 — the breaks are exactly four and each is in the changelog with a migration.**
+    `CompletionRequest` gains `effort`, `CompletionResponse` gains `reasoning`, `RunOutcome` gains
+    two variants, and `EventKind` gains three (additive under its `#[non_exhaustive]`, so it costs an
+    exhaustive match nothing). No public item is renamed or removed, so no deprecation cycle is owed.
+    `tests/changelog.rs` and `tests/public_api.rs` both pass.
+  - >
+    **N4 — every added public item carries a worked example**, enforced by the existing surface test.
   files:
-  - src/state.rs
-  - src/lib.rs
-  - tests/accounting.rs
+  - src/observe.rs
+  - docs/public-api.txt
+  - docs/CONTRACT.md
+  - README.md
+  - CHANGELOG.md
+  - Cargo.toml
   evidence:
   - >
-    Five accessors and three row types: `runs_by_outcome`, `runs_by_day`, `gate_failures_by_phase`
-    (all returning `Tally`), `first_try` (`FirstTry`) and `recovery` (`Recovery`). Each is one SQL
-    `GROUP BY` or count — unlike the 0.18.0 spend groupings, which read every call row into Rust
-    because the price table is a Rust value the SQL cannot see. Rows out, no rendering, no rate.
+    F5 — `observe::tests::event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+    and `every_variant_round_trips` both pass with the three added variants. The variants were added
+    to `every_kind()`'s vector in the same commit as the enum, which is the lesson the three 0.21.0
+    variants cost seven releases to learn: the guard below the vector proves the ARMS exhaustive and
+    says nothing about what the vector holds.
   - >
-    Two things are deliberately NOT shipped, which is the honest half of the task. `first_try`
-    returns three counts and no rate, because *first_try / succeeded* and *first_try / runs* are
-    both legitimate and picking one silently would decide for the caller. And `Recovery` has no
-    escalation count: nothing records an escalation as an event, and an escalation is the opposite
-    of a rescue anyway — the contract's open question is answered "its own row, and not until
-    something records it".
+    N3 — four breaking entries, each with a `*Migration:*` note and, where the shapes differ enough
+    to need one, a fenced snippet. `tests/changelog.rs` (5 tests, including
+    `every_breaking_entry_carries_a_migration_note`) passes. No public item is renamed or removed,
+    so no deprecation cycle is owed: `docs/public-api.txt` gains 15 lines and loses none, verified by
+    `git diff --stat` as `15 insertions(+)` with no deletions.
   - >
-    F7 — `f7_the_aggregates_are_right_against_a_known_composition` reads the committed 0.29.0
-    fixture, on a copy, and asserts every accessor against the `composition` literals in its
-    sidecar. The fixture is built so runs (6), succeeded (4) and first_try (2) all differ, and the
-    test asserts they differ: with any two equal it would pass against an accessor that confused
-    them. `the_aggregates_over_an_empty_store_are_empty_rather_than_absent` is the other end — zero
-    rows and zeroed counts, not an error and not a plausible number.
+    N4 — `tests/public_api.rs` (9 tests) passes, including `every_public_item_has_a_worked_example`
+    over all 15 added crate-root names.
   - >
-    N2 — `state::tests::every_aggregate_reaches_its_rows_through_an_index` asserts the *query plan*
-    of all seven statements names an index, with a control that must NOT (a `COUNT(*)` over
-    `runs.goal`, which has no index) so the check can be seen answering no. A wall-clock assertion
-    was rejected on purpose: it is flaky on a loaded runner and it passes on a fast machine running
-    a full scan. Five indexes were added — `run_outcomes (outcome)`, `run_outcomes (finished_at)`,
-    `sandbox_events (kind, detail)`, `sandbox_events (run_id, kind)`, `context_events (kind)`,
-    `checkpoint_events (kind)` — created after every table, since the first attempt declared them
-    beside the memory table and named `run_outcomes` before it existed.
+    `docs/CONTRACT.md` gains two sections. "What the plan gate stops, and what it does not" states
+    that the boundary is the policy and not the tool list, that reads and `Act::Net` stay open and
+    why, that `remember` is the one write the policy cannot see, and — the honest limit — that a
+    read-shaped registered `Tool` which quietly writes is outside every boundary this crate has, in
+    the phase and out of it. "Reasoning effort, per vendor" carries the four-row table and states
+    plainly that OpenAI's Chat Completions returns no reasoning text at all and that Anthropic has no
+    tiers.
   - >
-    N2's measurement, recorded rather than asserted. Store built in memory, macOS, debug build.
-    At 1,000 finished runs: runs_by_outcome 325µs, gate_failures_by_phase 135µs, first_try 353µs,
-    recovery 79µs. At 20,000 runs: 1.81ms, 2.47ms, 7.64ms, 1.19ms.
+    Three new `known_limitations` in the contract's "Limits that hold today": the gate binds the
+    agent and not the caller holding the `Store`; a second verdict on one plan is refused but two
+    resumes after a single approval are not guarded; and reasoning text is live-only.
   - >
-    **N2's wording over-claims and the measurement is what shows it.** "The aggregates do not scale
-    with the trace" is not achievable for an aggregate over full history — counting every row is
-    what the answer *is*, so the cost is linear in rows no matter which index serves it. Twenty
-    times the runs cost roughly five times (runs_by_outcome) to twenty times (first_try) as long.
-    What IS true, and is what the criterion's own second sentence asks for, is that each is one
-    indexed query rather than a table scan, at roughly 90–380ns per run. Raising it for the owner
-    rather than quietly reading the criterion as satisfied; making it literally true would need
-    materialised counters, which is a different release.
+    `docs/guide/permissions.md` gains "Reviewing the approach, before there is anything to approve"
+    and `docs/guide/providers.md` gains "Asking a model to think harder"; the README's guide table
+    points at both. `cargo test --test docs_drift --test readme --test guide_pages` — 10, 8 and 7
+    passed, 0 failed.
   - >
-    One optimisation attempt was measured and reverted: rewriting `first_try`'s correlated
-    `NOT EXISTS` as a LEFT JOIN onto a `DISTINCT` subquery made it **25 seconds** at 20,000 runs
-    against 7.6ms, because the subquery materialises without an index and every outcome row then
-    probes it linearly. The comment beside the query records the number so nobody re-proposes it.
-  - >
-    `gate_failures_by_phase` groups on `detail` directly rather than on a `COALESCE` of it — a
-    function in the GROUP BY makes the (kind, detail) index unusable and SQLite falls back to a scan
-    plus a temp B-tree, which the plan test caught. The NULL is handled in `tally`, where it costs
-    nothing, as the key `(none)`.
+    `cargo doc --no-deps --all-features` — **0 warnings**. Four redundant explicit link targets were
+    introduced and removed before the gate; the rustdoc build is clean.
 
-- id: US-IO-HARNESS-0.30.0-T06
+
+- id: US-IO-HARNESS-0.31.0-T07
   summary: >
-    The cross-version test over the committed 0.29.0 fixtures — read-back, resume, and the reverse
-    direction where a 0.29.0 binary reads a store this tree wrote — plus the CI job that runs it.
+    Cross-version evidence in both directions over the new table, and the release gates: fmt, clippy,
+    the three test invocations, `cargo tree` and `cargo package --locked`.
   why_required: >
-    Without it the additive-migration claim is an assertion. Both directions have to be executed by
-    the release that makes the claim, and one of them can only be executed by the previous binary.
+    The release adds a table to a format every earlier binary still reads. Both directions are
+    executed rather than argued, and the gates are what `complete` stores as evidence.
   status: done
-  depends_on:
-  - US-IO-HARNESS-0.30.0-T04
-  - US-IO-HARNESS-0.30.0-T05
+  depends_on: [US-IO-HARNESS-0.31.0-T06]
   acceptance_criteria:
   - >
-    **F8 — cross-version compatibility, both directions.** A database written by a real 0.29.0 build
-    opens, resumes and replays under 0.30.0 with nothing to migrate; and a 0.30.0 store is read by a
-    0.29.0 build, which never queries the new table. Proven with a pinned 0.29.0 fixture generator,
-    the way `tests/cross_version.rs` already proves it for the 0.22.0 boundary — never with a
-    database this tree wrote and labelled.
+    **F9 — cross-version compatibility, both directions.** A database written by a real 0.30.0 build
+    opens, resumes and replays under 0.31.0 with nothing to migrate; and a 0.31.0 store carrying a
+    decided plan is read by a 0.30.0 build, which never queries the `plans` table. Proven with the
+    pinned-generator technique `tests/cross_version.rs` already uses, never with a database this tree
+    wrote and labelled.
+  - >
+    **N1 — no new dependency.** `cargo tree` on macOS and Linux still reads 402 lines. Everything
+    here is a table, four fields, an enum and a trait.
+  - >
+    **O3 — `cargo package --locked` succeeds** and the packaged crate compiles.
   files:
   - tests/cross_version_0_29_0.rs
-  - .github/workflows/ci.yml
+  - tests/cross_version.rs
   evidence:
   - >
-    F8 forwards — `a_0_29_0_store_reads_back_identically_under_0_30_0` opens a copy of the
-    0.29.0-written `aggregates.sqlite3` and asserts every memory entry, run summary, gate event and
-    context event against the sidecar's `read_back`, which is what 0.29.0's own API returned. The
-    two new fields arrive at their documented defaults — every entry is `MemoryKind::Fact` and
-    unpinned, which is what those entries actually were — and `PRAGMA user_version` on the file is
-    still 7, so no format bump slipped in.
+    F9, the guard firing first. `cross_version.rs`'s two schema tests FAILED on the new table before
+    anything was declared, naming both the `plans` `CREATE TABLE` and its index — which is the guard
+    working. They pass once both objects are named in `ADDED_SINCE_0_22_0`, by name rather than by a
+    prefix rule, so the next table somebody adds is not absorbed silently. `CHECKPOINT_FORMAT` is
+    still 7 and no existing table's stored `CREATE TABLE` text moved.
   - >
-    F8 forwards, the half rows cannot cover — `a_0_29_0_tree_resumes_under_0_30_0` resumes the tree
-    0.29.0 stopped at its step cap and drives it to verified success. No run in the tree gains a
-    duplicate step number, the child that had already finished gains neither a step nor a token, the
-    tree total is exactly what 0.29.0 drew plus what this release drew, and `a.txt` still holds one
-    `ALPHA`.
+    F9 forwards — `a_0_29_0_store_reads_back_identically_under_the_current_tree` and
+    `a_0_29_0_tree_resumes_under_the_current_tree` run the real 0.29.0-written fixtures against this
+    tree, unchanged. Both pass.
   - >
-    F8 backwards — `a_0_30_0_store_is_read_by_a_0_29_0_binary` writes a store using every 0.30.0
-    surface (a pinned decision, a plain fact, a finished run) and then execs the pinned 0.29.0
-    binary's `read` mode over it. Ran locally: exit 0, `"reader": "io-harness 0.29.0"`, both keys and
-    both values read back, attribution intact. What it does not see is the kind and the pinned flag,
-    which is the point — those are columns its queries never name.
+    F9 backwards, and stronger than the criterion asked for.
+    `a_current_store_is_read_by_a_0_29_0_binary` execs the pinned `io-harness =0.29.0` build over a
+    store this tree wrote carrying a proposed AND approved plan. Exit 0,
+    `"reader": "io-harness 0.29.0"`, both memory entries with their attribution, and the run outcome
+    — because its queries never name the `plans` table. Run locally as well as in CI.
   - >
-    That test is `#[ignore]` by default, because it needs `tests/fixtures/gen-0.29.0` built and a
-    test that silently passes when its subject is missing is worse than one visibly not run. CI's
-    new `cross-version-0.29.0` job builds the generator and runs it with `-- --ignored --exact`.
+    **Deviation, stated rather than glossed.** The criterion named a 0.30.0 binary. The pinned
+    generator in the tree is 0.29.0, and a 0.29.0 binary lacks everything a 0.30.0 one lacks and
+    more — 0.30.0's two `memory` columns and its `memory_recalls` table as well as this release's
+    `plans` table — so the boundary tested is a two-release gap rather than a one-release gap. It is
+    a strictly stronger claim, proven by the technique the criterion named, and it costs no second
+    pinned crate to build and keep in sync. Tests renamed off the version of this tree so they do not
+    need renaming every release; `ci.yml`'s `--exact` argument and job display name follow.
   - >
-    The job carries a control of its own: it greps `tests/fixtures/gen-0.29.0/Cargo.toml` for
-    `io-harness = "=0.29.0"` and fails if the pin has drifted. That is the one way this job could
-    quietly stop proving anything — an "older binary" that is not older — and the failure would
-    otherwise be silent by construction. Same instinct as the `links-consumer` job's negative
-    control.
+    N1 — `cargo tree` reads **402 lines**, identical to 0.23.0 through 0.30.0.
+    `cargo tree --all-features` reads **842**. No dependency was added; nothing here needed one.
   - >
-    `cargo test --test cross_version_0_29_0` 2 passed, 1 ignored; with `-- --ignored`, 1 passed.
-    The CI file parses and its job list is test, msrv, lint, links-consumer, cross-version-0.29.0,
-    docs.
+    Gates, in the order CI runs them and as the last thing to touch the tree.
+    `cargo fmt --check` clean.
+    `cargo clippy --all-targets --all-features -- -D warnings` exit 0
+    (`.ultraship/evidence/0.31.0/clippy.txt`).
+    `cargo test` exit 0 — 55 `test result: ok` lines, 1,192 assertions passed, 0 failed, 311
+    doctests (`tests-default.txt`).
+    `cargo test --all-features --lib --tests` exit 0 — 54 ok lines, 958 passed, 0 failed
+    (`tests-all-features.txt`).
+    `cargo test --all-features --doc` exit 0 — 313 passed, 0 failed (`tests-doc.txt`).
+    `cargo doc --no-deps --all-features` — 0 warnings.
+  - >
+    O3 — `cargo package --locked` exit 0: **200 files, 4.6MiB (1.1MiB compressed)**, and the packaged
+    crate compiled under `target/package/io-harness-0.31.0`
+    (`.ultraship/evidence/0.31.0/package.txt`).
+  - >
+    Trap 1 was paid again and is worth recording: `target/` reached 22.7GiB and filled the disk to
+    146MiB free mid-suite, which surfaced as an `ENOSPC` opening an unrelated scratch file rather
+    than as a build error. `cargo clean` before `cargo package` is not optional on this machine.
+    Trap 2 was paid too: `cargo test --all-features --lib --tests` on a clean tree fails
+    `crash_resume_after_a_real_sigkill` because it does not build `examples/`; `cargo build
+    --all-features --examples` first. The new `examples/plan_gate_fixture` inherits exactly the same
+    requirement.
 
-- id: US-IO-HARNESS-0.30.0-T07
-  summary: >
-    Documentation: the three guide pages, `docs/CONTRACT.md`, `CHANGELOG.md`, `docs/public-api.txt`,
-    the version bump, and a worked example on every added public item.
-  why_required: >
-    A capability documented only in rustdoc is a capability only a reader who already knows it exists
-    will find, and the public-surface snapshot is enforced by a test rather than by habit.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.30.0-T02
-  - US-IO-HARNESS-0.30.0-T04
-  - US-IO-HARNESS-0.30.0-T05
-  acceptance_criteria:
-  - >
-    **N3 — nothing breaks.** No public item is renamed or removed, no signature changes, no default
-    changes. `docs/public-api.txt` gains lines and loses none, and the changelog carries no
-    `**BREAKING` entry. If one becomes necessary the release is wrong, not the rule.
-  - >
-    **N4 — every added public item carries a worked example**, enforced by the existing test that
-    enumerates the surface re-exported from `lib.rs` and fails on any item whose docs carry no
-    fenced example.
-  files:
-  - docs/guide/configuration.md
-  - docs/guide/context-and-memory.md
-  - docs/guide/accounting.md
-  - docs/CONTRACT.md
-  - docs/public-api.txt
-  - CHANGELOG.md
-  - README.md
-  - src/lib.rs
-  - Cargo.toml
-  - Cargo.lock
-  evidence:
-  - >
-    N3 — `docs/public-api.txt` gains six lines and loses none: `enum MemoryKind`, `struct FirstTry`,
-    `struct MemoryRecall`, `struct MemoryWrite`, `struct Recovery`, `struct Tally`. `config::Origin`
-    is deliberately NOT there, because it is not re-exported from `lib.rs` — same as `config::Scope`,
-    which it sits beside. `tests/public_api.rs` 9 passed, including `public_surface_matches_snapshot`
-    and `drift_reports_a_removal`.
-  - >
-    N4 — `every_public_item_has_a_worked_example` passes, so each of the six carries a fenced example
-    that compiles. `cargo test --doc` 271 passed at the point the memory work landed and the new
-    aggregate examples were added after it; the full-suite run under T08 is the one that covers them
-    all at once.
-  - >
-    The changelog's 0.30.0 section carries no `**BREAKING` entry and
-    `tests/changelog.rs` 5 passed. Version bumped to 0.30.0 in `Cargo.toml` and `Cargo.lock`.
-  - >
-    `docs/CONTRACT.md` gains the provenance bullet in the configuration section and four new entries
-    under "Limits that hold today": that an aggregate is one indexed query and NOT constant-time,
-    with the measured numbers; that gate failures group by phase and not by criterion; that
-    `Recovery` has no escalation count; that a pin binds a run and not the caller holding the store;
-    and that `MemoryEntry` gained two fields, which a caller constructing one in a literal must name.
-  - >
-    The three guide pages gain a section each — "Which file decided one key", "A correction that
-    sticks" and "Which notes a run actually used", "What the runs did, not just what they cost" —
-    plus a limits paragraph on each page. Written by a subagent against a brief and reviewed here.
-    It found one thing the brief had wrong and documented it rather than papering over it:
-    `memory_delete` and `memory_clear` have no pin guard, so a pinned entry is not tamper-proof
-    against the caller — which is the same bound `docs/CONTRACT.md` now states.
-  - >
-    `README.md` and the crate-root rustdoc updated in the same commit stream rather than later: the
-    memory paragraph, the configuration paragraph, a new "What the trace adds up to" paragraph
-    naming the five grouped accessors, and two guide-index rows. `cargo doc --no-deps
-    --all-features` is warning-free and `tests/readme.rs`, `tests/docs_drift.rs`,
-    `tests/guide_pages.rs` all pass.
-
-- id: US-IO-HARNESS-0.30.0-T08
-  summary: >
-    The release gates: `cargo fmt --check`, clippy `-D warnings`, the three test invocations,
-    `cargo tree` unchanged, `cargo package --locked`, and the three-OS matrix green on the commit
-    being released.
-  why_required: >
-    Every one of these is a refusal `release.yml` performs anyway; failing them here costs a re-run,
-    failing them there costs a release.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.30.0-T06
-  - US-IO-HARNESS-0.30.0-T07
-  acceptance_criteria:
-  - >
-    **N1 — no new dependency.** `cargo tree` on macOS and Linux is unchanged. This release is three
-    accessors, two fields and a table; anything it needs is already here.
-  - >
-    **O1 — the three-OS matrix is green** on the commit being released, including the MSRV job.
-  - >
-    **O2 — docs.rs builds.** Checked by the nightly job, because a stable `cargo doc` passing is not
-    evidence that docs.rs does — the 0.16.2 lesson, which cost two releases without a rendered page.
-  - >
-    **O3 — `cargo package --locked` succeeds**, and the packaged crate's tests compile.
-  files:
-  - .ultraship/evidence/0.30.0
-  evidence:
-  - >
-    `cargo fmt --check` clean. `cargo clippy --all-targets -- -D warnings` clean, and both feature
-    legs CI runs separately — `--features documents` and `--features media` — clean too.
-  - >
-    `cargo test` (default features): every one of the 29 test binaries green, 279 doctests passed,
-    0 failed. `cargo test --all-features --lib --tests`: 52 green result lines, 0 failed.
-    `cargo test --all-features --doc`: 281 passed, 0 failed.
-  - >
-    N1 — `cargo tree` is **402 lines**, exactly what 0.23.0 through 0.29.0 recorded. `cargo tree
-    --all-features` is 842. No dependency was added; nothing in this release needed one.
-  - >
-    O3 — `cargo package --locked` succeeded: 197 files, 4.5MiB (1.1MiB compressed), and the packaged
-    crate compiled in `target/package/io-harness-0.30.0`.
-  - >
-    Two failures on the way, both real and both worth recording. `tests/cross_version.rs` failed
-    first: 0.30.0 is the first release to ALTER a table rather than only add one, and that test's
-    rule was "no statement 0.22.0 wrote may be altered". The rule was made precise rather than
-    relaxed — it now names the table and the exact columns added, and removing them from the new
-    statement must reproduce the old one character for character. `ALTER TABLE ADD COLUMN` also puts
-    the definition after the last column and before the table constraints, not at the end, which a
-    prefix-shaped first attempt got wrong and the test caught.
-  - >
-    The second was `checkpoint::crash_resume_after_a_real_sigkill_reaches_verified_success` failing
-    right after `cargo clean`, because `--lib --tests` does not build `examples/` and that test execs
-    one. Known trap, not a defect: CI's plain `cargo test` step builds the examples first.
-    `cargo build --all-features --examples` then a re-run: green.
-  - >
-    Disk: `target/` reached 14GiB before the all-features leg and `cargo clean` was run
-    pre-emptively before packaging (19.7GiB and 20.8GiB freed across two cleans), which is the
-    standing remedy for the ENOSPC failures this repository keeps paying for.
-  - >
-    O1 and O2 are the two gates a local run cannot close — the three-OS matrix including the MSRV job,
-    and the docs.rs nightly build — and both run on the pushed commit. Recorded here as pending CI at
-    seal time, and the release record states the ordering rather than implying these were green
-    before they had run.

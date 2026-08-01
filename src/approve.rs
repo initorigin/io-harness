@@ -674,3 +674,401 @@ impl Responder for StdinResponder {
         })
     }
 }
+
+// ===========================================================================
+// 0.31.0 — proposing before acting, which is neither of the two above
+// ===========================================================================
+
+/// One step of a [`Plan`]: what will be done, and who will do it.
+///
+/// The owner is the whole reason this is a struct rather than a string. A plan
+/// that says *what* without saying *which agent* is a list an operator has to
+/// guess the shape of; naming the sub-agent makes "search with the cheap model,
+/// write with the strong one" reviewable before a token is spent on either.
+///
+/// ```
+/// use io_harness::PlanStep;
+///
+/// // A step the root will do itself names no agent.
+/// let read = PlanStep::new("read every call site of `parse`");
+/// assert!(read.agent.is_none());
+///
+/// // One it will hand off names the definition that will own it.
+/// let port = PlanStep::new("port the parser").by("writer");
+/// assert_eq!(port.agent.as_deref(), Some("writer"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct PlanStep {
+    /// What this step will do, in a short phrase.
+    pub intent: String,
+    /// The [`AgentDef`](crate::AgentDef) name that will own it, or `None` when the
+    /// agent proposing the plan will do it itself.
+    ///
+    /// A name that is not on the run's roster is refused back to the model rather
+    /// than accepted — a plan whose owner does not exist is a plan that cannot be
+    /// carried out, and finding that out at approval time is cheaper than finding
+    /// it out at the spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+}
+
+impl PlanStep {
+    /// A step the proposing agent will do itself.
+    ///
+    /// ```
+    /// use io_harness::PlanStep;
+    ///
+    /// assert_eq!(PlanStep::new("run the tests").intent, "run the tests");
+    /// ```
+    pub fn new(intent: impl Into<String>) -> Self {
+        Self {
+            intent: intent.into(),
+            agent: None,
+        }
+    }
+
+    /// Hand this step to a named agent definition.
+    ///
+    /// ```
+    /// use io_harness::PlanStep;
+    ///
+    /// let step = PlanStep::new("review the diff").by("critic");
+    /// assert_eq!(step.agent.as_deref(), Some("critic"));
+    /// ```
+    pub fn by(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
+        self
+    }
+}
+
+/// What the agent proposes to do, in order, before it does any of it.
+///
+/// The distinction from the 0.21.0 todo list is the reason this type exists, and
+/// the crate keeps it everywhere:
+///
+/// | | is | the operator |
+/// |---|---|---|
+/// | [`TodoItem`](crate::TodoItem) / `todo_write` | a plan the agent is executing | watches it |
+/// | `Plan` / [`PlanGate`] | a plan the agent has not started | answers it |
+///
+/// A `Plan` reaches a [`PlanGate`] and the run performs nothing — no write, no
+/// exec, no spawned child — until a verdict comes back. It is persisted first, so
+/// the answer may arrive in a different process on a different day.
+///
+/// ```
+/// use io_harness::{Plan, PlanStep};
+///
+/// let plan = Plan::new([
+///     PlanStep::new("find every implementation of `Provider`"),
+///     PlanStep::new("write the new method with a default").by("writer"),
+///     PlanStep::new("check nothing out of tree breaks").by("critic"),
+/// ]);
+///
+/// assert_eq!(plan.steps.len(), 3);
+/// // Which steps are handed off is the half an operator is reviewing.
+/// let delegated: Vec<&str> = plan.agents().collect();
+/// assert_eq!(delegated, ["writer", "critic"]);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct Plan {
+    /// The steps, in the order the agent intends to take them.
+    pub steps: Vec<PlanStep>,
+}
+
+impl Plan {
+    /// A plan from its steps.
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep};
+    ///
+    /// assert_eq!(Plan::new([PlanStep::new("one")]).steps.len(), 1);
+    /// ```
+    pub fn new<I: IntoIterator<Item = PlanStep>>(steps: I) -> Self {
+        Self {
+            steps: steps.into_iter().collect(),
+        }
+    }
+
+    /// Every distinct agent name this plan hands work to, in first-mention order.
+    ///
+    /// What a gate checks against a roster, and what a UI lists when it asks "who
+    /// is this going to spawn".
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep};
+    ///
+    /// let plan = Plan::new([
+    ///     PlanStep::new("a").by("writer"),
+    ///     PlanStep::new("b"),
+    ///     PlanStep::new("c").by("writer"),
+    /// ]);
+    /// // Named twice, listed once: this answers "who", not "how many steps".
+    /// assert_eq!(plan.agents().collect::<Vec<_>>(), ["writer"]);
+    /// ```
+    pub fn agents(&self) -> impl Iterator<Item = &str> {
+        let mut seen: Vec<&str> = Vec::new();
+        for step in &self.steps {
+            if let Some(a) = step.agent.as_deref() {
+                if !seen.contains(&a) {
+                    seen.push(a);
+                }
+            }
+        }
+        seen.into_iter()
+    }
+
+    /// The plan as the lines a human reads and the model is handed back.
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep};
+    ///
+    /// let plan = Plan::new([
+    ///     PlanStep::new("read the call sites"),
+    ///     PlanStep::new("port them").by("writer"),
+    /// ]);
+    /// assert_eq!(plan.render(), "1. read the call sites\n2. [writer] port them");
+    /// ```
+    pub fn render(&self) -> String {
+        self.steps
+            .iter()
+            .enumerate()
+            .map(|(i, s)| match s.agent.as_deref() {
+                Some(a) => format!("{}. [{a}] {}", i + 1, s.intent),
+                None => format!("{}. {}", i + 1, s.intent),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// What a [`PlanGate`] decided about a [`Plan`].
+///
+/// Three answers, and the middle one is the reason a gate is not an
+/// [`Approver`]: a plan that is nearly right is the common case, and the useful
+/// response to it is a correction rather than a refusal.
+///
+/// ```
+/// use io_harness::PlanVerdict;
+///
+/// // The correction is text the model reads and re-plans from. It authorizes
+/// // nothing — the run is still in its planning phase afterwards.
+/// let back = PlanVerdict::revise("do not touch the generated files");
+/// assert!(matches!(back, PlanVerdict::Revise { .. }));
+///
+/// // Cancel ends the run. Nothing was written, because nothing had been.
+/// assert_eq!(PlanVerdict::Cancel.as_str(), "cancel");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanVerdict {
+    /// Carry it out. The planning phase ends and the plan is handed to the model
+    /// as the approach it agreed to.
+    Approve,
+    /// Not this one. `correction` reaches the model as an observation and it
+    /// proposes again; the run stays in its planning phase and still writes
+    /// nothing.
+    Revise {
+        /// What to change, surfaced to the model so its next plan is different.
+        correction: String,
+    },
+    /// Do not do this at all. The run stops with
+    /// [`RunOutcome::PlanRejected`](crate::RunOutcome::PlanRejected).
+    Cancel,
+}
+
+impl PlanVerdict {
+    /// Send the plan back with a correction.
+    ///
+    /// ```
+    /// use io_harness::PlanVerdict;
+    ///
+    /// let v = PlanVerdict::revise("start with the tests");
+    /// assert_eq!(v.as_str(), "revise");
+    /// ```
+    pub fn revise(correction: impl Into<String>) -> Self {
+        PlanVerdict::Revise {
+            correction: correction.into(),
+        }
+    }
+
+    /// The stored spelling: `"approve"`, `"revise"` or `"cancel"`.
+    ///
+    /// ```
+    /// use io_harness::PlanVerdict;
+    ///
+    /// assert_eq!(PlanVerdict::Approve.as_str(), "approve");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PlanVerdict::Approve => "approve",
+            PlanVerdict::Revise { .. } => "revise",
+            PlanVerdict::Cancel => "cancel",
+        }
+    }
+}
+
+/// The future a [`PlanGate`] returns. Boxed for the same reason
+/// [`DecisionFuture`] and [`AnswerFuture`] are: object safety.
+///
+/// `Option<PlanVerdict>`, not `PlanVerdict`: `None` is "nobody in this process
+/// can answer", which is a real answer and the one that makes the run persist the
+/// plan and stop rather than guess. It is [`Responder`]'s shape deliberately —
+/// a caller who knows how a question pauses a run already knows how a plan does.
+///
+/// ```
+/// use io_harness::{Plan, PlanGate, PlanReview, PlanVerdict};
+///
+/// /// Approves anything that hands nothing to a sub-agent, and refers the rest.
+/// #[derive(Debug)]
+/// struct SoloOnly;
+///
+/// impl PlanGate for SoloOnly {
+///     fn review<'a>(&'a self, plan: &'a Plan) -> PlanReview<'a> {
+///         Box::pin(async move {
+///             match plan.agents().next() {
+///                 None => Some(PlanVerdict::Approve),
+///                 Some(_) => None, // a human decides whether to spend on a tree
+///             }
+///         })
+///     }
+/// }
+/// # let _ = SoloOnly;
+/// ```
+pub type PlanReview<'a> = Pin<Box<dyn Future<Output = Option<PlanVerdict>> + Send + 'a>>;
+
+/// Decides whether the agent may carry out the plan it proposed.
+///
+/// Registering one is what turns the planning phase on. Until the gate answers
+/// [`PlanVerdict::Approve`], the run's effective policy denies every
+/// [`Act::Write`] and every [`Act::Exec`] under a `plan-gate`
+/// layer, so the agent can read the workspace, think, and change nothing in it.
+/// Reads stay open on purpose: a plan written without looking is not worth
+/// gating.
+///
+/// `&self` and `Send + Sync` for the reason [`Approver`] and [`Responder`] are —
+/// one gate serves a whole run — and `Debug` because
+/// [`TaskContract`](crate::TaskContract) derives it.
+///
+/// ```
+/// use io_harness::{Plan, PlanGate, PlanReview, PlanVerdict};
+///
+/// /// A budget rule that would have been fiddly to write in a policy: no more
+/// /// than five steps, and nothing handed to the expensive definition.
+/// #[derive(Debug)]
+/// struct Frugal;
+///
+/// impl PlanGate for Frugal {
+///     fn review<'a>(&'a self, plan: &'a Plan) -> PlanReview<'a> {
+///         Box::pin(async move {
+///             Some(if plan.steps.len() > 5 {
+///                 PlanVerdict::revise("five steps at most; fold the small ones together")
+///             } else if plan.agents().any(|a| a == "deep-thinker") {
+///                 PlanVerdict::revise("do not spawn `deep-thinker` for this")
+///             } else {
+///                 PlanVerdict::Approve
+///             })
+///         })
+///     }
+/// }
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let verdict = rt.block_on(Frugal.review(&Plan::new(
+///     (0..6).map(|i| io_harness::PlanStep::new(format!("step {i}"))),
+/// )));
+/// assert_eq!(verdict, Some(PlanVerdict::revise(
+///     "five steps at most; fold the small ones together",
+/// )));
+/// ```
+pub trait PlanGate: Send + Sync + fmt::Debug {
+    /// Review one plan, or return `None` to let the run pause for a human.
+    fn review<'a>(&'a self, plan: &'a Plan) -> PlanReview<'a>;
+}
+
+/// Decides nothing, so every plan pauses the run for a human.
+///
+/// The honest gate for an unattended run, and the counterpart of
+/// [`ResponderNone`]: a machine standing in for an absent human is exactly what a
+/// decision about *whether to do the work at all* must not have. The plan is
+/// persisted and the run is resumable, so nothing is lost by waiting.
+///
+/// ```
+/// use io_harness::{Plan, PlanGate, PlanGateNone, PlanStep};
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let plan = Plan::new([PlanStep::new("rewrite the parser")]);
+/// assert!(rt.block_on(PlanGateNone.review(&plan)).is_none(), "it defers, and the run pauses");
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PlanGateNone;
+
+impl PlanGate for PlanGateNone {
+    fn review<'a>(&'a self, _plan: &'a Plan) -> PlanReview<'a> {
+        Box::pin(async { None })
+    }
+}
+
+/// Approves every plan. For tests, and for a caller who wants the *shape* of the
+/// gate — a proposal recorded before anything is written — without a human in it.
+///
+/// It is narrower than it sounds, in the way [`ApproveAll`] is: the planning
+/// phase still happened, the plan is still in the store, and an
+/// [`Observer`](crate::Observer) still saw it. What it removes is the wait.
+///
+/// ```
+/// use io_harness::{AcceptPlan, Plan, PlanGate, PlanStep, PlanVerdict};
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let verdict = rt.block_on(AcceptPlan.review(&Plan::new([PlanStep::new("go")])));
+/// assert_eq!(verdict, Some(PlanVerdict::Approve));
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AcceptPlan;
+
+impl PlanGate for AcceptPlan {
+    fn review<'a>(&'a self, _plan: &'a Plan) -> PlanReview<'a> {
+        Box::pin(async { Some(PlanVerdict::Approve) })
+    }
+}
+
+/// Prints the plan on the terminal and reads a verdict back, so a CLI gets a plan
+/// gate without building one.
+///
+/// `y` approves, `n` cancels, an empty line defers to a human later, and anything
+/// else is taken as the correction — which is what someone types when the plan is
+/// nearly right, and the reason the prompt does not insist on a letter.
+///
+/// Blocking stdin on the async runtime is acceptable for the reason it is in
+/// [`StdinApprover`]: a run waiting for a human has nothing else to do.
+///
+/// ```no_run
+/// use io_harness::{StdinPlanGate, TaskContract};
+/// use std::sync::Arc;
+///
+/// // The agent reads the workspace, proposes, and stops at the terminal. Nothing
+/// // under /repo has been touched at the moment the prompt appears.
+/// let contract = TaskContract::workspace("port the parser", "/repo")
+///     .with_plan_gate(Arc::new(StdinPlanGate));
+/// # let _ = contract;
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StdinPlanGate;
+
+impl PlanGate for StdinPlanGate {
+    fn review<'a>(&'a self, plan: &'a Plan) -> PlanReview<'a> {
+        Box::pin(async move {
+            use std::io::Write;
+            println!("\n[the agent proposes]\n{}", plan.render());
+            print!("approve? [y/N, empty to decide later, or type a correction] ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            if std::io::stdin().read_line(&mut line).is_err() {
+                return None;
+            }
+            match line.trim() {
+                "" => None,
+                y if y.eq_ignore_ascii_case("y") => Some(PlanVerdict::Approve),
+                n if n.eq_ignore_ascii_case("n") => Some(PlanVerdict::Cancel),
+                correction => Some(PlanVerdict::revise(correction)),
+            }
+        })
+    }
+}

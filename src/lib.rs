@@ -367,8 +367,9 @@ mod verify;
 pub mod web;
 
 pub use approve::{
-    AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Question, Request,
-    Responder, ResponderNone, StdinApprover, StdinResponder,
+    AcceptPlan, AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Plan,
+    PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict, Question, Request, Responder,
+    ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
 };
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
@@ -385,7 +386,7 @@ pub use net::REQUEST_TIMEOUT;
 pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
-    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, ModelInfo, OpenAi,
+    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, ModelInfo, OpenAi,
     OpenRouter, PriceSource, Provider, Reference, ToolCall, ToolSpec, Usage,
 };
 #[cfg(feature = "media")]
@@ -399,10 +400,12 @@ pub use run::{
     resume, resume_from_stored_policy, resume_from_stored_policy_observed, resume_observed,
     resume_tree, resume_tree_from_stored_policy, resume_tree_from_stored_policy_observed,
     resume_tree_observed, resume_tree_with_answer, resume_tree_with_answer_observed,
-    resume_tree_with_decision, resume_tree_with_decision_observed, resume_with, resume_with_answer,
+    resume_tree_with_decision, resume_tree_with_decision_observed, resume_tree_with_plan_decision,
+    resume_tree_with_plan_decision_observed, resume_with, resume_with_answer,
     resume_with_answer_observed, resume_with_decision, resume_with_decision_observed,
-    resume_with_observed, rewind, run, run_observed, run_tree, run_tree_observed, run_with,
-    run_with_observed, Rewind, RunOutcome, RunResult, SPAWN_TOOL,
+    resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed, rewind,
+    run, run_observed, run_tree, run_tree_observed, run_with, run_with_observed, Rewind,
+    RunOutcome, RunResult, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
@@ -419,15 +422,17 @@ pub use skills::{Skill, Skills};
 pub use agent::{AgentDef, Agents};
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, McpEvent, MemoryEntry, MemoryKind,
-    MemoryRecall, MemoryWrite, Pending, PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall,
-    Recovery, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Tally, TodoItem,
-    TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
-    MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
+    MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle,
+    ProviderCall, Recovery, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store,
+    Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS,
+    MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP,
+    UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;
 pub use tools::{
-    Tool, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, TODO_WRITE_TOOL,
+    Tool, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, PROPOSE_PLAN_TOOL,
+    TODO_WRITE_TOOL,
 };
 pub use verify::{ExecGuard, Verification, TEST_BINARY};
 pub use web::{Citation, ServerToolCall, WebAccess};

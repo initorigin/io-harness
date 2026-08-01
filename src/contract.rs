@@ -193,6 +193,29 @@ pub struct TaskContract {
     /// [`Toolbox`](crate::Toolbox) is, and governing the whole tree: a spawned
     /// child searches under the same declaration its parent did.
     pub web: Option<crate::web::WebAccess>,
+    /// Who reviews the plan the agent proposes, before it acts on any of it
+    /// (0.31.0).
+    ///
+    /// `None` — the default, and every release before 0.31.0 — is no plan gate at
+    /// all: the run starts working immediately, exactly as it always has.
+    /// `Some(gate)` opens the run in a planning phase where every
+    /// [`Act::Write`](crate::Act::Write) and [`Act::Exec`](crate::Act::Exec) is
+    /// denied under a `plan-gate` policy layer, and the only way out is a
+    /// [`Plan`](crate::Plan) the gate approves.
+    ///
+    /// Workspace mode only, and the root agent only. A spawned child does not hold
+    /// its own gate: a hundred children each pausing on a plan is the problem the
+    /// gate exists to prevent, not a feature of it.
+    ///
+    /// Behind an `Arc` for the same reason [`Self::responder`] is.
+    pub plan_gate: Option<std::sync::Arc<dyn crate::approve::PlanGate>>,
+    /// How hard the root agent's model should think (0.31.0).
+    ///
+    /// `None` — the default, and every release before 0.31.0 — asks for nothing and
+    /// sends the body 0.30.0 sent, leaving the vendor's own default in place. A
+    /// spawned child takes the tier on its [`AgentDef`](crate::AgentDef) instead,
+    /// which is where "search cheaply, write carefully" is said.
+    pub effort: Option<crate::provider::Effort>,
 }
 
 impl TaskContract {
@@ -205,6 +228,8 @@ impl TaskContract {
             root: None,
             constraints: Vec::new(),
             verify,
+            plan_gate: None,
+            effort: None,
             max_steps: 8,
             max_duration: None,
             max_tokens: None,
@@ -258,6 +283,8 @@ impl TaskContract {
             root: Some(root),
             constraints: Vec::new(),
             verify: Verification::None,
+            plan_gate: None,
+            effort: None,
             max_steps: 12,
             max_duration: None,
             max_tokens: None,
@@ -458,6 +485,63 @@ impl TaskContract {
     /// ```
     pub fn with_agents(mut self, agents: crate::agent::Agents) -> Self {
         self.agents = agents;
+        self
+    }
+
+    /// Require the agent to propose a plan and have it reviewed before it acts
+    /// (0.31.0).
+    ///
+    /// The run opens in a planning phase: the agent may read the workspace and may
+    /// change nothing in it — every [`Act::Write`](crate::Act::Write) and
+    /// [`Act::Exec`](crate::Act::Exec) is denied under a `plan-gate` policy layer,
+    /// which covers registered and MCP tools too because those are exec checks —
+    /// and the only way out is a [`Plan`](crate::Plan) the gate approves.
+    ///
+    /// Without a gate the run works immediately, exactly as every release before
+    /// 0.31.0 did. This is not [`TODO_WRITE_TOOL`](crate::TODO_WRITE_TOOL): that is
+    /// a plan the operator *watches* while it executes, this is one that executes
+    /// nothing until an answer arrives.
+    ///
+    /// When nothing in this process answers, the plan is persisted and the run stops
+    /// with [`RunOutcome::AwaitingPlan`](crate::RunOutcome::AwaitingPlan), so the
+    /// process may exit and
+    /// [`resume_with_plan_decision`](crate::resume_with_plan_decision) continues it
+    /// later under the same run id.
+    ///
+    /// ```
+    /// use io_harness::{PlanGateNone, TaskContract};
+    /// use std::sync::Arc;
+    ///
+    /// // Unattended and honest: every plan pauses for a human, and nothing under
+    /// // /repo is touched while it waits.
+    /// let contract = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_plan_gate(Arc::new(PlanGateNone));
+    ///
+    /// assert!(contract.plan_gate.is_some());
+    /// ```
+    pub fn with_plan_gate(mut self, gate: std::sync::Arc<dyn crate::approve::PlanGate>) -> Self {
+        self.plan_gate = Some(gate);
+        self
+    }
+
+    /// Ask for a reasoning tier on the root agent's completions (0.31.0).
+    ///
+    /// A request rather than a fact, in the sense a model slug is: each vendor is
+    /// asked in its own dialect and one that cannot be asked ignores it.
+    /// [`Usage::reasoning_tokens`](crate::Usage::reasoning_tokens) is what says
+    /// whether anything was thought. A spawned child takes the tier on its
+    /// [`AgentDef`](crate::AgentDef) instead.
+    ///
+    /// ```
+    /// use io_harness::{provider::Effort, TaskContract};
+    ///
+    /// let contract = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_effort(Effort::High);
+    ///
+    /// assert_eq!(contract.effort, Some(Effort::High));
+    /// ```
+    pub fn with_effort(mut self, effort: crate::provider::Effort) -> Self {
+        self.effort = Some(effort);
         self
     }
 

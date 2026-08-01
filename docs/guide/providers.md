@@ -370,6 +370,46 @@ run-time catalogue beats a compiled-in price list.
 A model the vendor did not price is **absent from the table**, so
 `Spend::unpriced_calls` counts it. It is never entered at zero.
 
+## Asking a model to think harder (0.31.0)
+
+`Effort` is a tier — `Low`, `Medium`, `High` — set on a `TaskContract` for the
+root agent or on an `AgentDef` for a role:
+
+```rust
+use io_harness::{AgentDef, Agents, Effort, TaskContract};
+
+let contract = TaskContract::workspace("port the parser", "/repo")
+    .with_effort(Effort::Medium)
+    .with_agents(
+        Agents::new()
+            .with(AgentDef::new("searcher").with_model("cheap").with_effort(Effort::Low))
+            .with(AgentDef::new("critic").with_model("strong").with_effort(Effort::High)),
+    );
+```
+
+The definition's tier wins over the run's, which is the sentence `AgentDef` could
+not say before: search cheaply, think hard only where thinking is the work.
+
+Each vendor is asked in its own dialect —`reasoning.effort` on OpenRouter,
+`reasoning_effort` on OpenAI and `Compatible`, and a `thinking` budget on
+Anthropic, which has no tiers — and the full table, including what each vendor
+does *not* do, is in [the contract](../CONTRACT.md). Two things are worth knowing
+before you set one:
+
+**OpenAI returns no thinking text.** The tier changes how the model behaves and
+`CompletionResponse::reasoning` stays `None`, because the Chat Completions API
+does not return it. `Usage::reasoning_tokens` is the only visibility on that path.
+
+**It is a request, not a fact.** A model that does not reason ignores it, and
+nothing is refused for asking, because the crate has no way to know which models
+reason. Read `Usage::reasoning_tokens` to find out whether anything happened.
+
+Where the thinking *is* returned it reaches an `Observer` as
+`EventKind::Reasoning` and goes nowhere else — not to the observation ledger, and
+therefore not into the next turn's prompt. A vendor bills thinking once as output;
+folding it into the next request would bill it again as input, every turn, for
+the rest of the run.
+
 ## The limits, stated plainly
 
 **`Compatible` sends one wire. It is not a compatibility layer.** Every vendor

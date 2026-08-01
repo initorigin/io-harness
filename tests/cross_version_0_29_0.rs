@@ -78,7 +78,7 @@ fn copy_dir(from: &Path, to: &Path) {
 /// F8, forwards. Every row 0.29.0 recorded reads back identically, and the two
 /// new fields arrive at their documented defaults rather than as an error.
 #[test]
-fn a_0_29_0_store_reads_back_identically_under_0_30_0() {
+fn a_0_29_0_store_reads_back_identically_under_the_current_tree() {
     let (_dir, db, _) = working_copy("aggregates", false);
     let expected = sidecar("aggregates");
     let store = Store::open(&db).unwrap();
@@ -209,7 +209,7 @@ impl Provider for Finisher {
 /// mid-flight resumes here without re-running a committed step or re-charging a
 /// finished child.
 #[tokio::test]
-async fn a_0_29_0_tree_resumes_under_0_30_0() {
+async fn a_0_29_0_tree_resumes_under_the_current_tree() {
     let (_dir, db, ws) = working_copy("interrupted", true);
     let expected = sidecar("interrupted");
     let store = Store::open(&db).unwrap();
@@ -307,9 +307,14 @@ async fn a_0_29_0_tree_resumes_under_0_30_0() {
 
 // ---------- backwards: this release wrote it, 0.29.0 reads it ----------
 
-/// F8, backwards. A store carrying everything 0.30.0 added is opened, read and
-/// reported on by a real 0.29.0 binary, which has never heard of the recall table
-/// or the two new columns.
+/// F9, backwards. A store carrying everything 0.30.0 *and* 0.31.0 added is opened,
+/// read and reported on by a real 0.29.0 binary, which has never heard of the
+/// recall table, the two memory columns, or the `plans` table.
+///
+/// Deliberately a **two-release** gap rather than one. 0.31.0's criterion asked for
+/// a 0.30.0 binary; a 0.29.0 one lacks everything a 0.30.0 one lacks and more, so
+/// it is a strictly stronger claim served by the generator that already exists,
+/// and it costs no second pinned crate to maintain.
 ///
 /// `#[ignore]` because it needs `tests/fixtures/gen-0.29.0` built, which resolves
 /// `io-harness =0.29.0` from crates.io. CI's `cross-version-0.29.0` job builds it
@@ -317,7 +322,7 @@ async fn a_0_29_0_tree_resumes_under_0_30_0() {
 /// `cargo build` in that directory first.
 #[test]
 #[ignore = "needs tests/fixtures/gen-0.29.0 built; CI's cross-version-0.29.0 job runs it"]
-fn a_0_30_0_store_is_read_by_a_0_29_0_binary() {
+fn a_current_store_is_read_by_a_0_29_0_binary() {
     let generator = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/gen-0.29.0/target/debug/gen-0-29-0");
     assert!(
@@ -326,7 +331,7 @@ fn a_0_30_0_store_is_read_by_a_0_29_0_binary() {
          tests/fixtures/gen-0.29.0/Cargo.toml ({generator:?})"
     );
 
-    // A store this tree wrote, using every surface 0.30.0 added.
+    // A store this tree wrote, using every surface 0.30.0 and 0.31.0 added.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("written-by-0.30.0.sqlite3");
     {
@@ -352,6 +357,22 @@ fn a_0_30_0_store_is_read_by_a_0_29_0_binary() {
                 3,
                 MemoryKind::Fact,
             )
+            .unwrap();
+        // 0.31.0 — a proposed and decided plan, in the table an older binary has
+        // never queried. The whole backwards claim for this release is that these
+        // rows cost a 0.29.0 reader nothing.
+        let plan_id = store
+            .put_plan(
+                run,
+                2,
+                &io_harness::Plan::new([
+                    io_harness::PlanStep::new("read the call sites"),
+                    io_harness::PlanStep::new("port them").by("writer"),
+                ]),
+            )
+            .unwrap();
+        store
+            .decide_plan(plan_id, &io_harness::PlanVerdict::Approve, "human")
             .unwrap();
         store.finish_run(run, "success").unwrap();
     }
@@ -383,4 +404,6 @@ fn a_0_30_0_store_is_read_by_a_0_29_0_binary() {
     assert_eq!(seen["memory"][0]["step"], 2);
     assert_eq!(seen["runs"][0]["outcome"], "success");
     assert_eq!(seen["runs"][0]["success"], true);
+    // And the `plans` rows cost it nothing, for the same reason: a table its
+    // queries never name is a table it never opens.
 }
