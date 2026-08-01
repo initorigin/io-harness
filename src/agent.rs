@@ -94,6 +94,22 @@ pub struct AgentDef {
     /// A step cap for this agent, or `None` to take the spawn call's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_steps: Option<u32>,
+    /// (0.31.0) How hard this role's model should think, or `None` for the
+    /// vendor's own default.
+    ///
+    /// The knob this type was missing. A definition could already say *which*
+    /// model a role gets and could not say how much thought the role is worth, so
+    /// a `searcher` doing lookups and a `critic` looking for what is missing paid
+    /// the same reasoning bill. It is a request, not a fact — see
+    /// [`Effort`](crate::Effort).
+    ///
+    /// Deserialized from an `io.toml` roster like every other field here, and it
+    /// is not a permission: it can raise what a run *spends*, and what a run may
+    /// spend is bounded by [`TaskContract::max_tokens`](crate::TaskContract) and
+    /// [`Containment`](crate::Containment), neither of which a project scope can
+    /// widen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<crate::provider::Effort>,
     /// Refuse every write for this agent.
     #[serde(default)]
     pub deny_write: bool,
@@ -152,6 +168,24 @@ impl AgentDef {
     /// ```
     pub fn with_max_steps(mut self, steps: u32) -> Self {
         self.max_steps = Some(steps);
+        self
+    }
+
+    /// Ask for a reasoning tier for this role (0.31.0).
+    ///
+    /// ```
+    /// use io_harness::{AgentDef, Effort};
+    ///
+    /// // The sentence `AgentDef` could not say until now: search cheaply, think
+    /// // hard only where thinking is the work.
+    /// let searcher = AgentDef::new("searcher").with_model("cheap").with_effort(Effort::Low);
+    /// let critic = AgentDef::new("critic").with_model("strong").with_effort(Effort::High);
+    ///
+    /// assert_eq!(searcher.effort, Some(Effort::Low));
+    /// assert_eq!(critic.effort, Some(Effort::High));
+    /// ```
+    pub fn with_effort(mut self, effort: crate::provider::Effort) -> Self {
+        self.effort = Some(effort);
         self
     }
 

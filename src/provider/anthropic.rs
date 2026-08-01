@@ -612,6 +612,7 @@ impl Accumulator {
                 Some(self.text)
             },
             tool_calls,
+            reasoning: None,
             usage: (total > 0).then_some(Usage {
                 prompt_tokens: prompt,
                 completion_tokens: self.output_tokens,

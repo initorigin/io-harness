@@ -10,7 +10,7 @@ tasks:
     Nothing else in the plan half can be written until the types exist and a plan can outlive the
     process. The table is also the only schema change in the release, so it lands first and the
     cross-version evidence is taken against it rather than against a moving target.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -24,7 +24,44 @@ tasks:
   - src/approve.rs
   - src/state.rs
   - src/lib.rs
-  evidence: []
+  - src/contract.rs
+  - src/agent.rs
+  - src/provider/mod.rs
+  - src/provider/anthropic.rs
+  - src/provider/openai_wire.rs
+  evidence:
+  - >
+    `Plan`, `PlanStep`, `PlanVerdict`, `PlanReview` and the `PlanGate` trait land in `src/approve.rs`
+    beside `Question`/`Responder`, whose shape they copy exactly: the review returns
+    `Option<PlanVerdict>` and `None` means "nobody in this process can answer", which is what makes
+    the run persist and pause rather than guess. Three implementations — `PlanGateNone` (the honest
+    unattended default), `AcceptPlan` (tests) and `StdinPlanGate` (a CLI) — mirror `ResponderNone`,
+    `FixedResponder` and `StdinResponder` one for one.
+  - >
+    `PlanVerdict::Revise { correction }` is the variant an `Approver` has no counterpart for, and it
+    is why a gate is not an approver: a plan that is nearly right is the common case and the useful
+    answer to it is a correction, not a refusal.
+  - >
+    The `plans` table lands in `Store::open`'s migration block, additive, `CHECKPOINT_FORMAT` still
+    7. Its index is `plans (run_id, verdict)` rather than `run_id` alone, because the loop's question
+    is "does this run have an *approved* plan" and both columns are in it.
+  - >
+    `plan_row` reads an unrecognised `verdict` spelling back as **undecided** rather than as a guess.
+    That is deliberate and is the safe direction: a row a binary does not understand must never be
+    reported as an approval, because an approval is precisely what lets the run write.
+  - >
+    Five `Store` accessors — `put_plan`, `plan`, `approved_plan`, `decide_plan`, `plans` — mirroring
+    the question accessors, `decide_plan` refusing a second verdict with `Error::Resume` the way
+    `answer_question` refuses a second answer. `cargo test --doc state::` — 60 passed, 0 failed,
+    including the `PendingPlan`, `put_plan`, `plan`, `approved_plan`, `decide_plan` and `plans`
+    worked examples. `cargo test --lib state::` — 38 passed, 0 failed.
+  - >
+    `Effort` lands in `src/provider/mod.rs` as a closed three-tier enum with `Ord`, so "at least
+    Medium" is expressible without a match, plus `FromStr` for an `io.toml` roster and
+    `thinking_budget()` for the one vendor that has no tiers. `CompletionRequest::effort` and
+    `CompletionResponse::reasoning` are declared here; the projections and the parsing are T04 and
+    T05. `cargo test --doc approve::` 31 passed, `agent::` 16 passed, `contract::` 8 passed,
+    `provider::Effort` 3 passed, all 0 failed.
 
 - id: US-IO-HARNESS-0.31.0-T02
   summary: >

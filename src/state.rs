@@ -1480,6 +1480,94 @@ fn question_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingQuestion> {
     })
 }
 
+/// A plan the agent proposed, and what was decided about it (0.31.0).
+///
+/// The stored half of the plan gate, and the reason a run can be approved by a
+/// process that never saw the one that proposed. It mirrors [`PendingQuestion`]
+/// field for field because it exists for the same reason: a decision a human has
+/// not made yet must outlive the process waiting for it.
+///
+/// ```
+/// use io_harness::{Plan, PlanStep, PlanVerdict, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("port the parser", "openrouter")?;
+/// let proposed = Plan::new([PlanStep::new("read the call sites"),
+///                           PlanStep::new("port them").by("writer")]);
+/// let id = store.put_plan(run_id, 2, &proposed)?;
+///
+/// // What a second process reads: the plan, undecided.
+/// let pending = store.plan(id)?.expect("proposed above");
+/// assert_eq!(pending.plan, proposed);
+/// assert!(!pending.resolved && pending.verdict.is_none());
+/// // And nothing is approved yet, which is what keeps the run from writing.
+/// assert!(store.approved_plan(run_id)?.is_none());
+///
+/// store.decide_plan(id, &PlanVerdict::Approve, "human")?;
+/// assert_eq!(store.approved_plan(run_id)?.as_ref(), Some(&proposed));
+/// assert_eq!(store.plan(id)?.unwrap().decided_by.as_deref(), Some("human"));
+///
+/// // Deciding twice is an error, not a silent second write.
+/// assert!(store.decide_plan(id, &PlanVerdict::Cancel, "human").is_err());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPlan {
+    /// The plan's own id, and what
+    /// [`resume_with_plan_decision`](crate::resume_with_plan_decision) takes.
+    pub id: i64,
+    /// The run that proposed it.
+    pub run_id: i64,
+    /// The step it was proposed on. That step **is** committed before the run
+    /// pauses, so a resume starts after it and the `propose_plan` call is not
+    /// replayed — the approved plan is delivered as a ledger observation instead,
+    /// exactly as an answer to a question is.
+    pub step: u32,
+    /// What the agent proposed.
+    pub plan: crate::approve::Plan,
+    /// What was decided, once something was.
+    pub verdict: Option<crate::approve::PlanVerdict>,
+    /// `"gate"` if a [`PlanGate`](crate::PlanGate) in the run's own process
+    /// decided, `"human"` if the decision arrived through a resume after a pause.
+    /// "The machine decided" and "a person decided" are different facts about a
+    /// run, and the distinction is sharper here than anywhere else in the crate:
+    /// this is the decision that spends the rest of the budget.
+    pub decided_by: Option<String>,
+    /// Whether it has been decided.
+    pub resolved: bool,
+}
+
+/// Read one `plans` row. One place, so the queries that read the table cannot
+/// drift in their column order.
+fn plan_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingPlan> {
+    let steps: String = r.get(3)?;
+    let verdict: Option<String> = r.get(4)?;
+    let correction: Option<String> = r.get(5)?;
+    Ok(PendingPlan {
+        id: r.get(0)?,
+        run_id: r.get(1)?,
+        step: r.get(2)?,
+        plan: crate::approve::Plan::new(
+            serde_json::from_str::<Vec<crate::approve::PlanStep>>(&steps).unwrap_or_default(),
+        ),
+        // An unrecognised spelling reads back as undecided rather than as a
+        // guess: a row this binary does not understand must not be reported as
+        // an approval, because an approval is what lets the run write.
+        verdict: match (verdict.as_deref(), correction) {
+            (Some("approve"), _) => Some(crate::approve::PlanVerdict::Approve),
+            (Some("revise"), c) => Some(crate::approve::PlanVerdict::Revise {
+                correction: c.unwrap_or_default(),
+            }),
+            (Some("cancel"), _) => Some(crate::approve::PlanVerdict::Cancel),
+            _ => None,
+        },
+        decided_by: r.get(6)?,
+        resolved: r.get::<_, i64>(7)? != 0,
+    })
+}
+
 /// Where one item of an agent's plan has got to (0.21.0).
 ///
 /// Three states and no more. A plan is for an operator to read at a glance, and
@@ -2820,6 +2908,40 @@ impl Store {
              CREATE INDEX IF NOT EXISTS sandbox_events_run_kind ON sandbox_events (run_id, kind);
              CREATE INDEX IF NOT EXISTS context_events_kind ON context_events (kind);
              CREATE INDEX IF NOT EXISTS checkpoint_events_kind ON checkpoint_events (kind);",
+        )?;
+
+        // 0.31.0 — the plan gate. One more additive table and, by the rule every
+        // addition since 0.13.0 follows, deliberately NOT a `CHECKPOINT_FORMAT`
+        // bump: no checkpoint layout changed, and bumping it would make
+        // [`Store::check_resumable`] refuse every 0.30.0 store over a table an
+        // older binary never queries.
+        //
+        // `plans` mirrors `pending_questions` field for field — including the
+        // `resolved` marker — because it exists for the same reason: a decision a
+        // human has not made yet has to outlive the process that is waiting for it.
+        // `verdict` is NULL until somebody decides, `correction` carries the text of
+        // a `Revise` and is NULL for the other two, and `decided_by` records whether
+        // a [`PlanGate`](crate::PlanGate) in the run's own process answered or a
+        // person did after a pause.
+        //
+        // The index is on `(run_id, verdict)` rather than `run_id` alone, and that
+        // is the release's one performance-shaped decision: the loop asks "does this
+        // run have an approved plan" at every entry, which is a lookup on both
+        // columns, and it is what makes the gate's durability free rather than a
+        // scan the run pays for on every step.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS plans (
+                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id      INTEGER NOT NULL,
+                 step        INTEGER NOT NULL,
+                 steps       TEXT NOT NULL,
+                 verdict     TEXT,
+                 correction  TEXT,
+                 decided_by  TEXT,
+                 resolved    INTEGER NOT NULL DEFAULT 0,
+                 proposed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS plans_run ON plans (run_id, verdict);",
         )?;
 
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
@@ -4349,6 +4471,183 @@ impl Store {
              FROM pending_questions WHERE run_id = ?1 ORDER BY id",
         )?;
         let rows = stmt.query_map([run_id], question_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- 0.31.0: the plan gate ----
+
+    /// Record a plan the agent proposed, undecided.
+    ///
+    /// Written *before* the gate is consulted, not after, and that ordering is the
+    /// whole of the durability claim: a process that dies between the proposal and
+    /// the verdict leaves a row a human can still answer.
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let id = store.put_plan(run_id, 1, &Plan::new([PlanStep::new("read first")]))?;
+    /// assert_eq!(store.plan(id)?.unwrap().step, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn put_plan(&self, run_id: i64, step: u32, plan: &crate::approve::Plan) -> Result<i64> {
+        let steps = serde_json::to_string(&plan.steps).unwrap_or_else(|_| "[]".into());
+        self.conn.execute(
+            "INSERT INTO plans (run_id, step, steps) VALUES (?1, ?2, ?3)",
+            rusqlite::params![run_id, step, steps],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Read one plan by id, decided or not.
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let id = store.put_plan(run_id, 1, &Plan::new([PlanStep::new("read first")]))?;
+    /// assert_eq!(store.plan(id)?.unwrap().plan.steps[0].intent, "read first");
+    /// assert!(store.plan(id + 1)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn plan(&self, plan_id: i64) -> Result<Option<PendingPlan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, steps, verdict, correction, decided_by, resolved
+             FROM plans WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query([plan_id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(plan_row(r)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// The plan this run is allowed to carry out, if one has been approved.
+    ///
+    /// This is the question the run loop asks at every entry, and asking the
+    /// *store* rather than a local variable is what makes the gate survive a
+    /// restart in both directions: an approved run does not plan again, and an
+    /// unapproved one does not start writing because the approval lived in a
+    /// process that has since died.
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep, PlanVerdict, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let id = store.put_plan(run_id, 1, &Plan::new([PlanStep::new("read first")]))?;
+    ///
+    /// // A returned plan is decided and still is not permission to proceed.
+    /// store.decide_plan(id, &PlanVerdict::revise("start with the tests"), "human")?;
+    /// assert!(store.approved_plan(run_id)?.is_none());
+    ///
+    /// let second = store.put_plan(run_id, 3, &Plan::new([PlanStep::new("write the tests")]))?;
+    /// store.decide_plan(second, &PlanVerdict::Approve, "human")?;
+    /// assert_eq!(store.approved_plan(run_id)?.unwrap().steps[0].intent, "write the tests");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn approved_plan(&self, run_id: i64) -> Result<Option<crate::approve::Plan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, steps, verdict, correction, decided_by, resolved
+             FROM plans WHERE run_id = ?1 AND verdict = 'approve' ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([run_id])?;
+        match rows.next()? {
+            Some(r) => Ok(Some(plan_row(r)?.plan)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record a verdict and mark the plan decided.
+    ///
+    /// `by` is `"gate"` or `"human"`. Deciding an already-decided plan is an
+    /// [`Error::Resume`] rather than a silent second write, exactly as
+    /// [`Self::answer_question`] refuses a second answer: two verdicts on one plan
+    /// means one of them was never acted on, and a caller should hear which.
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep, PlanVerdict, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let id = store.put_plan(run_id, 1, &Plan::new([PlanStep::new("read first")]))?;
+    /// store.decide_plan(id, &PlanVerdict::revise("tests first"), "human")?;
+    ///
+    /// // The correction round-trips, so a resume can put it in front of the model.
+    /// assert_eq!(
+    ///     store.plan(id)?.unwrap().verdict,
+    ///     Some(PlanVerdict::revise("tests first")),
+    /// );
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn decide_plan(
+        &self,
+        plan_id: i64,
+        verdict: &crate::approve::PlanVerdict,
+        by: &str,
+    ) -> Result<()> {
+        match self.plan(plan_id)? {
+            None => {
+                return Err(Error::Resume {
+                    reason: format!("no plan {plan_id} to decide"),
+                })
+            }
+            Some(p) if p.resolved => {
+                return Err(Error::Resume {
+                    reason: format!("plan {plan_id} was already decided"),
+                })
+            }
+            Some(_) => {}
+        }
+        let correction = match verdict {
+            crate::approve::PlanVerdict::Revise { correction } => Some(correction.as_str()),
+            _ => None,
+        };
+        self.conn.execute(
+            "UPDATE plans SET verdict = ?2, correction = ?3, decided_by = ?4, resolved = 1
+             WHERE id = ?1",
+            rusqlite::params![plan_id, verdict.as_str(), correction, by],
+        )?;
+        Ok(())
+    }
+
+    /// Every plan proposed on a run, in the order they were proposed.
+    ///
+    /// The whole negotiation: what was first proposed, what came back, and what was
+    /// finally agreed.
+    ///
+    /// ```
+    /// use io_harness::{Plan, PlanStep, PlanVerdict, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let first = store.put_plan(run_id, 1, &Plan::new([PlanStep::new("rewrite everything")]))?;
+    /// store.decide_plan(first, &PlanVerdict::revise("smaller"), "human")?;
+    /// store.put_plan(run_id, 3, &Plan::new([PlanStep::new("rewrite one file")]))?;
+    ///
+    /// let all = store.plans(run_id)?;
+    /// assert_eq!(all.len(), 2);
+    /// assert!(all[0].resolved && !all[1].resolved);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn plans(&self, run_id: i64) -> Result<Vec<PendingPlan>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, steps, verdict, correction, decided_by, resolved
+             FROM plans WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([run_id], plan_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 

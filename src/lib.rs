@@ -367,8 +367,9 @@ mod verify;
 pub mod web;
 
 pub use approve::{
-    AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Question, Request,
-    Responder, ResponderNone, StdinApprover, StdinResponder,
+    AcceptPlan, AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Plan,
+    PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict, Question, Request, Responder,
+    ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
 };
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, Ledger, SpawnRefusal};
@@ -385,7 +386,7 @@ pub use net::REQUEST_TIMEOUT;
 pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
-    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, ModelInfo, OpenAi,
+    Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, ModelInfo, OpenAi,
     OpenRouter, PriceSource, Provider, Reference, ToolCall, ToolSpec, Usage,
 };
 #[cfg(feature = "media")]
@@ -419,10 +420,11 @@ pub use skills::{Skill, Skills};
 pub use agent::{AgentDef, Agents};
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, McpEvent, MemoryEntry, MemoryKind,
-    MemoryRecall, MemoryWrite, Pending, PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall,
-    Recovery, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Tally, TodoItem,
-    TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
-    MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
+    MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle,
+    ProviderCall, Recovery, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store,
+    Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS,
+    MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP,
+    UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;

@@ -431,6 +431,7 @@ impl Accumulator {
                 Some(self.text)
             },
             tool_calls,
+            reasoning: None,
             usage: self.usage,
             model: self.model,
             finish_reason: self.finish_reason,

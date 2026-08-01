@@ -309,6 +309,110 @@ impl Media {
     }
 }
 
+/// How hard the model should think before it answers (0.31.0).
+///
+/// Three tiers, because three is the vocabulary every vendor shares — and it is a
+/// *tier* rather than a token count for the same reason
+/// [`CompletionRequest::model`] is a slug rather than a machine: each vendor
+/// spells the knob differently and one of them does not have tiers at all. The
+/// projection is the crate's job:
+///
+/// | provider | what is sent | what comes back as [`CompletionResponse::reasoning`] |
+/// |---|---|---|
+/// | [`OpenRouter`](crate::OpenRouter) | `reasoning: { effort }` | the thinking, when the model returns it |
+/// | [`OpenAi`](crate::OpenAi) | `reasoning_effort` | nothing — Chat Completions does not return it |
+/// | [`Anthropic`](crate::Anthropic) | `thinking: { budget_tokens }`, `max_tokens` raised to clear it | the thinking blocks |
+/// | [`Compatible`](crate::provider::Compatible) | `reasoning_effort`, unverified | whatever the endpoint sends |
+///
+/// It is a **request, not a fact**, in exactly the sense a model slug is. A model
+/// that does not reason ignores it, and `Usage::reasoning_tokens` is what says
+/// whether any thinking was actually done and paid for.
+///
+/// ```
+/// use io_harness::provider::Effort;
+///
+/// // Ordered by how much thinking is asked for, which is what makes a caller's
+/// // "at least Medium" rule expressible without a match.
+/// assert!(Effort::Low < Effort::Medium && Effort::Medium < Effort::High);
+///
+/// // The OpenAI-wire spelling, and what a caller reads back out of a config file.
+/// assert_eq!(Effort::High.as_str(), "high");
+/// assert_eq!("medium".parse::<Effort>().unwrap(), Effort::Medium);
+/// assert!("exhaustive".parse::<Effort>().is_err());
+/// ```
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// Answer quickly. The cheap end, for the steps that are lookups.
+    Low,
+    /// The middle tier, and what most vendors do by default on a reasoning model.
+    Medium,
+    /// Think hard. The expensive end, for the one step of a run that earns it.
+    High,
+}
+
+impl Effort {
+    /// The wire spelling: `"low"`, `"medium"` or `"high"`.
+    ///
+    /// ```
+    /// use io_harness::provider::Effort;
+    ///
+    /// assert_eq!(Effort::Low.as_str(), "low");
+    /// ```
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
+
+    /// Anthropic's shape for this tier: a thinking budget in tokens, because
+    /// Anthropic has no tiers.
+    ///
+    /// The lowest is 1024 because that is Anthropic's documented minimum — a
+    /// smaller budget is refused on the wire — and the crate raises `max_tokens`
+    /// above whichever of these it sends, since Anthropic rejects a request whose
+    /// budget is not strictly below it.
+    ///
+    /// ```
+    /// use io_harness::provider::Effort;
+    ///
+    /// assert_eq!(Effort::Low.thinking_budget(), 1_024);
+    /// assert!(Effort::High.thinking_budget() > Effort::Medium.thinking_budget());
+    /// ```
+    pub fn thinking_budget(&self) -> u64 {
+        match self {
+            Effort::Low => 1_024,
+            Effort::Medium => 4_096,
+            Effort::High => 16_384,
+        }
+    }
+}
+
+impl std::str::FromStr for Effort {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "low" => Ok(Effort::Low),
+            "medium" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            other => Err(crate::error::Error::Config(format!(
+                "unknown reasoning effort {other:?}; use low, medium or high"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for Effort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// A request for one model completion.
 ///
 /// Construct with `..Default::default()` for forward compatibility — fields are
@@ -383,6 +487,21 @@ pub struct CompletionRequest {
     /// [`Usage::server_tool_requests`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web: Option<crate::web::WebAccess>,
+    /// (0.31.0) How hard the model should think, or `None` (the default, and every
+    /// caller before 0.31.0) to leave the vendor's own default in place.
+    ///
+    /// It exists because a named agent definition ([`AgentDef`](crate::AgentDef))
+    /// carries a role and a model and could not say how much thought the role is
+    /// worth — the crate has recorded [`Usage::reasoning_tokens`] since 0.18.0 and
+    /// has never had a way to *ask* for them. `None` sends the body 0.30.0 sent,
+    /// byte for byte.
+    ///
+    /// A *request*, not a fact, exactly as [`CompletionRequest::model`] is: a model
+    /// that does not reason ignores it, and [`Usage::reasoning_tokens`] is what says
+    /// whether anything was thought. An out-of-tree [`Provider`] that ignores this
+    /// field keeps working and is honestly non-thinking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<Effort>,
     /// Images the model should see alongside `user`.
     ///
     /// A provider that does not accept images refuses a request carrying any,
@@ -601,6 +720,23 @@ pub struct CompletionResponse {
     /// broke". Keeping them apart is the whole reason this field exists.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub server_tools: Vec<crate::web::ServerToolCall>,
+    /// (0.31.0) The thinking the model produced before answering, where the
+    /// provider returns it. `None` when it returned none — never `Some("")`,
+    /// because "the model did not think" and "the model thought nothing" are
+    /// different facts and only the first is true.
+    ///
+    /// It reaches an [`Observer`](crate::Observer) as
+    /// [`EventKind::Reasoning`](crate::EventKind::Reasoning) and goes **nowhere
+    /// else**: it is never appended to the run's observation ledger, so it is never
+    /// in the prompt assembled for the next turn. That is not tidiness. A vendor
+    /// charges for thinking once as output; a harness that folded it into the next
+    /// request would be charged for it again as input, every turn, for the rest of
+    /// the run.
+    ///
+    /// It is therefore **not persisted**. [`Usage::reasoning_tokens`] is the durable
+    /// record of what was spent; this is the live view of what was spent on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
 }
 
 /// Where a [`ModelInfo`]'s price came from (0.29.0).
