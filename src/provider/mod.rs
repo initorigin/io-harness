@@ -319,10 +319,10 @@ impl Media {
 ///
 /// | provider | what is sent | what comes back as [`CompletionResponse::reasoning`] |
 /// |---|---|---|
-/// | [`OpenRouter`](crate::OpenRouter) | `reasoning: { effort }` | the thinking, when the model returns it |
-/// | [`OpenAi`](crate::OpenAi) | `reasoning_effort` | nothing — Chat Completions does not return it |
-/// | [`Anthropic`](crate::Anthropic) | `thinking: { budget_tokens }`, `max_tokens` raised to clear it | the thinking blocks |
-/// | [`Compatible`](crate::provider::Compatible) | `reasoning_effort`, unverified | whatever the endpoint sends |
+/// | [`OpenRouter`] | `reasoning: { effort }` | the thinking, when the model returns it |
+/// | [`OpenAi`] | `reasoning_effort` | nothing — Chat Completions does not return it |
+/// | [`Anthropic`] | `thinking: { budget_tokens }`, `max_tokens` raised to clear it | the thinking blocks |
+/// | [`Compatible`] | `reasoning_effort`, unverified | whatever the endpoint sends |
 ///
 /// It is a **request, not a fact**, in exactly the sense a model slug is. A model
 /// that does not reason ignores it, and `Usage::reasoning_tokens` is what says

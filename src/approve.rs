@@ -939,7 +939,7 @@ pub type PlanReview<'a> = Pin<Box<dyn Future<Output = Option<PlanVerdict>> + Sen
 ///
 /// Registering one is what turns the planning phase on. Until the gate answers
 /// [`PlanVerdict::Approve`], the run's effective policy denies every
-/// [`Act::Write`](crate::Act::Write) and every [`Act::Exec`] under a `plan-gate`
+/// [`Act::Write`] and every [`Act::Exec`] under a `plan-gate`
 /// layer, so the agent can read the workspace, think, and change nothing in it.
 /// Reads stay open on purpose: a plan written without looking is not worth
 /// gating.

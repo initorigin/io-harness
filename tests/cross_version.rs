@@ -161,6 +161,11 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     "sandbox_events_run_kind",
     "context_events_kind",
     "checkpoint_events_kind",
+    // 0.31.0 — the plan gate. One table and its index, added and nothing altered:
+    // a 0.29.0 binary opens a store carrying both and never names either, which
+    // `tests/cross_version_0_29_0.rs` executes rather than asserts on paper.
+    "plans",
+    "plans_run",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
