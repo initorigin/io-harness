@@ -11,7 +11,7 @@ itself, and that is precisely when a dependent needs the explanation most.
 The public surface is everything re-exported from the crate root plus the items
 reachable through the public modules it names.
 
-The re-exported half — the 110 items a caller reaches as `io_harness::Thing` —
+The re-exported half — the 145 items a caller reaches as `io_harness::Thing` —
 is enumerated in [public-api.txt](public-api.txt), which a test compares against
 the live crate on every run. That is the surface the deprecation cycle below
 covers and the surface every item of which carries a worked example.
