@@ -237,3 +237,187 @@ fn f2_an_event_this_crate_does_not_emit_is_refused_naming_it() {
     // The control is in `src/hooks.rs`: every name the crate emits is accepted, so a
     // rule written against a hand-typed subset fails there rather than here.
 }
+
+// ---------------------------------------------------------------------------
+// F4 — an executing hook is a fixed argv, is handed the event, and is bounded
+// ---------------------------------------------------------------------------
+
+/// A program that reads its stdin into a file whose name carries `;` and `&&`.
+///
+/// Both halves of F4 in one child. The file name proves the argv element arrived
+/// **whole**: this crate never hands a string to a shell, so what an operator wrote
+/// as one array element reaches the process as one argument, metacharacters and
+/// spaces and all. The file's contents prove the event reached stdin and that what
+/// arrived is the JSON of the event that fired.
+///
+/// Each platform's own programs are named rather than the test being skipped on
+/// Windows, which is the lesson 0.27.0's F4 paid for. The shell here is the
+/// *operator's* choice of program, which is a different thing from this crate
+/// inserting one.
+#[cfg(unix)]
+const CAPTURE: [&str; 3] = ["sh", "-c", "cat > 'a;b && c.jsonl'"];
+#[cfg(windows)]
+const CAPTURE: [&str; 3] = ["cmd", "/c", "findstr /r .* > \"a;b && c.jsonl\""];
+
+/// Sleeps well past any timeout this test sets.
+#[cfg(unix)]
+const SLOW: [&str; 2] = ["sleep", "30"];
+#[cfg(windows)]
+const SLOW: [&str; 3] = ["cmd", "/c", "ping -n 31 127.0.0.1 > NUL"];
+
+/// Returns at once, and successfully.
+#[cfg(unix)]
+const FAST: [&str; 2] = ["true", ""];
+#[cfg(windows)]
+const FAST: [&str; 3] = ["cmd", "/c", "exit 0"];
+
+/// Returns at once, and unsuccessfully.
+#[cfg(unix)]
+const FAILS: [&str; 2] = ["false", ""];
+#[cfg(windows)]
+const FAILS: [&str; 3] = ["cmd", "/c", "exit 1"];
+
+/// A TOML array literal for one of the tables above, dropping the padding entry the
+/// unix forms carry so the two platforms can share a fixed-size constant.
+fn argv(parts: &[&str]) -> String {
+    let items: Vec<String> = parts
+        .iter()
+        .filter(|p| !p.is_empty())
+        .map(|p| format!("{p:?}"))
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Run one turn under one hook table and report the outcome.
+async fn run_under(ws: &Path, hook: &str) -> io_harness::RunOutcome {
+    std::fs::write(ws.join("io.local.toml"), hook).unwrap();
+    let hooks = Config::discover(ws).unwrap().hooks();
+    let store = Store::open(ws.join("s.db")).unwrap();
+    run_with_observed(
+        &contract(ws),
+        &mock(vec![vec![call(
+            "read_file",
+            json!({"path": "io.local.toml"}),
+        )]]),
+        &store,
+        &read_only(),
+        &ApproveAll,
+        &hooks,
+    )
+    .await
+    .unwrap()
+    .outcome
+}
+
+#[tokio::test]
+async fn f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin() {
+    let user = tempfile::tempdir().unwrap();
+    let _guard = env(user.path());
+    let ws = tempfile::tempdir().unwrap();
+
+    run_under(
+        ws.path(),
+        &format!(
+            "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 20000\n",
+            argv(&CAPTURE)
+        ),
+    )
+    .await;
+
+    // The argument arrived whole. A harness that split on whitespace, or handed the
+    // string to a shell, would have produced some other file — or several.
+    let at = ws.path().join("a;b && c.jsonl");
+    assert!(
+        at.is_file(),
+        "the argv element did not reach the child intact: {:?}",
+        std::fs::read_dir(ws.path())
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect::<Vec<_>>()
+    );
+
+    // And what reached its stdin is the event that fired, as JSON rather than as a
+    // rendering of one.
+    let text = std::fs::read_to_string(&at).unwrap();
+    let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+    assert_eq!(v["event"], "started");
+    assert_eq!(v["run_id"], 1);
+}
+
+/// The bound, and the control that says "bounded" is not being satisfied by an
+/// implementation that kills everything. A killed hook is a failed hook, and the
+/// only way a failure is observable from out here is `on_failure = "cancel"` — so
+/// the two criteria are asserted through one another rather than through a log line.
+#[tokio::test]
+async fn f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure() {
+    let user = tempfile::tempdir().unwrap();
+    let _guard = env(user.path());
+
+    let slow = tempfile::tempdir().unwrap();
+    let outcome = run_under(
+        slow.path(),
+        &format!(
+            "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 50\non_failure = \"cancel\"\n",
+            argv(&SLOW)
+        ),
+    )
+    .await;
+    assert!(
+        matches!(outcome, io_harness::RunOutcome::Cancelled { .. }),
+        "a hook past its deadline is a failure: {outcome:?}"
+    );
+
+    // The negative control: the same shape inside its timeout completes, is not a
+    // failure, and does not stop the run.
+    let fast = tempfile::tempdir().unwrap();
+    let outcome = run_under(
+        fast.path(),
+        &format!(
+            "[[hook]]\non = [\"started\"]\nrun = {}\ntimeout_ms = 30000\non_failure = \"cancel\"\n",
+            argv(&FAST)
+        ),
+    )
+    .await;
+    assert!(
+        !matches!(outcome, io_harness::RunOutcome::Cancelled { .. }),
+        "a hook that succeeded must not stop the run: {outcome:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F5 — a hook can stop a run, and by default cannot
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to() {
+    let user = tempfile::tempdir().unwrap();
+    let _guard = env(user.path());
+
+    let asked = tempfile::tempdir().unwrap();
+    let outcome = run_under(
+        asked.path(),
+        &format!(
+            "[[hook]]\non = [\"started\"]\nrun = {}\non_failure = \"cancel\"\n",
+            argv(&FAILS)
+        ),
+    )
+    .await;
+    assert!(
+        matches!(outcome, io_harness::RunOutcome::Cancelled { .. }),
+        "a local policy check that says no must end the run: {outcome:?}"
+    );
+
+    // The negative control, and the whole reason the key exists: the byte-identical
+    // hook without `on_failure` leaves the run to reach its own ending. A
+    // notification that happens to fail is not a kill switch.
+    let unasked = tempfile::tempdir().unwrap();
+    let outcome = run_under(
+        unasked.path(),
+        &format!("[[hook]]\non = [\"started\"]\nrun = {}\n", argv(&FAILS)),
+    )
+    .await;
+    assert!(
+        matches!(outcome, io_harness::RunOutcome::StepCapReached { .. }),
+        "the default is continue: {outcome:?}"
+    );
+}
