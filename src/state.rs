@@ -1169,6 +1169,89 @@ impl MemoryKind {
     }
 }
 
+/// One group of an aggregate: what it is, and how many (0.30.0).
+///
+/// One row type for every grouped count this crate returns, so a caller reads
+/// `key`/`count` whether it asked for outcomes, days or gate phases. What the key
+/// *means* is the accessor's business and is documented there.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("goal", "/repo")?;
+/// store.finish_run(run, "success")?;
+///
+/// let rows = store.runs_by_outcome()?;
+/// assert_eq!((rows[0].key.as_str(), rows[0].count), ("success", 1));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Tally {
+    /// What this group is — an outcome, a day, a gate phase.
+    pub key: String,
+    /// How many rows fell into it.
+    pub count: u64,
+}
+
+/// How often a run was verified without a gate failing first (0.30.0).
+///
+/// Counts, never a rate: which denominator is the right one is the consumer's
+/// judgement, and returning a single number would make that choice invisibly.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("goal", "/repo")?;
+/// store.finish_run(run, "success")?;
+///
+/// let first = store.first_try()?;
+/// assert_eq!((first.runs, first.succeeded, first.first_try), (1, 1, 1));
+/// // "of the ones that worked" and "of everything we tried" are both legitimate,
+/// // and the crate declines to pick.
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FirstTry {
+    /// Runs that finished, whatever the ending.
+    pub runs: u64,
+    /// Of those, the ones that succeeded.
+    pub succeeded: u64,
+    /// Of those, the ones with no failed gate phase recorded against them.
+    pub first_try: u64,
+}
+
+/// How many times each recovery mechanism carried a run through (0.30.0).
+///
+/// ```
+/// use io_harness::{ContextEvent, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run = store.start_run("goal", "/repo")?;
+/// store.record_context_event(run, &ContextEvent::replan(2, "no progress"))?;
+///
+/// let recovery = store.recovery()?;
+/// assert_eq!(recovery.replans, 1);
+/// assert_eq!(recovery.fallbacks, 0, "no provider fell over");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Recovery {
+    /// Steps served by a fallback provider after the first one failed.
+    pub fallbacks: u64,
+    /// Times an agent making no progress was told once to change approach.
+    pub replans: u64,
+    /// Times a run was resumed from its checkpoint.
+    pub resumes: u64,
+}
+
 /// One recall: a run drew on one memory entry at one step (0.30.0).
 ///
 /// Returned by [`Store::memory_recalls`]. Per (run, key, step) rather than a flag
@@ -2723,6 +2806,22 @@ impl Store {
              CREATE INDEX IF NOT EXISTS snapshots_run ON snapshots(run_id, path);",
         )?;
 
+        // 0.30.0: the indexes the aggregates rest on, created last because they
+        // name tables every block above declares. Each one is what turns its
+        // accessor from a scan the caller pays for on every render into a lookup
+        // that stays flat as the trace grows — the whole of N2, and the reason
+        // these are declared rather than left to SQLite's judgement. Indexes
+        // only: no column, no row, nothing an older binary would notice.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS run_outcomes_outcome ON run_outcomes (outcome);
+             CREATE INDEX IF NOT EXISTS run_outcomes_finished ON run_outcomes (finished_at);
+             CREATE INDEX IF NOT EXISTS sandbox_events_kind_detail
+                 ON sandbox_events (kind, detail);
+             CREATE INDEX IF NOT EXISTS sandbox_events_run_kind ON sandbox_events (run_id, kind);
+             CREATE INDEX IF NOT EXISTS context_events_kind ON context_events (kind);
+             CREATE INDEX IF NOT EXISTS checkpoint_events_kind ON checkpoint_events (kind);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -3177,6 +3276,224 @@ impl Store {
             .into_iter()
             .map(|(k, calls)| crate::pricing::group(k, &calls, prices))
             .collect())
+    }
+
+    // ---- 0.30.0: outcome, gate and recovery aggregates ----
+    //
+    // The shape `src/pricing.rs` established in 0.18.0 and this release holds to
+    // without exception: grouped rows out, no rendering, no derived opinion. What
+    // is different from the spend groupings is where the work happens — those read
+    // every call row and group in Rust because the price table is a Rust value the
+    // SQL cannot see, and these have no such excuse, so each is one indexed
+    // `GROUP BY` and stays flat as the trace grows.
+
+    /// Finished runs grouped by the outcome they ended with (0.30.0).
+    ///
+    /// The raw outcome strings, not a success/failure collapse: "ran out of
+    /// steps", "stalled" and "a human refused" are different endings and the
+    /// distinction is the reason [`RunSummary`] keeps both the string and the
+    /// flag. Rows come back ordered by outcome, which is the only ordering
+    /// promised.
+    ///
+    /// A run that has not finished is not here — it has no ending yet — and a run
+    /// that crashed mid-loop never reached one at all.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// for outcome in ["success", "success", "stalled"] {
+    ///     let run = store.start_run("goal", "/repo")?;
+    ///     store.finish_run(run, outcome)?;
+    /// }
+    ///
+    /// let tally = store.runs_by_outcome()?;
+    /// assert_eq!(tally[0].key, "stalled");
+    /// assert_eq!(tally[0].count, 1);
+    /// assert_eq!(tally[1].key, "success");
+    /// assert_eq!(tally[1].count, 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn runs_by_outcome(&self) -> Result<Vec<Tally>> {
+        self.tally("SELECT outcome, COUNT(*) FROM run_outcomes GROUP BY outcome ORDER BY outcome")
+    }
+
+    /// Finished runs grouped by the day they finished (`YYYY-MM-DD`, UTC, from
+    /// the database clock) (0.30.0).
+    ///
+    /// The same clock `spend_by_day` groups on, so a cost row and an outcome row
+    /// for one day describe the same day rather than two that can disagree.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("goal", "/repo")?;
+    /// store.finish_run(run, "success")?;
+    ///
+    /// let days = store.runs_by_day()?;
+    /// assert_eq!(days.len(), 1, "one run, one day");
+    /// assert_eq!(days[0].count, 1);
+    /// assert_eq!(days[0].key.len(), 10, "YYYY-MM-DD");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn runs_by_day(&self) -> Result<Vec<Tally>> {
+        self.tally(
+            "SELECT date(finished_at), COUNT(*) FROM run_outcomes
+             GROUP BY date(finished_at) ORDER BY date(finished_at)",
+        )
+    }
+
+    /// How often a run was verified without a gate ever failing first (0.30.0).
+    ///
+    /// Three counts rather than a rate, because the denominator is a judgement
+    /// the consumer makes: *first_try / succeeded* is "when we got there, how
+    /// often first time", *first_try / runs* is "how often does this work at all
+    /// on the first attempt", and both are legitimate. Returning one number would
+    /// be picking for them and hiding which was picked.
+    ///
+    /// "First try" means finished successfully with no `gate_phase_failed` event
+    /// recorded against the run. A run whose gate never ran at all — a contract
+    /// with [`Verification::None`](crate::Verification::None) — counts as first
+    /// try, because it is a run that succeeded with nothing failing.
+    ///
+    /// ```
+    /// use io_harness::{SandboxEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let clean = store.start_run("goal", "/repo")?;
+    /// store.finish_run(clean, "success")?;
+    ///
+    /// let retried = store.start_run("goal", "/repo")?;
+    /// store.record_sandbox_event(&SandboxEvent::gate_phase_failed(retried, 2, "test-run"))?;
+    /// store.finish_run(retried, "success")?;
+    ///
+    /// let first = store.first_try()?;
+    /// assert_eq!((first.runs, first.succeeded, first.first_try), (2, 2, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn first_try(&self) -> Result<FirstTry> {
+        // A `NOT EXISTS` correlated per finished run, and measured against the
+        // alternatives rather than assumed: a LEFT JOIN onto a DISTINCT subquery
+        // reads far worse (25s at 20,000 runs against 7.6ms here), because the
+        // subquery is materialised without an index and every outcome row then
+        // probes it linearly. The correlated form probes
+        // `sandbox_events (run_id, kind)` instead, which is one index seek per run.
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(success), 0),
+                    COALESCE(SUM(success = 1 AND NOT EXISTS (
+                        SELECT 1 FROM sandbox_events e
+                        WHERE e.run_id = run_outcomes.run_id
+                          AND e.kind = 'gate_phase_failed')), 0)
+             FROM run_outcomes",
+            [],
+            |r| {
+                Ok(FirstTry {
+                    runs: r.get(0)?,
+                    succeeded: r.get(1)?,
+                    first_try: r.get(2)?,
+                })
+            },
+        )?)
+    }
+
+    /// Failed verification gates grouped by the phase that failed (0.30.0).
+    ///
+    /// The phase, not the criterion's text: `"compile"`, `"criterion-compile"`,
+    /// `"test-run"` are what the gate records, and reporting them as criteria
+    /// would be dressing up a column as something it is not. `criterion-compile`
+    /// is the one to look for — see
+    /// [`SandboxEvent::gate_phase_failed`](SandboxEvent::gate_phase_failed).
+    ///
+    /// Counted per event, so a run that failed the same phase three times is
+    /// three. "How many *runs* failed this phase" is a different question and is
+    /// deliberately not answered here rather than answered ambiguously.
+    ///
+    /// ```
+    /// use io_harness::{SandboxEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("goal", "/repo")?;
+    /// store.record_sandbox_event(&SandboxEvent::gate_phase_failed(run, 1, "test-run"))?;
+    /// store.record_sandbox_event(&SandboxEvent::gate_phase_failed(run, 4, "test-run"))?;
+    ///
+    /// let failures = store.gate_failures_by_phase()?;
+    /// assert_eq!(failures[0].key, "test-run");
+    /// assert_eq!(failures[0].count, 2, "per failure, not per run");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn gate_failures_by_phase(&self) -> Result<Vec<Tally>> {
+        // Grouped on `detail` itself rather than on a `COALESCE` of it: a function
+        // in the GROUP BY makes the (kind, detail) index unusable and SQLite falls
+        // back to a scan plus a temp B-tree. The NULL is handled where it costs
+        // nothing, in `tally`.
+        self.tally(
+            "SELECT detail, COUNT(*) FROM sandbox_events
+             WHERE kind = 'gate_phase_failed'
+             GROUP BY detail ORDER BY detail",
+        )
+    }
+
+    /// How many runs a recovery mechanism carried through something (0.30.0).
+    ///
+    /// Three counts, and deliberately not a fourth. An **escalation** is recorded
+    /// nowhere as an event and is in any case the opposite of a rescue — it is
+    /// the run handing the problem back — so it is neither counted here nor
+    /// smuggled into the total. An aggregate that cannot be computed honestly is
+    /// worse than a missing one; `Spend::unpriced_calls` is the precedent.
+    ///
+    /// ```
+    /// use io_harness::{CheckpointEvent, ContextEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("goal", "/repo")?;
+    /// store.record_context_event(run, &ContextEvent::served(1, "anthropic"))?;
+    /// store.record_context_event(run, &ContextEvent::replan(3, "no progress"))?;
+    /// store.record_checkpoint_event(&CheckpointEvent::resume(run, 4, "after a crash"))?;
+    ///
+    /// let recovery = store.recovery()?;
+    /// assert_eq!((recovery.fallbacks, recovery.replans, recovery.resumes), (1, 1, 1));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn recovery(&self) -> Result<Recovery> {
+        let count = |sql: &str| -> Result<u64> { Ok(self.conn.query_row(sql, [], |r| r.get(0))?) };
+        Ok(Recovery {
+            // `served` is written only when a `Fallback` moved off its first
+            // provider, so the row's existence *is* the fallback.
+            fallbacks: count("SELECT COUNT(*) FROM context_events WHERE kind = 'served'")?,
+            replans: count("SELECT COUNT(*) FROM context_events WHERE kind = 'replan'")?,
+            resumes: count("SELECT COUNT(*) FROM checkpoint_events WHERE kind = 'resume'")?,
+        })
+    }
+
+    /// The shared body of the three groupings that are one `GROUP BY`: run it,
+    /// read `(key, count)`. One place, so a caller cannot get a differently
+    /// shaped row from one of them.
+    fn tally(&self, sql: &str) -> Result<Vec<Tally>> {
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Tally {
+                // A NULL group key is a row the trace holds with nothing to name
+                // it by. `(none)` says that; dropping the row would quietly lose
+                // a count, and inventing a name would be worse.
+                key: r
+                    .get::<_, Option<String>>(0)?
+                    .unwrap_or_else(|| "(none)".into()),
+                count: r.get(1)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Record one file change and its line counts (0.18.0).
@@ -5034,6 +5351,98 @@ mod tests {
             "the parse found nothing, so it is measuring itself rather than the enum"
         );
         found
+    }
+
+    /// 0.30.0 N2. The claim is that an aggregate does not get slower as the trace
+    /// grows, and a wall-clock assertion is the wrong way to hold it: it is a
+    /// flaky test on a loaded CI runner, and it passes on a fast machine running
+    /// a full scan. The plan is the property — every one of these must reach its
+    /// rows through an index rather than reading the table.
+    #[test]
+    fn every_aggregate_reaches_its_rows_through_an_index() {
+        let store = Store::memory().unwrap();
+        // A plan is chosen against the tables as they stand, so they cannot be
+        // empty: SQLite will scan three rows whatever the indexes say.
+        for i in 0..64 {
+            let run = store.start_run("goal", "/repo").unwrap();
+            store
+                .record_sandbox_event(&SandboxEvent::gate_phase_failed(run, 1, "test-run"))
+                .unwrap();
+            store
+                .record_context_event(run, &ContextEvent::replan(1, "no progress"))
+                .unwrap();
+            store
+                .record_checkpoint_event(&CheckpointEvent::resume(run, 1, "after a crash"))
+                .unwrap();
+            store
+                .finish_run(run, if i % 2 == 0 { "success" } else { "stalled" })
+                .unwrap();
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows.join(" | ")
+        };
+
+        for (what, sql) in [
+            (
+                "runs_by_outcome",
+                "SELECT outcome, COUNT(*) FROM run_outcomes GROUP BY outcome ORDER BY outcome",
+            ),
+            (
+                "runs_by_day",
+                "SELECT date(finished_at), COUNT(*) FROM run_outcomes
+                 GROUP BY date(finished_at) ORDER BY date(finished_at)",
+            ),
+            (
+                "gate_failures_by_phase",
+                "SELECT detail, COUNT(*) FROM sandbox_events
+                 WHERE kind = 'gate_phase_failed'
+                 GROUP BY detail ORDER BY detail",
+            ),
+            (
+                "recovery: fallbacks",
+                "SELECT COUNT(*) FROM context_events WHERE kind = 'served'",
+            ),
+            (
+                "recovery: replans",
+                "SELECT COUNT(*) FROM context_events WHERE kind = 'replan'",
+            ),
+            (
+                "recovery: resumes",
+                "SELECT COUNT(*) FROM checkpoint_events WHERE kind = 'resume'",
+            ),
+            (
+                "first_try: the correlated existence check",
+                "SELECT COUNT(*) FROM sandbox_events e WHERE e.run_id = 1
+                 AND e.kind = 'gate_phase_failed'",
+            ),
+        ] {
+            let plan = plan(sql);
+            assert!(
+                plan.contains("USING INDEX") || plan.contains("USING COVERING INDEX"),
+                "{what} does not use an index, so it is a scan the caller pays for on \
+                 every render: {plan}"
+            );
+        }
+
+        // The control. `runs` has no index on `goal`, so this one must NOT report
+        // an index — without it, a plan string that said "USING INDEX" for
+        // everything would pass the loop above and prove nothing.
+        let scan = plan("SELECT COUNT(*) FROM runs WHERE goal = 'goal'");
+        assert!(
+            !scan.contains("USING INDEX"),
+            "the check cannot tell an index from a scan: {scan}"
+        );
     }
 
     #[test]

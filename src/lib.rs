@@ -403,11 +403,11 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use agent::{AgentDef, Agents};
 pub use state::{
-    AgentEvent, CheckpointEvent, ContextEvent, Edit, McpEvent, MemoryEntry, MemoryKind,
+    AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, McpEvent, MemoryEntry, MemoryKind,
     MemoryRecall, MemoryWrite, Pending, PendingQuestion, PolicyEvent, ProcessHandle, ProviderCall,
-    RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, TodoItem, TodoState, Turn,
-    BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
-    SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
+    Recovery, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store, Tally, TodoItem,
+    TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES,
+    MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;

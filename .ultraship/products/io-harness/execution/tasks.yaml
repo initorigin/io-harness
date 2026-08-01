@@ -240,7 +240,7 @@ tasks:
   why_required: >
     The third question, and the one every consumer currently re-derives from raw rows — which is the
     duplication the 0.18.0 cost grouping exists to prevent.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.30.0-T01
   acceptance_criteria:
@@ -256,8 +256,60 @@ tasks:
     number recorded; the point is that a panel refreshing does not get slower as history grows.
   files:
   - src/state.rs
+  - src/lib.rs
   - tests/accounting.rs
-  evidence: []
+  evidence:
+  - >
+    Five accessors and three row types: `runs_by_outcome`, `runs_by_day`, `gate_failures_by_phase`
+    (all returning `Tally`), `first_try` (`FirstTry`) and `recovery` (`Recovery`). Each is one SQL
+    `GROUP BY` or count — unlike the 0.18.0 spend groupings, which read every call row into Rust
+    because the price table is a Rust value the SQL cannot see. Rows out, no rendering, no rate.
+  - >
+    Two things are deliberately NOT shipped, which is the honest half of the task. `first_try`
+    returns three counts and no rate, because *first_try / succeeded* and *first_try / runs* are
+    both legitimate and picking one silently would decide for the caller. And `Recovery` has no
+    escalation count: nothing records an escalation as an event, and an escalation is the opposite
+    of a rescue anyway — the contract's open question is answered "its own row, and not until
+    something records it".
+  - >
+    F7 — `f7_the_aggregates_are_right_against_a_known_composition` reads the committed 0.29.0
+    fixture, on a copy, and asserts every accessor against the `composition` literals in its
+    sidecar. The fixture is built so runs (6), succeeded (4) and first_try (2) all differ, and the
+    test asserts they differ: with any two equal it would pass against an accessor that confused
+    them. `the_aggregates_over_an_empty_store_are_empty_rather_than_absent` is the other end — zero
+    rows and zeroed counts, not an error and not a plausible number.
+  - >
+    N2 — `state::tests::every_aggregate_reaches_its_rows_through_an_index` asserts the *query plan*
+    of all seven statements names an index, with a control that must NOT (a `COUNT(*)` over
+    `runs.goal`, which has no index) so the check can be seen answering no. A wall-clock assertion
+    was rejected on purpose: it is flaky on a loaded runner and it passes on a fast machine running
+    a full scan. Five indexes were added — `run_outcomes (outcome)`, `run_outcomes (finished_at)`,
+    `sandbox_events (kind, detail)`, `sandbox_events (run_id, kind)`, `context_events (kind)`,
+    `checkpoint_events (kind)` — created after every table, since the first attempt declared them
+    beside the memory table and named `run_outcomes` before it existed.
+  - >
+    N2's measurement, recorded rather than asserted. Store built in memory, macOS, debug build.
+    At 1,000 finished runs: runs_by_outcome 325µs, gate_failures_by_phase 135µs, first_try 353µs,
+    recovery 79µs. At 20,000 runs: 1.81ms, 2.47ms, 7.64ms, 1.19ms.
+  - >
+    **N2's wording over-claims and the measurement is what shows it.** "The aggregates do not scale
+    with the trace" is not achievable for an aggregate over full history — counting every row is
+    what the answer *is*, so the cost is linear in rows no matter which index serves it. Twenty
+    times the runs cost roughly five times (runs_by_outcome) to twenty times (first_try) as long.
+    What IS true, and is what the criterion's own second sentence asks for, is that each is one
+    indexed query rather than a table scan, at roughly 90–380ns per run. Raising it for the owner
+    rather than quietly reading the criterion as satisfied; making it literally true would need
+    materialised counters, which is a different release.
+  - >
+    One optimisation attempt was measured and reverted: rewriting `first_try`'s correlated
+    `NOT EXISTS` as a LEFT JOIN onto a `DISTINCT` subquery made it **25 seconds** at 20,000 runs
+    against 7.6ms, because the subquery materialises without an index and every outcome row then
+    probes it linearly. The comment beside the query records the number so nobody re-proposes it.
+  - >
+    `gate_failures_by_phase` groups on `detail` directly rather than on a `COALESCE` of it — a
+    function in the GROUP BY makes the (kind, detail) index unusable and SQLite falls back to a scan
+    plus a temp B-tree, which the plan test caught. The NULL is handled in `tally`, where it costs
+    nothing, as the key `(none)`.
 
 - id: US-IO-HARNESS-0.30.0-T06
   summary: >
