@@ -313,6 +313,125 @@ pub enum ProviderSpec {
         #[serde(default)]
         api_key: Option<String>,
     },
+    /// [`Compatible`](crate::Compatible) — any OpenAI-shaped endpoint (0.29.0).
+    ///
+    /// The variant 0.27.0's `#[non_exhaustive]` was added for. Exactly one of
+    /// `preset` and `base_url` is required: a preset supplies a vendor's
+    /// documented base URL and auth style, and a `base_url` is anything else that
+    /// speaks the format — a proxy, a gateway, a runtime on a port of your own.
+    ///
+    /// Unlike the three above there is no environment variable to fall back to,
+    /// because there is no single vendor to name one for. `${env:}` in the file
+    /// is the stated path and has worked since 0.19.0.
+    ///
+    /// ```
+    /// use io_harness::{Config, ProviderSpec};
+    ///
+    /// let config = Config::from_toml(r#"
+    ///     [[provider]]
+    ///     kind = "compatible"
+    ///     preset = "groq"
+    ///     model = "llama-3.3-70b-versatile"
+    ///
+    ///     [[provider]]
+    ///     kind = "compatible"
+    ///     base_url = "http://localhost:11434/v1"
+    ///     model = "llama3.2"
+    ///     auth = "none"
+    /// "#).unwrap();
+    ///
+    /// let ProviderSpec::Compatible { preset, model, .. } = config.provider_spec().unwrap() else {
+    ///     panic!("the file named a compatible provider");
+    /// };
+    /// assert_eq!(preset.as_deref(), Some("groq"));
+    /// assert_eq!(model, "llama-3.3-70b-versatile");
+    ///
+    /// // The fallback is a model on this machine, which costs nothing to run.
+    /// assert_eq!(config.fallback_specs().len(), 1);
+    /// ```
+    #[serde(rename = "compatible")]
+    Compatible {
+        /// The model id, as this endpoint spells it. Never defaulted: a guessed
+        /// slug is a wrong model that ships quietly.
+        model: String,
+        /// A vendor preset — `groq`, `ollama`, `zhipu` and the rest. Exactly one
+        /// of this and `base_url`.
+        #[serde(default)]
+        preset: Option<String>,
+        /// The whole base URL this endpoint documents, with `/chat/completions`
+        /// appended to it. Exactly one of this and `preset`.
+        #[serde(default)]
+        base_url: Option<String>,
+        /// The key, or `None` for an endpoint that needs none. There is no
+        /// environment variable fallback here; write `"${env:GROQ_API_KEY}"`.
+        #[serde(default)]
+        api_key: Option<String>,
+        /// How to authenticate, or `None` to take the preset's own style —
+        /// [`Auth::Bearer`](crate::Auth::Bearer) for a bare `base_url`.
+        #[serde(default)]
+        auth: Option<crate::provider::Auth>,
+        /// The label recorded in the trace, or `None` for the preset's name and
+        /// `"compatible"` for a bare `base_url`.
+        #[serde(default)]
+        name: Option<String>,
+        /// Opt in to filling missing prices from the reference catalogue.
+        ///
+        /// **This turns on an outbound request to a host this file did not
+        /// name.** When it is set the reference host appears in
+        /// [`Provider::endpoints`](crate::Provider::endpoints) and the run
+        /// authorises it against the policy's [`Act::Net`](crate::Act) rules
+        /// before the first step — denied means the run refuses rather than the
+        /// lookup being quietly skipped.
+        #[serde(default)]
+        reference_prices: bool,
+    },
+}
+
+impl ProviderSpec {
+    /// Refuse a `compatible` entry that names neither base or both (0.29.0).
+    ///
+    /// Exactly-one is enforced in code rather than in the type for the reason
+    /// `[[hook]]`'s `append`/`run` pair is: a tagged enum for the two shapes
+    /// would need `#[serde(flatten)]` for the keys they share, and serde refuses
+    /// `flatten` beside `deny_unknown_fields` — which would silently accept a
+    /// misspelled key inside the table, the standing `[[mcp]]` defect
+    /// (`src/config.rs:205-207`).
+    fn validate(&self, index: usize) -> Result<()> {
+        let Self::Compatible {
+            preset, base_url, ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let named = match (preset.as_deref(), base_url.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(Error::Config(format!(
+                    "[[provider]] #{index} names both `preset` and `base_url`; \
+                     a compatible provider takes exactly one — a preset supplies \
+                     the base URL, so naming both means one of them is ignored"
+                )))
+            }
+            (None, None) => {
+                return Err(Error::Config(format!(
+                    "[[provider]] #{index} of kind \"compatible\" names neither \
+                     `preset` nor `base_url`; one is required. The presets are: {}",
+                    crate::provider::compatible::preset_list()
+                )))
+            }
+            (Some(p), None) => Some(p),
+            (None, Some(_)) => None,
+        };
+        if let Some(p) = named {
+            if !crate::provider::compatible::preset_names().contains(&p) {
+                return Err(Error::Config(format!(
+                    "[[provider]] #{index} names unknown preset {p:?}; \
+                     the presets are: {}",
+                    crate::provider::compatible::preset_list()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Which files carry a repository's own instructions.
@@ -518,6 +637,7 @@ impl Config {
         let file: File = deserialize(toml::Value::Table(table.clone()), path)?;
         refuse_nested_profiles(&file, path)?;
         crate::hooks::Hooks::check(&file.hook, path)?;
+        check_providers(&file.provider)?;
         Ok(Self {
             file,
             sources: Vec::new(),
@@ -1206,6 +1326,7 @@ fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     let file: File = deserialize(toml::Value::Table(table.clone()), path)?;
     refuse_nested_profiles(&file, path)?;
     crate::hooks::Hooks::check(&file.hook, path)?;
+    check_providers(&file.provider)?;
     Ok(table)
 }
 
@@ -1241,6 +1362,19 @@ const PROJECT_WIDENING: &[(&[&str], &str)] = &[
     (&["sandbox", "allow_network"], "true"),
     (&["sandbox", "force_floor"], "false"),
 ];
+
+/// Validate every `[[provider]]` entry, reporting the index of the one at fault
+/// (0.29.0).
+///
+/// The index rather than the name, because an entry that named nothing usable is
+/// exactly the entry with no name to quote — the shape `[[hook]]` already uses
+/// for its own exactly-one rule.
+fn check_providers(providers: &[ProviderSpec]) -> Result<()> {
+    for (index, spec) in providers.iter().enumerate() {
+        spec.validate(index)?;
+    }
+    Ok(())
+}
 
 /// A project-scoped file may narrow the boundary and may never widen it.
 ///

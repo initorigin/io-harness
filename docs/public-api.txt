@@ -55,6 +55,7 @@ const TODO_TEXT_CAP src/state.rs
 const TODO_WRITE_TOOL src/tools/mod.rs
 const UNKNOWN_MODEL src/state.rs
 enum Act src/policy.rs
+enum Auth src/provider/compatible.rs
 enum Backend src/sandbox.rs
 enum Cap src/sandbox.rs
 enum Decision src/approve.rs
@@ -64,6 +65,7 @@ enum Error src/error.rs
 enum EventKind src/observe.rs
 enum Flow src/observe.rs
 enum McpTransport src/mcp.rs
+enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
 enum ProviderErrorKind src/error.rs
 enum ProviderSpec src/config.rs
@@ -83,6 +85,7 @@ struct Anthropic src/provider/anthropic.rs
 struct ApproveAll src/approve.rs
 struct CheckpointEvent src/state.rs
 struct Citation src/web.rs
+struct Compatible src/provider/compatible.rs
 struct CompletionRequest src/provider/mod.rs
 struct CompletionResponse src/provider/mod.rs
 struct Config src/config.rs
@@ -103,16 +106,18 @@ struct McpEvent src/state.rs
 struct McpServer src/mcp.rs
 struct Media src/provider/mod.rs (feature = "media")
 struct MemoryEntry src/state.rs
+struct ModelInfo src/provider/mod.rs
 struct OpenAi src/provider/openai.rs
 struct OpenRouter src/provider/openrouter.rs
 struct Pending src/state.rs
 struct PendingQuestion src/state.rs
 struct Policy src/policy.rs
 struct PolicyEvent src/state.rs
-struct Progress src/resilience.rs
 struct ProcessHandle src/state.rs
+struct Progress src/resilience.rs
 struct ProviderCall src/state.rs
 struct Question src/approve.rs
+struct Reference src/provider/catalog.rs
 struct Request src/approve.rs
 struct ResponderNone src/approve.rs
 struct RetryPolicy src/resilience.rs

@@ -338,6 +338,15 @@ model = "claude-sonnet-4"
 kind = "openai"
 model = "gpt-5"
 
+[[provider]]
+kind = "compatible"
+preset = "groq"
+model = "llama-3.3-70b-versatile"
+api_key = "sk-compatible"
+auth = "none"
+name = "groq-lab"
+reference_prices = true
+
 [app.cli]
 theme = "dark"
 
@@ -392,6 +401,17 @@ fn f7_every_key_reaches_a_typed_field() {
             io_harness::ProviderSpec::OpenAi {
                 model: "gpt-5".into(),
                 api_key: None,
+            },
+            // 0.29.0. Every key of the new variant, so each is proven to reach a
+            // typed field rather than to be accepted and dropped.
+            io_harness::ProviderSpec::Compatible {
+                model: "llama-3.3-70b-versatile".into(),
+                preset: Some("groq".into()),
+                base_url: None,
+                api_key: Some("sk-compatible".into()),
+                auth: Some(io_harness::Auth::None),
+                name: Some("groq-lab".into()),
+                reference_prices: true,
             },
         ]
     );
@@ -557,6 +577,28 @@ fn f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default() {
             .count(),
         1,
         "an absent `on` is every event"
+    );
+
+    // 0.29.0, the same control over one of this release's keys. With
+    // `reference_prices` removed the flag falls back to false, which is the
+    // difference between a provider that dials a second host and one that does
+    // not — so the fixture proves the key is read rather than defaulted.
+    let no_reference = without.replace("reference_prices = true\n", "");
+    write(project.path(), "io.local.toml", &no_reference);
+    let specs = Config::discover(project.path()).unwrap();
+    let io_harness::ProviderSpec::Compatible {
+        reference_prices,
+        auth,
+        ..
+    } = &specs.fallback_specs()[2]
+    else {
+        panic!("the fixture's fourth provider is the compatible one");
+    };
+    assert!(!reference_prices, "the removed key falls back to off");
+    assert_eq!(
+        *auth,
+        Some(io_harness::Auth::None),
+        "its neighbour does not"
     );
 }
 
@@ -1850,4 +1892,147 @@ fn an_unknown_key_inside_a_hook_table_is_rejected_naming_it() {
         "[[hook]]\non = [\"stalled\"]\nappend = \"a.jsonl\"\n",
     );
     Config::discover(project.path()).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// F9 — the compatible provider variant, and what the file may not say (0.29.0)
+// ---------------------------------------------------------------------------
+
+/// `[[provider]] kind = "compatible"` takes exactly one of `preset` and
+/// `base_url`, and says which entry is at fault.
+///
+/// By index rather than by name, for the reason `[[hook]]`'s exactly-one rule
+/// reports an index: the entry that named nothing usable is precisely the entry
+/// with no name to quote.
+#[test]
+fn a_compatible_provider_naming_neither_base_nor_preset_is_refused_by_index() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[provider]]\nkind = \"openrouter\"\nmodel = \"a\"\n\n\
+         [[provider]]\nkind = \"compatible\"\nmodel = \"b\"\n",
+    );
+
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("#1"),
+        "the second entry is the faulty one: {err}"
+    );
+    assert!(err.contains("preset"), "{err}");
+    assert!(err.contains("base_url"), "{err}");
+    assert!(
+        err.contains("groq") && err.contains("ollama"),
+        "the presets that do exist must be listed: {err}"
+    );
+}
+
+#[test]
+fn a_compatible_provider_naming_both_base_and_preset_is_refused() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[provider]]\nkind = \"compatible\"\nmodel = \"b\"\n\
+         preset = \"groq\"\nbase_url = \"http://localhost:8000/v1\"\n",
+    );
+
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(err.contains("#0"), "{err}");
+    assert!(
+        err.contains("both"),
+        "naming both means one is silently ignored, and the message says so: {err}"
+    );
+}
+
+#[test]
+fn an_unknown_preset_is_refused_listing_the_ones_that_exist() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[provider]]\nkind = \"compatible\"\nmodel = \"b\"\npreset = \"grok\"\n",
+    );
+
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(err.contains("grok"), "{err}");
+    assert!(err.contains("groq"), "the near miss must be visible: {err}");
+}
+
+/// The negative controls for the three above, together.
+///
+/// Without these the rule could be satisfied by an implementation that refused
+/// every `compatible` entry, or refused `[[provider]]` wholesale — which is the
+/// shape 0.27.0's F4 control exists to catch and is available again here.
+#[test]
+fn each_valid_shape_of_a_compatible_provider_loads() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+
+    for (label, body) in [
+        (
+            "a preset alone",
+            "[[provider]]\nkind = \"compatible\"\nmodel = \"m\"\npreset = \"ollama\"\n",
+        ),
+        (
+            "a base_url alone",
+            "[[provider]]\nkind = \"compatible\"\nmodel = \"m\"\n\
+             base_url = \"http://localhost:8000/v1\"\n",
+        ),
+        (
+            "every preset name in turn is accepted",
+            "[[provider]]\nkind = \"compatible\"\nmodel = \"m\"\npreset = \"zhipu\"\n",
+        ),
+    ] {
+        let project = tempfile::tempdir().unwrap();
+        write(project.path(), "io.toml", body);
+        assert!(
+            Config::discover(project.path()).is_ok(),
+            "{label} must load"
+        );
+    }
+
+    // And the three original kinds still load unchanged: this release adds a
+    // variant, it does not narrow what was already accepted.
+    let project = tempfile::tempdir().unwrap();
+    write(
+        project.path(),
+        "io.toml",
+        "[[provider]]\nkind = \"openrouter\"\nmodel = \"a\"\n\n\
+         [[provider]]\nkind = \"anthropic\"\nmodel = \"b\"\n\n\
+         [[provider]]\nkind = \"openai\"\nmodel = \"c\"\n",
+    );
+    assert!(Config::discover(project.path()).is_ok());
+}
+
+/// An unknown key inside a `compatible` entry is rejected naming it.
+///
+/// `ProviderSpec` carries `deny_unknown_fields`, and the exactly-one rule is
+/// enforced in code rather than through a nested tagged enum precisely so that
+/// stays true — a `#[serde(flatten)]` for the shared keys would have inherited
+/// the standing `[[mcp]]` hole, where a misspelled key is silently accepted.
+#[test]
+fn an_unknown_key_inside_a_compatible_provider_is_rejected_naming_it() {
+    let user_dir = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _guard = env(user_dir.path());
+    write(
+        project.path(),
+        "io.toml",
+        "[[provider]]\nkind = \"compatible\"\nmodel = \"m\"\npreset = \"groq\"\n\
+         reference_price = true\n",
+    );
+
+    let err = Config::discover(project.path()).unwrap_err().to_string();
+    assert!(
+        err.contains("reference_price"),
+        "the error must name the misspelled key, got: {err}"
+    );
+    assert!(err.contains("io.toml"), "and the file it is in, got: {err}");
 }

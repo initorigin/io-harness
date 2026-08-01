@@ -1,0 +1,62 @@
+product: io-harness
+version: 0.29.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+constraints:
+  time: null
+  budget: null
+  capacity: Parallel agents authorised; `allow_parallel_agents` is already true in the workspace
+    resource profile
+  source: user-estimate
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      Nothing here invents a mechanism. The provider is `openai_wire` with the endpoint widened from
+      a `const` into a field — the two existing OpenAI-shaped providers are 159 and 161 lines of
+      which only four strings differ, so a third is a table row rather than a file. The opt-in
+      second host is governed by `Provider::endpoints()`, which `src/run.rs:4630` already authorises
+      before the first step, so the egress boundary this release needs already exists and is not
+      written here.
+    - >
+      The recorded capacity constraint is that parallel agents are authorised —
+      `allow_parallel_agents: true` in the workspace resource profile, which is the user's own
+      recorded preference rather than anything measured. The work fits it because the release has
+      five genuinely separable pieces with disjoint files: the provider and its presets, the
+      catalogue types, the reference reader, the config variant, and the documentation. The
+      convergence files — `tests/config.rs`, `CHANGELOG.md`, `docs/public-api.txt`,
+      `docs/CONTRACT.md` — are written once and serially by the calling session, never in a wave.
+    - >
+      The expensive failure mode of this repository is discovering a documentation or public-surface
+      drift after the merge, and it is caught before the PR by `tests/public_api.rs`,
+      `tests/guide_pages.rs`, `tests/readme.rs`, `tests/config.rs`, `tests/docs_drift.rs` and
+      `tests/changelog.rs`, every one of which already fails on the omissions this release could
+      make. Five new public names is the largest surface addition since 0.24.0 and it is the part
+      those tests are best at catching.
+    - >
+      The reference catalogue's single largest unknown — whether the live host serves the shape the
+      parser assumes — was resolved before planning rather than during development: a keyless `GET
+      https://openrouter.ai/api/v1/models` returned 336 models with a pricing object whose five keys
+      map one-for-one onto `pricing::Price`. The parser is being written against an observed
+      response, not a remembered one.
+  major_cost_drivers:
+    - >
+      Five new crate-root names, each needing a line in `docs/public-api.txt` in sorted position and
+      a doc comment carrying a worked example that compiles as a doctest. `tests/public_api.rs`
+      enforces both and there is deliberately no `--bless`.
+    - >
+      The decimal-string to integer conversion. It is perhaps fifteen lines and it is the only place
+      in the release where a defect becomes money rather than an error, so it carries a table of
+      hand-computed cases and a control proving the implementation is not an `f64` multiply — which
+      is harder to test than correctness on easy inputs, and is the point.
+    - >
+      Twenty-one preset base URLs, four of which are not `/v1`-shaped. They are data, so the cost is
+      getting them right rather than writing them, and no test can dial them; F2 is what converts
+      "right" from a claim into a check.
+    - >
+      `docs/CONTRACT.md`'s divergence section has the most judgement in it and the least mechanical
+      checking behind it. The vLLM and SGLang line — no tool calls at all without a server-side
+      parser flag, and no error either — is the sentence a caller most needs to find and the one
+      nothing in the suite can force to be present.
+  recommended_scope_change: null
