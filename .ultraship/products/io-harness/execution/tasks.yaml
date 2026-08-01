@@ -132,7 +132,7 @@ tasks:
   why_required: 'This is the release: without it the ledger throttles nothing, the store rows are never
     written, and the counters never reach an observer. The resume path is also where `record_run_policy`
     was never called, and this task is already inside that function.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.32.0-T02
   acceptance_criteria:
@@ -178,7 +178,40 @@ tasks:
   files:
   - src/run.rs
   - src/observe.rs
-  evidence: []
+  evidence:
+  - '`spawn_child` is restructured around admission. The spawn-or-adopt lookup now decides only what
+    kind of spawn this is; the containment refusal still runs ahead of admission, so a child the tree
+    will never let exist does not first spend time in a queue; and admission sits between that decision
+    and the child''s first store write, which is what makes "queued and never started" mean "no run
+    row, no step rows, no tokens". Adopted children take a slot too, so the throttle is the same number
+    before and after a restart.'
+  - The slot is released with `drop(slot)` placed before the `?` on `run_agent` and before both early
+    returns, so a child that finished, a child that paused on a human and a child whose error is propagating
+    all free the slot and report the tier. A release on the happy path only is a fleet that stops draining
+    the first time something goes wrong.
+  - 'The per-step `.buffered(max_c)` becomes `.buffered(spawn_calls.len())`. That width was the old
+    cap''s only teeth and it was a property of one parent''s step: two parents fanning out at once got
+    twice the concurrency they asked for, and a child past the width was never queued — it just did
+    not start, invisibly. Every spawn now reaches the ledger. `children_are_composed_in_spawn_order_not_completion_order`
+    still passes, so `buffered` rather than `buffer_unordered` still holds the determinism 0.12.0 bought.'
+  - '`EventKind::Fleet { tier, working, queued, done }` is emitted on enqueue, on admission and on completion,
+    attributed to the parent''s run and the parent''s own `depth` with the tier in the payload — so
+    `RunEvent::depth` keeps meaning "who emitted this" everywhere. `EVENT_NAMES` gained `"fleet"` and
+    the source-reading census in `src/observe.rs` passes; `every_kind()` produces one of every tag and
+    no others.'
+  - Three tree-resume sites shared four lines of ledger restoration; they now share `restore_tree_ledger`,
+    which also reads the backlog back and seeds the ledger with it, and `emit_backlog`, which reports
+    it. In `resume_tree_observed` the backlog reaches the observer after `Started` and before `authorize_provider`,
+    so it is emitted before the provider is authorised, let alone called.
+  - 'The standing defect is fixed while this release was already in the function: `resume_tree_observed`
+    now calls `record_run_policy`, recording the caller''s policy before the provider layer is merged
+    in, exactly as `run_tree_observed` has always done. A tree resumed in a second process previously
+    left no record of the boundary it was actually resumed under.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` is clean (the `type_complexity` warning
+    the two-value return raised is resolved by the `Backlog` alias, not by allowing the lint), and all
+    14 existing `tests/subagents.rs` tests pass unchanged — including `concurrent_fanout_to_over_100_stays_bounded_and_completes`,
+    whose 120-child fan-out under a cap of 16 now runs through the tier queue and still measures a peak
+    at or below 16.'
 - id: US-IO-HARNESS-0.32.0-T04
   summary: 'The evidence: `examples/fleet_fixture` for a real SIGKILL with a non-empty queue, and the
     tests that read the backlog back — including the deletion that discriminates a restored depth from

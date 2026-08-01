@@ -2292,13 +2292,10 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                     format!("resumed:{request_id}"),
                 ),
             )?;
-            let ledger = Arc::new(Ledger::from_state(
-                containment,
-                store.spent_tokens_tree(run_id)?,
-                store.agent_count_tree(run_id)?,
-            ));
+            let (ledger, backlog) = restore_tree_ledger(store, run_id, containment)?;
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
+            emit_backlog(watch, run_id, start_step.saturating_sub(1), &ledger, &backlog);
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
@@ -2371,13 +2368,10 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 }
                 effective = effective.merge(layer);
             }
-            let ledger = Arc::new(Ledger::from_state(
-                containment,
-                store.spent_tokens_tree(run_id)?,
-                store.agent_count_tree(run_id)?,
-            ));
+            let (ledger, backlog) = restore_tree_ledger(store, run_id, containment)?;
             let start_step = record_resume_markers(store, run_id)?;
             store.set_provider(run_id, provider.name())?;
+            emit_backlog(watch, run_id, start_step.saturating_sub(1), &ledger, &backlog);
             let mcp = McpSession::connect(&contract.mcp, &effective, store, run_id, watch).await?;
             let tree = Tree {
                 mcp: &mcp,
@@ -3709,7 +3703,7 @@ struct Tree<'a, P: Provider> {
 /// // is something it could raise.
 /// let containment = Containment {
 ///     max_total_agents: 12,
-///     max_concurrent_agents: 4,   // the fan-out bound
+///     max_concurrent_agents: 4,   // four working at once; the fifth queues
 ///     max_depth: 2,
 ///     max_total_tokens: 500_000, // drawn down by the whole tree together
 ///     max_total_cost: None,      // reserved and inert; bound money in tokens
@@ -3771,8 +3765,14 @@ pub async fn run_tree<P: Provider>(
 ///                 println!("{pad}+ run {child_run_id}: {goal}");
 ///             }
 ///             // Containment refused the spawn — the tree hit `max_total_agents`,
-///             // `max_depth` or `max_concurrent_agents`. The parent adapts; nothing fails.
+///             // `max_depth`, or its spend ceiling. Never the concurrency cap: that
+///             // one queues the child. The parent adapts; nothing fails.
 ///             EventKind::SpawnRefused { cap } => println!("{pad}! spawn refused: {cap} cap"),
+///             // The tier's shape after that spawn: how many are working, how many
+///             // are still waiting for a slot, how many are done.
+///             EventKind::Fleet { tier, working, queued, done } => {
+///                 println!("{pad}  tier {tier}: {working} working, {queued} queued, {done} done");
+///             }
 ///             // What the tree has left of its ONE shared ceiling, after this draw.
 ///             EventKind::SpendDraw { remaining, .. } => {
 ///                 println!("{pad}  budget left: {remaining:?}");
@@ -4000,15 +4000,15 @@ pub async fn resume_tree_observed<P: Provider>(
         )
     })?;
 
-    // Restore the shared ledger from durable tree-wide totals, so the budget is
-    // continuous across the crash rather than reset to zero.
-    let ledger = Arc::new(Ledger::from_state(
-        containment,
-        store.spent_tokens_tree(run_id)?,
-        store.agent_count_tree(run_id)?,
-    ));
+    let (ledger, backlog) = restore_tree_ledger(store, run_id, containment)?;
     let start_step = record_resume_markers(store, run_id)?;
     store.set_provider(run_id, provider.name())?;
+    // The policy this resume runs under, recorded against the run — as
+    // `run_tree_observed` has always done and this function, until 0.32.0, never
+    // did. A tree resumed in a second process left no record of the boundary it
+    // was actually resumed under, so an audit of a crashed-and-continued run could
+    // read only the boundary of the process that died.
+    store.record_run_policy(run_id, policy)?;
     let watch = &Watch::new(observer);
     watch.emit(RunEvent::new(
         run_id,
@@ -4018,6 +4018,7 @@ pub async fn resume_tree_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
+    emit_backlog(watch, run_id, start_step.saturating_sub(1), &ledger, &backlog);
     // Re-authorized on resume rather than trusted from the crashed run: the
     // policy handed to the resume is the one that governs it, and a host allowed
     // before a crash may not be allowed after.
@@ -4551,10 +4552,19 @@ fn run_agent<'f, P: Provider>(
             }
             if paused.is_none() && !spawn_calls.is_empty() {
                 use futures_util::stream::{self, StreamExt};
-                let max_c = tree.containment.max_concurrent_agents.max(1) as usize;
-                // `buffered`, not `buffer_unordered`: up to `max_c` children still
-                // run at once, but their results are collected in the order the
-                // model asked for them rather than the order they happen to finish.
+                // Every spawn call is polled, and the tree's ledger — not this
+                // stream — is what decides how many actually run. Until 0.32.0
+                // this width was `max_concurrent`, which made the cap a per-step
+                // property of one parent: two parents fanning out at the same time
+                // got twice the concurrency they asked for, and a child past the
+                // width was not queued, it was simply not started until an earlier
+                // sibling finished, invisibly. Now every child reaches the ledger,
+                // takes a slot or a place in its tier's FIFO queue, and the queue
+                // is a fact in the store an observer and a resume can both read.
+                let width = spawn_calls.len().max(1);
+                // `buffered`, not `buffer_unordered`: children run as slots allow,
+                // but their results are collected in the order the model asked for
+                // them rather than the order they happen to finish.
                 //
                 // Until 0.12.0 this was `buffer_unordered`, which made a tree run
                 // non-reproducible: the composed child observations and the
@@ -4565,14 +4575,14 @@ fn run_agent<'f, P: Provider>(
                 // Deterministic replay cannot be built on that.
                 //
                 // The cost is that a child which finishes early has its result held
-                // until the children before it are done. That is bounded by `max_c`
-                // and changes when a result is *read*, never when the work runs.
+                // until the children before it are done. That changes when a result
+                // is *read*, never when the work runs.
                 let results: Vec<Result<SpawnResult>> = stream::iter(
                     spawn_calls
                         .into_iter()
                         .map(|c| spawn_child(tree, c, run_id, depth, policy, step)),
                 )
-                .buffered(max_c)
+                .buffered(width)
                 .collect()
                 .await;
                 for r in results {
@@ -4973,23 +4983,20 @@ async fn spawn_child<P: Provider>(
     // adopts that child and resumes it from its OWN last committed step instead
     // of creating a duplicate or restarting it. This is what lets every agent in
     // a crashed tree continue from its own checkpoint.
-    let (child_run, child_start) = match tree.store.find_spawn(parent_run_id, step, goal)? {
+    // What this spawn is, before anything is admitted or written. A child already
+    // finished is composed from its recorded outcome and never takes a slot —
+    // there is no work left for a slot to protect.
+    let adopted = match tree.store.find_spawn(parent_run_id, step, goal)? {
         Some(row) => {
-            // Adopted: already counted in the reconstructed ledger, so do NOT
-            // register it again. A finished child is composed from its recorded
-            // outcome without re-running; a mid-flight child resumes from its
-            // next step.
             if let Some(o) = terminal_outcome(tree.store, row.child_run_id)? {
                 return Ok(compose_child(row.child_run_id, goal, o));
             }
-            (
-                row.child_run_id,
-                tree.store.last_step(row.child_run_id)? + 1,
-            )
+            Some(row)
         }
         None => {
-            // Fresh: the containment boundary decides whether it may exist, and
-            // its contract is persisted so a later resume can adopt it.
+            // Fresh: the containment boundary decides whether it may exist. This
+            // is ahead of admission on purpose — a child the tree will never let
+            // exist must not first spend time in a queue.
             if let Err(refusal) = tree.ledger.register_agent(child_depth) {
                 tree.store.record_agent_event(&AgentEvent::spawn_refused(
                     parent_run_id,
@@ -5013,6 +5020,43 @@ async fn spawn_child<P: Provider>(
                     ),
                 });
             }
+            None
+        }
+    };
+
+    // Admission. The concurrency cap throttles rather than refuses, so a child
+    // past it waits here — and this is the only place the wait is durable, which
+    // is why it sits between deciding the child may exist and writing anything
+    // about it. A child that queues and never gets a slot has no run row, no step
+    // rows and no tokens against the tree's ceiling, because nothing about it was
+    // started.
+    //
+    // Adopted children take a slot too. Without that the throttle would be a
+    // different number before and after a restart: a resumed tree would run every
+    // mid-flight child at once and only queue the fresh ones.
+    let slot = match tree.ledger.try_admit(child_depth) {
+        Some(slot) => slot,
+        None => {
+            let newly = tree
+                .store
+                .enqueue_agent(parent_run_id, step, goal, child_depth)?;
+            tree.ledger.mark_queued(child_depth, newly);
+            emit_fleet(tree, parent_run_id, step, depth, child_depth);
+            let slot = tree.ledger.admit(child_depth).await;
+            tree.store.dequeue_agent(parent_run_id, step, goal)?;
+            slot
+        }
+    };
+    emit_fleet(tree, parent_run_id, step, depth, child_depth);
+
+    let (child_run, child_start) = match adopted {
+        // Adopted: already counted in the reconstructed ledger, so do NOT
+        // register it again. It resumes from its OWN next step.
+        Some(row) => (
+            row.child_run_id,
+            tree.store.last_step(row.child_run_id)? + 1,
+        ),
+        None => {
             let child_run = tree.store.start_child_run(
                 goal,
                 &tree.root.display().to_string(),
@@ -5073,7 +5117,15 @@ async fn spawn_child<P: Provider>(
         child_start,
         def,
     )
-    .await?;
+    .await;
+    // Before the `?` and before either early return, so every way out of a child
+    // — finished, paused on a human, or an error propagating — frees the slot and
+    // reports the tier. Only one of those three is the happy path, and a slot
+    // released on the happy path only is a fleet that stops draining the first
+    // time something goes wrong.
+    drop(slot);
+    emit_fleet(tree, parent_run_id, step, depth, child_depth);
+    let outcome = outcome?;
 
     // A child that deferred pauses the whole tree, surfacing its request_id so
     // the caller can resume that child once a human decides.
@@ -5090,6 +5142,100 @@ async fn spawn_child<P: Provider>(
     }
 
     Ok(compose_child(child_run, goal, outcome))
+}
+
+/// How many agents are waiting at each tier: `(tier, waiting)`, one entry per
+/// non-empty tier. A `Vec` rather than a map because a tree is a handful of tiers
+/// deep and the order the store returns them in is the order they are reported.
+type Backlog = Vec<(u32, u32)>;
+
+/// Rebuild a tree's shared ledger from the store on resume (0.32.0), and report
+/// the backlog it inherited as `(tier, waiting)` pairs.
+///
+/// Three things are restored, and the third is the one that is easy to miss. The
+/// spend and the agent count keep the budget and the total cap continuous across
+/// the crash. The *queue* is separate durable state: a child that was only ever
+/// waiting has no run row, so `agent_count_tree` never counted it and nothing
+/// about it was ever charged — its place in the queue is the only trace it left.
+///
+/// The replay that follows re-queues those children. `Store::enqueue_agent` tells
+/// the ledger they are already recorded, which is what keeps the restored depth
+/// this number rather than twice this number, and is the difference between a
+/// queue rebuilt from the store and one silently re-derived from the spawn calls
+/// the model happens to repeat.
+fn restore_tree_ledger(
+    store: &Store,
+    root: i64,
+    containment: &Containment,
+) -> Result<(Arc<Ledger>, Backlog)> {
+    let ledger = Arc::new(Ledger::from_state(
+        containment,
+        store.spent_tokens_tree(root)?,
+        store.agent_count_tree(root)?,
+    ));
+    let mut per_tier: Backlog = Vec::new();
+    for (tier, _) in store.queued_agents(root)? {
+        match per_tier.iter_mut().find(|(t, _)| *t == tier) {
+            Some((_, n)) => *n += 1,
+            None => per_tier.push((tier, 1)),
+        }
+    }
+    ledger.restore_queue(&per_tier);
+    Ok((ledger, per_tier))
+}
+
+/// Report an inherited backlog, before the provider is authorised and long
+/// before it is called, so an application that reconnects to a restarted tree
+/// sees the queue it is waiting on rather than a zero that fills in later.
+fn emit_backlog(
+    watch: &Watch<'_>,
+    root: i64,
+    step: u32,
+    ledger: &Ledger,
+    per_tier: &[(u32, u32)],
+) {
+    for &(tier, queued) in per_tier {
+        let t = ledger.tally(tier);
+        watch.emit(RunEvent::at_depth(
+            root,
+            step,
+            0,
+            EventKind::Fleet {
+                tier,
+                working: t.working,
+                queued,
+                done: t.done,
+            },
+        ));
+    }
+}
+
+/// Report one tier's shape to the observer (0.32.0).
+///
+/// Attributed to the PARENT's run and the parent's own `depth`, for the same
+/// reason [`EventKind::Spawned`] is: the parent is what caused the change, and a
+/// queued child has no run id to attribute anything to yet. Which tier is being
+/// counted is in the payload rather than in `RunEvent::depth`, so `depth` keeps
+/// meaning "who emitted this" everywhere.
+fn emit_fleet<P: Provider>(
+    tree: &Tree<'_, P>,
+    parent_run_id: i64,
+    step: u32,
+    depth: u32,
+    tier: u32,
+) {
+    let t = tree.ledger.tally(tier);
+    tree.watch.emit(RunEvent::at_depth(
+        parent_run_id,
+        step,
+        depth,
+        EventKind::Fleet {
+            tier,
+            working: t.working,
+            queued: t.queued,
+            done: t.done,
+        },
+    ));
 }
 
 /// Fold one child's finished result back into the parent's observation log.
