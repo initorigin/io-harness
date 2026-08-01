@@ -24,8 +24,31 @@ tasks:
   - tests/fixtures/gen-0.29.0/Cargo.lock
   - tests/fixtures/gen-0.29.0/src/main.rs
   - tests/fixtures/store-0.29.0
+  - .gitattributes
   - Cargo.toml
-  evidence: []
+  evidence:
+  - >
+    `tests/fixtures/gen-0.29.0` resolves `io-harness =0.29.0` from crates.io and builds clean. It is
+    the previous release compiling, not this tree: it failed first against
+    `TaskContract::workspace(goal, root, verify)` and against `io_harness::state::{..}`, because
+    0.29.0 takes two arguments there and re-exports those types at the crate root. Both are facts
+    about 0.29.0's API that the current tree could not have told me.
+  - >
+    `gen-0-29-0 write ../store-0.29.0` produced `aggregates.sqlite3` (six finished runs — four
+    successes of which two have no gate failure, one step cap, one stall; gate phases 2 test-run /
+    1 criterion-compile / 1 compile; 3 fallbacks, 2 replans, 2 resumes; three memory entries) and
+    `interrupted.sqlite3` with its workspace (root stopped at the step cap, child 2 finished having
+    written `a.txt` = ALPHA, child 3 out of steps with `b.txt` = DRAFT, tree spend 400 tokens).
+  - >
+    Each sidecar carries `composition` — the literals this generator chose, which is where F7's
+    expectations come from — beside `read_back`, which is what 0.29.0's own API returned from the
+    finished store and is what the forwards half of F8 compares against.
+  - >
+    A defect found and fixed while committing: `.gitattributes` matched `tests/fixtures/**` as
+    `text eol=lf`, so `git add` rewrote `0D 0A` to `0A` inside a database file. Both new fixtures
+    tripped it. `tests/fixtures/**/*.sqlite3 binary` now overrides it, and the staged blobs are
+    byte-identical to the working files (155,648 = 155,648 for both). The 0.22.0 fixtures survived
+    only because no page of theirs contained that byte pair.
 
 - id: US-IO-HARNESS-0.30.0-T02
   summary: >
