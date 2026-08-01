@@ -1,0 +1,1524 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.49s
+     Running unittests src/lib.rs (target/debug/deps/io_harness-521e4369c55e74fc)
+
+running 369 tests
+test agent::tests::a_bare_definition_narrows_nothing ... ok
+test agent::tests::an_unknown_key_in_a_definition_is_rejected ... ok
+test agent::tests::registering_the_same_name_twice_replaces_rather_than_shadows ... ok
+test agent::tests::a_definition_has_no_way_to_express_a_grant ... ok
+test agent::tests::the_catalog_lists_names_in_sorted_order ... ok
+test config::tests::a_later_scope_wins_one_key_and_leaves_its_siblings ... ok
+test containment::tests::a_contract_cannot_raise_the_ceiling ... ok
+test approve::tests::built_in_approvers_decide_as_advertised ... ok
+test containment::tests::the_ceiling_is_tree_wide_not_per_agent ... ok
+test config::tests::policy_layers_append_and_every_other_array_replaces ... ok
+test containment::tests::serde_roundtrips_and_is_stable ... ok
+test context::tests::a_nearly_exhausted_budget_still_gets_a_usable_floor ... ok
+test context::tests::an_unknown_kind_string_fails_rather_than_defaulting ... ok
+test context::tests::an_observation_round_trips_with_and_without_a_target ... ok
+test context::tests::a_ledger_round_trips_its_entries_in_order ... ok
+test context::tests::commas_group_thousands ... ok
+test context::tests::bounding_never_splits_a_char_boundary ... ok
+test containment::tests::concurrent_draws_never_overspend_the_ceiling ... ok
+test context::tests::effective_tokens_is_the_ceiling_when_no_budget_is_set ... ok
+test context::tests::effective_tokens_takes_the_configured_share_of_what_is_left ... ok
+test config::tests::substitution_resolves_or_fails_and_never_empties ... ok
+test context::tests::entry_cap_chars_is_an_eighth_of_the_budget_with_a_floor ... ok
+test context::tests::estimate_tokens_is_four_chars_per_token_rounded_up ... ok
+test context::tests::every_obs_kind_round_trips_through_json ... ok
+test context::tests::obs_kind_wire_strings_are_pinned ... ok
+test context::tests::only_a_target_that_is_the_subject_supersedes ... ok
+test error::tests::a_status_failure_keeps_its_status_and_retry_after ... ok
+test error::tests::retrying_is_worth_it_for_everything_except_a_rejected_request ... ok
+test context::tests::concatenating_each_steps_text_reproduces_the_whole_log ... ok
+test error::tests::the_same_status_always_maps_to_the_same_kind ... ok
+test context::tests::bounding_keeps_the_head_for_most_kinds_and_the_tail_for_a_read ... ok
+test hooks::tests::a_hook_needs_exactly_one_action ... ok
+test hooks::tests::every_event_the_crate_emits_is_a_name_a_hook_may_use ... ok
+test hooks::tests::a_hook_with_no_filter_wants_everything ... ok
+test hooks::tests::a_hook_that_matches_nothing_leaves_an_empty_file_rather_than_none ... ok
+test hooks::tests::an_event_the_crate_does_not_emit_is_refused_naming_it ... ok
+test hooks::tests::an_append_hook_writes_one_json_line_per_matching_event ... ok
+test mcp::tests::a_text_only_result_renders_exactly_its_text_and_attaches_nothing ... ok
+test mcp::tests::an_oversized_result_is_cut_on_a_char_boundary_and_says_so ... ok
+test mcp::tests::tool_names_are_namespaced_and_reversible ... ok
+test net::tests::a_retry_after_in_the_past_is_a_wait_of_zero ... ok
+test mcp::tests::a_stdio_config_omitting_optional_fields_still_parses ... ok
+test mcp::tests::a_server_config_round_trips_through_serde ... ok
+test approve::tests::an_approver_can_be_held_as_a_trait_object_and_answer_out_of_band ... ok
+test net::tests::an_unparseable_retry_after_is_treated_as_absent ... ok
+test net::tests::retry_after_reads_delta_seconds ... ok
+test net::tests::the_civil_date_is_exact_across_leap_years_and_century_rules ... ok
+test net::tests::retry_after_reads_an_http_date_as_the_wait_until_then ... ok
+test net::tests::an_uncheckable_url_is_refused_not_waved_through ... ok
+test net::tests::a_url_becomes_host_and_port ... ok
+test net::tests::today_is_a_well_formed_iso_date ... ok
+test observe::tests::a_unit_variant_still_carries_its_tag ... ok
+test observe::tests::every_kind_produces_one_of_every_tag_and_no_others ... ok
+test net::tests::a_retry_after_header_is_read_off_the_response_headers ... ok
+test observe::tests::ignore_never_cancels ... ok
+test observe::tests::event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained ... ok
+test observe::tests::the_wire_shape_is_flat_and_tagged ... ok
+test observe::tests::each_variant_has_a_distinct_tag ... ok
+test observe::tests::every_variant_round_trips ... ok
+test net::tests::the_provider_layer_is_named_and_a_caller_deny_still_wins ... ok
+test net::tests::deny_is_an_error_and_allow_is_a_verdict ... ok
+test policy::tests::a_pre_0_8_policy_deserialises_with_network_denied ... ok
+test policy::tests::a_backslash_is_an_ordinary_filename_character_on_unix ... ok
+test policy::tests::an_overlay_cannot_reallow_what_the_base_denied ... ok
+test policy::tests::a_child_overlay_deny_narrows_the_parent ... ok
+test policy::tests::a_net_rule_matches_with_or_without_the_port ... ok
+test policy::tests::a_child_overlay_allow_cannot_widen_a_parent_default ... ok
+test policy::tests::a_child_overlay_allow_cannot_reach_a_path_the_parent_denies ... ok
+test policy::tests::an_empty_overlay_leaves_the_base_unchanged ... ok
+test policy::tests::deny_beats_allow_even_when_both_match ... ok
+test policy::tests::default_policy_denies_dotenv_read_inside_a_readable_tree ... ok
+test policy::tests::containment_holds_downward_through_depth ... ok
+test policy::tests::net_is_denied_by_default_and_allowed_only_where_a_rule_says_so ... ok
+test policy::tests::an_overlay_only_allow_grants_capability_the_base_lacked ... ok
+test policy::tests::net_narrows_downward_and_never_widens ... ok
+test policy::tests::explain_names_the_rule_and_the_layer_that_decided ... ok
+test policy::tests::permissive_still_enforces_nothing_including_the_network ... ok
+test policy::tests::explain_and_check_never_disagree ... ok
+test pricing::tests::a_hand_computed_million_token_figure_comes_out_exact ... ok
+test pricing::tests::a_table_with_no_tiers_prices_exactly_as_it_did_before_they_existed ... ok
+test pricing::tests::a_tier_on_a_model_with_no_base_price_is_still_unpriced ... ok
+test pricing::tests::an_unpriced_model_is_unknown_rather_than_free ... ok
+test policy::tests::net_rules_survive_a_serde_roundtrip ... ok
+test pricing::tests::a_prompt_below_every_floor_gets_the_base_row_not_the_lowest_tier ... ok
+test pricing::tests::cache_figures_larger_than_the_prompt_saturate_rather_than_underflow ... ok
+test pricing::tests::rounding_is_once_at_the_end_and_half_up ... ok
+test pricing::tests::the_tier_boundary_is_exact_on_both_sides ... ok
+test provider::anthropic::tests::a_stream_that_reports_no_cache_or_stop_reason_yields_zeros_and_nones ... ok
+test pricing::tests::the_same_usage_costs_strictly_less_once_the_tiers_are_removed ... ok
+test pricing::tests::the_highest_reached_floor_wins_whatever_order_the_tiers_were_written_in ... ok
+test provider::anthropic::tests::a_stream_with_no_thinking_yields_none_rather_than_an_empty_string ... ok
+test provider::anthropic::tests::accumulates_tool_use_from_input_json_deltas_and_usage ... ok
+test provider::anthropic::tests::accumulates_plain_text ... ok
+test provider::anthropic::tests::cache_tokens_the_model_reports_reach_usage_with_the_model_and_stop_reason ... ok
+test provider::anthropic::tests::thinking_deltas_accumulate_and_stay_out_of_the_text ... ok
+test policy::tests::serde_roundtrip_enforces_identically ... ok
+test policy::tests::merging_is_deterministic_and_merging_a_layer_with_itself_changes_nothing ... ok
+test policy::tests::the_glob_cache_cannot_make_one_pattern_answer_another_pattern_s_question ... ok
+test provider::anthropic::web_wire::a_fetch_result_is_named_by_the_request_that_asked_for_it ... ok
+test provider::anthropic::web_wire::a_search_that_failed_inside_a_200_is_recorded_as_a_failure ... ok
+test provider::anthropic::web_wire::a_stream_with_no_web_activity_reports_none ... ok
+test provider::anthropic::web_wire::citations_arrive_from_deltas_and_from_result_blocks ... ok
+test config::tests::a_command_substitution_runs_outside_the_project_scope_and_never_inside_it ... ok
+test provider::anthropic::tests::body_maps_tools_to_input_schema_and_system_top_level ... ok
+test provider::anthropic::web_wire::a_declaration_becomes_dated_server_tool_entries ... ok
+test provider::anthropic::web_wire::no_effort_leaves_the_anthropic_body_exactly_as_it_was ... ok
+test provider::anthropic::web_wire::no_declaration_sends_the_0_21_0_body ... ok
+test provider::anthropic::web_wire::a_block_list_alone_is_sent_as_one ... ok
+test provider::anthropic::web_wire::the_effort_tier_becomes_a_thinking_budget_below_max_tokens ... ok
+test provider::catalog::tests::a_per_request_charge_is_not_scaled_to_a_million ... ok
+test provider::catalog::tests::f4_a_decimal_rate_becomes_an_exact_integer ... ok
+test provider::catalog::tests::f4_the_conversion_is_not_a_float_multiply ... ok
+test provider::catalog::tests::f5_a_model_the_reference_does_not_carry_stays_none ... ok
+test provider::catalog::tests::f5_an_ambiguous_normalisation_is_a_miss_not_a_first_wins ... ok
+test provider::catalog::tests::f4_a_malformed_rate_is_absent_rather_than_free ... ok
+test provider::catalog::tests::f5_an_exact_slug_matches ... ok
+test provider::catalog::tests::f5_normalisation_is_not_applied_in_the_other_direction ... ok
+test provider::catalog::tests::f5_the_one_normalisation_drops_a_single_leading_vendor_segment ... ok
+test provider::catalogue_default::a_provider_that_overrides_nothing_reports_an_empty_catalogue ... ok
+test provider::catalog::tests::the_host_is_knowable_before_any_request_is_made ... ok
+test provider::catalog::tests::the_catalogue_is_read_once_per_instance ... ok
+test provider::catalog::tests::every_price_carries_its_provenance_and_the_two_cannot_disagree ... ok
+test provider::compatible::tests::a_failure_is_classified_exactly_as_the_three_original_providers_classify_it ... ok
+test provider::catalog::tests::the_live_shape_parses_into_model_info ... ok
+test provider::compatible::tests::f2_a_local_runtime_takes_no_key_and_a_hosted_one_takes_a_bearer ... ok
+test provider::compatible::tests::f2_an_unknown_preset_is_refused_naming_the_ones_that_exist ... ok
+test provider::compatible::tests::a_price_table_carries_the_moment_it_was_read_rather_than_a_typed_date ... ok
+test provider::compatible::tests::f2_every_preset_names_a_distinct_vendor_with_a_well_formed_base ... ok
+test provider::compatible::tests::f2_the_table_check_reports_a_broken_row_rather_than_always_passing ... ok
+test provider::compatible::tests::f2_every_named_constructor_agrees_with_its_table_row ... ok
+test provider::compatible::tests::f1_a_streamed_completion_arrives_through_the_real_http_and_sse_path ... ok
+test provider::anthropic::web_wire::the_fetch_beta_header_is_sent_only_when_fetch_is_asked_for ... ok
+test provider::compatible::tests::f1_an_auth_none_provider_sends_no_authorization_header_at_all ... ok
+test provider::compatible::tests::f1_a_base_that_already_carries_a_path_keeps_every_segment_of_it ... ok
+test provider::compatible::tests::f3_a_connected_provider_returns_a_non_empty_catalogue ... ok
+test provider::failures::a_bad_request_is_request_and_not_retryable ... ok
+test provider::failures::a_rate_limit_with_an_http_date_keeps_the_wait_until_that_date ... ok
+test provider::failures::a_rate_limit_with_delta_seconds_keeps_the_wait_the_server_asked_for ... ok
+test provider::compatible::tests::f6_a_reference_price_fills_a_gap_and_says_it_is_a_reference_price ... ok
+test provider::failures::a_refused_connection_is_transport ... ok
+test provider::failures::a_rate_limit_without_a_retry_after_is_rate_limited_and_carries_no_wait ... ok
+test provider::failures::a_rejected_key_is_auth_and_not_retryable ... ok
+test provider::failures::a_server_error_is_server_and_retryable ... ok
+test provider::failures::a_stream_carrying_only_usage_is_not_malformed ... ok
+test provider::failures::a_stream_that_parses_to_nothing_is_malformed_not_an_empty_answer ... ok
+test provider::fallback::tests::a_down_primary_is_answered_by_the_secondary ... ok
+test provider::fallback::tests::a_failure_the_secondary_would_share_does_not_fall_over ... ok
+test provider::fallback::tests::a_working_primary_is_never_backed_up ... ok
+test provider::fallback::tests::authorization_sees_every_endpoint_in_the_chain ... ok
+test provider::fallback::tests::both_failing_reports_the_secondarys_error ... ok
+test provider::failures::a_stream_with_text_and_no_tool_call_stays_a_quiet_success ... ok
+test provider::compatible::tests::f7_the_reference_lookup_is_off_until_it_is_asked_for ... ok
+test provider::fallback::tests::three_providers_nest_and_the_leaf_is_what_gets_recorded ... ok
+test provider::openai_wire::tests::a_stream_with_no_reasoning_yields_none_rather_than_an_empty_string ... ok
+test provider::openai_wire::tests::a_disagreeing_total_is_kept_as_the_provider_reported_it ... ok
+test provider::openai_wire::tests::a_usage_chunk_without_detail_objects_yields_zeros ... ok
+test provider::openai_wire::tests::accumulates_tool_call_fragments_across_deltas ... ok
+test provider::openai_wire::tests::body_maps_tools_to_function_schema ... ok
+test provider::openai_wire::tests::cached_and_reasoning_tokens_reach_usage_with_the_model_and_finish_reason ... ok
+test provider::openai_wire::tests::reasoning_deltas_accumulate_and_stay_out_of_the_text ... ok
+test provider::openai_wire::web_wire::a_declaration_a_vendor_cannot_carry_is_refused_by_name ... ok
+test provider::openai_wire::web_wire::a_stream_with_no_web_activity_reports_none ... ok
+test provider::openai_wire::web_wire::an_error_object_in_a_200_stream_is_a_failed_call ... ok
+test provider::openai_wire::web_wire::annotations_become_citations_and_a_recorded_search ... ok
+test provider::openai_wire::web_wire::each_wire_vendor_gets_the_effort_tier_in_its_own_shape ... ok
+test provider::openai_wire::web_wire::no_declaration_adds_no_key_to_either_body ... ok
+test provider::openai_wire::web_wire::no_effort_leaves_both_bodies_exactly_as_they_were ... ok
+test provider::failures::anthropics_own_stream_shape_is_held_to_the_same_two_meanings ... ok
+test provider::openai_wire::web_wire::openrouter_gets_a_web_plugin_with_its_cap ... ok
+test provider::openai_wire::web_wire::openai_gets_web_search_options_with_its_filter ... ok
+test provider::record::tests::a_recording_is_refused_across_a_series_and_accepted_within_one ... ok
+test resilience::tests::a_servers_retry_after_wins_over_the_ceiling ... ok
+test resilience::tests::a_window_of_zero_disables_detection_entirely ... ok
+test resilience::tests::a_write_that_changed_nothing_does_not_count_as_progress ... ok
+test resilience::tests::backoff_doubles_up_to_the_ceiling ... ok
+test resilience::tests::changing_the_workspace_clears_the_window ... ok
+test resilience::tests::more_replans_than_allowed_is_a_configuration_a_caller_can_make ... ok
+test resilience::tests::repeating_one_call_while_nothing_changes_is_a_stall ... ok
+test resilience::tests::the_directive_names_what_was_tried ... ok
+test resilience::tests::varied_calls_that_change_nothing_are_exploration_not_a_stall ... ok
+test sandbox::linux::tests::allows_network_when_asked ... ok
+test sandbox::linux::tests::a_wrapper_failure_is_not_a_verification_failure ... ok
+test sandbox::linux::tests::denies_network_with_a_new_net_namespace ... ok
+test sandbox::macos::tests::profile_allows_network_when_asked ... ok
+test sandbox::macos::tests::profile_denies_network_by_default_and_confines_writes ... ok
+test sandbox::tests::config_and_limits_round_trip_through_serde ... ok
+test sandbox::linux::tests::the_reported_backend_is_the_one_the_host_can_actually_run ... ok
+test provider::anthropic::tests::the_ttft_clock_stops_at_the_first_content_event ... ok
+test sandbox::tests::copy_back_honours_the_write_policy ... ok
+test sandbox::linux::tests::degrades_to_the_floor_when_the_wrapper_does_not_work ... ok
+test sandbox::tests::a_capped_run_keeps_its_hard_limit_above_the_soft_one ... ok
+test sandbox::tests::force_floor_selects_the_portable_backend ... ok
+test sandbox::tests::floor_runs_a_command_and_captures_output ... ok
+test sandbox::tests::floor_reports_a_nonzero_exit ... ok
+test sandbox::tests::workdir_is_removed_on_drop ... ok
+test provider::failures::all_three_providers_map_a_status_to_the_same_kind ... ok
+test sandbox::windows::tests::absent_limits_map_to_nothing_rather_than_zero ... ok
+test sandbox::windows::tests::maps_limits_to_job_object_fields_and_ticks ... ok
+test skills::tests::a_description_spanning_lines_is_joined ... ok
+test skills::tests::a_heading_becomes_the_fallback_description ... ok
+test skills::tests::a_later_key_does_not_absorb_the_description ... ok
+test skills::tests::a_non_ascii_body_survives_and_a_long_description_clamps_at_a_char_boundary ... ok
+test skills::tests::a_plain_continuation_line_is_joined_too ... ok
+test skills::tests::absent_frontmatter_leaves_the_whole_file_as_body ... ok
+test skills::tests::crlf_line_endings_parse ... ok
+test skills::tests::plain_frontmatter_is_read_and_the_body_follows ... ok
+test skills::tests::skill_md_takes_its_directory_name_and_a_plain_file_its_stem ... ok
+test skills::tests::unterminated_frontmatter_is_treated_as_no_frontmatter ... ok
+test state::tests::a_handle_started_twice_keeps_what_is_known_about_the_first ... ok
+test state::tests::a_layered_policy_reads_back_exactly_as_it_was_recorded ... ok
+test approve::tests::a_slow_approver_keeps_the_caller_waiting_rather_than_timing_out ... ok
+test state::tests::a_permissive_policy_reads_back_permissive ... ok
+test state::tests::a_0_9_1_store_opens_unchanged_and_still_resumes ... ok
+test state::tests::a_pending_approval_survives_the_store_being_reopened ... ok
+test state::tests::a_pre_0_4_database_migrates_in_place_and_keeps_its_rows ... ok
+test state::tests::a_pre_0_5_database_migrates_and_keeps_its_rows ... ok
+test state::tests::a_rolled_back_step_leaves_the_prior_checkpoint_intact ... ok
+test state::tests::a_run_with_no_recorded_policy_reads_back_none_not_permissive ... ok
+test state::tests::a_pre_0_8_database_migrates_in_place_and_keeps_its_rows ... ok
+test state::tests::a_started_handle_reads_back_with_its_line_and_step_still_running ... ok
+test state::tests::an_ended_handle_is_not_re_ended_by_a_later_kill ... ok
+test state::tests::an_empty_chunk_writes_no_row ... ok
+test state::tests::an_oversized_value_is_truncated_with_a_marker_not_rejected ... ok
+test state::tests::a_pre_session_database_gains_the_session_tables_and_keeps_its_rows ... ok
+test state::tests::check_resumable_refuses_a_newer_format_and_a_missing_run ... ok
+test state::tests::checkpoint_step_commits_the_step_and_its_event_together ... ok
+test state::tests::decisions_record_their_value_source_and_any_altered_target ... ok
+test state::tests::full_trace_persists_and_reads_back ... ok
+test sandbox::tests::memory_cap_kills_a_heap_hog_and_names_the_memory_cap ... ok
+test state::tests::migrates_a_0_1_0_steps_table_in_place ... ok
+test state::tests::memory_kind_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained ... ok
+test sandbox::tests::memory_cap_kills_a_hog_the_shell_forked ... ok
+test state::tests::every_aggregate_reaches_its_rows_through_an_index ... ok
+test state::tests::migrates_a_pre_0_3_runs_table_adding_provider ... ok
+test state::tests::orphaning_a_run_touches_only_the_handles_still_running ... ok
+test state::tests::orphaning_a_run_twice_returns_nothing_the_second_time ... ok
+test state::tests::output_chunks_concatenate_in_the_order_they_were_read ... ok
+test state::tests::pids_round_trip_through_the_joined_column_including_the_empty_case ... ok
+test state::tests::provider_is_recorded_and_read_back ... ok
+test state::tests::re_recording_a_policy_for_the_same_run_replaces_it ... ok
+test state::tests::refusals_record_action_target_rule_and_layer ... ok
+test state::tests::re_recording_pids_replaces_the_list_rather_than_appending_to_it ... ok
+test state::tests::spent_tokens_and_elapsed_are_durable_reads ... ok
+test state::tests::status_round_trips_and_a_pre_0_7_database_migrates ... ok
+test state::tests::the_total_chars_cap_evicts_before_the_count_cap_is_reached ... ok
+test state::tests::the_approved_plan_lookup_reaches_its_row_through_an_index ... ok
+test template::tests::a_body_with_no_marker_renders_to_itself ... ok
+test state::tests::the_entry_count_cap_evicts_oldest_first_and_never_the_new_entry ... ok
+test template::tests::a_placeholder_and_arguments_are_the_whole_grammar ... ok
+test template::tests::a_repeated_placeholder_is_substituted_every_time ... ok
+test template::tests::an_unfilled_placeholder_and_an_unclosed_brace_are_both_errors ... ok
+test template::tests::a_value_is_not_re_substituted ... ok
+test state::tests::tree_aggregate_reads_span_root_and_descendants ... ok
+test template::tests::arguments_before_the_placeholder_that_claims_one_still_excludes_it ... ok
+test template::tests::frontmatter_is_stripped_from_the_body ... ok
+test template::tests::an_unknown_name_lists_what_exists ... ok
+test template::tests::spaces_inside_the_braces_are_tolerated ... ok
+test template::tests::template_md_takes_its_directory_name_and_a_plain_file_its_stem ... ok
+test toolchain::tests::a_deno_project_carrying_a_package_json_is_still_deno ... ok
+test toolchain::tests::a_directory_with_no_marker_reports_no_detection_rather_than_guessing ... ok
+test toolchain::tests::a_toolchain_round_trips_through_json ... ok
+test toolchain::tests::a_makefile_beside_a_real_build_system_does_not_win ... ok
+test toolchain::tests::the_description_names_the_marker_and_omits_the_commands_that_do_not_exist ... ok
+test state::tests::two_turns_may_share_a_parent_and_neither_is_rewritten ... ok
+test toolchain::tests::the_lockfile_beside_package_json_chooses_the_package_manager ... ok
+test toolchain::tests::the_python_runner_follows_the_lockfile ... ok
+test state::tests::the_tree_is_reconstructable_from_a_reopened_store ... ok
+test tools::diagnostics::tests::a_stream_with_no_diagnostics_in_it_renders_to_nothing ... ok
+test tools::diagnostics::tests::an_unknown_ecosystem_is_a_skip_and_spawns_nothing ... ok
+test tools::diagnostics::tests::every_checker_in_the_table_has_a_program_and_a_distinct_ecosystem ... ok
+test toolchain::tests::every_marker_names_its_ecosystem_and_its_test_command ... ok
+test tools::diagnostics::tests::the_parser_takes_rendered_from_compiler_messages_and_ignores_everything_else ... ok
+test tools::diagnostics::tests::a_checker_missing_from_path_is_a_failure_not_an_error_and_not_a_clean_check ... ok
+test tools::exec::tests::a_command_that_finishes_inside_the_timeout_is_not_reported_as_one ... ok
+test tools::diagnostics::tests::a_checker_that_finds_nothing_is_clean_and_not_a_skip ... ok
+test tools::exec::tests::a_missing_program_is_an_unavailable_outcome_not_a_run_failure ... ok
+test provider::failures::a_server_that_accepts_and_never_answers_ends_as_a_timeout ... ok
+test tools::exec::tests::an_empty_argv_is_a_config_error_rather_than_a_panic ... ok
+test tools::exec::tests::output_that_fits_is_returned_whole_and_reports_no_elision ... ok
+test tools::diagnostics::tests::a_checker_that_exits_nonzero_saying_nothing_is_unchecked_rather_than_clean ... ok
+test tools::exec::tests::oversized_output_keeps_both_ends_and_says_how_much_it_dropped ... ok
+test tools::exec::tests::the_child_gets_the_argv_verbatim_with_no_shell_between ... ok
+test tools::exec::tests::the_elision_is_measured_in_characters_not_bytes ... ok
+test tools::fs::tests::a_write_reports_what_it_did_to_the_file ... ok
+test tools::fs::tests::missing_reads_empty_then_roundtrips ... ok
+test tools::git::tests::a_missing_git_binary_is_an_unavailable_outcome_not_a_run_failure ... ok
+test tools::git::tests::a_path_beginning_with_a_dash_is_refused_and_the_same_path_without_it_is_not ... ok
+test tools::git::tests::a_path_named_like_a_flag_is_refused_and_its_relative_form_stays_data ... ok
+test tools::git::tests::a_path_with_a_space_a_quote_and_a_newline_survives_as_one_argv_element ... ok
+test tools::exec::tests::a_failing_command_comes_back_as_a_nonzero_exit_with_its_stderr ... ok
+test tools::exec::tests::a_real_command_reports_its_exit_status_and_its_output ... ok
+test tools::git::tests::every_model_supplied_path_lands_after_the_separator ... ok
+test tools::git::tests::every_shape_covers_every_variant ... ok
+test tools::git::tests::no_shape_can_write_or_reach_the_network ... ok
+test tools::git::tests::the_child_pins_the_pager_the_locale_the_config_and_the_hooks ... ok
+test tools::git::tests::an_exec_deny_refuses_the_spawn_and_a_permissive_policy_does_not ... ok
+test tools::git::tests::the_subcommand_is_always_one_of_the_five_this_crate_ships ... ok
+test tools::diagnostics::tests::the_findings_are_capped_and_say_what_they_dropped ... ok
+test tools::handles::tests::a_poll_over_the_window_keeps_the_end_and_reports_the_gap ... ok
+test tools::handles::tests::a_poll_before_any_output_is_empty_rather_than_an_error ... ok
+test tools::handles::tests::an_orphan_does_not_reuse_a_live_id ... ok
+test tools::handles::tests::a_poll_returns_only_what_is_new ... ok
+test tools::handles::tests::an_orphaned_handle_is_never_signalled ... ok
+test tools::handles::tests::killing_an_unknown_handle_says_so ... ok
+test tools::shell::tests::a_bare_command_is_one_stage ... ok
+test tools::handles::tests::the_cap_refuses_rather_than_queues ... ok
+test tools::shell::tests::a_quoted_digit_is_an_argument_not_a_descriptor ... ok
+test tools::shell::tests::a_refused_line_names_a_character_offset_inside_it ... ok
+test tools::shell::tests::double_quotes_follow_the_posix_escape_rule_exactly ... ok
+test tools::shell::tests::an_unquoted_digit_immediately_before_an_operator_is_a_descriptor ... ok
+test tools::shell::tests::every_ascii_character_in_command_position_is_refused_or_inert ... ok
+test tools::shell::tests::every_ascii_character_outside_the_permitted_set_is_refused ... ok
+test tools::shell::tests::every_ascii_character_is_either_refused_or_structurally_inert ... ok
+test tools::shell::tests::every_supported_redirect_is_recognised ... ok
+test tools::shell::tests::every_excluded_construct_is_refused_by_name ... ok
+test tools::shell::tests::non_ascii_is_a_literal_and_control_characters_are_not ... ok
+test tools::shell::tests::quoting_makes_a_refused_character_an_ordinary_argument ... ok
+test tools::shell::tests::sequences_and_newlines_are_the_same_separator ... ok
+test tools::shell::tests::the_motivating_line_parses_into_its_three_stages ... ok
+test tools::shell::tests::the_reported_stage_count_matches_the_operators_in_the_line ... ok
+test tools::shell::tests::words_split_on_whitespace_and_join_across_quotes ... ok
+test tools::shell::tests::write_redirects_are_distinguished_from_read_ones ... ok
+test tools::shell::tests::the_length_and_stage_caps_refuse_rather_than_allocate ... ok
+test tools::workspace::tests::a_denied_byte_read_is_refused_before_anything_is_read ... ok
+test tools::workspace::tests::a_byte_write_reports_whether_it_changed_anything ... ok
+test tools::git::tests::a_real_git_reports_its_own_failure_rather_than_erroring_the_run ... ok
+test tools::workspace::tests::a_denied_byte_write_is_refused_and_the_file_is_untouched ... ok
+test tools::workspace::tests::a_denied_write_is_refused_and_the_file_is_untouched ... ok
+test tools::workspace::tests::a_denied_write_is_refused_before_the_change_signal_is_computed ... ok
+test tools::workspace::tests::a_missing_byte_read_is_an_error_not_an_empty_document ... ok
+test tools::workspace::tests::a_symlink_is_denied_by_its_target_even_when_its_own_path_is_allowed ... ok
+test tools::workspace::tests::a_symlink_pointing_outside_the_root_is_refused ... ok
+test tools::workspace::tests::a_write_of_byte_identical_content_reports_unchanged ... ok
+test tools::workspace::tests::a_write_of_different_content_reports_changed_and_lands_on_disk ... ok
+test tools::workspace::tests::a_workspace_without_a_policy_behaves_exactly_as_0_3_0_did ... ok
+test tools::workspace::tests::a_write_to_a_path_that_does_not_exist_reports_created ... ok
+test tools::workspace::tests::byte_io_cannot_escape_the_workspace_root ... ok
+test tools::workspace::tests::a_write_of_the_same_length_but_different_bytes_reports_changed ... ok
+test tools::workspace::tests::byte_io_round_trips_content_that_is_not_valid_utf8 ... ok
+test tools::workspace::tests::find_matches_by_basename_and_path_glob ... ok
+test tools::workspace::tests::grep_finds_matches_by_regex_across_files_skipping_ignored ... ok
+test tools::workspace::tests::check_path_agrees_with_what_read_and_write_actually_enforce ... ok
+test tools::workspace::tests::grep_path_glob_restricts_to_matching_files ... ok
+test tools::workspace::tests::multibyte_content_round_trips_and_compares_correctly ... ok
+test tools::workspace::tests::denied_paths_are_invisible_to_grep_and_find ... ok
+test tools::shell::tests::no_input_containing_an_unpermitted_character_is_ever_accepted ... ok
+test tools::workspace::tests::resolve_refuses_escapes_but_allows_inner_paths ... ok
+test tools::workspace::tests::read_missing_is_empty_then_write_roundtrips_within_root ... ok
+test tools::workspace::tests::the_same_byte_io_succeeds_where_the_policy_allows_it ... ok
+test tools::workspace::tests::traversal_is_evaluated_on_the_resolved_path_not_the_literal_one ... ok
+test verify::tests::a_document_criterion_needs_a_workspace_root ... ok
+test verify::tests::a_document_criterion_refuses_a_format_it_cannot_read ... ok
+test tools::exec::tests::the_working_directory_is_the_one_it_was_given ... ok
+test verify::tests::contains_passes_and_fails ... ok
+test verify::tests::a_command_gate_rejects_a_stub_and_accepts_real_code ... ok
+test verify::tests::equals_is_exact ... ok
+test verify::tests::multi_file_variant_errors_in_single_file_mode ... ok
+test verify::tests::a_command_absent_from_the_allow_list_is_refused_not_failed ... ok
+test web::tests::a_declaration_with_neither_switch_is_not_enabled ... ok
+test web::tests::a_pattern_the_filter_cannot_express_is_an_error_naming_it ... ok
+test web::tests::a_policy_projects_onto_the_vendor_filter ... ok
+test web::tests::allow_everything_projects_to_no_filter_at_all ... ok
+test verify::tests::a_verification_with_no_policy_still_spawns_as_0_3_0_did ... ok
+test tools::exec::tests::a_command_that_outlives_the_timeout_is_killed_and_named_as_a_timeout ... ok
+test verify::tests::nothing_spawns_the_test_binary_since_the_rust_variants_were_removed ... ok
+test verify::tests::each_compiles_rust_fails_if_any_file_fails ... ok
+test sandbox::tests::cpu_cap_kills_a_busy_loop_and_names_the_cpu_cap ... ok
+test verify::tests::a_command_gate_runs_the_projects_own_suite_and_fails_with_it ... ok
+test sandbox::tests::the_wall_clock_kill_reaches_the_children_the_run_forked ... ok
+
+test result: ok. 369 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.07s
+
+     Running tests/accounting.rs (target/debug/deps/accounting-f0fbc2c8af2990a5)
+
+running 15 tests
+test a_run_that_predates_the_tables_reports_no_calls_rather_than_zero ... ok
+test a_call_with_no_model_groups_under_its_own_key ... ok
+test a_run_that_searched_is_charged_the_per_request_price_on_top_of_its_tokens ... ok
+test f7_the_aggregates_are_right_against_a_known_composition ... ok
+test a_retried_step_records_one_row_per_attempt ... ok
+test a_step_that_did_not_retry_records_exactly_one_row ... ok
+test a_provider_that_measured_nothing_records_no_ttft_rather_than_zero ... ok
+test correcting_a_price_changes_every_past_run_and_the_store_does_not_argue ... ok
+test edits_record_the_lines_each_change_added_and_removed ... ok
+test grouping_by_model_by_day_and_by_run_agree_with_each_other ... ok
+test the_aggregates_over_an_empty_store_are_empty_rather_than_absent ... ok
+test the_web_tables_carry_no_credential_and_no_prompt_derived_query ... ok
+test the_same_run_reporting_no_searches_is_charged_for_its_tokens_alone ... ok
+test two_models_serving_one_run_are_two_rows_and_one_provider_label ... ok
+test latency_brackets_the_call_and_ttft_is_smaller_than_it ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.24s
+
+     Running tests/agents.rs (target/debug/deps/agents-023a644d6cf1a681)
+
+running 7 tests
+test the_trace_records_which_definition_a_child_was_spawned_from ... ok
+test a_named_agents_role_is_prepended_to_its_system_prompt ... ok
+test a_spawn_with_no_agent_named_uses_the_providers_configured_model ... ok
+test an_unknown_agent_name_yields_an_error_observation_and_no_child ... ok
+test two_named_agents_put_their_own_two_models_on_the_wire ... ok
+test a_definition_that_denies_writes_produces_a_child_that_cannot_write ... ok
+test a_definition_silent_about_a_denied_path_does_not_restore_it ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/changelog.rs (target/debug/deps/changelog-29097368b3c92e6d)
+
+running 5 tests
+test a_fenced_snippet_does_not_split_an_entry ... ok
+test an_unmarked_entry_is_never_reported ... ok
+test a_marked_entry_with_no_note_is_reported ... ok
+test the_marker_is_actually_found_in_the_real_file ... ok
+test every_breaking_entry_carries_a_migration_note ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/checkpoint.rs (target/debug/deps/checkpoint-cf59622919f8023b)
+
+running 18 tests
+test a_multi_crash_run_history_is_reconstructable_from_the_store ... ok
+test a_finished_policy_bearing_run_still_reports_its_outcome_through_the_bare_resume ... ok
+test a_run_with_no_recorded_policy_resumes_through_the_bare_resume ... ok
+test a_run_with_no_durable_observations_resumes_and_re_derives ... ok
+test a_store_written_without_the_0_13_0_tables_opens_and_resumes ... ok
+test a_tree_with_no_recorded_policy_is_refused_rather_than_resumed_permissively ... ok
+test a_tree_approval_survives_a_full_restart ... ok
+test edit_applied_exactly_once_and_resume_is_idempotent ... ok
+test the_checkpoint_format_is_still_7_because_0_13_0_only_added_tables ... ok
+test resuming_an_unknown_run_returns_a_typed_error_not_a_panic ... ok
+test no_double_charge_across_a_crash_resume ... ok
+test a_long_unattended_run_sustains_the_loop_and_checkpoints_throughout ... ok
+test a_sandboxed_verification_is_recreated_on_resume ... ok
+test the_time_budget_is_wall_clock_and_durable_across_a_restart ... ok
+test a_tree_crash_resumes_every_agent_from_its_checkpoint ... ok
+test a_tree_resumed_from_its_stored_policy_is_still_bounded_by_it ... ok
+test the_same_tree_resume_on_a_permissive_run_performs_the_write ... ok
+test crash_resume_after_a_real_sigkill_reaches_verified_success ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.72s
+
+     Running tests/config.rs (target/debug/deps/config-bb3a48f4cb5ca089)
+
+running 48 tests
+test a_file_that_declares_only_agents_still_reaches_the_contract ... ok
+test a_command_substitution_is_refused_in_the_project_scope_and_runs_in_the_local_one ... ok
+test a_later_scope_replaces_the_whole_provider_chain ... ok
+test a_config_with_no_provider_table_has_no_spec ... ok
+test a_compatible_provider_naming_both_base_and_preset_is_refused ... ok
+test a_local_scope_switching_search_off_overrides_a_project_scope_that_turned_it_on ... ok
+test a_compatible_provider_naming_neither_base_nor_preset_is_refused_by_index ... ok
+test a_later_scope_redefining_one_agent_replaces_only_that_agent ... ok
+test a_profile_overlays_the_base_and_leaves_every_key_it_did_not_name ... ok
+test a_project_scoped_file_may_narrow_the_boundary_and_may_never_widen_it ... ok
+test a_project_scoped_file_may_not_declare_hooks_and_a_local_one_may ... ok
+test a_web_table_projects_onto_the_same_web_access_the_programmatic_api_builds ... ok
+test agent_tables_accumulate_across_scopes_rather_than_being_replaced ... ok
+test agent_tables_project_onto_the_same_roster_the_programmatic_api_builds ... ok
+test an_unknown_key_inside_a_compatible_provider_is_rejected_naming_it ... ok
+test an_unknown_key_inside_a_hook_table_is_rejected_naming_it ... ok
+test an_unknown_key_inside_a_profile_that_is_never_selected_is_rejected_naming_it ... ok
+test each_valid_shape_of_a_compatible_provider_loads ... ok
+test an_unknown_key_inside_an_agent_table_is_rejected_naming_it ... ok
+test an_unknown_key_inside_the_web_table_is_rejected_naming_it ... ok
+test an_unknown_preset_is_refused_listing_the_ones_that_exist ... ok
+test discovered_instructions_reach_the_contract_as_constraints ... ok
+test an_unknown_key_inside_a_provider_or_instructions_table_is_rejected_naming_it ... ok
+test f10_no_config_file_is_not_an_error ... ok
+test f5_an_unknown_key_fails_the_load_naming_the_key_and_the_file ... ok
+test f1_the_sources_report_which_files_were_merged_and_in_what_order ... ok
+test f2_a_later_scope_overrides_one_key_and_nothing_else ... ok
+test f4_policy_layers_append_across_scopes_and_a_deny_still_wins ... ok
+test f1_the_four_scopes_merge_in_order ... ok
+test a_substituted_secret_reaches_the_field_and_not_the_trace ... ok
+test f7_a_key_removed_from_that_file_leaves_exactly_that_field_at_its_default ... ok
+test f3_the_boundary_a_file_describes_is_the_boundary_a_run_enforces ... ok
+test f7_every_key_reaches_a_typed_field ... ok
+test f8_the_file_fills_the_price_table_and_the_toolchain ... ok
+test f6_substitution_reaches_the_field_or_names_the_key_that_failed ... ok
+test io_config_names_the_user_scope_file_and_does_not_bypass_the_merge ... ok
+test origin_after_a_profile_overlay_names_the_file_the_profile_came_from ... ok
+test provider_spec_is_non_exhaustive_because_a_later_release_adds_a_variant ... ok
+test origin_of_a_key_only_one_file_sets_is_that_file_not_the_last_one_read ... ok
+test f9_a_config_the_agent_writes_mid_run_cannot_widen_the_boundary ... ok
+test nf3_nothing_is_read_from_disk_for_configuration_once_the_caller_has_loaded_it ... ok
+test origin_of_a_substituted_value_is_the_file_it_was_written_in ... ok
+test origin_of_an_appending_key_lists_every_file_that_contributed ... ok
+test origin_reports_the_deciding_scope_at_every_step_down ... ok
+test origin_shows_the_project_file_that_narrowed_a_user_setting ... ok
+test the_app_table_takes_keys_this_crate_has_never_heard_of ... ok
+test the_project_scope_rule_reaches_inside_a_profile ... ok
+test the_run_section_carries_a_template_directory ... ok
+
+test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/context.rs (target/debug/deps/context-0a0d3d9f13d97354)
+
+running 16 tests
+test a_long_runs_stubs_collapse_so_the_ceiling_still_holds ... ok
+test a_policy_refused_reread_is_a_stub_naming_the_invalidating_step_and_the_reason ... ok
+test a_re_read_cannot_escape_the_workspace_root ... ok
+test a_write_invalidates_the_earlier_read_so_the_next_turn_sees_the_new_contents ... ok
+test a_read_superseded_by_a_later_read_of_the_same_path_becomes_a_stub ... ok
+test the_budget_derives_the_prompt_ceiling_and_the_entry_cap_from_one_number ... ok
+test a_sub_agent_loops_prompt_stays_inside_the_ceiling ... ok
+test assembling_one_turn_costs_a_bounded_amount_of_time ... ok
+test the_rendered_note_block_is_byte_identical_whatever_run_id_the_notes_carry ... ok
+test two_calls_to_one_tool_keep_both_answers_while_two_reads_of_a_path_collapse ... ok
+test a_resumed_run_asks_the_model_what_an_uninterrupted_run_would_have ... ok
+test what_the_run_observed_before_the_interruption_is_in_the_prompt_after_it ... ok
+test the_assembled_prompt_stays_inside_the_ceiling_while_the_trace_keeps_everything ... ok
+test prompt_size_stabilises_across_many_turns_instead_of_tracking_step_count ... ok
+test every_observation_kind_is_bounded_where_it_enters_the_context ... ok
+test an_mcp_result_is_bounded_where_it_enters_the_context ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+
+     Running tests/cross_version.rs (target/debug/deps/cross_version-869d6ae6be76f5a8)
+
+running 5 tests
+test a_0_22_0_store_reads_back_row_for_row_through_the_public_api ... ok
+test the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it ... ok
+test a_0_22_0_deferred_approval_is_resolved_here_and_the_run_continues ... ok
+test a_0_22_0_interrupted_tree_resumes_without_re_running_or_double_charging ... ok
+test the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/cross_version_0_29_0.rs (target/debug/deps/cross_version_0_29_0-65c0b5842f476b33)
+
+running 3 tests
+test a_current_store_is_read_by_a_0_29_0_binary ... ignored, needs tests/fixtures/gen-0.29.0 built; CI's cross-version-0.29.0 job runs it
+test a_0_29_0_store_reads_back_identically_under_the_current_tree ... ok
+test a_0_29_0_tree_resumes_under_the_current_tree ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/custom_tools.rs (target/debug/deps/custom_tools-bf3def278a7e42b6)
+
+running 15 tests
+test a_registered_tool_needs_a_name ... ok
+test a_registered_tool_may_not_use_the_mcp_prefix ... ok
+test a_legally_named_toolbox_runs ... ok
+test a_registered_tool_is_refused_by_the_policy_without_being_entered ... ok
+test a_registered_tool_is_offered_called_and_its_result_observed ... ok
+test a_failing_tool_becomes_an_observation_not_a_failed_run ... ok
+test a_contract_with_no_registered_tools_behaves_as_before ... ok
+test the_0_16_2_reserved_set_accepted_git_status ... ok
+test an_oversized_tool_result_is_truncated_before_it_enters_the_context ... ok
+test a_toolbox_survives_a_tree_resume_and_still_reaches_a_child ... ok
+test two_registered_tools_may_not_share_a_name ... ok
+test a_spawned_child_inherits_the_toolbox_and_the_call_is_its_own ... ok
+test dispatching_a_registered_tool_costs_under_a_millisecond_over_a_direct_call ... ok
+test a_registered_tool_may_not_shadow_a_built_in ... ok
+test no_built_in_name_can_be_taken_by_a_registered_tool ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s
+
+     Running tests/deadline.rs (target/debug/deps/deadline-9dfc50403328d0fc)
+
+running 2 tests
+test the_default_deadline_is_public ... ok
+test with_timeout_replaces_the_default_on_every_provider ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.51s
+
+     Running tests/determinism.rs (target/debug/deps/determinism-ca32aae2fe3a4ddb)
+
+running 8 tests
+test the_comparison_fails_when_a_run_id_reappears_in_the_prompt ... ok
+test the_comparison_fails_when_children_are_composed_in_a_different_order ... ok
+test a_replay_still_refuses_a_request_that_was_never_recorded ... ok
+test a_replay_matches_the_run_it_was_recorded_from ... ok
+test a_single_file_replay_does_survive_being_interrupted_and_resumed ... ok
+test two_identically_built_traces_compare_equal ... ok
+test one_case_replayed_twice_produces_the_same_trace ... ok
+test a_workspace_replay_survives_being_interrupted_and_resumed ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/docs_drift.rs (target/debug/deps/docs_drift-15e56a4838601e5f)
+
+running 10 tests
+test feature_checker_rejects_an_undocumented_feature ... ok
+test feature_checker_rejects_a_documented_feature_that_does_not_exist ... ok
+test feature_extractor_reads_lists_and_tables ... ok
+test link_checker_reports_an_absent_target ... ok
+test documented_feature_list_matches_cargo_toml ... ok
+test msrv_checker_rejects_a_different_version ... ok
+test msrv_checker_accepts_the_real_declaration ... ok
+test msrv_checker_rejects_silence ... ok
+test msrv_is_stated_and_matches_cargo_toml ... ok
+test relative_links_in_readme_and_docs_resolve ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/edit_file.rs (target/debug/deps/edit_file-984fc885c3daa77a)
+
+running 9 tests
+test edits_file_and_verifies_success ... ok
+test stops_at_step_cap_when_never_verified ... ok
+test stops_at_cost_budget ... ok
+test resumes_an_interrupted_run_without_restarting ... ok
+test stops_at_time_budget ... ok
+test execution_verify_rejects_the_i01_stub_in_the_loop ... ok
+test execution_verify_accepts_a_compiling_file ... ok
+test escalates_after_exhausting_retries ... ok
+test retries_then_succeeds_recording_each_attempt ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.58s
+
+     Running tests/edit_tool.rs (target/debug/deps/edit_tool-f1064f09df2469fa)
+
+running 8 tests
+test an_edit_cannot_escape_the_workspace_root ... ok
+test an_edit_that_replaces_text_with_itself_reports_that_nothing_moved ... ok
+test a_search_string_that_appears_twice_fails_stating_the_count_and_changes_nothing ... ok
+test a_search_string_that_appears_once_is_replaced_and_nothing_else_moves ... ok
+test a_search_string_that_appears_nowhere_fails_naming_the_file_and_changes_nothing ... ok
+test the_model_is_told_the_count_so_it_can_lengthen_the_search ... ok
+test an_edit_to_a_denied_path_is_refused_and_the_file_is_untouched ... ok
+test the_same_edit_to_an_allowed_path_is_applied ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/exec_tool.rs (target/debug/deps/exec_tool-42765ef276f9538c)
+
+running 12 tests
+test a_detected_project_puts_its_ecosystem_and_commands_in_the_recorded_prompt ... ok
+test a_denied_program_is_refused_before_it_is_spawned_and_the_refusal_is_attributed ... ok
+test an_undetected_project_says_nothing_about_its_toolchain ... ok
+test a_program_this_machine_does_not_have_is_an_observation_not_a_failed_run ... ok
+test a_command_that_fails_reports_its_status_and_its_stderr_to_the_agent ... ok
+test a_rule_can_allow_one_subcommand_and_deny_another_of_the_same_program ... ok
+test shell_metacharacters_reach_the_program_as_one_literal_argument ... ok
+test a_command_runs_in_the_workspace_root_and_its_result_reaches_the_next_turn ... ok
+test the_tool_schema_accepts_only_an_array_of_strings ... ok
+test a_policy_allowing_both_argvs_runs_both ... ok
+test the_same_command_under_a_policy_that_allows_it_executes ... ok
+test a_wedged_command_is_killed_and_reported_as_a_timeout_naming_itself ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.38s
+
+     Running tests/fallback.rs (target/debug/deps/fallback-78b1a1f8d3b40e79)
+
+running 6 tests
+test an_unacceptable_request_never_reaches_the_secondary_either ... ok
+test a_wrong_key_never_reaches_the_secondary_and_the_caller_gets_the_primarys_kind ... ok
+test a_single_provider_run_is_unaffected_and_records_no_served_row ... ok
+test three_nested_providers_reach_the_one_that_is_up ... ok
+test a_down_primary_is_answered_by_the_secondary_and_the_run_still_succeeds ... ok
+test falling_over_costs_the_primary_one_attempt_per_step_not_a_retry_budget ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/git.rs (target/debug/deps/git-3fb53d58abb6a375)
+
+running 12 tests
+test no_git_binary_is_an_observation_and_the_run_carries_on ... ok
+test a_git_builtin_refused_by_the_exec_policy_is_an_observation_and_the_run_goes_on ... ok
+test a_path_that_would_be_read_as_an_option_is_refused_without_ending_the_run ... ok
+test staging_a_path_the_policy_denies_for_reading_is_refused ... ok
+test a_commit_with_nothing_staged_is_reported_not_fatal ... ok
+test a_repositorys_own_pre_commit_hook_does_not_run_under_the_agent ... ok
+test an_agent_stages_its_edits_and_commits_them ... ok
+test the_commit_carries_the_contracts_identity_and_not_the_machines ... ok
+test a_commit_interrupted_before_its_checkpoint_is_not_taken_twice ... ok
+test the_same_call_under_a_policy_that_allows_git_actually_runs_it ... ok
+test the_same_stage_under_a_permissive_policy_succeeds ... ok
+test the_same_hook_does_fire_under_a_plain_git_commit ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running tests/guide_pages.rs (target/debug/deps/guide_pages-ffcf089cd31d9864)
+
+running 7 tests
+test control_a_missing_page_is_reported ... ok
+test control_a_stub_is_reported ... ok
+test control_a_complete_page_is_not_reported ... ok
+test control_a_dropped_limits_block_is_reported ... ok
+test the_guide_directory_holds_nothing_unlisted ... ok
+test no_guide_page_is_orphaned_from_the_index ... ok
+test every_capability_has_a_guide_page ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/handles.rs (target/debug/deps/handles-91cd802123b2242a)
+
+running 14 tests
+test an_edit_in_a_project_with_no_ecosystem_spawns_no_checker_at_all ... ok
+test a_denied_stage_starts_no_handle_and_spawns_nothing ... ok
+test a_handle_left_running_is_killed_when_the_run_ends ... ok
+test a_handle_that_exits_on_its_own_stops_reading_as_running ... ok
+test an_edit_whose_check_cannot_finish_in_time_is_reported_as_unchecked_rather_than_clean ... ok
+test a_handle_flooding_faster_than_anything_polls_it_keeps_its_process_and_stays_killable ... ok
+test a_single_poll_after_a_flood_returns_one_window_of_the_newest_output_and_reports_the_gap ... ok
+test killing_a_handle_kills_a_grandchild_whose_parent_already_exited ... ok
+test without_a_process_group_the_grandchild_survives ... ok
+test a_handle_starts_polls_twice_and_is_killed ... ok
+test a_poll_does_not_return_the_same_output_twice ... ok
+test the_whole_stream_is_in_the_trace_when_no_poll_had_to_skip_anything ... ok
+test shell_start_refuses_every_construct_shell_refuses ... ok
+test starting_past_the_cap_is_refused_and_spawns_nothing ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 16.81s
+
+     Running tests/hooks.rs (target/debug/deps/hooks-f7c02e8426f3c217)
+
+running 5 tests
+test f2_an_event_this_crate_does_not_emit_is_refused_naming_it ... ok
+test f1_a_hook_fires_on_the_events_it_names_and_on_no_others ... ok
+test f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin ... ok
+test f5_a_failing_hook_stops_the_run_only_when_the_operator_asked_it_to ... ok
+test f4_a_hook_that_outlives_its_timeout_is_killed_and_reported_as_a_failure ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/language_agnostic.rs (target/debug/deps/language_agnostic-e1e1ed5d94eaf908)
+
+running 8 tests
+test the_three_deprecated_variants_are_gone_from_the_source ... ok
+test a_run_with_no_gate_ends_when_the_agent_stops_calling_tools ... ok
+test a_quiet_turn_does_not_end_a_run_that_has_a_criterion ... ok
+test a_run_that_hits_the_step_cap_reports_the_cap_and_not_the_finished_outcome ... ok
+test a_command_criterion_is_refused_rather_than_failed_when_the_policy_forbids_it ... ok
+test a_node_projects_own_test_command_is_a_passing_criterion ... ok
+test a_failing_node_suite_is_not_a_pass_and_its_output_reaches_the_trace ... ok
+test the_replacement_criterion_reaches_the_outcome_the_removed_variants_did ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.87s
+
+     Running tests/list_dir.rs (target/debug/deps/list_dir-bfaec2dffa1ea77d)
+
+running 12 tests
+test a_path_outside_the_root_is_refused_rather_than_listed ... ok
+test each_entry_carries_its_kind_and_a_file_carries_its_size ... ok
+test the_order_is_the_same_on_every_run_over_an_unchanged_directory ... ok
+test a_symlink_is_reported_as_a_link_rather_than_followed ... ok
+test a_subdirectory_is_named_and_what_is_inside_it_is_not ... ok
+test a_denied_directory_is_refused_by_path_however_the_path_is_spelled ... ok
+test a_denied_entry_is_not_even_named_in_a_listing_of_the_directory_above_it ... ok
+test through_the_loop_an_escaping_path_is_an_error_the_agent_can_act_on ... ok
+test through_the_loop_the_agent_is_told_the_directory_and_not_the_tree ... ok
+test through_the_loop_a_denied_directory_is_a_refusal_attributed_to_its_rule ... ok
+test the_same_listing_of_an_allowed_directory_is_performed ... ok
+test a_large_directory_is_bounded_and_says_how_much_it_left_out ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/mcp.rs (target/debug/deps/mcp-bae66fe149492d82)
+
+running 12 tests
+test a_server_binary_the_policy_denies_is_never_spawned ... ok
+test a_server_that_cannot_start_fails_the_run_with_a_typed_error ... ok
+test a_contract_without_mcp_offers_exactly_the_builtin_tools ... ok
+test an_http_server_is_discovered_called_and_its_result_reaches_the_loop ... ok
+test a_stdio_server_is_discovered_called_and_its_result_reaches_the_loop ... ok
+test a_tool_that_reports_an_error_does_not_end_the_run ... ok
+test a_single_mcp_tool_can_be_denied_while_the_server_is_allowed ... ok
+test a_server_tool_named_like_a_builtin_does_not_shadow_it ... ok
+test a_server_that_dies_mid_run_becomes_an_observation_not_a_crash ... ok
+test an_unlisted_mcp_host_is_refused_before_anything_is_dialled ... ok
+test an_mcp_result_is_folded_into_the_next_prompt ... ok
+test a_tool_that_never_returns_times_out_and_the_run_continues ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.11s
+
+     Running tests/media.rs (target/debug/deps/media-71666f8420b07ccd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/memory.rs (target/debug/deps/memory-b10cf8c9c9767c8c)
+
+running 14 tests
+test an_oversized_value_is_remembered_truncated_rather_than_refused ... ok
+test a_pinned_entry_survives_a_run_that_tries_to_overwrite_it ... ok
+test a_write_past_the_entry_cap_reports_the_keys_it_evicted ... ok
+test live::a_second_run_over_the_workspace_recalls_what_the_first_wrote ... ok
+test live::two_workspaces_do_not_share_memory_through_one_store ... ok
+test a_fact_written_by_one_run_is_readable_by_another ... ok
+test live::a_deleted_note_does_not_come_back_in_a_later_run ... ok
+test memory_clear_empties_one_workspace_and_reports_the_count ... ok
+test live::an_over_long_memory_block_is_cut_with_a_marker ... ok
+test memory_delete_returns_true_then_false_and_the_key_stays_gone ... ok
+test re_putting_a_key_replaces_the_value_and_re_attributes_it ... ok
+test two_workspaces_never_see_each_others_entries ... ok
+test the_same_write_lands_when_the_entry_is_not_pinned ... ok
+test the_recall_record_names_which_entries_a_run_actually_used ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/multi_file.rs (target/debug/deps/multi_file-7e1bf42e51c884e1)
+
+running 3 tests
+test write_outside_the_workspace_is_refused_not_crashing_the_run ... ok
+test run_fails_when_one_of_the_edited_files_is_wrong ... ok
+test agent_finds_then_edits_several_files_and_the_set_verifies ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.57s
+
+     Running tests/net.rs (target/debug/deps/net-86d19ed8655d0cbd)
+
+running 9 tests
+test a_net_rule_does_not_govern_paths_and_a_path_rule_does_not_govern_hosts ... ok
+test denying_your_own_provider_is_legal_and_fails_as_a_refusal ... ok
+test an_ask_denied_at_the_gate_never_dials ... ok
+test a_refusal_is_recorded_in_the_trace ... ok
+test resuming_a_refused_run_reports_the_refusal_instead_of_asking_again ... ok
+test a_provider_with_no_endpoint_runs_under_a_network_deny_policy ... ok
+test a_deny_all_base_still_reaches_its_provider_through_the_provider_layer ... ok
+test an_ask_on_the_network_is_approved_and_dials ... ok
+test a_deferred_network_decision_persists_and_resumes ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/observe.rs (target/debug/deps/observe-1167b7c2fdc79594)
+
+running 13 tests
+test a_denied_network_host_is_announced_with_what_the_row_records ... ok
+test a_step_left_uncommitted_for_replay_is_not_announced_as_a_step ... ok
+test a_memory_write_is_announced_under_the_key_the_trace_row_names ... ok
+test an_observer_can_cancel_a_run_which_then_stays_resumable ... ok
+test a_sub_agents_events_carry_its_own_run_id_and_depth ... ok
+test a_refusal_is_announced_with_exactly_what_the_policy_events_row_records ... ok
+test an_approval_is_announced_as_a_request_and_then_the_decision_the_row_holds ... ok
+test every_dispatched_tool_is_announced_as_the_step_row_records_it ... ok
+test the_step_event_reports_whether_the_workspace_actually_changed ... ok
+test an_unobserved_run_writes_the_same_trace_and_makes_the_same_provider_calls ... ok
+test the_event_stream_reports_the_same_facts_as_the_trace_in_the_same_order ... ok
+test every_mcp_row_is_announced_with_the_same_server_tool_outcome_and_latency ... ok
+test the_verify_gates_sandbox_is_announced_as_sandbox_events_records_it ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.19s
+
+     Running tests/outcome_record.rs (target/debug/deps/outcome_record-666297c5cddcdf35)
+
+running 8 tests
+test a_run_paused_for_a_human_has_no_summary_until_it_really_ends ... ok
+test a_finished_run_reports_success_steps_spend_and_a_duration ... ok
+test reading_a_summary_is_a_pure_read ... ok
+test a_summary_round_trips_as_json ... ok
+test a_caller_reads_the_summary_off_its_own_run_result ... ok
+test a_run_from_an_older_binary_reports_no_summary_rather_than_zeroes ... ok
+test finishing_twice_replaces_the_summary_rather_than_duplicating_it ... ok
+test every_other_outcome_is_recorded_and_is_not_success ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/parity.rs (target/debug/deps/parity-8e964a8bb46c0b35)
+
+running 3 tests
+test f8_a_compatible_pointed_at_no_preset_claims_no_vendor_label ... ok
+test f8_the_real_compatible_carries_the_trait_shape_the_loop_drives ... ok
+test the_same_contract_verifies_under_every_provider_and_records_which_ran ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+
+     Running tests/plan_gate.rs (target/debug/deps/plan_gate-c0da839f555dbad2)
+
+running 16 tests
+test a_plan_belonging_to_another_run_is_refused ... ok
+test a_cancel_through_a_resume_finishes_the_run_without_re_entering_the_loop ... ok
+test a_plan_naming_a_roster_member_is_accepted ... ok
+test a_plan_naming_an_unknown_agent_is_refused_back_to_the_model ... ok
+test a_correction_through_a_resume_reaches_the_model_and_keeps_the_phase_on ... ok
+test a_refusal_during_the_phase_names_the_plan_gate_layer ... ok
+test a_run_without_a_gate_is_unchanged ... ok
+test approve_continues_the_run_and_puts_the_plan_in_the_next_prompt ... ok
+test cancel_stops_the_run_with_nothing_written ... ok
+test the_proposal_and_the_verdict_both_reach_an_observer ... ok
+test remember_is_refused_while_the_plan_is_pending ... ok
+test nothing_is_written_before_the_approval ... ok
+test revise_keeps_the_phase_on_and_the_correction_reaches_the_model ... ok
+test the_same_script_writes_once_the_plan_is_approved ... ok
+test the_tool_is_withdrawn_once_the_plan_is_approved ... ok
+test a_plan_survives_a_real_sigkill_and_is_approved_by_a_second_process ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+
+     Running tests/policy.rs (target/debug/deps/policy-e1806dd8cb1e0f50)
+
+running 24 tests
+test a_policy_on_a_single_file_contract_is_refused_not_silently_ignored ... ok
+test a_deny_that_lands_while_paused_still_holds_on_resume ... ok
+test a_refused_action_consumes_a_step_so_retrying_it_hits_the_cap ... ok
+test a_remembered_allow_cannot_override_a_base_deny ... ok
+test a_run_with_no_recorded_policy_is_refused_rather_than_resumed_permissively ... ok
+test a_denied_action_never_reaches_the_approver ... ok
+test a_bare_resume_refuses_a_run_that_was_started_under_a_policy ... ok
+test a_denied_write_is_refused_and_the_run_still_reaches_its_goal ... ok
+test a_run_with_no_policy_behaves_exactly_as_0_3_0_did ... ok
+test deferring_pauses_the_run_and_persists_the_pending_action ... ok
+test a_slow_approver_keeps_the_whole_run_waiting_and_it_then_completes ... ok
+test an_approved_rewrite_cannot_move_an_action_across_a_deny ... ok
+test an_approver_can_redirect_the_write_and_the_trace_shows_both_forms ... ok
+test resuming_a_denial_does_not_perform_the_action_and_closes_the_run ... ok
+test a_bare_resume_still_works_for_a_run_that_never_had_a_boundary ... ok
+test a_resumed_run_still_enforces_the_policy_it_was_started_under ... ok
+test a_run_resumed_from_its_stored_policy_is_still_bounded_by_it ... ok
+test resuming_an_approval_performs_the_pending_action_and_finishes_the_run ... ok
+test approve_all_proceeds_where_deny_all_does_not ... ok
+test reads_do_not_prompt_but_every_write_does_including_an_allowed_overwrite ... ok
+test refusal_and_decision_records_never_carry_file_contents ... ok
+test remembering_a_rule_stops_the_prompting_and_is_returned_to_the_caller ... ok
+test the_same_call_on_a_permissive_run_performs_the_write ... ok
+test the_same_resume_performs_the_write_when_no_policy_is_supplied ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.22s
+
+     Running tests/provider_failures.rs (target/debug/deps/provider_failures-b046f3d2343fb58d)
+
+running 13 tests
+test a_failure_that_is_not_the_providers_is_not_a_provider_error ... ok
+test a_failure_with_no_status_says_so_rather_than_inventing_one ... ok
+test a_wrong_key_and_a_bad_request_are_terminal_not_retried ... ok
+test a_status_failure_carries_the_status_a_caller_needs_to_branch_on ... ok
+test every_kind_states_whether_a_retry_is_worth_it ... ok
+test every_status_maps_to_one_kind_and_only_that_kind ... ok
+test the_rendering_names_the_kind_and_the_status_without_being_the_api ... ok
+test a_wrong_key_reaches_the_caller_after_exactly_one_provider_call ... ok
+test a_wrong_key_resumes_as_an_escalation_that_was_never_worth_retrying ... ok
+test a_retry_that_would_outlast_the_time_budget_escalates_instead_of_sleeping ... ok
+test resuming_an_escalated_run_reports_the_escalation_instead_of_calling_the_provider_again ... ok
+test a_rate_limit_waits_at_least_as_long_as_the_server_asked ... ok
+test a_server_failure_is_retried_to_the_limit_with_a_wait_that_doubles ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.32s
+
+     Running tests/public_api.rs (target/debug/deps/public_api-414d188c5fdc6198)
+
+running 9 tests
+test example_checker_reports_a_documented_but_exampleless_item ... ok
+test drift_reports_a_rename ... ok
+test drift_reports_an_addition_and_stays_quiet_when_nothing_changed ... ok
+test drift_reports_a_removal ... ok
+test an_unresolvable_export_is_reported_rather_than_skipped ... ok
+test a_feature_gate_is_part_of_the_compared_surface ... ok
+test the_parser_reads_the_shapes_this_crate_actually_uses ... ok
+test every_public_item_has_a_worked_example ... ok
+test public_surface_matches_snapshot ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/question.rs (target/debug/deps/question-d27ce719e29f3a54)
+
+running 8 tests
+test a_malformed_question_is_an_observation_rather_than_the_end_of_the_run ... ok
+test an_answer_to_another_runs_question_is_refused ... ok
+test a_responder_may_answer_some_questions_and_decline_others ... ok
+test a_childs_question_pauses_the_whole_tree_and_the_tree_resumes_on_the_answer ... ok
+test answering_the_same_question_twice_is_an_error ... ok
+test a_responder_answers_and_the_answer_changes_what_the_agent_does ... ok
+test an_unanswerable_question_pauses_the_run_and_survives_the_process ... ok
+test an_answer_is_not_authorization ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/readme.rs (target/debug/deps/readme-d86825a7060ad39c)
+
+running 8 tests
+test control_a_clean_heading_is_not_reported ... ok
+test control_release_narration_is_reported ... ok
+test control_first_screen_gaps_are_reported ... ok
+test crate_root_has_no_version_named_heading ... ok
+test readme_has_no_version_named_heading ... ok
+test crate_root_does_not_narrate_releases ... ok
+test readme_opens_as_a_landing_page ... ok
+test control_version_named_headings_are_reported ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/reasoning.rs (target/debug/deps/reasoning-9844e2714128fece)
+
+running 5 tests
+test a_role_carries_its_own_tier_over_the_runs ... ok
+test a_provider_that_returns_no_thinking_emits_nothing ... ok
+test a_run_that_asks_for_no_tier_sends_none ... ok
+test a_provider_that_ignores_the_tier_still_receives_it_and_still_works ... ok
+test reasoning_reaches_the_observer_and_never_the_next_prompt ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/replay.rs (target/debug/deps/replay-2a5d6a7772aa0d17)
+
+running 8 tests
+test a_response_the_trace_would_mangle_survives_the_round_trip ... ok
+test a_request_with_no_recording_is_a_typed_error_not_an_empty_response ... ok
+test identical_requests_recorded_with_two_answers_are_served_in_order ... ok
+test a_recording_round_trips_and_serves_the_same_responses ... ok
+test a_counter_keyed_mock_diverges_where_a_replay_does_not ... ok
+test a_recording_from_another_series_is_refused ... ok
+test a_real_run_replays_from_its_recording_without_a_provider ... ok
+test a_replay_opens_no_connection ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/rewind.rs (target/debug/deps/rewind-9fc9da0b70087505)
+
+running 7 tests
+test another_runs_restore_point_is_not_reachable_from_this_run ... ok
+test a_path_the_run_never_wrote_is_not_recorded_and_is_left_alone ... ok
+test contents_that_were_not_kept_are_reported_and_the_file_is_never_truncated ... ok
+test a_file_the_run_rewrote_is_put_back_and_a_file_it_created_is_removed ... ok
+test a_second_edit_does_not_move_the_restore_point ... ok
+test a_restore_point_survives_the_process_that_wrote_it ... ok
+test a_resume_rewinds_under_the_run_id_the_snapshots_were_written_against ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/sandbox.rs (target/debug/deps/sandbox-5eb14869ecffe8ec)
+
+running 8 tests
+test selection_picks_native_on_this_host_and_floor_when_forced ... ok
+test a_sandbox_that_cannot_start_returns_a_typed_failure ... ok
+test a_cap_hit_in_the_gate_is_recorded ... ok
+test the_selected_backend_denies_outbound_network_by_default ... ok
+test a_gate_run_leaves_no_workdir_behind ... ok
+test sandbox_lifecycle_is_recorded_and_reconstructable ... ok
+test sandbox_on_reaches_the_same_verified_success_as_direct ... ok
+test sandbox_on_runs_the_projects_test_runner_transparently ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.27s
+
+     Running tests/sandbox_job_object.rs (target/debug/deps/sandbox_job_object-35a81c1ca56b2392)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/session.rs (target/debug/deps/session-56b426feaa194c0d)
+
+running 5 tests
+test a_session_shares_the_store_with_the_runs_and_changes_none_of_them ... ok
+test a_turn_is_a_run_and_carries_a_runs_guarantees ... ok
+test a_branch_forgets_the_turns_after_it_and_deletes_none_of_them ... ok
+test a_session_outlives_the_process_that_opened_it ... ok
+test a_turn_is_unbounded_unless_the_caller_bounds_that_one_turn ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s
+
+     Running tests/session_steering.rs (target/debug/deps/session_steering-7f0c1ccee3d28ddc)
+
+running 4 tests
+test a_steer_sent_after_the_turn_is_an_error_rather_than_silence ... ok
+test an_interrupt_ends_the_turn_at_a_step_boundary_and_the_session_continues ... ok
+test a_mid_turn_message_changes_the_next_step_and_the_control_does_not ... ok
+test an_operator_cannot_steer_past_the_boundary ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/session_streaming.rs (target/debug/deps/session_streaming-cd8453d276a93548)
+
+running 4 tests
+test a_provider_without_streaming_yields_one_delta_carrying_the_whole_text ... ok
+test deltas_concatenate_to_the_final_text_and_arrive_before_the_step ... ok
+test a_quiet_turn_never_enters_the_streaming_path ... ok
+test a_one_shot_run_emits_no_deltas_and_a_session_turn_does ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+     Running tests/shell.rs (target/debug/deps/shell-baaf265bcf9b01fa)
+
+running 11 tests
+test a_refused_construct_names_itself_and_the_run_continues ... ok
+test a_redirect_that_leaves_the_workspace_is_refused ... ok
+test a_denied_stage_of_a_pipeline_refuses_the_pipeline ... ok
+test a_read_redirect_is_checked_against_the_path_policy ... ok
+test a_sequence_with_cd_runs_every_stage_in_the_right_directory ... ok
+test a_pipeline_wires_one_stage_into_the_next ... ok
+test an_append_redirect_appends_rather_than_truncating ... ok
+test the_tool_is_offered_with_a_line_parameter_and_names_its_refusals ... ok
+test a_write_redirect_is_checked_against_the_path_policy ... ok
+test the_trace_carries_one_authorisation_per_stage_and_per_redirect ... ok
+test a_denied_later_stage_prevents_the_earlier_one_from_running_at_all ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s
+
+     Running tests/skills.rs (target/debug/deps/skills-7700a52d7e02e64e)
+
+running 15 tests
+test a_flat_file_and_a_skill_md_directory_are_both_discovered ... ok
+test a_skills_path_that_is_not_a_directory_fails_at_run_start ... ok
+test a_missing_skills_directory_fails_at_run_start ... ok
+test frontmatter_overrides_the_derived_name_and_description ... ok
+test an_unknown_skill_name_is_an_observation_listing_what_exists ... ok
+test a_usable_skills_directory_lets_the_run_start ... ok
+test the_catalog_carries_names_and_descriptions_but_no_bodies ... ok
+test an_absolute_path_still_cannot_escape_the_workspace_root ... ok
+test discovery_happens_once_per_run_not_once_per_step ... ok
+test a_denied_skills_directory_refuses_the_read_but_keeps_the_catalog ... ok
+test a_directory_over_the_skill_cap_fails_at_run_start ... ok
+test discovery_over_a_32_skill_directory_is_under_50ms ... ok
+test read_skill_is_not_offered_when_no_skills_are_configured ... ok
+test the_catalog_reaches_the_system_prompt_and_no_body_does ... ok
+test read_skill_loads_exactly_the_named_body_into_the_observations ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+     Running tests/stall.rs (target/debug/deps/stall-c45bdcfaae0d1ec7)
+
+running 9 tests
+test a_stalled_root_agent_ends_the_tree_as_stalled ... ok
+test the_same_read_repeated_over_an_unchanged_workspace_is_caught_within_the_window ... ok
+test three_different_spawns_that_each_do_work_are_never_flagged ... ok
+test a_still_stalled_run_stops_far_short_of_its_step_budget ... ok
+test a_write_that_changed_nothing_is_not_progress_and_is_flagged ... ok
+test the_same_spawn_repeated_is_caught_even_though_every_step_counts_as_progress ... ok
+test an_agent_that_changes_the_workspace_is_never_flagged ... ok
+test varied_calls_that_write_nothing_are_exploration_and_are_never_flagged ... ok
+test a_window_of_zero_restores_the_old_step_cap_behaviour_exactly ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.10s
+
+     Running tests/store_open.rs (target/debug/deps/store_open-fee9460b0b4975a2)
+
+running 4 tests
+test the_busy_timeout_is_a_documented_non_zero_wait ... ok
+test an_in_memory_store_still_opens ... ok
+test a_store_opened_from_a_file_is_in_wal_mode ... ok
+test a_second_reader_sees_committed_steps_while_the_writer_is_still_open ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/subagents.rs (target/debug/deps/subagents-c58c88f616eebaf6)
+
+running 14 tests
+test a_child_defer_persists_and_resumes_via_resume_with_decision ... ok
+test a_spawn_beyond_max_depth_is_refused_and_depth_counts_from_the_root ... ok
+test a_spawn_beyond_the_agent_cap_is_refused_but_the_rest_complete ... ok
+test a_parent_spawns_three_children_over_a_shared_workspace ... ok
+test each_agent_keeps_its_own_durable_ledger_under_its_own_run_id ... ok
+test spawn_agent_composes_the_childs_result_back ... ok
+test one_approver_serves_the_whole_tree_deny ... ok
+test one_approver_serves_the_whole_tree_approve ... ok
+test sub_agents_are_opt_in_a_plain_run_never_exposes_spawn ... ok
+test the_aggregate_ceiling_halts_the_whole_tree ... ok
+test concurrent_fanout_to_over_100_stays_bounded_and_completes ... ok
+test a_tree_with_no_duration_ceiling_is_unaffected ... ok
+test a_tree_halts_on_its_duration_ceiling_instead_of_ignoring_it ... ok
+test children_are_composed_in_spawn_order_not_completion_order ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.56s
+
+     Running tests/template.rs (target/debug/deps/template-c0e2c4ab6c5cbcc6)
+
+running 12 tests
+test a_missing_or_non_directory_path_is_a_config_error ... ok
+test arguments_with_no_remainder_expands_to_nothing ... ok
+test a_substituted_value_is_never_re_substituted ... ok
+test a_template_is_plain_data ... ok
+test a_placeholder_with_no_argument_is_an_error_not_an_empty_string ... ok
+test discovery_finds_both_layouts_with_their_descriptions ... ok
+test an_unknown_template_name_is_an_error ... ok
+test render_substitutes_placeholders_and_routes_the_remainder_to_arguments ... ok
+test the_catalog_carries_names_and_descriptions_but_no_bodies ... ok
+test two_templates_of_the_same_name_are_rejected ... ok
+test a_rendered_prompt_drives_a_real_run_unchanged ... ok
+test a_directory_over_the_template_cap_is_rejected ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/todo.rs (target/debug/deps/todo-b2139255fee2f165)
+
+running 7 tests
+test a_plan_reads_back_in_the_order_the_agent_wrote_it ... ok
+test an_empty_plan_clears_the_list_and_is_not_an_error ... ok
+test a_malformed_plan_is_an_observation_rather_than_the_end_of_the_run ... ok
+test a_second_write_replaces_the_whole_list_rather_than_merging_it ... ok
+test a_plan_is_inert ... ok
+test a_plan_outlives_the_store_that_wrote_it ... ok
+test a_plan_is_readable_from_a_second_connection_while_the_run_is_still_going ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running tests/verify_gate.rs (target/debug/deps/verify_gate-d7de21be887cc38a)
+
+running 5 tests
+test the_added_subject_compile_is_still_policy_checked ... ok
+test a_compile_gate_rejects_a_subject_that_deletes_its_own_items ... ok
+test the_trace_names_a_subject_that_deleted_its_own_items ... ok
+test an_honest_file_still_passes_the_compile_gates ... ok
+test a_subject_cannot_shadow_a_macro_a_command_criterion_never_compiles_with ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.35s
+
+     Running tests/web.rs (target/debug/deps/web-bbecfcb0134ef668)
+
+running 10 tests
+test a_search_that_found_nothing_is_a_successful_call ... ok
+test an_ended_turn_still_ends_the_run ... ok
+test a_provider_that_ignores_the_declaration_still_runs ... ok
+test a_run_that_declares_nothing_reports_no_server_tool_requests ... ok
+test an_answer_with_no_citations_writes_no_rows ... ok
+test a_failed_search_is_recorded_as_a_failure_and_told_to_the_model ... ok
+test a_paused_turn_continues_the_run ... ok
+test a_spawned_child_inherits_the_declaration_and_cannot_ask_for_its_own ... ok
+test server_tool_requests_reach_the_trace ... ok
+test citations_are_recorded_and_readable_after_the_run ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+
+   Doc-tests io_harness
+
+running 311 tests
+test src/agent.rs - agent::AgentDef::deny_write (line 196) ... ok
+test src/agent.rs - agent::AgentDef::with_effort (line 176) ... ok
+test src/agent.rs - agent::AgentDef::with_max_steps (line 164) ... ok
+test src/agent.rs - agent::AgentDef::with_model (line 151) ... ok
+test src/agent.rs - agent::AgentDef::new (line 124) ... ok
+test src/agent.rs - agent::AgentDef (line 70) ... ok
+test src/agent.rs - agent (line 36) ... ok
+test src/agent.rs - agent::AgentDef::deny_net (line 208) ... ok
+test src/agent.rs - agent::AgentDef::with_role (line 138) ... ok
+test src/agent.rs - agent::Agents (line 225) ... ok
+test src/agent.rs - agent::Agents::catalog (line 325) ... ok
+test src/agent.rs - agent::Agents::get (line 272) ... ok
+test src/approve.rs - approve::ApproveAll (line 243) - compile ... ok
+test src/agent.rs - agent::Agents::is_empty (line 310) ... ok
+test src/approve.rs - approve::Decision (line 118) - compile ... ok
+test src/agent.rs - agent::Agents::len (line 299) ... ok
+test src/approve.rs - approve::DenyAll (line 277) - compile ... ok
+test src/agent.rs - agent::Agents::names (line 285) ... ok
+test src/agent.rs - agent::Agents::new (line 244) ... ok
+test src/agent.rs - agent::Agents::with (line 255) ... ok
+test src/approve.rs - approve::AcceptPlan (line 1016) ... ok
+test src/approve.rs - approve::AnswerFuture (line 506) ... ok
+test src/approve.rs - approve::Approver (line 196) ... ok
+test src/approve.rs - approve::Decision (line 78) ... ok
+test src/approve.rs - approve::FixedResponder (line 595) ... ok
+test src/approve.rs - approve::Plan (line 758) ... ok
+test src/approve.rs - approve::Plan::agents (line 797) ... ok
+test src/approve.rs - approve::Plan::new (line 781) ... ok
+test src/approve.rs - approve::Plan::render (line 822) ... ok
+test src/approve.rs - approve::PlanGate (line 951) ... ok
+test src/approve.rs - approve::PlanGateNone (line 993) ... ok
+test src/approve.rs - approve::PlanReview (line 917) ... ok
+test src/approve.rs - approve::PlanStep (line 689) ... ok
+test src/approve.rs - approve::PlanStep::by (line 732) ... ok
+test src/approve.rs - approve::PlanStep::new (line 718) ... ok
+test src/approve.rs - approve::PlanVerdict (line 850) ... ok
+test src/approve.rs - approve::PlanVerdict::as_str (line 895) ... ok
+test src/approve.rs - approve::PlanVerdict::revise (line 881) ... ok
+test src/approve.rs - approve::StdinApprover (line 308) - compile ... ok
+test src/approve.rs - approve::StdinPlanGate (line 1042) - compile ... ok
+test src/approve.rs - approve::StdinResponder (line 632) - compile ... ok
+test src/approve.rs - approve::Question (line 430) ... ok
+test src/approve.rs - approve::Question::new (line 456) ... ok
+test src/approve.rs - approve::Question::with_choices (line 484) ... ok
+test src/approve.rs - approve::Question::with_context (line 471) ... ok
+test src/approve.rs - approve::Request (line 26) ... ok
+test src/approve.rs - approve::Responder (line 542) ... ok
+test src/approve.rs - approve::ResponderNone (line 577) ... ok
+test src/config.rs - config (line 106) ... ok
+test src/config.rs - config (line 51) ... ok
+test src/config.rs - config::Config (line 567) ... ok
+test src/config.rs - config::Config::agents (line 1217) ... ok
+test src/config.rs - config::Config::app (line 956) ... ok
+test src/config.rs - config::Config::apply_to (line 1300) ... ok
+test src/config.rs - config::Config::discover (line 609) ... ok
+test src/config.rs - config::Config::fallback_specs (line 914) ... ok
+test src/config.rs - config::Config::from_toml (line 677) ... ok
+test src/config.rs - config::Config::hooks (line 1261) ... ok
+test src/config.rs - config::Config::is_empty (line 861) ... ok
+test src/config.rs - config::Config::mcp_servers (line 1188) ... ok
+test src/config.rs - config::Config::origin (line 810) ... ok
+test src/config.rs - config::Config::origins (line 840) ... ok
+test src/config.rs - config::Config::policy (line 1015) ... ok
+test src/config.rs - config::Config::prices (line 1106) ... ok
+test src/config.rs - config::Config::provider_spec (line 889) ... ok
+test src/config.rs - config::Config::sandbox (line 1057) ... ok
+test src/config.rs - config::Config::sources (line 786) ... ok
+test src/config.rs - config::Config::toolchain (line 1143) ... ok
+test src/config.rs - config::Config::with_profile (line 720) ... ok
+test src/config.rs - config::Origin (line 189) ... ok
+test src/config.rs - config::ProviderSpec (line 293) ... ok
+test src/config.rs - config::ProviderSpec::Compatible (line 360) ... ok
+test src/config.rs - config::Scope (line 165) ... ok
+test src/config.rs - config::user_path (line 1417) ... ok
+test src/containment.rs - containment::Containment (line 25) ... ok
+test src/containment.rs - containment::Draw (line 160) ... ok
+test src/containment.rs - containment::Ledger (line 201) ... ok
+test src/containment.rs - containment::SpawnRefusal (line 104) ... ok
+test src/context.rs - context::ContextBudget (line 206) ... ok
+test src/context.rs - context::ContextBudget (line 231) ... ok
+test src/context.rs - context::ContextBudget (line 248) ... ok
+test src/contract.rs - contract::TaskContract (line 21) ... ok
+test src/contract.rs - contract::TaskContract::with_agents (line 473) ... ok
+test src/contract.rs - contract::TaskContract::with_effort (line 535) ... ok
+test src/error.rs - error::Result (line 297) - compile ... ok
+test src/contract.rs - contract::TaskContract::with_exec_timeout (line 608) ... ok
+test src/contract.rs - contract::TaskContract::with_plan_gate (line 511) ... ok
+test src/contract.rs - contract::TaskContract::with_responder (line 558) ... ok
+test src/lib.rs - (line 18) - compile ... ok
+test src/contract.rs - contract::TaskContract::with_verification (line 323) ... ok
+test src/mcp.rs - mcp::McpServer (line 175) - compile ... ok
+test src/contract.rs - contract::TaskContract::with_web (line 368) ... ok
+test src/net.rs - net::REQUEST_TIMEOUT (line 48) - compile ... ok
+test src/observe.rs - observe (line 16) - compile ... ok
+test src/error.rs - error::Error (line 116) ... ok
+test src/error.rs - error::ProviderErrorKind (line 16) ... ok
+test src/observe.rs - observe::Ignore (line 798) - compile ... ok
+test src/observe.rs - observe::Observer (line 722) - compile ... ok
+test src/hooks.rs - hooks::Hooks (line 253) ... ok
+test src/hooks.rs - hooks::Hooks::is_empty (line 323) ... ok
+test src/lib.rs - (line 161) ... ok
+test src/mcp.rs - mcp::MCP_TOOL_PREFIX (line 54) ... ok
+test src/mcp.rs - mcp::McpTransport (line 98) ... ok
+test src/observe.rs - observe::EventKind (line 248) ... ok
+test src/observe.rs - observe::Flow (line 89) ... ok
+test src/observe.rs - observe::RunEvent (line 152) ... ok
+test src/observe.rs - observe::RunEvent (line 179) ... ok
+test src/policy.rs - policy::Act (line 30) ... ok
+test src/policy.rs - policy::Defaults (line 190) ... ok
+test src/policy.rs - policy::Effect (line 75) ... ok
+test src/provider/anthropic.rs - provider::anthropic::Anthropic (line 39) - compile ... ok
+test src/policy.rs - policy::Layer (line 152) ... ok
+test src/policy.rs - policy::Policy (line 297) ... ok
+test src/provider/compatible.rs - provider::compatible::Compatible (line 144) - compile ... ok
+test src/provider/fallback.rs - provider::fallback::Fallback (line 33) - compile ... ok
+test src/provider/mod.rs - provider::CompletionRequest (line 422) - compile ... ok
+test src/policy.rs - policy::Rule (line 111) ... ok
+test src/policy.rs - policy::Verdict (line 246) ... ok
+test src/pricing.rs - pricing (line 29) ... ok
+test src/pricing.rs - pricing::Price (line 77) ... ok
+test src/pricing.rs - pricing::PriceTier (line 131) ... ok
+test src/provider/catalog.rs - provider::catalog::Reference (line 63) ... ok
+test src/provider/compatible.rs - provider::compatible::Auth (line 50) ... ok
+test src/provider/mod.rs - provider::CompletionResponse (line 641) ... ok
+test src/provider/mod.rs - provider::Effort (line 331) ... ok
+test src/provider/mod.rs - provider::Effort::as_str (line 359) ... ok
+test src/provider/mod.rs - provider::Effort::thinking_budget (line 380) ... ok
+test src/provider/mod.rs - provider::ModelInfo (line 789) ... ok
+test src/provider/openai.rs - provider::openai::OpenAi (line 22) - compile ... ok
+test src/provider/openrouter.rs - provider::openrouter::OpenRouter (line 22) - compile ... ok
+test src/provider/record.rs - provider::record::Record (line 114) - compile ... ok
+test src/provider/replay.rs - provider::replay::Replay (line 84) - compile ... ok
+test src/provider/mod.rs - provider::PriceSource (line 749) ... ok
+test src/provider/mod.rs - provider::Provider (line 853) ... ok
+test src/provider/mod.rs - provider::Provider::complete_streaming (line 917) ... ok
+test src/provider/mod.rs - provider::Provider::models (line 992) ... ok
+test src/provider/mod.rs - provider::ToolCall (line 544) ... ok
+test src/provider/mod.rs - provider::ToolSpec (line 111) ... ok
+test src/provider/mod.rs - provider::Usage (line 577) ... ok
+test src/resilience.rs - resilience::Progress (line 250) ... ok
+test src/resilience.rs - resilience::Progress (line 270) ... ok
+test src/run.rs - run::RunResult (line 319) - compile ... ok
+test src/resilience.rs - resilience::Progressing (line 198) ... ok
+test src/run.rs - run::resume (line 876) - compile ... ok
+test src/run.rs - run::resume_from_stored_policy (line 1578) - compile ... ok
+test src/run.rs - run::resume_from_stored_policy_observed (line 1625) - compile ... ok
+test src/run.rs - run::resume_observed (line 921) - compile ... ok
+test src/run.rs - run::resume_tree (line 3887) - compile ... ok
+test src/resilience.rs - resilience::RetryPolicy (line 33) ... ok
+test src/run.rs - run::resume_tree_from_stored_policy (line 4085) - compile ... ok
+test src/run.rs - run::resume_tree_from_stored_policy_observed (line 4136) - compile ... ok
+test src/run.rs - run::resume_tree_observed (line 3945) - compile ... ok
+test src/run.rs - run::resume_tree_with_answer (line 1158) - compile ... ok
+test src/run.rs - run::resume_tree_with_answer_observed (line 1211) - compile ... ok
+test src/run.rs - run::resume_tree_with_decision (line 2112) - compile ... ok
+test src/run.rs - run::resume_tree_with_decision_observed (line 2173) - compile ... ok
+test src/run.rs - run::resume_tree_with_plan_decision (line 1466) - compile ... ok
+test src/run.rs - run::resume_tree_with_plan_decision_observed (line 1514) - compile ... ok
+test src/run.rs - run::resume_with (line 1007) - compile ... ok
+test src/resilience.rs - resilience::RetryPolicy (line 67) ... ok
+test src/run.rs - run::resume_with_answer (line 1065) - compile ... ok
+test src/run.rs - run::resume_with_answer_observed (line 1117) - compile ... ok
+test src/run.rs - run::resume_with_decision (line 1818) - compile ... ok
+test src/run.rs - run::resume_with_decision_observed (line 1883) - compile ... ok
+test src/run.rs - run::resume_with_observed (line 1679) - compile ... ok
+test src/run.rs - run::resume_with_plan_decision_observed (line 1413) - compile ... ok
+test src/run.rs - run::resume_with_plan_decision (line 1374) - compile ... ok
+test src/run.rs - run::run_observed (line 578) - compile ... ok
+test src/run.rs - run::run (line 528) - compile ... ok
+test src/resilience.rs - resilience::StallPolicy (line 141) ... ok
+test src/run.rs - run::run_tree (line 3684) - compile ... ok
+test src/run.rs - run::run_tree_observed (line 3759) - compile ... ok
+test src/run.rs - run::run_with (line 630) - compile ... ok
+test src/run.rs - run::run_with_observed (line 682) - compile ... ok
+test src/resilience.rs - resilience::StallPolicy (line 164) ... ok
+test src/run.rs - run::Rewind (line 410) ... ok
+test src/run.rs - run::RunOutcome (line 148) ... ok
+test src/run.rs - run::SPAWN_TOOL (line 80) ... ok
+test src/run.rs - run::rewind (line 465) ... ok
+test src/sandbox.rs - sandbox::Backend (line 67) ... ok
+test src/sandbox.rs - sandbox::Cap (line 116) ... ok
+test src/sandbox.rs - sandbox::Sandbox (line 413) ... ok
+test src/session.rs - session::Session (line 49) - compile ... ok
+test src/session.rs - session::Session::branch_from (line 202) - compile ... ok
+test src/session.rs - session::Session::history (line 164) - compile ... ok
+test src/sandbox.rs - sandbox::SandboxConfig (line 280) ... ok
+test src/sandbox.rs - sandbox::SandboxConfig (line 302) ... ok
+test src/session.rs - session::Session::turn_bounded (line 385) - compile ... ok
+test src/session.rs - session::Session::turn_observed (line 271) - compile ... ok
+test src/session.rs - session::Session::turn_steered (line 327) - compile ... ok
+test src/sandbox.rs - sandbox::SandboxLimits (line 185) ... ok
+test src/sandbox.rs - sandbox::SandboxOutcome (line 352) ... ok
+test src/session.rs - session::TurnResult (line 552) - compile ... ok
+test src/skills.rs - skills::Skill (line 78) - compile ... ok
+test src/skills.rs - skills::Skills (line 127) - compile ... ok
+test src/sandbox.rs - sandbox::Selected (line 468) ... ok
+test src/sandbox.rs - sandbox::copy_back (line 1073) ... ok
+test src/state.rs - state::BUSY_TIMEOUT (line 2306) - compile ... ok
+test src/sandbox.rs - sandbox::select (line 535) ... ok
+test src/session.rs - session::Session::open (line 83) ... ok
+test src/session.rs - session::Session::reopen (line 113) ... ok
+test src/session.rs - session::Steer (line 605) ... ok
+test src/session.rs - session::SteerInbox (line 634) ... ok
+test src/skills.rs - skills::Skills (line 149) ... ok
+test src/state.rs - state::AgentEvent (line 664) ... ok
+test src/state.rs - state::CHECKPOINT_FORMAT (line 81) ... ok
+test src/state.rs - state::CheckpointEvent (line 363) ... ok
+test src/state.rs - state::ContextEvent (line 1828) ... ok
+test src/state.rs - state::Edit (line 2103) ... ok
+test src/state.rs - state::Edit::measure (line 2143) ... ok
+test src/state.rs - state::FirstTry (line 1204) ... ok
+test src/state.rs - state::MEMORY_MAX_CHARS (line 1758) ... ok
+test src/state.rs - state::MEMORY_MAX_ENTRIES (line 1732) ... ok
+test src/state.rs - state::MEMORY_MAX_ENTRY_CHARS (line 1783) ... ok
+test src/state.rs - state::McpEvent (line 949) ... ok
+test src/state.rs - state::MemoryEntry (line 1064) ... ok
+test src/state.rs - state::MemoryKind (line 1122) ... ok
+test src/state.rs - state::MemoryRecall (line 1261) ... ok
+test src/state.rs - state::MemoryWrite (line 1294) ... ok
+test src/state.rs - state::Pending (line 614) ... ok
+test src/state.rs - state::PendingPlan (line 1490) ... ok
+test src/state.rs - state::PendingQuestion (line 1409) ... ok
+test src/state.rs - state::PolicyEvent (line 516) ... ok
+test src/state.rs - state::ProcessHandle (line 2235) ... ok
+test src/state.rs - state::ProviderCall (line 2021) ... ok
+test src/state.rs - state::Recovery (line 1231) ... ok
+test src/state.rs - state::Store (line 326) - compile ... ok
+test src/state.rs - state::RunStatus (line 146) ... ok
+test src/state.rs - state::RunSummary (line 251) ... ok
+test src/state.rs - state::SUCCESS_OUTCOME (line 115) ... ok
+test src/state.rs - state::SandboxEvent (line 769) ... ok
+test src/state.rs - state::SandboxEvent::gate_output (line 912) ... ok
+test src/state.rs - state::SpawnRow (line 198) ... ok
+test src/state.rs - state::StepRecord (line 432) ... ok
+test src/state.rs - state::Store::approved_plan (line 4556) ... ok
+test src/state.rs - state::Store::citations (line 4802) ... ok
+test src/state.rs - state::Store::decide_plan (line 4593) ... ok
+test src/state.rs - state::Store::first_try (line 3500) ... ok
+test src/state.rs - state::Store::gate_failures_by_phase (line 3555) ... ok
+test src/state.rs - state::Store::handle_output (line 5547) ... ok
+test src/state.rs - state::Store::memory_pin (line 5012) ... ok
+test src/state.rs - state::Store::memory_recalls (line 5069) ... ok
+test src/state.rs - state::Store::memory_write (line 4950) ... ok
+test src/state.rs - state::Store::orphan_live_handles (line 5484) ... ok
+test src/state.rs - state::Store::plan (line 4524) ... ok
+test src/state.rs - state::Store::plans (line 4646) ... ok
+test src/state.rs - state::Store::process_handles (line 5434) ... ok
+test src/state.rs - state::Store::put_plan (line 4502) ... ok
+test src/state.rs - state::Store::record_citations (line 4749) ... ok
+test src/state.rs - state::Store::record_handle_ended (line 5370) ... ok
+test src/state.rs - state::Store::record_server_tool_calls (line 4840) ... ok
+test src/state.rs - state::Store::recovery (line 3590) ... ok
+test src/state.rs - state::Store::runs_by_day (line 3465) ... ok
+test src/state.rs - state::Store::runs_by_outcome (line 3437) ... ok
+test src/state.rs - state::Store::server_tool_calls (line 4889) ... ok
+test src/state.rs - state::Store::spend_by_model (line 3356) ... ok
+test src/state.rs - state::TODO_MAX_ITEMS (line 1685) ... ok
+test src/template.rs - template::Template (line 91) - compile ... ok
+test src/state.rs - state::TODO_TEXT_CAP (line 1710) ... ok
+test src/template.rs - template::Templates (line 156) - compile ... ok
+test src/state.rs - state::Tally (line 1178) ... ok
+test src/state.rs - state::TodoItem (line 1635) ... ok
+test src/state.rs - state::TodoState (line 1578) ... ok
+test src/state.rs - state::Turn (line 1326) ... ok
+test src/state.rs - state::UNKNOWN_MODEL (line 21) ... ok
+test src/template.rs - template::MAX_TEMPLATES (line 71) ... ok
+test src/template.rs - template::Templates (line 124) ... ok
+test src/template.rs - template::Templates::catalog (line 354) ... ok
+test src/template.rs - template::Templates::discover (line 200) ... ok
+test src/template.rs - template::Templates::get (line 327) ... ok
+test src/template.rs - template::Templates::is_empty (line 309) ... ok
+test src/template.rs - template::Templates::iter (line 336) ... ok
+test src/template.rs - template::Templates::len (line 318) ... ok
+test src/template.rs - template::Templates::names (line 345) ... ok
+test src/template.rs - template::Templates::none (line 181) ... ok
+test src/template.rs - template::Templates::render (line 376) ... ok
+test src/toolchain.rs - toolchain::Toolchain (line 44) ... ok
+test src/toolchain.rs - toolchain::Toolchain::describe (line 96) ... ok
+test src/toolchain.rs - toolchain::detect (line 199) ... ok
+test src/tools/custom.rs - tools::custom::Tool (line 98) ... ok
+test src/tools/custom.rs - tools::custom::ToolFuture (line 53) ... ok
+test src/tools/custom.rs - tools::custom::Toolbox (line 156) ... ok
+test src/tools/custom.rs - tools::custom::Toolbox (line 201) ... ok
+test src/tools/exec.rs - tools::exec::DEFAULT_EXEC_TIMEOUT (line 62) ... ok
+test src/tools/git.rs - tools::git::Identity (line 147) ... ok
+test src/tools/git.rs - tools::git::Identity (line 178) ... ok
+test src/tools/mod.rs - tools::ASK_QUESTION_TOOL (line 242) ... ok
+test src/tools/mod.rs - tools::PROPOSE_PLAN_TOOL (line 257) ... ok
+test src/tools/mod.rs - tools::TODO_WRITE_TOOL (line 210) ... ok
+test src/tools/workspace.rs - tools::workspace::Workspace::edit_file (line 455) ... ok
+test src/tools/workspace.rs - tools::workspace::Workspace::list_dir (line 345) ... ok
+test src/verify.rs - verify::ExecGuard (line 305) ... ok
+test src/verify.rs - verify::TEST_BINARY (line 630) ... ok
+test src/verify.rs - verify::Verification (line 130) ... ok
+test src/verify.rs - verify::Verification (line 99) ... ok
+test src/verify.rs - verify::Verification::Command (line 166) ... ok
+test src/verify.rs - verify::Verification::None (line 217) ... ok
+test src/web.rs - web::Citation (line 313) ... ok
+test src/web.rs - web::ServerToolCall (line 347) ... ok
+test src/web.rs - web::ServerToolCall::failed (line 395) ... ok
+test src/web.rs - web::ServerToolCall::ok (line 378) ... ok
+test src/web.rs - web::ServerToolCall::succeeded (line 415) ... ok
+test src/web.rs - web::WebAccess (line 27) ... ok
+test src/web.rs - web::WebAccess::allow (line 127) ... ok
+test src/web.rs - web::WebAccess::block (line 143) ... ok
+test src/web.rs - web::WebAccess::enabled (line 160) ... ok
+test src/web.rs - web::WebAccess::from_policy (line 219) ... ok
+test src/web.rs - web::WebAccess::max_uses (line 110) ... ok
+test src/web.rs - web::WebAccess::search (line 76) ... ok
+test src/web.rs - web::WebAccess::vendor_filter (line 183) ... ok
+test src/web.rs - web::WebAccess::with_fetch (line 95) ... ok
+
+test result: ok. 311 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 143.29s
+

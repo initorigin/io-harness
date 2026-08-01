@@ -288,7 +288,7 @@ jobs:
   # the whole workflow file at parse time, which is a 0-second run and not a test
   # failure. The displayed name carries the version.
   cross-version-0-29-0:
-    name: cross-version-0.29.0 (0.29.0 reads a 0.30.0 store)
+    name: cross-version-0.29.0 (0.29.0 reads a store this tree wrote)
     runs-on: ubuntu-latest
     # Compiles the previous release from crates.io with a bundled SQLite, then
     # this tree's test binary. 20 minutes, in line with the other single-OS jobs.
@@ -311,7 +311,7 @@ jobs:
       # the step above just produced, and a test that silently passes when its
       # subject is missing is worse than one that is visibly not run.
       - name: a 0.29.0 binary reads a store this tree wrote
-        run: cargo test --test cross_version_0_29_0 -- --ignored --exact a_0_30_0_store_is_read_by_a_0_29_0_binary
+        run: cargo test --test cross_version_0_29_0 -- --ignored --exact a_current_store_is_read_by_a_0_29_0_binary
       # The control. The generator is supposed to be the PREVIOUS release, and the
       # one way this job quietly stops proving anything is that pin drifting to a
       # version that already knows about the new schema. Checked here rather than

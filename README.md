@@ -240,7 +240,7 @@ none rather than guessing.
 
 | Guide | What it covers |
 | --- | --- |
-| [Permissions and approval](docs/guide/permissions.md) | Layered rules, what asks and what is refused, deferring past process exit |
+| [Permissions and approval](docs/guide/permissions.md) | Layered rules, what asks and what is refused, deferring past process exit, and the plan gate that reviews the approach before anything is written |
 | [Command execution](docs/guide/command-execution.md) | Running a project's own toolchain, checked on the whole argv, in the step or beyond it — and the bound that is not there |
 | [Language support](docs/guide/language-support.md) | Toolchain detection, a criterion in any language, migrating off the Rust-specific gates |
 | [Verification](docs/guide/verification.md) | The criteria, execution-based gates, and exactly what a pass proves |
@@ -260,7 +260,7 @@ none rather than guessing.
 | [Documents](docs/guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut |
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |
-| [Providers](docs/guide/providers.md) | One compatible provider, the 21 vendor presets, running a model locally, and what a model costs |
+| [Providers](docs/guide/providers.md) | One compatible provider, the 21 vendor presets, running a model locally, what a model costs, and asking one to think harder |
 
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md) indexes them.
 [docs/CONTRACT.md](docs/CONTRACT.md) is the public contract: what is stable, what

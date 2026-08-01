@@ -245,6 +245,21 @@ pub const TODO_WRITE_TOOL: &str = "todo_write";
 /// assert_eq!(ASK_QUESTION_TOOL, "ask_question");
 /// ```
 pub const ASK_QUESTION_TOOL: &str = "ask_question";
+/// The tool the agent proposes a plan with, offered only while a
+/// [`PlanGate`](crate::PlanGate) is registered and unsatisfied (0.31.0).
+///
+/// The distinction from [`TODO_WRITE_TOOL`] is the reason both exist: that one
+/// records a plan the agent is already executing, this one proposes a plan the run
+/// has not started. While it is on the table every [`Act::Write`](crate::Act::Write)
+/// and [`Act::Exec`](crate::Act::Exec) is denied, so calling it is the only way the
+/// agent gets to do anything at all.
+///
+/// ```
+/// use io_harness::PROPOSE_PLAN_TOOL;
+///
+/// assert_eq!(PROPOSE_PLAN_TOOL, "propose_plan");
+/// ```
+pub const PROPOSE_PLAN_TOOL: &str = "propose_plan";
 /// Keep a tool result within `cap` chars, reporting whether it was cut.
 ///
 /// A tool that returns a megabyte would otherwise spend the rest of the run's

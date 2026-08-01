@@ -434,10 +434,113 @@ are reached through `Store`'s methods rather than depended on directly. Both are
 additive and no checkpoint layout changed, so **`CHECKPOINT_FORMAT` stays 7**: a
 0.24.0 binary reading a database this release wrote never queries either table.
 
+## What the plan gate stops, and what it does not (0.31.0)
+
+Registering a [`PlanGate`](https://docs.rs/io-harness/latest/io_harness/trait.PlanGate.html)
+on a contract opens the run in a **planning phase**. It is worth being exact
+about what that phase is, because the useful claim — *nothing is written before
+the approval* — is only as good as the boundary that enforces it.
+
+**It is the policy, not the tool list.** While the phase is on, the run's
+effective policy carries a `plan-gate` layer denying every `Act::Write` and every
+`Act::Exec`. `Policy::explain` resolves deny-first across all layers, so this
+covers `write_file`, `edit_file`, `exec`, the four shell tools, the git built-ins,
+every registered `Tool` and every MCP tool — the last two because invoking one is
+an exec check on its own name. A refusal during the phase appears in the trace as
+an ordinary refusal attributed to the `plan-gate` layer, so it is legible to
+someone who has never heard of this feature.
+
+**Reads and the network stay open.** A plan written without looking at the
+workspace is not worth reviewing, so `grep`, `find`, `read_file`, `list_dir` and
+the rest are untouched. `Act::Net` is untouched too, for a blunter reason: the
+provider is reached over the network, and denying it would stop the run asking
+for the plan in the first place.
+
+**`remember` is the one write the policy cannot see**, because it lands in this
+crate's own store rather than in the workspace. It is refused explicitly for the
+duration of the phase. `todo_write` and `ask_question` are not: neither changes
+anything outside the run's own record of itself.
+
+**What the phase is not:** it is not a sandbox, and it does not undo. A tool that
+reads a file and has a side effect the crate cannot see — a registered `Tool`
+that posts to an API from inside its `invoke` — is refused by the exec check like
+any other, but a *read* tool the embedding program wrote that quietly writes
+something is outside every boundary this crate has, in the phase and out of it.
+
+**One gate, at the root, once per run.** A spawned child never holds its own
+plan: a hundred children each pausing for a human is the problem the gate exists
+to prevent. And the tool is withdrawn the moment a plan is approved, so a long run
+that changes its mind cannot re-open the gate mid-flight.
+
+**It is not `todo_write`.** The 0.21.0 todo tool records a plan the agent is
+already executing, for an operator to watch. This one proposes a plan the run has
+not started and will not start until an answer arrives. Both exist and neither
+replaces the other.
+
+## Reasoning effort, per vendor (0.31.0)
+
+`Effort` is a tier — `Low`, `Medium`, `High` — because that is the vocabulary the
+vendors share, and it is projected onto whatever each one actually accepts. It is
+a **request, not a fact**, in exactly the sense `CompletionRequest::model` is: the
+crate cannot know which models reason, so nothing is refused for asking, and
+`Usage::reasoning_tokens` is what says whether any thinking was done and billed.
+
+| provider | what is sent | thinking returned in `CompletionResponse::reasoning` |
+| --- | --- | --- |
+| `OpenRouter` | `reasoning: { effort }` | yes, from `delta.reasoning`, where the model returns it |
+| `OpenAi` | `reasoning_effort` | **no** — Chat Completions does not return reasoning text at all |
+| `Anthropic` | `thinking: { type: "enabled", budget_tokens }`, with `max_tokens` raised to clear the budget | yes, from `thinking_delta` blocks |
+| `Compatible` | `reasoning_effort` | whatever the endpoint sends, unverified |
+
+Three things follow that a caller should hear plainly rather than discover.
+
+**OpenAI returns no thinking.** Asking for `Effort::High` against `OpenAi` will
+change how the model behaves and will leave `reasoning` at `None`, because the
+Chat Completions API this crate speaks does not return reasoning text. That is
+not a defect here and it is not worked around; `Usage::reasoning_tokens` is the
+only visibility available on that path.
+
+**Anthropic has no tiers**, so the tier becomes a token budget — 1,024 / 4,096 /
+16,384 — and `max_tokens` is raised above it because Anthropic refuses a request
+whose budget is not strictly below the cap. A caller who needs a specific budget
+rather than a tier cannot express one; that is the cost of a vendor-neutral knob.
+
+**`Compatible` is unverified.** The key is passed through to whatever endpoint
+you pointed it at. An endpoint that does not know it may ignore it or may reject
+the request; this crate does not check, in keeping with everything else on that
+provider.
+
+**The thinking is shown once and billed once.** Where a provider returns it, it
+reaches an `Observer` as `EventKind::Reasoning` and is **never** appended to the
+observation ledger — so it is not in the prompt assembled for the next turn. A
+vendor charges for thinking once as output; a harness that folded it into the
+next request would be charged for it again as input, every turn, for the rest of
+the run. It is also **not persisted**: `Usage::reasoning_tokens` is the durable
+record, and the text is live-only.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.30.0.
+is fixed as of 0.31.0.
+
+**The plan gate is a boundary on the agent, not on the caller (0.31.0).** The
+`plan-gate` policy layer holds for the duration of the run's own loop. The
+embedding program holding the `Store` and the workspace is not the run and is not
+refused anything — the same distinction 0.30.0 drew for a pinned memory entry.
+
+**A cancelled plan is final, and a pending one is not resumable twice (0.31.0).**
+`Store::decide_plan` refuses a second verdict with `Error::Resume`, so two
+processes racing to approve the same plan means one of them hears about it. What
+is *not* guarded is two processes each resuming the same run after a single
+approval; that is the same property every other resume in this crate has, and
+`Store::check_resumable` is the only lock there is.
+
+**Reasoning text is live-only (0.31.0).** `EventKind::Reasoning` is the only
+place the thinking appears. It is not written to the trace, so a run whose
+`Observer` was not attached — or a run being read after the fact — can see what
+the thinking *cost* through `Usage::reasoning_tokens` and cannot see what it
+*said*. Persisting it would grow the trace by the most verbose thing a model
+produces, for a value nobody has asked for yet.
 
 **An aggregate is one indexed query, not a constant-time one (0.30.0).**
 `runs_by_outcome`, `runs_by_day`, `gate_failures_by_phase`, `first_try` and
