@@ -489,7 +489,7 @@ pub trait Reviewer: Send + Sync + std::fmt::Debug {
 ///
 /// ```
 /// # use io_harness::{ModelReviewer, Reviewer};
-/// # fn demo<P: io_harness::Provider>(provider: P) {
+/// # fn demo<P: io_harness::Provider + std::fmt::Debug + Send + Sync>(provider: P) {
 /// let reviewer = ModelReviewer::new(provider, "a-different-model");
 /// assert_eq!(reviewer.model(), Some("a-different-model"));
 /// # }
