@@ -1499,6 +1499,130 @@ const TREE_EVENTS_SQL: &str = "WITH RECURSIVE tree(id) AS (
      WHERE e.id > ?2
      ORDER BY e.id ASC LIMIT ?3";
 
+/// One run's gate attempts, oldest first (0.34.0).
+///
+/// A `const` for the reason [`TREE_EVENTS_SQL`] is: the query-plan test
+/// `EXPLAIN`s the statement the crate runs, so dropping the index would fail the
+/// test rather than pass a re-typed copy of the SQL.
+const GATE_ATTEMPTS_SQL: &str = "SELECT id, step, phase, outcome, detail, at
+     FROM gate_attempts INDEXED BY gate_attempts_run
+     WHERE run_id = ?1
+     ORDER BY id ASC";
+
+/// The latest gate attempt for one run (0.34.0).
+const LAST_GATE_ATTEMPT_SQL: &str = "SELECT id, step, phase, outcome, detail, at
+     FROM gate_attempts INDEXED BY gate_attempts_run
+     WHERE run_id = ?1
+     ORDER BY id DESC LIMIT 1";
+
+/// How one gate evaluation ended (0.34.0).
+///
+/// The variant this crate has never had is `Errored`. Before 0.34.0 a gate
+/// answered `bool`, so a criterion that could not be evaluated at all — a
+/// provider that returned a 529, a verdict nobody could parse — was
+/// indistinguishable from work that was judged and found wanting. They call for
+/// opposite responses: one is retried,
+/// [`retry_gate`](crate::retry_gate) being how, and the other needs the work
+/// changed.
+///
+/// ```
+/// use io_harness::GateOutcome;
+///
+/// assert!(GateOutcome::Errored.is_retryable());
+/// assert!(!GateOutcome::Failed.is_retryable());
+/// assert_eq!(GateOutcome::Passed.as_str(), "passed");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GateOutcome {
+    /// The criterion was evaluated and satisfied.
+    Passed,
+    /// The criterion was evaluated and not satisfied. Nothing about the work has
+    /// changed, so re-running the same criterion over the same tree would say the
+    /// same thing.
+    Failed,
+    /// The criterion could not be evaluated. Whatever stopped it is in
+    /// [`GateAttempt::detail`].
+    Errored,
+}
+
+impl GateOutcome {
+    /// The stored form.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            GateOutcome::Passed => "passed",
+            GateOutcome::Failed => "failed",
+            GateOutcome::Errored => "errored",
+        }
+    }
+
+    /// Whether re-running the criterion could honestly produce a different
+    /// answer.
+    #[must_use]
+    pub fn is_retryable(self) -> bool {
+        matches!(self, GateOutcome::Errored)
+    }
+
+    /// Read the stored form back. An unknown string is `Errored` rather than a
+    /// parse failure: a row written by a newer binary describes an evaluation
+    /// this one cannot interpret, and treating that as "it did not run" is the
+    /// conservative reading.
+    fn from_str(s: &str) -> Self {
+        match s {
+            "passed" => GateOutcome::Passed,
+            "failed" => GateOutcome::Failed,
+            _ => GateOutcome::Errored,
+        }
+    }
+}
+
+/// One recorded gate evaluation (0.34.0).
+///
+/// ```
+/// use io_harness::{GateOutcome, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("port it", "openrouter")?;
+/// store.put_gate_attempt(run_id, 3, "review", GateOutcome::Errored, "HTTP 529")?;
+///
+/// let attempt = store.last_gate_attempt(run_id)?.unwrap();
+/// assert_eq!(attempt.outcome, GateOutcome::Errored);
+/// assert_eq!(attempt.detail, "HTTP 529");
+/// assert!(attempt.outcome.is_retryable());
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateAttempt {
+    /// Row id, ascending in evaluation order.
+    pub id: i64,
+    /// The step the gate ran after.
+    pub step: u32,
+    /// Which criterion ran, as a short name — `review`, `command`, `contains`.
+    pub phase: String,
+    /// How it ended.
+    pub outcome: GateOutcome,
+    /// The verdict's reasons, or what stopped the evaluation. Empty for a plain
+    /// pass.
+    pub detail: String,
+    /// When it ran.
+    pub at: String,
+}
+
+fn gate_attempt_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GateAttempt> {
+    let outcome: String = r.get(3)?;
+    Ok(GateAttempt {
+        id: r.get(0)?,
+        step: r.get(1)?,
+        phase: r.get(2)?,
+        outcome: GateOutcome::from_str(&outcome),
+        detail: r.get(4)?,
+        at: r.get(5)?,
+    })
+}
+
 /// Read one `run_events` row back as `(cursor, event)` (0.33.0).
 ///
 /// A row whose JSON will not parse is a `FromSqlConversionFailure` rather than a
@@ -3065,6 +3189,33 @@ impl Store {
              CREATE INDEX IF NOT EXISTS run_events_run ON run_events (run_id, id);",
         )?;
 
+        // 0.34.0 — what each gate evaluation decided, durably.
+        //
+        // Until now a gate's answer was a `bool` the run threw away, so "the
+        // criterion said no" and "the criterion never ran" were the same
+        // outcome and the only way back from either was to run the whole task
+        // again. `outcome` is one of `passed`, `failed`, `errored`; `detail`
+        // carries the verdict's reasons or the error's display.
+        //
+        // `detail` is deliberately in **no** index: it is the control column
+        // the query-plan test filters on, for the reason `run_events.kind` is —
+        // a trailing composite column is skip-scanned and is not a control.
+        //
+        // Additive, and NOT a `CHECKPOINT_FORMAT` bump: a 0.33.0 binary never
+        // names this table.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS gate_attempts (
+                 id      INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id  INTEGER NOT NULL,
+                 step    INTEGER NOT NULL,
+                 phase   TEXT NOT NULL,
+                 outcome TEXT NOT NULL,
+                 detail  TEXT NOT NULL DEFAULT '',
+                 at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS gate_attempts_run ON gate_attempts (run_id, id);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4360,6 +4511,90 @@ impl Store {
             rusqlite::params![event.run_id, event.step, event.depth, kind, json],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record how one gate evaluation ended (0.34.0).
+    ///
+    /// Appends rather than replaces. A run whose review gate errored and was
+    /// retried has two rows, and the history of what a gate did is the thing an
+    /// operator asks for when a run comes back wrong — overwriting would answer
+    /// "what does it say now" and destroy "what has it been saying".
+    ///
+    /// ```
+    /// use io_harness::{GateOutcome, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    ///
+    /// store.put_gate_attempt(run_id, 2, "review", GateOutcome::Errored, "HTTP 529")?;
+    /// store.put_gate_attempt(run_id, 2, "review", GateOutcome::Passed, "")?;
+    ///
+    /// assert_eq!(store.gate_attempts(run_id)?.len(), 2);
+    /// assert_eq!(store.last_gate_attempt(run_id)?.unwrap().outcome, GateOutcome::Passed);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn put_gate_attempt(
+        &self,
+        run_id: i64,
+        step: u32,
+        phase: &str,
+        outcome: crate::state::GateOutcome,
+        detail: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO gate_attempts (run_id, step, phase, outcome, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![run_id, step, phase, outcome.as_str(), detail],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Every gate attempt for one run, oldest first (0.34.0).
+    ///
+    /// One index seek on `gate_attempts_run`, whose leading column is `run_id`.
+    ///
+    /// ```
+    /// use io_harness::{GateOutcome, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// assert!(store.gate_attempts(run_id)?.is_empty());
+    ///
+    /// store.put_gate_attempt(run_id, 1, "command", GateOutcome::Failed, "exit 101")?;
+    /// assert_eq!(store.gate_attempts(run_id)?[0].phase, "command");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn gate_attempts(&self, run_id: i64) -> Result<Vec<GateAttempt>> {
+        let mut stmt = self.conn.prepare(GATE_ATTEMPTS_SQL)?;
+        let rows = stmt.query_map(rusqlite::params![run_id], gate_attempt_row)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The most recent gate attempt for one run, or `None` if it never gated
+    /// (0.34.0).
+    ///
+    /// What [`retry_gate`](crate::retry_gate) reads to decide whether a retry is
+    /// honest: an `Errored` attempt is a criterion that never ran, and a `Failed`
+    /// one is work that needs changing rather than a call that needs repeating.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// assert!(store.last_gate_attempt(run_id)?.is_none());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn last_gate_attempt(&self, run_id: i64) -> Result<Option<GateAttempt>> {
+        let mut stmt = self.conn.prepare(LAST_GATE_ATTEMPT_SQL)?;
+        let mut rows = stmt.query_map(rusqlite::params![run_id], gate_attempt_row)?;
+        rows.next().transpose().map_err(Into::into)
     }
 
     /// The highest cursor the stream has reached, across every run (0.33.0).

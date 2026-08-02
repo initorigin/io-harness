@@ -672,6 +672,33 @@ pub enum EventKind {
         /// started by a previous process and its pid may since have been reused.
         reason: String,
     },
+    /// A review criterion returned a verdict (0.34.0).
+    ///
+    /// The reasons are carried rather than summarised because a refusal a human
+    /// cannot argue with is a gate nobody trusts twice. A verdict that never
+    /// happened — a transport failure, an unreadable answer — emits nothing here
+    /// and is recorded as [`GateOutcome::Errored`](crate::GateOutcome): "the
+    /// review said no" and "the review did not run" are different facts and the
+    /// stream keeps them apart.
+    Reviewed {
+        /// Whether the work satisfied the rubric.
+        passed: bool,
+        /// Why, in the reviewer's own words.
+        reasons: Vec<String>,
+    },
+    /// The run changed which model it is asking (0.34.0).
+    ///
+    /// Emitted once, at the transition, not once per step: a rule that fires on
+    /// every request afterwards would make a change of model indistinguishable
+    /// from a run that always used it.
+    Routed {
+        /// The model the run was asking, or empty for the provider's own default.
+        from: String,
+        /// The model it is asking now.
+        to: String,
+        /// Which rule fired, in words an operator reads.
+        why: String,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -732,6 +759,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "handle_killed",
     "handle_exited",
     "handle_orphaned",
+    "reviewed",
+    "routed",
     "finished",
 ];
 
@@ -1234,6 +1263,15 @@ mod tests {
                 outcome: "success".into(),
                 steps: 4,
                 tokens: 9,
+            },
+            EventKind::Reviewed {
+                passed: false,
+                reasons: vec!["`parse` still panics on empty input".into()],
+            },
+            EventKind::Routed {
+                from: "small-model".into(),
+                to: "big-model".into(),
+                why: "2 consecutive gate failures".into(),
             },
             EventKind::Token {
                 text: "hello".into(),

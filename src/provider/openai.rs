@@ -101,6 +101,12 @@ impl Provider for OpenAi {
         "openai"
     }
 
+    /// 0.34.0 — the model this provider was constructed with, so the
+    /// self-review refusal has something to compare.
+    fn model_hint(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+
     fn endpoint(&self) -> Option<&str> {
         Some(&self.endpoint)
     }
