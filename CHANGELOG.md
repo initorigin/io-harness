@@ -26,6 +26,87 @@ notes are produced from it.
 
 ### Security
 
+## [0.34.0] - 2026-08-02
+
+A second model checks the first, one failed gate is retried on its own, and which
+model answers stops being fixed for the whole run.
+
+Every criterion this crate has shipped is a command or a string: `Command` runs an
+argv and reads its exit status, `WorkspaceFileContains` reads a file for a needle,
+`EachCompilesRust` compiles. That is the right default and it cannot catch the
+change that compiles, passes the suite, and is still the wrong change.
+
+**`Verification::Review` is a criterion a model answers.** It carries a rubric the
+caller wrote; a `Reviewer` — `ModelReviewer` over any provider, or a human, or a
+stub — reads the goal, the rubric and the files the run wrote, and returns a
+`Review { passed, reasons }`. The reasons reach the trace and the `Observer` as
+`EventKind::Reviewed`, because a refusal a human cannot argue with is a gate
+nobody trusts twice.
+
+**A model may not review its own work.** With `allow_self_review: false` (the
+default), a reviewer whose model is the model that produced the change is refused
+with `Error::Config` **before a request is built** — not warned about, and not
+after the answer arrives. Set the flag to `true` to say you meant it.
+
+**Every gate evaluation is durable, and `Errored` is not `Failed`.** A new
+`gate_attempts` table records what each gate decided: `Passed`, `Failed`, or —
+the distinction the crate has never had — `Errored`, a criterion that could not be
+evaluated at all. `Store::gate_attempts` and `Store::last_gate_attempt` read them
+back; attempts are appended, never overwritten, so the history of what a gate said
+survives a retry.
+
+**`retry_gate` re-runs the criterion and nothing else.** A run that spent forty
+model calls and then lost its review gate to a 529 no longer has to run the task
+again to get a verdict: `retry_gate` evaluates the criterion against the workspace
+as the run left it, from the run's own checkpoint. Its steps rows, its token
+ledger and its files are unchanged by the retry except for the review it asked
+for. It refuses a gate that `Failed` — that criterion ran and answered, and the
+work has to change before the answer can.
+
+**`Routing` changes which model the run asks, while it is running.** Three rules,
+applied by the run itself and set on the request that is actually sent:
+`escalate_after(n, model)` after n consecutive failed gates, `downshift_under(bytes,
+model)` while the change is small, and `require_primary()`, which asks
+`Provider::reachable()` before the first step and refuses to start rather than
+running an unattended job on a fallback nobody chose. `EventKind::Routed` is
+emitted once, at the transition.
+
+### Added
+
+- `Verification::Review { rubric, allow_self_review }` — a criterion whose check is
+  a model reading the change against a rubric.
+- `Reviewer`, `Reviewing`, `ReviewRequest`, `Review` and `ModelReviewer<P>` — who
+  answers a review, and the model-backed implementation.
+- `TaskContract::with_reviewer`, and `TaskContract::reviewer`.
+- `GateOutcome` (`Passed`, `Failed`, `Errored`), `GateAttempt`,
+  `Store::put_gate_attempt`, `Store::gate_attempts`, `Store::last_gate_attempt`,
+  and the additive `gate_attempts` table with its `(run_id, id)` index.
+- `retry_gate` and `retry_gate_observed` — re-run one run's criterion, from its own
+  checkpoint, without re-running a step.
+- `Routing`, `TaskContract::with_routing`, and `TaskContract::routing`.
+- `Provider::reachable` and `Provider::model_hint`, both **defaulted**, so every
+  existing implementation compiles and behaves exactly as it did in 0.33.0.
+- `EventKind::Reviewed { passed, reasons }` and `EventKind::Routed { from, to, why }`,
+  with their `EVENT_NAMES` entries.
+
+### Changed
+
+- **BREAKING (API)** `Verification` gains a variant and becomes
+  `#[non_exhaustive]`. Both are the same break for an exhaustive `match` on it
+  outside this crate, so they are paid together rather than twice.
+  *Migration:* add a wildcard arm — `_ => { /* a criterion this code does not
+  handle */ }` — to any `match` on `Verification`. Constructing every existing
+  variant, and every `with_verification` call, is unchanged. Nothing was removed
+  and no signature moved.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.33.0] - 2026-08-02
 
 Two processes, one run.

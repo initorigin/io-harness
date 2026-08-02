@@ -565,10 +565,94 @@ row is now written *before* the in-process approver is consulted, so one exists 
 approvals that were answered instantly. Read
 `Store::unresolved_approvals`, which is what `Attach::waiting` uses.
 
+## What a review criterion is, and what it is not (0.34.0)
+
+[`Verification::Review`](https://docs.rs/io-harness/latest/io_harness/enum.Verification.html)
+is the first criterion in this crate whose check is a judgement. A `Reviewer` —
+`ModelReviewer` over any provider, a human, or a second harness — is handed the
+goal, the rubric and the files the run wrote, and returns a verdict with its
+reasons.
+
+**A review is not a proof, and it is not reproducible.** It is one model's opinion
+of one change against one rubric, at one moment. It does not replace an execution
+gate and it is not meant to: an exit status is a fact and a verdict is not. The two
+compose — run the suite *and* have the change read.
+
+**A model may not review its own work, and the check is by name.** With
+`allow_self_review: false` (the default), a reviewer whose model equals the model
+under review is refused with `Error::Config` before a request is built. The
+comparison is between **strings**: two different names can be the same weights
+behind a gateway, and one name can be two snapshots a month apart. It catches the
+obvious case honestly and cannot catch the disguised one. The model under review is
+read from `Provider::model_hint`, which is defaulted to `None` — a provider that
+does not name its model makes the refusal unreachable.
+
+**The reviewer does not see the conversation.** It reads the goal, the rubric and
+what was written, deliberately: a reviewer reading the author's reasoning is a
+reviewer being led. The cost is that a change whose justification lived only in the
+transcript is judged without it.
+
+**A failed review is not fed back to the run.** The verdict ends the gate; it does
+not become an observation the model is asked to address. Closing that loop would
+let a model optimise against the reviewer, which is the failure the criterion
+exists to prevent.
+
+## What a gate attempt records, and what `retry_gate` will and will not do (0.34.0)
+
+Every gate evaluation writes a `gate_attempts` row: `Passed`, `Failed`, or
+`Errored`. The third is the distinction the crate did not have before 0.34.0 — a
+criterion that could not be evaluated at all is not one that was evaluated and said
+no, and only the first is worth repeating.
+
+**`retry_gate` re-runs the criterion and nothing else.** No step is re-executed, no
+tool is called, and the only provider call is the one the criterion itself needs. A
+run's steps rows, its token ledger and its files are what the run left them.
+
+**It grades the tree as it now stands.** The criterion runs against the workspace
+at the moment of the retry, not against a snapshot taken when the gate failed. If
+something changed the tree in between, the retry judges the new tree. The crate
+does not snapshot a workspace at gate time.
+
+**It refuses a gate that answered.** A `Failed` attempt means the criterion ran and
+said no; re-running it over an unchanged tree asks the same question until the
+answer is convenient. `retry_gate` returns `Error::Resume` for that, and for a run
+that never gated at all.
+
+## What routing changes, and what it cannot (0.34.0)
+
+[`Routing`](https://docs.rs/io-harness/latest/io_harness/struct.Routing.html) sets
+`CompletionRequest.model` on the requests the run sends. That is its whole
+mechanism, and its whole limit.
+
+**It routes models, not providers.** There is no rule that swaps the provider
+mid-run: `Fallback` chains providers on failure, and a rule that moved between them
+would have to answer what happens to the conversation the first one was holding.
+
+**Escalation is one-way and counts consecutive failures.** A run that escalates
+does not come back down — oscillating between two models mid-run is a behaviour
+nobody asked for. Escalation beats downshifting: a run whose gate keeps refusing is
+not one to save money on.
+
+**`require_primary` asks once, and only of a provider that answers.**
+`Provider::reachable` is defaulted to `Ok(true)`, so a provider that does not
+override it makes the rule a no-op rather than a failure. It is a point-in-time
+answer with no bearing on the next minute — a provider that dies mid-run is what
+`Fallback` and `RetryPolicy` are for. There is no health check, no cache, and no
+re-probe.
+
+**A model name is a request.** Naming a model the provider does not have fails the
+way any wrong slug fails: at the vendor, on the next request.
+
+**Routing governs the root agent.** A spawned child takes the model on its
+`AgentDef`, exactly as it takes its `Effort` there since 0.31.0 — that is where
+"search cheaply, think hard where thinking is the work" is said, and a rule that
+overrode a role's own model would be the roster's author being ignored by a
+counter.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.33.0.
+is fixed as of 0.34.0.
 
 **The concurrency cap is per tier, not per tree (0.32.0).**
 `Containment::max_concurrent_agents` bounds how many agents work at once *at one

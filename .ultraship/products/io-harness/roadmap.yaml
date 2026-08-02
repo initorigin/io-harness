@@ -869,8 +869,8 @@ versions:
       Plus the smallest piece and the one an operator asks for first: **retry a single failed gate
       from its own checkpoint**, so a terminal transport failure on one gate does not cost the forty
       that passed.
-    detail: hypothesis
-    status: planned
+    detail: specified
+    status: released
   - version: 0.35.0
     outcome: >
       A directory is a capability bundle. Skills, hooks, MCP servers, agent definitions, prompt

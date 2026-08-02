@@ -90,6 +90,75 @@ the repository, where the project's own tooling runs it, reviews it and keeps it
 A criterion that lived only in a `TaskContract` was invisible to everyone except
 the run that used it.
 
+## A criterion a model answers (0.34.0)
+
+Every criterion above is a fact: the command exited 0, the file holds the text, the
+crate compiled. That is the right default and it has one blind spot — a change that
+compiles, passes the suite, and is not the change that was asked for. An agent
+optimising against an exit status produces exactly that.
+
+`Verification::Review` is the criterion for it:
+
+```rust,no_run
+use io_harness::{ModelReviewer, TaskContract, Verification};
+use std::sync::Arc;
+
+# fn demo<P: io_harness::Provider + std::fmt::Debug + Send + Sync + 'static>(reviewing: P) {
+let contract = TaskContract::workspace("split the parser into two modules", "/repo")
+    .with_verification(Verification::Review {
+        rubric: "the split is by responsibility, and every public item kept its docs".into(),
+        allow_self_review: false,
+    })
+    // The reviewer holds its OWN provider and its own model. That is the point.
+    .with_reviewer(Arc::new(ModelReviewer::new(reviewing, "a-different-model")));
+# let _ = contract; }
+```
+
+The reviewer is handed the goal, the rubric and the files the run wrote — with
+their current contents — and returns `Review { passed, reasons }`. The reasons
+reach the trace and every `Observer` as `EventKind::Reviewed`.
+
+**A model may not review its own work.** With `allow_self_review: false`, a
+reviewer whose model equals the model under review is refused with `Error::Config`
+*before a request is built*. A model grading its own answer reports what the run
+already believes; the refusal is not a warning, and it costs nothing because it
+happens before the wire.
+
+**What a review does not prove.** It is one model's opinion of one change against
+one rubric, at one moment: not deterministic, not reproducible across model
+versions, and not a proof. It does not replace an execution gate — run the suite
+*and* have the change read. The full bounds, including why the reviewer never sees
+the run's conversation, are in [the public contract](../CONTRACT.md).
+
+## Retrying one gate, without re-running the run (0.34.0)
+
+A review is the first criterion that can fail for a reason that is not about the
+work — a 529, a dropped socket, an answer nobody could parse. Before 0.34.0 every
+gate outcome was a `bool` the run discarded, so "the review said no" and "the
+review never happened" were the same ending, and the only way back was to run the
+whole task again.
+
+Each evaluation now writes a `gate_attempts` row: `Passed`, `Failed`, or
+`Errored`. Only the last is retryable, and `retry_gate` is how:
+
+```rust,no_run
+use io_harness::{retry_gate, GateOutcome, Store, TaskContract};
+
+# async fn demo(contract: &TaskContract, store: &Store, run_id: i64) -> io_harness::Result<()> {
+if store.last_gate_attempt(run_id)?.is_some_and(|a| a.outcome.is_retryable()) {
+    // The criterion runs again. The forty steps that produced the work do not.
+    let outcome = retry_gate(contract, store, run_id).await?;
+    assert!(matches!(outcome, GateOutcome::Passed | GateOutcome::Failed));
+}
+# Ok(()) }
+```
+
+It re-runs the criterion and nothing else: no step is re-executed, no tool is
+called, and the run's steps rows, token ledger and files are what the run left
+them. It grades the workspace **as it now stands** rather than a snapshot from gate
+time, and it refuses a gate that `Failed` — that criterion ran and answered, and
+asking again over an unchanged tree is asking until the answer is convenient.
+
 ## What a passing gate proves
 
 **A pass means the stated criterion was satisfied under the harness's compile and

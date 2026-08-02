@@ -1011,6 +1011,74 @@ pub trait Provider {
         async { Ok(Vec::new()) }
     }
 
+    /// Whether this provider is answering, asked once before a run starts
+    /// (0.34.0).
+    ///
+    /// Defaulted to `Ok(true)` for the reason [`models`](Provider::models) is
+    /// defaulted to an empty list: a required method on the crate's one extension
+    /// point breaks every implementation that already exists. A provider that
+    /// does not override it makes
+    /// [`Routing::require_primary`](crate::Routing) a no-op rather than a
+    /// failure, which is stated in `docs/CONTRACT.md` rather than left to be
+    /// discovered.
+    ///
+    /// It is a point-in-time answer and nothing more. A provider that is
+    /// reachable now and gone in ten minutes is what
+    /// [`Fallback`] and
+    /// [`RetryPolicy`](crate::RetryPolicy) are for; this exists so an unattended
+    /// job does not *start* on a fallback nobody chose.
+    ///
+    /// ```
+    /// use io_harness::{CompletionRequest, CompletionResponse, Provider};
+    ///
+    /// struct Down;
+    ///
+    /// impl Provider for Down {
+    ///     async fn complete(&self, _r: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         unreachable!("a run under `require_primary` never gets here")
+    ///     }
+    ///     async fn reachable(&self) -> io_harness::Result<bool> { Ok(false) }
+    /// }
+    ///
+    /// # async fn demo() -> io_harness::Result<()> {
+    /// assert!(!Down.reachable().await?);
+    /// # Ok(()) }
+    /// ```
+    fn reachable(&self) -> impl std::future::Future<Output = Result<bool>> + Send {
+        async { Ok(true) }
+    }
+
+    /// The model this provider will ask when a request does not name one
+    /// (0.34.0).
+    ///
+    /// Defaulted to `None` — "this provider is not saying" — so every existing
+    /// implementation keeps compiling. The built-ins return the model they were
+    /// constructed with.
+    ///
+    /// It exists for one caller: the self-review refusal on
+    /// [`Verification::Review`](crate::Verification::Review) needs to know the
+    /// model that produced the change in order to refuse a reviewer that is the
+    /// same one. A provider that says nothing here makes that refusal impossible
+    /// to reach, which is stated in `docs/CONTRACT.md` rather than hidden.
+    ///
+    /// ```
+    /// use io_harness::{CompletionRequest, CompletionResponse, Provider};
+    ///
+    /// struct Mine(String);
+    ///
+    /// impl Provider for Mine {
+    ///     async fn complete(&self, _r: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         Ok(CompletionResponse::default())
+    ///     }
+    ///     fn model_hint(&self) -> Option<&str> { Some(&self.0) }
+    /// }
+    ///
+    /// assert_eq!(Mine("a-model".into()).model_hint(), Some("a-model"));
+    /// ```
+    fn model_hint(&self) -> Option<&str> {
+        None
+    }
+
     /// A short label recorded in the run's trace so an audit shows which
     /// provider ran. Defaults to `"provider"` so existing implementers keep
     /// compiling; the built-in providers override it.
