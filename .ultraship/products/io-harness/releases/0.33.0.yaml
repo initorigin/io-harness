@@ -414,6 +414,51 @@ known_limitations:
 - >
   Attaching gives read and answer, not control. There is no attached steer, cancel or budget change,
   by design.
+- >
+  **This record was sealed before the crates.io upload.** `mode: published` is the release's target
+  and the flow's last step: the develop merge, the main merge and the GitHub Release all come after
+  the record rides the `feat/0.33.0` commit, and `cargo publish --locked` comes after those. Sealing
+  it `release-ready` and correcting it afterwards would mean editing an immutable record, which is
+  worse.
+- >
+  **The crate does not detect whether the owning process is alive.** `runs.status = 'running'` has
+  never told a live process from a crashed one and this release does not change it. A run whose owner
+  died still reports what it was holding through `Attach::waiting`, and answering it writes a row
+  nothing will read until somebody resumes. In the other direction, `resume_*` refuses a request that
+  has already been *decided* but cannot refuse one still held by a process that is still running.
+  Both are stated in `docs/CONTRACT.md` and the module page; a liveness heartbeat is recorded as an
+  open question because its false-negative story — a slow step looking dead — has to be designed
+  rather than defaulted.
+- >
+  **`Attach::poll` is a poll, at both ends.** Latency is the caller's own interval outbound, and
+  `ATTACH_POLL` (200 ms) for an answer to reach a parked run. There is no push in either direction.
+- >
+  **`run_events` is never pruned.** A long run's stream grows without bound and deleting it is the
+  application's call. The crate has never pruned anything in the trace and did not start with its
+  newest table.
+- >
+  **A run only picks up an attached answer while it is *blocked in* its gate.** A gate that declines
+  — `ResponderNone`, a `PlanGate` returning `None`, an approver deferring — pauses the run as it
+  always did, and that pause is answered by `resume_*`, not by `Attach`. That is correct rather than
+  a gap, but a reader could take "answer a live run" more widely than it holds.
+- >
+  **F10 was met against 0.29.0 rather than 0.32.0, deliberately.** The criterion named "a database
+  written by a real 0.32.0 build". The repository's pinned cross-version generator is
+  `tests/fixtures/gen-0.29.0` with its own CI job, three releases back rather than one, and the
+  0.33.0 store it reads now carries a `run_events` row alongside the 0.30.0 memory rows and the
+  0.31.0 plan. Adding a 0.32.0 generator would be a second fixture crate and a second CI job for a
+  strictly weaker claim. The substance — both directions executed, the 0.22.0 schema guard fed
+  `run_events` and `run_events_run` by name — holds.
+- >
+  **The two `cargo test` invocations were run with `CARGO_PROFILE_DEV_DEBUG=0` and
+  `CARGO_PROFILE_TEST_DEBUG=0`.** With debuginfo on, `target/` reached 19 GiB and took the volume to
+  4.4 GiB mid-suite; the first attempt died with `No space left on device` inside an incremental
+  copy. Debug info changes no test outcome, and CI runs the unmodified commands on a fresh runner.
+  Recorded because the numbers above were measured under it.
+- >
+  **Inherited and unresolved: 0.30.0's N2 wording.** "The aggregates do not scale with the trace"
+  over-claims — counting every row is the answer. Stated honestly in `docs/CONTRACT.md` and raised
+  rather than read as satisfied. Untouched by this release.
 
 open_questions:
 - >
@@ -434,4 +479,76 @@ open_questions:
   `poll_blocking(timeout)` would suit the second better and is worth asking a consumer about before
   guessing.
 
-status: planned
+status: released
+released_at: 2026-08-02T14:30:00Z
+mode: published
+delivered: >
+  Two processes, one run. `Broadcast` wraps whatever `Observer` a caller already has and writes each
+  `RunEvent` to a new `run_events` table on its way past, so the durable stream is the same value the
+  in-process observer received rather than a reconstruction. `Attach` is what a second process opens
+  on the same store file: a cursor it chooses, `poll()` for what is new, `waiting()` for what the run
+  is parked on — an approval, a question or an unreviewed plan — and three answers that write into
+  the durable row the run already reads. A run blocked in its `Approver`, `Responder` or `PlanGate`
+  picks that answer up and carries on, never killed and never resumed. The first answer wins by
+  compare-and-swap and the loser is told; the run reads the decision back from the row in both arms,
+  fast path included. An attaching process has no method that starts, resumes or steps a run, so the
+  observer dying changes nothing and the owner dying leaves exactly the resumable run 0.7.0 always
+  did — both executed with real SIGKILLs rather than argued.
+
+evidence:
+  tests:
+  - >
+    `cargo test` — 37 result lines, all `ok`, 0 failed, including 329 doctests. Two rounds were
+    needed and both failures were the release's own break landing where it should: the first was
+    `every_public_item_has_a_worked_example` on `Waiting` and `POLL_LIMIT`, the second was the two
+    doctests on `PendingQuestion` and `PendingPlan` that asserted the old `is_err()` semantics for a
+    second answer. Both are now the `Result<bool>` the release introduced.
+  - >
+    `cargo test --all-features` — 57 result lines, all `ok`, 0 failed, no `FAILED` and no `error`
+    line; 331 doctests in 153.48s. Run alone, in its own invocation, after the default-feature run.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — clean. The one lint the release
+    raised was `clippy::zombie_processes` on the test fixture guard, resolved by calling `wait()`
+    explicitly rather than by an `allow`: the lint reads the code and it is right to, since a `Child`
+    taken and never waited on is a leak everywhere except that one already-reaped case.
+  - >
+    `cargo fmt --check` — clean.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — clean,
+    run BEFORE the release PR was opened. It caught two `rustdoc::broken_intra_doc_links` errors
+    (`[`Store::open`]` from `src/observe.rs` and `[`RunEvent`]` from `src/state.rs`, neither type in
+    scope in its own file) that stable `cargo doc --no-deps --all-features` reported as zero
+    warnings. Trap 28 from 0.32.0, and it paid for itself again.
+  - >
+    Twenty tests in `tests/attach.rs`, one query-plan test in `src/state.rs`, and the whole existing
+    suite unchanged and green — including `tests/question.rs::answering_the_same_question_twice_is_an_error`,
+    which still passes because the *resume* path refuses a second answer even though the *write*
+    path now returns a bool.
+  - >
+    Five sabotages, each run against the tests before they were finished. S1 the event reports the
+    raced value rather than the store row -> 4 named tests fail. S1b the row is read only in the
+    attached arm, so the fast path reports its own value -> `tests/policy.rs::approve_all_proceeds_where_deny_all_does_not`
+    fails, which is the fast-path half of F9 and the half a single sabotage would have missed. S2 the
+    three compare-and-swap guards removed -> 8 named tests fail while all 448 lib unit tests still
+    pass. S3 `Broadcast` writes a synthesised event instead of the one it forwards -> 5 named tests
+    fail, F1 among them. S4 the durable row written after the gate, the 0.32.0 ordering -> 5 named
+    tests fail.
+  - >
+    The query plan is asserted against the statement the crate runs, not a copy of it:
+    `TREE_EVENTS_SQL` is a `const` the test `EXPLAIN`s directly, so "tidying" the `CROSS JOIN ...
+    INDEXED BY` into a plain join fails the test rather than passing a re-typed one. Two controls:
+    `kind`, a column in no index at all, must not be servable from `run_events_run`; and the same
+    query with a plain join must build an `AUTOMATIC COVERING INDEX (id=?)` over the CTE instead.
+    Measured over 40 trees x 40 events: 0.093 ms forced against 0.179 ms naive.
+  builds:
+  - >
+    `cargo package --locked` — exit 0, and the packaged crate compiles. Run after `rm -rf target`,
+    because the disk trap took the volume under 5 GiB twice during this release.
+  - >
+    `cargo tree | wc -l` — 402, unchanged since 0.23.0. The transport is the `rusqlite` store both
+    processes already open, the wait is `tokio::time` and the race is `tokio::select!`.
+  reviews: []
+  deployments: []
+  health_checks: []
+
+immutable: true

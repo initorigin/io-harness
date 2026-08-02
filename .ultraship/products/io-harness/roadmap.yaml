@@ -850,7 +850,7 @@ versions:
       does not take ownership — so the failure modes are bounded: the observer dying changes
       nothing, and the owner dying leaves exactly the resumable run it always did.
     detail: specified
-    status: planned
+    status: released
   - version: 0.34.0
     outcome: >
       A second model checks the first, and which model runs stops being fixed for the whole run.
