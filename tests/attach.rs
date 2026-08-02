@@ -500,8 +500,13 @@ impl Fixture {
     /// job is killed.
     fn finished(mut self) -> String {
         until("the fixture to exit", || self.exited().then_some(()));
-        let status = self.status.unwrap();
         let mut child = self.child.take().unwrap();
+        // `exited` already reaped it, so this returns the cached status without
+        // blocking. Written as a `wait` rather than reading `self.status` because
+        // `clippy::zombie_processes` reads the code, not the intent, and it is
+        // right to: a `Child` that is taken and never waited on is a leak
+        // everywhere except here.
+        let status = child.wait().unwrap();
         let mut out = String::new();
         child
             .stdout
