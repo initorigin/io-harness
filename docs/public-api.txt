@@ -50,6 +50,7 @@ const MCP_TOOL_PREFIX src/mcp.rs
 const MEMORY_MAX_CHARS src/state.rs
 const MEMORY_MAX_ENTRIES src/state.rs
 const MEMORY_MAX_ENTRY_CHARS src/state.rs
+const POLL_LIMIT src/attach.rs
 const PROPOSE_PLAN_TOOL src/tools/mod.rs
 const REQUEST_TIMEOUT src/net.rs
 const SPAWN_TOOL src/run.rs
@@ -84,6 +85,7 @@ enum Selected src/sandbox.rs
 enum SpawnRefusal src/containment.rs
 enum TodoState src/state.rs
 enum Verification src/verify.rs
+enum Waiting src/attach.rs
 fn rewind src/run.rs
 fn select src/sandbox.rs
 struct AcceptPlan src/approve.rs
@@ -92,6 +94,8 @@ struct AgentEvent src/state.rs
 struct Agents src/agent.rs
 struct Anthropic src/provider/anthropic.rs
 struct ApproveAll src/approve.rs
+struct Attach src/attach.rs
+struct Broadcast src/observe.rs
 struct CheckpointEvent src/state.rs
 struct Citation src/web.rs
 struct Compatible src/provider/compatible.rs

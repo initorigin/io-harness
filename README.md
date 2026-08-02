@@ -158,6 +158,17 @@ draw, and a checkpoint commit in one transaction. A crash resumes the whole tree
 where it stopped: completed steps are not re-run, the budget is not
 double-charged, and an irreversible action already taken is not taken twice.
 
+**Two processes, one run.** A run no longer belongs to the process that started
+it. `Broadcast` wraps whatever `Observer` you already have and writes each event
+to the store as it passes, so a second process can `Attach` to a run that is
+*still going*, read the same events, see whether it is parked on an approval, a
+question or an unreviewed plan, and answer it — without killing it and without
+resuming it. The first answer wins and the loser is told, because the write is a
+compare-and-swap on the row the run already reads. An attaching process reads and
+decides: there is no method on it that starts, resumes or steps a run, so killing
+the watcher changes nothing and killing the owner leaves exactly the resumable run
+it always did.
+
 **Providers, with fallback.** OpenRouter, Anthropic and OpenAI behind one trait,
 over the crate's own HTTP+SSE client. Beside them one `Compatible` provider
 reaches any OpenAI-shaped endpoint from a base URL, an auth style, a key and a

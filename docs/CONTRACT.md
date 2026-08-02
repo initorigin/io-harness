@@ -518,10 +518,57 @@ next request would be charged for it again as input, every turn, for the rest of
 the run. It is also **not persisted**: `Usage::reasoning_tokens` is the durable
 record, and the text is live-only.
 
+## What attaching to a live run gives you, and what it does not (0.33.0)
+
+A second process can [`Attach`](https://docs.rs/io-harness/latest/io_harness/struct.Attach.html)
+to a run that is still going: read the events the owning process is receiving, see
+what it is parked on, and answer it. The transport is the SQLite store both
+processes already open — `Store::open` has set `journal_mode = WAL` and a
+five-second `BUSY_TIMEOUT` since 0.12.0 — so there is no socket, no lock, no lease
+and no on-disk migration.
+
+**Nothing is durable unless you broadcast.** `Observer` is still an in-process
+callback. The events reach the store only through
+[`Broadcast`](https://docs.rs/io-harness/latest/io_harness/struct.Broadcast.html),
+which wraps another observer and writes each event on its way past. A run without
+one writes no `run_events` rows at all, and an attached reader on it sees nothing.
+
+**It reads and decides; it does not take ownership.** `Attach` has no method that
+starts, resumes or steps a run. Answering writes a row the owning process reads —
+it is not a transfer of control, and there is no attached steer, cancel or budget
+change. That is a boundary, not an omission.
+
+**The first answer wins, and the loser is told.** `answer_approval`,
+`answer_question` and `answer_plan` each return `bool`: whether this caller's
+answer is the one the run acted on. It is one conditional `UPDATE`, so two
+processes answering the same approval cannot both land, and the run reads the
+decision back from the row rather than from whoever raced.
+
+**It is a poll, at both ends.** `Attach::poll` is called by you, at whatever rate
+suits. The run picks up an attached answer at `ATTACH_POLL` — 200 ms — rather than
+instantly. Neither end pushes.
+
+**The crate does not know whether the owner is alive.** `runs.status = 'running'`
+has never told a live process from a crashed one and this does not change it. A run
+whose owning process died still reports what it was holding, and answering it
+writes a row nothing will read until somebody resumes. Conversely, a run that is
+genuinely live is not detected either: `resume_*` will refuse a request that has
+already been decided, but it will not refuse one that is still being held by a
+process that is still running.
+
+**`run_events` is never pruned.** A long run's stream grows without bound. Deleting
+it is the application's call; the crate has never pruned anything in the trace and
+did not start with its newest table.
+
+**A row in `pending_approvals` no longer means the run is waiting (0.33.0).** The
+row is now written *before* the in-process approver is consulted, so one exists for
+approvals that were answered instantly. Read
+`Store::unresolved_approvals`, which is what `Attach::waiting` uses.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.32.0.
+is fixed as of 0.33.0.
 
 **The concurrency cap is per tier, not per tree (0.32.0).**
 `Containment::max_concurrent_agents` bounds how many agents work at once *at one
