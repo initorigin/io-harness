@@ -1480,6 +1480,20 @@ fn question_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingQuestion> {
     })
 }
 
+/// Read one `run_events` row back as `(cursor, event)` (0.33.0).
+///
+/// A row whose JSON will not parse is a `FromSqlConversionFailure` rather than a
+/// silently skipped event: a gap in a stream a reader is using to decide things
+/// is worse than an error, because nothing downstream can tell a missing event
+/// from one that never happened.
+fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, crate::observe::RunEvent)> {
+    let json: String = r.get(1)?;
+    let event = serde_json::from_str(&json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok((r.get(0)?, event))
+}
+
 /// A plan the agent proposed, and what was decided about it (0.31.0).
 ///
 /// The stored half of the plan gate, and the reason a run can be approved by a
@@ -2989,6 +3003,48 @@ impl Store {
                  ON agent_queue (parent_run_id, step, goal);",
         )?;
 
+        // 0.33.0: the durable event stream. Until now an [`Observer`] was an
+        // in-process callback and the events existed only where the run did, so a
+        // second process wanting to watch a run was back to polling the trace
+        // against a schema this crate does not promise — the very thing
+        // `src/observe.rs` says the observer exists to stop people doing.
+        //
+        // A row here is one `RunEvent`, serialised by the same `serde` impl the
+        // 0.12.0 wire format already promised, written by
+        // [`Broadcast`](crate::Broadcast) as it passes the event on. It is
+        // deliberately the *same* value the in-process observer received rather
+        // than something reassembled from the twenty tables above: a
+        // reconstruction drifts the first time one of them gains a column, and
+        // there would be no test that could tell.
+        //
+        // `id` is the cursor. `AUTOINCREMENT` makes it globally monotonic rather
+        // than merely unique, so one number orders a whole tree's stream and a
+        // reader that stored it yesterday can still ask for "everything after
+        // that" — a per-run counter could not, because a tree interleaves.
+        //
+        // `kind` is the wire tag, denormalised out of the JSON so a reader can
+        // filter without deserialising every row. It is deliberately in **no**
+        // index: it is the control column the query-plan test filters on, and a
+        // column that is merely absent from a left prefix is not a control —
+        // SQLite skip-scans a trailing composite column and produces a full read
+        // wearing an index's name.
+        //
+        // Additive, and NOT a `CHECKPOINT_FORMAT` bump, for the reason every
+        // addition since 0.13.0 has recorded: a 0.32.0 binary never names this
+        // table, so refusing its database would refuse one it can in fact read.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS run_events (
+                 id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id INTEGER NOT NULL,
+                 step   INTEGER NOT NULL,
+                 depth  INTEGER NOT NULL,
+                 kind   TEXT NOT NULL,
+                 json   TEXT NOT NULL,
+                 at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS run_events_run ON run_events (run_id, id);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -3084,12 +3140,39 @@ impl Store {
     }
 
     /// Mark a pending action decided, so a resume knows what the human chose.
-    pub fn resolve_pending(&self, request_id: i64, decision: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE pending_approvals SET resolved = ?1 WHERE id = ?2",
+    /// Returns whether *this* call is the one that decided it (0.33.0).
+    ///
+    /// A single conditional `UPDATE`, not a read followed by a write. Since 0.33.0
+    /// a live run can be answered by a second process
+    /// ([`Attach::answer_approval`](crate::Attach::answer_approval)) as well as by
+    /// the [`Approver`](crate::Approver) in its own process, so two writers racing
+    /// for one approval is ordinary rather than exotic. `WHERE resolved IS NULL`
+    /// makes the store the arbiter: the first answer lands, every later one
+    /// returns `false` and changes nothing. Two answers to one approval means one
+    /// of them was never acted on, and the caller should hear which was theirs.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("ship it", "openrouter")?;
+    /// let id = store.put_pending(run_id, 3, "write", "deploy/prod.yaml", None)?;
+    ///
+    /// assert!(store.resolve_pending(id, "approve")?);
+    /// // Second writer. It does not overwrite, and it is told.
+    /// assert!(!store.resolve_pending(id, "deny")?);
+    /// assert_eq!(store.pending(id)?.unwrap().resolved.as_deref(), Some("approve"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn resolve_pending(&self, request_id: i64, decision: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "UPDATE pending_approvals SET resolved = ?1
+             WHERE id = ?2 AND resolved IS NULL",
             (decision, request_id),
         )?;
-        Ok(())
+        Ok(changed == 1)
     }
 
     /// Start a run row; returns its id. Stamps `started_at` (UTC, from SQLite's
@@ -3896,6 +3979,41 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
+    /// Every run in the tree rooted at `root`, `root` first, then its descendants
+    /// in spawn order (0.33.0).
+    ///
+    /// [`Self::children`]'s deep sibling, and what
+    /// [`Attach::to_tree`](crate::Attach::to_tree) walks to ask each run what it is
+    /// waiting on. One recursive walk of `runs` rather than a query per level.
+    ///
+    /// ```
+    /// use io_harness::Store;
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let root = store.start_run("fan out", "/tmp/ws")?;
+    /// let child = store.start_child_run("a sub-task", "/tmp/ws", root, 1)?;
+    /// let grandchild = store.start_child_run("deeper", "/tmp/ws", child, 2)?;
+    ///
+    /// // `children` stops at one level; this does not.
+    /// assert_eq!(store.children(root)?, vec![child]);
+    /// assert_eq!(store.tree_runs(root)?, vec![root, child, grandchild]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tree_runs(&self, root: i64) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT id FROM tree ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([root], |r| r.get(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
     /// The parent run id of `run_id`, or `None` for a root run.
     pub fn parent(&self, run_id: i64) -> Result<Option<i64>> {
         Ok(self.conn.query_row(
@@ -4212,6 +4330,227 @@ impl Store {
         )?;
         let rows = stmt.query_map([root], |r| {
             Ok((r.get::<_, i64>(0)? as u32, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    // ---- 0.33.0: the durable event stream ----
+
+    /// Append one [`RunEvent`] to the durable stream; returns its cursor id
+    /// (0.33.0).
+    ///
+    /// The event is stored as the JSON its own `Serialize` produces, so what a
+    /// second process reads back is the value the in-process observer was handed
+    /// and not a summary of it. [`Broadcast`](crate::Broadcast) is what normally
+    /// calls this — reach for it directly only if you are forwarding a stream you
+    /// received some other way.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, RunEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let event = RunEvent::new(run_id, 1, EventKind::Stalled);
+    ///
+    /// let cursor = store.put_event(&event)?;
+    /// assert!(cursor > 0);
+    /// assert_eq!(store.events_since(run_id, 0, 10)?, vec![(cursor, event)]);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn put_event(&self, event: &crate::observe::RunEvent) -> Result<i64> {
+        let json = serde_json::to_string(event).map_err(|e| Error::Config(e.to_string()))?;
+        // The tag is read back out of the JSON rather than matched on the enum:
+        // `EventKind` is `#[non_exhaustive]` and gains variants freely, and a
+        // `match` here would be one more place a new variant has to be added.
+        // `serde` already decided the name; this reads its answer.
+        let kind = serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|v| v.get("event").and_then(|e| e.as_str()).map(str::to_string))
+            .unwrap_or_default();
+        self.conn.execute(
+            "INSERT INTO run_events (run_id, step, depth, kind, json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![event.run_id, event.step, event.depth, kind, json],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The highest cursor the stream has reached, across every run (0.33.0).
+    ///
+    /// What a reader that wants "from now on" rather than the backlog starts at.
+    /// Global rather than per run because [`Self::put_event`]'s ids are globally
+    /// monotonic: one number is a valid starting point for a single run's stream
+    /// and for a whole tree's, and asking per run would give a tree reader a
+    /// cursor that is already stale for its siblings.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, RunEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// assert_eq!(store.event_cursor()?, 0);
+    ///
+    /// let cursor = store.put_event(&RunEvent::new(run_id, 1, EventKind::Stalled))?;
+    /// assert_eq!(store.event_cursor()?, cursor);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn event_cursor(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id), 0) FROM run_events", [], |r| {
+                r.get(0)
+            })?)
+    }
+
+    /// One run's events after `cursor`, oldest first, at most `limit` of them
+    /// (0.33.0).
+    ///
+    /// `cursor` is exclusive, so passing back the id of the last event you saw
+    /// returns only what is new. Start at `0` for the whole backlog, or at
+    /// [`Self::event_cursor`] for a tail.
+    ///
+    /// One index seek on `run_events_run`: its leading column is `run_id` and its
+    /// second is the `id` this filters and orders by, so the range is walked in
+    /// order rather than sorted.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, RunEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let first = store.put_event(&RunEvent::new(run_id, 1, EventKind::Retry {
+    ///     kind: "timeout".into(), attempt: 1, delay_ms: 250,
+    /// }))?;
+    /// store.put_event(&RunEvent::new(run_id, 2, EventKind::Retry {
+    ///     kind: "timeout".into(), attempt: 2, delay_ms: 500,
+    /// }))?;
+    ///
+    /// // Exclusive: the event at the cursor is not repeated.
+    /// let after = store.events_since(run_id, first, 10)?;
+    /// assert_eq!(after.len(), 1);
+    /// assert_eq!(after[0].1.step, 2);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn events_since(
+        &self,
+        run_id: i64,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, crate::observe::RunEvent)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, json FROM run_events INDEXED BY run_events_run
+             WHERE run_id = ?1 AND id > ?2
+             ORDER BY id ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![run_id, cursor, limit as i64], event_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every event after `cursor` from anywhere in the tree rooted at `root`,
+    /// oldest first, at most `limit` of them (0.33.0).
+    ///
+    /// The tree's whole stream in one read, interleaved the way the runs produced
+    /// it, because `id` is globally monotonic. `RunEvent::depth` and
+    /// `RunEvent::run_id` say which agent each one came from.
+    ///
+    /// `CROSS JOIN ... INDEXED BY` for the reason [`Self::queued_agents`]
+    /// records: a recursive CTE is a co-routine SQLite cannot seek into, so left
+    /// to itself the planner scans `run_events` — every tree's events, not this
+    /// one's — and probes the CTE instead. That is right for a file holding one
+    /// tree and wrong for one holding a hundred, and no amount of `ANALYZE` on a
+    /// single-tree fixture can tell it which it has. This read is on an
+    /// attached observer's poll loop, so it is the one place in the crate where
+    /// that difference is paid repeatedly.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, RunEvent, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let root = store.start_run("fan out", "/tmp/ws")?;
+    /// let child = store.start_child_run("a sub-task", "/tmp/ws", root, 1)?;
+    ///
+    /// store.put_event(&RunEvent::new(root, 1, EventKind::Spawned {
+    ///     child_run_id: child, goal: "a sub-task".into(),
+    /// }))?;
+    /// store.put_event(&RunEvent::at_depth(child, 1, 1, EventKind::Stalled))?;
+    ///
+    /// // The child's event is in the root's stream, in the order it happened.
+    /// let stream = store.tree_events_since(root, 0, 100)?;
+    /// assert_eq!(stream.len(), 2);
+    /// assert_eq!(stream[1].1.run_id, child);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn tree_events_since(
+        &self,
+        root: i64,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, crate::observe::RunEvent)>> {
+        let mut stmt = self.conn.prepare(
+            "WITH RECURSIVE tree(id) AS (
+                 SELECT id FROM runs WHERE id = ?1
+                 UNION ALL
+                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+             )
+             SELECT e.id, e.json
+             FROM tree CROSS JOIN run_events e INDEXED BY run_events_run
+                 ON e.run_id = tree.id
+             WHERE e.id > ?2
+             ORDER BY e.id ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![root, cursor, limit as i64], event_row)?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every approval on `run_id` that nobody has decided yet, oldest first
+    /// (0.33.0).
+    ///
+    /// What [`Attach::waiting`](crate::Attach::waiting) reads to report a live run
+    /// parked on an approval. Filtered on `resolved IS NULL` rather than on the
+    /// row merely existing, and that is load-bearing since 0.33.0: the row is now
+    /// written *before* the in-process approver is consulted, so a row exists for
+    /// approvals that were answered instantly and "a row is here" no longer means
+    /// "the run is waiting".
+    ///
+    /// ```
+    /// use io_harness::{Decision, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let id = store.put_pending(run_id, 2, "write", "deploy/prod.yaml", None)?;
+    /// assert_eq!(store.unresolved_approvals(run_id)?.len(), 1);
+    ///
+    /// assert!(store.resolve_pending(id, "approve")?);
+    /// assert!(store.unresolved_approvals(run_id)?.is_empty());
+    /// # let _ = Decision::approve();
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn unresolved_approvals(&self, run_id: i64) -> Result<Vec<Pending>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, run_id, step, act, target, content, resolved
+             FROM pending_approvals WHERE run_id = ?1 AND resolved IS NULL
+             ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], |r| {
+            Ok(Pending {
+                id: r.get(0)?,
+                run_id: r.get(1)?,
+                step: r.get::<_, i64>(2)? as u32,
+                act: r.get(3)?,
+                target: r.get(4)?,
+                content: r.get(5)?,
+                resolved: r.get(6)?,
+            })
         })?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -4619,33 +4958,55 @@ impl Store {
         }
     }
 
-    /// Record an answer and mark the question resolved.
+    /// Record an answer and mark the question resolved. Returns whether *this*
+    /// call is the one that answered it.
     ///
-    /// `by` is `"responder"` or `"human"`. Answering an already-answered question is
-    /// an [`Error::Resume`] rather than a silent second write, the way
-    /// [`Self::resolve_pending`] refuses a second decision: two answers to one
-    /// question means one of them was never acted on, and a caller should hear which.
-    pub fn answer_question(&self, question_id: i64, answer: &str, by: &str) -> Result<()> {
-        let existing = self.question(question_id)?;
-        match existing {
-            None => {
-                return Err(Error::Resume {
-                    reason: format!("no question {question_id} to answer"),
-                })
-            }
-            Some(q) if q.resolved => {
-                return Err(Error::Resume {
-                    reason: format!("question {question_id} was already answered"),
-                })
-            }
-            Some(_) => {}
-        }
-        self.conn.execute(
+    /// `by` is `"responder"`, `"human"` or — since 0.33.0 — `"attached"`.
+    ///
+    /// Until 0.33.0 this read the row and then wrote it, and returned an
+    /// [`Error::Resume`] if it was already answered. That check was correct within
+    /// one process and not atomic across two, which stopped being a theoretical
+    /// gap the moment [`Attach::answer_question`](crate::Attach::answer_question)
+    /// let a second process answer a live run: both writers could pass the read
+    /// and both writes could land, and the run would act on whichever arrived
+    /// second with nothing recording that the first had ever been given. It is now
+    /// a single conditional `UPDATE`, and an already-answered question is
+    /// `Ok(false)` — a fact about the race rather than an error. A question that
+    /// does not exist is still an error, because that is a caller's bug rather
+    /// than a lost race.
+    ///
+    /// ```
+    /// use io_harness::{Question, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let store = Store::memory()?;
+    /// let run_id = store.start_run("port it", "openrouter")?;
+    /// let id = store.put_question(run_id, 2, &Question::new("which database?"))?;
+    ///
+    /// assert!(store.answer_question(id, "postgres", "human")?);
+    /// // Second writer. The first answer is what the run acted on, and it stands.
+    /// assert!(!store.answer_question(id, "sqlite", "attached")?);
+    /// assert_eq!(store.question(id)?.unwrap().answer.as_deref(), Some("postgres"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn answer_question(&self, question_id: i64, answer: &str, by: &str) -> Result<bool> {
+        let changed = self.conn.execute(
             "UPDATE pending_questions SET answer = ?2, answered_by = ?3, resolved = 1
-             WHERE id = ?1",
+             WHERE id = ?1 AND resolved = 0",
             rusqlite::params![question_id, answer, by],
         )?;
-        Ok(())
+        if changed == 1 {
+            return Ok(true);
+        }
+        // Nothing moved. Either it was already answered — a lost race — or there is
+        // no such question, which is a bug in the caller and stays an error.
+        match self.question(question_id)? {
+            None => Err(Error::Resume {
+                reason: format!("no question {question_id} to answer"),
+            }),
+            Some(_) => Ok(false),
+        }
     }
 
     /// Every question asked on a run, in the order they were asked.
@@ -4779,30 +5140,28 @@ impl Store {
         plan_id: i64,
         verdict: &crate::approve::PlanVerdict,
         by: &str,
-    ) -> Result<()> {
-        match self.plan(plan_id)? {
-            None => {
-                return Err(Error::Resume {
-                    reason: format!("no plan {plan_id} to decide"),
-                })
-            }
-            Some(p) if p.resolved => {
-                return Err(Error::Resume {
-                    reason: format!("plan {plan_id} was already decided"),
-                })
-            }
-            Some(_) => {}
-        }
+    ) -> Result<bool> {
         let correction = match verdict {
             crate::approve::PlanVerdict::Revise { correction } => Some(correction.as_str()),
             _ => None,
         };
-        self.conn.execute(
+        let changed = self.conn.execute(
             "UPDATE plans SET verdict = ?2, correction = ?3, decided_by = ?4, resolved = 1
-             WHERE id = ?1",
+             WHERE id = ?1 AND resolved = 0",
             rusqlite::params![plan_id, verdict.as_str(), correction, by],
         )?;
-        Ok(())
+        if changed == 1 {
+            return Ok(true);
+        }
+        // Nothing moved: already decided — a lost race — or no such plan, which is
+        // a caller's bug and stays an error. See [`Self::answer_question`] for why
+        // the read-then-write this replaced could not survive two processes.
+        match self.plan(plan_id)? {
+            None => Err(Error::Resume {
+                reason: format!("no plan {plan_id} to decide"),
+            }),
+            Some(_) => Ok(false),
+        }
     }
 
     /// Every plan proposed on a run, in the order they were proposed.

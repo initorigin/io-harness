@@ -344,6 +344,7 @@
 
 pub mod agent;
 pub mod approve;
+pub mod attach;
 pub mod config;
 pub mod containment;
 pub mod context;
@@ -385,7 +386,8 @@ pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // `with_timeout` should be able to name the value they are overriding without
 // reaching into a provider's namespace to find it.
 pub use net::REQUEST_TIMEOUT;
-pub use observe::{EventKind, Flow, Ignore, Observer, RunEvent};
+pub use attach::{Attach, Waiting, POLL_LIMIT};
+pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, RunEvent};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, ModelInfo, OpenAi,

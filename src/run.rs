@@ -2648,6 +2648,48 @@ impl<'a> Watch<'a> {
     }
 }
 
+/// How often a run parked on a gate looks to see whether a second process
+/// answered for it (0.33.0).
+///
+/// The one number that decides how quickly an
+/// [`Attach`](crate::Attach)-supplied answer reaches a live run. It is the
+/// latency of a person's decision, not of a step, so a fifth of a second is far
+/// below anything anyone notices while costing one indexed read per interval —
+/// and only while a run is actually parked, because the poll never fires when
+/// the in-process gate answers.
+pub const ATTACH_POLL: Duration = Duration::from_millis(200);
+
+/// Await the in-process gate and the durable row together, and take whichever
+/// answers first (0.33.0).
+///
+/// `Some(v)` is the gate's own answer; `None` means a second process wrote the
+/// durable row while this run was waiting, and the caller must read it back —
+/// `None` deliberately carries no value, so a caller cannot report an attached
+/// answer it has not read from the store.
+///
+/// `biased;` so the gate is polled first on every pass. An
+/// [`ApproveAll`](crate::ApproveAll) or a [`DenyAll`](crate::DenyAll) answers
+/// before the first timer is ever created, which is what keeps an unattended run
+/// paying nothing for a feature it is not using.
+async fn race_gate<T, F, P>(gate: F, store: &Store, answered: P) -> Result<Option<T>>
+where
+    F: Future<Output = T> + Unpin,
+    P: Fn(&Store) -> Result<bool>,
+{
+    let mut gate = gate;
+    loop {
+        tokio::select! {
+            biased;
+            v = &mut gate => return Ok(Some(v)),
+            _ = tokio::time::sleep(ATTACH_POLL) => {
+                if answered(store)? {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 /// Announce a refusal, reading the event straight off the row that records it.
 ///
 /// Every `Refused` in the crate goes through here, and takes the `PolicyEvent`
@@ -5373,37 +5415,57 @@ async fn authorize_provider<P: Provider>(
             target: target.clone(),
         },
     ));
-    match approver.decide(&Request::new(Act::Net, &target)).await {
-        Decision::Approve { .. } => {
-            let ev = PolicyEvent::decision(0, "net", &target, "approve", "approver");
-            store.record_event(run_id, &ev)?;
-            decided(watch, run_id, 0, &ev);
-            Ok(ProviderAccess::Granted(effective))
-        }
-        Decision::Deny { reason } => {
-            let ev = PolicyEvent::decision(0, "net", &target, "deny", "approver");
-            store.record_event(run_id, &ev)?;
-            decided(watch, run_id, 0, &ev);
-            // Step 0: the run never started, so it finished having taken no steps.
-            finish(store, watch, run_id, 0, 0, "refused")?;
-            Err(crate::error::Error::Refused {
-                act: "net".into(),
-                target: format!("{target} — {reason}"),
-                // The approver denied it, so the refusal is the human's, not a
-                // rule's: there is no rule to name.
-                rule: None,
-                layer: None,
-            })
-        }
-        Decision::Defer => {
-            let ev = PolicyEvent::decision(0, "net", &target, "defer", "approver");
-            store.record_event(run_id, &ev)?;
-            decided(watch, run_id, 0, &ev);
-            let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
-            finish(store, watch, run_id, 0, 0, "awaiting_approval")?;
-            Ok(ProviderAccess::Pending(request_id))
-        }
+    // 0.33.0 — durable before the gate, so a run parked here before its first step
+    // is answerable by a second process rather than only by killing it. See
+    // `gate_path` for the same ordering and the same reason.
+    let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
+    let request = Request::new(Act::Net, &target);
+    let raced = race_gate(approver.decide(&request), store, |s| {
+        Ok(s.pending(request_id)?
+            .is_some_and(|p| p.resolved.is_some()))
+    })
+    .await?;
+
+    if matches!(raced, Some(Decision::Defer)) {
+        let ev = PolicyEvent::decision(0, "net", &target, "defer", "approver");
+        store.record_event(run_id, &ev)?;
+        decided(watch, run_id, 0, &ev);
+        finish(store, watch, run_id, 0, 0, "awaiting_approval")?;
+        return Ok(ProviderAccess::Pending(request_id));
     }
+
+    let reason = match &raced {
+        Some(Decision::Deny { reason }) => reason.clone(),
+        _ => "answered by an attached process".to_string(),
+    };
+    let mine = match &raced {
+        Some(Decision::Approve { .. }) => store.resolve_pending(request_id, "approve")?,
+        Some(Decision::Deny { .. }) => store.resolve_pending(request_id, "deny")?,
+        _ => false,
+    };
+    // The row decides, not the value we raced with. Read back in both arms.
+    let landed = store
+        .pending(request_id)?
+        .and_then(|p| p.resolved)
+        .unwrap_or_else(|| "deny".to_string());
+    let source = if mine { "approver" } else { "attached" };
+
+    let ev = PolicyEvent::decision(0, "net", &target, &landed, source);
+    store.record_event(run_id, &ev)?;
+    decided(watch, run_id, 0, &ev);
+    if landed == "approve" {
+        return Ok(ProviderAccess::Granted(effective));
+    }
+    // Step 0: the run never started, so it finished having taken no steps.
+    finish(store, watch, run_id, 0, 0, "refused")?;
+    Err(crate::error::Error::Refused {
+        act: "net".into(),
+        target: format!("{target} — {reason}"),
+        // A human denied it, so the refusal is theirs, not a rule's: there is no
+        // rule to name.
+        rule: None,
+        layer: None,
+    })
 }
 
 /// The responder a contract carries, or one that answers nothing.
@@ -5999,21 +6061,35 @@ async fn dispatch(
                 &ContextEvent::question_asked(step, question.question.clone()),
             )?;
 
-            // Only the in-process responder is consulted here. A human's answer does
-            // NOT arrive through this path: the step that asks is committed before the
-            // run pauses, so a resume starts at the step *after* it and this call is
-            // never replayed. `resume_with_answer` therefore delivers the answer as an
-            // observation instead, the way a steer is delivered.
-            let answered = match responder.answer(&question).await {
-                Some(answer) => {
-                    // Recorded even though nothing paused: "the machine decided" is a
-                    // fact about the run worth keeping.
-                    let id = store.put_question(run_id, step, &question)?;
-                    store.answer_question(id, &answer, "responder")?;
-                    Some((answer, "responder".to_string()))
-                }
-                None => None,
-            };
+            // 0.33.0 — persisted BEFORE the responder is consulted, so a run
+            // blocked in a `Responder` that nobody is sitting in front of can be
+            // answered by a second process instead of killed.
+            //
+            // A resume still delivers its answer as an observation rather than
+            // through here: the step that asks is committed before the run pauses,
+            // so a resume starts at the step *after* it and this call is never
+            // replayed. That is unchanged. What is new is the run that never
+            // paused, because it is still sitting in `answer`.
+            let question_id = store.put_question(run_id, step, &question)?;
+            let raced = race_gate(responder.answer(&question), store, |s| {
+                Ok(s.question(question_id)?.is_some_and(|q| q.resolved))
+            })
+            .await?;
+            // The responder's answer is written through the same compare-and-swap
+            // an attached one uses. "The machine decided" is a fact about the run
+            // worth keeping even when nothing paused.
+            if let Some(Some(answer)) = &raced {
+                store.answer_question(question_id, answer, "responder")?;
+            }
+            // Read the row back rather than using what we raced with: the answer
+            // the model is handed must be the one the store holds, in both arms,
+            // or an audit of `pending_questions` cannot be trusted to say what the
+            // run acted on. `answered_by` comes from the row too, so it names
+            // whoever actually won.
+            let answered = store
+                .question(question_id)?
+                .filter(|q| q.resolved)
+                .and_then(|q| Some((q.answer?, q.answered_by.unwrap_or_default())));
 
             match answered {
                 Some((answer, by)) => {
@@ -6045,9 +6121,10 @@ async fn dispatch(
                     )
                 }
                 None => {
-                    // Nobody here can answer. Persist it and pause: a run that had to
-                    // guess would spend its budget pursuing something nobody asked for.
-                    let question_id = store.put_question(run_id, step, &question)?;
+                    // Nobody answered — not the in-process responder, and nobody
+                    // attached while it was being asked. Pause on the row already
+                    // written: a run that had to guess would spend its budget
+                    // pursuing something nobody asked for.
                     info!(run_id, step, question_id, "run paused for an answer");
                     Dispatched::Ask { question_id }
                 }
@@ -6101,9 +6178,27 @@ async fn dispatch(
             // that proposes is committed before the run pauses, so a resume starts
             // after it and this call is never replayed.
             // `resume_with_plan_decision` delivers the verdict as an observation.
-            let verdict = gate.review(&proposed).await;
-            if let Some(v) = &verdict {
+            // 0.33.0 — the row was already written first, so this only had to gain
+            // the race: a run held in a `PlanGate` nobody is watching is now
+            // answerable by a second process, the third of the three things a live
+            // run can be holding.
+            let raced = race_gate(gate.review(&proposed), store, |s| {
+                Ok(s.plan(plan_id)?.is_some_and(|p| p.resolved))
+            })
+            .await?;
+            if let Some(Some(v)) = &raced {
                 store.decide_plan(plan_id, v, "gate")?;
+            }
+            // The verdict the run acts on is the row's, in both arms — including
+            // `decided_by`, so the event names whoever actually won rather than
+            // assuming it was the gate.
+            let decided_row = store.plan(plan_id)?.filter(|p| p.resolved);
+            let by = decided_row
+                .as_ref()
+                .and_then(|p| p.decided_by.clone())
+                .unwrap_or_default();
+            let verdict = decided_row.and_then(|p| p.verdict);
+            if let Some(v) = &verdict {
                 watch.emit(RunEvent::at_depth(
                     run_id,
                     step,
@@ -6111,12 +6206,12 @@ async fn dispatch(
                     EventKind::PlanDecided {
                         plan_id,
                         verdict: v.as_str().to_string(),
-                        by: "gate".to_string(),
+                        by: by.clone(),
                     },
                 ));
                 store.record_context_event(
                     run_id,
-                    &ContextEvent::plan_decided(step, format!("gate: {}", v.as_str())),
+                    &ContextEvent::plan_decided(step, format!("{by}: {}", v.as_str())),
                 )?;
             }
             info!(
@@ -8044,56 +8139,97 @@ async fn gate(
                     target: target.to_string(),
                 },
             ));
-            match approver.decide(&request).await {
-                Decision::Approve { modified, remember } => {
-                    let performed = modified.unwrap_or_else(|| request.clone());
-                    // The rewritten action gets the same scrutiny as the original.
-                    let recheck = check(act, &performed.target);
-                    if recheck.effect == Effect::Deny {
-                        let mut ev = PolicyEvent::refusal(step, &kind, &performed.target);
-                        ev.rule = recheck.rule.clone();
-                        ev.layer = recheck.layer.clone();
-                        store.record_event(run_id, &ev)?;
-                        // A refusal, not a decision: the row is a refusal too, and
-                        // the approval it overrode never took effect.
-                        refused(watch, run_id, depth, &ev);
-                        return Ok(Gated::Refused {
-                            decision: format!("{kind} refused after approval"),
-                            obs: format!(
-                                "\n[{kind} refused] {} — an approved change may not cross a deny\n",
-                                performed.target
-                            ),
-                        });
-                    }
-                    let mut ev = PolicyEvent::decision(step, &kind, target, "approve", "approver");
-                    if performed.target != target {
-                        ev = ev.with_performed(&performed.target);
-                    }
-                    store.record_event(run_id, &ev)?;
-                    decided(watch, run_id, depth, &ev);
-                    Ok(Gated::Go {
-                        target: performed.target,
-                        content: performed.content,
-                        remember,
-                    })
-                }
-                Decision::Deny { reason } => {
-                    let ev = PolicyEvent::decision(step, &kind, target, "deny", "approver");
-                    store.record_event(run_id, &ev)?;
-                    decided(watch, run_id, depth, &ev);
-                    Ok(Gated::Refused {
-                        decision: format!("{kind} denied"),
-                        obs: format!("\n[{kind} denied] {target} — {reason}\n"),
-                    })
-                }
-                Decision::Defer => {
-                    let ev = PolicyEvent::decision(step, &kind, target, "defer", "approver");
-                    store.record_event(run_id, &ev)?;
-                    decided(watch, run_id, depth, &ev);
-                    let request_id = store.put_pending(run_id, step, &kind, target, content)?;
-                    Ok(Gated::Paused { request_id })
-                }
+            // 0.33.0 — the row is durable BEFORE the gate is consulted, the
+            // ordering `put_plan` has had since 0.31.0. A row that only appears
+            // once the approver has deferred is a row no second process can answer
+            // while the run is still holding the question, which is exactly the
+            // gap this release closes.
+            let request_id = store.put_pending(run_id, step, &kind, target, content)?;
+            let raced = race_gate(approver.decide(&request), store, |s| {
+                Ok(s.pending(request_id)?
+                    .is_some_and(|p| p.resolved.is_some()))
+            })
+            .await?;
+
+            // Deferring is the one answer that writes nothing: it leaves the row
+            // unresolved so the run pauses with something a resume — or an
+            // attached process — can still answer.
+            if matches!(raced, Some(Decision::Defer)) {
+                let ev = PolicyEvent::decision(step, &kind, target, "defer", "approver");
+                store.record_event(run_id, &ev)?;
+                decided(watch, run_id, depth, &ev);
+                return Ok(Gated::Paused { request_id });
             }
+
+            // The gate's answer goes through the same compare-and-swap an attached
+            // process uses, so the store arbitrates instead of the last writer.
+            let mine = match &raced {
+                Some(Decision::Approve { .. }) => store.resolve_pending(request_id, "approve")?,
+                Some(Decision::Deny { .. }) => store.resolve_pending(request_id, "deny")?,
+                // The attached arm: the row was written by whoever raced us.
+                _ => false,
+            };
+            let (modified, remember, reason) = match raced {
+                Some(Decision::Approve { modified, remember }) => {
+                    (modified, remember, String::new())
+                }
+                Some(Decision::Deny { reason }) => (None, Vec::new(), reason),
+                _ => (None, Vec::new(), "answered by an attached process".to_string()),
+            };
+
+            // The row is the authority, in BOTH arms. A decision reported from the
+            // value we raced with rather than from the store would be true whether
+            // or not the durable write landed — and would still be reported if a
+            // second process had won the swap a microsecond earlier, which is the
+            // silent double-answer this release exists to prevent. `mine` is the
+            // store's own answer to "was it me", so the source is a fact rather
+            // than an assumption.
+            let landed = store
+                .pending(request_id)?
+                .and_then(|p| p.resolved)
+                .unwrap_or_else(|| "deny".to_string());
+            let source = if mine { "approver" } else { "attached" };
+
+            if landed != "approve" {
+                let ev = PolicyEvent::decision(step, &kind, target, &landed, source);
+                store.record_event(run_id, &ev)?;
+                decided(watch, run_id, depth, &ev);
+                return Ok(Gated::Refused {
+                    decision: format!("{kind} denied"),
+                    obs: format!("\n[{kind} denied] {target} — {reason}\n"),
+                });
+            }
+
+            let performed = modified.unwrap_or_else(|| request.clone());
+            // The rewritten action gets the same scrutiny as the original.
+            let recheck = check(act, &performed.target);
+            if recheck.effect == Effect::Deny {
+                let mut ev = PolicyEvent::refusal(step, &kind, &performed.target);
+                ev.rule = recheck.rule.clone();
+                ev.layer = recheck.layer.clone();
+                store.record_event(run_id, &ev)?;
+                // A refusal, not a decision: the row is a refusal too, and the
+                // approval it overrode never took effect.
+                refused(watch, run_id, depth, &ev);
+                return Ok(Gated::Refused {
+                    decision: format!("{kind} refused after approval"),
+                    obs: format!(
+                        "\n[{kind} refused] {} — an approved change may not cross a deny\n",
+                        performed.target
+                    ),
+                });
+            }
+            let mut ev = PolicyEvent::decision(step, &kind, target, "approve", source);
+            if performed.target != target {
+                ev = ev.with_performed(&performed.target);
+            }
+            store.record_event(run_id, &ev)?;
+            decided(watch, run_id, depth, &ev);
+            Ok(Gated::Go {
+                target: performed.target,
+                content: performed.content,
+                remember,
+            })
         }
     }
 }
