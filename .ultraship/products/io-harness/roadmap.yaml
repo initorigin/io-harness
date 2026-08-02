@@ -849,7 +849,7 @@ versions:
       The run's own durable state stays the authority — an attaching process reads and decides, it
       does not take ownership — so the failure modes are bounded: the observer dying changes
       nothing, and the owner dying leaves exactly the resumable run it always did.
-    detail: hypothesis
+    detail: specified
     status: planned
   - version: 0.34.0
     outcome: >
