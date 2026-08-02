@@ -143,6 +143,7 @@ use crate::state::{PolicyEvent, SandboxEvent, Store};
 /// # Ok(()) }
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Verification {
     /// The file's contents must contain this text. Cheap, but gameable — a
     /// model can satisfy it without producing working code.
@@ -290,6 +291,327 @@ pub enum Verification {
     /// Hardened in 0.8.1: each file goes through the same probe-backed compile,
     /// so no listed file can pass by deleting its own contents.
     EachCompilesRust(Vec<PathBuf>),
+    /// (workspace/multi-file, 0.34.0) A **second model** reads what the run wrote
+    /// and decides whether it satisfies `rubric`.
+    ///
+    /// The first criterion in this crate whose check is a judgement rather than
+    /// an exit status or a substring. Every other variant is a fact: the command
+    /// exited 0, the file holds the text, the crate compiled. That is the right
+    /// default and it cannot catch the change that compiles, passes the suite and
+    /// is still the wrong change — which is the failure mode of an agent
+    /// optimising against a gate rather than against the goal.
+    ///
+    /// It is resolved by the run loop, not by [`Verification::passes_in`]: a
+    /// review needs a provider, and `passes_in` has none. The run reads
+    /// [`TaskContract::reviewer`](crate::TaskContract) and calls it; a contract
+    /// carrying this criterion with no reviewer registered fails with
+    /// [`Error::Config`](crate::Error::Config) at run start rather than at the
+    /// gate, so the mistake costs nothing.
+    ///
+    /// ```
+    /// use io_harness::{TaskContract, Verification};
+    ///
+    /// let contract = TaskContract::workspace("tidy the parser", "/repo")
+    ///     .with_verification(Verification::Review {
+    ///         rubric: "every public item changed still has a doc comment".into(),
+    ///         allow_self_review: false,
+    ///     });
+    /// # let _ = contract;
+    /// ```
+    ///
+    /// `allow_self_review` is `false` in every sensible case. With it false, a
+    /// [`ModelReviewer`] whose model is the model that produced the change is
+    /// refused **before a request is built** — a model grading its own answer
+    /// reports what the run already believes. It is a field rather than an
+    /// unconditional rule so the exception is visible in the caller's own code:
+    /// a smoke test against one scripted provider is the honest use for `true`.
+    Review {
+        /// What the reviewing model is asked to decide, in the caller's words.
+        rubric: String,
+        /// Permit the reviewing model to be the model that wrote the change.
+        allow_self_review: bool,
+    },
+}
+
+/// What a [`Reviewer`] is handed: the goal, the rubric, and what the run wrote.
+///
+/// Deliberately **not** the run's conversation. A reviewer reading the author's
+/// own reasoning is a reviewer being led, and the point of the criterion is a
+/// judgement formed from the work rather than from the argument for it. The cost
+/// is stated in `docs/CONTRACT.md`: a change whose justification lived only in
+/// the transcript is judged without it.
+///
+/// ```
+/// use io_harness::ReviewRequest;
+///
+/// let request = ReviewRequest {
+///     goal: "add a parser for the config file".into(),
+///     rubric: "errors carry the line number".into(),
+///     files: vec![("src/parse.rs".into(), "pub fn parse() {}".into())],
+/// };
+/// assert_eq!(request.files.len(), 1);
+/// ```
+#[derive(Debug, Clone)]
+pub struct ReviewRequest {
+    /// The contract's goal, so the reviewer knows what was asked for.
+    pub goal: String,
+    /// The criterion's rubric, verbatim.
+    pub rubric: String,
+    /// Every file the run wrote, relative to the workspace root, with its
+    /// current contents.
+    pub files: Vec<(PathBuf, String)>,
+}
+
+/// One reviewer's verdict, with the reasons it gave for it.
+///
+/// `reasons` is not decoration: a refusal a human cannot argue with is a gate
+/// nobody will trust twice, and the reasons are what reach the trace and the
+/// [`Observer`](crate::Observer) through
+/// [`EventKind::Reviewed`](crate::EventKind).
+///
+/// ```
+/// use io_harness::Review;
+///
+/// let verdict = Review::failed(["`parse` returns `()` on a malformed line"]);
+/// assert!(!verdict.passed);
+/// assert_eq!(verdict.reasons.len(), 1);
+/// assert!(Review::passed().reasons.is_empty());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Review {
+    /// Whether the work satisfies the rubric.
+    pub passed: bool,
+    /// Why, in the reviewer's own words. Empty is permitted for a pass and is
+    /// the reason a fail should never be.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+impl Review {
+    /// A pass with nothing further to say.
+    #[must_use]
+    pub fn passed() -> Self {
+        Self {
+            passed: true,
+            reasons: Vec::new(),
+        }
+    }
+
+    /// A refusal, with the reasons for it.
+    #[must_use]
+    pub fn failed<I, S>(reasons: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            passed: false,
+            reasons: reasons.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+/// The future a [`Reviewer`] returns.
+///
+/// Boxed for the same reason [`PlanReview`](crate::PlanReview) is: a reviewer is
+/// held behind a `dyn` on the contract, and a trait returning `impl Future` is
+/// not dyn-compatible. [`Provider`](crate::Provider) can afford RPITIT because it
+/// is always a generic parameter; a reviewer is a field.
+///
+/// ```
+/// use io_harness::{Review, ReviewRequest, Reviewer, Reviewing};
+///
+/// #[derive(Debug)]
+/// struct Human;
+///
+/// impl Reviewer for Human {
+///     // The return type is this alias, which is what makes `dyn Reviewer` work.
+///     fn review<'a>(&'a self, _request: ReviewRequest) -> Reviewing<'a> {
+///         Box::pin(async { Ok(Review::failed(["I would like a test for it"])) })
+///     }
+///     fn model(&self) -> Option<&str> { None }
+/// }
+/// # let _ = Human;
+/// ```
+pub type Reviewing<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Review>> + Send + 'a>>;
+
+/// Who answers a [`Verification::Review`] criterion.
+///
+/// A trait rather than a concrete type so the reviewer can be a second model
+/// ([`ModelReviewer`]), a human at a terminal, a second harness, or a stub in a
+/// test — without this crate growing a second provider abstraction to describe
+/// any of them.
+///
+/// ```
+/// use io_harness::{Review, ReviewRequest, Reviewer, Reviewing};
+///
+/// /// The reviewer a test uses: it says yes, and says so out loud.
+/// #[derive(Debug)]
+/// struct AlwaysPasses;
+///
+/// impl Reviewer for AlwaysPasses {
+///     fn review<'a>(&'a self, _request: ReviewRequest) -> Reviewing<'a> {
+///         Box::pin(async { Ok(Review::passed()) })
+///     }
+///     fn model(&self) -> Option<&str> { None }
+/// }
+///
+/// let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+/// let request = ReviewRequest { goal: "g".into(), rubric: "r".into(), files: vec![] };
+/// assert!(rt.block_on(AlwaysPasses.review(request)).unwrap().passed);
+/// ```
+pub trait Reviewer: Send + Sync + std::fmt::Debug {
+    /// Judge the work against the rubric.
+    ///
+    /// An `Err` here is a review that did not *happen* — a transport failure, a
+    /// verdict that could not be parsed — and is recorded as
+    /// [`GateOutcome::Errored`](crate::GateOutcome), which
+    /// [`retry_gate`](crate::retry_gate) can retry. A review that happened and
+    /// said no is `Ok(Review { passed: false, .. })` and is not retryable,
+    /// because nothing about the work has changed.
+    fn review<'a>(&'a self, request: ReviewRequest) -> Reviewing<'a>;
+
+    /// The model this reviewer will ask, when it is a model at all.
+    ///
+    /// `None` means the question does not apply — a human, a stub, a second
+    /// harness — and the self-review refusal has nothing to compare, so it does
+    /// not fire. A [`ModelReviewer`] returns the model it was built with, which
+    /// is what makes the refusal possible before a request is built.
+    fn model(&self) -> Option<&str>;
+}
+
+/// A [`Reviewer`] that asks a model.
+///
+/// It holds its **own** provider and its own model name, which is the whole
+/// design: reusing the run's provider is the cheapest implementation available
+/// and it is exactly the mistake the criterion exists to prevent.
+///
+/// ```
+/// # use io_harness::{ModelReviewer, Reviewer};
+/// # fn demo<P: io_harness::Provider + std::fmt::Debug + Send + Sync>(provider: P) {
+/// let reviewer = ModelReviewer::new(provider, "a-different-model");
+/// assert_eq!(reviewer.model(), Some("a-different-model"));
+/// # }
+/// ```
+#[derive(Debug)]
+pub struct ModelReviewer<P> {
+    provider: P,
+    model: String,
+}
+
+impl<P> ModelReviewer<P> {
+    /// Review with `provider`, asking for `model`.
+    pub fn new(provider: P, model: impl Into<String>) -> Self {
+        Self {
+            provider,
+            model: model.into(),
+        }
+    }
+}
+
+/// What the reviewing model is told it is doing, and the shape its answer must
+/// take.
+///
+/// The verdict is JSON because a bool has to be read out of it by a program. The
+/// parse is deliberately forgiving about *surroundings* — a model that wraps the
+/// object in prose or a fenced block is still answering — and unforgiving about
+/// the object itself: a response with no parsable verdict is an
+/// [`Error`](crate::Error), which makes the gate `Errored` rather than failing
+/// work that was never judged.
+const REVIEW_SYSTEM: &str = "\
+You are reviewing work another model produced. You did not write it.
+
+Decide one thing: does the work satisfy the rubric? Answer with a single JSON \
+object and nothing else:
+
+{\"passed\": true}
+{\"passed\": false, \"reasons\": [\"...\", \"...\"]}
+
+Give a reason for every refusal. Judge the work in front of you against the \
+rubric, not against what you would have written.";
+
+impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Reviewer for ModelReviewer<P> {
+    fn review<'a>(&'a self, request: ReviewRequest) -> Reviewing<'a> {
+        Box::pin(async move {
+            let mut user = format!(
+                "# Goal\n{}\n\n# Rubric\n{}\n\n# What the run wrote\n",
+                request.goal, request.rubric
+            );
+            if request.files.is_empty() {
+                user.push_str("(nothing was written)\n");
+            }
+            for (path, contents) in &request.files {
+                user.push_str(&format!(
+                    "\n## {}\n```\n{contents}\n```\n",
+                    path.to_string_lossy()
+                ));
+            }
+            let response = self
+                .provider
+                .complete(crate::provider::CompletionRequest {
+                    system: REVIEW_SYSTEM.to_string(),
+                    user,
+                    model: Some(self.model.clone()),
+                    ..Default::default()
+                })
+                .await?;
+            parse_verdict(response.text.as_deref().unwrap_or_default())
+        })
+    }
+
+    fn model(&self) -> Option<&str> {
+        Some(&self.model)
+    }
+}
+
+/// Read a verdict out of a model's answer.
+///
+/// Scans for the first balanced JSON object rather than requiring the whole
+/// response to be one: a model that says "Looks good to me. {...}" has answered,
+/// and refusing it would turn a judgement into a transport error. A response with
+/// no object at all, or one that does not carry `passed`, is an error — a verdict
+/// nobody can read is a review that did not happen.
+fn parse_verdict(text: &str) -> Result<Review> {
+    let bytes = text.as_bytes();
+    for (start, _) in text.char_indices().filter(|&(_, c)| c == '{') {
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        for end in start..bytes.len() {
+            let c = bytes[end] as char;
+            if in_string {
+                match c {
+                    _ if escaped => escaped = false,
+                    '\\' => escaped = true,
+                    '"' => in_string = false,
+                    _ => {}
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Ok(review) = serde_json::from_str::<Review>(&text[start..=end]) {
+                            return Ok(review);
+                        }
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Err(Error::provider(
+        crate::error::ProviderErrorKind::Malformed,
+        format!(
+            "the reviewing model returned no readable verdict: {}",
+            text.chars().take(200).collect::<String>()
+        ),
+    ))
 }
 
 /// What the verification layer is allowed to spawn, and where to record it.
@@ -688,6 +1010,16 @@ impl Verification {
             | Verification::WorkspaceFileContains { .. } => Err(Error::Config(
                 "multi-file verification requires a workspace root".into(),
             )),
+            // A review needs a provider and this function has none. It is
+            // resolved by the run loop, which holds the contract's reviewer —
+            // the same shape the multi-file variants use above, and for the same
+            // reason: a criterion this entry point cannot honestly evaluate says
+            // so rather than returning `false`.
+            Verification::Review { .. } => Err(Error::Config(
+                "a review criterion is resolved by the run loop, not by `passes`; \
+                 register a reviewer with `TaskContract::with_reviewer`"
+                    .into(),
+            )),
         }
     }
 
@@ -759,6 +1091,13 @@ impl Verification {
                 }
                 Ok(true)
             }
+            // A review needs a provider and this function has none. Resolved by
+            // the run loop, which holds the contract's reviewer.
+            Verification::Review { .. } => Err(Error::Config(
+                "a review criterion is resolved by the run loop, not by `passes_in`; \
+                 register a reviewer with `TaskContract::with_reviewer`"
+                    .into(),
+            )),
             // Single-file variants against a workspace need a target file, which
             // this method does not carry; use them in single-file mode.
             _ => Err(Error::Config(
@@ -797,6 +1136,14 @@ impl Verification {
             Verification::EachCompilesRust(files) => {
                 format!("each of these files must compile as Rust: {files:?}")
             }
+            // The rubric verbatim. A reviewing model reads the same words the
+            // working model was told it would be judged by, which is the only
+            // honest way to run this criterion: a hidden rubric grades work
+            // against a standard nobody could have aimed at.
+            Verification::Review { rubric, .. } => format!(
+                "a second model will read what you wrote and decide whether it \
+                 satisfies this rubric: {rubric:?}"
+            ),
         }
     }
 }

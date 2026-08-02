@@ -1,0 +1,43 @@
+product: io-harness
+version: 0.34.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      Every mechanism the release needs is already compiled in and already has a precedent in this
+      repository. A criterion that spends a provider call is new, but the provider abstraction, the
+      spend ledger that will carry its tokens, and the per-request `model` field routing sets are
+      all shipped surface. The recorded constraint that decides the assessment is the standing "no
+      new runtime dependency" limit — `cargo tree` reads 402 lines and a new dependency is a
+      criterion failure rather than a trade-off — and nothing here comes near it.
+    - >
+      The additive-table half is the shape this repository has executed five times since 0.28.0:
+      one table, one composite index, a query-plan test against the SQL `const` itself, the 0.22.0
+      schema guard fed the new names by hand, and `CHECKPOINT_FORMAT` unmoved. `gate_attempts` is
+      that shape again with different columns.
+    - >
+      The one genuinely new design question is small and already decided: `Verification` has no
+      provider and cannot grow one without a public signature change, so the review arm is resolved
+      by the run loop and the two `passes*` entry points refuse it the way they already refuse a
+      multi-file variant in single-file mode. That boundary is stated in the contract's cost
+      drivers rather than left to be discovered mid-release.
+  major_cost_drivers:
+    - >
+      `Verification` gains a variant *and* `#[non_exhaustive]` in one release. Both are the same
+      break for an external exhaustive match, so paying them together is right — but every internal
+      match on the enum has to grow an arm, and there are several across `verify.rs`, `run.rs` and
+      the test suite.
+    - >
+      Three negative controls have to be designed before the code: the always-true reviewer (F1),
+      the zero-request assertion that proves the self-review refusal precedes the wire (F2), and
+      the step-count-plus-ledger identity that proves `retry_gate` re-ran only the criterion (F4).
+      Trap 34 applies to F6 and F7 — each has two arms and each arm needs its own sabotage.
+    - >
+      The scripted test provider has to start recording `CompletionRequest.model` per call, because
+      every routing assertion is against the outbound request rather than against the event. That
+      is a change in shared test infrastructure, so it touches tests that have nothing to do with
+      this release.
+  recommended_scope_change: null

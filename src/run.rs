@@ -35,8 +35,8 @@ use crate::resilience::{Progress, Progressing};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
-    AgentEvent, ContextEvent, Kept, MemoryKind, RunStatus, Snapshot, StepRecord, Store, TodoItem,
-    TodoState, MAX_SNAPSHOT_BYTES,
+    AgentEvent, ContextEvent, GateOutcome, Kept, MemoryKind, RunStatus, Snapshot, StepRecord,
+    Store, TodoItem, TodoState, MAX_SNAPSHOT_BYTES,
 };
 use crate::toolchain::Toolchain;
 use crate::tools::exec::{Exec, ExecOutcome};
@@ -2478,6 +2478,428 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
 /// Record the resume marker and one skipped marker per already-committed step,
 /// so a multi-crash run's full history is reconstructable from the store alone.
 /// Returns the step to resume from (last committed + 1).
+/// Re-run a run's criterion, and nothing else (0.34.0).
+///
+/// The unit of retry is the gate rather than the run, because that is the unit
+/// the failure had. A run that spent an hour and forty model calls and then lost
+/// its review gate to a 529 has forty calls' worth of work sitting in the
+/// workspace, and every way this crate had of getting a verdict on it started by
+/// running the task again.
+///
+/// It re-evaluates [`TaskContract::verify`] against the workspace as it now
+/// stands and appends the result to the run's gate attempts. **No step is
+/// re-executed**, no tool is called, and the only provider call made is the one
+/// the criterion itself needs — so a run's `steps` rows and its token ledger are
+/// unchanged by a retry except for the review it asked for.
+///
+/// It refuses what it cannot honestly do. A gate that `Failed` was evaluated and
+/// said no: nothing about the work has changed, so running it again is a way of
+/// asking the same question until the answer is convenient. Only
+/// [`GateOutcome::Errored`](crate::GateOutcome) — a criterion that never ran — is
+/// retryable, and a run that never gated at all is refused too.
+///
+/// ```no_run
+/// use io_harness::{retry_gate, GateOutcome, Store, TaskContract};
+///
+/// # async fn demo(contract: &TaskContract, store: &Store, run_id: i64) -> io_harness::Result<()> {
+/// // The gate errored: the review never happened, so the work has not been judged.
+/// assert!(store.last_gate_attempt(run_id)?.unwrap().outcome.is_retryable());
+///
+/// // One criterion, re-run. The forty steps that produced the work are not.
+/// let passed = retry_gate(contract, store, run_id).await?;
+/// assert!(matches!(passed, GateOutcome::Passed | GateOutcome::Failed));
+/// # Ok(()) }
+/// ```
+pub async fn retry_gate(
+    contract: &TaskContract,
+    store: &Store,
+    run_id: i64,
+) -> Result<GateOutcome> {
+    retry_gate_observed(contract, store, run_id, &Ignore).await
+}
+
+/// [`retry_gate`], reporting what it does to `observer` (0.34.0).
+///
+/// The verdict reaches an [`Observer`] as
+/// [`EventKind::Reviewed`](crate::EventKind), so a retry is visible in the same
+/// stream the run was — including to a process attached with
+/// [`Attach`](crate::Attach), since 0.33.0's `Broadcast` carries whatever it is
+/// wrapped around.
+///
+/// ```no_run
+/// use io_harness::observe::{Flow, Observer, RunEvent};
+/// use io_harness::{retry_gate_observed, Store, TaskContract};
+///
+/// struct Print;
+/// impl Observer for Print {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         println!("{:?}", event.kind);
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, store: &Store, run_id: i64) -> io_harness::Result<()> {
+/// let outcome = retry_gate_observed(contract, store, run_id, &Print).await?;
+/// println!("the gate now says {}", outcome.as_str());
+/// # Ok(()) }
+/// ```
+pub async fn retry_gate_observed(
+    contract: &TaskContract,
+    store: &Store,
+    run_id: i64,
+    observer: &dyn Observer,
+) -> Result<GateOutcome> {
+    let root = contract.root.as_deref().ok_or_else(|| {
+        Error::Config("retry_gate needs a workspace contract; single-file runs have no root".into())
+    })?;
+    let last = store
+        .last_gate_attempt(run_id)?
+        .ok_or_else(|| Error::Resume {
+            reason: format!("run {run_id} has no gate attempt to retry"),
+        })?;
+    if !last.outcome.is_retryable() {
+        return Err(Error::Resume {
+            reason: format!(
+                "run {run_id}'s last gate attempt {} — the criterion ran and answered, so the work                  has to change before it can answer differently",
+                last.outcome.as_str()
+            ),
+        });
+    }
+
+    let watch = Watch::new(observer);
+    // The same evaluation the run itself does, at the same step, through the same
+    // function — so a retry cannot drift into a second, laxer implementation of
+    // the criterion. The guard is permissive-by-policy only in the sense every
+    // gate's is: a `Command` criterion still checks its program against the
+    // contract's policy through `ExecGuard`.
+    let policy = Policy::default();
+    let guard = crate::verify::ExecGuard::new(&policy).tracing(store, run_id, last.step);
+    match evaluate_gate(contract, root, &guard, store, run_id, last.step, &watch, 0).await {
+        Ok(true) => Ok(GateOutcome::Passed),
+        Ok(false) => Ok(GateOutcome::Failed),
+        // `evaluate_gate` has already recorded the `Errored` attempt; the error is
+        // handed back so a caller can decide whether to wait and ask again.
+        Err(e) => Err(e),
+    }
+}
+
+/// Everything 0.34.0 refuses before the first request is billed.
+///
+/// Three checks, all of them things a run can be certain of up front:
+///
+/// 1. A [`Verification::Review`] criterion with no reviewer registered. A gate
+///    that cannot run is found at run start rather than after the work.
+/// 2. The reviewing model being the model that produced the change. A model
+///    grading its own answer reports what the run already believes, so this is a
+///    refusal rather than a warning — and it happens here, before any request is
+///    built, which is what makes it observable as *zero* calls to the reviewing
+///    provider.
+/// 3. [`Routing::require_primary`](crate::Routing) against
+///    [`Provider::reachable`]. An unattended job that starts on a fallback nobody
+///    chose is the failure this exists to prevent.
+async fn preflight_review_and_routing<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+) -> Result<()> {
+    if let Verification::Review {
+        allow_self_review, ..
+    } = &contract.verify
+    {
+        let Some(reviewer) = contract.reviewer.as_ref() else {
+            return Err(Error::Config(
+                "a Verification::Review criterion needs a reviewer; register one with \
+                 TaskContract::with_reviewer"
+                    .into(),
+            ));
+        };
+        // The run's own model, as this contract asks for it. `None` means the
+        // provider's own default, which this crate cannot name — so it cannot
+        // compare it either, and says so in `docs/CONTRACT.md` rather than
+        // guessing.
+        let author = contract.routing.as_ref().and_then(|r| {
+            r.escalate_after
+                .as_ref()
+                .map(|(_, m)| m.as_str())
+                .or(r.downshift_under.as_ref().map(|(_, m)| m.as_str()))
+        });
+        if !allow_self_review {
+            if let (Some(reviewing), Some(writing)) = (reviewer.model(), author) {
+                if reviewing == writing {
+                    return Err(Error::Config(format!(
+                        "the reviewing model and the model under review are both {reviewing}; a \
+                         model grading its own work reports what the run already believes. Use a \
+                         different model, or set allow_self_review: true to say you meant it"
+                    )));
+                }
+            }
+            if let (Some(reviewing), Some(writing)) = (reviewer.model(), provider.model_hint()) {
+                if reviewing == writing {
+                    return Err(Error::Config(format!(
+                        "the reviewing model and the model under review are both {reviewing}; a \
+                         model grading its own work reports what the run already believes. Use a \
+                         different model, or set allow_self_review: true to say you meant it"
+                    )));
+                }
+            }
+        }
+    }
+
+    if contract.routing.as_ref().is_some_and(|r| r.require_primary) && !provider.reachable().await?
+    {
+        return Err(Error::Config(format!(
+            "{} reports it is not reachable and this contract requires the primary provider; \
+             refusing to start rather than running unattended on a fallback",
+            provider.name()
+        )));
+    }
+    Ok(())
+}
+
+/// Evaluate the contract's criterion once, and record what it decided (0.34.0).
+///
+/// The one place a gate outcome is produced, so `passed`, `failed` and — the
+/// distinction 0.34.0 exists to make — `errored` are written by the same code for
+/// every criterion and for every entry point. A gate that returns `Err` here has
+/// already recorded [`GateOutcome::Errored`](crate::GateOutcome), which is what
+/// makes [`retry_gate`] able to tell "the review never happened" from "the review
+/// said no".
+#[allow(clippy::too_many_arguments)]
+async fn evaluate_gate(
+    contract: &TaskContract,
+    root: &Path,
+    guard: &crate::verify::ExecGuard<'_>,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    watch: &Watch<'_>,
+    depth: u32,
+) -> Result<bool> {
+    let phase = gate_phase(&contract.verify);
+    match &contract.verify {
+        Verification::Review { rubric, .. } => {
+            // Absent reviewer is caught at run start, so reaching here without one
+            // is a bug in this crate rather than a caller's mistake — but it is
+            // still reported rather than treated as a failing gate, because a
+            // criterion that could not run has not judged anything.
+            let Some(reviewer) = contract.reviewer.as_ref() else {
+                let e = Error::Config(
+                    "a Verification::Review criterion needs a reviewer; register one with \
+                     TaskContract::with_reviewer"
+                        .into(),
+                );
+                store.put_gate_attempt(
+                    run_id,
+                    step,
+                    phase,
+                    GateOutcome::Errored,
+                    &e.to_string(),
+                )?;
+                return Err(e);
+            };
+            let request = crate::verify::ReviewRequest {
+                goal: contract.goal.clone(),
+                rubric: rubric.clone(),
+                files: written_files(store, run_id, root),
+            };
+            match reviewer.review(request).await {
+                Ok(review) => {
+                    watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::Reviewed {
+                            passed: review.passed,
+                            reasons: review.reasons.clone(),
+                        },
+                    ));
+                    let outcome = if review.passed {
+                        GateOutcome::Passed
+                    } else {
+                        GateOutcome::Failed
+                    };
+                    store.put_gate_attempt(
+                        run_id,
+                        step,
+                        phase,
+                        outcome,
+                        &review.reasons.join("; "),
+                    )?;
+                    Ok(review.passed)
+                }
+                // A review that did not happen. No `Reviewed` event, because
+                // nothing was reviewed — the event stream would otherwise report a
+                // verdict nobody gave.
+                Err(e) => {
+                    store.put_gate_attempt(
+                        run_id,
+                        step,
+                        phase,
+                        GateOutcome::Errored,
+                        &e.to_string(),
+                    )?;
+                    Err(e)
+                }
+            }
+        }
+        _ => match contract.verify.passes_in_guarded(root, guard).await {
+            Ok(passed) => {
+                let outcome = if passed {
+                    GateOutcome::Passed
+                } else {
+                    GateOutcome::Failed
+                };
+                store.put_gate_attempt(run_id, step, phase, outcome, "")?;
+                Ok(passed)
+            }
+            Err(e) => {
+                store.put_gate_attempt(
+                    run_id,
+                    step,
+                    phase,
+                    GateOutcome::Errored,
+                    &e.to_string(),
+                )?;
+                Err(e)
+            }
+        },
+    }
+}
+
+/// A criterion's short name, as it is recorded in `gate_attempts.phase`.
+fn gate_phase(verify: &Verification) -> &'static str {
+    match verify {
+        Verification::Command { .. } => "command",
+        Verification::Review { .. } => "review",
+        Verification::EachCompilesRust(_) => "compiles",
+        Verification::DocumentContains { .. } => "document",
+        Verification::FileContains(_)
+        | Verification::FileEquals(_)
+        | Verification::WorkspaceFileContains { .. } => "contains",
+        Verification::None => "none",
+    }
+}
+
+/// Every path the run wrote, with its contents as they now stand.
+///
+/// Read from `edits` — the run's own record of what it touched — rather than by
+/// walking the tree, so a reviewer is handed the run's change and not the
+/// repository. A path that has since been deleted is skipped: a reviewer reading
+/// an empty file it was told exists would be judging an artefact of the read.
+fn written_files(store: &Store, run_id: i64, root: &Path) -> Vec<(PathBuf, String)> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut files = Vec::new();
+    for edit in store.edits(run_id).unwrap_or_default() {
+        if seen.contains(&edit.path) {
+            continue;
+        }
+        seen.push(edit.path.clone());
+        if let Ok(contents) = std::fs::read_to_string(root.join(&edit.path)) {
+            files.push((PathBuf::from(&edit.path), contents));
+        }
+    }
+    files
+}
+
+/// How many gate attempts in a row, most recent first, ended without passing
+/// (0.34.0).
+///
+/// What [`Routing::escalate_after`](crate::Routing) counts.
+///
+/// Consecutive rather than cumulative — and today the two readings agree, because
+/// a gate that passes ends the run, so no run can hold a pass followed by a
+/// failure. It is written this way for the case that stops being true: a
+/// criterion that is evaluated without ending the run would make "failed three
+/// times ever" and "failing right now" different questions, and escalating on the
+/// first is escalating for history.
+fn consecutive_gate_failures(store: &Store, run_id: i64) -> u32 {
+    let attempts = store.gate_attempts(run_id).unwrap_or_default();
+    attempts
+        .iter()
+        .rev()
+        .take_while(|a| a.outcome != GateOutcome::Passed)
+        .count()
+        .try_into()
+        .unwrap_or(u32::MAX)
+}
+
+/// Bytes the run has written, as they stand on disk (0.34.0).
+///
+/// What [`Routing::downshift_under`](crate::Routing) measures. On disk rather
+/// than summed from the edits, because an edit that replaced a file twice is one
+/// change of one size and two rows.
+fn bytes_written(store: &Store, run_id: i64, root: &Path) -> u64 {
+    let mut seen: Vec<String> = Vec::new();
+    let mut total = 0u64;
+    for edit in store.edits(run_id).unwrap_or_default() {
+        if seen.contains(&edit.path) {
+            continue;
+        }
+        seen.push(edit.path.clone());
+        if let Ok(meta) = std::fs::metadata(root.join(&edit.path)) {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
+/// Apply the contract's routing rules to one outbound request (0.34.0).
+///
+/// Called with the request already built, so the rule sets the model that is
+/// actually sent rather than an intention recorded beside it. Emits
+/// [`EventKind::Routed`](crate::EventKind) only when the model changes, which is
+/// what makes "this run moved" distinguishable from "this run always used that
+/// model".
+#[allow(clippy::too_many_arguments)]
+fn apply_routing(
+    contract: &TaskContract,
+    request: &mut CompletionRequest,
+    routed: &mut Option<String>,
+    store: &Store,
+    run_id: i64,
+    root: &Path,
+    step: u32,
+    watch: &Watch<'_>,
+    depth: u32,
+) {
+    let Some(routing) = contract.routing.as_ref() else {
+        return;
+    };
+    let failures = consecutive_gate_failures(store, run_id);
+    let written = bytes_written(store, run_id, root);
+    let Some(model) = routing.model_for(failures, written) else {
+        return;
+    };
+    // The comparison is against what the RUN is on, not against this request:
+    // every request is built fresh with `model: None`, so comparing here would
+    // announce a transition on every step and make a run that moved
+    // indistinguishable from one that always used that model.
+    if routed.as_deref() == Some(model) {
+        request.model = Some(model.to_string());
+        return;
+    }
+    let why = if routing
+        .escalate_after
+        .as_ref()
+        .is_some_and(|(after, m)| failures >= *after && m == model)
+    {
+        format!("{failures} consecutive gate failures")
+    } else {
+        format!("{written} bytes written so far")
+    };
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::Routed {
+            from: request.model.clone().unwrap_or_default(),
+            to: model.to_string(),
+            why,
+        },
+    ));
+    *routed = Some(model.to_string());
+    request.model = Some(model.to_string());
+}
+
 /// Did this step end the run, because there is no gate and the agent stopped
 /// acting?
 ///
@@ -3097,6 +3519,12 @@ async fn run_workspace_from<P: Provider>(
     watch: &Watch<'_>,
     extras: &TurnExtras<'_>,
 ) -> Result<RunResult> {
+    // 0.34.0 — every precondition a review criterion and a routing rule bring,
+    // checked before the first completion is billed. A contract that cannot be
+    // honoured should cost nothing to find out about, which is why this is here
+    // and not at the gate: a review gate fires at the END of a run.
+    preflight_review_and_routing(contract, provider).await?;
+
     // The effective policy grows as approvers remember rules; it is rebuilt as a
     // merge so a remembered allow can still never defeat a deny beneath it.
     let mut effective = policy.clone();
@@ -3163,6 +3591,12 @@ async fn run_workspace_from<P: Provider>(
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
+    // 0.34.0 — which model routing has moved this run to, or `None` while it is
+    // still on the provider's own. Held here rather than read off the request,
+    // because each request is built fresh and would report a transition every
+    // step. Not restored on resume: a resumed run re-derives it from the gate
+    // history it can still read, on its first step.
+    let mut routed_model: Option<String> = None;
     // The run's live process handles, created before the first turn and killed
     // when the run ends however it ends. `Arc` because the reaping task for each
     // handle outlives the dispatch that started it and has to be able to record
@@ -3320,6 +3754,20 @@ async fn run_workspace_from<P: Provider>(
             media: attach_media(contract, pending_media)?,
             ..Default::default()
         };
+        // 0.34.0 — the rule that changes which model answers, applied to the
+        // request that is actually sent rather than recorded beside it.
+        let mut request = request;
+        apply_routing(
+            contract,
+            &mut request,
+            &mut routed_model,
+            store,
+            run_id,
+            root,
+            step,
+            watch,
+            0,
+        );
 
         let response = complete_with_retry(
             provider,
@@ -3688,15 +4136,19 @@ async fn run_workspace_from<P: Provider>(
                 .with_remembered(remembered));
         }
 
-        if contract
-            .verify
-            .passes_in_guarded(
-                root,
-                &ExecGuard::new(&effective)
-                    .tracing(store, run_id, step)
-                    .watching(watch, 0),
-            )
-            .await?
+        if evaluate_gate(
+            contract,
+            root,
+            &ExecGuard::new(&effective)
+                .tracing(store, run_id, step)
+                .watching(watch, 0),
+            store,
+            run_id,
+            step,
+            watch,
+            0,
+        )
+        .await?
         {
             finish(store, watch, run_id, 0, step, "success")?;
             return Ok(RunResult::new(RunOutcome::Success { steps: step }, run_id)
@@ -4952,15 +5404,19 @@ fn run_agent<'f, P: Provider>(
                 return Ok(RunOutcome::Finished { steps: step });
             }
 
-            if contract
-                .verify
-                .passes_in_guarded(
-                    &tree.root,
-                    &ExecGuard::new(policy)
-                        .tracing(tree.store, run_id, step)
-                        .watching(tree.watch, depth),
-                )
-                .await?
+            if evaluate_gate(
+                contract,
+                &tree.root,
+                &ExecGuard::new(policy)
+                    .tracing(tree.store, run_id, step)
+                    .watching(tree.watch, depth),
+                tree.store,
+                run_id,
+                step,
+                tree.watch,
+                depth,
+            )
+            .await?
             {
                 finish(tree.store, tree.watch, run_id, depth, step, "success")?;
                 return Ok(RunOutcome::Success { steps: step });

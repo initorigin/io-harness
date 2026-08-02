@@ -377,7 +377,7 @@ pub use approve::{
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::ContextBudget;
-pub use contract::TaskContract;
+pub use contract::{Routing, TaskContract};
 pub use error::{Error, ProviderErrorKind, Result};
 pub use hooks::Hooks;
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
@@ -407,9 +407,9 @@ pub use run::{
     resume_tree_with_decision, resume_tree_with_decision_observed, resume_tree_with_plan_decision,
     resume_tree_with_plan_decision_observed, resume_with, resume_with_answer,
     resume_with_answer_observed, resume_with_decision, resume_with_decision_observed,
-    resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed, rewind,
-    run, run_observed, run_tree, run_tree_observed, run_with, run_with_observed, Rewind,
-    RunOutcome, RunResult, SPAWN_TOOL,
+    resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed,
+    retry_gate, retry_gate_observed, rewind, run, run_observed, run_tree, run_tree_observed,
+    run_with, run_with_observed, Rewind, RunOutcome, RunResult, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
@@ -425,12 +425,12 @@ pub use skills::{Skill, Skills};
 // leaving its own audit table reachable only by opening the SQLite file.
 pub use agent::{AgentDef, Agents};
 pub use state::{
-    AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, McpEvent, MemoryEntry, MemoryKind,
-    MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion, PolicyEvent, ProcessHandle,
-    ProviderCall, Recovery, RunStatus, RunSummary, SandboxEvent, SpawnRow, StepRecord, Store,
-    Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS,
-    MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP,
-    UNKNOWN_MODEL,
+    AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, GateAttempt, GateOutcome, McpEvent,
+    MemoryEntry, MemoryKind, MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion,
+    PolicyEvent, ProcessHandle, ProviderCall, Recovery, RunStatus, RunSummary, SandboxEvent,
+    SpawnRow, StepRecord, Store, Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
+    MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS,
+    TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};
 pub use tools::git::Identity;
@@ -438,5 +438,7 @@ pub use tools::{
     Tool, ToolFuture, Toolbox, ASK_QUESTION_TOOL, DEFAULT_EXEC_TIMEOUT, PROPOSE_PLAN_TOOL,
     TODO_WRITE_TOOL,
 };
-pub use verify::{ExecGuard, Verification, TEST_BINARY};
+pub use verify::{
+    ExecGuard, ModelReviewer, Review, ReviewRequest, Reviewer, Reviewing, Verification, TEST_BINARY,
+};
 pub use web::{Citation, ServerToolCall, WebAccess};

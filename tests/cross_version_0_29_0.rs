@@ -384,6 +384,17 @@ fn a_current_store_is_read_by_a_0_29_0_binary() {
                 io_harness::EventKind::Stalled,
             ))
             .unwrap();
+        // 0.34.0 — a gate attempt, in the newest table an older binary has never
+        // queried. Same claim, executed rather than argued.
+        store
+            .put_gate_attempt(
+                run,
+                2,
+                "review",
+                io_harness::GateOutcome::Errored,
+                "HTTP 529",
+            )
+            .unwrap();
         store.finish_run(run, "success").unwrap();
     }
 

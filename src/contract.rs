@@ -216,6 +216,26 @@ pub struct TaskContract {
     /// spawned child takes the tier on its [`AgentDef`](crate::AgentDef) instead,
     /// which is where "search cheaply, write carefully" is said.
     pub effort: Option<crate::provider::Effort>,
+    /// Who answers a [`Verification::Review`](crate::Verification::Review)
+    /// criterion (0.34.0).
+    ///
+    /// `None` — the default, and every release before 0.34.0 — is no reviewer, and
+    /// a contract that carries a review criterion without one fails at run start
+    /// rather than at the gate: the mistake is a configuration error and it should
+    /// cost nothing to find.
+    ///
+    /// Behind an `Arc` for the same reason [`Self::responder`] and
+    /// [`Self::plan_gate`] are — one reviewer for a whole tree.
+    pub reviewer: Option<std::sync::Arc<dyn crate::verify::Reviewer>>,
+    /// Rules that change which model the run asks, while it is running (0.34.0).
+    ///
+    /// `None` — the default — is every release before 0.34.0: whichever model the
+    /// provider was built with answers every step. See [`Routing`](crate::Routing).
+    ///
+    /// The **root** agent's, like [`Self::effort`]. A spawned child takes the model
+    /// on its [`AgentDef`](crate::AgentDef), which is where a role's own model is
+    /// said.
+    pub routing: Option<crate::contract::Routing>,
 }
 
 impl TaskContract {
@@ -230,6 +250,8 @@ impl TaskContract {
             verify,
             plan_gate: None,
             effort: None,
+            reviewer: None,
+            routing: None,
             max_steps: 8,
             max_duration: None,
             max_tokens: None,
@@ -284,6 +306,8 @@ impl TaskContract {
             constraints: Vec::new(),
             verify: Verification::None,
             plan_gate: None,
+            reviewer: None,
+            routing: None,
             effort: None,
             max_steps: 12,
             max_duration: None,
@@ -524,6 +548,51 @@ impl TaskContract {
         self
     }
 
+    /// Register who answers a
+    /// [`Verification::Review`](crate::Verification::Review) criterion (0.34.0).
+    ///
+    /// ```
+    /// use io_harness::{Review, ReviewRequest, Reviewer, Reviewing, TaskContract, Verification};
+    /// use std::sync::Arc;
+    ///
+    /// #[derive(Debug)]
+    /// struct Strict;
+    /// impl Reviewer for Strict {
+    ///     fn review<'a>(&'a self, _r: ReviewRequest) -> Reviewing<'a> {
+    ///         Box::pin(async { Ok(Review::failed(["the goal asked for two files"])) })
+    ///     }
+    ///     fn model(&self) -> Option<&str> { None }
+    /// }
+    ///
+    /// let contract = TaskContract::workspace("split the module", "/repo")
+    ///     .with_verification(Verification::Review {
+    ///         rubric: "the module is two files and both compile".into(),
+    ///         allow_self_review: false,
+    ///     })
+    ///     .with_reviewer(Arc::new(Strict));
+    ///
+    /// assert!(contract.reviewer.is_some());
+    /// ```
+    pub fn with_reviewer(mut self, reviewer: std::sync::Arc<dyn crate::verify::Reviewer>) -> Self {
+        self.reviewer = Some(reviewer);
+        self
+    }
+
+    /// Let the run change which model it asks, while it is running (0.34.0).
+    ///
+    /// ```
+    /// use io_harness::{Routing, TaskContract};
+    ///
+    /// let contract = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_routing(Routing::new().escalate_after(2, "big-model").require_primary());
+    ///
+    /// assert!(contract.routing.is_some());
+    /// ```
+    pub fn with_routing(mut self, routing: Routing) -> Self {
+        self.routing = Some(routing);
+        self
+    }
+
     /// Ask for a reasoning tier on the root agent's completions (0.31.0).
     ///
     /// A request rather than a fact, in the sense a model slug is: each vendor is
@@ -667,5 +736,112 @@ impl TaskContract {
     pub fn with_constraint(mut self, constraint: impl Into<String>) -> Self {
         self.constraints.push(constraint.into());
         self
+    }
+}
+
+/// Rules that change which model a run asks, while it is running (0.34.0).
+///
+/// Roles have been able to name a model since 0.11.0 and
+/// [`Fallback`](crate::provider::Fallback) has chained two providers since
+/// 0.9.0. What has never existed is a rule that changes either one *during* a
+/// run: a role's model is fixed when the roster is written, and a fallback fires
+/// on a failure rather than on a judgement about the work.
+///
+/// Every rule here sets [`CompletionRequest::model`](crate::CompletionRequest) —
+/// the per-request knob that has existed since 0.11.0 — so no provider changes
+/// and nothing new is constructed. A rule that names a model the provider does
+/// not have fails the way any wrong model slug fails: at the vendor, loudly.
+///
+/// ```
+/// use io_harness::Routing;
+///
+/// // Start on the cheap model, move up if the gate keeps saying no, and refuse
+/// // to start at all if the primary provider is not answering.
+/// let routing = Routing::new()
+///     .escalate_after(3, "big-model")
+///     .downshift_under(2_048, "small-model")
+///     .require_primary();
+///
+/// assert_eq!(routing.escalate_after, Some((3, "big-model".into())));
+/// assert!(routing.require_primary);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Routing {
+    /// After this many *consecutive* failed gate attempts, ask this model
+    /// instead.
+    ///
+    /// Consecutive rather than cumulative: a run that fails, recovers and fails
+    /// again much later is not a run that needs a bigger model, it is a run doing
+    /// hard work. The escalation happens once and does not come back down —
+    /// oscillating between two models mid-run is a behaviour nobody asked for.
+    pub escalate_after: Option<(u32, String)>,
+    /// While the run has written fewer than this many bytes, ask this model
+    /// instead.
+    ///
+    /// The cheap direction, and deliberately measured on *what was written*
+    /// rather than on what was planned: bytes on disk are a fact the run already
+    /// has, and an estimate of a change's size before making it is the model's
+    /// own guess about its own work.
+    pub downshift_under: Option<(u64, String)>,
+    /// Ask the provider whether it is reachable before the first step, and refuse
+    /// to start if it says no.
+    ///
+    /// The rule an unattended job needs. Without it, a primary that is down means
+    /// a night's work quietly running on whatever
+    /// [`Fallback`](crate::provider::Fallback) had underneath — which is correct
+    /// for one request and wrong for eight hours of them. See
+    /// [`Provider::reachable`](crate::Provider::reachable), which is defaulted to
+    /// `Ok(true)`: a provider that says nothing about reachability makes this a
+    /// no-op rather than a failure.
+    pub require_primary: bool,
+}
+
+impl Routing {
+    /// No rules — the same behaviour as no routing at all.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Escalate to `model` after `failures` consecutive failed gate attempts.
+    #[must_use]
+    pub fn escalate_after(mut self, failures: u32, model: impl Into<String>) -> Self {
+        self.escalate_after = Some((failures, model.into()));
+        self
+    }
+
+    /// Use `model` while the run has written fewer than `bytes` bytes.
+    #[must_use]
+    pub fn downshift_under(mut self, bytes: u64, model: impl Into<String>) -> Self {
+        self.downshift_under = Some((bytes, model.into()));
+        self
+    }
+
+    /// Refuse to start when the provider reports it is not reachable.
+    #[must_use]
+    pub fn require_primary(mut self) -> Self {
+        self.require_primary = true;
+        self
+    }
+
+    /// Which model this run should ask now, given what has happened so far, or
+    /// `None` to leave the request's model as it is.
+    ///
+    /// Escalation wins over downshifting: a run whose gate keeps refusing is not
+    /// a run to save money on, however few bytes it has written.
+    #[must_use]
+    pub fn model_for(&self, consecutive_gate_failures: u32, bytes_written: u64) -> Option<&str> {
+        if let Some((after, model)) = &self.escalate_after {
+            if consecutive_gate_failures >= *after {
+                return Some(model);
+            }
+        }
+        if let Some((under, model)) = &self.downshift_under {
+            if bytes_written < *under {
+                return Some(model);
+            }
+        }
+        None
     }
 }
