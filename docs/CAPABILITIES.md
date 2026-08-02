@@ -16,7 +16,7 @@ the limits that capability actually has.
 | [Permissions and approval](guide/permissions.md) | Layered deny-first rules, what asks and what is refused, deferring a decision past process exit |
 | [Command execution](guide/command-execution.md) | Running a project's own toolchain under an `Act::Exec` check on the whole argv, and the bound that is not there |
 | [Language support](guide/language-support.md) | Toolchain detection, a criterion in any language, and migrating off the Rust-specific gates |
-| [Verification](guide/verification.md) | The criteria, execution-based gates, and exactly what a pass proves |
+| [Verification](guide/verification.md) | The criteria, execution-based gates, the review criterion a second model answers, per-gate retry, and exactly what a pass proves |
 | [Agent composition](guide/composition.md) | Sub-agents, inherit-and-narrow containment, the shared ledger |
 | [Execution sandbox](guide/sandbox.md) | Backends per platform, resource caps, the portable floor |
 | [Durable runs](guide/durable-runs.md) | Checkpoints, resume, the stored-policy entry points, approvals that survive a restart |
@@ -33,7 +33,7 @@ the limits that capability actually has.
 | [Documents](guide/documents.md) | Spreadsheets, Word, PowerPoint, PDF, barcodes — and what was cut, with the reasoning |
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
-| [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, and what `Provider::models()` reports |
+| [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, and the routing rules that change which model answers mid-run |
 
 ## The twelve pillars
 

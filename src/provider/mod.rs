@@ -1024,7 +1024,7 @@ pub trait Provider {
     ///
     /// It is a point-in-time answer and nothing more. A provider that is
     /// reachable now and gone in ten minutes is what
-    /// [`Fallback`](crate::provider::Fallback) and
+    /// [`Fallback`] and
     /// [`RetryPolicy`](crate::RetryPolicy) are for; this exists so an unattended
     /// job does not *start* on a fallback nobody chose.
     ///

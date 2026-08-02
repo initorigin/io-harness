@@ -231,6 +231,10 @@ pub struct TaskContract {
     ///
     /// `None` — the default — is every release before 0.34.0: whichever model the
     /// provider was built with answers every step. See [`Routing`](crate::Routing).
+    ///
+    /// The **root** agent's, like [`Self::effort`]. A spawned child takes the model
+    /// on its [`AgentDef`](crate::AgentDef), which is where a role's own model is
+    /// said.
     pub routing: Option<crate::contract::Routing>,
 }
 

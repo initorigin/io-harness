@@ -643,6 +643,12 @@ re-probe.
 **A model name is a request.** Naming a model the provider does not have fails the
 way any wrong slug fails: at the vendor, on the next request.
 
+**Routing governs the root agent.** A spawned child takes the model on its
+`AgentDef`, exactly as it takes its `Effort` there since 0.31.0 — that is where
+"search cheaply, think hard where thinking is the work" is said, and a rule that
+overrode a role's own model would be the roster's author being ignored by a
+counter.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
