@@ -492,6 +492,44 @@ compatibility endpoint rather than its native API. An application that mints its
 own bearer token can reach the first two by passing it as the key; this crate
 grows no signing dependency to do it for you.
 
+## Changing model mid-run (0.34.0)
+
+A role's model is fixed when the roster is written, and `Fallback` moves to its
+secondary on a *failure*. Neither is a rule that changes which model answers as a
+run goes:
+
+```rust
+use io_harness::{Routing, TaskContract};
+
+let contract = TaskContract::workspace("port the parser", "/repo")
+    .with_routing(
+        Routing::new()
+            // Three gates in a row have refused: stop paying the cheap model to
+            // fail.
+            .escalate_after(3, "big-model")
+            // While the change is small, it does not need the expensive one.
+            .downshift_under(2_048, "small-model")
+            // And do not start an eight-hour unattended job on a fallback.
+            .require_primary(),
+    );
+# let _ = contract;
+```
+
+Every rule sets `CompletionRequest.model` on the request that is actually sent, so
+no provider changes and nothing new is constructed. `EventKind::Routed { from, to,
+why }` is emitted **once**, at the transition — a run that moved is otherwise
+indistinguishable from one that always used that model.
+
+**`require_primary` asks `Provider::reachable()` before the first step.** That
+method is defaulted to `Ok(true)`, so an out-of-tree provider that does not
+override it keeps its 0.33.0 behaviour and makes the rule a no-op rather than a new
+precondition. It is a point-in-time answer: a provider that dies mid-run is what
+`Fallback` and `RetryPolicy` are for, and this crate runs no health check.
+
+Escalation wins over downshifting, is one-way, and counts *consecutive* failed
+gates. A run whose gate keeps refusing is not one to save money on, and a run that
+oscillates between two models is a behaviour nobody asked for.
+
 ## See also
 
 - [The public contract](../CONTRACT.md) — the per-vendor divergences, stated

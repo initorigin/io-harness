@@ -2525,6 +2525,24 @@ pub async fn retry_gate(
 /// stream the run was — including to a process attached with
 /// [`Attach`](crate::Attach), since 0.33.0's `Broadcast` carries whatever it is
 /// wrapped around.
+///
+/// ```no_run
+/// use io_harness::observe::{Flow, Observer, RunEvent};
+/// use io_harness::{retry_gate_observed, Store, TaskContract};
+///
+/// struct Print;
+/// impl Observer for Print {
+///     fn event(&self, event: &RunEvent) -> Flow {
+///         println!("{:?}", event.kind);
+///         Flow::Continue
+///     }
+/// }
+///
+/// # async fn demo(contract: &TaskContract, store: &Store, run_id: i64) -> io_harness::Result<()> {
+/// let outcome = retry_gate_observed(contract, store, run_id, &Print).await?;
+/// println!("the gate now says {}", outcome.as_str());
+/// # Ok(()) }
+/// ```
 pub async fn retry_gate_observed(
     contract: &TaskContract,
     store: &Store,
@@ -2771,7 +2789,7 @@ fn written_files(store: &Store, run_id: i64, root: &Path) -> Vec<(PathBuf, Strin
     let mut seen: Vec<String> = Vec::new();
     let mut files = Vec::new();
     for edit in store.edits(run_id).unwrap_or_default() {
-        if seen.iter().any(|p| *p == edit.path) {
+        if seen.contains(&edit.path) {
             continue;
         }
         seen.push(edit.path.clone());
@@ -2813,7 +2831,7 @@ fn bytes_written(store: &Store, run_id: i64, root: &Path) -> u64 {
     let mut seen: Vec<String> = Vec::new();
     let mut total = 0u64;
     for edit in store.edits(run_id).unwrap_or_default() {
-        if seen.iter().any(|p| *p == edit.path) {
+        if seen.contains(&edit.path) {
             continue;
         }
         seen.push(edit.path.clone());

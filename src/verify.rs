@@ -417,6 +417,22 @@ impl Review {
 /// held behind a `dyn` on the contract, and a trait returning `impl Future` is
 /// not dyn-compatible. [`Provider`](crate::Provider) can afford RPITIT because it
 /// is always a generic parameter; a reviewer is a field.
+///
+/// ```
+/// use io_harness::{Review, ReviewRequest, Reviewer, Reviewing};
+///
+/// #[derive(Debug)]
+/// struct Human;
+///
+/// impl Reviewer for Human {
+///     // The return type is this alias, which is what makes `dyn Reviewer` work.
+///     fn review<'a>(&'a self, _request: ReviewRequest) -> Reviewing<'a> {
+///         Box::pin(async { Ok(Review::failed(["I would like a test for it"])) })
+///     }
+///     fn model(&self) -> Option<&str> { None }
+/// }
+/// # let _ = Human;
+/// ```
 pub type Reviewing<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Review>> + Send + 'a>>;
 

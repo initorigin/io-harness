@@ -120,10 +120,14 @@ with your process's privileges and is **not** sandboxed — that bound is stated
 full in the [command execution guide](docs/guide/command-execution.md), because
 it is the widest thing the crate grants.
 
-**Verification in any language, or none.** A criterion can be the project's own
-test command in whatever language it is written, or nothing at all when the task
-has no checkable criterion — "work out why the deploy fails" is a run, not a
-gate. What a passing gate does and does not prove is stated exactly in the
+**Verification in any language, or none — and, since 0.34.0, a second model.** A
+criterion can be the project's own test command in whatever language it is
+written, or nothing at all when the task has no checkable criterion — "work out
+why the deploy fails" is a run, not a gate. `Verification::Review` is the other
+direction: a model reads what the run wrote against a rubric you set and returns a
+verdict with its reasons, and it **refuses to run on the model that wrote the
+change**. An exit status cannot catch a change that compiles, passes and is still
+wrong; a review can, and is not a proof — the two compose. What a passing gate does and does not prove is stated exactly in the
 [verification guide](docs/guide/verification.md); it is narrower than it reads.
 The harness also ships a table of what each ecosystem's commands conventionally
 are, so the agent does not spend turns discovering that this is a pnpm workspace
@@ -138,6 +142,18 @@ the rule and the layer that produced it.
 **Budgets and stop conditions.** Steps, wall-clock time, and token spend are
 capped. A tree of agents draws from one shared ledger no spawned contract can
 raise.
+
+**One failed gate is retried on its own (0.34.0).** Every gate evaluation is
+recorded as `Passed`, `Failed` or `Errored` — the last being a criterion that
+could not run at all, a distinction the crate did not have before. `retry_gate`
+re-runs *only* the criterion, against the workspace the run left, so a transport
+failure on the gate does not cost the forty steps that produced the work.
+
+**Which model answers can change mid-run (0.34.0).** `Routing` escalates to a
+stronger model after repeated gate failures, downshifts while the change is small,
+and — the rule an unattended job needs — refuses to start at all when the primary
+provider reports it is unreachable, rather than quietly spending the night on a
+fallback nobody chose.
 
 **Agent composition.** A root run can spawn contained sub-agents over a shared
 workspace, nested, many at once. Two caps, different in kind:

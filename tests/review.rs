@@ -48,7 +48,7 @@ impl MockScript {
 
     /// The same script, but the provider names the model it would ask — which is
     /// what the self-review refusal compares against.
-    fn as_model(mut self, model: &str) -> Self {
+    fn naming_model(mut self, model: &str) -> Self {
         self.model = Some(model.to_string());
         self
     }
@@ -340,7 +340,7 @@ async fn a_model_may_not_review_its_own_work_and_the_refusal_precedes_the_wire()
         .with_reviewer(reviewer.clone())
         .with_max_steps(2);
     // The run's own provider names the same model.
-    let provider = MockScript::new(write_script()).as_model("same-model");
+    let provider = MockScript::new(write_script()).naming_model("same-model");
 
     let err = run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
         .await
@@ -376,7 +376,7 @@ async fn allow_self_review_says_you_meant_it_and_the_run_proceeds() {
         })
         .with_reviewer(reviewer.clone())
         .with_max_steps(2);
-    let provider = MockScript::new(write_script()).as_model("same-model");
+    let provider = MockScript::new(write_script()).naming_model("same-model");
 
     let result = run_with(&contract, &provider, &store, &open_policy(), &ApproveAll)
         .await
