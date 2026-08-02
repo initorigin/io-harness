@@ -9,7 +9,7 @@ tasks:
   why_required: Nothing a second process can see exists until the events are durable, and every later
     task reads them back. Writing the tree query the wrong way first and fixing it after is how the recursive-CTE
     trap gets shipped.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F1 — the attached stream is the same stream, not a reconstruction.** A run executes under `Broadcast::new(&store,
@@ -39,14 +39,30 @@ tasks:
   - src/observe.rs
   - src/lib.rs
   - tests/attach.rs
-  evidence: []
+  evidence:
+  - '`run_events (id AUTOINCREMENT, run_id, step, depth, kind, json, at)` plus `run_events_run ON (run_id,
+    id)` in `Store::open`''s migration chain; `CHECKPOINT_FORMAT` unmoved at 7.'
+  - '`observe::Broadcast` is an `Observer` decorator over `Mutex<Store>` and `&dyn Observer`; it writes
+    `serde_json::to_string(event)` of the value it is forwarding, so the durable stream cannot drift from
+    the in-process one.'
+  - 'F1 green: `an_attached_reader_gets_the_same_events_the_in_process_observer_got` compares the attached
+    read against the recorder with `assert_eq!` on `Vec<RunEvent>`. Its control `without_a_broadcast_an_attached_reader_sees_nothing`
+    is green too.'
+  - 'N3 green: `state::tests::the_tree_event_tail_seeks_rather_than_scanning_every_trees_events` EXPLAINs
+    `TREE_EVENTS_SQL` itself (a `const`, not a re-typed copy) and requires `INDEX run_events_run` and
+    no `SCAN run_events`. Two controls: `kind` (in no index) must not use the index, and the same query
+    with a plain join must build an `AUTOMATIC COVERING INDEX (id=?)` instead. Measured over 40 trees
+    x 40 events: 0.093 ms forced, 0.179 ms naive.'
+  - 'N4 green: `broadcasting_writes_one_row_per_event_and_nothing_without_it`.'
+  - 'Sabotage S3 — `Broadcast` writes a synthesised `Stalled` instead of the event it forwards: 5 named
+    tests fail, F1 among them.'
 - id: US-IO-HARNESS-0.33.0-T02
   summary: 'The read-and-decide surface: `src/attach.rs` with `Attach` (per run and per tree, cursor from
     zero / from now / from a caller''s id), `Waiting`, and `Store::unresolved_approvals` behind it. No
     method that starts, resumes or steps a run, with a source-reading test that proves it.'
   why_required: This is the type the outcome names. The ownership boundary is enforced by what the type
     does not have, so the type has to exist before the boundary can be tested.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.33.0-T01
   acceptance_criteria:
@@ -69,7 +85,18 @@ tasks:
   - src/state.rs
   - src/lib.rs
   - tests/attach.rs
-  evidence: []
+  evidence:
+  - '`src/attach.rs`: `Attach::{to, to_tree, from_now, from_cursor, cursor, poll, waiting, answer_approval,
+    answer_question, answer_plan}`, `Waiting` (`#[non_exhaustive]`, three variants), `POLL_LIMIT`, and
+    `Store::unresolved_approvals`.'
+  - 'F2 green across four named tests: backlog from zero, `from_now` skipping it, `from_cursor` resuming
+    exactly there, and a tree reader seeing its child''s events interleaved by the globally monotonic
+    cursor.'
+  - 'F8 green: `attach_has_no_method_that_drives_a_run` reads `src/attach.rs` (line-endings normalised
+    for the CRLF checkout) and requires no `pub fn` starting `run`/`resume`/`step`. Its control `the_no_driving_check_catches_a_driving_method`
+    splices one in and asserts the checker names it.'
+  - '`waiting()` filters on unresolved rather than on the row existing, proven by `waiting_excludes_everything_that_has_been_answered`
+    — load-bearing since the approval row is now written before the gate.'
 - id: US-IO-HARNESS-0.33.0-T03
   summary: First answer wins, by compare-and-swap. `Store::resolve_pending`, `Store::answer_question`
     and `Store::decide_plan` become a single conditional `UPDATE` returning `Result<bool>`; the read-then-write
@@ -78,7 +105,7 @@ tasks:
   why_required: Silent double-answering is the defect class the release exists to prevent, and two of
     the three write paths had it before the release started. Every later task depends on the run being
     able to ask the store who won.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.33.0-T02
   acceptance_criteria:
@@ -103,7 +130,17 @@ tasks:
   - src/run.rs
   - src/attach.rs
   - tests/attach.rs
-  evidence: []
+  evidence:
+  - '`Store::resolve_pending` / `answer_question` / `decide_plan` are each one conditional `UPDATE` returning
+    `Result<bool>`. The read-then-write in the last two, which two processes interleave through, is gone.'
+  - 'F5 green in three named tests, one per gate: `assert_ne!(first, second)` plus `assert!(first || second)`,
+    and the stored value is the first writer''s.'
+  - '`an_attached_process_cannot_defer` — deferring from an attached process is an error and writes nothing.'
+  - 'N5: exactly three signature breaks, all on `Store`, all `Result<()>` to `Result<bool>`. `resume_with_answer`
+    and `resume_with_plan_decision` still refuse a second answer with `Error::Resume` (`tests/question.rs::answering_the_same_question_twice_is_an_error`
+    green), because driving a run twice is a different thing from writing once.'
+  - 'Sabotage S2 — the three `WHERE ... resolved` guards removed: 8 named tests fail across `tests/attach.rs`.
+    The 448 lib unit tests still pass, which is why the integration controls exist.'
 - id: US-IO-HARNESS-0.33.0-T04
   summary: 'The wait becomes answerable at all four places a live run parks: the write/exec approval in
     `gate_path`, the network authorization in `authorize_net`, `ask_question` and `propose_plan`. The
@@ -111,7 +148,7 @@ tasks:
     with `tokio::select!`, and the decision it reports is read back from the row in both arms.'
   why_required: Without this the store rows are a place to write an answer nothing reads. This is the
     whole of 'a second process can answer the thing it is holding'.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.33.0-T03
   acceptance_criteria:
@@ -146,14 +183,28 @@ tasks:
   - src/attach.rs
   - examples/attach_fixture.rs
   - tests/attach.rs
-  evidence: []
+  evidence:
+  - '`race_gate` in `src/run.rs`: `tokio::select!` with `biased;` over the gate future and a `tokio::time::sleep(ATTACH_POLL)`
+    store poll. `Some(v)` is the gate''s answer, `None` carries no value on purpose so a caller cannot
+    report an attached answer it has not read from the store.'
+  - 'All four sites converted: `gate_path`''s `Effect::Ask`, `authorize_net`, `ask_question` and `propose_plan`.'
+  - 'F3 green both ways: `an_attached_process_answers_a_live_approval_and_the_run_finishes` runs the same
+    fixture with approve and with deny; the fixture''s stdout must report the decision it acted on and
+    the file must follow it. It is never killed and never resumed.'
+  - 'F4 green: `an_attached_process_answers_a_live_question` and `an_attached_process_answers_a_live_plan`,
+    each asserting `answered_by`/`decided_by` is `attached` — the row names who actually won, not who
+    was asked.'
+  - 'F9 proven by two sabotages. S1 — the event reports the raced value rather than the row: 4 named tests
+    fail. S1b — the row is read only in the ATTACHED arm and the fast path reports its own value: `tests/policy.rs::approve_all_proceeds_where_deny_all_does_not`
+    fails, which is the fast-path half the criterion asked for.'
+  - 'Sabotage S4 — the row written after the gate (the 0.32.0 ordering), no race: 5 named tests fail.'
 - id: US-IO-HARNESS-0.33.0-T05
   summary: 'The bounded failure modes, executed: SIGKILL the attaching process and the owner runs to completion
     with a stream continuous across the kill; SIGKILL the owner and what is left is exactly the unresolved
     row `resume_with_decision` has consumed since 0.7.0.'
   why_required: '''The failure modes are bounded'' is the outcome''s central claim and the one most easily
     believed without evidence. Both halves are kills, not assertions on paper.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.33.0-T04
   acceptance_criteria:
@@ -175,7 +226,18 @@ tasks:
   files:
   - examples/attach_fixture.rs
   - tests/attach.rs
-  evidence: []
+  evidence:
+  - '`examples/attach_fixture` parks *live* in a gate that never returns, in four modes (`approve`, `question`,
+    `plan`, `watch`) — unlike `crash_fixture`, `plan_gate_fixture` and `fleet_fixture`, which park after
+    the run has stopped.'
+  - 'F6 green: `killing_the_attached_process_does_not_disturb_the_run` SIGKILLs a third process mid-poll,
+    then answers the owner from the test process; the owner completes and the cursor sequence strictly
+    ascends across the kill.'
+  - 'F7 green: `killing_the_owner_leaves_an_unresolved_row_a_resume_can_still_consume` asserts an ABSENCE
+    first — `pending.resolved.is_none()` — because the row now exists before the approver is consulted,
+    so its presence proves nothing; then that the swap consumes it exactly once.'
+  - A `Fixture` guard kills on drop and bounds every wait, so a failing test cannot leak a process that
+    parks forever.
 - id: US-IO-HARNESS-0.33.0-T06
   summary: Cross-version evidence in both directions and the 0.22.0 schema guard fed `run_events` and
     `run_events_run` by name; `CHECKPOINT_FORMAT` unmoved; the no-migration claim asserted rather than
@@ -183,7 +245,7 @@ tasks:
   why_required: A new table fires the schema guard, and a release that touches the store owes both directions
     of the compatibility story. The WAL claim is the release's transport argument and has to be a criterion,
     not a sentence.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.33.0-T01
   acceptance_criteria:
@@ -204,7 +266,14 @@ tasks:
   - tests/cross_version.rs
   - tests/cross_version_0_29_0.rs
   - tests/store_open.rs
-  evidence: []
+  evidence:
+  - '`ADDED_SINCE_0_22_0` in `tests/cross_version.rs` fed `run_events` and `run_events_run` by name (trap
+    19). The whole `tests/cross_version.rs` suite green.'
+  - '`tests/cross_version_0_29_0.rs`''s current-tree store now carries a `run_events` row alongside the
+    0.30.0 memory rows and the 0.31.0 plan, so the backwards claim covers this release''s table too.'
+  - 'N2 met by evidence rather than by work: `Store::open` has set `journal_mode = WAL` and `BUSY_TIMEOUT`
+    since 0.12.0 and `tests/store_open.rs` asserts both, so the two-process transport needed no migration
+    and no pragma change at all.'
 - id: US-IO-HARNESS-0.33.0-T07
   summary: 'Documentation shipped with the code: the `attach` module page, `Broadcast`''s and `Attach`''s
     worked examples, `README.md`, `docs/CONTRACT.md` including the four honest limitations, and the `CHANGELOG.md`
@@ -212,7 +281,7 @@ tasks:
   why_required: '`release.yml` refuses a version with no changelog section, and the crate''s surface test
     refuses a public item with no compiling example. Documentation is part of this release, not after
     it.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.33.0-T05
   acceptance_criteria:
@@ -239,7 +308,13 @@ tasks:
   - src/attach.rs
   - src/observe.rs
   - Cargo.toml
-  evidence: []
+  evidence:
+  - '`src/attach.rs` module page, `Broadcast`''s and `Attach`''s worked examples, README''s ''Two processes,
+    one run'', a `docs/CONTRACT.md` section with the six limitations stated plainly, and the CHANGELOG
+    section `release.yml` reads verbatim.'
+  - 'N6 green: `tests/public_api.rs::every_public_item_has_a_worked_example`, with `docs/public-api.txt`
+    gaining `struct Attach`, `struct Broadcast`, `enum Waiting`, `const POLL_LIMIT`.'
+  - 'N1: `cargo tree | wc -l` = 402, unchanged since 0.23.0.'
 - id: US-IO-HARNESS-0.33.0-T08
   summary: 'The gates CI runs, on the shipped tree: fmt, clippy `-D warnings`, `cargo test`, `cargo test
     --all-features`, the nightly docs.rs command, and `cargo package --locked`.'

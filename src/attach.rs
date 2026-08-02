@@ -82,6 +82,24 @@ use crate::Result;
 /// one allocation. `poll` advances its cursor by what it returned, so calling it
 /// again continues — a caller draining a backlog loops until it gets fewer than
 /// this many.
+///
+/// ```
+/// use io_harness::{Attach, EventKind, RunEvent, Store, POLL_LIMIT};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("port it", "openrouter")?;
+/// for step in 0..3 {
+///     store.put_event(&RunEvent::new(run_id, step, EventKind::Stalled))?;
+/// }
+///
+/// // Fewer than the limit came back, so this reader has caught up.
+/// let mut view = Attach::to(&store, run_id);
+/// let batch = view.poll()?;
+/// assert!(batch.len() < POLL_LIMIT);
+/// # Ok(())
+/// # }
+/// ```
 pub const POLL_LIMIT: usize = 512;
 
 /// What a live run is parked on, waiting for somebody to answer (0.33.0).
@@ -92,7 +110,27 @@ pub const POLL_LIMIT: usize = 512;
 /// holding" a two-thirds claim.
 ///
 /// `#[non_exhaustive]` because a later release that gives a run a fourth way to
-/// wait should not break every `match` written against this one.
+/// wait should not break every `match` written against this one — so a `match`
+/// over it carries a wildcard arm today and costs nothing tomorrow.
+///
+/// ```
+/// use io_harness::{Attach, Question, Store, Waiting};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("port it", "openrouter")?;
+/// store.put_question(run_id, 2, &Question::new("which database?"))?;
+///
+/// for waiting in Attach::to(&store, run_id).waiting()? {
+///     match waiting {
+///         Waiting::Question { question, .. } => assert_eq!(question, "which database?"),
+///         Waiting::Approval { .. } | Waiting::Plan { .. } => unreachable!(),
+///         _ => {}
+///     }
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waiting {
