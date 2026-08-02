@@ -1375,6 +1375,10 @@ mod tests {
                 | EventKind::PlanDecided { .. }
                 | EventKind::Reasoning { .. }
                 | EventKind::ServerToolUsed { .. }
+                // 0.34.0 — the verdict a review returned, and a run changing which
+                // model it asks.
+                | EventKind::Reviewed { .. }
+                | EventKind::Routed { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

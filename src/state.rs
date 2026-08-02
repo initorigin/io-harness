@@ -6842,8 +6842,71 @@ mod tests {
         );
     }
 
-    /// N3 — an attached observer's tail read seeks into this tree's events rather
-    /// than scanning every tree's.
+    /// N3 (0.34.0) — one run's gate history is an index seek, not a scan of every
+    /// run's.
+    ///
+    /// `EXPLAIN`s the `const` the crate executes rather than a copy of it: a
+    /// re-typed statement in a test keeps passing after somebody "tidies" the
+    /// `INDEXED BY` out of the real one, which is the change this exists to catch.
+    ///
+    /// The control filters on `detail`, a column in **no** index at all. A
+    /// trailing column of the composite index would not be a control — SQLite
+    /// skip-scans one and produces a full read wearing an index's name.
+    #[test]
+    fn a_runs_gate_history_seeks_rather_than_scanning_every_runs() {
+        let store = Store::memory().unwrap();
+        let mut first = 0;
+        for r in 0..40 {
+            let run = store.start_run(&format!("run {r}"), "/repo").unwrap();
+            if r == 0 {
+                first = run;
+            }
+            for step in 0..20 {
+                store
+                    .put_gate_attempt(run, step, "review", GateOutcome::Failed, "no")
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<i64> = vec![first][..n].to_vec();
+            stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        for sql in [GATE_ATTEMPTS_SQL, LAST_GATE_ATTEMPT_SQL] {
+            let p = plan(sql);
+            assert!(
+                p.contains("gate_attempts_run"),
+                "the read must seek on gate_attempts_run, got {p}"
+            );
+            assert!(
+                !p.contains("SCAN gate_attempts"),
+                "the read must not scan every run\'s attempts, got {p}"
+            );
+        }
+
+        // The control: a column in no index at all cannot be served from one, so
+        // the assertions above are about the index and not about the planner
+        // being unable to scan.
+        let control = plan("SELECT id FROM gate_attempts WHERE detail = \'no\'");
+        assert!(
+            !control.contains("gate_attempts_run"),
+            "a column in no index must not be servable from the index, got {control}"
+        );
+    }
+
+    /// N3 — an attached observer\'s tail read seeks into this tree\'s events rather
+    /// than scanning every tree\'s.
     ///
     /// Trap 37, paid for in 0.32.0 and load-bearing here: a recursive CTE is a
     /// co-routine SQLite cannot seek into, so a plain join makes the planner scan

@@ -2785,9 +2785,14 @@ fn written_files(store: &Store, run_id: i64, root: &Path) -> Vec<(PathBuf, Strin
 /// How many gate attempts in a row, most recent first, ended without passing
 /// (0.34.0).
 ///
-/// What [`Routing::escalate_after`](crate::Routing) counts. Consecutive rather
-/// than cumulative, so a run that failed early, recovered, and is now working
-/// steadily is not escalated for history.
+/// What [`Routing::escalate_after`](crate::Routing) counts.
+///
+/// Consecutive rather than cumulative — and today the two readings agree, because
+/// a gate that passes ends the run, so no run can hold a pass followed by a
+/// failure. It is written this way for the case that stops being true: a
+/// criterion that is evaluated without ending the run would make "failed three
+/// times ever" and "failing right now" different questions, and escalating on the
+/// first is escalating for history.
 fn consecutive_gate_failures(store: &Store, run_id: i64) -> u32 {
     let attempts = store.gate_attempts(run_id).unwrap_or_default();
     attempts
@@ -2826,9 +2831,11 @@ fn bytes_written(store: &Store, run_id: i64, root: &Path) -> u64 {
 /// [`EventKind::Routed`](crate::EventKind) only when the model changes, which is
 /// what makes "this run moved" distinguishable from "this run always used that
 /// model".
+#[allow(clippy::too_many_arguments)]
 fn apply_routing(
     contract: &TaskContract,
     request: &mut CompletionRequest,
+    routed: &mut Option<String>,
     store: &Store,
     run_id: i64,
     root: &Path,
@@ -2844,7 +2851,12 @@ fn apply_routing(
     let Some(model) = routing.model_for(failures, written) else {
         return;
     };
-    if request.model.as_deref() == Some(model) {
+    // The comparison is against what the RUN is on, not against this request:
+    // every request is built fresh with `model: None`, so comparing here would
+    // announce a transition on every step and make a run that moved
+    // indistinguishable from one that always used that model.
+    if routed.as_deref() == Some(model) {
+        request.model = Some(model.to_string());
         return;
     }
     let why = if routing
@@ -2866,6 +2878,7 @@ fn apply_routing(
             why,
         },
     ));
+    *routed = Some(model.to_string());
     request.model = Some(model.to_string());
 }
 
@@ -3560,6 +3573,12 @@ async fn run_workspace_from<P: Provider>(
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
     let mut progress = Progress::new();
+    // 0.34.0 — which model routing has moved this run to, or `None` while it is
+    // still on the provider's own. Held here rather than read off the request,
+    // because each request is built fresh and would report a transition every
+    // step. Not restored on resume: a resumed run re-derives it from the gate
+    // history it can still read, on its first step.
+    let mut routed_model: Option<String> = None;
     // The run's live process handles, created before the first turn and killed
     // when the run ends however it ends. `Arc` because the reaping task for each
     // handle outlives the dispatch that started it and has to be able to record
@@ -3720,7 +3739,17 @@ async fn run_workspace_from<P: Provider>(
         // 0.34.0 — the rule that changes which model answers, applied to the
         // request that is actually sent rather than recorded beside it.
         let mut request = request;
-        apply_routing(contract, &mut request, store, run_id, root, step, watch, 0);
+        apply_routing(
+            contract,
+            &mut request,
+            &mut routed_model,
+            store,
+            run_id,
+            root,
+            step,
+            watch,
+            0,
+        );
 
         let response = complete_with_retry(
             provider,
