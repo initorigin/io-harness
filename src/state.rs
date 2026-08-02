@@ -1426,8 +1426,10 @@ fn turn_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Turn> {
 /// assert_eq!(q.answer.as_deref(), Some("io.local.toml"));
 /// assert_eq!(q.answered_by.as_deref(), Some("human"));
 ///
-/// // Answering twice is an error, not a silent second write.
-/// assert!(store.answer_question(id, "io.toml", "human").is_err());
+/// // Answering twice does not overwrite, and says so: `false` means somebody
+/// // else's answer is the one the run acted on (0.33.0).
+/// assert!(!store.answer_question(id, "io.toml", "human")?);
+/// assert_eq!(store.question(id)?.unwrap().answer.as_deref(), Some("io.local.toml"));
 /// # Ok(())
 /// # }
 /// ```
@@ -1539,8 +1541,9 @@ fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, crate::observe::Ru
 /// assert_eq!(store.approved_plan(run_id)?.as_ref(), Some(&proposed));
 /// assert_eq!(store.plan(id)?.unwrap().decided_by.as_deref(), Some("human"));
 ///
-/// // Deciding twice is an error, not a silent second write.
-/// assert!(store.decide_plan(id, &PlanVerdict::Cancel, "human").is_err());
+/// // Deciding twice does not overwrite, and says so (0.33.0).
+/// assert!(!store.decide_plan(id, &PlanVerdict::Cancel, "human")?);
+/// assert_eq!(store.plan(id)?.unwrap().verdict, Some(PlanVerdict::Approve));
 /// # Ok(())
 /// # }
 /// ```
