@@ -1504,14 +1504,22 @@ const TREE_EVENTS_SQL: &str = "WITH RECURSIVE tree(id) AS (
 /// A `const` for the reason [`TREE_EVENTS_SQL`] is: the query-plan test
 /// `EXPLAIN`s the statement the crate runs, so dropping the index would fail the
 /// test rather than pass a re-typed copy of the SQL.
+///
+/// **No `INDEXED BY` here, deliberately, and it was measured rather than
+/// assumed.** 0.33.0's tree tail needs the hint because a recursive CTE is a
+/// co-routine the planner cannot seek into; this is a plain
+/// `WHERE run_id = ? ORDER BY id`, whose left prefix is the index's own, and
+/// removing the hint changed the plan not at all across forty runs. The hint is
+/// left out where it buys nothing; the query-plan test still fails if the index
+/// itself goes.
 const GATE_ATTEMPTS_SQL: &str = "SELECT id, step, phase, outcome, detail, at
-     FROM gate_attempts INDEXED BY gate_attempts_run
+     FROM gate_attempts
      WHERE run_id = ?1
      ORDER BY id ASC";
 
 /// The latest gate attempt for one run (0.34.0).
 const LAST_GATE_ATTEMPT_SQL: &str = "SELECT id, step, phase, outcome, detail, at
-     FROM gate_attempts INDEXED BY gate_attempts_run
+     FROM gate_attempts
      WHERE run_id = ?1
      ORDER BY id DESC LIMIT 1";
 
