@@ -73,6 +73,9 @@
 //! panicking observer takes the run's future with it and leaves the run row
 //! `running`. Do not panic in an observer.
 
+use std::fmt;
+use std::sync::Mutex;
+
 use serde::{Deserialize, Serialize};
 
 /// Whether the run should keep going.
@@ -849,6 +852,120 @@ pub struct Ignore;
 impl Observer for Ignore {
     fn event(&self, _event: &RunEvent) -> Flow {
         Flow::Continue
+    }
+}
+
+/// Writes every event to the store on its way to another observer, so a second
+/// process can read the run's stream (0.33.0).
+///
+/// [`Observer`] solved serialisation in 0.12.0 and left transport unsolved: the
+/// events existed only inside the process driving the run, so an application that
+/// wanted to watch a run it had not started was back to polling the trace against
+/// a schema this crate does not promise — the exact thing the observer exists to
+/// stop people doing. `Broadcast` closes that gap using the store both processes
+/// already open.
+///
+/// Wrap it around whatever observer you already have and pass it to any
+/// `*_observed` entry point:
+///
+/// ```no_run
+/// use io_harness::{run_observed, Broadcast, Ignore, OpenRouter, Store, TaskContract,
+///                  Verification};
+///
+/// # async fn demo() -> io_harness::Result<()> {
+/// let contract = TaskContract::new(
+///     "add a hello function", "src/hello.rs",
+///     Verification::FileContains("fn hello".into()));
+/// // A file, not `Store::memory()`: a second process has to be able to open it.
+/// let store = Store::open("runs.db")?;
+///
+/// // `Ignore` when this process has nothing of its own to do with the events —
+/// // the point is that another one does.
+/// let watching = Broadcast::new(Store::open("runs.db")?, &Ignore);
+/// run_observed(&contract, &OpenRouter::from_env()?, &store, &watching).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Why a decorator
+///
+/// The durable stream is the *same* [`RunEvent`] the inner observer receives, not
+/// a reconstruction assembled from the trace. That is the whole design: a
+/// reconstruction would drift the first time one of the trace's tables gained a
+/// column the event did not, and there is no test that could catch it. Here there
+/// is only one value, written and forwarded, so the two surfaces cannot disagree.
+///
+/// # Why it takes a [`Store`](crate::Store) of its own
+///
+/// [`Observer`] is `Send + Sync`, because one observer serves a whole tree of
+/// concurrent agents. `rusqlite::Connection` is `Send` and **not** `Sync`, so a
+/// `&Store` borrowed from the run cannot live inside one. `Broadcast` therefore
+/// opens its own connection to the same file and holds it behind a `Mutex` —
+/// which is not a workaround so much as the release's own premise: two
+/// connections to one store is exactly what an attaching process does, and
+/// [`Store::open`](crate::Store::open) has set `journal_mode = WAL` and a
+/// [`BUSY_TIMEOUT`](crate::BUSY_TIMEOUT) since 0.12.0 precisely so that works.
+///
+/// It follows that a [`Store::memory`](crate::Store::memory) store cannot be
+/// broadcast usefully: a private in-memory database is not a file a second
+/// connection can open, and there is no second process to read it.
+///
+/// # What it costs
+///
+/// One `INSERT` per event, on the run's own task, because [`Observer::event`] is
+/// synchronous and on the critical path — the same caution the trait's own
+/// documentation gives applies here, and this is the cheapest thing that can be
+/// on it. A run with no `Broadcast` writes nothing at all.
+///
+/// # Failure
+///
+/// An observer is a spectator and `event` returns no `Result`, so a write that
+/// fails is logged at `warn` and dropped rather than taking the run with it. A
+/// reader that must not miss an event should treat a gap in the cursor sequence as
+/// what it is; the run's own durable trace is unaffected either way, and remains
+/// the authority.
+///
+/// [`Flow`] is passed through from the inner observer unchanged: `Broadcast`
+/// records, it does not decide.
+pub struct Broadcast<'a> {
+    store: Mutex<crate::Store>,
+    inner: &'a dyn Observer,
+}
+
+impl<'a> Broadcast<'a> {
+    /// Write every event to `store`, then pass it to `inner`.
+    ///
+    /// `store` is this observer's own connection — open a second one on the same
+    /// path rather than trying to share the run's, for the reason above.
+    pub fn new(store: crate::Store, inner: &'a dyn Observer) -> Self {
+        Self {
+            store: Mutex::new(store),
+            inner,
+        }
+    }
+}
+
+// Written out rather than derived: `Observer` is not `Debug` and requiring it
+// would be a break for every observer already implemented out of tree.
+impl fmt::Debug for Broadcast<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Broadcast").finish_non_exhaustive()
+    }
+}
+
+impl Observer for Broadcast<'_> {
+    fn event(&self, event: &RunEvent) -> Flow {
+        // A poisoned lock means a previous `event` panicked mid-write. The run
+        // must not die of it — recover and keep broadcasting.
+        let store = self
+            .store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = store.put_event(event) {
+            tracing::warn!(run_id = event.run_id, error = %e, "event not broadcast");
+        }
+        drop(store);
+        self.inner.event(event)
     }
 }
 

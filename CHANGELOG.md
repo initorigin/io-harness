@@ -26,6 +26,129 @@ notes are produced from it.
 
 ### Security
 
+## [0.33.0] - 2026-08-02
+
+Two processes, one run.
+
+A run used to belong to the process that started it. `Observer` is an in-process
+callback, so its events existed only where the run did; `resume_*` reattaches to a
+run that has **stopped**. A run left unattended and parked on an approval was
+therefore unreachable — the only way to make progress was to kill the process, at
+which point `resume_with_decision` worked, on a run that was no longer live.
+
+**`Broadcast` makes the stream durable.** It is an `Observer` that wraps another
+one, writes each `RunEvent` to a new `run_events` table and passes it on. Wrap it
+around whatever observer you already have and hand it to any of the fourteen
+`*_observed` entry points; nothing else changes. It is a decorator on purpose: what
+a second process reads back is the *same* value the in-process observer received,
+not a reconstruction assembled from the trace's twenty tables — and a
+reconstruction would drift the first time one of those tables gained a column the
+event did not, with no test able to catch it. The test asserts `RunEvent` equality
+against what the owning observer collected, and its control is a run with no
+`Broadcast`, which must read back empty.
+
+**`Attach` is what a second process opens.** A `&Store` on the same file, a run id
+or a tree's root, and a cursor the caller chooses: from the beginning, `from_now()`,
+or `from_cursor(n)` for a reader that recorded where it was. `poll()` returns what
+is new and advances. `waiting()` reports what the run is parked on — a
+`Waiting::Approval`, a `Waiting::Question` or a `Waiting::Plan`. All three, decided
+explicitly: a pending plan is as much a stopped run as a pending approval is, and
+leaving it out would have made "answer what it is holding" a two-thirds claim.
+
+`answer_approval`, `answer_question` and `answer_plan` write into the same durable
+row the run already writes, and the run — sitting in its `Approver`, `Responder` or
+`PlanGate` — picks it up and carries on. The four gate call sites now write their
+row **before** consulting the in-process gate (the ordering `put_plan` has had since
+0.31.0) and then await the gate and the row together, taking whichever answers
+first.
+
+**First answer wins, and the loser is told.** Each answer returns `bool`: `true` if
+this caller's answer is the one the run acted on. Two operators answering one
+approval stops being hypothetical the moment a run is reachable from more than one
+place, and a harness that lets both writes land and then acts on the second has a
+defect nobody can see. It is a single conditional `UPDATE` in the store rather than
+a read followed by a write — and the run reads the decision back **from the row**,
+in both arms, so what an event and a `policy_events` row report is what the store
+holds rather than what the racing caller proposed.
+
+**An attaching process reads and decides; it does not take ownership.** `Attach` has
+no method that starts, resumes or steps a run, which is the mechanism rather than
+the advice — a source-reading test asserts it, with a control that splices such a
+method in and must name it. The failure modes stay bounded and both are executed
+with real kills: SIGKILL the attached process and the owner runs to completion with
+a stream continuous across the kill; SIGKILL the owner and what is left is exactly
+the unresolved row `resume_with_decision` has consumed since 0.7.0.
+
+**No new dependency and no migration.** `cargo tree` still reads 402 lines: the
+transport is the SQLite store both processes already open, the wait is
+`tokio::time`, the race is `tokio::select!`. And `Store::open` has set
+`journal_mode = WAL` and a five-second `BUSY_TIMEOUT` since 0.12.0, so two
+connections to one file needs no on-disk change at all — `CHECKPOINT_FORMAT` stays
+7 and a 0.32.0 binary reads a 0.33.0 store without ever naming the new table.
+
+### Breaking changes
+
+- **BREAKING** — `Store::resolve_pending`, `Store::answer_question` and
+  `Store::decide_plan` return `Result<bool>` instead of `Result<()>`. The bool is
+  whether *this* call is the one that landed, which is what makes the race
+  decidable instead of silent. The last two also return `Ok(false)` where they used
+  to return `Err(Error::Resume)` for an already-answered row: losing a race is a
+  fact about the race, not an error. A row that does not exist is still an error.
+  *Migration:* a caller writing `store.answer_question(id, a, by)?;` as a statement
+  recompiles unchanged. A caller matching on the already-answered error moves to
+  the bool:
+
+  ```rust
+  // was
+  if store.answer_question(id, answer, "human").is_err() { /* already answered */ }
+  // now
+  if !store.answer_question(id, answer, "human")? { /* somebody else got there first */ }
+  ```
+
+  `resume_with_answer` and `resume_with_plan_decision` still refuse a second answer
+  with `Error::Resume`, and `resume_with_decision` now refuses an
+  already-decided request the same way. Driving a run twice from two answers is a
+  different thing from writing one, and only the write path returns a bool.
+
+### Added
+
+- `Broadcast`, an `Observer` decorator that writes every event it forwards to the
+  store. It takes a `Store` of its own — `Observer` is `Send + Sync` and
+  `rusqlite::Connection` is `Send` and not `Sync` — which is the release's own
+  premise rather than a workaround: two connections to one file is exactly what
+  attaching is.
+- `Attach` and `Waiting`, in a new `attach` module, plus `POLL_LIMIT`.
+- `Store::put_event`, `Store::events_since`, `Store::tree_events_since`,
+  `Store::event_cursor` and `Store::unresolved_approvals`.
+- A `run_events` table and its `(run_id, id)` index. Additive, `CHECKPOINT_FORMAT`
+  still 7. `id` is `AUTOINCREMENT` so the cursor is globally monotonic and one
+  number orders a whole tree's interleaved stream; `kind` is denormalised out of
+  the JSON so a reader can filter without deserialising, and is deliberately in no
+  index — it is the control column the query-plan test needs.
+- `run::ATTACH_POLL`, the interval at which a parked run checks whether a second
+  process answered for it. 200 ms, and never reached at all when the in-process
+  gate answers, so an unattended run pays nothing for a feature it is not using.
+- `examples/attach_fixture`, a deterministic offline run that parks *live* in a
+  gate that never returns — unlike `crash_fixture`, `plan_gate_fixture` and
+  `fleet_fixture`, which park after the run has stopped.
+
+### Changed
+
+- The durable row for an approval and for a question is written before the
+  in-process gate is consulted rather than after it. A row now exists for approvals
+  that were answered instantly, so "a `pending_approvals` row exists" no longer
+  means "the run is waiting" — read `Store::unresolved_approvals`, which
+  `Attach::waiting` uses.
+- `pending_questions.answered_by` and `plans.decided_by` carry `attached` when the
+  answer came from a second process, against `responder` / `gate` for the
+  in-process arm, so an audit can tell which.
+- Reading a tree's event tail is `CROSS JOIN ... INDEXED BY`, not a plain join, for
+  the reason 0.32.0's queue read is. Left to itself the planner drives from
+  `run_events` by rowid — every tree's events from the cursor forward — and probes
+  the recursive CTE through an automatic index it has to build, because a CTE is a
+  co-routine it cannot seek into. Measured over 40 trees of 40 events: 0.093 ms
+  seeking against 0.179 ms, and the gap grows with the number of trees in the file.
+
 ## [0.32.0] - 2026-08-02
 
 A fleet holds the ceiling instead of hitting it.

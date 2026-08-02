@@ -1,401 +1,342 @@
 product: io-harness
-version: 0.32.0
+version: 0.33.0
 tasks:
-- id: US-IO-HARNESS-0.32.0-T01
-  summary: 'Split the two caps in `Containment` and give `Ledger` a per-tier FIFO admission queue: `max_concurrent`
-    becomes `max_concurrent_agents`, one `tokio::sync::Semaphore` per tier, and per-tier working/queued/done
-    counters behind the new `FleetTally`.'
-  why_required: Every other task calls this API. Until the ledger can admit, queue and count, `spawn_child`
-    has nothing to wait on and the observer has nothing to report — and the rename is the release's
-    one break, so it lands first and everything downstream is written against the final name.
+- id: US-IO-HARNESS-0.33.0-T01
+  summary: 'The durable event stream: a `run_events` table and its `(run_id, id)` index, `Store::put_event`
+    / `events_since` / `tree_events_since` / `event_cursor`, and `observe::Broadcast` — the `Observer`
+    decorator that writes the same `RunEvent` it passes on. The tree read is written `FROM tree CROSS
+    JOIN run_events INDEXED BY run_events_run` from the first line, not corrected later.'
+  why_required: Nothing a second process can see exists until the events are durable, and every later
+    task reads them back. Writing the tree query the wrong way first and fixing it after is how the recursive-CTE
+    trap gets shipped.
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**F2 — the total cap still refuses, and the two caps are independent.** `max_total_agents: 8` with
-    `max_concurrent_agents: 64` refuses at eight; `max_total_agents: 200` with `max_concurrent_agents:
-    1` refuses nothing and runs strictly one child at a time (measured peak exactly one). Two named
-    tests. A single test moving both numbers together could not tell which cap produced the behaviour.
+  - '**F1 — the attached stream is the same stream, not a reconstruction.** A run executes under `Broadcast::new(&store,
+    &recorder)` where `recorder` collects every `RunEvent`. A reader opened on the same store afterwards,
+    with `Attach::to(&store, run_id)` at cursor 0, must return a `Vec<RunEvent>` **equal** to what `recorder`
+    collected — `assert_eq!` on the values, since `RunEvent` is `PartialEq`, not a comparison of lengths
+    or of tags. Its negative control is a run under the bare `recorder` with no `Broadcast`: the attached
+    read must return empty, proving the equality above was not satisfied by a reader that reconstructs
+    events from the trace.
 
     '
-  - '**N1 — no new dependency.** `cargo tree` on macOS and Linux still reads 402 lines. The queue is
-    `tokio::sync::Semaphore`, which the `sync` feature already in `Cargo.toml` provides, and one SQLite
-    table.
+  - '**N3 — the tail read is an index seek per run, not a scan of the event log.** `EXPLAIN QUERY PLAN`
+    for `Store::tree_events_since` must name `run_events_run` for the `run_events` access and must **not**
+    contain `SCAN run_events`. The control statement filters on `kind`, a column in no index at all —
+    not merely absent from a left prefix, because SQLite skip-scans a trailing composite column — and
+    must not use `run_events_run`. The measured numbers over 200 trees × 100 events are recorded in the
+    release record; no wall-clock threshold is asserted, for the reason 0.30.0''s N2 recorded.
 
     '
-  - '**N4 — the break is exactly one, and it is in the changelog with a migration.** `Containment::max_concurrent`
-    becomes `max_concurrent_agents`. A caller who wrote a struct literal renames one field; a caller
-    who deserialises stored configuration changes nothing, because `#[serde(alias = "max_concurrent")]`
-    keeps the old key readable. `EventKind` gains a variant, which is free under its `#[non_exhaustive]`.
-    No public item is removed, so no deprecation cycle is owed. `tests/changelog.rs` and `tests/public_api.rs`
-    both pass.
-
-    '
-  - '**N5 — every added public item carries a worked example**, enforced by the existing surface test:
-    `FleetTally` and the renamed field both appear in compiling doctests.
-
-    '
-  - '**N6 — the wait graph is acyclic by construction, stated where a reader will find it.** The per-tier
-    semaphore and the reason for it are documented on `Containment::max_concurrent_agents` and in `docs/CONTRACT.md`,
-    including the honest consequence: the ceiling is per tier, so a tree of depth *d* can hold up to
-    `max_concurrent_agents * d` agents working at once. A reader must not have to derive that from the
-    source.
-
-    '
-  files:
-  - src/containment.rs
-  - src/lib.rs
-  - src/run.rs
-  - src/observe.rs
-  evidence:
-  - '`Containment::max_concurrent` is now `max_concurrent_agents`, carrying `#[serde(alias = "max_concurrent")]`.
-    `a_stored_config_written_before_the_rename_still_loads` deserializes a 0.31.0 JSON body and reads
-    7 back out of the new field, so the break costs a struct literal one rename and costs a stored configuration
-    file nothing.'
-  - '`Ledger` gained one `tokio::sync::Semaphore` per tier — `MAX_TIERS` clamps the allocation at 64
-    so a `max_depth` of `u32::MAX` cannot be a denial of service written by the API — plus `try_admit`,
-    `admit`, `mark_queued`, `restore_queue` and the public `tally`. `register_agent` is untouched and
-    still refuses on the total, depth and budget caps only; `the_concurrency_cap_queues_where_the_total_cap_refuses`
-    asserts both halves in one test: `try_admit` returns `None` while `register_agent` returns `Ok`.'
-  - 'The deadlock argument is executed rather than written down. `each_tier_holds_its_own_slots` fills
-    tier 1 with the single available slot and then admits at tier 2; a tree-global pool returns `None`
-    there and the tree hangs. `a_queued_child_waits_and_then_runs` drives the real async path: the waiter
-    stays queued across a `yield_now` while the slot is held, is admitted the moment it is dropped,
-    and the tally moves working -> done on `AgentSlot::drop` rather than on a happy-path call.'
-  - 'Negative control for the release''s load-bearing distinction: `mark_queued` was sabotaged to ignore
-    its `newly_recorded` flag and count every re-queue. `a_restored_backlog_is_not_counted_twice_by_the_replay`
-    failed by name and the other nine tests passed, which is what shows the assertion discriminates
-    a restored depth from a re-derived one rather than merely being present.'
-  - '`FleetTally` is exported from `src/lib.rs` with a worked example; the crate-root prose about composition
-    now names both caps and says which one queues.'
-- id: US-IO-HARNESS-0.32.0-T02
-  summary: 'Make the queue durable: an `agent_queue` table keyed uniquely by `(parent_run_id, step,
-    goal)`, `Store::enqueue_agent` / `dequeue_agent` / `queued_agents`, and the indexed read that answers
-    a tree''s backlog in FIFO order.'
-  why_required: A backlog that lives only in a dead process's memory is not a backlog anyone can act
-    on. This is also the release's only schema change, so it lands before the code that writes to it
-    and the cross-version evidence is taken against something that has stopped moving.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.32.0-T01
-  acceptance_criteria:
-  - '**N2 — reading a tree''s backlog is an indexed lookup per parent, not a scan of the queue.** `EXPLAIN
-    QUERY PLAN` for `Store::queued_agents` must name `agent_queue_entry` for the `agent_queue` access,
-    with a control statement filtering on `goal` alone — not a left prefix of that index — which must
-    not use it. The cost''s shape is one index seek per run in the tree plus the recursive walk of `runs`
-    the tree queries already pay, and the measured wall time at the backlog sizes this release cares
-    about is recorded in the record rather than asserted, for the reason 0.30.0''s N2 recorded: a wall-clock
-    threshold is flaky on a loaded runner and green on a fast one running a full scan.
-
-    '
-  - '**F9 — cross-version compatibility, both directions.** A database written by a real 0.31.0 build
-    opens, resumes and replays under 0.32.0 with nothing to migrate; and a 0.32.0 store carrying `agent_queue`
-    rows is read by a 0.31.0 build, which never names the table. Proven with the pinned-generator technique
-    `tests/cross_version.rs` already uses. The 0.22.0 schema guard is fed `agent_queue` and `agent_queue_entry`
-    by name.
+  - '**N4 — the durable stream costs one INSERT per event and nothing when it is not asked for.** A run
+    with no `Broadcast` writes zero `run_events` rows, asserted. A run with one writes exactly as many
+    rows as its observer received events, asserted by count against the recorder.
 
     '
   files:
   - src/state.rs
-  - tests/cross_version.rs
+  - src/observe.rs
+  - src/lib.rs
+  - tests/attach.rs
   evidence:
-  - '`agent_queue` lands beside `plans` — `(parent_run_id, step, goal, depth, queued_at)` with a UNIQUE
-    index `agent_queue_entry` on the same `(parent_run_id, step, goal)` key `spawns` is adopted by.
-    `CHECKPOINT_FORMAT` does not move: a 0.31.0 binary never names the table, so bumping it would make
-    `check_resumable` refuse a database that is in fact readable. Both objects are declared in `ADDED_SINCE_0_22_0`,
-    which the 0.22.0 schema guard requires by name.'
-  - '`Store::enqueue_agent` returns whether the row is new — `INSERT OR IGNORE` against the unique index
-    — which is what lets the ledger tell a fresh wait from a replayed one without guessing. `a_replayed_wait_reuses_its_row_rather_than_adding_one`
-    asserts the second and third enqueue of the same key return `false` and leave one row, while a different
-    step or a different goal is a different wait.'
-  - 'N2, and it moved the implementation. The natural `FROM agent_queue q JOIN tree` reads `SCAN q`:
-    a recursive CTE is a co-routine SQLite cannot seek into, so the planner scans every tree''s backlog
-    and probes the CTE instead. `queued_agents` is `FROM tree CROSS JOIN agent_queue q INDEXED BY agent_queue_entry`,
-    and `reading_a_backlog_reaches_its_rows_through_an_index` asserts the plan contains `SEARCH q USING
-    INDEX agent_queue_entry` over a 32-tree fixture. Measured over 200 trees of 100 waiting children:
-    0.057 ms seeking against 0.593 ms scanning, a 10x difference that only appears once the file holds
-    more than one tree.'
-  - 'Deviation from N2 as written, stated rather than quietly worked around: the criterion named a control
-    filtering on `goal` alone. `goal` is the index''s last column and SQLite still uses the index for
-    it, skip-scanning `ANY(parent_run_id) AND ANY(step) AND goal=?` — a full read wearing an index''s
-    name. The control is `queued_at`, which is in no index at all and therefore genuinely cannot use
-    one. The criterion''s substance (a control that proves the check discriminates an index from a scan)
-    is met; its example column was wrong.'
-  - '`a_queued_child_has_no_run_and_therefore_no_spend` asserts the charge claim against the durable
-    rows: with one admitted child that spent 250 tokens and one waiting, `children` holds exactly the
-    admitted run, `queued_agents` holds exactly the waiting goal, `spent_tokens_tree` is 250 and `agent_count_tree`
-    is 2. Three doctests on `enqueue_agent`, `dequeue_agent` and `queued_agents` cover the FIFO order,
-    the reach into the tree, and the idempotent delete the never-queued fast path calls.'
-- id: US-IO-HARNESS-0.32.0-T03
-  summary: Wire admission into `spawn_child` for fresh and adopted children alike, widen the per-step
-    `buffered()` so the tree-wide throttle is the only bound, emit `EventKind::Fleet` per tier, and
-    restore the backlog from the store on resume before the provider is touched.
-  why_required: 'This is the release: without it the ledger throttles nothing, the store rows are never
-    written, and the counters never reach an observer. The resume path is also where `record_run_policy`
-    was never called, and this task is already inside that function.'
+  - '`run_events (id AUTOINCREMENT, run_id, step, depth, kind, json, at)` plus `run_events_run ON (run_id,
+    id)` in `Store::open`''s migration chain; `CHECKPOINT_FORMAT` unmoved at 7.'
+  - '`observe::Broadcast` is an `Observer` decorator over `Mutex<Store>` and `&dyn Observer`; it writes
+    `serde_json::to_string(event)` of the value it is forwarding, so the durable stream cannot drift from
+    the in-process one.'
+  - 'F1 green: `an_attached_reader_gets_the_same_events_the_in_process_observer_got` compares the attached
+    read against the recorder with `assert_eq!` on `Vec<RunEvent>`. Its control `without_a_broadcast_an_attached_reader_sees_nothing`
+    is green too.'
+  - 'N3 green: `state::tests::the_tree_event_tail_seeks_rather_than_scanning_every_trees_events` EXPLAINs
+    `TREE_EVENTS_SQL` itself (a `const`, not a re-typed copy) and requires `INDEX run_events_run` and
+    no `SCAN run_events`. Two controls: `kind` (in no index) must not use the index, and the same query
+    with a plain join must build an `AUTOMATIC COVERING INDEX (id=?)` instead. Measured over 40 trees
+    x 40 events: 0.093 ms forced, 0.179 ms naive.'
+  - 'N4 green: `broadcasting_writes_one_row_per_event_and_nothing_without_it`.'
+  - 'Sabotage S3 — `Broadcast` writes a synthesised `Stalled` instead of the event it forwards: 5 named
+    tests fail, F1 among them.'
+- id: US-IO-HARNESS-0.33.0-T02
+  summary: 'The read-and-decide surface: `src/attach.rs` with `Attach` (per run and per tree, cursor from
+    zero / from now / from a caller''s id), `Waiting`, and `Store::unresolved_approvals` behind it. No
+    method that starts, resumes or steps a run, with a source-reading test that proves it.'
+  why_required: This is the type the outcome names. The ownership boundary is enforced by what the type
+    does not have, so the type has to exist before the boundary can be tested.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.32.0-T02
+  - US-IO-HARNESS-0.33.0-T01
   acceptance_criteria:
-  - '**F1 — the concurrency cap throttles and does not refuse.** A 120-child fan-out under `Containment
-    { max_total_agents: 200, max_concurrent_agents: 8, .. }`: all 120 children run to completion, `store.children(root)`
-    holds 120 rows, no `EventKind::SpawnRefused` is emitted, and an in-flight probe''s measured peak
-    is greater than one and never above eight. Its negative control is the same fan-out under `max_total_agents:
-    8`, which must refuse 112 spawns with `SpawnRefusal::AgentCap` — without it the test would pass
-    against a harness that had simply stopped enforcing anything.
+  - '**F2 — the cursor is the caller''s to choose, and it advances.** Three named tests over one run:
+    `Attach::to` from 0 returns the whole backlog; `Attach::to(..).from_now()` returns nothing already
+    emitted and then returns exactly the events emitted after it was constructed; `from_cursor(n)` returns
+    exactly the events with id greater than `n`. After each `poll`, `cursor()` equals the id of the last
+    event returned, and a second `poll` with no new events returns empty rather than repeating.
 
     '
-  - '**F5 — a replayed spawn does not double the backlog.** After the resume in F4 completes, no two
-    `agent_queue` rows share a `(parent_run_id, step, goal)` — structurally impossible under the unique
-    index, so the assertion is on the *counter*: the ledger''s queued tally after the replay equals
-    the restored depth rather than twice it. The re-queue path is what is being tested, and it is the
-    one place where "restored" and "re-derived" produce different numbers.
+  - '**F8 — ownership cannot be taken, structurally.** A source-reading test over `src/attach.rs`, in
+    the technique `tests/public_api.rs` has used since 0.16.0: no `impl` block on `Attach` may name `run_`,
+    `resume_` or `Provider`. Its control is the same check run against a copy of the source with one such
+    method spliced in, which must fail and name it — a check that passes immediately has not been shown
+    to discriminate.
 
     '
-  - '**F6 — the counters reach the observer per tier and are internally consistent.** A recording `Observer`
-    over a two-tier fan-out receives `EventKind::Fleet` for tier 1 and tier 2 with distinct `tier` values;
-    for every event, `working` never exceeds `max_concurrent_agents`; and the final event for each tier
-    has `queued == 0` and `done` equal to the number of children that tier ran. The last one is what
-    catches a counter that is decremented on the happy path only.
+  files:
+  - src/attach.rs
+  - src/state.rs
+  - src/lib.rs
+  - tests/attach.rs
+  evidence:
+  - '`src/attach.rs`: `Attach::{to, to_tree, from_now, from_cursor, cursor, poll, waiting, answer_approval,
+    answer_question, answer_plan}`, `Waiting` (`#[non_exhaustive]`, three variants), `POLL_LIMIT`, and
+    `Store::unresolved_approvals`.'
+  - 'F2 green across four named tests: backlog from zero, `from_now` skipping it, `from_cursor` resuming
+    exactly there, and a tree reader seeing its child''s events interleaved by the globally monotonic
+    cursor.'
+  - 'F8 green: `attach_has_no_method_that_drives_a_run` reads `src/attach.rs` (line-endings normalised
+    for the CRLF checkout) and requires no `pub fn` starting `run`/`resume`/`step`. Its control `the_no_driving_check_catches_a_driving_method`
+    splices one in and asserts the checker names it.'
+  - '`waiting()` filters on unresolved rather than on the row existing, proven by `waiting_excludes_everything_that_has_been_answered`
+    — load-bearing since the approval row is now written before the gate.'
+- id: US-IO-HARNESS-0.33.0-T03
+  summary: First answer wins, by compare-and-swap. `Store::resolve_pending`, `Store::answer_question`
+    and `Store::decide_plan` become a single conditional `UPDATE` returning `Result<bool>`; the read-then-write
+    in the last two, which two processes interleave through, is removed. `Attach`'s three answer methods
+    return that bool.
+  why_required: Silent double-answering is the defect class the release exists to prevent, and two of
+    the three write paths had it before the release started. Every later task depends on the run being
+    able to ask the store who won.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.33.0-T02
+  acceptance_criteria:
+  - '**F5 — first answer wins, and the loser is told.** Two `Attach` handles over one store answer the
+    same `request_id`. Exactly one returns `true` and the other `false` — `assert_ne!(a, b)` plus `assert!(a
+    || b)`, so a mechanism that answered `true` twice or `false` twice fails. The decision the run acts
+    on must be the winner''s, asserted from the run''s own reported outcome and not from either caller''s
+    return value. The same test exists for a question and for a plan, because the three had three different
+    write shapes before this release and two of them were read-then-write.
 
     '
-  - '**F7 — `EVENT_NAMES` still equals the enum.** The census test in `src/observe.rs` passes with `Fleet`
-    added, and `every_kind()` still produces one of every tag and no others. The added variant makes
-    that test fail unless `EVENT_NAMES` gains its entry, which is the point of it.
+  - '**N5 — the breaks are exactly three, all in `Store`, and all in the changelog.** `resolve_pending`,
+    `answer_question` and `decide_plan` return `Result<bool>` instead of `Result<()>`, and the last two
+    return `Ok(false)` where they used to return `Err(Error::Resume)` for an already-answered row. A caller
+    writing `store.answer_question(id, a, by)?;` as a statement recompiles unchanged; a caller matching
+    on the error must move to the bool. No public item is removed. `CompletionRequest` and `CompletionResponse`
+    are untouched, so no `E0639` is owed. `tests/changelog.rs` and `tests/public_api.rs` both pass.
 
     '
-  - '**F8 — an adopted child takes a slot.** A tree resumed with one mid-flight child and a `max_concurrent_agents`
-    of one: the adopted child runs, and the fresh siblings queue behind it rather than running alongside
-    it. Without this the throttle would be a different number before and after a restart, which is the
-    failure a durable queue exists to prevent.
+  files:
+  - src/state.rs
+  - src/run.rs
+  - src/attach.rs
+  - tests/attach.rs
+  evidence:
+  - '`Store::resolve_pending` / `answer_question` / `decide_plan` are each one conditional `UPDATE` returning
+    `Result<bool>`. The read-then-write in the last two, which two processes interleave through, is gone.'
+  - 'F5 green in three named tests, one per gate: `assert_ne!(first, second)` plus `assert!(first || second)`,
+    and the stored value is the first writer''s.'
+  - '`an_attached_process_cannot_defer` — deferring from an attached process is an error and writes nothing.'
+  - 'N5: exactly three signature breaks, all on `Store`, all `Result<()>` to `Result<bool>`. `resume_with_answer`
+    and `resume_with_plan_decision` still refuse a second answer with `Error::Resume` (`tests/question.rs::answering_the_same_question_twice_is_an_error`
+    green), because driving a run twice is a different thing from writing once.'
+  - 'Sabotage S2 — the three `WHERE ... resolved` guards removed: 8 named tests fail across `tests/attach.rs`.
+    The 448 lib unit tests still pass, which is why the integration controls exist.'
+- id: US-IO-HARNESS-0.33.0-T04
+  summary: 'The wait becomes answerable at all four places a live run parks: the write/exec approval in
+    `gate_path`, the network authorization in `authorize_net`, `ask_question` and `propose_plan`. The
+    durable row moves ahead of the in-process gate, the run awaits the gate and the store row together
+    with `tokio::select!`, and the decision it reports is read back from the row in both arms.'
+  why_required: Without this the store rows are a place to write an answer nothing reads. This is the
+    whole of 'a second process can answer the thing it is holding'.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.33.0-T03
+  acceptance_criteria:
+  - '**F3 — a second process answers a live approval and the owner carries on.** `examples/attach_fixture`
+    starts a run under an `Approver` that never returns, prints its run id, and does not exit. The test
+    opens the store file in its own process, attaches, waits for `Waiting::Approval` to appear, calls
+    `answer_approval(request_id, Decision::approve())` and reads the fixture''s exit. The fixture must
+    exit 0 having completed the write it was asking about, without being killed and without any `resume_*`
+    call. The discriminating assertion is that the fixture''s own stdout reports the decision it acted
+    on, and that it says `approve` — the same test run with `Decision::deny` must see `deny`, so a fixture
+    that ignores the answer and proceeds fails one of the two.
 
     '
-  - '**N3 — enqueue and admit cost one statement each, and neither is on the per-step path.** A child
-    that is admitted immediately writes nothing: the `agent_queue` row exists only for a child that
-    actually waits. Asserted by running a fan-out that never queues and requiring `agent_queue` to be
-    empty throughout and afterwards.
+  - '**F4 — a live question and a live plan are answerable too, and the plan is not an omission.** Two
+    more named tests over the same fixture shape: a run parked in `ask_question` is answered by `Attach::answer_question`
+    and the answer text reaches the model as the observation the in-process `Responder` path produces;
+    a run parked in `propose_plan` is answered by `Attach::answer_plan(plan_id, PlanVerdict::Approve)`
+    and the run leaves its planning phase and writes. Both assert the run continued in the *same* process,
+    never resumed.
+
+    '
+  - '**F9 — the reported decision comes from the store row, in both arms.** After the race resolves, the
+    emitted `EventKind::ApprovalDecided` and the `policy_events` row are built from a fresh `Store::pending(request_id)`
+    read, not from the value the race returned. Asserted by answering with an approval that the store
+    then holds and requiring the event to carry it, and — the part that discriminates — by running the
+    same assertion on the **fast path**, where the in-process `Approver` answers immediately and the store
+    poll never fires. A read that only exists in the attached arm passes the first and fails the second.
 
     '
   files:
   - src/run.rs
-  - src/observe.rs
+  - src/attach.rs
+  - examples/attach_fixture.rs
+  - tests/attach.rs
   evidence:
-  - '`spawn_child` is restructured around admission. The spawn-or-adopt lookup now decides only what
-    kind of spawn this is; the containment refusal still runs ahead of admission, so a child the tree
-    will never let exist does not first spend time in a queue; and admission sits between that decision
-    and the child''s first store write, which is what makes "queued and never started" mean "no run
-    row, no step rows, no tokens". Adopted children take a slot too, so the throttle is the same number
-    before and after a restart.'
-  - The slot is released with `drop(slot)` placed before the `?` on `run_agent` and before both early
-    returns, so a child that finished, a child that paused on a human and a child whose error is propagating
-    all free the slot and report the tier. A release on the happy path only is a fleet that stops draining
-    the first time something goes wrong.
-  - 'The per-step `.buffered(max_c)` becomes `.buffered(spawn_calls.len())`. That width was the old
-    cap''s only teeth and it was a property of one parent''s step: two parents fanning out at once got
-    twice the concurrency they asked for, and a child past the width was never queued — it just did
-    not start, invisibly. Every spawn now reaches the ledger. `children_are_composed_in_spawn_order_not_completion_order`
-    still passes, so `buffered` rather than `buffer_unordered` still holds the determinism 0.12.0 bought.'
-  - '`EventKind::Fleet { tier, working, queued, done }` is emitted on enqueue, on admission and on completion,
-    attributed to the parent''s run and the parent''s own `depth` with the tier in the payload — so
-    `RunEvent::depth` keeps meaning "who emitted this" everywhere. `EVENT_NAMES` gained `"fleet"` and
-    the source-reading census in `src/observe.rs` passes; `every_kind()` produces one of every tag and
-    no others.'
-  - Three tree-resume sites shared four lines of ledger restoration; they now share `restore_tree_ledger`,
-    which also reads the backlog back and seeds the ledger with it, and `emit_backlog`, which reports
-    it. In `resume_tree_observed` the backlog reaches the observer after `Started` and before `authorize_provider`,
-    so it is emitted before the provider is authorised, let alone called.
-  - 'The standing defect is fixed while this release was already in the function: `resume_tree_observed`
-    now calls `record_run_policy`, recording the caller''s policy before the provider layer is merged
-    in, exactly as `run_tree_observed` has always done. A tree resumed in a second process previously
-    left no record of the boundary it was actually resumed under.'
-  - '`cargo clippy --all-targets --all-features -- -D warnings` is clean (the `type_complexity` warning
-    the two-value return raised is resolved by the `Backlog` alias, not by allowing the lint), and all
-    14 existing `tests/subagents.rs` tests pass unchanged — including `concurrent_fanout_to_over_100_stays_bounded_and_completes`,
-    whose 120-child fan-out under a cap of 16 now runs through the tier queue and still measures a peak
-    at or below 16.'
-- id: US-IO-HARNESS-0.32.0-T04
-  summary: 'The evidence: `examples/fleet_fixture` for a real SIGKILL with a non-empty queue, and the
-    tests that read the backlog back — including the deletion that discriminates a restored depth from
-    a re-derived one, and the spend-row assertion that a queued child was never charged.'
-  why_required: Every outcome assertion in this release passes whether the queue was restored or silently
-    rebuilt from the replayed spawn calls. Without the absence assertion the durability claim is unproven,
-    and an unproven durability claim is the one this contract must not make.
+  - '`race_gate` in `src/run.rs`: `tokio::select!` with `biased;` over the gate future and a `tokio::time::sleep(ATTACH_POLL)`
+    store poll. `Some(v)` is the gate''s answer, `None` carries no value on purpose so a caller cannot
+    report an attached answer it has not read from the store.'
+  - 'All four sites converted: `gate_path`''s `Effect::Ask`, `authorize_net`, `ask_question` and `propose_plan`.'
+  - 'F3 green both ways: `an_attached_process_answers_a_live_approval_and_the_run_finishes` runs the same
+    fixture with approve and with deny; the fixture''s stdout must report the decision it acted on and
+    the file must follow it. It is never killed and never resumed.'
+  - 'F4 green: `an_attached_process_answers_a_live_question` and `an_attached_process_answers_a_live_plan`,
+    each asserting `answered_by`/`decided_by` is `attached` — the row names who actually won, not who
+    was asked.'
+  - 'F9 proven by two sabotages. S1 — the event reports the raced value rather than the row: 4 named tests
+    fail. S1b — the row is read only in the ATTACHED arm and the fast path reports its own value: `tests/policy.rs::approve_all_proceeds_where_deny_all_does_not`
+    fails, which is the fast-path half the criterion asked for.'
+  - 'Sabotage S4 — the row written after the gate (the 0.32.0 ordering), no race: 5 named tests fail.'
+- id: US-IO-HARNESS-0.33.0-T05
+  summary: 'The bounded failure modes, executed: SIGKILL the attaching process and the owner runs to completion
+    with a stream continuous across the kill; SIGKILL the owner and what is left is exactly the unresolved
+    row `resume_with_decision` has consumed since 0.7.0.'
+  why_required: '''The failure modes are bounded'' is the outcome''s central claim and the one most easily
+    believed without evidence. Both halves are kills, not assertions on paper.'
   status: done
   depends_on:
-  - US-IO-HARNESS-0.32.0-T03
+  - US-IO-HARNESS-0.33.0-T04
   acceptance_criteria:
-  - '**F1 — the concurrency cap throttles and does not refuse.** A 120-child fan-out under `Containment
-    { max_total_agents: 200, max_concurrent_agents: 8, .. }`: all 120 children run to completion, `store.children(root)`
-    holds 120 rows, no `EventKind::SpawnRefused` is emitted, and an in-flight probe''s measured peak
-    is greater than one and never above eight. Its negative control is the same fan-out under `max_total_agents:
-    8`, which must refuse 112 spawns with `SpawnRefusal::AgentCap` — without it the test would pass
-    against a harness that had simply stopped enforcing anything.
+  - '**F6 — the observer dying changes nothing.** The attaching process is SIGKILLed while polling a live
+    fixture run. The fixture then receives an answer from a *third* process and completes normally, and
+    the event stream the third process reads is continuous across the kill — no gap in `id`, no duplicate.
+    Nothing about the owner''s run row, step rows or outcome differs from the same run with no observer
+    ever attached, asserted by comparing the two runs'' `steps` rows.
 
     '
-  - '**F2 — the total cap still refuses, and the two caps are independent.** `max_total_agents: 8` with
-    `max_concurrent_agents: 64` refuses at eight; `max_total_agents: 200` with `max_concurrent_agents:
-    1` refuses nothing and runs strictly one child at a time (measured peak exactly one). Two named
-    tests. A single test moving both numbers together could not tell which cap produced the behaviour.
-
-    '
-  - '**F3 — a queued child is not charged.** After a fan-out is killed mid-flight with the queue non-empty:
-    every goal named in `Store::queued_agents` has no row in `runs` — asserted as a set difference against
-    `Store::children`, so a queued goal appearing there fails — and `Store::spent_tokens_tree` equals
-    the sum of the `steps.tokens` rows of the children that actually started, computed independently
-    in the test. Asserted against the spend rows, not against the ledger counter, because the counter
-    and the rows are two different claims and only the rows outlive the process.
-
-    '
-  - '**F4 — the queue survives a real restart at the depth it had, and the depth comes from the store.**
-    `examples/fleet_fixture` runs a fan-out under `max_concurrent_agents: 1` whose admitted child parks
-    forever, then parks itself; the test kills it with SIGKILL and opens the store in its own process.
-    `Store::queued_agents` returns the waiting children, at their tier, in the order they queued.
-
-    The discriminating assertion is an absence. Before resuming, the test deletes exactly one `agent_queue`
-    row. The resumed run''s first `EventKind::Fleet` must report a backlog one smaller than the fixture
-    left — and it must arrive before the resumed provider has been handed a single `CompletionRequest`.
-    A depth silently re-derived from the replayed spawn calls would be unchanged by the deletion and
-    could not exist before the first provider call; both facts are asserted, because either alone passes
-    on a re-derivation.
-
-    '
-  - '**F5 — a replayed spawn does not double the backlog.** After the resume in F4 completes, no two
-    `agent_queue` rows share a `(parent_run_id, step, goal)` — structurally impossible under the unique
-    index, so the assertion is on the *counter*: the ledger''s queued tally after the replay equals
-    the restored depth rather than twice it. The re-queue path is what is being tested, and it is the
-    one place where "restored" and "re-derived" produce different numbers.
-
-    '
-  - '**F6 — the counters reach the observer per tier and are internally consistent.** A recording `Observer`
-    over a two-tier fan-out receives `EventKind::Fleet` for tier 1 and tier 2 with distinct `tier` values;
-    for every event, `working` never exceeds `max_concurrent_agents`; and the final event for each tier
-    has `queued == 0` and `done` equal to the number of children that tier ran. The last one is what
-    catches a counter that is decremented on the happy path only.
-
-    '
-  - '**F8 — an adopted child takes a slot.** A tree resumed with one mid-flight child and a `max_concurrent_agents`
-    of one: the adopted child runs, and the fresh siblings queue behind it rather than running alongside
-    it. Without this the throttle would be a different number before and after a restart, which is the
-    failure a durable queue exists to prevent.
-
-    '
-  - '**F9 — cross-version compatibility, both directions.** A database written by a real 0.31.0 build
-    opens, resumes and replays under 0.32.0 with nothing to migrate; and a 0.32.0 store carrying `agent_queue`
-    rows is read by a 0.31.0 build, which never names the table. Proven with the pinned-generator technique
-    `tests/cross_version.rs` already uses. The 0.22.0 schema guard is fed `agent_queue` and `agent_queue_entry`
-    by name.
-
-    '
-  - '**N3 — enqueue and admit cost one statement each, and neither is on the per-step path.** A child
-    that is admitted immediately writes nothing: the `agent_queue` row exists only for a child that
-    actually waits. Asserted by running a fan-out that never queues and requiring `agent_queue` to be
-    empty throughout and afterwards.
+  - '**F7 — the owner dying leaves exactly the resumable run 0.7.0 guaranteed.** The fixture is SIGKILLed
+    while parked on an approval. The store then holds an unresolved `pending_approvals` row, and `resume_with_decision(request_id,
+    Decision::approve())` completes the run — the exact 0.7.0 path, unchanged. The discriminating assertion
+    is an absence, in the shape 0.31.0''s F-gate should have used: the row must be *unresolved*, checked
+    before the resume, because a run whose pending row was resolved up front by the new write-before-gate
+    ordering and then abandoned would resume into a decision nobody made.
 
     '
   files:
-  - examples/fleet_fixture.rs
-  - tests/fleet.rs
-  - tests/cross_version.rs
+  - examples/attach_fixture.rs
+  - tests/attach.rs
   evidence:
-  - '`examples/fleet_fixture` is shaped so the kill lands with the queue full and keeps it full: one
-    slot per tier, five children asked for in one step, and the child that wins the slot commits one
-    real 90-token step and then parks forever. Verified against the store while it ran — two `runs`
-    rows (the root and child-0), four `agent_queue` rows for child-1..4, and one `steps` row.'
-  - 'Nine tests in `tests/fleet.rs`, ten with the fast-path case. F1 (120 children under a cap of 8:
-    all 120 ran, zero refusals, measured peak 2..=8) is paired with its control (the same fan-out under
-    `max_total_agents: 8` refuses 113 spawns with cap `agents`), and F2 adds the independent axis (`max_total_agents:
-    200` with concurrency 1: nothing refused, measured peak exactly 1).'
-  - 'F3 asserts the charge claim against the durable rows after a real SIGKILL: `children` holds one
-    run, `queued_agents` holds exactly `child-1..4` in FIFO order at tier 1, `spent_tokens_tree` equals
-    the admitted child''s own step tokens computed independently, and `agent_count_tree` is 2.'
-  - F4 is the absence assertion. One `agent_queue` row is deleted from the killed fixture's store before
-    the resume; the resumed run's first `EventKind::Fleet` must report 3 rather than the 4 the fixture
-    left or the 5 the model is about to ask for, and it must precede the first `EventKind::Step`. A
-    re-derived depth is unchanged by the deletion and cannot exist before the first provider call; both
-    are asserted because either alone passes on a re-derivation.
-  - Eight sabotages, each run against the whole file. S1 adoption takes another tier's slot -> 5 named
-    tests fail. S2 the replay counts a restored wait as fresh -> F5 fails. S3 the backlog is never seeded
-    into the ledger -> F4 and F5 fail. S4 `done` is never incremented -> F6 fails. S5 a restored row
-    admitted immediately is never cleared -> the fast-path test fails. S6 an admitted child's row is
-    never deleted -> F5 fails. S7 the per-step buffered width caps the fan-out again -> 5 named tests
-    fail. S8 the slot is never released -> the 120-child fan-out under 8 slots never completes, which
-    CI detects as a timeout rather than an assertion.
-  - 'Two of those sabotages were run BEFORE the tests were finished and passed everything, and both
-    exposed a real defect rather than a weak test. S3 passing was trap 23 landing exactly as the brief
-    predicted: `emit_backlog` was reporting the row count it had just read instead of the restored ledger,
-    so the event was true whether or not the ledger had been seeded. S5 passing exposed a genuine bug
-    — a restored wait admitted through the immediate path never cleared its row, so a fully drained
-    tree left rows behind and the reported backlog never reached zero. Both are fixed and both now have
-    a named test that fails without the fix.'
-  - '`ADDED_SINCE_0_22_0` in `tests/cross_version.rs` names `agent_queue` and `agent_queue_entry`, which
-    the 0.22.0 schema guard requires by name — there is deliberately no prefix rule.'
-- id: US-IO-HARNESS-0.32.0-T05
-  summary: 'Documentation as part of the release: the changelog section the workflow reads verbatim,
-    the rename and its semantic change in `docs/CONTRACT.md` and the guides, the per-tier ceiling stated
-    where a reader will find it, the public-API snapshot, and the manifest version.'
-  why_required: '`release.yml` refuses a version with no changelog section, and the per-tier ceiling
-    is a limitation a reader must not have to derive from the source. The public-API snapshot is a build
-    failure until `FleetTally` is in it.'
+  - '`examples/attach_fixture` parks *live* in a gate that never returns, in four modes (`approve`, `question`,
+    `plan`, `watch`) — unlike `crash_fixture`, `plan_gate_fixture` and `fleet_fixture`, which park after
+    the run has stopped.'
+  - 'F6 green: `killing_the_attached_process_does_not_disturb_the_run` SIGKILLs a third process mid-poll,
+    then answers the owner from the test process; the owner completes and the cursor sequence strictly
+    ascends across the kill.'
+  - 'F7 green: `killing_the_owner_leaves_an_unresolved_row_a_resume_can_still_consume` asserts an ABSENCE
+    first — `pending.resolved.is_none()` — because the row now exists before the approver is consulted,
+    so its presence proves nothing; then that the swap consumes it exactly once.'
+  - A `Fixture` guard kills on drop and bounds every wait, so a failing test cannot leak a process that
+    parks forever.
+- id: US-IO-HARNESS-0.33.0-T06
+  summary: Cross-version evidence in both directions and the 0.22.0 schema guard fed `run_events` and
+    `run_events_run` by name; `CHECKPOINT_FORMAT` unmoved; the no-migration claim asserted rather than
+    assumed.
+  why_required: A new table fires the schema guard, and a release that touches the store owes both directions
+    of the compatibility story. The WAL claim is the release's transport argument and has to be a criterion,
+    not a sentence.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.32.0-T04
+  - US-IO-HARNESS-0.33.0-T01
   acceptance_criteria:
-  - '**N4 — the break is exactly one, and it is in the changelog with a migration.** `Containment::max_concurrent`
-    becomes `max_concurrent_agents`. A caller who wrote a struct literal renames one field; a caller
-    who deserialises stored configuration changes nothing, because `#[serde(alias = "max_concurrent")]`
-    keeps the old key readable. `EventKind` gains a variant, which is free under its `#[non_exhaustive]`.
-    No public item is removed, so no deprecation cycle is owed. `tests/changelog.rs` and `tests/public_api.rs`
-    both pass.
+  - '**N2 — no migration, because WAL is already the file''s mode.** `Store::open` has set `journal_mode
+    = WAL` and `busy_timeout = BUSY_TIMEOUT` since 0.12.0, both asserted by `tests/store_open.rs`. This
+    release opens no second connection mode, sets no new pragma and does not change `user_version`. Recorded
+    as a criterion rather than assumed, because a release that *had* needed to turn WAL on would have
+    owed the full cross-version evidence F10 provides.
 
     '
-  - '**N5 — every added public item carries a worked example**, enforced by the existing surface test:
-    `FleetTally` and the renamed field both appear in compiling doctests.
+  - '**F10 — cross-version compatibility, both directions.** A database written by a real 0.32.0 build
+    opens, resumes and replays under 0.33.0 with nothing to migrate; a 0.33.0 store carrying `run_events`
+    rows is read by a 0.32.0 build, which never names the table. `CHECKPOINT_FORMAT` does not move. The
+    0.22.0 schema guard in `tests/cross_version.rs` is fed `run_events` and `run_events_run` by name.
 
     '
-  - '**N6 — the wait graph is acyclic by construction, stated where a reader will find it.** The per-tier
-    semaphore and the reason for it are documented on `Containment::max_concurrent_agents` and in `docs/CONTRACT.md`,
-    including the honest consequence: the ceiling is per tier, so a tree of depth *d* can hold up to
-    `max_concurrent_agents * d` agents working at once. A reader must not have to derive that from the
-    source.
+  files:
+  - tests/cross_version.rs
+  - tests/cross_version_0_29_0.rs
+  - tests/store_open.rs
+  evidence:
+  - '`ADDED_SINCE_0_22_0` in `tests/cross_version.rs` fed `run_events` and `run_events_run` by name (trap
+    19). The whole `tests/cross_version.rs` suite green.'
+  - '`tests/cross_version_0_29_0.rs`''s current-tree store now carries a `run_events` row alongside the
+    0.30.0 memory rows and the 0.31.0 plan, so the backwards claim covers this release''s table too.'
+  - 'N2 met by evidence rather than by work: `Store::open` has set `journal_mode = WAL` and `BUSY_TIMEOUT`
+    since 0.12.0 and `tests/store_open.rs` asserts both, so the two-process transport needed no migration
+    and no pragma change at all.'
+- id: US-IO-HARNESS-0.33.0-T07
+  summary: 'Documentation shipped with the code: the `attach` module page, `Broadcast`''s and `Attach`''s
+    worked examples, `README.md`, `docs/CONTRACT.md` including the four honest limitations, and the `CHANGELOG.md`
+    section the release workflow reads verbatim.'
+  why_required: '`release.yml` refuses a version with no changelog section, and the crate''s surface test
+    refuses a public item with no compiling example. Documentation is part of this release, not after
+    it.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.33.0-T05
+  acceptance_criteria:
+  - '**N6 — every added public item carries a worked example**, enforced by the existing surface test:
+    `Broadcast`, `Attach`, `Waiting`, and the four new `Store` methods all appear in compiling doctests.
 
     '
+  - '**N7 — the honest limitations are stated where a reader finds them.** `docs/CONTRACT.md` says plainly
+    that the crate does not detect whether the owning process is alive, that `run_events` is never pruned,
+    that `Attach::poll` is a poll and its latency is the caller''s interval plus the owner''s, and that
+    the run picks up an attached answer at the gate''s poll interval rather than instantly. Under the
+    `known_limitations` discipline, not implied.
+
+    '
+  - '**N1 — no new dependency.** `cargo tree` on macOS and Linux still reads 402 lines. The transport
+    is the `rusqlite` store both processes already open, the wait is `tokio::time`, and the race is `tokio::select!`
+    — every one of them already compiled into every build.
+
+    '
+  files:
+  - README.md
+  - docs/CONTRACT.md
+  - CHANGELOG.md
+  - src/attach.rs
+  - src/observe.rs
+  - Cargo.toml
+  evidence:
+  - '`src/attach.rs` module page, `Broadcast`''s and `Attach`''s worked examples, README''s ''Two processes,
+    one run'', a `docs/CONTRACT.md` section with the six limitations stated plainly, and the CHANGELOG
+    section `release.yml` reads verbatim.'
+  - 'N6 green: `tests/public_api.rs::every_public_item_has_a_worked_example`, with `docs/public-api.txt`
+    gaining `struct Attach`, `struct Broadcast`, `enum Waiting`, `const POLL_LIMIT`.'
+  - 'N1: `cargo tree | wc -l` = 402, unchanged since 0.23.0.'
+- id: US-IO-HARNESS-0.33.0-T08
+  summary: 'The gates CI runs, on the shipped tree: fmt, clippy `-D warnings`, `cargo test`, `cargo test
+    --all-features`, the nightly docs.rs command, and `cargo package --locked`.'
+  why_required: These are the release's operational criteria and the workflow runs them anyway. Running
+    the docs.rs command before the release PR is what 0.32.0 paid an extra PR to learn.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.33.0-T07
+  acceptance_criteria:
   - '**O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job.
-    The SIGKILL fixture is Unix-shaped; its test is gated so Windows runs the store-level assertions
-    rather than being skipped silently.
+    The SIGKILL fixtures are Unix-shaped; their tests are gated so Windows runs the store-level and query-plan
+    assertions rather than being skipped silently.
 
     '
-  - '**O2 — docs.rs builds**, checked by the nightly job rather than inferred from a local `cargo doc`.
+  - '**O2 — docs.rs builds**, proven by running the nightly job''s exact command (`RUSTDOCFLAGS="--cfg
+    docsrs -D warnings" cargo +nightly doc --all-features --no-deps`) before the release PR is opened,
+    not by inferring it from a stable `cargo doc`.
 
     '
   - '**O3 — `cargo package --locked` succeeds** and the packaged crate compiles.
 
     '
   files:
-  - CHANGELOG.md
-  - README.md
-  - docs/CONTRACT.md
-  - docs/public-api.txt
-  - docs/guide/composition.md
-  - docs/guide/observability.md
-  - Cargo.toml
   - Cargo.lock
-  evidence:
-  - 'The changelog section for 0.32.0 exists, which `release.yml` requires before it will cut anything,
-    and states the break twice over: the rename, and the semantic change underneath it. A caller relying
-    on several parents each getting the full per-step width will now see a LOWER effective concurrency,
-    and the entry says so and says to raise the number — a rename applied mechanically while the meaning
-    moves is the worse half of this break.'
-  - '`docs/CONTRACT.md` gains three entries under `Limits that hold today`: the per-tier ceiling with
-    `max_concurrent_agents * d` spelled out, the queue''s total absence of policy beyond FIFO, and what
-    a queued child costs in visibility (`Store::children` and `Store::agent_events` will not show it).
-    The standing `resume_tree` defect is rewritten as fixed rather than deleted, so the history of the
-    claim is still readable.'
-  - '`docs/guide/composition.md` gains the two-caps-different-in-kind section and a fleet-watching section;
-    `docs/guide/observability.md` gains the `Fleet` row in the event table and corrects `SpawnRefused`,
-    which claimed `concurrency` was one of the caps that refuses. README''s composition paragraph names
-    both caps and the durable queue.'
-  - '`docs/public-api.txt` gains `struct FleetTally src/containment.rs`, without which `public_surface_matches_snapshot`
-    fails — it did fail, and that is how the entry was found rather than remembered. `FleetTally` carries
-    a worked doctest, which the surface test also requires.'
-  - 'Gates run against the shipped tree after a `cargo clean` forced by a full disk: `cargo build --all-features
-    --examples` exits 0, and `public_api` (9), `docs_drift` (10), `readme` (8), `changelog` (5) and
-    `guide_pages` (7) all pass.'
+  evidence: []

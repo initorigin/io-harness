@@ -331,7 +331,7 @@ fn a_current_store_is_read_by_a_0_29_0_binary() {
          tests/fixtures/gen-0.29.0/Cargo.toml ({generator:?})"
     );
 
-    // A store this tree wrote, using every surface 0.30.0 and 0.31.0 added.
+    // A store this tree wrote, using every surface 0.30.0 through 0.33.0 added.
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("written-by-0.30.0.sqlite3");
     {
@@ -373,6 +373,16 @@ fn a_current_store_is_read_by_a_0_29_0_binary() {
             .unwrap();
         store
             .decide_plan(plan_id, &io_harness::PlanVerdict::Approve, "human")
+            .unwrap();
+        // 0.33.0 — a durable event stream, in a table an older binary has never
+        // queried. Same claim as the plan rows above: these cost a 0.29.0 reader
+        // nothing, and it is executed here rather than argued.
+        store
+            .put_event(&io_harness::RunEvent::new(
+                run,
+                2,
+                io_harness::EventKind::Stalled,
+            ))
             .unwrap();
         store.finish_run(run, "success").unwrap();
     }
