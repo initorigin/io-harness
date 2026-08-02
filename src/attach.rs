@@ -282,7 +282,9 @@ impl<'a> Attach<'a> {
     pub fn poll(&mut self) -> Result<Vec<RunEvent>> {
         let rows = match self.target {
             Target::Run(id) => self.store.events_since(id, self.cursor, POLL_LIMIT)?,
-            Target::Tree(root) => self.store.tree_events_since(root, self.cursor, POLL_LIMIT)?,
+            Target::Tree(root) => self
+                .store
+                .tree_events_since(root, self.cursor, POLL_LIMIT)?,
         };
         if let Some((last, _)) = rows.last() {
             self.cursor = *last;
@@ -358,17 +360,16 @@ impl<'a> Attach<'a> {
     /// owning process saying "park this", and an attached process choosing it
     /// would leave the run exactly as it was while reporting that it had answered.
     pub fn answer_approval(&self, request_id: i64, decision: Decision) -> Result<bool> {
-        let word = match decision {
-            Decision::Approve { .. } => "approve",
-            Decision::Deny { .. } => "deny",
-            Decision::Defer => {
-                return Err(crate::error::Error::Config(
+        let word =
+            match decision {
+                Decision::Approve { .. } => "approve",
+                Decision::Deny { .. } => "deny",
+                Decision::Defer => return Err(crate::error::Error::Config(
                     "an attached process may approve or deny, not defer: deferring would report \
                      an answer while leaving the run exactly as it was"
                         .into(),
-                ))
-            }
-        };
+                )),
+            };
         self.store.resolve_pending(request_id, word)
     }
 

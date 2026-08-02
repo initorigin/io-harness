@@ -29,8 +29,7 @@ use io_harness::approve::{AnswerFuture, DecisionFuture, PlanReview};
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
     run_with_observed, Approver, Attach, Broadcast, Ignore, Plan, Policy, Provider, Question,
-    Request, Responder, Store, TaskContract, Verification, ASK_QUESTION_TOOL,
-    PROPOSE_PLAN_TOOL,
+    Request, Responder, Store, TaskContract, Verification, ASK_QUESTION_TOOL, PROPOSE_PLAN_TOOL,
 };
 use serde_json::json;
 
@@ -173,8 +172,15 @@ async fn main() -> io_harness::Result<()> {
     let provider = Scripted {
         ask: mode == "question",
     };
-    let outcome =
-        run_with_observed(&contract, &provider, &store, &policy, &NeverDecides, &watching).await;
+    let outcome = run_with_observed(
+        &contract,
+        &provider,
+        &store,
+        &policy,
+        &NeverDecides,
+        &watching,
+    )
+    .await;
     let result = match &outcome {
         Ok(r) => r,
         Err(e) => {

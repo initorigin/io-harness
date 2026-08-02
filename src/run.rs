@@ -5479,8 +5479,7 @@ async fn authorize_provider<P: Provider>(
     let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
     let request = Request::new(Act::Net, &target);
     let raced = race_gate(approver.decide(&request), store, |s| {
-        Ok(s.pending(request_id)?
-            .is_some_and(|p| p.resolved.is_some()))
+        Ok(s.pending(request_id)?.is_some_and(|p| p.resolved.is_some()))
     })
     .await?;
 
@@ -8204,8 +8203,7 @@ async fn gate(
             // gap this release closes.
             let request_id = store.put_pending(run_id, step, &kind, target, content)?;
             let raced = race_gate(approver.decide(&request), store, |s| {
-                Ok(s.pending(request_id)?
-                    .is_some_and(|p| p.resolved.is_some()))
+                Ok(s.pending(request_id)?.is_some_and(|p| p.resolved.is_some()))
             })
             .await?;
 
@@ -8232,7 +8230,11 @@ async fn gate(
                     (modified, remember, String::new())
                 }
                 Some(Decision::Deny { reason }) => (None, Vec::new(), reason),
-                _ => (None, Vec::new(), "answered by an attached process".to_string()),
+                _ => (
+                    None,
+                    Vec::new(),
+                    "answered by an attached process".to_string(),
+                ),
             };
 
             // The row is the authority, in BOTH arms. A decision reported from the

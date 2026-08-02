@@ -385,8 +385,8 @@ pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 // surfaced here as well as from each provider module. A caller overriding it with
 // `with_timeout` should be able to name the value they are overriding without
 // reaching into a provider's namespace to find it.
-pub use net::REQUEST_TIMEOUT;
 pub use attach::{Attach, Waiting, POLL_LIMIT};
+pub use net::REQUEST_TIMEOUT;
 pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, RunEvent};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{

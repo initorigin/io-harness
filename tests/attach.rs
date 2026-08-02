@@ -160,11 +160,7 @@ fn attaching_from_now_skips_what_already_happened() {
     );
 
     emit_into(&store, run_id, 2);
-    assert_eq!(
-        view.poll().unwrap().len(),
-        2,
-        "but everything after it is"
-    );
+    assert_eq!(view.poll().unwrap().len(), 2, "but everything after it is");
 }
 
 #[test]
@@ -251,7 +247,12 @@ fn two_processes_answering_one_approval_produce_exactly_one_winner() {
     assert_ne!(first, second, "exactly one of them landed");
     assert!(first || second, "and one of them did");
     assert_eq!(
-        store.pending(request_id).unwrap().unwrap().resolved.as_deref(),
+        store
+            .pending(request_id)
+            .unwrap()
+            .unwrap()
+            .resolved
+            .as_deref(),
         Some("approve"),
         "the first answer is what stands"
     );
@@ -309,7 +310,9 @@ fn two_processes_deciding_one_plan_produce_exactly_one_winner() {
 fn an_attached_process_cannot_defer() {
     let store = Store::memory().unwrap();
     let run_id = store.start_run("ship it", "mock").unwrap();
-    let id = store.put_pending(run_id, 1, "write", "a.txt", None).unwrap();
+    let id = store
+        .put_pending(run_id, 1, "write", "a.txt", None)
+        .unwrap();
 
     assert!(Attach::to(&store, run_id)
         .answer_approval(id, Decision::Defer)
@@ -364,8 +367,12 @@ fn waiting_excludes_everything_that_has_been_answered() {
         .unwrap();
 
     assert!(store.resolve_pending(approval, "approve").unwrap());
-    assert!(store.answer_question(question, "postgres", "human").unwrap());
-    assert!(store.decide_plan(plan, &PlanVerdict::Approve, "human").unwrap());
+    assert!(store
+        .answer_question(question, "postgres", "human")
+        .unwrap());
+    assert!(store
+        .decide_plan(plan, &PlanVerdict::Approve, "human")
+        .unwrap());
 
     assert!(
         Attach::to(&store, run_id).waiting().unwrap().is_empty(),
@@ -397,9 +404,7 @@ fn attach_has_no_method_that_drives_a_run() {
 #[test]
 fn the_no_driving_check_catches_a_driving_method() {
     let mut source = std::fs::read_to_string("src/attach.rs").unwrap();
-    source.push_str(
-        "impl Attach<'_> {\n    pub fn resume_it(&self) -> Result<()> { Ok(()) }\n}\n",
-    );
+    source.push_str("impl Attach<'_> {\n    pub fn resume_it(&self) -> Result<()> { Ok(()) }\n}\n");
     assert_eq!(
         driving_methods(&source),
         vec!["resume_it".to_string()],
@@ -442,7 +447,10 @@ fn broadcasting_writes_one_row_per_event_and_nothing_without_it() {
     );
 
     let recorder = Recorder::default();
-    emit_a_few(&Broadcast::new(Store::open(&path).unwrap(), &recorder), run_id);
+    emit_a_few(
+        &Broadcast::new(Store::open(&path).unwrap(), &recorder),
+        run_id,
+    );
     assert_eq!(
         store.events_since(run_id, 0, 100).unwrap().len(),
         recorder.seen().len(),
@@ -568,9 +576,13 @@ fn start_parked(mode: &str, dir: &TempDir) -> (Fixture, i64, Store, String) {
     let run_id = until("the run row", || {
         store.runs().ok().and_then(|r| r.first().copied())
     });
-    (Fixture::new(child), run_id, store, root.to_string_lossy().into_owned())
+    (
+        Fixture::new(child),
+        run_id,
+        store,
+        root.to_string_lossy().into_owned(),
+    )
 }
-
 
 /// F3 — a second process answers a live approval and the owner carries on.
 ///
@@ -580,8 +592,10 @@ fn start_parked(mode: &str, dir: &TempDir) -> (Fixture, i64, Store, String) {
 #[cfg(unix)]
 #[test]
 fn an_attached_process_answers_a_live_approval_and_the_run_finishes() {
-    for (approve, expected, wrote) in [(true, "approve", "wrote=true"), (false, "deny", "wrote=false")]
-    {
+    for (approve, expected, wrote) in [
+        (true, "approve", "wrote=true"),
+        (false, "deny", "wrote=false"),
+    ] {
         let dir = ws();
         let (mut child, run_id, store, _root) = start_parked("approve", &dir);
 
@@ -714,7 +728,10 @@ fn an_attached_process_answers_a_live_plan() {
         .unwrap());
 
     let out = child.finished();
-    assert!(out.contains("wrote=true"), "the run left its plan phase: {out}");
+    assert!(
+        out.contains("wrote=true"),
+        "the run left its plan phase: {out}"
+    );
     assert_eq!(
         store.plan(plan_id).unwrap().unwrap().decided_by.as_deref(),
         Some("attached"),
