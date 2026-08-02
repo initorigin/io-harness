@@ -903,7 +903,7 @@ impl Observer for Ignore {
 /// opens its own connection to the same file and holds it behind a `Mutex` —
 /// which is not a workaround so much as the release's own premise: two
 /// connections to one store is exactly what an attaching process does, and
-/// [`Store::open`] has set `journal_mode = WAL` and a five-second
+/// [`Store::open`](crate::Store::open) has set `journal_mode = WAL` and a
 /// [`BUSY_TIMEOUT`](crate::BUSY_TIMEOUT) since 0.12.0 precisely so that works.
 ///
 /// It follows that a [`Store::memory`](crate::Store::memory) store cannot be

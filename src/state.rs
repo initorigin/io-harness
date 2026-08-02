@@ -4321,8 +4321,8 @@ impl Store {
 
     // ---- 0.33.0: the durable event stream ----
 
-    /// Append one [`RunEvent`] to the durable stream; returns its cursor id
-    /// (0.33.0).
+    /// Append one [`RunEvent`](crate::RunEvent) to the durable stream; returns its
+    /// cursor id (0.33.0).
     ///
     /// The event is stored as the JSON its own `Serialize` produces, so what a
     /// second process reads back is the value the in-process observer was handed
