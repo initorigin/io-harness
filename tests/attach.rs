@@ -454,6 +454,70 @@ fn broadcasting_writes_one_row_per_event_and_nothing_without_it() {
 // F3 / F4 / F6 / F7 — the live fixture. Unix only: they are real kills.
 // ---------------------------------------------------------------------------
 
+/// A spawned fixture that is killed when it goes out of scope.
+///
+/// These fixtures park forever by design, so a test that fails before answering
+/// would otherwise leak a process that never exits — on a developer's machine and
+/// on a CI runner alike. `Child` is not killed on drop, so this does it.
+struct Fixture {
+    child: Option<std::process::Child>,
+    /// Cached, because `try_wait` reaps: once it has answered, asking again
+    /// answers `None` forever and a later `finished()` would wait for a process
+    /// that is already gone.
+    status: Option<std::process::ExitStatus>,
+}
+
+impl Fixture {
+    fn new(child: std::process::Child) -> Self {
+        Self {
+            child: Some(child),
+            status: None,
+        }
+    }
+
+    fn id(&self) -> u32 {
+        self.child.as_ref().unwrap().id()
+    }
+
+    /// Whether it has finished, without blocking.
+    fn exited(&mut self) -> bool {
+        if self.status.is_none() {
+            self.status = self.child.as_mut().unwrap().try_wait().unwrap();
+        }
+        self.status.is_some()
+    }
+
+    /// Wait for it to finish and return what it printed. Bounded, so a fixture
+    /// that never exits is a named failure rather than a run that stalls until the
+    /// job is killed.
+    fn finished(mut self) -> String {
+        until("the fixture to exit", || self.exited().then_some(()));
+        let status = self.status.unwrap();
+        let mut child = self.child.take().unwrap();
+        let mut out = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut out)
+            .unwrap();
+        assert!(
+            status.success(),
+            "the fixture must exit 0, got {status}: {out}"
+        );
+        out
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if let (Some(child), None) = (self.child.as_mut(), self.status) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 /// Locate the compiled `attach_fixture` example next to this test binary.
 /// Standard cargo layout: `target/<profile>/deps/<test>` and
 /// `target/<profile>/examples/<name>`. It joins `crash_fixture`,
@@ -484,7 +548,7 @@ fn until<T>(what: &str, mut f: impl FnMut() -> Option<T>) -> T {
 
 /// Start the fixture in `mode` and wait until it is parked, returning its handle,
 /// its run id and the store the parent reads through.
-fn start_parked(mode: &str, dir: &TempDir) -> (std::process::Child, i64, Store, String) {
+fn start_parked(mode: &str, dir: &TempDir) -> (Fixture, i64, Store, String) {
     let path = dir.path().join("runs.db");
     let root = dir.path().join("ws");
     std::fs::create_dir_all(&root).unwrap();
@@ -504,57 +568,75 @@ fn start_parked(mode: &str, dir: &TempDir) -> (std::process::Child, i64, Store, 
     let run_id = until("the run row", || {
         store.runs().ok().and_then(|r| r.first().copied())
     });
-    (child, run_id, store, root.to_string_lossy().into_owned())
+    (Fixture::new(child), run_id, store, root.to_string_lossy().into_owned())
 }
 
-fn stdout_of(mut child: std::process::Child) -> String {
-    // Bounded, so a fixture that never finishes is a named failure rather than a
-    // test run that stalls until the CI job is killed.
-    let status = until("the fixture to exit", || child.try_wait().unwrap());
-    let mut out = String::new();
-    child.stdout.take().unwrap().read_to_string(&mut out).unwrap();
-    assert!(status.success(), "the fixture must exit 0, got {status}: {out}");
-    out
-}
 
 /// F3 — a second process answers a live approval and the owner carries on.
+///
+/// Both directions, because "the run finished" passes against a run that ignored
+/// the answer entirely. Only the pair discriminates: the same fixture, the same
+/// attach, one decision each way, and the effect must follow the decision.
 #[cfg(unix)]
 #[test]
 fn an_attached_process_answers_a_live_approval_and_the_run_finishes() {
-    for (decision, expected, wrote) in [
-        (Decision::approve(), "approve", "wrote=true"),
-        (Decision::deny("not that path"), "deny", "wrote=false"),
-    ] {
+    for (approve, expected, wrote) in [(true, "approve", "wrote=true"), (false, "deny", "wrote=false")]
+    {
         let dir = ws();
-        let (child, run_id, store, _root) = start_parked("approve", &dir);
+        let (mut child, run_id, store, _root) = start_parked("approve", &dir);
 
         // The stream reached us before we answered — this is the observer half.
-        let saw_request = until("the approval request in the stream", || {
-            let seen = Attach::to(&store, run_id).poll().ok()?;
-            seen.iter()
+        until("the approval request in the stream", || {
+            Attach::to(&store, run_id)
+                .poll()
+                .ok()?
+                .iter()
                 .any(|e| matches!(e.kind, EventKind::ApprovalRequested { .. }))
-                .then_some(true)
+                .then_some(())
         });
-        assert!(saw_request);
 
-        let request_id = until("the approval", || {
-            match Attach::to(&store, run_id).waiting().ok()?.first()? {
-                Waiting::Approval { request_id, .. } => Some(*request_id),
-                _ => None,
-            }
-        });
-        assert!(Attach::to(&store, run_id)
-            .answer_approval(request_id, decision)
-            .unwrap());
+        // Keep answering until it exits. A denied write is not the end of a run:
+        // the model reads the refusal and tries again, so it parks on a fresh
+        // approval each step until its step cap. Answering once would prove the
+        // approve case and hang the deny one.
+        let answered = answer_until_it_exits(&store, run_id, &mut child, approve);
+        assert!(answered >= 1, "at least one answer must have landed");
 
         // Never killed, never resumed: it finishes on its own.
-        let out = stdout_of(child);
+        let out = child.finished();
         assert!(
-            out.contains(&format!("decisions={expected}")),
+            out.contains(&format!("decisions={expected}")) || out.contains(&format!(",{expected}")),
             "the run must act on the answer it was given, got: {out}"
         );
         assert!(out.contains(wrote), "and the effect must follow it: {out}");
     }
+}
+
+/// Answer every approval the run parks on, with the same verdict, until it exits.
+/// Returns how many answers this process landed.
+#[cfg(unix)]
+fn answer_until_it_exits(store: &Store, run_id: i64, child: &mut Fixture, approve: bool) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut landed = 0;
+    while !child.exited() {
+        assert!(Instant::now() < deadline, "the fixture never exited");
+        for waiting in Attach::to(store, run_id).waiting().unwrap() {
+            if let Waiting::Approval { request_id, .. } = waiting {
+                let decision = match approve {
+                    true => Decision::approve(),
+                    false => Decision::deny("not that path"),
+                };
+                if Attach::to(store, run_id)
+                    .answer_approval(request_id, decision)
+                    .unwrap()
+                {
+                    landed += 1;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    landed
 }
 
 /// F4 — a live question is answerable, and the answer reaches the model.
@@ -589,7 +671,7 @@ fn an_attached_process_answers_a_live_question() {
         .answer_approval(request_id, Decision::approve())
         .unwrap());
 
-    let out = stdout_of(child);
+    let out = child.finished();
     assert!(out.contains("wrote=true"), "got: {out}");
     let answered = store.question(question_id).unwrap().unwrap();
     assert_eq!(
@@ -631,7 +713,7 @@ fn an_attached_process_answers_a_live_plan() {
         .answer_approval(request_id, Decision::approve())
         .unwrap());
 
-    let out = stdout_of(child);
+    let out = child.finished();
     assert!(out.contains("wrote=true"), "the run left its plan phase: {out}");
     assert_eq!(
         store.plan(plan_id).unwrap().unwrap().decided_by.as_deref(),
@@ -668,7 +750,7 @@ fn killing_the_attached_process_does_not_disturb_the_run() {
     assert!(Attach::to(&store, run_id)
         .answer_approval(request_id, Decision::approve())
         .unwrap());
-    let out = stdout_of(owner);
+    let out = owner.finished();
     assert!(out.contains("wrote=true"), "got: {out}");
 
     // And the stream is continuous across the kill: strictly ascending cursors,
@@ -686,7 +768,7 @@ fn killing_the_attached_process_does_not_disturb_the_run() {
 #[test]
 fn killing_the_owner_leaves_an_unresolved_row_a_resume_can_still_consume() {
     let dir = ws();
-    let (mut owner, run_id, store, _root) = start_parked("approve", &dir);
+    let (owner, run_id, store, _root) = start_parked("approve", &dir);
 
     let request_id = until("the approval", || {
         match Attach::to(&store, run_id).waiting().ok()?.first()? {
@@ -695,7 +777,7 @@ fn killing_the_owner_leaves_an_unresolved_row_a_resume_can_still_consume() {
         }
     });
     kill9(owner.id());
-    owner.wait().unwrap();
+    drop(owner);
 
     // The discriminating assertion is the ABSENCE of a resolution. The row is now
     // written *before* the approver is consulted, so a row existing proves nothing;
