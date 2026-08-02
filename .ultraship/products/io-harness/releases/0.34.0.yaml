@@ -415,6 +415,53 @@ known_limitations:
   the tree between the failed gate and the retry, the retry grades the new tree. The crate does not
   snapshot the workspace at gate time.
 - >
+  **F7 was met with `Error::Config`, not `Error::Unreachable`, stated rather than glossed.** The
+  criterion's prose named an `Error::Unreachable`; no such variant exists in `Error` and adding one
+  would have been a second break in a release whose whole N2 claim is that there is exactly one.
+  `Error::Config` is the variant every other refusal-before-the-first-request uses —
+  `ensure_web_supported`, the missing-reviewer refusal, the self-review refusal — and the
+  discriminating half of the criterion is untouched: the run fails, the error names the provider,
+  and the provider records **zero** completions.
+- >
+  **One of the nine sabotages failed nothing, and it is recorded rather than hidden.** S8 replaced
+  the consecutive gate-failure count with a cumulative one and no test failed. The reason is real
+  and now documented at the function: a gate that passes ends the run, so no run can hold a pass
+  followed by a failure, and the two readings coincide. The code counts consecutive anyway, for the
+  case where that stops being true. A test asserting the difference today would have had to
+  re-implement the counting rather than exercise it, which is theatre, so it was removed rather than
+  kept green.
+- >
+  **`INDEXED BY` was tried on the gate-attempt reads and removed, measured rather than assumed.**
+  0.33.0's tree tail needs the hint because a recursive CTE cannot be seeked into; these are plain
+  `WHERE run_id = ? ORDER BY id` reads whose left prefix is the index's own, and the plan is
+  identical with and without it across forty runs (sabotage S9 removed the hint and failed nothing;
+  S9b removed the index itself and failed N3). The hint is left out where it buys nothing.
+- >
+  **Routing governs the root agent only.** A spawned child takes the model on its `AgentDef`,
+  exactly as it takes `Effort` there since 0.31.0. A rule that overrode a role's own model would be
+  the roster's author being ignored by a counter. Stated in `docs/CONTRACT.md`.
+- >
+  **The self-review refusal compares model NAMES, and can be unreachable.** Two names can be the
+  same weights behind a gateway, and one name can be two snapshots a month apart. The model under
+  review is read from `Provider::model_hint`, defaulted to `None` — so a provider that does not name
+  its model makes the refusal impossible to reach rather than failing loudly. Both are in
+  `docs/CONTRACT.md`.
+- >
+  **This record was sealed before the crates.io upload.** `mode: published` is the release's target
+  and the flow's last step: the develop merge, the main merge and the GitHub Release all come after
+  the record rides the `feat/0.34.0` commit, and `cargo publish --locked` comes after those. Sealing
+  it `release-ready` and correcting it afterwards would mean editing an immutable record, which is
+  worse.
+- >
+  **The local suites were run with `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_TEST_DEBUG=0`,**
+  and `target/` was deleted twice during the release. The volume still reached 5.8 GiB free. Debug
+  info changes no test outcome and CI runs the unmodified commands on a fresh runner; recorded
+  because the numbers above were measured under it.
+- >
+  **Inherited and unresolved: 0.30.0's N2 wording.** "The aggregates do not scale with the trace"
+  over-claims — counting every row is the answer. Raised rather than read as satisfied, and
+  untouched by this release.
+- >
   The reviewing model does not see the run's conversation, only the goal, the rubric and what was
   written. That is deliberate — a reviewer reading the author's reasoning is a reviewer being led —
   but it means a change whose justification lived only in the transcript is judged without it.
@@ -434,4 +481,88 @@ open_questions:
   `policy_events`-derived aggregate. They would agree for runs written by 0.34.0 and disagree for
   every older one, so unifying them is a migration question rather than a refactor.
 
-status: planned
+status: released
+released_at: 2026-08-02T22:15:00Z
+mode: published
+delivered: >
+  A second model checks the first, one failed gate is retried on its own, and which model answers
+  stops being fixed for the whole run.
+
+  `Verification::Review` carries a rubric the caller wrote; a `Reviewer` — `ModelReviewer` over any
+  provider, a human, or a stub — reads the goal, the rubric and the files the run wrote, and returns
+  a `Review { passed, reasons }` whose reasons reach the trace and every `Observer` as
+  `EventKind::Reviewed`. It refuses to run on the model that produced the change, with
+  `Error::Config`, **before a request is built** — proven by a reviewing provider that records zero
+  calls, not by the text of an error. `Verification` gains `#[non_exhaustive]` in the same release
+  that adds the variant, so the one break is paid once.
+
+  Every gate evaluation is now a durable `gate_attempts` row: `Passed`, `Failed`, or `Errored` — a
+  criterion that could not run at all, the distinction the crate never had. `retry_gate` re-runs
+  **only** the criterion, against the workspace the run left, and the run's steps rows, its token
+  ledger and its files are identical before and after. It refuses a gate that `Failed`, because that
+  criterion ran and answered.
+
+  `Routing` is three rules the run applies to the request it actually sends: escalate after N
+  consecutive failed gates, downshift while the change is small, and `require_primary`, which asks
+  the defaulted `Provider::reachable()` before the first step and refuses to start rather than
+  spending a night on a fallback nobody chose. `EventKind::Routed` is emitted once, at the
+  transition.
+
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — 59 result lines, 0 failed. One round was needed: the first
+    run's only failure was this release's own doctest on `ModelReviewer`, whose generic example
+    lacked the `Debug + Send + Sync` bounds the `Reviewer` impl requires. Fixed and re-run against
+    the sealed tree.
+  - >
+    `cargo test --all-features` — 59 result lines, all `ok`, 0 failed, including 449 lib unit tests
+    and 349 doctests in 167s. Run alone, in its own invocation, after `rm -rf target`.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — clean. Two lints were raised and
+    both were fixed rather than allowed: `manual_contains` on the written-files dedup, and
+    `wrong_self_convention` on a test helper named `as_model` that took `self` by value.
+  - >
+    `cargo fmt --check` — clean.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — clean,
+    run BEFORE the release PR was opened. It caught one `redundant explicit link target`
+    (`[`Fallback`](crate::provider::Fallback)` in `src/provider/mod.rs`) that stable
+    `cargo doc --no-deps --all-features` reported as zero warnings. Trap 28, and it has now paid for
+    itself in three consecutive releases.
+  - >
+    Eleven tests in `tests/review.rs`, eight in `tests/routing.rs`, one query-plan test in
+    `src/state.rs`, and the whole existing suite unchanged and green — including `tests/verify.rs`,
+    whose pre-0.34.0 assertions about a `Command` gate hold untouched.
+  - >
+    **Nine sabotages, each run against the tests before they were finished, each failing a NAMED
+    test.** S1 the review verdict is ignored and the gate reports `true` -> F1 fails. S2 `Errored`
+    recorded as `Failed` -> F3 and F4 fail. S3 the self-review refusal removed -> F2 fails. S4
+    `retry_gate` does not check retryability -> F5 fails. S5 the reviewer is handed no files -> F1
+    fails. S6 the routing rule records the intention and sends the old model -> F6 fails. S7
+    `require_primary` not checked -> F7 fails. S9b the `gate_attempts_run` index removed -> N3 fails.
+    S8 — counting cumulative rather than consecutive gate failures — failed **nothing**, and that is
+    recorded in `known_limitations` rather than papered over: a passing gate ends the run, so no run
+    can hold a pass followed by a failure and the two readings coincide today.
+  - >
+    The two new events round-trip: `EVENT_NAMES` gained `reviewed` and `routed`, and the
+    source-reading test 0.28.0 added — which reads `pub enum EventKind` out of `src/observe.rs` and
+    asserts the tags are *equal* to the list — passes without being amended by hand.
+  - >
+    Cross-version, both directions: `tests/cross_version.rs` is fed `gate_attempts` and
+    `gate_attempts_run` by name and passes; `cargo test --test cross_version_0_29_0 -- --ignored`
+    passes with a `gate_attempts` row written into the store the pinned 0.29.0 binary reads.
+    `CHECKPOINT_FORMAT` unmoved at 7.
+  builds:
+  - >
+    `cargo package --locked` — exit 0, 1.3 MB, and the packaged crate compiles. Run after
+    `cargo clean`, because the volume reached 5.8 GiB free during this release.
+  - >
+    `cargo tree | wc -l` — **402**, unchanged since 0.23.0. The reviewer is a provider the caller
+    already has, the gate attempts are rows in the store already open, and routing sets a field on a
+    request the run already builds.
+  reviews: []
+  deployments: []
+  health_checks: []
+
+immutable: true

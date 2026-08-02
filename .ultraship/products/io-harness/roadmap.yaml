@@ -870,7 +870,7 @@ versions:
       from its own checkpoint**, so a terminal transport failure on one gate does not cost the forty
       that passed.
     detail: specified
-    status: planned
+    status: released
   - version: 0.35.0
     outcome: >
       A directory is a capability bundle. Skills, hooks, MCP servers, agent definitions, prompt
