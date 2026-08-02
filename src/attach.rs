@@ -396,7 +396,7 @@ impl<'a> Attach<'a> {
     fn runs(&self) -> Result<Vec<i64>> {
         match self.target {
             Target::Run(id) => Ok(vec![id]),
-            Target::Tree(root) => self.store.tree_runs(root),
+            Target::Tree(root) => self.store.tree_run_ids(root),
         }
     }
 }

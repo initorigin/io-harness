@@ -172,6 +172,12 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // asserts on paper.
     "agent_queue",
     "agent_queue_entry",
+    // 0.33.0 — the durable event stream. One table and its index, added and
+    // nothing altered: a 0.29.0 binary opens a store carrying both and never names
+    // either, which `tests/cross_version_0_29_0.rs` executes rather than asserts on
+    // paper.
+    "run_events",
+    "run_events_run",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].

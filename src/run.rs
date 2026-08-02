@@ -1274,7 +1274,16 @@ fn record_answer(store: &Store, run_id: i64, question_id: i64, answer: &str) -> 
             ),
         });
     }
-    store.answer_question(question_id, answer, "human")?;
+    // 0.33.0: the swap answers "was it me". A resume that finds the question
+    // already answered — by a second process through `Attach`, or by an earlier
+    // resume — must refuse rather than replay the step: the run acted on somebody
+    // else's answer, and driving it again with a different one is exactly the
+    // silent double-answer the store's compare-and-swap exists to make impossible.
+    if !store.answer_question(question_id, answer, "human")? {
+        return Err(Error::Resume {
+            reason: format!("question {question_id} was already answered"),
+        });
+    }
 
     // The answer has to reach the model, and an observation is the only thing that
     // does. The step that asked WAS committed — a paused step is committed and the
@@ -1331,7 +1340,14 @@ fn record_plan_decision(
             ),
         });
     }
-    store.decide_plan(plan_id, verdict, "human")?;
+    // Refused for the reason `record_answer` refuses: a plan a second process
+    // already decided has already moved the run, and deciding it again here would
+    // drive it a second time from a verdict nothing recorded.
+    if !store.decide_plan(plan_id, verdict, "human")? {
+        return Err(Error::Resume {
+            reason: format!("plan {plan_id} was already decided"),
+        });
+    }
 
     // `ObsKind::Message` and no target, exactly as an answer is, so the assembler
     // cannot stub it away as stale when a later read touches the same path.
@@ -1933,6 +1949,19 @@ pub async fn resume_with_decision_observed<P: Provider>(
         )));
     }
 
+    // 0.33.0: a request a second process already answered is not resumable. Since
+    // `Attach::answer_approval` can decide a *live* run, "there is a pending row"
+    // stopped meaning "nobody has decided this" — and the row is now written before
+    // the approver is consulted, so one exists even for approvals answered
+    // instantly. Driving the run again from a decision the store did not record
+    // would be the silent double-answer this release exists to prevent. The
+    // compare-and-swap below is what makes it airtight; this is the readable error.
+    if let Some(already) = &pending.resolved {
+        return Err(crate::error::Error::Config(format!(
+            "request {request_id} was already decided ({already})"
+        )));
+    }
+
     let root = contract.root.clone().ok_or_else(|| {
         crate::error::Error::Config("resume_with_decision needs a workspace".into())
     })?;
@@ -2054,10 +2083,18 @@ pub async fn resume_with_decision_observed<P: Provider>(
                 return Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id));
             }
 
+            // Claimed BEFORE the effect, not after: a swap that loses means a
+            // second process decided this request while we were checking it, and a
+            // file written on a decision that lost would be an effect nothing in
+            // the store accounts for.
+            if !store.resolve_pending(request_id, "approve")? {
+                return Err(crate::error::Error::Config(format!(
+                    "request {request_id} was decided by another process"
+                )));
+            }
             if act == Act::Write {
                 ws.write_file(&target, content.as_deref().unwrap_or_default())?;
             }
-            store.resolve_pending(request_id, "approve")?;
             let mut ev = PolicyEvent::decision(
                 step,
                 &pending.act,
@@ -2236,6 +2273,19 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             pending.run_id
         )));
     }
+
+    // 0.33.0: a request a second process already answered is not resumable. Since
+    // `Attach::answer_approval` can decide a *live* run, "there is a pending row"
+    // stopped meaning "nobody has decided this" — and the row is now written before
+    // the approver is consulted, so one exists even for approvals answered
+    // instantly. Driving the run again from a decision the store did not record
+    // would be the silent double-answer this release exists to prevent. The
+    // compare-and-swap below is what makes it airtight; this is the readable error.
+    if let Some(already) = &pending.resolved {
+        return Err(crate::error::Error::Config(format!(
+            "request {request_id} was already decided ({already})"
+        )));
+    }
     let root = contract.root.clone().ok_or_else(|| {
         crate::error::Error::Config("resume_tree_with_decision needs a workspace".into())
     })?;
@@ -2349,10 +2399,18 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 finish(store, watch, run_id, 0, step, "denied")?;
                 return Ok(RunResult::new(RunOutcome::Denied { steps: step }, run_id));
             }
+            // Claimed BEFORE the effect, not after: a swap that loses means a
+            // second process decided this request while we were checking it, and a
+            // file written on a decision that lost would be an effect nothing in
+            // the store accounts for.
+            if !store.resolve_pending(request_id, "approve")? {
+                return Err(crate::error::Error::Config(format!(
+                    "request {request_id} was decided by another process"
+                )));
+            }
             if act == Act::Write {
                 ws.write_file(&target, content.as_deref().unwrap_or_default())?;
             }
-            store.resolve_pending(request_id, "approve")?;
             store.record_event(
                 pending.run_id,
                 &PolicyEvent::decision(

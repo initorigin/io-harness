@@ -1480,6 +1480,23 @@ fn question_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PendingQuestion> {
     })
 }
 
+/// The tree-wide event tail, as one statement (0.33.0).
+///
+/// A `const` rather than a literal at the call site so the query-plan test can
+/// `EXPLAIN` the statement the crate actually runs. A test that re-typed the SQL
+/// would keep passing after somebody "tidied" the `CROSS JOIN ... INDEXED BY`
+/// into a plain join, which is exactly the change it exists to catch.
+const TREE_EVENTS_SQL: &str = "WITH RECURSIVE tree(id) AS (
+         SELECT id FROM runs WHERE id = ?1
+         UNION ALL
+         SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
+     )
+     SELECT e.id, e.json
+     FROM tree CROSS JOIN run_events e INDEXED BY run_events_run
+         ON e.run_id = tree.id
+     WHERE e.id > ?2
+     ORDER BY e.id ASC LIMIT ?3";
+
 /// Read one `run_events` row back as `(cursor, event)` (0.33.0).
 ///
 /// A row whose JSON will not parse is a `FromSqlConversionFailure` rather than a
@@ -3979,41 +3996,6 @@ impl Store {
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
-    /// Every run in the tree rooted at `root`, `root` first, then its descendants
-    /// in spawn order (0.33.0).
-    ///
-    /// [`Self::children`]'s deep sibling, and what
-    /// [`Attach::to_tree`](crate::Attach::to_tree) walks to ask each run what it is
-    /// waiting on. One recursive walk of `runs` rather than a query per level.
-    ///
-    /// ```
-    /// use io_harness::Store;
-    ///
-    /// # fn main() -> io_harness::Result<()> {
-    /// let store = Store::memory()?;
-    /// let root = store.start_run("fan out", "/tmp/ws")?;
-    /// let child = store.start_child_run("a sub-task", "/tmp/ws", root, 1)?;
-    /// let grandchild = store.start_child_run("deeper", "/tmp/ws", child, 2)?;
-    ///
-    /// // `children` stops at one level; this does not.
-    /// assert_eq!(store.children(root)?, vec![child]);
-    /// assert_eq!(store.tree_runs(root)?, vec![root, child, grandchild]);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub fn tree_runs(&self, root: i64) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE tree(id) AS (
-                 SELECT id FROM runs WHERE id = ?1
-                 UNION ALL
-                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
-             )
-             SELECT id FROM tree ORDER BY id ASC",
-        )?;
-        let rows = stmt.query_map([root], |r| r.get(0))?;
-        Ok(rows.collect::<std::result::Result<_, _>>()?)
-    }
-
     /// The parent run id of `run_id`, or `None` for a root run.
     pub fn parent(&self, run_id: i64) -> Result<Option<i64>> {
         Ok(self.conn.query_row(
@@ -4494,18 +4476,7 @@ impl Store {
         cursor: i64,
         limit: usize,
     ) -> Result<Vec<(i64, crate::observe::RunEvent)>> {
-        let mut stmt = self.conn.prepare(
-            "WITH RECURSIVE tree(id) AS (
-                 SELECT id FROM runs WHERE id = ?1
-                 UNION ALL
-                 SELECT r.id FROM runs r JOIN tree t ON r.parent_run_id = t.id
-             )
-             SELECT e.id, e.json
-             FROM tree CROSS JOIN run_events e INDEXED BY run_events_run
-                 ON e.run_id = tree.id
-             WHERE e.id > ?2
-             ORDER BY e.id ASC LIMIT ?3",
-        )?;
+        let mut stmt = self.conn.prepare(TREE_EVENTS_SQL)?;
         let rows = stmt.query_map(rusqlite::params![root, cursor, limit as i64], event_row)?;
         Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
@@ -6630,6 +6601,111 @@ mod tests {
                 .filter(|t| t.parent_turn_id == Some(root))
                 .count(),
             2
+        );
+    }
+
+    /// N3 — an attached observer's tail read seeks into this tree's events rather
+    /// than scanning every tree's.
+    ///
+    /// Trap 37, paid for in 0.32.0 and load-bearing here: a recursive CTE is a
+    /// co-routine SQLite cannot seek into, so a plain join makes the planner scan
+    /// the joined table and build an automatic index on the CTE instead. That is
+    /// right for a file holding one tree and wrong for one holding forty, and no
+    /// `ANALYZE` on a single-tree fixture can tell it which it has. This read is on
+    /// a poll loop, so it is the one place in the crate that pays the difference
+    /// repeatedly.
+    #[test]
+    fn the_tree_event_tail_seeks_rather_than_scanning_every_trees_events() {
+        let store = Store::memory().unwrap();
+        // Many trees, so the planner is choosing for the file this query is
+        // actually run against.
+        let mut first = 0;
+        for t in 0..40 {
+            let root = store.start_run(&format!("tree {t}"), "/repo").unwrap();
+            if t == 0 {
+                first = root;
+            }
+            let child = store.start_child_run("child", "/repo", root, 1).unwrap();
+            for step in 0..20 {
+                store
+                    .put_event(&crate::observe::RunEvent::new(
+                        root,
+                        step,
+                        crate::observe::EventKind::Stalled,
+                    ))
+                    .unwrap();
+                store
+                    .put_event(&crate::observe::RunEvent::at_depth(
+                        child,
+                        step,
+                        1,
+                        crate::observe::EventKind::Stalled,
+                    ))
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            // Three parameters for the tail, one for the control: bind by
+            // position up to whatever the statement declares.
+            let n = stmt.parameter_count();
+            let args: Vec<i64> = vec![first, 0, 100][..n].to_vec();
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows.join(" | ")
+        };
+
+        // The statement the crate runs, not a copy of it.
+        let tail = plan(TREE_EVENTS_SQL);
+        assert!(
+            tail.contains("run_events_run"),
+            "the tail must seek into this tree's events: {tail}"
+        );
+        assert!(
+            !tail.contains("SCAN run_events"),
+            "and must not read every tree's: {tail}"
+        );
+
+        // And the assertion above discriminates. The same query with the join the
+        // planner would choose for itself reads every tree's events, which is what
+        // makes `CROSS JOIN ... INDEXED BY` a decision rather than decoration.
+        // And the assertion above discriminates. Left to itself the planner drives
+        // from `run_events` by rowid — every tree's events from the cursor forward,
+        // filtered by probing the CTE through an automatic index it has to build,
+        // which is trap 37's shape exactly. Measured over 40 trees x 40 events:
+        // 0.093 ms forced, 0.179 ms naive, and the gap grows with the number of
+        // trees in the file because the naive walk is global while the seek is not.
+        let naive = plan(
+            &TREE_EVENTS_SQL
+                .replace("CROSS JOIN", "JOIN")
+                .replace("INDEXED BY run_events_run", ""),
+        );
+        assert!(
+            !naive.contains("run_events_run"),
+            "if the planner picks the index unaided, the hint proves nothing: {naive}"
+        );
+        assert!(
+            naive.contains("AUTOMATIC COVERING INDEX (id=?)"),
+            "it should be probing the co-routine instead, which is what the hint avoids: {naive}"
+        );
+
+        // The control. `kind` is in NO index — not merely absent from a left
+        // prefix, because SQLite skip-scans a trailing composite column and gives
+        // a full read wearing an index's name. A control the planner could still
+        // serve from `run_events_run` would prove nothing about the assertion
+        // above, so it is asserted here that it cannot.
+        let control = plan("SELECT id FROM run_events WHERE kind = 'stalled' AND run_id > ?1");
+        assert!(
+            !control.contains("run_events_run"),
+            "the control must not be servable from the index, or it is not a control: {control}"
         );
     }
 
