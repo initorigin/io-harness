@@ -8,7 +8,7 @@ tasks:
     — there is no error path out of loading.'
   why_required: Nothing else in the release exists without a loaded plugin. Every other task either
     feeds this one its declarations or consumes what it produced.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F6 — a broken bundle costs exactly itself.** Four plugins declared: one valid, one with no `plugin.toml`,
@@ -36,7 +36,14 @@ tasks:
   - src/plugin.rs
   - src/lib.rs
   - tests/plugin.rs
-  evidence: []
+  evidence:
+  - '`tests/plugin.rs` — 12 tests, all green. `a_broken_bundle_costs_exactly_itself` covers the four
+    load failures and its repaired control; `a_bad_or_duplicate_id_drops_only_its_own_bundle` covers
+    the id rules; `a_manifest_may_not_run_a_command_in_any_scope` covers `${cmd:}` from both scopes.'
+  - Sabotage S9 (`parse` called with `Scope::Local`, so a manifest may run a command) failed `a_manifest_may_not_run_a_command_in_any_scope`.
+    Sabotage S7 (duplicate-id check removed) failed `a_bad_or_duplicate_id_drops_only_its_own_bundle`.
+  - '`cargo tree | wc -l` — 402, unchanged since 0.23.0: a manifest is parsed by the `toml` and `serde`
+    already present.'
 - id: US-IO-HARNESS-0.35.0-T02
   summary: '`[[plugin]] path = "..."` in the configuration file, `plugin` added to `APPENDING`, the
     declaring scope captured per entry as each scope is read, `Config::plugins()`, and the trust rule:
@@ -44,7 +51,7 @@ tasks:
     deny rules only.'
   why_required: The trust rule is the reason a bundle can be pointed at a cloned repository at all,
     and the per-entry scope it rests on is unrecoverable after the merge concatenates the arrays.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.35.0-T01
   acceptance_criteria:
@@ -75,13 +82,24 @@ tasks:
   - src/plugin.rs
   - tests/plugin.rs
   - tests/config.rs
-  evidence: []
+  evidence:
+  - '`a_project_scoped_bundle_contributes_nothing_that_runs_a_program` — both arms, for `[[hook]]` and
+    `[[mcp]]`: dropped from `io.toml` with the key named, loaded from `io.local.toml`. `a_locally_declared_bundle_hook_runs`
+    takes the positive arm to a hook firing on a real `finished` event and writing its line.'
+  - '`plugin_policy_may_only_narrow` — the `allow` rule and the `defaults` block each drop the bundle,
+    and the act the rule would have granted is still refused, asserted on `Policy::check` rather than
+    on the error text.'
+  - Sabotage S4 (trust rule removed) and S5 (trust rule strips the offending array instead of dropping
+    the bundle) each failed `a_project_scoped_bundle_contributes_nothing_that_runs_a_program` — one
+    sabotage per arm, trap 51. S6 (narrowing check removed) failed `plugin_policy_may_only_narrow`.
+  - '`tests/hooks.rs` and `tests/config.rs` unchanged and green: the 0.28.0 project-scope refusal for
+    `[[hook]]` in `io.toml` itself is untouched.'
 - id: US-IO-HARNESS-0.35.0-T03
   summary: 'Namespacing as attribution: every contributed skill, agent, policy layer and MCP server
     id becomes `<plugin>__<name>` at load, plus `Plugins::apply_to` and `Plugins::templates`.'
   why_required: Attribution is the half of the roadmap outcome that makes a bundle auditable, and it
     is the reason no new table is needed — without it a refusal or a spend draw names nothing.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.35.0-T01
   - US-IO-HARNESS-0.35.0-T02
@@ -116,14 +134,25 @@ tasks:
   - src/agent.rs
   - src/policy.rs
   - tests/plugin.rs
-  evidence: []
+  evidence:
+  - '`a_refusal_names_the_plugin_that_introduced_the_rule` — the stored `PolicyEvent.layer` reads `rust-review__guard`
+    for a bundle rule and the bare `guard` for the same layer declared by the application, which is
+    what proves the prefix is written by the loader.'
+  - '`an_mcp_call_from_a_bundle_is_attributed_to_it` — against the real `mcp_fixture_server` over stdio:
+    the model is offered `mcp__tools__fixture__echo`, the call succeeds, and every `mcp_events` row
+    names `tools__fixture`. The namespaced name resolving back to the server-side tool is what makes
+    `__` a safe separator.'
+  - '`a_bundle_agent_is_registered_under_its_namespaced_name_only` — the roster holds `rust-review__reviewer`
+    and not `reviewer`.'
+  - Sabotages S1 (policy layer), S2 (skills) and S3 (MCP id) each removed one namespacing and each failed
+    a different named test.
 - id: US-IO-HARNESS-0.35.0-T04
   summary: '`TaskContract` gains `#[non_exhaustive]` and a `plugins` field with `with_plugins`, and
     `discover_skills` merges every plugin''s skills directory with the contract''s own.'
   why_required: A run whose skills come from a contract directory and three bundles needs more than
     the one `Option<PathBuf>` the contract has carried since 0.14.0. This is the release's one break
     and the path by which every contribution reaches a run.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.35.0-T03
   acceptance_criteria:
@@ -148,14 +177,20 @@ tasks:
   - src/run.rs
   - src/skills.rs
   - tests/plugin.rs
-  evidence: []
+  evidence:
+  - '`a_declared_bundle_contributes_and_an_undeclared_one_does_not` — agents, policy layers, templates
+    and the skill catalogue in the system prompt the provider was handed, asserted present with the
+    `[[plugin]]` line and absent without it over an otherwise identical tree.'
+  - Sabotage S10 (`Config::plugins` loads from an empty declaration list) failed it.
+  - '`tests/public_api.rs` green against a hand-edited `docs/public-api.txt`; `tests/changelog.rs` finds
+    the `*Migration:*` note under the `**BREAKING (API)**` entry.'
 - id: US-IO-HARNESS-0.35.0-T05
   summary: '`EventKind::PluginLoaded { plugin, contributions }` and `EventKind::PluginDropped { plugin,
     why }`, their `EVENT_NAMES` entries, their round trip through `every_kind()` and the source-reading
     census.'
   why_required: A plugin that is dropped and reported on no channel an operator watches is a plugin
     that was silently ignored, which is the failure mode the drop-not-fatal rule creates.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.35.0-T01
   acceptance_criteria:
@@ -172,7 +207,13 @@ tasks:
   - src/observe.rs
   - src/plugin.rs
   - tests/plugin.rs
-  evidence: []
+  evidence:
+  - '`a_broken_bundle_costs_exactly_itself` counts `EventKind::PluginDropped` and `PluginLoaded` reaching
+    a recording `Observer` — three and one when three bundles are broken, zero and four when every manifest
+    is repaired.'
+  - Sabotage S8 (`emit_plugins` returns early) failed it.
+  - The 0.28.0 source-reading census, `EVENT_NAMES` and `every_kind()` all pass with the two new tags,
+    without being amended by hand beyond the list itself.
 - id: US-IO-HARNESS-0.35.0-T06
   summary: 'The compatibility and cost evidence: `ADDED_SINCE_0_22_0` asserted unchanged, both cross-version
     directions executed, and the source-reading test that no function reachable from the per-step loop
@@ -180,7 +221,7 @@ tasks:
   why_required: A release that quietly added a table and forgot the guard is exactly what the 0.22.0
     schema guard exists to catch, and a loader creeping into the step loop is how a bundle becomes a
     per-step file read.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.35.0-T04
   acceptance_criteria:
@@ -205,14 +246,22 @@ tasks:
   - tests/cross_version.rs
   - tests/plugin.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test cross_version` — 5 passed. `ADDED_SINCE_0_22_0` is **unchanged** by this release,
+    which is the executed form of the no-schema-change claim: the guard fires on any new table or index,
+    and it is silent.'
+  - '`cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0
+    -- --ignored` — `a_current_store_is_read_by_a_0_29_0_binary` passed. `CHECKPOINT_FORMAT` unmoved
+    at 7.'
+  - '`the_step_loop_never_touches_a_plugin` reads `src/run.rs` and asserts the plugin module is named
+    only in documentation, with a splice-in control that finds exactly the call the test exists to catch.'
 - id: US-IO-HARNESS-0.35.0-T07
   summary: 'Documentation as part of the release: `docs/guide/plugins.md`, its `docs/CAPABILITIES.md`
     entry, the honest limits in `docs/CONTRACT.md`, `README.md`, `CHANGELOG.md` with the `*Migration:*`
     note the break owes, and `docs/public-api.txt` edited by hand.'
   why_required: Four checked-in surfaces have tests that fail without them, and the release workflow
     refuses a version with no CHANGELOG section.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.35.0-T04
   - US-IO-HARNESS-0.35.0-T05
@@ -238,13 +287,22 @@ tasks:
   - README.md
   - CHANGELOG.md
   - Cargo.toml
-  evidence: []
+  evidence:
+  - '`cargo test --test guide_pages --test docs_drift --test readme --test changelog --test public_api`
+    — all green. `docs/guide/plugins.md` is registered in `GUIDES` with its limits block required, indexed
+    in `docs/CAPABILITIES.md` and linked from `README.md`.'
+  - '`docs/CONTRACT.md` gains ''What a capability bundle contributes, and what it may not (0.35.0)'':
+    no verification of a directory''s origin, no fetch or install, data and never code, the whole project-scope
+    refusal, narrowing-only policy, the untouched `[[mcp]]` gap, and the fact that a dropped bundle
+    is quiet by design.'
+  - '`CHANGELOG.md` carries the 0.35.0 section the release workflow takes its notes from, with the one
+    break and its migration note.'
 - id: US-IO-HARNESS-0.35.0-T08
   summary: 'The gates, run last against the tree that ships: fmt, clippy, both test invocations, the
     nightly docs.rs command, the cross-version job, and `cargo package --locked` after a `cargo clean`.'
   why_required: Evidence before assertions. The nightly command has caught something stable `cargo doc`
     called clean in three consecutive releases.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.35.0-T06
   - US-IO-HARNESS-0.35.0-T07
@@ -266,4 +324,17 @@ tasks:
     '
   files:
   - .ultraship/products/io-harness/execution/tasks.yaml
-  evidence: []
+  evidence:
+  - '`cargo fmt --check` — clean. `cargo clippy --all-targets --all-features -- -D warnings` — clean,
+    no lint raised.'
+  - '`cargo test` (default features) — 60 result lines, 0 failed. `cargo test --all-features` — 60 result
+    lines, 0 failed, including 361 doctests in 156s. Separate invocations with `rm -rf target` between
+    them.'
+  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — clean,
+    run before the release PR. It caught one `redundant explicit link target` in `src/plugin.rs` that
+    stable `cargo doc` reported as zero warnings; fourth consecutive release for that gate.'
+  - '`cargo clean && cargo package --locked` — exit 0, 1,279,826 bytes, and the packaged crate compiles.
+    Run with `--allow-dirty` because the working tree holds one unrelated uncommitted file, `assets/initorigin-logo.png`,
+    edited locally by the owner and not by this release; CI''s `verify` job runs it on a clean checkout
+    of `main`.'
+  - '`cargo tree | wc -l` — 402.'
