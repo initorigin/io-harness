@@ -1,0 +1,47 @@
+product: io-harness
+version: 0.35.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      Every type a manifest deserializes into already exists and is already deserialized from
+      `io.toml`: `AgentDef`, `McpServer`, `Hook` and `Layer`. The release adds a file format over
+      the vocabulary the configuration module already has rather than a second vocabulary, so the
+      parsing half is small. The recorded constraint that decides the assessment is the standing "no
+      new runtime dependency" limit — `cargo tree` reads 402 lines and a new dependency is a
+      criterion failure rather than a trade-off — and `toml` plus `serde` cover the whole format.
+    - >
+      Attribution needs no new storage. Namespacing a contribution's name as it loads puts the
+      plugin into `PolicyEvent.layer`, `McpEvent.server`, the `mcp__` tool name and the agent name
+      on a spawned run's rows — all columns written since 0.4.0. That is why the migrations section
+      is empty, `CHECKPOINT_FORMAT` stays 7 and `ADDED_SINCE_0_22_0` is unchanged, which removes the
+      whole class of work the last four releases each spent a day on.
+    - >
+      The trust rule is an extension of one this repository already wrote and tested. 0.28.0 refuses
+      `[[hook]]` whole in a project-scoped file and 0.27.0 refuses `${cmd:}` there; both have tests
+      that must keep passing unchanged, and the new rule is the same shape applied to a new
+      declaration site.
+  major_cost_drivers:
+    - >
+      `TaskContract` gains `#[non_exhaustive]` and a field in one release. Both are the same break
+      for an external struct literal, so paying them together is right — but every in-crate literal
+      construction of a `TaskContract` in `src/` and `tests/` has to grow the field, and there are
+      many.
+    - >
+      Per-entry declaring scope is not recoverable after the merge concatenates the arrays, so
+      `Config::discover` has to capture it as each scope is read — the same place and the same
+      reason as 0.30.0's `record_origins`.
+    - >
+      Four negative controls designed before the code: the no-`[[plugin]]` arm of F1, the
+      application-declared layer of F2, the repaired-manifest arm of F6, and the namespacing-removed
+      arm of F7. Trap 51 applies to F4 and F5 — each has two arms and each arm needs its own
+      sabotage.
+    - >
+      Namespacing touches four subsystems whose existing suites must pass unchanged for a run that
+      declares no plugin. MCP is the delicate one: the scheme works only because `bare_name` strips
+      a known server id rather than splitting on `__`, and that has to be proven rather than
+      assumed.
+  recommended_scope_change: null

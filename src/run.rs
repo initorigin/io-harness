@@ -807,6 +807,7 @@ pub(crate) async fn run_with_extras<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
+    emit_plugins(watch, run_id, contract);
     // Decided against the *caller's* policy, before the provider layer is merged
     // in: the harness adding a network layer of its own must not turn a
     // permissive caller into a policy-bearing one and push it off the
@@ -1759,6 +1760,7 @@ pub async fn resume_with_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
+    emit_plugins(watch, run_id, contract);
     match contract.root.clone() {
         Some(root) => {
             // Re-authorized on resume rather than trusted from the interrupted
@@ -1978,6 +1980,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
+    emit_plugins(watch, run_id, contract);
 
     match decision {
         // Deferring again leaves it pending and the run paused.
@@ -2299,6 +2302,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
+    emit_plugins(watch, run_id, contract);
 
     match decision {
         Decision::Defer => Ok(RunResult::new(
@@ -3034,6 +3038,49 @@ fn persist_ledger(
 ) -> Result<usize> {
     store.record_observations(run_id, &ledger.entries()[written..])?;
     Ok(ledger.len())
+}
+
+/// Report the capability bundles this run is carrying, loaded and dropped
+/// (0.35.0).
+///
+/// Emitted at run start, beside `Started`, on step 0 — a bundle is part of a
+/// run's configuration rather than something that happened on a step, which is
+/// the same reason an MCP connect records step 0.
+///
+/// The dropped half is why this is the crate's job and not the caller's:
+/// [`Plugins`](crate::Plugins) has no error path, so a bundle that failed to load
+/// is visible only to someone who thought to look. Putting it in the trace means
+/// an operator reading a run's events finds out that the deny rules they believed
+/// in were never installed.
+///
+/// It reads what the contract is already holding. Nothing here touches the
+/// filesystem — loading happened before the run, in the caller's own
+/// [`Config::plugins`](crate::Config::plugins) call.
+fn emit_plugins(watch: &Watch<'_>, run_id: i64, contract: &TaskContract) {
+    for plugin in contract.plugins.iter() {
+        watch.emit(RunEvent::new(
+            run_id,
+            0,
+            EventKind::PluginLoaded {
+                plugin: plugin.id().to_string(),
+                contributions: plugin
+                    .contributions()
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+            },
+        ));
+    }
+    for dropped in contract.plugins.dropped() {
+        watch.emit(RunEvent::new(
+            run_id,
+            0,
+            EventKind::PluginDropped {
+                plugin: dropped.id.clone(),
+                why: dropped.error.clone(),
+            },
+        ));
+    }
 }
 
 /// The outcome of a run that is already over, if it is over.
@@ -4392,6 +4439,7 @@ pub async fn run_tree_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
+    emit_plugins(watch, run_id, contract);
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
@@ -4582,6 +4630,7 @@ pub async fn resume_tree_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
+    emit_plugins(watch, run_id, contract);
     emit_backlog(
         watch,
         run_id,

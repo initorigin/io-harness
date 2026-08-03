@@ -883,8 +883,8 @@ versions:
       may only narrow. Every contribution carries its plugin as its origin in the trace, so a
       refusal or a spend draw can be attributed to the thing that introduced it. A plugin that fails
       to load is dropped and reported, never fatal — one broken bundle must not take a run with it.
-    detail: hypothesis
-    status: planned
+    detail: specified
+    status: released
   - version: 0.36.0
     outcome: >
       A run lands as a branch, and can be put back.

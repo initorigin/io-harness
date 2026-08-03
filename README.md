@@ -262,6 +262,16 @@ run. `Config::hooks()` returns an `Observer` the caller installs like any other,
 so no run loop changed — and the whole array is refused in the committed project
 file, for the same reason `${cmd:...}` is. See the [hooks guide](docs/guide/hooks.md).
 
+**Capability bundles, so a set of capabilities travels as one thing.** A
+directory with a `plugin.toml` contributes skills, prompt templates, an agent
+roster, MCP servers, hooks and deny-only policy at once, named by a `[[plugin]]`
+entry in any scope. Every contributed name is namespaced `<plugin>__<name>` as it
+loads, so a refusal, a tool call and a child's spend already say which bundle
+introduced them — with no new table. A bundle declared in the committed project
+file may not contribute a hook or an MCP server, because both name a program this
+machine would run, and a bundle that fails to load is dropped and reported rather
+than taking the run with it. See the [bundles guide](docs/guide/plugins.md).
+
 **Undo.** Every write records what was there before the run first touched that
 file, in the store rather than in memory, so `rewind(&workspace, &store, run_id,
 path)` puts a file back — including deleting one the run created — after a crash
@@ -293,6 +303,7 @@ none rather than guessing.
 | [Images and git](docs/guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](docs/guide/hooks.md) | An audit log, a notification, a formatter or a check that stops the run, declared in `io.toml` |
 | [Providers](docs/guide/providers.md) | One compatible provider, the 21 vendor presets, running a model locally, what a model costs, and asking one to think harder |
+| [Capability bundles](docs/guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny rules at once, what a cloned repository may not hand you, and how a contribution names its bundle |
 
 [docs/CAPABILITIES.md](docs/CAPABILITIES.md) indexes them.
 [docs/CONTRACT.md](docs/CONTRACT.md) is the public contract: what is stable, what

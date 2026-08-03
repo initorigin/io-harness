@@ -47,10 +47,13 @@ const BUSY_TIMEOUT src/state.rs
 const CHECKPOINT_FORMAT src/state.rs
 const DEFAULT_EXEC_TIMEOUT src/tools/exec.rs
 const IMAGE_MEDIA_TYPES src/provider/mod.rs (feature = "media")
+const MAX_ID src/plugin.rs
 const MCP_TOOL_PREFIX src/mcp.rs
 const MEMORY_MAX_CHARS src/state.rs
 const MEMORY_MAX_ENTRIES src/state.rs
 const MEMORY_MAX_ENTRY_CHARS src/state.rs
+const NAMESPACE src/plugin.rs
+const PLUGIN_FILE src/plugin.rs
 const POLL_LIMIT src/attach.rs
 const PROPOSE_PLAN_TOOL src/tools/mod.rs
 const REQUEST_TIMEOUT src/net.rs
@@ -109,6 +112,7 @@ struct ContextBudget src/context.rs
 struct ContextEvent src/state.rs
 struct Defaults src/policy.rs
 struct DenyAll src/approve.rs
+struct Dropped src/plugin.rs
 struct Edit src/state.rs
 struct ExecGuard src/verify.rs
 struct FirstTry src/state.rs
@@ -136,6 +140,8 @@ struct PendingQuestion src/state.rs
 struct Plan src/approve.rs
 struct PlanGateNone src/approve.rs
 struct PlanStep src/approve.rs
+struct Plugin src/plugin.rs
+struct Plugins src/plugin.rs
 struct Policy src/policy.rs
 struct PolicyEvent src/state.rs
 struct ProcessHandle src/state.rs

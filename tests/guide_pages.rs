@@ -78,6 +78,13 @@ const GUIDES: &[(&str, bool)] = &[
     // and SGLang emitting no tool calls at all unless the server was started for
     // them, which is the failure that reports nothing and errors nowhere.
     ("providers.md", true),
+    // 0.35.0. It carries a limits block because a packaging format is defined by
+    // what it does not promise: nothing verifies that a directory is what its
+    // author published, nothing fetches or installs one, a bundle contributes data
+    // and never code, and a bundle that fails to load is dropped quietly enough
+    // that an operator watching neither report channel can run without deny rules
+    // they believe are installed.
+    ("plugins.md", true),
 ];
 
 fn guide_dir() -> PathBuf {

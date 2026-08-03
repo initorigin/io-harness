@@ -281,6 +281,15 @@ struct File {
     // than a pile assembled from three.
     #[serde(default)]
     hook: Vec<crate::hooks::Hook>,
+    // 0.35.0. Each entry names a directory holding a `plugin.toml`. In `APPENDING`
+    // for the reason `[[agent]]` is: a project's bundles and an individual's own
+    // are both wanted, and a local file that silently deleted the project's would
+    // be a roster nobody could rely on. What a *plugin* may contribute depends on
+    // the scope that declared it, which is why `Config` keeps `plugin_decls`
+    // beside this — the merge that concatenates these arrays cannot say afterwards
+    // which file contributed which element.
+    #[serde(default)]
+    plugin: Vec<crate::plugin::Declaration>,
 }
 
 /// Which provider a run uses, as a value a configuration can carry (0.27.0).
@@ -598,6 +607,14 @@ pub struct Config {
     /// operator writing `append = "audit.jsonl"` means the project they are pointing
     /// the harness at rather than their own home directory.
     dir: PathBuf,
+    /// Every `[[plugin]]` entry with the scope of the file that declared it
+    /// (0.35.0).
+    ///
+    /// Recorded per scope as the scopes are read, like `origins` and for the same
+    /// reason: the merge concatenates the arrays and nothing afterwards can say
+    /// which file wrote which element. The trust rule needs exactly that answer,
+    /// so it is kept rather than derived.
+    plugin_decls: Vec<(Scope, PathBuf)>,
 }
 
 impl Config {
@@ -630,11 +647,17 @@ impl Config {
         let mut merged = toml::value::Table::new();
         let mut sources = Vec::new();
         let mut origins = BTreeMap::new();
+        let mut plugin_decls = Vec::new();
         for (scope, path) in candidates {
             if !path.is_file() {
                 continue;
             }
             let table = read_scope(scope, &path)?;
+            // Captured here, from this scope's own table, for the reason
+            // `record_origins` runs here: after the merge the arrays are one array.
+            for decl in declared_plugins(&table, &path)? {
+                plugin_decls.push((scope, decl.path));
+            }
             // Recorded from the scope's own table, before the merge folds it into
             // everything read so far — afterwards there is nothing left to say
             // which file a key came from.
@@ -660,6 +683,7 @@ impl Config {
             instructions,
             origins,
             dir: root.to_path_buf(),
+            plugin_decls,
         })
     }
 
@@ -692,6 +716,13 @@ impl Config {
         refuse_nested_profiles(&file, path)?;
         crate::hooks::Hooks::check(&file.hook, path)?;
         check_providers(&file.provider)?;
+        // Parsed text is the project scope, so every plugin it declares is
+        // declared from the scope a `git clone` delivers.
+        let plugin_decls = file
+            .plugin
+            .iter()
+            .map(|d| (Scope::Project, d.path.clone()))
+            .collect();
         Ok(Self {
             file,
             sources: Vec::new(),
@@ -702,6 +733,7 @@ impl Config {
             // never read.
             origins: BTreeMap::new(),
             dir: PathBuf::from("."),
+            plugin_decls,
         })
     }
 
@@ -777,6 +809,9 @@ impl Config {
             instructions: self.instructions.clone(),
             origins,
             dir: self.dir.clone(),
+            // A profile overlays keys; it does not re-declare bundles. Carried
+            // whole so `with_profile` does not quietly change what is loaded.
+            plugin_decls: self.plugin_decls.clone(),
         })
     }
 
@@ -1281,6 +1316,42 @@ impl Config {
         crate::hooks::Hooks::new(self.file.hook.clone(), &self.dir)
     }
 
+    /// Every `[[plugin]]` this configuration declares, loaded (0.35.0).
+    ///
+    /// Infallible, and that is the feature: a bundle that cannot be loaded is
+    /// **dropped** onto [`Plugins::dropped`](crate::Plugins::dropped) with its
+    /// reason rather than failing the call, so one broken directory cannot take a
+    /// run with it. See [`crate::plugin`] for the manifest, the trust rule that
+    /// bounds what a project-scoped declaration may contribute, and the
+    /// namespacing that puts a plugin's id into the trace.
+    ///
+    /// A relative `path` resolves against the discovery root, which is the
+    /// project the harness was pointed at rather than the directory the declaring
+    /// file lives in — the rule a `[[hook]]`'s `append` already follows.
+    ///
+    /// ```
+    /// use io_harness::Config;
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// let root = dir.path();
+    /// std::fs::create_dir(root.join("bundle"))?;
+    /// std::fs::write(root.join("bundle").join("plugin.toml"), "name = \"review\"\n")?;
+    /// std::fs::write(root.join("io.toml"), "[[plugin]]\npath = \"bundle\"\n")?;
+    ///
+    /// let plugins = Config::discover(root)?.plugins();
+    /// assert_eq!(plugins.names(), vec!["review"]);
+    /// assert!(plugins.dropped().is_empty());
+    ///
+    /// // A configuration that declares none reads no directory at all.
+    /// assert!(Config::from_toml("").unwrap().plugins().is_empty());
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn plugins(&self) -> crate::plugin::Plugins {
+        crate::plugin::Plugins::load(&self.plugin_decls, &self.dir)
+    }
+
     /// The prompt-template directory this configuration points at, if any (0.21.0).
     ///
     /// Discovery is the caller's to do — [`Templates::discover`](crate::Templates) is
@@ -1469,12 +1540,28 @@ fn read_scope(scope: Scope, path: &Path) -> Result<toml::value::Table> {
     Ok(table)
 }
 
+/// The `[[plugin]]` entries one scope's own table declares (0.35.0).
+///
+/// Read from the scope's table rather than the merged one, because which file
+/// declared a bundle decides what that bundle may contribute.
+fn declared_plugins(
+    table: &toml::value::Table,
+    path: &Path,
+) -> Result<Vec<crate::plugin::Declaration>> {
+    let Some(value) = table.get("plugin") else {
+        return Ok(Vec::new());
+    };
+    value.clone().try_into().map_err(|e: toml::de::Error| {
+        Error::Config(format!("{}: key `plugin`: {}", path.display(), e.message()))
+    })
+}
+
 /// Parse and substitute, in that order — a substitution is a value, not syntax.
 ///
 /// `scope` reaches all the way down to [`expand`] because one substitution —
 /// `${cmd:...}` — is refused in the project scope, and the project scope is the one
 /// a `git clone` delivers.
-fn parse(scope: Scope, text: &str, path: &Path) -> Result<toml::value::Table> {
+pub(crate) fn parse(scope: Scope, text: &str, path: &Path) -> Result<toml::value::Table> {
     let mut table: toml::value::Table = toml::from_str(text)
         .map_err(|e| Error::Config(format!("{}: {}", path.display(), e.message())))?;
     let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -1764,10 +1851,11 @@ fn bad_key(path: &Path, key: &[String], why: impl std::fmt::Display) -> Error {
 
 /// The keys whose arrays *append* across scopes instead of being replaced.
 ///
-/// Only one, and it is the one the [`Policy`] type's own semantics call for: a
-/// later scope adds a layer, it does not rewrite the boundary. Everything else
+/// Three, and each is a set every scope contributes to rather than a value one
+/// scope owns: a later scope adds a policy layer, an agent or a plugin, it does
+/// not rewrite the boundary, the roster or the bundle list. Everything else
 /// replaces, because a half-merged MCP server definition is not a server.
-const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"]];
+const APPENDING: &[&[&str]] = &[&["policy", "layers"], &["agent"], &["plugin"]];
 
 /// Record `origin` against every leaf key of `table`, walking it the way
 /// [`merge`] walks it so the two cannot disagree about what a leaf is (0.30.0).

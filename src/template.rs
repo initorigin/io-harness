@@ -189,6 +189,34 @@ impl Templates {
         Self::default()
     }
 
+    /// Every name prefixed with the plugin that contributed it (0.35.0).
+    ///
+    /// The same rule [`Skills`](crate::Skills) follows, for the same reason: two
+    /// bundles carrying a `review` template would otherwise be a collision the
+    /// operator has to discover.
+    #[must_use]
+    pub(crate) fn namespaced(mut self, plugin: &str) -> Self {
+        for template in &mut self.templates {
+            template.name = crate::plugin::namespaced(plugin, &template.name);
+        }
+        self
+    }
+
+    /// This set and `other`, sorted by name, refusing a duplicate (0.35.0).
+    pub(crate) fn merged(mut self, other: Self) -> Result<Self> {
+        self.templates.extend(other.templates);
+        self.templates.sort_by(|a, b| a.name.cmp(&b.name));
+        for pair in self.templates.windows(2) {
+            if pair[0].name == pair[1].name {
+                return Err(Error::Config(format!(
+                    "two templates are both named {:?}",
+                    pair[0].name
+                )));
+            }
+        }
+        Ok(self)
+    }
+
     /// Discover every template under `dir`, sorted by name.
     ///
     /// Fails with [`Error::Config`] when `dir` does not exist, is not a

@@ -34,6 +34,7 @@ the limits that capability actually has.
 | [Images and git](guide/images-and-git.md) | Image passthrough and the fixed-argv git built-ins |
 | [Hooks](guide/hooks.md) | Reacting to a run from `io.toml`: an audit log, a notification, a formatter, a check that stops the run — and why the whole array is refused in the project scope |
 | [Providers](guide/providers.md) | One `Compatible` provider over any OpenAI-shaped endpoint, the 21 vendor presets, the local runtimes, what `Provider::models()` reports, and the routing rules that change which model answers mid-run |
+| [Capability bundles](guide/plugins.md) | A directory that contributes skills, templates, agents, MCP servers, hooks and deny-only policy at once; what a project-scoped declaration may not hand you; how a contribution names the bundle it came from; and why a broken bundle is dropped rather than fatal |
 
 ## The twelve pillars
 
