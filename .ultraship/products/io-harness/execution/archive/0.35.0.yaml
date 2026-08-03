@@ -10,8 +10,8 @@ release_fit:
       Every type a manifest deserializes into already exists and is already deserialized from
       `io.toml`: `AgentDef`, `McpServer`, `Hook` and `Layer`. The release adds a file format over
       the vocabulary the configuration module already has rather than a second vocabulary, so the
-      parsing half is small. The recorded constraint that decides the assessment is the standing
-      "no new runtime dependency" limit — `cargo tree` reads 402 lines and a new dependency is a
+      parsing half is small. The recorded constraint that decides the assessment is the standing "no
+      new runtime dependency" limit — `cargo tree` reads 402 lines and a new dependency is a
       criterion failure rather than a trade-off — and `toml` plus `serde` cover the whole format.
     - >
       Attribution needs no new storage. Namespacing a contribution's name as it loads puts the
@@ -20,10 +20,10 @@ release_fit:
       is empty, `CHECKPOINT_FORMAT` stays 7 and `ADDED_SINCE_0_22_0` is unchanged, which removes the
       whole class of work the last four releases each spent a day on.
     - >
-      The trust rule is an extension of one this repository already wrote and tested. 0.28.0
-      refuses `[[hook]]` whole in a project-scoped file and 0.27.0 refuses `${cmd:}` there; both
-      have tests that must keep passing unchanged, and the new rule is the same shape applied to a
-      new declaration site.
+      The trust rule is an extension of one this repository already wrote and tested. 0.28.0 refuses
+      `[[hook]]` whole in a project-scoped file and 0.27.0 refuses `${cmd:}` there; both have tests
+      that must keep passing unchanged, and the new rule is the same shape applied to a new
+      declaration site.
   major_cost_drivers:
     - >
       `TaskContract` gains `#[non_exhaustive]` and a field in one release. Both are the same break
@@ -36,11 +36,12 @@ release_fit:
       reason as 0.30.0's `record_origins`.
     - >
       Four negative controls designed before the code: the no-`[[plugin]]` arm of F1, the
-      application-declared layer of F2, the repaired-manifest arm of F6, and the
-      namespacing-removed arm of F7. Trap 51 applies to F4 and F5 — each has two arms and each arm
-      needs its own sabotage.
+      application-declared layer of F2, the repaired-manifest arm of F6, and the namespacing-removed
+      arm of F7. Trap 51 applies to F4 and F5 — each has two arms and each arm needs its own
+      sabotage.
     - >
       Namespacing touches four subsystems whose existing suites must pass unchanged for a run that
       declares no plugin. MCP is the delicate one: the scheme works only because `bare_name` strips
-      a known server id rather than splitting on `__`, and that has to be proven rather than assumed.
+      a known server id rather than splitting on `__`, and that has to be proven rather than
+      assumed.
   recommended_scope_change: null

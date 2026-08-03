@@ -884,7 +884,7 @@ versions:
       refusal or a spend draw can be attributed to the thing that introduced it. A plugin that fails
       to load is dropped and reported, never fatal — one broken bundle must not take a run with it.
     detail: specified
-    status: planned
+    status: released
   - version: 0.36.0
     outcome: >
       A run lands as a branch, and can be put back.

@@ -470,6 +470,47 @@ known_limitations:
   over-claims — counting every row is the answer. Raised rather than read as satisfied, and
   untouched by this release.
 
+- >
+  **The namespacing rule was applied to templates as well as the four the contract's prose named,
+  stated rather than glossed.** The included list says "skills, agents, policy layers and MCP server
+  ids"; templates are merged from several bundles by the same `merged`/`namespaced` pair and would
+  collide in exactly the same way, so leaving them out would have been a rule with an unexplained
+  hole. Nothing else was widened.
+- >
+  **Contributions install through three calls, not one.** The contract's prose names
+  `Plugins::apply_to(TaskContract)`. Policy and hooks are not on a contract — a `Policy` is passed to
+  the entry point and a `Hooks` is an `Observer` the caller installs — so `apply_to_policy` and
+  `apply_to_hooks` exist beside it. Three calls is the shape the crate already has; folding them
+  into one would have meant this release inventing an install point.
+- >
+  **`Plugins::templates()` is fallible where the rest of the type is not.** A `templates` key naming
+  a directory that does not exist is a mistake inside a bundle that otherwise loaded, and reporting
+  it as an empty catalogue would hide it. The infallible-loading claim covers the manifest, not the
+  directories a loaded manifest points at.
+- >
+  **N3 was met in the shape the crate already has, and the difference is worth stating.** Manifest
+  loading is the caller's, before the run. A bundle's *skills directory* is read at run start by
+  `discover_skills`, once, exactly as a contract's own skills directory has been since 0.9.0 — not
+  per step, and not by the step loop. The source-reading test asserts `src/run.rs` names the plugin
+  module only in documentation; `emit_plugins` reads the already-loaded value the contract carries
+  and touches no filesystem.
+- >
+  **`cargo package --locked` was run with `--allow-dirty`.** The working tree held one uncommitted
+  file, `assets/initorigin-logo.png`, edited locally by the owner and unrelated to this release; it
+  was deliberately left uncommitted rather than swept into a release commit. CI's `verify` job runs
+  `cargo package --locked` on a clean checkout of `main`, which is the run that gates the Release.
+- >
+  **This record was sealed before the crates.io upload.** `mode: published` is the release's target
+  and the flow's last step: the develop merge, the main merge and the GitHub Release all come after
+  the record rides the `feat/0.35.0` commit, and `cargo publish --locked` comes after those. Sealing
+  it `release-ready` and correcting it afterwards would mean editing an immutable record, which is
+  worse.
+- >
+  **The local suites were run with `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_TEST_DEBUG=0`,**
+  and `target/` was deleted twice during the release (13 GiB and 12.9 GiB). The volume reached
+  8.0 GiB free at its lowest. Debug info changes no test outcome and CI runs the unmodified commands
+  on a fresh runner; recorded because the numbers above were measured under it.
+
 open_questions:
 - >
   Whether a plugin should be able to contribute a `[[provider]]`. It is data like everything else
@@ -485,4 +526,96 @@ open_questions:
   because MCP already uses it and it is safe in a vendor's tool-name grammar; it is also four
   characters of every name a model reads. Worth measuring before changing.
 
-status: planned
+status: released
+released_at: 2026-08-03T17:55:00Z
+mode: published
+delivered: >
+  A directory is a capability bundle, and everything it contributes says which bundle it came from.
+
+  A `plugin.toml` declares skills, prompt templates, agent definitions, MCP servers, lifecycle hooks
+  and policy layers in the vocabulary `io.toml` already deserializes. A `[[plugin]]` entry in any
+  scope names one by path — appending across scopes the way `policy.layers` and `[[agent]]` do — and
+  `Config::plugins()` loads them. `Plugins::apply_to`, `apply_to_policy`, `apply_to_hooks` and
+  `templates()` install what they brought, at the three install points this crate already had.
+
+  Every contributed name is namespaced `<plugin>__<name>` as it loads, so attribution needed no new
+  storage: a refusal reads `rust-review__no-secrets` in `PolicyEvent.layer`, a call reads
+  `rust-review__docs` in `McpEvent.server` and is offered as `mcp__rust-review__docs__search`, and a
+  spawned child's tokens are billed under `rust-review__reviewer`. **No table, column or index was
+  added and `CHECKPOINT_FORMAT` is unmoved at 7.** Namespacing also makes a collision impossible
+  rather than unlikely: ids are unique, bounded to 32 characters of `[a-z0-9-]`, and may not contain
+  the separator.
+
+  A bundle is a stranger's directory, so 0.28.0's rule governs it: a plugin declared in the
+  committed `io.toml` contributes skills, templates, agents and deny rules and may not contribute a
+  `[[hook]]` or an `[[mcp]]`, and the refusal is **whole** — such a bundle contributes none of its
+  other kinds either. `${cmd:}` is refused inside a manifest in every scope. Plugin policy may carry
+  `deny` rules only.
+
+  Loading has no error path at all. A bundle that cannot be loaded is dropped onto
+  `Plugins::dropped()` with its reason and reported as `EventKind::PluginDropped`, and the run
+  proceeds with every bundle that did load.
+
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — 60 result lines, 0 failed. Run in its own invocation.
+  - >
+    `cargo test --all-features` — 60 result lines, 0 failed, including 361 doctests in 156s. A
+    separate invocation with `rm -rf target` between the two, per the standing disk trap.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — clean, no lint raised.
+    `cargo fmt --check` — clean, run against the sealed tree.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — clean,
+    run BEFORE the release PR was opened. It caught one `redundant explicit link target`
+    (``[`Hooks`](crate::Hooks)`` in `src/plugin.rs`'s module docs) that stable
+    `cargo doc --all-features --no-deps` reported as zero warnings. **Fourth consecutive release**
+    for that gate.
+  - >
+    Twelve tests in `tests/plugin.rs`, green, covering F1-F8 and N3. The MCP half of F3 runs against
+    the real `examples/mcp_fixture_server` over stdio — a real handshake, `tools/list` and
+    `tools/call` — rather than a protocol mock.
+  - >
+    **Ten sabotages, each failing a NAMED test, none of them silent.** S1 policy layers not
+    namespaced -> `a_refusal_names_the_plugin_that_introduced_the_rule`. S2 skills not namespaced ->
+    `namespacing_makes_a_collision_impossible`. S3 MCP ids not namespaced ->
+    `an_mcp_call_from_a_bundle_is_attributed_to_it`. S4 trust rule removed and S5 trust rule strips
+    the offending array instead of dropping the bundle -> both
+    `a_project_scoped_bundle_contributes_nothing_that_runs_a_program`, one per arm as trap 51
+    requires. S6 narrowing check removed -> `plugin_policy_may_only_narrow`. S7 duplicate-id check
+    removed -> `a_bad_or_duplicate_id_drops_only_its_own_bundle`. S8 `emit_plugins` returns early ->
+    `a_broken_bundle_costs_exactly_itself`. S9 a manifest parsed as the local scope, so `${cmd:}`
+    runs -> `a_manifest_may_not_run_a_command_in_any_scope`. S10 the loader is handed an empty
+    declaration list -> `a_declared_bundle_contributes_and_an_undeclared_one_does_not`.
+  - >
+    Cross-version, both directions, with nothing to migrate: `cargo test --test cross_version` — 5
+    passed with `ADDED_SINCE_0_22_0` **unchanged**, which is the executed form of the
+    no-schema-change claim rather than an assertion about it. `cargo build --manifest-path
+    tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 -- --ignored`
+    — `a_current_store_is_read_by_a_0_29_0_binary` passed.
+  - >
+    The documentation gates: `tests/public_api.rs` (9 passed) against a hand-edited
+    `docs/public-api.txt` carrying the six new names, `tests/guide_pages.rs` (7) with
+    `docs/guide/plugins.md` registered and its limits block required, `tests/changelog.rs` (5)
+    finding the `*Migration:*` note under the one `**BREAKING (API)**` entry, plus `docs_drift` and
+    `readme`.
+  - >
+    The two new events round-trip: `EVENT_NAMES` gained `plugin_loaded` and `plugin_dropped`, and
+    the source-reading census 0.28.0 added — which reads `pub enum EventKind` out of
+    `src/observe.rs` and asserts the tags are equal to the list — passes.
+  builds:
+  - >
+    `cargo clean && cargo package --locked --allow-dirty` — exit 0, **1,279,826 bytes**, and the
+    packaged crate compiles. `--allow-dirty` because of one unrelated uncommitted asset; see
+    `known_limitations`.
+  - >
+    `cargo tree | wc -l` — **402**, unchanged since 0.23.0. A manifest is parsed by the `toml` and
+    `serde` already in the graph, into the `AgentDef`, `McpServer`, `Hook` and `Layer` types
+    `io.toml` already deserializes.
+  reviews: []
+  deployments: []
+  health_checks: []
+supersedes: 0.34.0
+next_recommended_version: 0.36.0
+immutable: true
