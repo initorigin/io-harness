@@ -63,7 +63,10 @@ use crate::tools::{
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
-use crate::tools::{GIT_ADD_TOOL, GIT_COMMIT_TOOL, GIT_DIFF_TOOL, GIT_LOG_TOOL, GIT_STATUS_TOOL};
+use crate::tools::{
+    GIT_ADD_TOOL, GIT_BRANCH_TOOL, GIT_COMMIT_TOOL, GIT_DIFF_TOOL, GIT_LOG_TOOL, GIT_STATUS_TOOL,
+    GIT_WORKTREE_TOOL,
+};
 #[cfg(feature = "pdf")]
 use crate::tools::{PDF_FILL_FORM_TOOL, PDF_READ_TOOL, PDF_WATERMARK_TOOL, PDF_WRITE_TOOL};
 #[cfg(feature = "xlsx")]
@@ -8070,10 +8073,16 @@ async fn dispatch(
         // built-ins, and `Toolbox::validate` has already guaranteed the three
         // sets are disjoint, so the order is documentation rather than a
         // tie-break.
-        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL | GIT_ADD_TOOL | GIT_COMMIT_TOOL => {
+        GIT_LOG_TOOL
+        | GIT_STATUS_TOOL
+        | GIT_DIFF_TOOL
+        | GIT_ADD_TOOL
+        | GIT_COMMIT_TOOL
+        | GIT_BRANCH_TOOL
+        | GIT_WORKTREE_TOOL => {
             // Paths the model named, if any. Every one of them is data: `argv`
             // puts them after `--` and refuses a leading `-`.
-            let paths: Vec<String> = a
+            let mut paths: Vec<String> = a
                 .get("paths")
                 .and_then(|v| v.as_array())
                 .map(|v| {
@@ -8083,13 +8092,33 @@ async fn dispatch(
                 })
                 .unwrap_or_default();
 
+            // 0.36.0 — `git_worktree` names one path rather than a list, and it
+            // is the location a directory is created at. Folding it into `paths`
+            // here rather than carrying a second variable is what puts it
+            // through the same gate loop, the same `check_path` and the same
+            // `--` separator as every other model-supplied path in this crate.
+            if name == GIT_WORKTREE_TOOL {
+                paths = s("path")
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| vec![p.to_string()])
+                    .unwrap_or_default();
+            }
+
             // What the policy is asked, per tool. Reading history reads `.git`.
             // Staging copies a file's bytes into the object store, so it needs
             // `Act::Read` on that file — which is what stops a path the policy
             // denies from reaching a commit. Committing writes `.git`.
+            //
+            // 0.36.0: creating a branch writes a ref, so it writes `.git` and
+            // names no path. A worktree writes `.git` *and* creates a directory
+            // at the path the model chose, so that path is an `Act::Write` — the
+            // only git built-in whose path is checked for writing rather than
+            // reading, because it is the only one that makes a file the model
+            // named rather than reading one.
             let (repo_act, path_act) = match name {
                 GIT_ADD_TOOL => (Act::Write, Some(Act::Read)),
-                GIT_COMMIT_TOOL => (Act::Write, None),
+                GIT_COMMIT_TOOL | GIT_BRANCH_TOOL => (Act::Write, None),
+                GIT_WORKTREE_TOOL => (Act::Write, Some(Act::Write)),
                 _ => (Act::Read, Some(Act::Read)),
             };
 
@@ -8145,6 +8174,36 @@ async fn dispatch(
                         ));
                     }
                     GitCmd::Add { paths }
+                }
+                GIT_BRANCH_TOOL => {
+                    let Some(branch) = s("name").filter(|n| !n.trim().is_empty()) else {
+                        return Ok(Dispatched::go(
+                            "git_branch missing name",
+                            "\n[git error] git_branch needs a non-empty \"name\"\n".to_string(),
+                        ));
+                    };
+                    GitCmd::Branch {
+                        name: branch.to_string(),
+                    }
+                }
+                GIT_WORKTREE_TOOL => {
+                    let Some(branch) = s("name").filter(|n| !n.trim().is_empty()) else {
+                        return Ok(Dispatched::go(
+                            "git_worktree missing name",
+                            "\n[git error] git_worktree needs a non-empty \"name\"\n".to_string(),
+                        ));
+                    };
+                    // `paths` holds exactly the `path` argument, or nothing.
+                    let Some(path) = paths.into_iter().next() else {
+                        return Ok(Dispatched::go(
+                            "git_worktree missing path",
+                            "\n[git error] git_worktree needs a non-empty \"path\"\n".to_string(),
+                        ));
+                    };
+                    GitCmd::Worktree {
+                        name: branch.to_string(),
+                        path,
+                    }
                 }
                 _ => {
                     let Some(message) = s("message").filter(|m| !m.trim().is_empty()) else {
@@ -9678,8 +9737,9 @@ fn workspace_tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: GIT_COMMIT_TOOL.to_string(),
             description: "Commit what you have staged, on the branch that is checked out. There \
-                          is no push, no branch switching and no history rewriting: your work \
-                          stays local for a human to review."
+                          is no push and no history rewriting: your work stays local for a human \
+                          to review. Use git_branch first if it should land somewhere other than \
+                          the branch you found."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -9687,6 +9747,39 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "message": { "type": "string", "description": "The commit message." }
                 },
                 "required": ["message"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_BRANCH_TOOL.to_string(),
+            description: "Create a branch at the current commit and move onto it, so your work \
+                          lands somewhere a human can review or delete on its own rather than on \
+                          whatever branch you happened to find. It never discards anything: your \
+                          uncommitted changes come with you, and a name that already exists is \
+                          refused. There is no way back to another branch and no way to delete \
+                          one."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Branch to create, e.g. agent/fix-the-flake. Letters, digits, dot, underscore, slash and dash only; at most 100 characters." }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_WORKTREE_TOOL.to_string(),
+            description: "Make a second working tree of this repository at a path you name, on a \
+                          new branch, so work that would collide with another agent's files gets \
+                          its own checkout. The path is created for you and is yours to work in; \
+                          nothing here removes a worktree afterwards."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Branch to create for the new working tree. Same naming rules as git_branch." },
+                    "path": { "type": "string", "description": "Where to put it, relative to the workspace root, e.g. .worktrees/reviewer." }
+                },
+                "required": ["name", "path"]
             }),
         },
         #[cfg(feature = "media")]

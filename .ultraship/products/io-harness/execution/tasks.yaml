@@ -9,7 +9,7 @@ tasks:
       Every other git task renders through `GitCmd::options`/`paths`. Without the two shapes and a
       validator that refuses a name before any spawn, there is nothing for a tool to call and the
       fixed-argv property has no test that covers the new surface.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -46,7 +46,7 @@ tasks:
     why_required: >
       The release's headline outcome is that a run lands as a branch. A `GitCmd` variant no tool
       dispatches to reaches no run, and the claim is only true if the starting branch is unmoved.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T01
     acceptance_criteria:
@@ -61,8 +61,32 @@ tasks:
     files:
       - src/tools/mod.rs
       - src/run.rs
-      - tests/git_branch.rs
-    evidence: []
+      - tests/git.rs
+    evidence:
+      - >
+        `cargo test --test git` — 14 passed, 0 failed. The two added tests are
+        `a_run_lands_its_commit_on_a_branch_it_made_and_leaves_the_one_it_found_alone` and
+        `an_agent_makes_a_second_working_tree_and_a_denied_path_refuses_it`; the twelve that
+        existed pass unchanged.
+      - >
+        F2 in full: `HEAD` is `agent/fix-the-flake`, the log holds `add notes`, `git show
+        --name-only` holds `NOTES.md`, the commit's author is `Agent Smith
+        <smith@example.invalid>` from the contract's identity, and **`main` points at the same
+        commit it pointed at before the run** while the new branch does not.
+      - >
+        The worktree half is asserted with its own control: `.worktrees/side/README.md` is a real
+        checkout on branch `agent/side`, the parent is still on `main`, and the identical call at
+        `private/wt` under `deny_write("private/**")` creates neither the directory nor the branch.
+      - >
+        Sabotage S2 — `git_branch` dispatched to `GitCmd::Status`, which is exactly the 0.35.0
+        behaviour of committing onto the branch that was found — failed exactly
+        `a_run_lands_its_commit_on_a_branch_it_made_and_leaves_the_one_it_found_alone`
+        (13 passed, 1 failed). The file still got written, staged and committed under the sabotage,
+        which is why the unmoved-`main` assertion is the one that discriminates.
+      - >
+        The `git_commit` tool description said "no push, no branch switching and no history
+        rewriting"; the middle clause became false in this release and was corrected in the same
+        commit rather than left for a reader to discover.
 
   - id: US-IO-HARNESS-0.36.0-T03
     summary: >
