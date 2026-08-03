@@ -1,340 +1,307 @@
 product: io-harness
-version: 0.35.0
+version: 0.36.0
 tasks:
-- id: US-IO-HARNESS-0.35.0-T01
-  summary: 'The manifest and the loader: `src/plugin.rs` with `Manifest`, `Plugin`, `Dropped` and `Plugins`.
-    A plugin.toml is parsed into the types `io.toml` already deserializes, its id is validated `[a-z0-9][a-z0-9-]{0,31}`,
-    `${cmd:}` is refused in every scope, and every failure becomes a `Dropped` rather than an error
-    — there is no error path out of loading.'
-  why_required: Nothing else in the release exists without a loaded plugin. Every other task either
-    feeds this one its declarations or consumes what it produced.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - '**F6 — a broken bundle costs exactly itself.** Four plugins declared: one valid, one with no `plugin.toml`,
-    one whose TOML does not parse, one whose manifest carries an unknown key. The run reaches its normal
-    outcome, `Plugins::dropped()` has exactly three entries whose errors name three different causes,
-    exactly three `EventKind::PluginDropped` events reach the observer, and every contribution of the
-    valid one is present. The control is the same four directories with every manifest repaired: `dropped()`
-    is empty and four `PluginLoaded` events fire. A duplicate id and a malformed id (`Rust_Review`,
-    `a__b`, 33 characters) are asserted the same way, each dropping only its own plugin.
+  - id: US-IO-HARNESS-0.36.0-T01
+    summary: >
+      Two new `GitCmd` shapes — `Branch` and `Worktree` — and the branch-name validator, with the
+      argv sweeps and the forbidden-list test extended to cover them without being relaxed.
+    why_required: >
+      Every other git task renders through `GitCmd::options`/`paths`. Without the two shapes and a
+      validator that refuses a name before any spawn, there is nothing for a tool to call and the
+      fixed-argv property has no test that covers the new surface.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        **F1 — the two built-ins are fixed argv, and the forbidden surface is still unreachable.**
+        Every `GitCmd` shape, including the two new ones, is asserted to produce a subcommand drawn
+        from `status`, `diff`, `log`, `add`, `commit`, `switch`, `worktree` and nothing else, and
+        `no_shape_can_write_or_reach_the_network` passes **unchanged** over the widened shape list —
+        the pre-existing test, not a rewritten one, because a release that relaxed the list to fit
+        its new argv is what that test exists to catch. The control is name validation: `-x`,
+        `a..b`, `/lead`, `trail/`, `x.lock`, a 101-character name and an empty name are each refused
+        before any spawn, and the same name with the offending part removed is accepted.
+    files:
+      - src/tools/git.rs
+    evidence: []
 
-    '
-  - '**F8 — `${cmd:}` is refused in a manifest from every scope.** A manifest carrying `${cmd:...}`
-    in any value is dropped whether it was declared from the user file, `io.local.toml` or `io.toml`,
-    with the error naming the substitution. Asserted for all three scopes, because the rule that makes
-    this different from `io.toml`''s own `${cmd:}` rule is precisely that it does not depend on the
-    scope.
+  - id: US-IO-HARNESS-0.36.0-T02
+    summary: >
+      `git_branch` and `git_worktree` as built-ins the model can call: tool name constants, tool
+      specs, dispatch, and an end-to-end run over a real repository that lands its commit on a new
+      branch while the branch it started on stays put.
+    why_required: >
+      The release's headline outcome is that a run lands as a branch. A `GitCmd` variant no tool
+      dispatches to reaches no run, and the claim is only true if the starting branch is unmoved.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T01
+    acceptance_criteria:
+      - >
+        **F2 — a run lands as a branch, and the branch it started on is unmoved.** A real git
+        repository in a temporary directory with one commit on `main`. A scripted provider drives
+        `git_branch`, an edit, `git_add` and `git_commit`. Assertions: `HEAD` is the new branch, the
+        new branch's tip is a commit the run made, the file's change is in that commit, **and `main`
+        still points at the commit it pointed at before the run** — the discriminating one, because
+        a run that never switched satisfies every other assertion here. The commit is attributed to
+        the run's `Identity`, which is the existing behaviour asserted to survive the branch.
+    files:
+      - src/tools/mod.rs
+      - src/run.rs
+      - tests/git_branch.rs
+    evidence: []
 
-    '
-  - '**N1 — no new dependency.** `cargo tree` on macOS and Linux still reads 402 lines. A manifest is
-    parsed by the `toml` and `serde` already present, into the `AgentDef`, `McpServer`, `Hook` and `Layer`
-    types already deserialized from `io.toml`.
+  - id: US-IO-HARNESS-0.36.0-T03
+    summary: >
+      `AgentDef` gains `#[non_exhaustive]` and `worktree`, and a child of that definition is rooted
+      at its own worktree on its own branch, with the `worktree = false` collision executed as the
+      control.
+    why_required: >
+      "Concurrent agents stop colliding on one working tree" is unreachable while `spawn_child`
+      hard-codes the tree root, and the property is worth nothing unless the collision it removes is
+      demonstrated.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T02
+    acceptance_criteria:
+      - >
+        **F3 — two concurrent children do not collide, and the collision is executed as the
+        control.** A tree whose roster holds one `worktree = true` definition,
+        `max_concurrent_agents = 2`, two children spawned from it, each writing the same relative
+        path with different contents. Assertions: each child's worktree exists at its own path under
+        `.worktrees/`, each holds that child's content, the two contents differ, the parent's own
+        working tree does not hold either, and each child's branch carries its own commit. **The
+        control is the identical tree with `worktree = false`**, under which the two children write
+        one file and one write is lost — the property is worth nothing unless the control fails, so
+        the control is run and its outcome recorded. What the parent's `git_status` reports with the
+        worktrees present is asserted to be whatever it is and written into `docs/CONTRACT.md`; it
+        is not assumed.
+    files:
+      - src/agent.rs
+      - src/run.rs
+      - tests/worktree.rs
+    evidence: []
 
-    '
-  files:
-  - src/plugin.rs
-  - src/lib.rs
-  - tests/plugin.rs
-  evidence:
-  - '`tests/plugin.rs` — 12 tests, all green. `a_broken_bundle_costs_exactly_itself` covers the four
-    load failures and its repaired control; `a_bad_or_duplicate_id_drops_only_its_own_bundle` covers
-    the id rules; `a_manifest_may_not_run_a_command_in_any_scope` covers `${cmd:}` from both scopes.'
-  - Sabotage S9 (`parse` called with `Scope::Local`, so a manifest may run a command) failed `a_manifest_may_not_run_a_command_in_any_scope`.
-    Sabotage S7 (duplicate-id check removed) failed `a_bad_or_duplicate_id_drops_only_its_own_bundle`.
-  - '`cargo tree | wc -l` — 402, unchanged since 0.23.0: a manifest is parsed by the `toml` and `serde`
-    already present.'
-- id: US-IO-HARNESS-0.35.0-T02
-  summary: '`[[plugin]] path = "..."` in the configuration file, `plugin` added to `APPENDING`, the
-    declaring scope captured per entry as each scope is read, `Config::plugins()`, and the trust rule:
-    a project-scoped plugin contributes no `[[hook]]` and no `[[mcp]]`, and plugin policy may carry
-    deny rules only.'
-  why_required: The trust rule is the reason a bundle can be pointed at a cloned repository at all,
-    and the per-entry scope it rests on is unrecoverable after the merge concatenates the arrays.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.35.0-T01
-  acceptance_criteria:
-  - '**F4 — the trust rule, both arms, whole-plugin.** The same plugin directory, whose manifest declares
-    a `[[hook]]`, is declared once from `io.toml` and once from `io.local.toml`. From `io.toml` it is
-    dropped, `Dropped::error` names the `hook` key and the scope, and the discriminating assertion is
-    that **none** of its other contributions is present — no skill, no agent, no layer — because a half-applied
-    stranger''s manifest is the failure this rule exists to prevent. From `io.local.toml` it loads and
-    the hook fires on a real event. The same pair is run for `[[mcp]]`. Trap 51 applies: one sabotage
-    per arm.
+  - id: US-IO-HARNESS-0.36.0-T04
+    summary: >
+      Worktree creation is idempotent by the key a spawn is adopted by, so a resumed tree reuses the
+      worktree and branch it already made rather than re-creating them or discarding the child's
+      work.
+    why_required: >
+      Creating unconditionally fails on resume and re-creating discards the child's files. Without
+      this the worktree flag makes a crashed tree unresumable, which is a regression against 0.32.0.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T03
+    acceptance_criteria:
+      - >
+        **F4 — an adopted child reuses its worktree rather than re-creating or re-deriving it.** A
+        tree with a `worktree = true` child is killed mid-child and resumed. The resumed parent
+        replays the spawn, finds the child by `(parent, step, goal)`, and the child continues in
+        **the same worktree, on the same branch, with the files it had already written still
+        there**. The discriminating assertion is a file the child wrote before the kill, present
+        after the resume: a resume that re-created the worktree passes "the child finished" and
+        fails this. A second creation attempt is asserted not to error the spawn.
+    files:
+      - src/run.rs
+      - tests/worktree.rs
+    evidence: []
 
-    '
-  - '**F5 — plugin policy may only narrow, asserted by effect.** A manifest whose layer carries an `allow_write`
-    for a path the application''s policy denies. The plugin is dropped naming the rule, **and the write
-    is still refused** — the assertion is the run''s outcome and the stored refusal, not the error text.
-    A loader that validated after merging the layer fails this and passes an error-text assertion. The
-    same pair for a manifest carrying `[policy.defaults]`.
+  - id: US-IO-HARNESS-0.36.0-T05
+    summary: >
+      A memory restore point written at the run's first write to a key, in the shape `snapshots`
+      already has, guarded by a unique index so a later write cannot move it.
+    why_required: >
+      Restoring memory needs the previous value, and `memory` rows are replaced in place. Without a
+      restore point the memory half of a rewind cannot exist at all.
+    status: todo
+    depends_on: []
+    acceptance_criteria:
+      - >
+        **F6 — the memory restore point is the first write, guarded.** A run writes one key five
+        times. `rewind_run` restores the value that was there before write one. The sabotage removes
+        the insert's uniqueness guard so the last write's predecessor wins, and it must fail this
+        named test rather than a compile — trap 8's rule, and the same guard `record_snapshot` has
+        for files.
+    files:
+      - src/state.rs
+    evidence: []
 
-    '
-  - '**N6 — `[[hook]]`''s existing project-scope refusal is untouched.** The 0.28.0 rule that a project-scoped
-    `io.toml` may declare no `[[hook]]` at all, inside a `[profile]` too, still holds with the same
-    error, asserted by the pre-existing tests passing unchanged. This release adds a rule beside it
-    and weakens nothing.
+  - id: US-IO-HARNESS-0.36.0-T06
+    summary: >
+      `rewind_run`, `Rewound`, the rewinds record and `Store::rewinds`, plus `EventKind::Rewound` —
+      one call that puts back files, memory and the queued backlog while the trace keeps what it
+      undid.
+    why_required: >
+      This is the release's second headline outcome. A partial undo that looks complete is the
+      failure the release exists to fix, and an undo that deletes rows makes the ledger disagree
+      with the invoice.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T05
+    acceptance_criteria:
+      - >
+        **F5 — one call puts back files, memory and the queue.** A run that writes two files (one it
+        created, one it rewrote), writes two memory keys (one new, one overwriting an existing value
+        written by an earlier run), and queues two children past the concurrency cap. `rewind_run`
+        returns: the created file `Removed` and gone from disk, the rewritten file `Restored` with
+        its original bytes, `memory_removed` naming the new key which `memory_get` no longer finds,
+        and `memory_restored` naming the overwritten key **whose value is the one that was there
+        before this run's first write** — the discriminating assertion, since deleting the key or
+        leaving the run's value both satisfy "the entry changed". `queued_agents` for that run is
+        empty and `queue_cleared` names the two goals. The control is the identical run with no
+        `rewind_run` call, under which all six effects are still present.
+      - >
+        **F7 — the trace keeps both branches.** Before and after the rewind of F5, the row counts
+        and contents of `steps`, `run_events`, `spawns` and the ledger for that run are identical,
+        and `Store::rewinds(run_id)` returns exactly one row naming the two files, the two memory
+        keys and the two cleared goals. One `EventKind::Rewound` reaches the observer, and its four
+        numbers equal the `Rewound` value's own — **built from the returned value, not from a second
+        query**, which the sabotage proves by making the two disagree. A rewind implemented by
+        deleting rows passes F5 entirely and fails this.
+      - >
+        **F8 — what rewind does not undo, executed rather than implied.** A run that made a commit
+        is rewound: the commit is still reachable, `HEAD` is unmoved, no `reset` was spawned
+        (asserted against the recorded argv of every git spawn in the run, which the trace already
+        holds), and `Rewound` claims nothing about it. A file whose previous contents were over the
+        1 MiB cap comes back `NotKept` and is **byte-identical to what the run left**, not truncated
+        and not restored.
+    files:
+      - src/run.rs
+      - src/state.rs
+      - src/observe.rs
+      - src/lib.rs
+      - tests/rewind_run.rs
+    evidence: []
 
-    '
-  files:
-  - src/config.rs
-  - src/plugin.rs
-  - tests/plugin.rs
-  - tests/config.rs
-  evidence:
-  - '`a_project_scoped_bundle_contributes_nothing_that_runs_a_program` — both arms, for `[[hook]]` and
-    `[[mcp]]`: dropped from `io.toml` with the key named, loaded from `io.local.toml`. `a_locally_declared_bundle_hook_runs`
-    takes the positive arm to a hook firing on a real `finished` event and writing its line.'
-  - '`plugin_policy_may_only_narrow` — the `allow` rule and the `defaults` block each drop the bundle,
-    and the act the rule would have granted is still refused, asserted on `Policy::check` rather than
-    on the error text.'
-  - Sabotage S4 (trust rule removed) and S5 (trust rule strips the offending array instead of dropping
-    the bundle) each failed `a_project_scoped_bundle_contributes_nothing_that_runs_a_program` — one
-    sabotage per arm, trap 51. S6 (narrowing check removed) failed `plugin_policy_may_only_narrow`.
-  - '`tests/hooks.rs` and `tests/config.rs` unchanged and green: the 0.28.0 project-scope refusal for
-    `[[hook]]` in `io.toml` itself is untouched.'
-- id: US-IO-HARNESS-0.35.0-T03
-  summary: 'Namespacing as attribution: every contributed skill, agent, policy layer and MCP server
-    id becomes `<plugin>__<name>` at load, plus `Plugins::apply_to` and `Plugins::templates`.'
-  why_required: Attribution is the half of the roadmap outcome that makes a bundle auditable, and it
-    is the reason no new table is needed — without it a refusal or a spend draw names nothing.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.35.0-T01
-  - US-IO-HARNESS-0.35.0-T02
-  acceptance_criteria:
-  - '**F2 — a refusal names the plugin that introduced the rule.** A plugin layer denying `secrets/**`;
-    the run attempts the write. The discriminating assertion is the stored `PolicyEvent.layer` for that
-    refusal, which must equal `<plugin>__<layer>` — not that a refusal occurred, because every deny
-    rule refuses. The control is the same layer declared by the application instead of the plugin, whose
-    event carries the bare layer name, proving the prefix is written by the loader and not by the policy.
+  - id: US-IO-HARNESS-0.36.0-T07
+    summary: >
+      The two added tables and their indexes fed to `ADDED_SINCE_0_22_0` by name, with the
+      cross-version suites green in both directions and `CHECKPOINT_FORMAT` asserted unmoved.
+    why_required: >
+      The 0.22.0 schema guard fires on any new table and must be fed by name; a release that added
+      one and forgot the list is exactly what that guard exists to catch.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T06
+    acceptance_criteria:
+      - >
+        **F9 — cross-version, both directions, with the guard fed by name.** Two tables and their
+        indexes are added; `ADDED_SINCE_0_22_0` gains exactly those four names and
+        `tests/cross_version.rs` passes. A database written by the pinned 0.29.0 generator opens,
+        resumes and replays under 0.36.0, and a 0.36.0 store is read by that binary.
+        `CHECKPOINT_FORMAT` stays 7, asserted rather than assumed.
+    files:
+      - tests/cross_version.rs
+    evidence: []
 
-    '
-  - '**F3 — an MCP call and a spawned child are attributed the same way.** A plugin-contributed MCP
-    server is called: the stored `McpEvent.server` reads `<plugin>__<server>` and the tool the model
-    was offered is `mcp__<plugin>__<server>__<tool>`, and `bare_name` round-trips it back to the server-side
-    name — a namespacing scheme that broke the existing strip would fail here rather than in production.
-    A plugin-contributed agent is spawned: its run row and its ledger entry name `<plugin>__<agent>`,
-    so the tokens it spent are attributable to the bundle.
+  - id: US-IO-HARNESS-0.36.0-T08
+    summary: >
+      The two reads a rewind makes asserted by query plan with a control column in no index, and the
+      source-reading boundary test proving the step loop does no rewind work, with its splice-in
+      control.
+    why_required: >
+      A cost claim asserted by clock is flaky on a loaded runner and passes on a fast machine
+      running a full scan, and a "the loop never touches it" claim with no control is decorative.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T06
+    acceptance_criteria:
+      - >
+        **N3 — the step loop does no rewind work, and a run that uses neither half pays for
+        neither.** `rewind_run` is the caller's call, never a tool and never a step; asserted by a
+        source-reading test in the shape 0.33.0 and 0.35.0 used, with a splice-in control that makes
+        it fail when such a call is added. A run that sets no `worktree` creates no `.worktrees`
+        directory and spawns no `git`. The one unconditional cost is stated rather than hidden: a
+        memory write now also writes a restore-point row **the first time this run touches that
+        key**, bounded by keys touched per run exactly as file snapshots are bounded by paths
+        written per run, and measured.
+      - >
+        **N6 — a query whose cost grows with the trace is asserted by plan, not by clock.** The two
+        reads a rewind makes (`memory_snapshots` by run, `agent_queue` by parent run) are `EXPLAIN
+        QUERY PLAN`-asserted to use their index, with a control column in no index at all — trap
+        38's rule, not a column that happens not to be a left prefix — and the measured number is
+        recorded. No wall-clock assertion is written.
+    files:
+      - src/state.rs
+      - tests/rewind_run.rs
+    evidence: []
 
-    '
-  - '**F7 — namespacing makes collision impossible rather than unlikely.** Two plugins each contributing
-    a skill named `review`, plus a contract-level skills directory that also holds `review`. All three
-    are offered, under `a__review`, `b__review` and `review`; `Skills::discover`''s duplicate-name refusal
-    does not fire; and the catalogue the model is handed contains all three names. The negative control
-    is the same tree with namespacing removed, under which the run fails on the duplicate — the failure
-    proving the property is load-bearing.
+  - id: US-IO-HARNESS-0.36.0-T09
+    summary: >
+      Every documentation surface in the same release as the code — the three guide pages,
+      `docs/CONTRACT.md`'s honest limits, `README.md`, `CHANGELOG.md` with the migration note the
+      one break owes, `docs/public-api.txt` by hand, and a worked example on every added item.
+    why_required: >
+      Four of these are guarded by tests that fail without them, and the changelog section must
+      exist before `release.yml` will cut the Release at all.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T06
+    acceptance_criteria:
+      - >
+        **N2 — the break is exactly one, and it is stated as loudly as it is small.** `AgentDef`
+        gains `#[non_exhaustive]` and `worktree`. An external struct literal or exhaustive
+        destructuring stops compiling; `AgentDef::new` and every builder call site is untouched, and
+        a roster deserialized from `io.toml` or a `plugin.toml` that names no `worktree` is
+        unchanged. `CompletionRequest`/`CompletionResponse` and `TaskContract` are not touched, so
+        no `E0639` is owed. `tests/changelog.rs` finds the `*Migration:*` note under the one
+        `**BREAKING` entry and `tests/public_api.rs` passes against a hand-edited
+        `docs/public-api.txt`.
+      - >
+        **N4 — every added public item carries a worked example**, enforced by the existing
+        `every_public_item_has_a_worked_example` gate: `rewind_run`, `Rewound`, `Store::rewinds` and
+        its row type, `GIT_BRANCH_TOOL`, `GIT_WORKTREE_TOOL`, `AgentDef::worktree`.
+      - >
+        **N5 — the honest limits are where a reader finds them.** `docs/CONTRACT.md` states: a
+        commit is not un-committed and a push is not recalled; a migration, a provider call and
+        anything else outside the workspace is not undone; the crate never removes a worktree or
+        deletes a branch; a rewind is per run, not per tree; the parent's `git_status` reports the
+        worktree directory (in whatever form F3 measured) and the operator's one-line exclusion is
+        given; `git switch` needs git 2.23 and `git worktree` needs git 2.5, and an older git
+        surfaces as the observation git itself prints rather than as a crate error.
+    files:
+      - docs/CONTRACT.md
+      - docs/public-api.txt
+      - docs/guide/images-and-git.md
+      - docs/guide/durable-runs.md
+      - docs/guide/context-and-memory.md
+      - README.md
+      - CHANGELOG.md
+    evidence: []
 
-    '
-  files:
-  - src/plugin.rs
-  - src/mcp.rs
-  - src/skills.rs
-  - src/agent.rs
-  - src/policy.rs
-  - tests/plugin.rs
-  evidence:
-  - '`a_refusal_names_the_plugin_that_introduced_the_rule` — the stored `PolicyEvent.layer` reads `rust-review__guard`
-    for a bundle rule and the bare `guard` for the same layer declared by the application, which is
-    what proves the prefix is written by the loader.'
-  - '`an_mcp_call_from_a_bundle_is_attributed_to_it` — against the real `mcp_fixture_server` over stdio:
-    the model is offered `mcp__tools__fixture__echo`, the call succeeds, and every `mcp_events` row
-    names `tools__fixture`. The namespaced name resolving back to the server-side tool is what makes
-    `__` a safe separator.'
-  - '`a_bundle_agent_is_registered_under_its_namespaced_name_only` — the roster holds `rust-review__reviewer`
-    and not `reviewer`.'
-  - Sabotages S1 (policy layer), S2 (skills) and S3 (MCP id) each removed one namespacing and each failed
-    a different named test.
-- id: US-IO-HARNESS-0.35.0-T04
-  summary: '`TaskContract` gains `#[non_exhaustive]` and a `plugins` field with `with_plugins`, and
-    `discover_skills` merges every plugin''s skills directory with the contract''s own.'
-  why_required: A run whose skills come from a contract directory and three bundles needs more than
-    the one `Option<PathBuf>` the contract has carried since 0.14.0. This is the release's one break
-    and the path by which every contribution reaches a run.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.35.0-T03
-  acceptance_criteria:
-  - '**F1 — a bundle''s contributions reach a run, and their absence is asserted too.** One plugin directory
-    contributing a skill, a template, an agent, an MCP server and a deny layer, declared from `io.local.toml`.
-    The run''s discovered skill catalogue, the contract''s agent roster, its MCP server list and its
-    policy layer stack each contain the contribution under its namespaced name. The control is the identical
-    tree with the `[[plugin]]` entry removed: all five are absent, and every other assertion in the
-    test is unchanged. A loader that discovered nothing passes the second half only.
-
-    '
-  - '**N2 — the break is exactly one, and it is stated as loudly as it is small.** `TaskContract` gains
-    `#[non_exhaustive]` and one field. An external struct literal or exhaustive destructuring stops
-    compiling; every `TaskContract::new`, `TaskContract::workspace` and `with_*` call site is untouched,
-    which is how every documented caller builds one. `CompletionRequest` and `CompletionResponse` are
-    not touched, so no `E0639` is owed. `tests/changelog.rs` finds the `*Migration:*` note under a `**BREAKING`
-    entry and `tests/public_api.rs` passes against a hand-edited `docs/public-api.txt`.
-
-    '
-  files:
-  - src/contract.rs
-  - src/run.rs
-  - src/skills.rs
-  - tests/plugin.rs
-  evidence:
-  - '`a_declared_bundle_contributes_and_an_undeclared_one_does_not` — agents, policy layers, templates
-    and the skill catalogue in the system prompt the provider was handed, asserted present with the
-    `[[plugin]]` line and absent without it over an otherwise identical tree.'
-  - Sabotage S10 (`Config::plugins` loads from an empty declaration list) failed it.
-  - '`tests/public_api.rs` green against a hand-edited `docs/public-api.txt`; `tests/changelog.rs` finds
-    the `*Migration:*` note under the `**BREAKING (API)**` entry.'
-- id: US-IO-HARNESS-0.35.0-T05
-  summary: '`EventKind::PluginLoaded { plugin, contributions }` and `EventKind::PluginDropped { plugin,
-    why }`, their `EVENT_NAMES` entries, their round trip through `every_kind()` and the source-reading
-    census.'
-  why_required: A plugin that is dropped and reported on no channel an operator watches is a plugin
-    that was silently ignored, which is the failure mode the drop-not-fatal rule creates.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.35.0-T01
-  acceptance_criteria:
-  - '**F6 — a broken bundle costs exactly itself.** Four plugins declared: one valid, one with no `plugin.toml`,
-    one whose TOML does not parse, one whose manifest carries an unknown key. The run reaches its normal
-    outcome, `Plugins::dropped()` has exactly three entries whose errors name three different causes,
-    exactly three `EventKind::PluginDropped` events reach the observer, and every contribution of the
-    valid one is present. The control is the same four directories with every manifest repaired: `dropped()`
-    is empty and four `PluginLoaded` events fire. A duplicate id and a malformed id (`Rust_Review`,
-    `a__b`, 33 characters) are asserted the same way, each dropping only its own plugin.
-
-    '
-  files:
-  - src/observe.rs
-  - src/plugin.rs
-  - tests/plugin.rs
-  evidence:
-  - '`a_broken_bundle_costs_exactly_itself` counts `EventKind::PluginDropped` and `PluginLoaded` reaching
-    a recording `Observer` — three and one when three bundles are broken, zero and four when every manifest
-    is repaired.'
-  - Sabotage S8 (`emit_plugins` returns early) failed it.
-  - The 0.28.0 source-reading census, `EVENT_NAMES` and `every_kind()` all pass with the two new tags,
-    without being amended by hand beyond the list itself.
-- id: US-IO-HARNESS-0.35.0-T06
-  summary: 'The compatibility and cost evidence: `ADDED_SINCE_0_22_0` asserted unchanged, both cross-version
-    directions executed, and the source-reading test that no function reachable from the per-step loop
-    calls into `plugin::`, with its splice-in control.'
-  why_required: A release that quietly added a table and forgot the guard is exactly what the 0.22.0
-    schema guard exists to catch, and a loader creeping into the step loop is how a bundle becomes a
-    per-step file read.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.35.0-T04
-  acceptance_criteria:
-  - '**F9 — cross-version compatibility, both directions, with nothing to migrate.** No table, column
-    or index is added, so `tests/cross_version.rs`''s `ADDED_SINCE_0_22_0` list is **unchanged** — asserted
-    rather than assumed, since a release that quietly added a table and forgot the list is exactly what
-    that guard exists to catch. A database written by the pinned 0.29.0 generator opens, resumes and
-    replays under 0.35.0; a 0.35.0 store is read by that binary. `CHECKPOINT_FORMAT` stays 7.
-
-    '
-  - '**N3 — plugin loading is bounded by what was declared and the run loop never touches it.** Discovery
-    is one manifest read plus one directory listing per skills or templates directory, per declared
-    plugin, performed once by the caller before the run starts — the same shape `Config::discover` and
-    `Skills::discover` already have. The assertion is a source-reading test in the shape 0.33.0 used
-    for its ownership boundary: no function reachable from the per-step loop in `src/run.rs` calls into
-    `plugin::`, with a splice-in control that makes the test fail when such a call is added. A configuration
-    declaring no plugin performs no plugin I/O at all, asserted by a plugins directory that does not
-    exist and a run that neither fails nor drops anything.
-
-    '
-  files:
-  - tests/cross_version.rs
-  - tests/plugin.rs
-  - src/run.rs
-  evidence:
-  - '`cargo test --test cross_version` — 5 passed. `ADDED_SINCE_0_22_0` is **unchanged** by this release,
-    which is the executed form of the no-schema-change claim: the guard fires on any new table or index,
-    and it is silent.'
-  - '`cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0
-    -- --ignored` — `a_current_store_is_read_by_a_0_29_0_binary` passed. `CHECKPOINT_FORMAT` unmoved
-    at 7.'
-  - '`the_step_loop_never_touches_a_plugin` reads `src/run.rs` and asserts the plugin module is named
-    only in documentation, with a splice-in control that finds exactly the call the test exists to catch.'
-- id: US-IO-HARNESS-0.35.0-T07
-  summary: 'Documentation as part of the release: `docs/guide/plugins.md`, its `docs/CAPABILITIES.md`
-    entry, the honest limits in `docs/CONTRACT.md`, `README.md`, `CHANGELOG.md` with the `*Migration:*`
-    note the break owes, and `docs/public-api.txt` edited by hand.'
-  why_required: Four checked-in surfaces have tests that fail without them, and the release workflow
-    refuses a version with no CHANGELOG section.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.35.0-T04
-  - US-IO-HARNESS-0.35.0-T05
-  acceptance_criteria:
-  - '**N4 — every added public item carries a worked example**, enforced by the existing `every_public_item_has_a_worked_example`
-    surface test: `Plugins`, `Plugin`, `Dropped`, `Config::plugins`, `Plugins::apply_to`, `Plugins::templates`,
-    `Plugins::dropped`, `TaskContract::with_plugins` and the manifest''s own module documentation.
-
-    '
-  - '**N5 — the honest limits are where a reader finds them.** `docs/CONTRACT.md` states: a plugin is
-    a directory the operator chose to point at and the crate verifies nothing about its origin; a hook
-    or MCP server contributed from a trusted scope runs a program with this process''s privileges and
-    is not sandboxed by the fact that a plugin declared it; namespacing changes the names a model sees,
-    so a prompt naming a skill by its bare name after it moves into a bundle stops matching; and the
-    standing `[[mcp]]` gap in `io.toml` itself is unchanged.
-
-    '
-  files:
-  - docs/guide/plugins.md
-  - docs/CAPABILITIES.md
-  - docs/CONTRACT.md
-  - docs/public-api.txt
-  - README.md
-  - CHANGELOG.md
-  - Cargo.toml
-  evidence:
-  - '`cargo test --test guide_pages --test docs_drift --test readme --test changelog --test public_api`
-    — all green. `docs/guide/plugins.md` is registered in `GUIDES` with its limits block required, indexed
-    in `docs/CAPABILITIES.md` and linked from `README.md`.'
-  - '`docs/CONTRACT.md` gains ''What a capability bundle contributes, and what it may not (0.35.0)'':
-    no verification of a directory''s origin, no fetch or install, data and never code, the whole project-scope
-    refusal, narrowing-only policy, the untouched `[[mcp]]` gap, and the fact that a dropped bundle
-    is quiet by design.'
-  - '`CHANGELOG.md` carries the 0.35.0 section the release workflow takes its notes from, with the one
-    break and its migration note.'
-- id: US-IO-HARNESS-0.35.0-T08
-  summary: 'The gates, run last against the tree that ships: fmt, clippy, both test invocations, the
-    nightly docs.rs command, the cross-version job, and `cargo package --locked` after a `cargo clean`.'
-  why_required: Evidence before assertions. The nightly command has caught something stable `cargo doc`
-    called clean in three consecutive releases.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.35.0-T06
-  - US-IO-HARNESS-0.35.0-T07
-  acceptance_criteria:
-  - '**O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job,
-    with no test skipped silently on Windows. A manifest path is joined from components rather than
-    from a slash-bearing literal, and any source-reading test normalises line endings.
-
-    '
-  - '**O2 — docs.rs builds**, proven by running the nightly job''s exact command (`RUSTDOCFLAGS="--cfg
-    docsrs -D warnings" cargo +nightly doc --all-features --no-deps`) before the release PR is opened,
-    never inferred from a stable `cargo doc`. It has caught something in three consecutive releases.
-
-    '
-  - '**O3 — `cargo package --locked` succeeds** and the packaged crate compiles, run after a `cargo
-    clean`, because `target/` and this volume have collided in every release since 0.25.0. Every local
-    build and test runs with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
-
-    '
-  files:
-  - .ultraship/products/io-harness/execution/tasks.yaml
-  evidence:
-  - '`cargo fmt --check` — clean. `cargo clippy --all-targets --all-features -- -D warnings` — clean,
-    no lint raised.'
-  - '`cargo test` (default features) — 60 result lines, 0 failed. `cargo test --all-features` — 60 result
-    lines, 0 failed, including 361 doctests in 156s. Separate invocations with `rm -rf target` between
-    them.'
-  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — clean,
-    run before the release PR. It caught one `redundant explicit link target` in `src/plugin.rs` that
-    stable `cargo doc` reported as zero warnings; fourth consecutive release for that gate.'
-  - '`cargo clean && cargo package --locked` — exit 0, 1,279,826 bytes, and the packaged crate compiles.
-    Run with `--allow-dirty` because the working tree holds one unrelated uncommitted file, `assets/initorigin-logo.png`,
-    edited locally by the owner and not by this release; CI''s `verify` job runs it on a clean checkout
-    of `main`.'
-  - '`cargo tree | wc -l` — 402.'
+  - id: US-IO-HARNESS-0.36.0-T10
+    summary: >
+      The release gates, run last against the sealed tree: the dependency count, fmt, clippy, both
+      test invocations, the nightly docs.rs command, and a clean `cargo package --locked`.
+    why_required: >
+      The record's evidence is these commands' output. A gate run before the last edit is evidence
+      about a tree that no longer exists.
+    status: todo
+    depends_on:
+      - US-IO-HARNESS-0.36.0-T07
+      - US-IO-HARNESS-0.36.0-T08
+      - US-IO-HARNESS-0.36.0-T09
+    acceptance_criteria:
+      - >
+        **N1 — no new dependency.** `cargo tree` on macOS and Linux still reads **402** lines. A
+        worktree is a `git` spawn through the machinery that already spawns git; a restore point is
+        two tables in the SQLite already there.
+      - >
+        **O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95
+        job, with no test skipped silently on Windows. The git-dependent tests are the exposure: a
+        worktree path is joined from components rather than from a slash-bearing literal, any
+        source-reading test normalises line endings, and a test that reads git's output tolerates
+        the line ending git produces on that platform.
+      - >
+        **O2 — docs.rs builds**, proven by running the nightly job's exact command
+        (`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`)
+        before the release PR is opened, never inferred from a stable `cargo doc`. It has caught
+        something in four consecutive releases.
+      - >
+        **O3 — `cargo package --locked` succeeds** on a clean tree and the packaged crate compiles,
+        run after a `cargo clean`, with `.worktrees` proven absent from the packaged file list.
+        Every local build and test runs with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
+    files:
+      - Cargo.toml
+    evidence: []
