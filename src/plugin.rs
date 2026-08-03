@@ -12,7 +12,7 @@
 //! path, [`Config::plugins`](crate::Config::plugins) loads every declared one,
 //! and the result installs in three places — a [`TaskContract`] through
 //! [`Plugins::apply_to`], a [`Policy`] through [`Plugins::apply_to_policy`], and
-//! a [`Hooks`](crate::Hooks) through [`Plugins::apply_to_hooks`] — because those
+//! a [`Hooks`] through [`Plugins::apply_to_hooks`] — because those
 //! are the three places this crate has ever installed anything.
 //!
 //! ```toml
@@ -585,11 +585,12 @@ fn load_one(scope: Scope, dir: &Path) -> Result<Plugin> {
     // manifest wherever it was declared from: a bundle is a third party's
     // directory even when the file naming it is the operator's own.
     let table = crate::config::parse(Scope::Project, &text, &file)?;
-    let mut manifest: Manifest = toml::Value::Table(table)
-        .try_into()
-        .map_err(|e: toml::de::Error| {
-            crate::Error::Config(format!("{}: {}", file.display(), e.message()))
-        })?;
+    let mut manifest: Manifest =
+        toml::Value::Table(table)
+            .try_into()
+            .map_err(|e: toml::de::Error| {
+                crate::Error::Config(format!("{}: {}", file.display(), e.message()))
+            })?;
 
     check_id(&manifest.name, &file)?;
     if scope == Scope::Project {

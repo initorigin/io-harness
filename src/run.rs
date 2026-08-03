@@ -807,7 +807,7 @@ pub(crate) async fn run_with_extras<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
-        emit_plugins(watch, run_id, contract);
+    emit_plugins(watch, run_id, contract);
     // Decided against the *caller's* policy, before the provider layer is merged
     // in: the harness adding a network layer of its own must not turn a
     // permissive caller into a policy-bearing one and push it off the
@@ -1760,7 +1760,7 @@ pub async fn resume_with_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
-        emit_plugins(watch, run_id, contract);
+    emit_plugins(watch, run_id, contract);
     match contract.root.clone() {
         Some(root) => {
             // Re-authorized on resume rather than trusted from the interrupted
@@ -1980,7 +1980,7 @@ pub async fn resume_with_decision_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
-        emit_plugins(watch, run_id, contract);
+    emit_plugins(watch, run_id, contract);
 
     match decision {
         // Deferring again leaves it pending and the run paused.
@@ -2302,7 +2302,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
-        emit_plugins(watch, run_id, contract);
+    emit_plugins(watch, run_id, contract);
 
     match decision {
         Decision::Defer => Ok(RunResult::new(
@@ -4439,7 +4439,7 @@ pub async fn run_tree_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
-        emit_plugins(watch, run_id, contract);
+    emit_plugins(watch, run_id, contract);
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
@@ -4630,7 +4630,7 @@ pub async fn resume_tree_observed<P: Provider>(
             provider: provider.name().to_string(),
         },
     ));
-        emit_plugins(watch, run_id, contract);
+    emit_plugins(watch, run_id, contract);
     emit_backlog(
         watch,
         run_id,

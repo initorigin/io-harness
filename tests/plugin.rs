@@ -267,7 +267,10 @@ async fn a_refusal_names_the_plugin_that_introduced_the_rule() {
                 &root.join("io.local.toml"),
                 "[[plugin]]\npath = \"bundles/rust-review\"\n",
             );
-            policy = Config::discover(root).unwrap().plugins().apply_to_policy(policy);
+            policy = Config::discover(root)
+                .unwrap()
+                .plugins()
+                .apply_to_policy(policy);
         } else {
             policy = policy.layer("guard").deny_write("secrets/**");
         }
@@ -287,7 +290,11 @@ async fn a_refusal_names_the_plugin_that_introduced_the_rule() {
             .into_iter()
             .filter(|e| e.kind == "refusal")
             .collect();
-        assert_eq!(refusals.len(), 1, "one refusal, from_plugin = {from_plugin}");
+        assert_eq!(
+            refusals.len(),
+            1,
+            "one refusal, from_plugin = {from_plugin}"
+        );
         let expected = if from_plugin {
             "rust-review__guard"
         } else {
@@ -328,7 +335,10 @@ async fn an_mcp_call_from_a_bundle_is_attributed_to_it() {
 
     let plugins = Config::discover(root).unwrap().plugins();
     assert!(plugins.dropped().is_empty(), "{:?}", plugins.dropped());
-    assert_eq!(plugins.get("tools").unwrap().mcp_servers()[0].id, "tools__fixture");
+    assert_eq!(
+        plugins.get("tools").unwrap().mcp_servers()[0].id,
+        "tools__fixture"
+    );
 
     let namespaced = format!("{MCP_TOOL_PREFIX}tools__fixture__echo");
     let contract = plugins.apply_to(contract(root)).with_max_steps(2);
@@ -382,7 +392,13 @@ fn a_bundle_agent_is_registered_under_its_namespaced_name_only() {
         contract.agents.get("reviewer").is_none(),
         "the bare name is not registered, so a bundle cannot occupy one the operator uses"
     );
-    assert!(contract.agents.get("rust-review__reviewer").unwrap().deny_write);
+    assert!(
+        contract
+            .agents
+            .get("rust-review__reviewer")
+            .unwrap()
+            .deny_write
+    );
 }
 
 // ------------------------------------------------------------------ F4
@@ -503,7 +519,10 @@ async fn plugin_policy_may_only_narrow() {
         let dir = tmp();
         let root = dir.path();
         let plugin = root.join("bundles/wide");
-        write(&plugin.join("plugin.toml"), &format!("name = \"wide\"\n\n{block}"));
+        write(
+            &plugin.join("plugin.toml"),
+            &format!("name = \"wide\"\n\n{block}"),
+        );
         write(
             &root.join("io.local.toml"),
             "[[plugin]]\npath = \"bundles/wide\"\n",
@@ -545,7 +564,10 @@ async fn a_broken_bundle_costs_exactly_itself() {
         // No manifest at all.
         std::fs::create_dir_all(root.join("bundles/absent")).unwrap();
         if repaired {
-            write(&root.join("bundles/absent/plugin.toml"), "name = \"absent\"\n");
+            write(
+                &root.join("bundles/absent/plugin.toml"),
+                "name = \"absent\"\n",
+            );
         }
         // Unparseable TOML.
         write(
@@ -576,18 +598,28 @@ async fn a_broken_bundle_costs_exactly_itself() {
 
         let plugins = Config::discover(root).unwrap().plugins();
         let expected_drops = if repaired { 0 } else { 3 };
-        assert_eq!(plugins.dropped().len(), expected_drops, "repaired = {repaired}");
+        assert_eq!(
+            plugins.dropped().len(),
+            expected_drops,
+            "repaired = {repaired}"
+        );
         assert_eq!(plugins.len(), 4 - expected_drops);
 
         if !repaired {
             let reasons: Vec<&str> = plugins.dropped().iter().map(|d| d.error.as_str()).collect();
-            assert!(reasons.iter().any(|r| r.contains("plugin.toml")), "{reasons:?}");
+            assert!(
+                reasons.iter().any(|r| r.contains("plugin.toml")),
+                "{reasons:?}"
+            );
             assert!(
                 reasons.iter().any(|r| r.contains("unknown field")),
                 "{reasons:?}"
             );
             assert_eq!(
-                reasons.iter().collect::<std::collections::BTreeSet<_>>().len(),
+                reasons
+                    .iter()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len(),
                 3,
                 "three different causes, not one repeated: {reasons:?}"
             );
@@ -609,7 +641,11 @@ async fn a_broken_bundle_costs_exactly_itself() {
         )
         .await
         .unwrap();
-        assert_eq!(recorder.dropped().len(), expected_drops, "reported to the observer");
+        assert_eq!(
+            recorder.dropped().len(),
+            expected_drops,
+            "reported to the observer"
+        );
         assert_eq!(recorder.loaded().len(), 4 - expected_drops);
     }
 }
