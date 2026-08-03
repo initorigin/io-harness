@@ -26,6 +26,101 @@ notes are produced from it.
 
 ### Security
 
+## [0.36.0] - 2026-08-03
+
+A run lands as a branch, and can be put back.
+
+Git reached this crate as five fixed-argv built-ins — status, diff, log, add and
+commit — with `checkout` on the forbidden list, so a run committed onto whatever
+branch it found and every agent in a tree shared one working directory. Two
+children editing the same file were one overwriting the other, which made the
+concurrency 0.32.0 bought usable only for work that did not overlap.
+
+**`git_branch` creates a branch at the current commit and moves onto it.** It
+renders `git switch --create=<name>` — the one shape of a checkout that cannot
+discard anything: the new ref starts at `HEAD`, an existing name is refused by
+git, and the working tree is carried across rather than replaced. That is why
+`switch` is reachable while `checkout` stays refused, and the test that holds
+the forbidden list passes **unchanged** rather than being relaxed to fit.
+
+**`git_worktree` makes a second working tree at its own new branch**, at a path
+the policy allowed. The branch name is fused into one argv element where git
+offers that form and validated by an ASCII allowlist where it does not, so a
+name git could read as an option is refused before a spawn rather than escaped.
+
+**An `AgentDef` can ask for its own checkout.** A child of a `worktree = true`
+definition is rooted at `.worktrees/<agent>-<parent>-<step>-<digest>` on a
+branch of that name, created before its first step. The path is *derived* from
+the key a spawn is adopted by, so a resumed tree finds the worktree it already
+made — with the files the child had written still in it — rather than
+re-creating it. If one cannot be made, the spawn fails and says why: quietly
+sharing the parent's tree is the collision the flag exists to prevent.
+
+**`rewind_run` widens a rewind from a path to a run.** 0.28.0 kept the previous
+contents of every path a run wrote and put one back; it did not put back what
+the run *learned* or what it had *queued*. A run that wrote three files,
+recorded two decisions in memory and queued four children left three of those
+five effects standing after an operator had restored every file — and the two
+that remained are the ones that change what the next run does. Memory is read
+into context, so a wrong fact outlives the files it was learned from; a backlog
+is adopted on resume, so work the operator undid is re-admitted. A partial undo
+is worse than none, because it looks complete.
+
+One call now restores every file the run wrote — with the four verdicts
+`Rewind` already distinguishes — restores every memory entry to the value that
+was there before the run's **first** write to that key, and clears the spawn
+backlog it left queued.
+
+**The trace keeps both branches.** Nothing in the steps, the event stream, the
+spawn records or the ledger is deleted or altered by a rewind: the spend
+happened, and an undo that erased the rows would make the ledger disagree with
+the invoice. What the rewind took is written down before it goes, readable
+through `Store::rewinds`.
+
+**What a rewind does not undo, plainly rather than by implication:** a commit
+the run made is still there, a push is not recalled, a migration is not
+reversed, a provider call is not un-billed, and no worktree is ever removed by
+this crate.
+
+### Added
+
+- `git_branch` and `git_worktree` built-ins, with `GIT_BRANCH_TOOL` and
+  `GIT_WORKTREE_TOOL` in `io_harness::tools`.
+- `AgentDef::worktree` and `AgentDef::with_worktree()`.
+- `rewind_run` and `rewind_run_observed`, returning `Rewound` — the files with
+  their per-path verdicts, the memory keys restored and removed, and the queued
+  children cleared.
+- `Store::rewinds`, returning `RewindRecord`: what one rewind put back, took
+  away and cleared, and when.
+- `EventKind::Rewound { files, memory, queued }`, with its `EVENT_NAMES` entry.
+- Two additive tables, `memory_snapshots` and `rewinds`, and their indexes.
+  `CHECKPOINT_FORMAT` is unmoved at 7 and no existing table is altered.
+
+### Changed
+
+- **BREAKING (API)** `AgentDef` gains the `worktree` field and becomes
+  `#[non_exhaustive]`. Both are the same break for a struct literal or an
+  exhaustive destructuring outside this crate, so they are paid together rather
+  than twice — and the second one means the next field this type gains is free.
+  *Migration:* build definitions with `AgentDef::new` and the `with_*` builders,
+  which is what every documented caller already does and which is unchanged.
+  Replace any `AgentDef { .. }` literal with `AgentDef::new(name)` plus
+  builders, and add a `..` to any exhaustive `let AgentDef { .. } = def`
+  destructuring. No field was removed, no signature moved, and a roster
+  deserialized from `io.toml` or a `plugin.toml` that names no `worktree` is
+  unchanged.
+- `git_commit`'s tool description no longer claims there is "no branch
+  switching". `git_branch` is the narrow form that now exists, and the
+  description points at it.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.35.0] - 2026-08-03
 
 A directory is a capability bundle.

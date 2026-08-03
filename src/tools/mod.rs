@@ -133,6 +133,22 @@ pub const GIT_DIFF_TOOL: &str = "git_diff";
 pub const GIT_ADD_TOOL: &str = "git_add";
 /// See [`GIT_LOG_TOOL`].
 pub const GIT_COMMIT_TOOL: &str = "git_commit";
+/// The name the model uses to create a branch and move onto it (0.36.0).
+///
+/// `git switch --create=<name>`, so a run lands its commits somewhere a human
+/// can review or delete on its own. It is the only shape of a checkout this
+/// crate builds, and the only one that cannot discard a working-tree change:
+/// the new ref starts at `HEAD`, an existing name is refused by git, and the
+/// tree is carried across rather than replaced. See [`GIT_LOG_TOOL`] for why
+/// each of these is its own tool rather than an argument.
+pub const GIT_BRANCH_TOOL: &str = "git_branch";
+/// The name the model uses to make a second working tree (0.36.0).
+///
+/// `git worktree add -b <name> -- <path>`: another checkout of the same
+/// repository, at its own new branch, so two agents stop overwriting each
+/// other's files without either leaving the workspace. Nothing here removes
+/// one — see [`GIT_LOG_TOOL`].
+pub const GIT_WORKTREE_TOOL: &str = "git_worktree";
 
 /// The name the model uses to look at an image in the workspace (0.15.0,
 /// `media` feature).

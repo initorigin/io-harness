@@ -726,6 +726,32 @@ pub enum EventKind {
         /// What stopped it, worded for whoever has to fix it.
         why: String,
     },
+    /// A run was put back: its files, what it remembered and what it had queued
+    /// (0.36.0).
+    ///
+    /// Emitted by [`rewind_run_observed`](crate::rewind_run_observed) once the
+    /// work is done. The three numbers are taken from the
+    /// [`Rewound`](crate::Rewound) value being returned rather than re-read from
+    /// the store — a count re-queried afterwards is true whether or not anything
+    /// was restored, which is the shape 0.32.0 paid to learn.
+    ///
+    /// Nothing about this event says a rewind erased anything: the steps, the
+    /// event stream, the spawn records and the ledger of the rewound run are all
+    /// still there, and [`Store::rewinds`](crate::Store::rewinds) is the durable
+    /// half naming exactly what changed.
+    ///
+    /// Which run was put back is the envelope's own `run_id`. A second copy here
+    /// does not survive the wire at all: the kind is flattened into the envelope,
+    /// so a `run_id` field is a duplicate key and serde refuses it — caught by
+    /// `every_variant_round_trips` rather than in production.
+    Rewound {
+        /// How many paths were rewound, whatever verdict each got.
+        files: u32,
+        /// How many memory entries were restored or removed.
+        memory: u32,
+        /// How many queued children were dropped.
+        queued: u32,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -790,6 +816,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "routed",
     "plugin_loaded",
     "plugin_dropped",
+    "rewound",
     "finished",
 ];
 
@@ -1310,6 +1337,11 @@ mod tests {
                 plugin: "broken".into(),
                 why: "no plugin.toml".into(),
             },
+            EventKind::Rewound {
+                files: 2,
+                memory: 1,
+                queued: 0,
+            },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -1418,6 +1450,8 @@ mod tests {
                 | EventKind::Routed { .. }
                 | EventKind::PluginLoaded { .. }
                 | EventKind::PluginDropped { .. }
+                // 0.36.0 — a whole run put back.
+                | EventKind::Rewound { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

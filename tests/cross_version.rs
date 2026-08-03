@@ -177,6 +177,14 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // either, which `tests/cross_version_0_29_0.rs` executes rather than asserts on
     // paper.
     "run_events",
+    // 0.36.0 — the memory restore point and the record of each rewind. Two
+    // tables and their indexes, added and nothing altered: a 0.29.0 binary opens
+    // a store carrying all four and never names any of them, which
+    // `tests/cross_version_0_29_0.rs` executes rather than asserts on paper.
+    "memory_snapshots",
+    "memory_snapshots_entry",
+    "rewinds",
+    "rewinds_run",
     "run_events_run",
     // 0.34.0 — what each gate evaluation decided. One table and its index, added
     // and nothing altered: a 0.29.0 binary opens a store carrying both and never

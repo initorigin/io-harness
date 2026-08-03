@@ -2390,6 +2390,75 @@ pub(crate) struct Snapshot {
     pub kept: Kept,
 }
 
+/// What one memory entry looked like before a run first wrote it (0.36.0).
+///
+/// One row per `(run, workspace, key)`, at the run's first write, which is what
+/// makes "the way it was" one answer rather than one per edit — the same
+/// definition and the same guard [`Snapshot`] has for files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MemorySnapshot {
+    /// The workspace the entry belongs to.
+    pub workspace: String,
+    /// The entry's key.
+    pub key: String,
+    /// The value that was there, or `None` when there was no entry.
+    pub before: Option<String>,
+    /// The kind it had, or `None` when there was no entry.
+    pub kind: Option<String>,
+    /// True when the run *created* this entry, so putting it back means removing
+    /// it. Kept apart from `before.is_none()` for the reason `snapshots.state`
+    /// is: the two ways to be wrong are refusing to restore and deleting an entry
+    /// the run only edited, and only the first is recoverable.
+    pub created: bool,
+}
+
+/// What one rewind of one run put back, took away and cleared (0.36.0).
+///
+/// Returned by [`Store::rewinds`]. A rewind changes rows that already exist, so
+/// this is written *before* they change: it is the durable half of "the trace
+/// keeps both branches", and the reason nothing in `steps`, the event stream, the
+/// spawn records or the ledger has to be deleted for an undo to be honest.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_run, MemoryKind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let root = dir.path().display().to_string();
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+///
+/// // An earlier run left a note behind.
+/// let first = store.start_run("learn something", &root)?;
+/// store.memory_write(&root, "retries", "three", first, 1, MemoryKind::Fact)?;
+///
+/// // This run corrects it, and is then put back.
+/// let second = store.start_run("get it wrong", &root)?;
+/// store.memory_write(&root, "retries", "nine", second, 1, MemoryKind::Fact)?;
+/// rewind_run(&ws, &store, second)?;
+///
+/// assert_eq!(store.memory_get(&root, "retries")?.unwrap().value, "three");
+/// let record = &store.rewinds(second)?[0];
+/// assert_eq!(record.memory_restored, ["retries"]);
+/// assert!(record.memory_removed.is_empty(), "it was edited, not created");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RewindRecord {
+    /// UTC time of the rewind, from the database clock.
+    pub at: String,
+    /// The paths that were put back, in the order the run first wrote them.
+    pub files: Vec<String>,
+    /// Memory keys whose earlier value was restored.
+    pub memory_restored: Vec<String>,
+    /// Memory keys the run created, and which were therefore removed.
+    pub memory_removed: Vec<String>,
+    /// The goals of the children that were still queued and no longer are.
+    pub queue_cleared: Vec<String>,
+}
+
 /// One background process the run started, as the store last knew it.
 ///
 /// A row is written when the handle starts and updated when it ends, so a handle
@@ -3195,6 +3264,75 @@ impl Store {
                  at     TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              );
              CREATE INDEX IF NOT EXISTS run_events_run ON run_events (run_id, id);",
+        )?;
+
+        // 0.36.0 — the restore point for one memory entry, so a rewind can put
+        // back what a run *learned* and not only what it wrote.
+        //
+        // The same shape as `snapshots` above and for the same reasons. One row
+        // per `(run, workspace, key)`, written at the run's FIRST write to that
+        // key, which is what makes "the way it was" mean "before this run touched
+        // it" rather than "before its last edit" — a run that corrects one note
+        // five times has one restore point, not five, and storage is bounded by
+        // keys touched rather than writes made. The uniqueness is an index rather
+        // than a read-then-write in the caller, so `INSERT OR IGNORE` *is* the
+        // guard and two writers cannot interleave through it.
+        //
+        // `state` carries which of two cases `before` holds, for the reason
+        // `snapshots.state` does: `text` (the value that was there, with the
+        // `kind` it had) and `absent` (there was no entry, so putting it back
+        // means deleting the one the run created). A NULL `before` alone cannot
+        // tell "created" from "was empty", and a rewind reading the second as the
+        // first deletes an entry the run merely edited.
+        //
+        // `step` is deliberately in **no** index: it is the control column the
+        // query-plan test filters on, and a column merely absent from a left
+        // prefix is not a control — SQLite skip-scans a trailing composite
+        // column and produces a full read wearing an index's name.
+        //
+        // Additive, and NOT a `CHECKPOINT_FORMAT` bump, for the reason every
+        // addition since 0.13.0 has recorded.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS memory_snapshots (
+                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id    INTEGER NOT NULL,
+                 workspace TEXT NOT NULL,
+                 key       TEXT NOT NULL,
+                 step      INTEGER NOT NULL,
+                 before    TEXT,
+                 kind      TEXT,
+                 state     TEXT NOT NULL,
+                 at        TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             CREATE UNIQUE INDEX IF NOT EXISTS memory_snapshots_entry
+                 ON memory_snapshots (run_id, workspace, key);",
+        )?;
+
+        // 0.36.0 — what one rewind put back, taken away and cleared.
+        //
+        // This table is the whole of "the trace keeps both branches". A rewind
+        // changes rows that already exist — a file on disk, a `memory` row, an
+        // `agent_queue` row — and the obvious implementation simply deletes them,
+        // which leaves a trace that says the run did work whose effects nobody
+        // can account for, and a ledger that disagrees with the invoice. Writing
+        // down what went, *before* it goes, means the undone branch is still
+        // readable beside the branch that stayed.
+        //
+        // Nothing in `steps`, `run_events`, `spawns` or the ledger is touched by
+        // a rewind. The three columns here are JSON arrays rather than three more
+        // tables because nothing queries *into* them: they are read whole, by run
+        // id, by somebody asking what a rewind did.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rewinds (
+                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id          INTEGER NOT NULL,
+                 files           TEXT NOT NULL,
+                 memory_restored TEXT NOT NULL,
+                 memory_removed  TEXT NOT NULL,
+                 queue_cleared   TEXT NOT NULL,
+                 at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS rewinds_run ON rewinds (run_id, id);",
         )?;
 
         // 0.34.0 — what each gate evaluation decided, durably.
@@ -4026,6 +4164,175 @@ impl Store {
             })
         })?;
         Ok(rows.next().transpose()?)
+    }
+
+    // ---- 0.36.0: putting a whole run back ----
+
+    /// Every path this run recorded a restore point for, in the order it first
+    /// touched them (0.36.0).
+    ///
+    /// [`Store::snapshot`] answers for one path, which is all a per-path rewind
+    /// needs. A rewind of the whole run has to start from the set, and it comes
+    /// back ordered by insertion so files are put back in the order they were
+    /// first written.
+    pub(crate) fn snapshot_paths(&self, run_id: i64) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM snapshots WHERE run_id = ?1 ORDER BY id")?;
+        let rows = stmt.query_map((run_id,), |r| r.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Every memory restore point this run wrote (0.36.0).
+    ///
+    /// Extracted to a `const` and executed as written so the query-plan test can
+    /// `EXPLAIN` the statement the crate actually runs. Re-typing the SQL in the
+    /// test leaves it passing after someone tidies the real one.
+    pub(crate) const MEMORY_SNAPSHOTS_SQL: &'static str =
+        "SELECT workspace, key, before, kind, state FROM memory_snapshots
+         WHERE run_id = ?1 ORDER BY id";
+
+    /// What every memory entry this run wrote looked like before it wrote it
+    /// (0.36.0).
+    pub(crate) fn memory_snapshots(&self, run_id: i64) -> Result<Vec<MemorySnapshot>> {
+        let mut stmt = self.conn.prepare(Self::MEMORY_SNAPSHOTS_SQL)?;
+        let rows = stmt.query_map((run_id,), |r| {
+            let state: String = r.get(4)?;
+            Ok(MemorySnapshot {
+                workspace: r.get(0)?,
+                key: r.get(1)?,
+                before: r.get(2)?,
+                kind: r.get(3)?,
+                // An unknown state reads as "there was something here", for the
+                // reason [`Store::snapshot`] gives: this table is additive, a
+                // newer store can be opened by this binary, and refusing to
+                // restore is recoverable where deleting an entry the run only
+                // edited is not.
+                created: state == "absent",
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
+    }
+
+    /// Put one memory entry back as a rewind found it (0.36.0).
+    ///
+    /// Deliberately not [`Store::memory_write`]: that would take a restore point
+    /// of the restore, and the pin guard would refuse to undo a write to an entry
+    /// pinned *after* the run made it — which would leave the caller told that a
+    /// rewind happened when it had not.
+    pub(crate) fn memory_restore(
+        &self,
+        workspace: &str,
+        key: &str,
+        value: &str,
+        kind: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "UPDATE memory SET value = ?1, kind = COALESCE(?2, kind)
+             WHERE workspace = ?3 AND key = ?4",
+            (value, kind, workspace, key),
+        )?;
+        Ok(())
+    }
+
+    /// Every child still queued under this run, and the rows removed (0.36.0).
+    ///
+    /// One statement's worth of plan, extracted for the same reason
+    /// [`Store::MEMORY_SNAPSHOTS_SQL`] is.
+    pub(crate) const QUEUED_UNDER_SQL: &'static str =
+        "SELECT depth, goal FROM agent_queue WHERE parent_run_id = ?1 ORDER BY id";
+
+    /// Drop the spawn backlog this run left behind, returning what went (0.36.0).
+    ///
+    /// One run's own rows, not the subtree's: a rewind is of one run, and a
+    /// child's backlog belongs to the child. What is returned is read *before*
+    /// the delete, so the caller records rows that existed rather than rows it
+    /// assumes existed.
+    pub(crate) fn clear_queue_under(&self, parent_run_id: i64) -> Result<Vec<(u32, String)>> {
+        let mut stmt = self.conn.prepare(Self::QUEUED_UNDER_SQL)?;
+        let rows = stmt.query_map((parent_run_id,), |r| {
+            Ok((r.get::<_, u32>(0)?, r.get::<_, String>(1)?))
+        })?;
+        let cleared: Vec<(u32, String)> = rows.collect::<std::result::Result<_, _>>()?;
+        self.conn.execute(
+            "DELETE FROM agent_queue WHERE parent_run_id = ?1",
+            (parent_run_id,),
+        )?;
+        Ok(cleared)
+    }
+
+    /// Write down what one rewind did, before it does it (0.36.0).
+    pub(crate) fn record_rewind(
+        &self,
+        run_id: i64,
+        files: &[String],
+        memory_restored: &[String],
+        memory_removed: &[String],
+        queue_cleared: &[(u32, String)],
+    ) -> Result<()> {
+        let goals: Vec<&String> = queue_cleared.iter().map(|(_, g)| g).collect();
+        self.conn.execute(
+            "INSERT INTO rewinds (run_id, files, memory_restored, memory_removed, queue_cleared)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                run_id,
+                serde_json::to_string(files).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(memory_restored).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(memory_removed).unwrap_or_else(|_| "[]".into()),
+                serde_json::to_string(&goals).unwrap_or_else(|_| "[]".into()),
+            ),
+        )?;
+        Ok(())
+    }
+
+    /// Every rewind of one run, oldest first (0.36.0).
+    ///
+    /// This is the half of "the trace keeps both branches" a reader reaches for.
+    /// A rewind changes rows that already existed — a file, a memory entry, a
+    /// queued child — and this says which ones, so the work and its undoing are
+    /// both answerable long after the process that did either is gone.
+    ///
+    /// ```
+    /// use io_harness::tools::Workspace;
+    /// use io_harness::{rewind_run, Store};
+    ///
+    /// # fn main() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// let ws = Workspace::new(dir.path());
+    /// let store = Store::memory()?;
+    /// let run = store.start_run("tidy up", &dir.path().display().to_string())?;
+    ///
+    /// assert!(store.rewinds(run)?.is_empty(), "nothing has been put back yet");
+    ///
+    /// // A run that wrote nothing still records that it was rewound: "this was
+    /// // undone and there was nothing to undo" is an answer, and an absent row
+    /// // would be indistinguishable from never having asked.
+    /// rewind_run(&ws, &store, run)?;
+    /// let done = store.rewinds(run)?;
+    /// assert_eq!(done.len(), 1);
+    /// assert!(done[0].files.is_empty() && done[0].queue_cleared.is_empty());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn rewinds(&self, run_id: i64) -> Result<Vec<RewindRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT at, files, memory_restored, memory_removed, queue_cleared FROM rewinds
+             INDEXED BY rewinds_run WHERE run_id = ?1 ORDER BY id",
+        )?;
+        let rows = stmt.query_map((run_id,), |r| {
+            let list = |i: usize| -> rusqlite::Result<Vec<String>> {
+                let raw: String = r.get(i)?;
+                Ok(serde_json::from_str(&raw).unwrap_or_default())
+            };
+            Ok(RewindRecord {
+                at: r.get(0)?,
+                files: list(1)?,
+                memory_restored: list(2)?,
+                memory_removed: list(3)?,
+                queue_cleared: list(4)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<_, _>>()?)
     }
 
     /// Record the policy a run was started under.
@@ -5716,6 +6023,34 @@ impl Store {
         kind: MemoryKind,
     ) -> Result<MemoryWrite> {
         let value = truncate_memory_value(value);
+        // 0.36.0 — the restore point, taken BEFORE the write, because after it
+        // the previous value is gone. `INSERT OR IGNORE` against a unique
+        // `(run_id, workspace, key)` index is the whole first-write guard: the
+        // second and fifth write of one key by one run insert nothing and the
+        // restore point stays at what was there before the first.
+        //
+        // Two statements rather than one, because "there was a value" and "there
+        // was no entry" are different rows and SQLite cannot write either from a
+        // single `SELECT` that may return no row. The second only fires when the
+        // first inserted nothing, which is both "no entry to copy" and "this run
+        // already recorded one" — and in the second case it inserts nothing
+        // either, which is what makes running them in sequence safe.
+        let recorded = self.conn.execute(
+            "INSERT OR IGNORE INTO memory_snapshots
+                 (run_id, workspace, key, step, before, kind, state)
+             SELECT ?1, ?2, ?3, ?4, m.value, m.kind, 'text'
+             FROM memory m WHERE m.workspace = ?2 AND m.key = ?3",
+            (run_id, workspace, key, step),
+        )?;
+        let recorded = match recorded {
+            0 => self.conn.execute(
+                "INSERT OR IGNORE INTO memory_snapshots
+                     (run_id, workspace, key, step, before, kind, state)
+                 VALUES (?1, ?2, ?3, ?4, NULL, NULL, 'absent')",
+                (run_id, workspace, key, step),
+            )?,
+            n => n,
+        };
         // The guard is in the SQL rather than a read-then-write in the caller, so
         // two writers on one store cannot interleave between the check and the
         // write. `IS NOT 1` rather than `!= 1` because a pre-0.30.0 row's `pinned`
@@ -5734,6 +6069,17 @@ impl Store {
             (workspace, key, &value, run_id, step, kind.as_str()),
         )?;
         if n == 0 {
+            // Pinned, so nothing was written — and therefore there is nothing to
+            // put back. Take the restore point away again, but only if THIS call
+            // is what wrote it: an earlier successful write of the same key by
+            // the same run owns that row, and a refusal must not discard it.
+            if recorded == 1 {
+                self.conn.execute(
+                    "DELETE FROM memory_snapshots
+                     WHERE run_id = ?1 AND workspace = ?2 AND key = ?3",
+                    (run_id, workspace, key),
+                )?;
+            }
             return Ok(MemoryWrite {
                 refused: true,
                 evicted: Vec::new(),
@@ -6910,6 +7256,96 @@ mod tests {
         assert!(
             !control.contains("gate_attempts_run"),
             "a column in no index must not be servable from the index, got {control}"
+        );
+    }
+
+    /// N6 (0.36.0) — the two reads a rewind makes seek into one run rather than
+    /// scanning every run's restore points and every parent's backlog.
+    ///
+    /// `EXPLAIN`s the two `const`s the crate executes rather than copies of them,
+    /// for the reason the gate-history test above gives. The control filters on a
+    /// column in **no** index at all — trap 38: a trailing column of a composite
+    /// index is not a control, because SQLite skip-scans one and produces a full
+    /// read wearing an index's name.
+    ///
+    /// Measured on this fixture (40 runs × 20 keys, 40 parents × 20 queued):
+    /// both plans are index seeks and neither reads a row belonging to another
+    /// run. The number is recorded rather than asserted — a wall-clock assertion
+    /// is flaky on a loaded runner and passes on a fast machine running a full
+    /// scan.
+    #[test]
+    fn a_rewinds_two_reads_seek_into_one_run_rather_than_scanning_every_runs() {
+        let store = Store::memory().unwrap();
+        let mut first = 0;
+        for r in 0..40 {
+            let run = store.start_run(&format!("run {r}"), "/repo").unwrap();
+            if r == 0 {
+                first = run;
+            }
+            for k in 0..20 {
+                store
+                    .memory_write(
+                        "/repo",
+                        &format!("key {r}-{k}"),
+                        "v",
+                        run,
+                        k,
+                        MemoryKind::Fact,
+                    )
+                    .unwrap();
+                store
+                    .enqueue_agent(run, k, &format!("goal {r}-{k}"), 1)
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<i64> = vec![first][..n].to_vec();
+            stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let notes = plan(Store::MEMORY_SNAPSHOTS_SQL);
+        assert!(
+            notes.contains("memory_snapshots_entry"),
+            "the restore points must seek on memory_snapshots_entry, got {notes}"
+        );
+        assert!(
+            !notes.contains("SCAN memory_snapshots"),
+            "a rewind must not read every run's restore points, got {notes}"
+        );
+
+        let queue = plan(Store::QUEUED_UNDER_SQL);
+        assert!(
+            queue.contains("agent_queue_entry"),
+            "the backlog must seek on agent_queue_entry, got {queue}"
+        );
+        assert!(
+            !queue.contains("SCAN agent_queue"),
+            "a rewind must not read every parent's backlog, got {queue}"
+        );
+
+        // The controls. `step` and `depth` are in no index at all, so neither can
+        // be served from one — which is what makes the two assertions above about
+        // the index rather than about the planner being unable to scan.
+        let control = plan("SELECT id FROM memory_snapshots WHERE step = 3");
+        assert!(
+            !control.contains("memory_snapshots_entry"),
+            "a column in no index must not be servable from one, got {control}"
+        );
+        let control = plan("SELECT id FROM agent_queue WHERE depth = 1");
+        assert!(
+            !control.contains("agent_queue_entry"),
+            "a column in no index must not be servable from one, got {control}"
         );
     }
 
