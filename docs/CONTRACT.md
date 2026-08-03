@@ -649,10 +649,67 @@ way any wrong slug fails: at the vendor, on the next request.
 overrode a role's own model would be the roster's author being ignored by a
 counter.
 
+## What a capability bundle contributes, and what it may not (0.35.0)
+
+A **plugin** is a directory with a `plugin.toml` at its root, named by a
+`[[plugin]]` entry in a configuration scope and loaded by `Config::plugins()`. It
+contributes skills, prompt templates, agent definitions, MCP servers, lifecycle
+hooks and policy layers — no more.
+
+**A plugin contributes data, never code.** There is no dynamic loading, and there
+will not be. A `Tool` is an in-process trait implementation the application
+registers; `dlopen` would make every safety property of this crate a function of a
+directory a stranger wrote.
+
+**Nothing verifies that a directory is what its author published.** No signature,
+no checksum, no provenance. Nothing fetches, installs or updates a bundle either:
+`[[plugin]]` names a directory that already exists on this machine, and
+distribution is the application's. What *is* bounded is what an untrusted bundle
+may contribute, which is a different and achievable claim.
+
+**A project-scoped declaration may not contribute a hook or an MCP server.** Both
+name a program this machine would run, and `io.toml` is the file a `git clone`
+delivers — the 0.28.0 rule for `[[hook]]`, applied to a new declaration site. The
+refusal is whole: a project-scoped bundle whose manifest declares one contributes
+none of its other kinds either, because a half-applied stranger's manifest is the
+failure the rule exists to prevent. `${cmd:}` inside a manifest is refused in
+every scope.
+
+**This does not narrow the standing `[[mcp]]` gap in `io.toml` itself.** A
+project-scoped `io.toml` may still name an MCP command directly, and an unknown
+key inside an `[[mcp]]` table is still accepted, because serde refuses `flatten`
+beside `deny_unknown_fields`. A *plugin's* `[[mcp]]` is refused there, so the new
+surface is stricter than the old one — deliberately: new surface starts closed,
+existing surface is not narrowed under a release nobody asked to break.
+
+**Plugin-supplied policy may only narrow.** A `[policy]` block may carry layers of
+`deny` rules; an `allow` rule, an `ask` rule or a `defaults` block drops the
+bundle. A bundle takes capability away and never hands it out.
+
+**A hook or MCP server contributed from a trusted scope is not sandboxed by having
+come from a bundle.** It runs a program with this process's privileges under the
+same policy any other one would.
+
+**Namespacing changes the names a model sees.** Every contributed name becomes
+`<plugin>__<name>`, which is what makes a contribution attributable in the trace
+with no new column — and it means a prompt or a skill that referred to another
+skill by its bare name stops matching once that skill moves into a bundle. This
+crate cannot rewrite prose.
+
+**A bundle that fails to load is dropped, and that is quiet by design.** Loading
+has no error path: the reason is on `Plugins::dropped()` and in
+`EventKind::PluginDropped`, and the run proceeds. An operator watching neither can
+therefore run for a week believing in deny rules that were never installed. An
+application that wants a broken bundle to be fatal writes one `if` — see
+[the guide](guide/plugins.md).
+
+**`version` in a manifest is documentation.** Nothing resolves it, compares two
+bundles, orders their loading, or checks one against the crate.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
-is fixed as of 0.34.0.
+is fixed as of 0.35.0.
 
 **The concurrency cap is per tier, not per tree (0.32.0).**
 `Containment::max_concurrent_agents` bounds how many agents work at once *at one

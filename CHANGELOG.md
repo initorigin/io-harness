@@ -26,6 +26,89 @@ notes are produced from it.
 
 ### Security
 
+## [0.35.0] - 2026-08-03
+
+A directory is a capability bundle.
+
+Six capabilities had a discovery path each and shared nothing: skills came from
+one directory, templates from another, agents, MCP servers and hooks from arrays
+in `io.toml`, and policy layers from a stack the application assembled. Handing a
+coherent set of them to somebody else meant six manual steps, and once they were
+in place nothing recorded that any of them came from anywhere but the operator.
+
+**A `plugin.toml` declares what a directory contributes**, and a `[[plugin]]`
+entry in any configuration scope names one by path. `Config::plugins()` loads
+every declared bundle; `Plugins::apply_to`, `apply_to_policy`, `apply_to_hooks`
+and `templates()` install what they brought. The manifest's contribution types are
+the ones `io.toml` already deserializes, so it is the configuration file's
+vocabulary rather than a second one.
+
+**A bundle is a stranger's directory, and the 0.28.0 trust rule governs it.** A
+plugin declared in the committed, cloned `io.toml` contributes skills, templates,
+agents and deny rules, and may **not** contribute a `[[hook]]` or an `[[mcp]]` —
+both name a program this machine would run. Declared in `io.local.toml` or the
+user file it contributes all six. The refusal is whole: a project-scoped bundle
+that declares one contributes none of its other kinds either. `${cmd:}` is refused
+inside a manifest in every scope.
+
+**Plugin-supplied policy may only narrow.** A `[policy]` block may carry layers of
+`deny` rules and nothing else; an `allow` rule, an `ask` rule or a `defaults`
+block drops the bundle. A bundle may take capability away and may never hand it
+out.
+
+**Every contribution carries its plugin.** Skills, templates, agents, policy
+layers and MCP server ids are namespaced `<plugin>__<name>` as they load, so the
+bundle is already inside the strings the trace has recorded since 0.4.0: a refusal
+names `<plugin>__<layer>` in `PolicyEvent.layer`, a call names `<plugin>__<server>`
+in `McpEvent.server` and offers `mcp__<plugin>__<server>__<tool>`, and a spawned
+child's tokens are billed under `<plugin>__<agent>`. **No table, column or index
+was added** — `CHECKPOINT_FORMAT` is unmoved at 7. It also makes a name collision
+impossible rather than unlikely: a bundle cannot occupy a name the operator uses,
+and ids are unique, bounded and may not contain `__`.
+
+**A broken bundle costs exactly itself.** Loading has no error path. A directory
+with no manifest, unparseable TOML, an unknown key, a malformed or duplicate id,
+or a contribution its scope may not make is dropped — recorded on
+`Plugins::dropped()` with its reason and reported as `EventKind::PluginDropped` —
+while every bundle that did load is applied and the run proceeds. An application
+that wants a broken bundle to be fatal writes one `if`.
+
+### Added
+
+- `io_harness::plugin`, with `Plugins`, `Plugin`, `Dropped`, `PLUGIN_FILE`,
+  `NAMESPACE` and `MAX_ID`.
+- `Config::plugins()`, and `[[plugin]]` in `io.toml`, `io.local.toml` and the
+  user-scope file. The array **appends** across scopes, like `policy.layers` and
+  `[[agent]]`.
+- `Plugins::apply_to`, `Plugins::apply_to_policy`, `Plugins::apply_to_hooks` and
+  `Plugins::templates`, plus `Plugins::get`/`iter`/`names`/`len`/`is_empty`/
+  `dropped`/`none`.
+- `TaskContract::plugins` and `TaskContract::with_plugins`.
+- `EventKind::PluginLoaded { plugin, contributions }` and
+  `EventKind::PluginDropped { plugin, why }`, with their `EVENT_NAMES` entries.
+- [`docs/guide/plugins.md`](docs/guide/plugins.md).
+
+### Changed
+
+- **BREAKING (API)** `TaskContract` gains the `plugins` field and becomes
+  `#[non_exhaustive]`. Both are the same break for a struct literal or an
+  exhaustive destructuring outside this crate, so they are paid together rather
+  than twice — and the second one means the next field this type gains is free.
+  *Migration:* build contracts with `TaskContract::new` or
+  `TaskContract::workspace` and the `with_*` builders, which is what every
+  documented caller already does and which is unchanged. Replace any
+  `TaskContract { .. }` literal with a constructor plus builders, and add a `..`
+  to any exhaustive `let TaskContract { .. } = contract` destructuring. No field
+  was removed, no signature moved, and reading any existing field still compiles.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.34.0] - 2026-08-02
 
 A second model checks the first, one failed gate is retried on its own, and which
