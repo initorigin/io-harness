@@ -62,7 +62,8 @@ in [Documents](documents.md#video-is-off-the-roadmap).
 
 ## Git
 
-Five tools: `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`.
+Seven tools: `git_status`, `git_diff`, `git_log`, `git_add`, `git_commit`, and
+since 0.36.0 `git_branch` and `git_worktree`.
 
 The reachable surface is closed by construction rather than by an allow-list.
 The exec policy enforces a program *name* and records argv without checking it,
@@ -91,10 +92,70 @@ The committing identity is the caller's to set, with
 `TaskContract::with_commit_identity`, rather than whatever the machine's global
 git config happens to say.
 
-Commits are local: there is no push, no fetch, no branch switching and no history
-rewriting. Repository hooks do not run — `.git/hooks/*` is arbitrary code carried
-by the repository the agent was pointed at, and nothing in the permission model
-covers it.
+Commits are local: there is no push, no fetch and no history rewriting.
+Repository hooks do not run — `.git/hooks/*` is arbitrary code carried by the
+repository the agent was pointed at, and nothing in the permission model covers
+it.
+
+## Landing on a branch (0.36.0)
+
+Without `git_branch`, a run commits onto whatever branch it found — an agent
+asked to fix a test lands its work on `main` because `main` was checked out, and
+a human reviewing it has to move it themselves.
+
+`git_branch` renders `git switch --create=<name>`: a branch at the current
+commit, moved onto, carrying the working tree across. It is the only shape of a
+checkout this crate builds, and the only one that cannot discard a change — an
+existing name is refused by git, and nothing is replaced. `checkout` stays on
+the forbidden list, and the test that holds that list is unchanged by this
+release rather than relaxed to fit.
+
+Branch names are validated here before git sees them: letters, digits, `.`, `_`,
+`/` and `-`, at most 100 characters, no leading `-`, no `..`, and no empty or
+`.lock` path component. A refused name is an observation the agent can act on.
+The allowlist is deliberately narrower than git's own rules — the set of names
+an agent has reason to ask for is small, so the safe subset is the one that can
+be enumerated.
+
+## A working tree per agent (0.36.0)
+
+Every agent in a tree shares one checkout, so two children editing the same file
+are one overwriting the other. `git_worktree` renders
+`git worktree add -b <name> -- <path>`: another checkout of the same repository,
+on a new branch, at a path checked for `Act::Write` like every other
+model-supplied path.
+
+A roster can ask for one without the model deciding:
+
+```rust
+use io_harness::AgentDef;
+
+// Each child of this definition is rooted at its own worktree under
+// `.worktrees/`, on its own branch, created before its first step.
+let worker = AgentDef::new("worker").with_worktree();
+```
+
+The path is derived from the key a spawn is adopted by, so a resumed tree
+continues in the worktree it already made rather than re-creating it and
+throwing the child's work away. If one cannot be made — no git, not a
+repository, the policy refusing that path — the spawn fails and says why, because
+quietly sharing the parent's tree is the collision the flag exists to prevent.
+
+**Two honest costs.** Nothing here removes a worktree: removing one deletes the
+work the child was spawned to do, so it is the operator's call
+(`git worktree remove`). And the parent's own `git_status` reports the directory
+as untracked — one line, `?? .worktrees/`, because git summarises an untracked
+directory rather than descending into it — so a `git_add` naming `.` stages the
+children's trees. This crate does not write to `.git/info/exclude` on your
+behalf; the one line an operator can add themselves is:
+
+```sh
+echo '/.worktrees/' >> .git/info/exclude
+```
+
+`git switch` needs git 2.23 and `git worktree` needs git 2.5. An older git
+surfaces as the message git itself prints, as an observation, not as a crate
+error.
 
 ## Why this raises the stakes on resume
 

@@ -128,8 +128,51 @@ undo, no rewind to step 4, and no redo. A previous file over 1 MiB or one that i
 not valid UTF-8 is `NotKept` — reported, and never guessed at, and never truncated.
 Only `write_file` and `edit_file` take a snapshot: a file changed by `shell`,
 `exec` or a git built-in has no restore point and answers `NotRecorded`. And
-`rewind` takes one path per call, so undoing a whole run is a loop the caller
-writes and can interrupt halfway.
+`rewind` takes one path per call; `rewind_run` below is the whole-run form.
+
+## Putting a whole run back (0.36.0)
+
+`rewind` answers "undo this edit". `rewind_run` answers "undo this run", which
+is not the same question. A run that wrote three files, recorded two decisions
+in memory and queued four children leaves three of those five effects in place
+after you have restored every file — and the two that remain are the ones that
+change what the *next* run does. Memory is read into context, so a wrong fact a
+rewound run learned outlives the files it was learned from; a queued backlog is
+adopted on resume, so work you undid is re-admitted. A partial undo is worse
+than none, because it looks complete.
+
+```rust
+use io_harness::rewind_run;
+
+let done = rewind_run(&workspace, &store, run_id)?;
+for (path, verdict) in &done.files {
+    println!("{path}: {verdict:?}");   // the same four verdicts as `rewind`
+}
+println!("{} notes put back, {} removed", done.memory_restored.len(), done.memory_removed.len());
+println!("{} queued children dropped", done.queue_cleared.len());
+# Ok::<(), io_harness::Error>(())
+```
+
+Each memory entry goes back to the value that was there before this run's
+**first** write to that key — the same definition, and the same first-write
+guard, that files have had since 0.28.0. An entry the run created is removed,
+because "the way it was" for an entry that did not exist is not existing.
+
+**Nothing in the trace is deleted.** The steps, the event stream, the spawn
+records and the ledger are untouched: the spend happened, and an undo that
+erased the rows would make the ledger disagree with the invoice and make "this
+agent has tried this three times" unanswerable. What the rewind took is written
+down before it goes, and `Store::rewinds` reads it back — so the work and its
+undoing are both answerable long afterwards. `EventKind::Rewound` reports the
+same three numbers to an observer.
+
+**What it does not undo, stated rather than implied.** A commit the run made is
+still there; `git reset` is unreachable from this crate by construction, and
+undoing history is a decision about a branch rather than about a run. A push is
+not recalled, a migration is not reversed, a provider call is not un-billed, and
+a worktree is never removed. It is one run and not a tree — a caller wanting a
+subtree loops over it, which is honest about what "a rewind" means rather than
+inventing an ordering over children whose files may overlap.
 
 ## See also
 

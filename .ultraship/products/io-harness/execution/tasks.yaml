@@ -456,7 +456,7 @@ tasks:
     why_required: >
       Four of these are guarded by tests that fail without them, and the changelog section must
       exist before `release.yml` will cut the Release at all.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T06
     acceptance_criteria:
@@ -489,7 +489,47 @@ tasks:
       - docs/guide/context-and-memory.md
       - README.md
       - CHANGELOG.md
-    evidence: []
+      - src/lib.rs
+      - Cargo.toml
+    evidence:
+      - >
+        Every doc guard green: `tests/public_api.rs` 9 passed against a **hand-edited**
+        `docs/public-api.txt` carrying `fn rewind_run`, `fn rewind_run_observed`,
+        `struct RewindRecord` and `struct Rewound`; `tests/guide_pages.rs` 7;
+        `tests/changelog.rs` 5, finding the `*Migration:*` note under the one `**BREAKING (API)**`
+        entry; `tests/readme.rs` 8; `tests/docs_drift.rs` 10, including the relative-link check
+        over the new guide anchors.
+      - >
+        N4: `every_public_item_has_a_worked_example` passes, so all four added crate-root items
+        carry one. `Cargo.toml` is at 0.36.0 and the CHANGELOG section exists, which `release.yml`
+        refuses a version without.
+      - >
+        N5, all of it in `docs/CONTRACT.md`: a commit is not un-committed and `git reset` stays
+        unreachable; a push, a migration and a provider call are not undone; nothing removes a
+        worktree or deletes a branch; a rewind is one run and not a tree; the parent's
+        `git_status` reports `?? .worktrees/` (the number F3 measured) and the operator's
+        `echo '/.worktrees/' >> .git/info/exclude` is given; git 2.23 for `switch` and 2.5 for
+        `worktree`, surfacing as git's own message rather than a crate error. Plus two limits the
+        criterion did not name and the code has: a rewind bypasses the memory pin, and
+        `AgentDef::worktree` fails the spawn rather than falling back.
+      - >
+        Three guide pages extended rather than a new page added, so no `GUIDES`/`CAPABILITIES.md`
+        bookkeeping: `images-and-git.md` (the count moved from five tools to seven, plus
+        "Landing on a branch" and "A working tree per agent"), `durable-runs.md` ("Putting a whole
+        run back"), `context-and-memory.md` (the pin/rewind interaction).
+      - >
+        Two prose claims that this release made false, corrected in it rather than later: the
+        README and the crate-root docs both said "there is no push, no fetch, no branch switching
+        and no history rewriting". Branch switching now exists in one narrow form, so both now say
+        what is true and why `switch --create` is the only checkout that is reachable.
+      - >
+        **A criterion met in a different form, stated not glossed.** N4 lists `GIT_BRANCH_TOOL` and
+        `GIT_WORKTREE_TOOL` among the items owing a worked example. They are
+        `io_harness::tools::` constants and not crate-root re-exports, so the
+        `every_public_item_has_a_worked_example` gate does not reach them — and their five
+        siblings, `GIT_LOG_TOOL` and the rest, carry prose and no example. They are documented to
+        exactly that standard rather than being made the only two of seven with a doctest, which
+        for a `&str` constant would assert its own spelling.
 
   - id: US-IO-HARNESS-0.36.0-T10
     summary: >

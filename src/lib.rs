@@ -228,11 +228,15 @@
 //! [`Verification::DocumentContains`] rather than a container read as the empty
 //! string; plus image passthrough to any provider whose model accepts one.
 //!
-//! **Git**, as fixed-argv built-ins: status, diff, log, add, and commit (under a
-//! caller-supplied [`Identity`]), so a run ends as a reviewable commit rather
-//! than a working tree someone has to reconstruct. The model supplies paths and
-//! a message, never a subcommand or a flag, so push, fetch, reset and rebase are
-//! unreachable by construction.
+//! **Git**, as fixed-argv built-ins: status, diff, log, add, commit (under a
+//! caller-supplied [`Identity`]), branch and worktree, so a run ends as a
+//! reviewable commit on a branch of its own rather than a working tree someone
+//! has to reconstruct. The model supplies paths, a message and a branch name,
+//! never a subcommand or a flag, so push, fetch, reset and rebase are
+//! unreachable by construction — `git switch --create`, the one checkout that
+//! cannot discard a change, is the only one of them that is reachable. An
+//! [`AgentDef`] can ask for its own worktree, so concurrent children stop
+//! overwriting each other's files.
 //!
 //! What none of it governs: a stdio MCP server and a registered [`Tool`] both
 //! run outside the sandbox with the privileges of whoever started them, and a
