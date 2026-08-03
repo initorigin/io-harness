@@ -707,3 +707,89 @@ async fn a_rewind_leaves_a_commit_alone_and_does_not_touch_what_it_did_not_keep(
     assert!(done.queue_cleared.is_empty());
     assert!(done.memory_restored.is_empty() && done.memory_removed.is_empty());
 }
+
+/// N3 — a rewind is the caller's call. It is never a tool, never a step, and
+/// nothing in the run loop reaches it.
+///
+/// `rewind_run` lives in `src/run.rs` beside the loop, so the 0.33.0/0.35.0
+/// module-path grep cannot be used here — there is no module boundary to grep
+/// for. The claim this makes instead is the one that is actually load-bearing:
+/// no tool the model can call dispatches to it, and no line of `src/run.rs`
+/// outside its own two definitions calls it. Trap 70's rule applies — this is
+/// stated as what it proves, not as "the loop does no rewind work".
+#[test]
+fn no_tool_dispatches_to_a_rewind_and_the_loop_never_calls_one() {
+    let source = std::fs::read_to_string("src/run.rs")
+        .unwrap()
+        .replace("\r\n", "\n");
+
+    // Nothing the model can call is a rewind: the tool-name constants are the
+    // whole surface a `ToolSpec` is built from.
+    let tools = std::fs::read_to_string("src/tools/mod.rs")
+        .unwrap()
+        .replace("\r\n", "\n");
+    let named: Vec<&str> = tools
+        .lines()
+        .filter(|l| l.trim_start().starts_with("pub const") && l.contains("_TOOL"))
+        .filter(|l| l.contains("rewind"))
+        .collect();
+    assert!(named.is_empty(), "a rewind must not be a tool: {named:?}");
+
+    // And no code in the run module calls one. Its own definition line, and the
+    // one call `rewind_run` makes to the observed form, are the only two.
+    let calls: Vec<&str> = source
+        .lines()
+        .filter(|l| !l.contains("///") && !l.contains("//!"))
+        .filter(|l| l.contains("rewind_run(") || l.contains("rewind_run_observed("))
+        .collect();
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected only the two definitions and the delegation: {calls:?}"
+    );
+    assert!(
+        calls.iter().filter(|l| l.contains("pub fn")).count() == 2,
+        "two of the three are the definitions themselves: {calls:?}"
+    );
+
+    // The control: the same check over a source that does call one from the loop.
+    let spliced = source.replace(
+        "async fn dispatch(",
+        "fn spliced(ws: &Workspace, store: &Store) { let _ = rewind_run(ws, store, 1); }\nasync fn dispatch(",
+    );
+    let control: Vec<&str> = spliced
+        .lines()
+        .filter(|l| !l.contains("///") && !l.contains("//!"))
+        .filter(|l| l.contains("rewind_run(") || l.contains("rewind_run_observed("))
+        .collect();
+    assert_eq!(
+        control.len(),
+        4,
+        "the control finds the call this test exists to catch: {control:?}"
+    );
+}
+
+/// N3's other half, asserted by behaviour rather than by reading source: a run
+/// that uses neither half of this release pays for neither.
+#[tokio::test]
+async fn a_run_that_rewinds_nothing_writes_no_rewind_rows_and_makes_no_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "notes.md", b"original\n");
+    let store = Store::memory().unwrap();
+
+    let (_ws, run_id) = drive(
+        dir.path(),
+        &store,
+        vec![vec![call(
+            "write_file",
+            json!({ "path": "notes.md", "content": "rewritten\n" }),
+        )]],
+    )
+    .await;
+
+    assert!(store.rewinds(run_id).unwrap().is_empty());
+    assert!(
+        !dir.path().join(".worktrees").exists(),
+        "nothing asked for a worktree, so none was made"
+    );
+}

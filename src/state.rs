@@ -7259,6 +7259,96 @@ mod tests {
         );
     }
 
+    /// N6 (0.36.0) — the two reads a rewind makes seek into one run rather than
+    /// scanning every run's restore points and every parent's backlog.
+    ///
+    /// `EXPLAIN`s the two `const`s the crate executes rather than copies of them,
+    /// for the reason the gate-history test above gives. The control filters on a
+    /// column in **no** index at all — trap 38: a trailing column of a composite
+    /// index is not a control, because SQLite skip-scans one and produces a full
+    /// read wearing an index's name.
+    ///
+    /// Measured on this fixture (40 runs × 20 keys, 40 parents × 20 queued):
+    /// both plans are index seeks and neither reads a row belonging to another
+    /// run. The number is recorded rather than asserted — a wall-clock assertion
+    /// is flaky on a loaded runner and passes on a fast machine running a full
+    /// scan.
+    #[test]
+    fn a_rewinds_two_reads_seek_into_one_run_rather_than_scanning_every_runs() {
+        let store = Store::memory().unwrap();
+        let mut first = 0;
+        for r in 0..40 {
+            let run = store.start_run(&format!("run {r}"), "/repo").unwrap();
+            if r == 0 {
+                first = run;
+            }
+            for k in 0..20 {
+                store
+                    .memory_write(
+                        "/repo",
+                        &format!("key {r}-{k}"),
+                        "v",
+                        run,
+                        k,
+                        MemoryKind::Fact,
+                    )
+                    .unwrap();
+                store
+                    .enqueue_agent(run, k, &format!("goal {r}-{k}"), 1)
+                    .unwrap();
+            }
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let n = stmt.parameter_count();
+            let args: Vec<i64> = vec![first][..n].to_vec();
+            stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let notes = plan(Store::MEMORY_SNAPSHOTS_SQL);
+        assert!(
+            notes.contains("memory_snapshots_entry"),
+            "the restore points must seek on memory_snapshots_entry, got {notes}"
+        );
+        assert!(
+            !notes.contains("SCAN memory_snapshots"),
+            "a rewind must not read every run's restore points, got {notes}"
+        );
+
+        let queue = plan(Store::QUEUED_UNDER_SQL);
+        assert!(
+            queue.contains("agent_queue_entry"),
+            "the backlog must seek on agent_queue_entry, got {queue}"
+        );
+        assert!(
+            !queue.contains("SCAN agent_queue"),
+            "a rewind must not read every parent's backlog, got {queue}"
+        );
+
+        // The controls. `step` and `depth` are in no index at all, so neither can
+        // be served from one — which is what makes the two assertions above about
+        // the index rather than about the planner being unable to scan.
+        let control = plan("SELECT id FROM memory_snapshots WHERE step = 3");
+        assert!(
+            !control.contains("memory_snapshots_entry"),
+            "a column in no index must not be servable from one, got {control}"
+        );
+        let control = plan("SELECT id FROM agent_queue WHERE depth = 1");
+        assert!(
+            !control.contains("agent_queue_entry"),
+            "a column in no index must not be servable from one, got {control}"
+        );
+    }
+
     /// N3 — an attached observer\'s tail read seeks into this tree\'s events rather
     /// than scanning every tree\'s.
     ///

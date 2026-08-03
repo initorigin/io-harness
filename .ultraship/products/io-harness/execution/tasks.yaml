@@ -357,7 +357,7 @@ tasks:
     why_required: >
       The 0.22.0 schema guard fires on any new table and must be fed by name; a release that added
       one and forgot the list is exactly what that guard exists to catch.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T06
     acceptance_criteria:
@@ -369,7 +369,20 @@ tasks:
         `CHECKPOINT_FORMAT` stays 7, asserted rather than assumed.
     files:
       - tests/cross_version.rs
-    evidence: []
+    evidence:
+      - >
+        `ADDED_SINCE_0_22_0` gained exactly four names — `memory_snapshots`,
+        `memory_snapshots_entry`, `rewinds`, `rewinds_run` — and nothing else. No existing table
+        is altered, so `ALTERED_SINCE_0_22_0` is untouched.
+      - >
+        `cargo test --test cross_version` — 5 passed, 0 failed, including
+        `the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it` and
+        `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing`.
+      - >
+        The other direction, executed rather than asserted on paper: `cargo build --manifest-path
+        tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 --
+        --ignored` — `a_current_store_is_read_by_a_0_29_0_binary` passed. A 0.29.0 binary opens a
+        store carrying all four new objects and never names any of them.
 
   - id: US-IO-HARNESS-0.36.0-T08
     summary: >
@@ -379,7 +392,7 @@ tasks:
     why_required: >
       A cost claim asserted by clock is flaky on a loaded runner and passes on a fast machine
       running a full scan, and a "the loop never touches it" claim with no control is decorative.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T06
     acceptance_criteria:
@@ -400,8 +413,40 @@ tasks:
         recorded. No wall-clock assertion is written.
     files:
       - src/state.rs
-      - tests/rewind_run.rs
-    evidence: []
+      - tests/rewind.rs
+    evidence:
+      - >
+        N6: `a_rewinds_two_reads_seek_into_one_run_rather_than_scanning_every_runs` `EXPLAIN`s the
+        two `const`s the crate actually executes — `Store::MEMORY_SNAPSHOTS_SQL` and
+        `Store::QUEUED_UNDER_SQL` — over a fixture of 40 runs × 20 keys and 40 parents × 20 queued
+        children, after `ANALYZE`. Both plans seek on their index and neither reads a row belonging
+        to another run. No wall-clock assertion is written.
+      - >
+        The controls are `memory_snapshots.step` and `agent_queue.depth`, each in **no** index at
+        all — trap 38's rule rather than a trailing composite column, which SQLite skip-scans into
+        a full read wearing an index's name. Neither control's plan names an index.
+      - >
+        N3: `no_tool_dispatches_to_a_rewind_and_the_loop_never_calls_one` — no `*_TOOL` constant in
+        `src/tools/mod.rs` names a rewind, and outside doc comments `src/run.rs` holds exactly
+        three lines mentioning one: the two definitions and `rewind_run`'s delegation to the
+        observed form. The splice-in control adds a call above `async fn dispatch(` and the count
+        becomes four, so the test fails when such a call is added.
+      - >
+        **A criterion met in a different shape, stated not glossed.** N3's prose asks for "a
+        source-reading test in the shape 0.33.0 and 0.35.0 used" — those grep for a *module path*,
+        which cannot work here because `rewind_run` lives in `src/run.rs` beside the loop and there
+        is no module boundary to grep for. What the test claims instead is the load-bearing half:
+        no tool dispatches to a rewind and no line of the run module calls one. Trap 70 applies —
+        it is stated as what it proves, not as "the loop does no rewind work".
+      - >
+        The behavioural half, which no source read can give:
+        `a_run_that_rewinds_nothing_writes_no_rewind_rows_and_makes_no_worktree` drives an ordinary
+        run and asserts `rewinds` is empty and no `.worktrees` directory exists.
+      - >
+        The one unconditional cost, measured rather than hidden: a memory write now also writes a
+        restore-point row the first time a run touches that key. Bounded by keys touched per run,
+        exactly as file snapshots are bounded by paths written per run — the fixture above writes
+        800 memory entries and 800 restore points, one each.
 
   - id: US-IO-HARNESS-0.36.0-T09
     summary: >
