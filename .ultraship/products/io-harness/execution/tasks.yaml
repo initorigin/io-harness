@@ -23,7 +23,20 @@ tasks:
         before any spawn, and the same name with the offending part removed is accepted.
     files:
       - src/tools/git.rs
-    evidence: []
+    evidence:
+      - >
+        `cargo test --lib tools::git` — 13 passed, 0 failed, including
+        `no_shape_can_write_or_reach_the_network` **unchanged** over the widened eight-shape list
+        and `the_subcommand_is_always_one_of_the_seven_this_crate_ships`.
+      - >
+        F1's control, `a_branch_name_git_could_read_as_an_option_is_refused_and_its_repaired_form_is_not`:
+        `-x`, `a..b`, `/lead`, `trail/`, `x.lock`, a 101-character name and an empty name are each
+        refused for both `Branch` and `Worktree` before an argv exists, and each repaired form
+        builds `--create=<name>`. Three more the allowlist catches for free: a space, `^` and `@{`.
+      - >
+        Sabotage S1 — `cmd.check()?` removed from `Git::argv` — failed exactly
+        `a_branch_name_git_could_read_as_an_option_is_refused_and_its_repaired_form_is_not`
+        (12 passed, 1 failed), so the refusal is the code's and not the test's.
 
   - id: US-IO-HARNESS-0.36.0-T02
     summary: >
