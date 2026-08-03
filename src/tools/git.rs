@@ -11,13 +11,22 @@
 //!
 //! There is no `&str`, no `Vec<String>`, and no `impl IntoIterator<Item = ...>`
 //! anywhere on the way in that reaches the argv as an *option*. A caller names a
-//! `GitCmd` variant, and every field of every variant is one of two things:
+//! `GitCmd` variant, and every field of every variant is one of three things:
 //!
 //! * a typed non-string value (`bool`, `u32`) that this module renders into a
 //!   flag itself — a `bool` cannot spell `--upload-pack=…`; or
 //! * a `paths` vector, which is model-supplied data and is therefore emitted
 //!   *only* after the `--` separator, and only after each element passes
-//!   `check_path`.
+//!   `check_path`; or
+//! * a string this module fuses into an argv element it owns — a commit message
+//!   as the operand of `-m`, a branch name inside `--create=<name>` — which is
+//!   never a separate element `git` could read as an option, and which passes
+//!   `check_branch_name` first where the fusion is not available.
+//!
+//! `git worktree add` is the one shape where the fusion is not available:
+//! `--branch=<name>` does not exist, only `-b <name>`, so the name is a separate
+//! argv element and `check_branch_name` is what stands between it and `git`'s
+//! own parser. Measured on git 2.41.0, not assumed.
 //!
 //! Adding a git capability means adding a variant here and getting it reviewed.
 //! That is the whole security property: the set of argvs this module can emit is
@@ -79,9 +88,11 @@ const NO_HOOKS: &str = "core.hooksPath";
 
 /// One git invocation, as a closed set of shapes.
 ///
-/// Every variant renders to a *read-only* subcommand. See the module docs for
-/// why the fields are typed the way they are, and
-/// [`no_shape_can_write_or_reach_the_network`] for the test that holds the line.
+/// Every variant renders to a subcommand that reads the repository, writes an
+/// object, or creates a ref — and none that reaches the network or rewrites
+/// history. See the module docs for why the fields are typed the way they are,
+/// and [`no_shape_can_write_or_reach_the_network`] for the test that holds the
+/// line.
 //
 // ponytail: three shapes, the ones the first built-ins need. More git
 // capability = one more variant plus its case in `render`, not a new
@@ -128,6 +139,92 @@ pub(crate) enum GitCmd {
         /// Who the commit is attributed to.
         identity: Identity,
     },
+    /// `git switch --create=<name> --` (0.36.0)
+    ///
+    /// Creates a branch at the current commit and moves onto it. This is the one
+    /// shape of a checkout that cannot discard anything: `--create` refuses a
+    /// name that already exists, the new ref starts at `HEAD`, and the working
+    /// tree is carried across rather than replaced — which is why `switch` is
+    /// reachable here while `checkout` stays on the forbidden list.
+    ///
+    /// The name is fused into one argv element (`--create=<name>`), so `git`
+    /// cannot read it as an option however it is spelled, and it still passes
+    /// [`check_branch_name`] because a name `git` rejects is better refused here
+    /// with a reason the agent can act on.
+    Branch {
+        /// The branch to create and move onto.
+        name: String,
+    },
+    /// `git worktree add -b <name> -- <path>` (0.36.0)
+    ///
+    /// A second working tree at its own new branch, checked out from the current
+    /// commit. Two agents in one repository stop overwriting each other's files
+    /// without either of them leaving the repository.
+    ///
+    /// Unlike [`GitCmd::Branch`] the name cannot be fused — `git worktree add`
+    /// has no `--branch=<name>` form — so it is a separate argv element and
+    /// [`check_branch_name`] is the whole of what keeps it from being read as an
+    /// option.
+    Worktree {
+        /// The branch the new working tree is created on.
+        name: String,
+        /// Model-supplied path for the new working tree. Data, after `--`.
+        path: String,
+    },
+}
+
+/// The longest branch name this crate will build an argv from.
+///
+/// Not git's limit — git's is the filesystem's — but a bound, for the reason
+/// every other model-supplied string here has one: an unbounded name reaches a
+/// ref file, a reflog and every subsequent `git log` line.
+const MAX_BRANCH_NAME: usize = 100;
+
+/// Accept one model-supplied branch name, or refuse it.
+///
+/// An allowlist rather than a denylist, and deliberately narrower than git's own
+/// `check-ref-format`. Git's rules are a set of exclusions over an otherwise open
+/// byte string, and reproducing them here would mean tracking a grammar this
+/// crate does not own; the set of names an agent has any reason to ask for is
+/// small, so the safe subset is the one that is enumerable. A name git would
+/// accept and this refuses costs an observation the agent can act on; a name git
+/// would treat as an option costs the property the whole module exists for.
+fn check_branch_name(name: &str) -> Result<()> {
+    let bad = if name.is_empty() {
+        Some("<branch name may not be empty>")
+    } else if name.len() > MAX_BRANCH_NAME {
+        Some("<branch name may not be over 100 characters>")
+    } else if name.starts_with('-') {
+        Some("<branch name may not begin with `-`>")
+    } else if name.contains("..") {
+        Some("<branch name may not contain `..`>")
+    } else if name
+        .split('/')
+        .any(|part| part.is_empty() || part.ends_with(".lock") || part == ".")
+    {
+        // Covers a leading `/`, a trailing `/`, an empty component and the
+        // `.lock` suffix git reserves for its own lock files — per component,
+        // because `refs/heads/a.lock/b` is as invalid as `a.lock`.
+        Some(
+            "<each `/`-separated part of a branch name must be non-empty and not end with `.lock`>",
+        )
+    } else if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
+    {
+        Some("<branch name may hold only letters, digits, `.`, `_`, `/` and `-`>")
+    } else {
+        None
+    };
+    match bad {
+        None => Ok(()),
+        Some(rule) => Err(Error::Refused {
+            act: "exec".into(),
+            target: name.to_string(),
+            rule: Some(rule.into()),
+            layer: None,
+        }),
+    }
 }
 
 /// Who a commit is attributed to.
@@ -256,6 +353,21 @@ impl GitCmd {
                 v.push("-m".into());
                 v.push(message.clone());
             }
+            Self::Branch { name } => {
+                v.push("switch".into());
+                // Fused, not `--create <name>`: one argv element cannot be split
+                // into an option and its operand by any spelling of the name.
+                v.push(format!("--create={name}"));
+            }
+            Self::Worktree { name, .. } => {
+                v.push("worktree".into());
+                v.push("add".into());
+                // `--branch=<name>` does not exist on `worktree add`, so this is
+                // the one name that reaches git as its own element. It is
+                // validated by `check` before `argv` builds anything.
+                v.push("-b".into());
+                v.push(name.clone());
+            }
         }
         v
     }
@@ -269,6 +381,24 @@ impl GitCmd {
             | Self::Add { paths } => paths,
             // A commit takes the index, not a pathspec.
             Self::Commit { .. } => &[],
+            // A branch is created where HEAD already is; there is no path.
+            Self::Branch { .. } => &[],
+            // The worktree's location is model-supplied, so it goes through the
+            // separator and `check_path` with every other path in this module.
+            Self::Worktree { path, .. } => std::slice::from_ref(path),
+        }
+    }
+
+    /// Refuse a shape whose model-supplied non-path text this crate will not
+    /// build an argv from (0.36.0).
+    ///
+    /// Runs before [`Git::argv`] assembles anything, for the same reason
+    /// `check_path` runs before a path is pushed: the answer to a name `git`
+    /// could read as an option is that it is not present.
+    fn check(&self) -> Result<()> {
+        match self {
+            Self::Branch { name } | Self::Worktree { name, .. } => check_branch_name(name),
+            _ => Ok(()),
         }
     }
 
@@ -360,6 +490,7 @@ impl<'a> Git<'a> {
     /// the subcommand (git only accepts them there), and the `--` separator must
     /// precede every model-supplied byte.
     pub(crate) fn argv(&self, cmd: &GitCmd) -> Result<Vec<String>> {
+        cmd.check()?;
         let mut argv = vec![
             self.program.clone(),
             "--no-pager".into(),
@@ -484,6 +615,13 @@ mod tests {
                 message: "a message".into(),
                 identity: Identity::default(),
             },
+            GitCmd::Branch {
+                name: "agent/fix-the-flake".into(),
+            },
+            GitCmd::Worktree {
+                name: "agent/child-1".into(),
+                path: ".worktrees/child-1".into(),
+            },
         ]
     }
 
@@ -499,16 +637,18 @@ mod tests {
                 | GitCmd::Diff { .. }
                 | GitCmd::Log { .. }
                 | GitCmd::Add { .. }
-                | GitCmd::Commit { .. } => {}
+                | GitCmd::Commit { .. }
+                | GitCmd::Branch { .. }
+                | GitCmd::Worktree { .. } => {}
             }
         }
         let mut kinds: Vec<_> = every_shape().iter().map(std::mem::discriminant).collect();
         let before = kinds.len();
         kinds.dedup_by(|a, b| a == b);
-        assert_eq!(before, 6, "every_shape lists six commands");
+        assert_eq!(before, 8, "every_shape lists eight commands");
         assert_eq!(
             kinds.len(),
-            5,
+            7,
             "every_shape must contain one of each variant; add the new one"
         );
     }
@@ -517,7 +657,7 @@ mod tests {
     /// by scanning the whole argv — the whole argv contains model-supplied data,
     /// and a path named `push` is a path.
     #[test]
-    fn the_subcommand_is_always_one_of_the_five_this_crate_ships() {
+    fn the_subcommand_is_always_one_of_the_seven_this_crate_ships() {
         let p = Policy::permissive();
         let dir = tempfile::tempdir().unwrap();
         let g = git(&p, dir.path());
@@ -531,10 +671,106 @@ mod tests {
                 .find(|a| !a.starts_with('-') && !a.contains('='))
                 .expect("every argv has a subcommand");
             assert!(
-                ["status", "diff", "log", "add", "commit"].contains(&sub.as_str()),
+                ["status", "diff", "log", "add", "commit", "switch", "worktree"]
+                    .contains(&sub.as_str()),
                 "{cmd:?} produced subcommand {sub:?}"
             );
         }
+    }
+
+    /// F1's control. Each of these is refused *before* an argv exists, and the
+    /// same name with the offending part removed is accepted — which is what
+    /// makes the refusal a rule about the name rather than a rule about
+    /// everything.
+    #[test]
+    fn a_branch_name_git_could_read_as_an_option_is_refused_and_its_repaired_form_is_not() {
+        let p = Policy::permissive();
+        let dir = tempfile::tempdir().unwrap();
+        let g = git(&p, dir.path());
+
+        let long = "a".repeat(MAX_BRANCH_NAME + 1);
+        let refused: &[(&str, &str)] = &[
+            ("-x", "x"),
+            ("a..b", "a.b"),
+            ("/lead", "lead"),
+            ("trail/", "trail"),
+            ("x.lock", "x.locked"),
+            (&long, "a"),
+            ("", "a"),
+            // Not in the criterion's list, and refused by the same allowlist:
+            // the byte a shell user would expect to be quoted, and the one git
+            // itself reserves.
+            ("has space", "has-space"),
+            ("caret^1", "caret1"),
+            ("at@{0}", "at0"),
+        ];
+        for (bad, repaired) in refused {
+            for cmd in [
+                GitCmd::Branch {
+                    name: (*bad).into(),
+                },
+                GitCmd::Worktree {
+                    name: (*bad).into(),
+                    path: "wt".into(),
+                },
+            ] {
+                let out = g.argv(&cmd);
+                assert!(
+                    matches!(out, Err(Error::Refused { .. })),
+                    "{bad:?} was not refused: {out:?}"
+                );
+            }
+            // The control: the identical name with the offending part removed
+            // builds an argv, so the rule is discriminating rather than a
+            // blanket refusal.
+            let ok = g
+                .argv(&GitCmd::Branch {
+                    name: (*repaired).into(),
+                })
+                .unwrap_or_else(|e| panic!("{repaired:?} should be accepted: {e:?}"));
+            assert!(
+                ok.contains(&format!("--create={repaired}")),
+                "{repaired:?} produced {ok:?}"
+            );
+        }
+    }
+
+    /// The name is fused into `--create=<name>` and is therefore not an argv
+    /// element of its own, and the worktree's path lands after the separator
+    /// while its branch does not.
+    #[test]
+    fn a_branch_name_is_fused_and_a_worktree_path_is_data() {
+        let p = Policy::permissive();
+        let dir = tempfile::tempdir().unwrap();
+        let g = git(&p, dir.path());
+
+        let argv = g
+            .argv(&GitCmd::Branch {
+                name: "agent/x".into(),
+            })
+            .unwrap();
+        assert!(argv.contains(&"switch".to_string()));
+        assert!(argv.contains(&"--create=agent/x".to_string()));
+        assert!(
+            !argv.iter().any(|a| a == "agent/x"),
+            "the name is fused, never its own element: {argv:?}"
+        );
+        // Nothing follows the separator: a branch is created where HEAD is.
+        let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(argv.len(), sep + 1, "{argv:?}");
+
+        let argv = g
+            .argv(&GitCmd::Worktree {
+                name: "agent/x".into(),
+                path: ".worktrees/x".into(),
+            })
+            .unwrap();
+        let sep = argv.iter().position(|a| a == "--").unwrap();
+        assert_eq!(&argv[sep + 1..], [".worktrees/x".to_string()]);
+        // The branch is on the crate's side of the separator, next to the `-b`
+        // this module wrote.
+        assert_eq!(argv[sep - 2], "-b");
+        assert_eq!(argv[sep - 1], "agent/x");
     }
 
     #[test]

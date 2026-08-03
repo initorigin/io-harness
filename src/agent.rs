@@ -77,6 +77,7 @@ use std::collections::BTreeMap;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AgentDef {
     /// How the parent asks for it, in `spawn_agent`'s `agent` argument.
     pub name: String,
@@ -116,6 +117,38 @@ pub struct AgentDef {
     /// Refuse every outbound connection for this agent.
     #[serde(default)]
     pub deny_net: bool,
+    /// (0.36.0) Give this agent its own git worktree instead of the tree's one
+    /// working directory.
+    ///
+    /// Every agent in a tree shares one checkout, so two children editing the
+    /// same file are one overwriting the other — the concurrency 0.32.0 bought is
+    /// usable only for work that does not overlap. With this set, a child is
+    /// rooted at `<root>/.worktrees/<agent>-<parent run>-<step>`, on a new branch
+    /// of that name, created before its first step.
+    ///
+    /// The path is derived from the key a spawn is *adopted* by, so a resumed
+    /// tree finds the worktree it already made and continues in it rather than
+    /// re-creating it and discarding what the child had written.
+    ///
+    /// If the worktree cannot be made — no `git`, not a repository, the policy
+    /// refusing that path — the spawn fails with the reason and **no child
+    /// starts**. Quietly sharing the parent's tree would be exactly the collision
+    /// this field was set to prevent.
+    ///
+    /// Nothing removes a worktree afterwards: that is the operator's call, since
+    /// removing one deletes the work the child was spawned to do.
+    ///
+    /// ```
+    /// use io_harness::AgentDef;
+    ///
+    /// let shared = AgentDef::new("reviewer");
+    /// assert!(!shared.worktree, "one checkout, as every release before 0.36.0");
+    ///
+    /// let own = AgentDef::new("reviewer").with_worktree();
+    /// assert!(own.worktree);
+    /// ```
+    #[serde(default)]
+    pub worktree: bool,
 }
 
 impl AgentDef {
@@ -168,6 +201,22 @@ impl AgentDef {
     /// ```
     pub fn with_max_steps(mut self, steps: u32) -> Self {
         self.max_steps = Some(steps);
+        self
+    }
+
+    /// Give this agent its own git worktree and branch (0.36.0).
+    ///
+    /// See [`AgentDef::worktree`] for what is created, where, and what happens
+    /// when it cannot be.
+    ///
+    /// ```
+    /// use io_harness::AgentDef;
+    ///
+    /// let d = AgentDef::new("reviewer").with_worktree();
+    /// assert!(d.worktree);
+    /// ```
+    pub fn with_worktree(mut self) -> Self {
+        self.worktree = true;
         self
     }
 

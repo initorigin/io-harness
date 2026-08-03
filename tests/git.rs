@@ -625,3 +625,121 @@ async fn the_same_call_under_a_policy_that_allows_git_actually_runs_it() {
         steps[0].result
     );
 }
+
+// ------------------------------------------------------------------- F2 (0.36.0)
+
+/// The branch `HEAD` is on, by name.
+fn head_branch(dir: &std::path::Path) -> String {
+    String::from_utf8_lossy(&git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+        .trim()
+        .to_string()
+}
+
+/// The commit one ref points at.
+fn rev(dir: &std::path::Path, r: &str) -> String {
+    String::from_utf8_lossy(&git(dir, &["rev-parse", r]).stdout)
+        .trim()
+        .to_string()
+}
+
+/// F2 — a run lands as a branch, and the branch it started on is unmoved.
+///
+/// The last assertion is the discriminating one. A run that never switched
+/// still writes the file, still stages it and still produces a commit, so every
+/// other assertion here passes for the 0.35.0 behaviour this release exists to
+/// change. Only `main` standing still tells the two apart.
+#[tokio::test]
+async fn a_run_lands_its_commit_on_a_branch_it_made_and_leaves_the_one_it_found_alone() {
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    let p = dir.path();
+    assert_eq!(head_branch(p), "main", "the fixture starts on main");
+    let main_before = rev(p, "main");
+
+    run_with(
+        &contract(&dir, 5).with_commit_identity("Agent Smith", "smith@example.invalid"),
+        &Script::new(vec![
+            vec![call("git_branch", json!({ "name": "agent/fix-the-flake" }))],
+            vec![call(
+                "write_file",
+                json!({ "path": "NOTES.md", "content": "written on a branch\n" }),
+            )],
+            vec![call("git_add", json!({ "paths": ["NOTES.md"] }))],
+            vec![call("git_commit", json!({ "message": "add notes" }))],
+        ]),
+        &store(&dir),
+        &Policy::permissive(),
+        &io_harness::approve::ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    // HEAD moved to the branch the run made.
+    assert_eq!(head_branch(p), "agent/fix-the-flake");
+
+    // The branch carries the commit, and the commit carries the change.
+    let log = log(p);
+    assert!(log.contains("add notes"), "{log}");
+    let show =
+        String::from_utf8_lossy(&git(p, &["show", "--name-only", "--format="]).stdout).into_owned();
+    assert!(show.contains("NOTES.md"), "{show}");
+
+    // The existing behaviour survives the branch: the commit is the contract's
+    // identity, not the machine's.
+    let who = String::from_utf8_lossy(&git(p, &["log", "-1", "--format=%an <%ae>"]).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(who, "Agent Smith <smith@example.invalid>");
+
+    // The discriminating assertion.
+    assert_eq!(
+        rev(p, "main"),
+        main_before,
+        "the branch the run found must not have moved"
+    );
+    assert_ne!(rev(p, "agent/fix-the-flake"), main_before);
+}
+
+/// A worktree is a second checkout the agent can reach, created at a path the
+/// policy allowed. The control is the same call at a path the policy denies.
+#[tokio::test]
+async fn an_agent_makes_a_second_working_tree_and_a_denied_path_refuses_it() {
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    let p = dir.path();
+
+    let policy = Policy::permissive().deny_write("private/**");
+    drive(
+        &dir,
+        vec![
+            vec![call(
+                "git_worktree",
+                json!({ "name": "agent/side", "path": ".worktrees/side" }),
+            )],
+            // The control: the identical call under a path the policy denies.
+            vec![call(
+                "git_worktree",
+                json!({ "name": "agent/denied", "path": "private/wt" }),
+            )],
+        ],
+        &policy,
+        &store(&dir),
+    )
+    .await;
+
+    // The allowed one exists, is a real checkout, and is on its own branch.
+    assert!(p.join(".worktrees/side/README.md").is_file());
+    assert_eq!(head_branch(&p.join(".worktrees/side")), "agent/side");
+    // The parent is untouched — still on main, still where it was.
+    assert_eq!(head_branch(p), "main");
+
+    // The denied one was never created and never became a branch.
+    assert!(!p.join("private/wt").exists());
+    let branches = String::from_utf8_lossy(&git(p, &["branch", "--list"]).stdout).into_owned();
+    assert!(branches.contains("agent/side"), "{branches}");
+    assert!(!branches.contains("agent/denied"), "{branches}");
+}

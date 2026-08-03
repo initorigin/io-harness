@@ -63,7 +63,10 @@ use crate::tools::{
 };
 #[cfg(feature = "docx")]
 use crate::tools::{DOCX_READ_TOOL, DOCX_WRITE_TOOL};
-use crate::tools::{GIT_ADD_TOOL, GIT_COMMIT_TOOL, GIT_DIFF_TOOL, GIT_LOG_TOOL, GIT_STATUS_TOOL};
+use crate::tools::{
+    GIT_ADD_TOOL, GIT_BRANCH_TOOL, GIT_COMMIT_TOOL, GIT_DIFF_TOOL, GIT_LOG_TOOL, GIT_STATUS_TOOL,
+    GIT_WORKTREE_TOOL,
+};
 #[cfg(feature = "pdf")]
 use crate::tools::{PDF_FILL_FORM_TOOL, PDF_READ_TOOL, PDF_WATERMARK_TOOL, PDF_WRITE_TOOL};
 #[cfg(feature = "xlsx")]
@@ -512,6 +515,227 @@ pub fn rewind(ws: &Workspace, store: &Store, run_id: i64, path: &str) -> Result<
             }
         }
     }
+}
+
+/// What [`rewind_run`] put back (0.36.0).
+///
+/// Three kinds of effect, kept apart because a caller reporting to a human has to
+/// say which happened: files come back with the four verdicts [`Rewind`] already
+/// distinguishes, memory entries were either restored to an earlier value or
+/// removed because this run created them, and queued children were dropped.
+///
+/// A rewind that restores the files and leaves the memory is the failure this
+/// type exists to make visible — the two effects that outlive a run's files are
+/// exactly the two that change what the *next* run does.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_run, Rewind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(dir.path().join("notes.md"), "the original\n")?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy the notes", &dir.path().display().to_string())?;
+///
+/// // This run wrote nothing, remembered nothing and queued nothing, so there is
+/// // nothing to put back — and, crucially, nothing is touched.
+/// let done = rewind_run(&ws, &store, run)?;
+/// assert!(done.files.is_empty());
+/// assert!(done.memory_restored.is_empty() && done.memory_removed.is_empty());
+/// assert!(done.queue_cleared.is_empty());
+/// assert_eq!(ws.read_file("notes.md")?, "the original\n");
+///
+/// // After a real run, `files` carries one entry per path it wrote, with the
+/// // same verdict `rewind` would have given for that path on its own.
+/// let _: fn(&Rewind) = |_| ();
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rewound {
+    /// Every path the run recorded a restore point for, with what happened to it,
+    /// in the order the run first wrote them.
+    pub files: Vec<(String, Rewind)>,
+    /// Memory keys put back to the value that was there before this run's first
+    /// write to them.
+    pub memory_restored: Vec<String>,
+    /// Memory keys this run created, and which are therefore now gone.
+    pub memory_removed: Vec<String>,
+    /// Children still queued under this run when it was rewound, as
+    /// `(depth, goal)` — the shape [`Store::queued_agents`] returns.
+    pub queue_cleared: Vec<(u32, String)>,
+}
+
+/// Put a whole run back: its files, what it remembered, and what it had queued
+/// (0.36.0).
+///
+/// [`rewind`] answers "undo this edit". This answers "undo this run", which is
+/// not the same question and was not previously answerable: a run that wrote
+/// three files, recorded two decisions in memory and queued four children leaves
+/// three of those five effects in place after an operator has restored every
+/// file — and the two that remain are the ones that change what the next run
+/// does. Memory is read into context, so a wrong fact a rewound run learned
+/// outlives the files it was learned from; a queue backlog is adopted on resume,
+/// so work the operator undid is re-admitted. A partial undo is worse than none,
+/// because it looks complete.
+///
+/// Each file gets the verdict [`rewind`] would have given it alone, for the same
+/// restore point: before the run's *first* write to that path.
+///
+/// **Nothing in the trace is deleted.** The steps, the event stream, the spawn
+/// records and the ledger are untouched, and the rewind is written down as a row
+/// of its own naming what it restored, removed and cleared — readable through
+/// [`Store::rewinds`]. The spend happened; an undo that erased the rows would
+/// make the ledger disagree with the invoice and make "this agent has tried this
+/// three times" unanswerable.
+///
+/// What it does **not** undo, plainly rather than by implication: a commit the
+/// run made is still there (`git reset` is unreachable from this crate by
+/// construction), a push is not recalled, a migration is not reversed, a
+/// provider call is not un-billed, and a worktree is never removed. It is one
+/// run, not a tree — a caller who wants a subtree loops over it.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_run, MemoryKind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let root = dir.path().display().to_string();
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+///
+/// // What an earlier run learned.
+/// let earlier = store.start_run("learn", &root)?;
+/// store.memory_write(&root, "retries", "three", earlier, 1, MemoryKind::Fact)?;
+///
+/// // This run corrects it wrongly, and invents a second note of its own.
+/// let run = store.start_run("get it wrong", &root)?;
+/// store.memory_write(&root, "retries", "nine", run, 1, MemoryKind::Fact)?;
+/// store.memory_write(&root, "flaky", "always", run, 2, MemoryKind::Fact)?;
+///
+/// let done = rewind_run(&ws, &store, run)?;
+///
+/// // Edited, so it comes back. Created, so it goes.
+/// assert_eq!(done.memory_restored, ["retries"]);
+/// assert_eq!(store.memory_get(&root, "retries")?.unwrap().value, "three");
+/// assert_eq!(done.memory_removed, ["flaky"]);
+/// assert!(store.memory_get(&root, "flaky")?.is_none());
+///
+/// // And the undoing is itself in the trace.
+/// assert_eq!(store.rewinds(run)?.len(), 1);
+/// # Ok(())
+/// # }
+/// ```
+pub fn rewind_run(ws: &Workspace, store: &Store, run_id: i64) -> Result<Rewound> {
+    rewind_run_observed(ws, store, run_id, &crate::observe::Ignore)
+}
+
+/// [`rewind_run`], reporting to an [`Observer`](crate::Observer) (0.36.0).
+///
+/// One [`EventKind::Rewound`] once the work is done, carrying the counts from the
+/// value being returned rather than from a second query — a number re-read from
+/// the store would be true whether or not the rewind happened, which is the
+/// defect 0.32.0 paid to learn.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_run_observed, EventKind, Flow, Observer, RunEvent, Store};
+/// use std::sync::Mutex;
+///
+/// #[derive(Default)]
+/// struct Seen(Mutex<Vec<String>>);
+/// impl Observer for Seen {
+///     fn event(&self, e: &RunEvent) -> Flow {
+///         if let EventKind::Rewound { files, memory, queued } = &e.kind {
+///             self.0.lock().unwrap().push(format!("{files}/{memory}/{queued}"));
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy up", &dir.path().display().to_string())?;
+///
+/// let seen = Seen::default();
+/// rewind_run_observed(&ws, &store, run, &seen)?;
+/// assert_eq!(*seen.0.lock().unwrap(), ["0/0/0"], "it happened, and undid nothing");
+/// # Ok(())
+/// # }
+/// ```
+pub fn rewind_run_observed(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    observer: &dyn Observer,
+) -> Result<Rewound> {
+    // Read everything that is about to change BEFORE changing any of it, so the
+    // record names rows that existed rather than rows the code assumed. This is
+    // the same rule 0.32.0 paid for on its backlog event: a number read from the
+    // query that produced it is true whether or not the work happened.
+    let paths = store.snapshot_paths(run_id)?;
+    let notes = store.memory_snapshots(run_id)?;
+    let queue_cleared = store.clear_queue_under(run_id)?;
+
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let verdict = rewind(ws, store, run_id, &path)?;
+        files.push((path, verdict));
+    }
+
+    let mut memory_restored = Vec::new();
+    let mut memory_removed = Vec::new();
+    for note in notes {
+        match note.created {
+            true => {
+                store.memory_delete(&note.workspace, &note.key)?;
+                memory_removed.push(note.key);
+            }
+            false => {
+                store.memory_restore(
+                    &note.workspace,
+                    &note.key,
+                    note.before.as_deref().unwrap_or_default(),
+                    note.kind.as_deref(),
+                )?;
+                memory_restored.push(note.key);
+            }
+        }
+    }
+
+    let done = Rewound {
+        files,
+        memory_restored,
+        memory_removed,
+        queue_cleared,
+    };
+    let names: Vec<String> = done.files.iter().map(|(p, _)| p.clone()).collect();
+    store.record_rewind(
+        run_id,
+        &names,
+        &done.memory_restored,
+        &done.memory_removed,
+        &done.queue_cleared,
+    )?;
+    // Built from the value being returned, never re-queried. The counts and the
+    // `Rewound` a caller receives cannot disagree, because there is only one of
+    // them.
+    observer.event(&RunEvent::at_depth(
+        run_id,
+        0,
+        0,
+        EventKind::Rewound {
+            files: done.files.len() as u32,
+            memory: (done.memory_restored.len() + done.memory_removed.len()) as u32,
+            queued: done.queue_cleared.len() as u32,
+        },
+    ));
+    Ok(done)
 }
 
 /// Run a task contract to a verified result using `provider` and `store`.
@@ -4271,6 +4495,131 @@ struct Tree<'a, P: Provider> {
     web: Option<crate::web::WebAccess>,
 }
 
+/// The directory every per-agent worktree is made under, relative to the tree
+/// root (0.36.0).
+///
+/// One component, never a literal holding a separator, so the path is joined the
+/// way every other path in this crate is and a Windows checkout gets a Windows
+/// path rather than a string that happens to work.
+const WORKTREE_DIR: &str = ".worktrees";
+
+/// How much of `git`'s own output is kept when a worktree cannot be made.
+///
+/// Its own bound rather than the run's per-observation cap, because this text
+/// never becomes a tool result: it reaches the model as the reason one spawn did
+/// not happen, and a page of it would say nothing the first lines do not.
+const WORKTREE_ERR_CAP: usize = 4_000;
+
+/// One agent name as one path component and one branch name.
+///
+/// An allowlist, matching `check_branch_name`'s: a definition's name is the
+/// operator's free text and reaches both a directory and a ref. Truncated
+/// because it is only half of the slug — the run id and step that follow are what
+/// make it unique.
+fn slugify(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed: String = mapped.trim_matches('-').chars().take(40).collect();
+    match trimmed.is_empty() {
+        true => "agent".into(),
+        false => trimmed,
+    }
+}
+
+/// A stable 32-bit digest of one goal, for the worktree slug (0.36.0).
+///
+/// FNV-1a written out rather than `std::hash::DefaultHasher`, which is documented
+/// as unstable across releases: a slug that changed when the crate was rebuilt on
+/// a newer toolchain would send a resumed spawn to a worktree that does not
+/// exist, and surviving a rebuild is the one property this derivation exists for.
+fn goal_digest(goal: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in goal.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// The worktree one agent of one spawn works in, made if it is not there already
+/// (0.36.0).
+///
+/// The path is *derived* from `(agent, parent run, step, goal)` — the same key
+/// `find_spawn` adopts by, plus the agent's name — rather than allocated fresh,
+/// and an existing directory is reused rather than re-created. That is the whole
+/// of the resume story: a parent replaying a spawn after a crash finds the
+/// worktree it made last time, with the files the child had already written still
+/// in it. Creating unconditionally would fail on the branch that already exists,
+/// and deleting first would throw away the work the resume exists to keep.
+///
+/// The goal is in the slug as a digest and it is not decoration: two children of
+/// the *same* definition spawned in the *same* step — which is the ordinary shape
+/// of a fan-out — differ in nothing else, and would otherwise be handed one
+/// worktree between them. That is the collision this field exists to remove,
+/// reappearing one level down.
+///
+/// The path is checked against the parent's policy before `git` is asked,
+/// because the crate is writing somewhere the model did not name and an
+/// unchecked write is a claim this crate does not get to make. A policy denying
+/// `.worktrees/**` turns the feature off loudly rather than quietly.
+async fn worktree_for<P: Provider>(
+    tree: &Tree<'_, P>,
+    parent_policy: &Policy,
+    agent: &str,
+    goal: &str,
+    parent_run_id: i64,
+    step: u32,
+) -> std::result::Result<PathBuf, String> {
+    let slug = format!(
+        "{}-{parent_run_id}-{step}-{:08x}",
+        slugify(agent),
+        goal_digest(goal)
+    );
+    let rel = Path::new(WORKTREE_DIR).join(&slug);
+    let abs = tree.root.join(&rel);
+    if abs.exists() {
+        return Ok(abs);
+    }
+
+    let target = rel.to_string_lossy().into_owned();
+    let verdict = parent_policy.check(Act::Write, &target);
+    if verdict.effect != Effect::Allow {
+        return Err(match verdict.rule {
+            Some(rule) => format!("the policy refuses to write {target} (rule {rule})"),
+            None => format!("the policy refuses to write {target}"),
+        });
+    }
+
+    let cmd = GitCmd::Worktree {
+        name: slug,
+        path: target,
+    };
+    match Git::new(parent_policy, &tree.root, WORKTREE_ERR_CAP)
+        .run(&cmd)
+        .await
+    {
+        Ok(GitOutcome::Ran { code: Some(0), .. }) => Ok(abs),
+        Ok(GitOutcome::Ran { code, stderr, .. }) => Err(format!(
+            "`git worktree add` {} — {}",
+            match code {
+                Some(c) => format!("exited {c}"),
+                None => "was killed by a signal".to_string(),
+            },
+            stderr.trim()
+        )),
+        Ok(GitOutcome::Unavailable { reason }) => Err(reason),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Run a workspace contract as the root of an agent tree under `containment`.
 ///
 /// The root agent runs the workspace loop with one extra tool, [`SPAWN_TOOL`],
@@ -4848,7 +5197,13 @@ fn run_agent<'f, P: Provider>(
         if planning {
             effective = effective.merge(plan_lock());
         }
-        let mut ws = Workspace::with_policy(&tree.root, effective);
+        // 0.36.0 — the contract's own root, which is the tree's for every agent
+        // except one given a worktree by its definition. Reading it from the
+        // contract rather than from the tree is what makes a per-child root a
+        // property of the contract the spawn built, so nothing else in this loop
+        // has to know a worktree exists.
+        let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
+        let mut ws = Workspace::with_policy(agent_root, effective);
         // The tree shares one MCP session, so every agent in it — root or child —
         // is offered the same server tools beside its built-ins. Connecting a
         // session and then not offering its tools would leave the model unable to
@@ -5582,11 +5937,41 @@ async fn spawn_child<P: Provider>(
     }
     let child_policy = parent_policy.contain(&overlay);
 
+    // 0.36.0 — a child of a `worktree = true` definition works in its own
+    // checkout instead of the tree's one working directory.
+    //
+    // Before anything is registered, admitted or written: a worktree that cannot
+    // be made is a spawn that does not happen, and doing it here means the
+    // failure costs no ledger entry, no queue row and no run row. The cost of
+    // that ordering is that a child refused by containment a few lines below may
+    // leave an empty worktree behind — harmless, reused by the next attempt
+    // because the path is derived rather than fresh, and cheaper than leaking a
+    // registered agent that never ran.
+    let child_root = match def.filter(|d| d.worktree) {
+        Some(d) => {
+            match worktree_for(tree, parent_policy, &d.name, goal, parent_run_id, step).await {
+                Ok(root) => Some(root),
+                Err(why) => {
+                    return Ok(SpawnResult::Composed {
+                        decision: "worktree unavailable".into(),
+                        obs: format!(
+                        "\n[spawn error] `{}` needs its own worktree and one could not be made: \
+                         {why}\n",
+                        d.name
+                    ),
+                    });
+                }
+            }
+        }
+        None => None,
+    };
+    let child_root = child_root.unwrap_or_else(|| tree.root.clone());
+
     let verify = Verification::WorkspaceFileContains {
         file: file.into(),
         needle: needle.into(),
     };
-    let mut child_contract = TaskContract::workspace(goal, &tree.root).with_verification(verify);
+    let mut child_contract = TaskContract::workspace(goal, &child_root).with_verification(verify);
     // 0.22.0 — the tree's web declaration, not one the model asked for. A child
     // inherits exactly what the root was given and has no way to widen it: the
     // spawn arguments are never read for this, so "give the sub-agent web access"
@@ -5696,7 +6081,12 @@ async fn spawn_child<P: Provider>(
         None => {
             let child_run = tree.store.start_child_run(
                 goal,
-                &tree.root.display().to_string(),
+                // 0.36.0 — the child's OWN root, which is the tree's unless a
+                // definition gave it a worktree. The run row is what an operator
+                // reads to find where a child's files went, so recording the
+                // parent's root for a child that worked elsewhere would send them
+                // to the wrong directory.
+                &child_root.display().to_string(),
                 parent_run_id,
                 child_depth,
             )?;
@@ -8070,10 +8460,11 @@ async fn dispatch(
         // built-ins, and `Toolbox::validate` has already guaranteed the three
         // sets are disjoint, so the order is documentation rather than a
         // tie-break.
-        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL | GIT_ADD_TOOL | GIT_COMMIT_TOOL => {
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL | GIT_ADD_TOOL | GIT_COMMIT_TOOL
+        | GIT_BRANCH_TOOL | GIT_WORKTREE_TOOL => {
             // Paths the model named, if any. Every one of them is data: `argv`
             // puts them after `--` and refuses a leading `-`.
-            let paths: Vec<String> = a
+            let mut paths: Vec<String> = a
                 .get("paths")
                 .and_then(|v| v.as_array())
                 .map(|v| {
@@ -8083,13 +8474,33 @@ async fn dispatch(
                 })
                 .unwrap_or_default();
 
+            // 0.36.0 — `git_worktree` names one path rather than a list, and it
+            // is the location a directory is created at. Folding it into `paths`
+            // here rather than carrying a second variable is what puts it
+            // through the same gate loop, the same `check_path` and the same
+            // `--` separator as every other model-supplied path in this crate.
+            if name == GIT_WORKTREE_TOOL {
+                paths = s("path")
+                    .filter(|p| !p.trim().is_empty())
+                    .map(|p| vec![p.to_string()])
+                    .unwrap_or_default();
+            }
+
             // What the policy is asked, per tool. Reading history reads `.git`.
             // Staging copies a file's bytes into the object store, so it needs
             // `Act::Read` on that file — which is what stops a path the policy
             // denies from reaching a commit. Committing writes `.git`.
+            //
+            // 0.36.0: creating a branch writes a ref, so it writes `.git` and
+            // names no path. A worktree writes `.git` *and* creates a directory
+            // at the path the model chose, so that path is an `Act::Write` — the
+            // only git built-in whose path is checked for writing rather than
+            // reading, because it is the only one that makes a file the model
+            // named rather than reading one.
             let (repo_act, path_act) = match name {
                 GIT_ADD_TOOL => (Act::Write, Some(Act::Read)),
-                GIT_COMMIT_TOOL => (Act::Write, None),
+                GIT_COMMIT_TOOL | GIT_BRANCH_TOOL => (Act::Write, None),
+                GIT_WORKTREE_TOOL => (Act::Write, Some(Act::Write)),
                 _ => (Act::Read, Some(Act::Read)),
             };
 
@@ -8145,6 +8556,36 @@ async fn dispatch(
                         ));
                     }
                     GitCmd::Add { paths }
+                }
+                GIT_BRANCH_TOOL => {
+                    let Some(branch) = s("name").filter(|n| !n.trim().is_empty()) else {
+                        return Ok(Dispatched::go(
+                            "git_branch missing name",
+                            "\n[git error] git_branch needs a non-empty \"name\"\n".to_string(),
+                        ));
+                    };
+                    GitCmd::Branch {
+                        name: branch.to_string(),
+                    }
+                }
+                GIT_WORKTREE_TOOL => {
+                    let Some(branch) = s("name").filter(|n| !n.trim().is_empty()) else {
+                        return Ok(Dispatched::go(
+                            "git_worktree missing name",
+                            "\n[git error] git_worktree needs a non-empty \"name\"\n".to_string(),
+                        ));
+                    };
+                    // `paths` holds exactly the `path` argument, or nothing.
+                    let Some(path) = paths.into_iter().next() else {
+                        return Ok(Dispatched::go(
+                            "git_worktree missing path",
+                            "\n[git error] git_worktree needs a non-empty \"path\"\n".to_string(),
+                        ));
+                    };
+                    GitCmd::Worktree {
+                        name: branch.to_string(),
+                        path,
+                    }
                 }
                 _ => {
                     let Some(message) = s("message").filter(|m| !m.trim().is_empty()) else {
@@ -9678,8 +10119,9 @@ fn workspace_tools() -> Vec<ToolSpec> {
         ToolSpec {
             name: GIT_COMMIT_TOOL.to_string(),
             description: "Commit what you have staged, on the branch that is checked out. There \
-                          is no push, no branch switching and no history rewriting: your work \
-                          stays local for a human to review."
+                          is no push and no history rewriting: your work stays local for a human \
+                          to review. Use git_branch first if it should land somewhere other than \
+                          the branch you found."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -9687,6 +10129,39 @@ fn workspace_tools() -> Vec<ToolSpec> {
                     "message": { "type": "string", "description": "The commit message." }
                 },
                 "required": ["message"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_BRANCH_TOOL.to_string(),
+            description: "Create a branch at the current commit and move onto it, so your work \
+                          lands somewhere a human can review or delete on its own rather than on \
+                          whatever branch you happened to find. It never discards anything: your \
+                          uncommitted changes come with you, and a name that already exists is \
+                          refused. There is no way back to another branch and no way to delete \
+                          one."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Branch to create, e.g. agent/fix-the-flake. Letters, digits, dot, underscore, slash and dash only; at most 100 characters." }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolSpec {
+            name: GIT_WORKTREE_TOOL.to_string(),
+            description: "Make a second working tree of this repository at a path you name, on a \
+                          new branch, so work that would collide with another agent's files gets \
+                          its own checkout. The path is created for you and is yours to work in; \
+                          nothing here removes a worktree afterwards."
+                .to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Branch to create for the new working tree. Same naming rules as git_branch." },
+                    "path": { "type": "string", "description": "Where to put it, relative to the workspace root, e.g. .worktrees/reviewer." }
+                },
+                "required": ["name", "path"]
             }),
         },
         #[cfg(feature = "media")]

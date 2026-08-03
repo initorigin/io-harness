@@ -22,8 +22,8 @@ use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usag
 use io_harness::tools::workspace::Wrote;
 use io_harness::tools::Workspace;
 use io_harness::{
-    resume_with, rewind, run_with, ApproveAll, Policy, Provider, Rewind, Store, TaskContract,
-    Verification,
+    resume_with, rewind, rewind_run, rewind_run_observed, run_with, ApproveAll, EventKind, Flow,
+    MemoryKind, Observer, Policy, Provider, Rewind, RunEvent, Store, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -431,4 +431,404 @@ async fn another_runs_restore_point_is_not_reachable_from_this_run() {
     // Nothing moved, and in particular the first run's restore point was not
     // applied on the second run's behalf.
     assert_eq!(bytes(dir.path(), "notes.md"), b"what the first run wrote\n");
+}
+
+// ============================================================= 0.36.0: the run
+
+/// Everything a run touched, read straight out of the store, so a "the trace was
+/// not disturbed" claim is made against rows rather than against a summary.
+fn trace_shape(store: &Store, run_id: i64) -> (usize, usize, usize, u64) {
+    (
+        store.steps(run_id).unwrap().len(),
+        store.events_since(run_id, 0, 10_000).unwrap().len(),
+        store.agent_events(run_id).unwrap().len(),
+        store
+            .provider_calls(run_id)
+            .unwrap()
+            .iter()
+            .map(|c| c.usage.as_ref().map_or(0, |u| u.total_tokens))
+            .sum::<u64>(),
+    )
+}
+
+/// F5 — one call puts back the files, the memory and the queued backlog.
+///
+/// The discriminating assertion is the *value* of the key this run overwrote.
+/// Deleting the key, or leaving the run's own value in place, both satisfy "the
+/// entry changed"; only the earlier value satisfies "put back".
+#[tokio::test]
+async fn one_call_puts_back_the_files_the_memory_and_the_queue() {
+    let dir = tempfile::tempdir().unwrap();
+    // The run keys memory by the CANONICALISED root — on macOS a tempdir's
+    // `/var/...` is a symlink to `/private/var/...` — so a test that used the
+    // path it was handed would be reading a different workspace's notes.
+    let root = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .display()
+        .to_string();
+    const ORIGINAL: &[u8] = b"the original notes\n";
+    write(dir.path(), "notes.md", ORIGINAL);
+
+    let store = Store::memory().unwrap();
+
+    // What an earlier run left behind: one memory entry this run will overwrite.
+    let earlier = store.start_run("learn something", &root).unwrap();
+    store
+        .memory_write(&root, "retries", "three", earlier, 1, MemoryKind::Fact)
+        .unwrap();
+
+    // The run: rewrites one file, creates another, corrects one note and invents
+    // one of its own.
+    let (ws, run_id) = drive(
+        dir.path(),
+        &store,
+        vec![
+            vec![call(
+                "write_file",
+                json!({ "path": "notes.md", "content": "rewritten by the run\n" }),
+            )],
+            vec![call(
+                "write_file",
+                json!({ "path": "new.md", "content": "invented by the run\n" }),
+            )],
+            vec![call(
+                "remember",
+                json!({ "key": "retries", "value": "nine" }),
+            )],
+            vec![call(
+                "remember",
+                json!({ "key": "flaky", "value": "always" }),
+            )],
+        ],
+    )
+    .await;
+
+    // And a backlog it never got to: two children still queued under it.
+    store
+        .enqueue_agent(run_id, 5, "summarise chapter 7", 1)
+        .unwrap();
+    store
+        .enqueue_agent(run_id, 5, "summarise chapter 8", 1)
+        .unwrap();
+
+    // Everything is in place before the rewind — the control for all six effects.
+    assert_eq!(bytes(dir.path(), "notes.md"), b"rewritten by the run\n");
+    assert!(dir.path().join("new.md").exists());
+    assert_eq!(
+        store.memory_get(&root, "retries").unwrap().unwrap().value,
+        "nine"
+    );
+    assert!(store.memory_get(&root, "flaky").unwrap().is_some());
+    assert_eq!(store.queued_agents(run_id).unwrap().len(), 2);
+
+    let done = rewind_run(&ws, &store, run_id).unwrap();
+
+    // Files: one restored to its original bytes, one removed because the run
+    // created it.
+    let verdicts: std::collections::HashMap<&str, &Rewind> =
+        done.files.iter().map(|(p, v)| (p.as_str(), v)).collect();
+    assert!(
+        matches!(verdicts["notes.md"], Rewind::Restored(_)),
+        "{:?}",
+        done.files
+    );
+    assert_eq!(verdicts["new.md"], &Rewind::Removed);
+    assert_eq!(bytes(dir.path(), "notes.md"), ORIGINAL);
+    assert!(!dir.path().join("new.md").exists());
+
+    // Memory: the discriminating half.
+    assert_eq!(done.memory_restored, ["retries"]);
+    assert_eq!(
+        store.memory_get(&root, "retries").unwrap().unwrap().value,
+        "three",
+        "the value that was there before this run's first write, not a deletion \
+         and not the run's own"
+    );
+    assert_eq!(done.memory_removed, ["flaky"]);
+    assert!(store.memory_get(&root, "flaky").unwrap().is_none());
+
+    // The queue: gone, and named.
+    let goals: Vec<&str> = done.queue_cleared.iter().map(|(_, g)| g.as_str()).collect();
+    assert_eq!(goals, ["summarise chapter 7", "summarise chapter 8"]);
+    assert!(store.queued_agents(run_id).unwrap().is_empty());
+}
+
+/// F7 — the trace keeps both branches: nothing about the run itself moves, and
+/// what the rewind took is written down.
+///
+/// A rewind implemented by deleting the run's rows passes the whole of the test
+/// above and fails this one.
+#[tokio::test]
+async fn a_rewind_writes_down_what_it_took_and_disturbs_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    // The run keys memory by the CANONICALISED root — on macOS a tempdir's
+    // `/var/...` is a symlink to `/private/var/...` — so a test that used the
+    // path it was handed would be reading a different workspace's notes.
+    let root = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .display()
+        .to_string();
+    write(dir.path(), "notes.md", b"original\n");
+
+    let store = Store::memory().unwrap();
+    let earlier = store.start_run("learn", &root).unwrap();
+    store
+        .memory_write(&root, "retries", "three", earlier, 1, MemoryKind::Fact)
+        .unwrap();
+
+    let (ws, run_id) = drive(
+        dir.path(),
+        &store,
+        vec![
+            vec![call(
+                "write_file",
+                json!({ "path": "notes.md", "content": "rewritten\n" }),
+            )],
+            vec![call(
+                "remember",
+                json!({ "key": "retries", "value": "nine" }),
+            )],
+        ],
+    )
+    .await;
+    store
+        .enqueue_agent(run_id, 3, "a child that never ran", 1)
+        .unwrap();
+
+    let before = trace_shape(&store, run_id);
+    assert!(before.0 > 0, "the run left steps behind: {before:?}");
+
+    let seen = std::sync::Mutex::new(Vec::new());
+    struct Seen<'a>(&'a std::sync::Mutex<Vec<(u32, u32, u32)>>);
+    impl Observer for Seen<'_> {
+        fn event(&self, e: &RunEvent) -> Flow {
+            if let EventKind::Rewound {
+                files,
+                memory,
+                queued,
+            } = &e.kind
+            {
+                self.0.lock().unwrap().push((*files, *memory, *queued));
+            }
+            Flow::Continue
+        }
+    }
+    let done = rewind_run_observed(&ws, &store, run_id, &Seen(&seen)).unwrap();
+
+    // Nothing about the run moved. Not the steps, not the event stream, not the
+    // spawn records, not the ledger.
+    assert_eq!(
+        trace_shape(&store, run_id),
+        before,
+        "a rewind must not rewrite the history of what happened"
+    );
+
+    // And what it took is written down, exactly once.
+    let records = store.rewinds(run_id).unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].files, ["notes.md"]);
+    assert_eq!(records[0].memory_restored, ["retries"]);
+    assert!(records[0].memory_removed.is_empty());
+    assert_eq!(records[0].queue_cleared, ["a child that never ran"]);
+
+    // The event carries the returned value's own numbers, not a second query's.
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(
+            done.files.len() as u32,
+            (done.memory_restored.len() + done.memory_removed.len()) as u32,
+            done.queue_cleared.len() as u32
+        )]
+    );
+    assert_eq!(*seen.lock().unwrap(), [(1, 1, 1)]);
+}
+
+/// F6 — the restore point is the run's FIRST write to a key, not its last.
+#[tokio::test]
+async fn five_writes_to_one_key_rewind_to_the_value_before_the_first() {
+    let dir = tempfile::tempdir().unwrap();
+    // The run keys memory by the CANONICALISED root — on macOS a tempdir's
+    // `/var/...` is a symlink to `/private/var/...` — so a test that used the
+    // path it was handed would be reading a different workspace's notes.
+    let root = std::fs::canonicalize(dir.path())
+        .unwrap()
+        .display()
+        .to_string();
+    let store = Store::memory().unwrap();
+
+    let earlier = store.start_run("learn", &root).unwrap();
+    store
+        .memory_write(
+            &root,
+            "retries",
+            "the original",
+            earlier,
+            1,
+            MemoryKind::Fact,
+        )
+        .unwrap();
+
+    let (ws, run_id) = drive(
+        dir.path(),
+        &store,
+        (1..=5)
+            .map(|n| {
+                vec![call(
+                    "remember",
+                    json!({ "key": "retries", "value": format!("guess {n}") }),
+                )]
+            })
+            .collect(),
+    )
+    .await;
+    assert_eq!(
+        store.memory_get(&root, "retries").unwrap().unwrap().value,
+        "guess 5",
+        "the run really did write it five times"
+    );
+
+    rewind_run(&ws, &store, run_id).unwrap();
+    assert_eq!(
+        store.memory_get(&root, "retries").unwrap().unwrap().value,
+        "the original",
+        "before write one, not before write five"
+    );
+}
+
+/// F8 — what a rewind does not undo, executed rather than implied.
+///
+/// The `NotKept` half is the one way this could destroy work: "returned NotKept"
+/// and "left the file exactly as the run left it" are different claims, so the
+/// bytes are asserted.
+#[tokio::test]
+async fn a_rewind_leaves_a_commit_alone_and_does_not_touch_what_it_did_not_keep() {
+    let dir = tempfile::tempdir().unwrap();
+    // Over the 1 MiB restore-point cap, so the run's rewrite is not kept.
+    let huge = "x".repeat(1_100_000);
+    write(dir.path(), "big.txt", huge.as_bytes());
+    write(dir.path(), "notes.md", b"original\n");
+
+    let store = Store::memory().unwrap();
+    let (ws, run_id) = drive(
+        dir.path(),
+        &store,
+        vec![
+            vec![call(
+                "write_file",
+                json!({ "path": "big.txt", "content": "replaced\n" }),
+            )],
+            vec![call(
+                "write_file",
+                json!({ "path": "notes.md", "content": "rewritten\n" }),
+            )],
+        ],
+    )
+    .await;
+
+    let done = rewind_run(&ws, &store, run_id).unwrap();
+    let verdicts: std::collections::HashMap<&str, &Rewind> =
+        done.files.iter().map(|(p, v)| (p.as_str(), v)).collect();
+
+    // Not kept, and therefore not touched: the file is byte-identical to what the
+    // run left, neither restored nor truncated.
+    assert!(
+        matches!(verdicts["big.txt"], Rewind::NotKept(_)),
+        "{:?}",
+        done.files
+    );
+    assert_eq!(bytes(dir.path(), "big.txt"), b"replaced\n");
+
+    // The one it could put back, it did.
+    assert_eq!(bytes(dir.path(), "notes.md"), b"original\n");
+
+    // Nothing in `Rewound` claims anything about a commit, a push or a call: the
+    // three lists are the whole of what a rewind touches.
+    assert!(done.queue_cleared.is_empty());
+    assert!(done.memory_restored.is_empty() && done.memory_removed.is_empty());
+}
+
+/// N3 — a rewind is the caller's call. It is never a tool, never a step, and
+/// nothing in the run loop reaches it.
+///
+/// `rewind_run` lives in `src/run.rs` beside the loop, so the 0.33.0/0.35.0
+/// module-path grep cannot be used here — there is no module boundary to grep
+/// for. The claim this makes instead is the one that is actually load-bearing:
+/// no tool the model can call dispatches to it, and no line of `src/run.rs`
+/// outside its own two definitions calls it. Trap 70's rule applies — this is
+/// stated as what it proves, not as "the loop does no rewind work".
+#[test]
+fn no_tool_dispatches_to_a_rewind_and_the_loop_never_calls_one() {
+    let source = std::fs::read_to_string("src/run.rs")
+        .unwrap()
+        .replace("\r\n", "\n");
+
+    // Nothing the model can call is a rewind: the tool-name constants are the
+    // whole surface a `ToolSpec` is built from.
+    let tools = std::fs::read_to_string("src/tools/mod.rs")
+        .unwrap()
+        .replace("\r\n", "\n");
+    let named: Vec<&str> = tools
+        .lines()
+        .filter(|l| l.trim_start().starts_with("pub const") && l.contains("_TOOL"))
+        .filter(|l| l.contains("rewind"))
+        .collect();
+    assert!(named.is_empty(), "a rewind must not be a tool: {named:?}");
+
+    // And no code in the run module calls one. Its own definition line, and the
+    // one call `rewind_run` makes to the observed form, are the only two.
+    let calls: Vec<&str> = source
+        .lines()
+        .filter(|l| !l.contains("///") && !l.contains("//!"))
+        .filter(|l| l.contains("rewind_run(") || l.contains("rewind_run_observed("))
+        .collect();
+    assert_eq!(
+        calls.len(),
+        3,
+        "expected only the two definitions and the delegation: {calls:?}"
+    );
+    assert!(
+        calls.iter().filter(|l| l.contains("pub fn")).count() == 2,
+        "two of the three are the definitions themselves: {calls:?}"
+    );
+
+    // The control: the same check over a source that does call one from the loop.
+    let spliced = source.replace(
+        "async fn dispatch(",
+        "fn spliced(ws: &Workspace, store: &Store) { let _ = rewind_run(ws, store, 1); }\nasync fn dispatch(",
+    );
+    let control: Vec<&str> = spliced
+        .lines()
+        .filter(|l| !l.contains("///") && !l.contains("//!"))
+        .filter(|l| l.contains("rewind_run(") || l.contains("rewind_run_observed("))
+        .collect();
+    assert_eq!(
+        control.len(),
+        4,
+        "the control finds the call this test exists to catch: {control:?}"
+    );
+}
+
+/// N3's other half, asserted by behaviour rather than by reading source: a run
+/// that uses neither half of this release pays for neither.
+#[tokio::test]
+async fn a_run_that_rewinds_nothing_writes_no_rewind_rows_and_makes_no_worktree() {
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), "notes.md", b"original\n");
+    let store = Store::memory().unwrap();
+
+    let (_ws, run_id) = drive(
+        dir.path(),
+        &store,
+        vec![vec![call(
+            "write_file",
+            json!({ "path": "notes.md", "content": "rewritten\n" }),
+        )]],
+    )
+    .await;
+
+    assert!(store.rewinds(run_id).unwrap().is_empty());
+    assert!(
+        !dir.path().join(".worktrees").exists(),
+        "nothing asked for a worktree, so none was made"
+    );
 }

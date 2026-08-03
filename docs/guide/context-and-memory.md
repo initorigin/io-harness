@@ -165,6 +165,15 @@ pinned entry like any other, because an operator who cannot clear their own stor
 has been locked out by their own correction. Neither is a boundary against
 anything but the agent's own `remember`.
 
+**A rewind ignores the pin, and that is deliberate (0.36.0).** `rewind_run` puts
+every entry a run wrote back to the value that was there before its **first**
+write to that key — the same restore-point rule files have had since 0.28.0 — and
+removes an entry the run created. It bypasses `memory_write`, so an entry pinned
+*after* the run wrote it is still put back; the alternative is telling a caller a
+rewind happened when it had not. The cost is one restore-point row the first time
+a run writes a given key, bounded by keys touched per run rather than by writes
+made. See [Durable runs](durable-runs.md#putting-a-whole-run-back-0360).
+
 ## See also
 
 - [Tools and skills](tools-and-skills.md) — the per-result cap this budget derives

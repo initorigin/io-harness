@@ -227,10 +227,14 @@ case so it runs identically twice.
 text, PDF, and barcode decoding, each gated on the real path the model named; and
 image passthrough to any provider whose model accepts one.
 
-**Git**, as fixed-argv built-ins: status, diff, log, add, and commit, so a run
-ends as a reviewable commit rather than a working tree someone has to
-reconstruct. The model supplies paths and a message, never a subcommand or a
-flag, so push, fetch, reset and rebase are unreachable by construction.
+**Git**, as fixed-argv built-ins: status, diff, log, add, commit, branch and
+worktree, so a run ends as a reviewable commit on a branch of its own rather
+than a working tree someone has to reconstruct. The model supplies paths, a
+message and a branch name, never a subcommand or a flag, so push, fetch, reset
+and rebase are unreachable by construction — and `git switch --create`, the one
+checkout that cannot discard a change, is the only one of them that is
+reachable. An agent definition can ask for its own worktree, so concurrent
+children stop overwriting each other's files.
 
 **Durable conversations.** `Session::open(store, root)` holds a conversation
 instead of firing one task: turns that read the turns before them, text streamed
@@ -276,7 +280,10 @@ than taking the run with it. See the [bundles guide](docs/guide/plugins.md).
 file, in the store rather than in memory, so `rewind(&workspace, &store, run_id,
 path)` puts a file back — including deleting one the run created — after a crash
 and a resume. One restore point per file per run, and it says plainly when it has
-none rather than guessing.
+none rather than guessing. `rewind_run` widens that to the whole run: the files,
+the memory entries it wrote, and the spawn backlog it left queued, in one call —
+while the steps, the events and the ledger stay exactly as they were, because the
+spend happened and an undo that erased them would make the trace lie.
 
 ## Guides
 

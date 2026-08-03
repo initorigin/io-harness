@@ -92,6 +92,8 @@ enum TodoState src/state.rs
 enum Verification src/verify.rs
 enum Waiting src/attach.rs
 fn rewind src/run.rs
+fn rewind_run src/run.rs
+fn rewind_run_observed src/run.rs
 fn select src/sandbox.rs
 struct AcceptPlan src/approve.rs
 struct AgentDef src/agent.rs
@@ -154,6 +156,8 @@ struct Request src/approve.rs
 struct ResponderNone src/approve.rs
 struct RetryPolicy src/resilience.rs
 struct Review src/verify.rs
+struct RewindRecord src/state.rs
+struct Rewound src/run.rs
 struct ReviewRequest src/verify.rs
 struct Routing src/contract.rs
 struct Rule src/policy.rs

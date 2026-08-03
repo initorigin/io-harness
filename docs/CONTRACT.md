@@ -1092,8 +1092,67 @@ to the state it was in before *this run* first wrote it.
   `Workspace::write_file`; removing checks `Act::Write` itself and refuses anything
   that is not an outright allow, because a write is inspectable afterwards and a
   delete is not.
-- **One path per call.** Undoing a whole run is a loop the caller writes, and it is
-  not transactional.
+- **One path per call.** `rewind_run` (0.36.0) is the whole-run form; neither is
+  transactional.
+
+**What `rewind_run` puts back, and what it cannot (0.36.0).** `rewind_run` widens
+the above from a path to a run: every file it wrote, every memory entry it wrote,
+and the spawn backlog it left queued, in one call.
+
+- **Memory goes back to the value before this run's FIRST write to that key**, on
+  the same one-restore-point-per-run rule and the same guard files have. An entry
+  the run created is removed, because "the way it was" for an entry that did not
+  exist is not existing.
+- **The pin does not apply to an undo.** Restoring bypasses `memory_write`, so an
+  entry pinned *after* the run wrote it is still put back. The alternative is
+  telling a caller a rewind happened when it had not.
+- **Nothing in the trace is deleted.** Steps, the durable event stream, the spawn
+  records and the ledger are untouched. The spend happened, and an undo that
+  erased the rows would make the ledger disagree with the invoice. What the rewind
+  took is recorded before it goes and is read back through `Store::rewinds`.
+- **A commit is not un-committed.** `git reset` is unreachable from this crate by
+  construction and stays so. A push is not recalled, a migration is not reversed,
+  a provider call is not un-billed. A rewind restores a working tree, memory and a
+  queue — nothing outside them.
+- **One run, not a tree.** A caller wanting a subtree loops over it. Choosing an
+  ordering over children whose written paths may overlap is a decision this crate
+  does not make for you.
+- **Two additive tables**, `memory_snapshots` and `rewinds`. `CHECKPOINT_FORMAT`
+  stays 7, no existing table is altered, and a run from before this release has no
+  restore points to find. The unconditional cost is one restore-point row the
+  first time a run writes a given memory key — bounded by keys touched per run,
+  exactly as file snapshots are bounded by paths written.
+
+**What a branch and a worktree do and do not promise (0.36.0).** `git_branch`
+renders `git switch --create=<name>` and `git_worktree` renders
+`git worktree add -b <name> -- <path>`.
+
+- **`switch --create` cannot discard a working-tree change.** The ref starts at
+  `HEAD`, git refuses a name that already exists, and the tree is carried across
+  rather than replaced. That is the whole reason it is reachable while `checkout`,
+  `reset`, `rebase`, `stash`, `push`, `fetch`, `clone`, `remote` and
+  `filter-branch` remain unreachable by construction.
+- **Branch names are validated in this crate, more narrowly than git validates
+  them.** Letters, digits, `.`, `_`, `/` and `-`; at most 100 characters; no
+  leading `-`, no `..`, no empty or `.lock` path component. A name git would
+  accept and this refuses costs an observation; a name git would read as an option
+  costs the property the whole module exists for.
+- **Nothing removes a worktree or deletes a branch.** Removing a worktree deletes
+  the work a child was spawned to produce, so it stays the operator's call.
+  Worktrees a run created accumulate until someone removes them.
+- **A worktree is visible to the parent's own `git_status`**, as one untracked
+  entry — `?? .worktrees/` — because git summarises an untracked directory rather
+  than descending into it. A `git_add` naming `.` in the parent therefore stages
+  the children's trees. This crate does not write to `.git/info/exclude`,
+  `.gitignore` or any other repository metadata on your behalf; the operator adds
+  `/.worktrees/` to `.git/info/exclude` if they want it hidden.
+- **`AgentDef::worktree` fails the spawn when a worktree cannot be made** — no
+  `git`, not a repository, or the policy refusing that path. It does not fall back
+  to the parent's tree, because that fallback is the collision the field exists to
+  remove.
+- **Version floors this crate does not probe for:** `git switch` needs git 2.23,
+  `git worktree` needs git 2.5. An older git surfaces as the message git itself
+  prints, as an observation rather than a crate error.
 
 **Lines added and removed are not a minimal diff.** `Edit::measure` compares the
 file's lines before and after and trims the common head and tail. A one-line
