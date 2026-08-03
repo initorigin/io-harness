@@ -410,8 +410,9 @@ pub use run::{
     resume_tree_with_plan_decision_observed, resume_with, resume_with_answer,
     resume_with_answer_observed, resume_with_decision, resume_with_decision_observed,
     resume_with_observed, resume_with_plan_decision, resume_with_plan_decision_observed,
-    retry_gate, retry_gate_observed, rewind, run, run_observed, run_tree, run_tree_observed,
-    run_with, run_with_observed, Rewind, RunOutcome, RunResult, SPAWN_TOOL,
+    retry_gate, retry_gate_observed, rewind, rewind_run, rewind_run_observed, run, run_observed,
+    run_tree, run_tree_observed, run_with, run_with_observed, Rewind, RunOutcome, RunResult,
+    Rewound, SPAWN_TOOL,
 };
 pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
@@ -429,7 +430,8 @@ pub use agent::{AgentDef, Agents};
 pub use state::{
     AgentEvent, CheckpointEvent, ContextEvent, Edit, FirstTry, GateAttempt, GateOutcome, McpEvent,
     MemoryEntry, MemoryKind, MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion,
-    PolicyEvent, ProcessHandle, ProviderCall, Recovery, RunStatus, RunSummary, SandboxEvent,
+    PolicyEvent, ProcessHandle, ProviderCall, Recovery, RewindRecord, RunStatus, RunSummary,
+    SandboxEvent,
     SpawnRow, StepRecord, Store, Tally, TodoItem, TodoState, Turn, BUSY_TIMEOUT, CHECKPOINT_FORMAT,
     MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS, SUCCESS_OUTCOME, TODO_MAX_ITEMS,
     TODO_TEXT_CAP, UNKNOWN_MODEL,

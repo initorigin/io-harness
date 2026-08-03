@@ -517,6 +517,227 @@ pub fn rewind(ws: &Workspace, store: &Store, run_id: i64, path: &str) -> Result<
     }
 }
 
+/// What [`rewind_run`] put back (0.36.0).
+///
+/// Three kinds of effect, kept apart because a caller reporting to a human has to
+/// say which happened: files come back with the four verdicts [`Rewind`] already
+/// distinguishes, memory entries were either restored to an earlier value or
+/// removed because this run created them, and queued children were dropped.
+///
+/// A rewind that restores the files and leaves the memory is the failure this
+/// type exists to make visible — the two effects that outlive a run's files are
+/// exactly the two that change what the *next* run does.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_run, Rewind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// std::fs::write(dir.path().join("notes.md"), "the original\n")?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy the notes", &dir.path().display().to_string())?;
+///
+/// // This run wrote nothing, remembered nothing and queued nothing, so there is
+/// // nothing to put back — and, crucially, nothing is touched.
+/// let done = rewind_run(&ws, &store, run)?;
+/// assert!(done.files.is_empty());
+/// assert!(done.memory_restored.is_empty() && done.memory_removed.is_empty());
+/// assert!(done.queue_cleared.is_empty());
+/// assert_eq!(ws.read_file("notes.md")?, "the original\n");
+///
+/// // After a real run, `files` carries one entry per path it wrote, with the
+/// // same verdict `rewind` would have given for that path on its own.
+/// let _: fn(&Rewind) = |_| ();
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Rewound {
+    /// Every path the run recorded a restore point for, with what happened to it,
+    /// in the order the run first wrote them.
+    pub files: Vec<(String, Rewind)>,
+    /// Memory keys put back to the value that was there before this run's first
+    /// write to them.
+    pub memory_restored: Vec<String>,
+    /// Memory keys this run created, and which are therefore now gone.
+    pub memory_removed: Vec<String>,
+    /// Children still queued under this run when it was rewound, as
+    /// `(depth, goal)` — the shape [`Store::queued_agents`] returns.
+    pub queue_cleared: Vec<(u32, String)>,
+}
+
+/// Put a whole run back: its files, what it remembered, and what it had queued
+/// (0.36.0).
+///
+/// [`rewind`] answers "undo this edit". This answers "undo this run", which is
+/// not the same question and was not previously answerable: a run that wrote
+/// three files, recorded two decisions in memory and queued four children leaves
+/// three of those five effects in place after an operator has restored every
+/// file — and the two that remain are the ones that change what the next run
+/// does. Memory is read into context, so a wrong fact a rewound run learned
+/// outlives the files it was learned from; a queue backlog is adopted on resume,
+/// so work the operator undid is re-admitted. A partial undo is worse than none,
+/// because it looks complete.
+///
+/// Each file gets the verdict [`rewind`] would have given it alone, for the same
+/// restore point: before the run's *first* write to that path.
+///
+/// **Nothing in the trace is deleted.** The steps, the event stream, the spawn
+/// records and the ledger are untouched, and the rewind is written down as a row
+/// of its own naming what it restored, removed and cleared — readable through
+/// [`Store::rewinds`]. The spend happened; an undo that erased the rows would
+/// make the ledger disagree with the invoice and make "this agent has tried this
+/// three times" unanswerable.
+///
+/// What it does **not** undo, plainly rather than by implication: a commit the
+/// run made is still there (`git reset` is unreachable from this crate by
+/// construction), a push is not recalled, a migration is not reversed, a
+/// provider call is not un-billed, and a worktree is never removed. It is one
+/// run, not a tree — a caller who wants a subtree loops over it.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_run, MemoryKind, Store};
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let root = dir.path().display().to_string();
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+///
+/// // What an earlier run learned.
+/// let earlier = store.start_run("learn", &root)?;
+/// store.memory_write(&root, "retries", "three", earlier, 1, MemoryKind::Fact)?;
+///
+/// // This run corrects it wrongly, and invents a second note of its own.
+/// let run = store.start_run("get it wrong", &root)?;
+/// store.memory_write(&root, "retries", "nine", run, 1, MemoryKind::Fact)?;
+/// store.memory_write(&root, "flaky", "always", run, 2, MemoryKind::Fact)?;
+///
+/// let done = rewind_run(&ws, &store, run)?;
+///
+/// // Edited, so it comes back. Created, so it goes.
+/// assert_eq!(done.memory_restored, ["retries"]);
+/// assert_eq!(store.memory_get(&root, "retries")?.unwrap().value, "three");
+/// assert_eq!(done.memory_removed, ["flaky"]);
+/// assert!(store.memory_get(&root, "flaky")?.is_none());
+///
+/// // And the undoing is itself in the trace.
+/// assert_eq!(store.rewinds(run)?.len(), 1);
+/// # Ok(())
+/// # }
+/// ```
+pub fn rewind_run(ws: &Workspace, store: &Store, run_id: i64) -> Result<Rewound> {
+    rewind_run_observed(ws, store, run_id, &crate::observe::Ignore)
+}
+
+/// [`rewind_run`], reporting to an [`Observer`](crate::Observer) (0.36.0).
+///
+/// One [`EventKind::Rewound`] once the work is done, carrying the counts from the
+/// value being returned rather than from a second query — a number re-read from
+/// the store would be true whether or not the rewind happened, which is the
+/// defect 0.32.0 paid to learn.
+///
+/// ```
+/// use io_harness::tools::Workspace;
+/// use io_harness::{rewind_run_observed, EventKind, Flow, Observer, RunEvent, Store};
+/// use std::sync::Mutex;
+///
+/// #[derive(Default)]
+/// struct Seen(Mutex<Vec<String>>);
+/// impl Observer for Seen {
+///     fn event(&self, e: &RunEvent) -> Flow {
+///         if let EventKind::Rewound { files, memory, queued } = &e.kind {
+///             self.0.lock().unwrap().push(format!("{files}/{memory}/{queued}"));
+///         }
+///         Flow::Continue
+///     }
+/// }
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let dir = tempfile::tempdir()?;
+/// let ws = Workspace::new(dir.path());
+/// let store = Store::memory()?;
+/// let run = store.start_run("tidy up", &dir.path().display().to_string())?;
+///
+/// let seen = Seen::default();
+/// rewind_run_observed(&ws, &store, run, &seen)?;
+/// assert_eq!(*seen.0.lock().unwrap(), ["0/0/0"], "it happened, and undid nothing");
+/// # Ok(())
+/// # }
+/// ```
+pub fn rewind_run_observed(
+    ws: &Workspace,
+    store: &Store,
+    run_id: i64,
+    observer: &dyn Observer,
+) -> Result<Rewound> {
+    // Read everything that is about to change BEFORE changing any of it, so the
+    // record names rows that existed rather than rows the code assumed. This is
+    // the same rule 0.32.0 paid for on its backlog event: a number read from the
+    // query that produced it is true whether or not the work happened.
+    let paths = store.snapshot_paths(run_id)?;
+    let notes = store.memory_snapshots(run_id)?;
+    let queue_cleared = store.clear_queue_under(run_id)?;
+
+    let mut files = Vec::with_capacity(paths.len());
+    for path in paths {
+        let verdict = rewind(ws, store, run_id, &path)?;
+        files.push((path, verdict));
+    }
+
+    let mut memory_restored = Vec::new();
+    let mut memory_removed = Vec::new();
+    for note in notes {
+        match note.created {
+            true => {
+                store.memory_delete(&note.workspace, &note.key)?;
+                memory_removed.push(note.key);
+            }
+            false => {
+                store.memory_restore(
+                    &note.workspace,
+                    &note.key,
+                    note.before.as_deref().unwrap_or_default(),
+                    note.kind.as_deref(),
+                )?;
+                memory_restored.push(note.key);
+            }
+        }
+    }
+
+    let done = Rewound {
+        files,
+        memory_restored,
+        memory_removed,
+        queue_cleared,
+    };
+    let names: Vec<String> = done.files.iter().map(|(p, _)| p.clone()).collect();
+    store.record_rewind(
+        run_id,
+        &names,
+        &done.memory_restored,
+        &done.memory_removed,
+        &done.queue_cleared,
+    )?;
+    // Built from the value being returned, never re-queried. The counts and the
+    // `Rewound` a caller receives cannot disagree, because there is only one of
+    // them.
+    observer.event(&RunEvent::at_depth(
+        run_id,
+        0,
+        0,
+        EventKind::Rewound {
+            files: done.files.len() as u32,
+            memory: (done.memory_restored.len() + done.memory_removed.len()) as u32,
+            queued: done.queue_cleared.len() as u32,
+        },
+    ));
+    Ok(done)
+}
+
 /// Run a task contract to a verified result using `provider` and `store`.
 ///
 /// Each iteration: read the file into context, ask the model (offering the

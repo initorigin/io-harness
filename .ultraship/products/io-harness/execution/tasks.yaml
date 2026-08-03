@@ -216,7 +216,7 @@ tasks:
     why_required: >
       Restoring memory needs the previous value, and `memory` rows are replaced in place. Without a
       restore point the memory half of a rewind cannot exist at all.
-    status: todo
+    status: done
     depends_on: []
     acceptance_criteria:
       - >
@@ -227,7 +227,25 @@ tasks:
         for files.
     files:
       - src/state.rs
-    evidence: []
+    evidence:
+      - >
+        `memory_snapshots` and its UNIQUE index `memory_snapshots_entry (run_id, workspace, key)`,
+        written inside `Store::memory_write` **before** the write, because after it the previous
+        value is gone. `INSERT OR IGNORE` against that index IS the first-write guard — the second
+        and fifth write of one key by one run insert nothing.
+      - >
+        `cargo test --test rewind` — 11 passed, 0 failed (7 that existed, 4 added). F6 is
+        `five_writes_to_one_key_rewind_to_the_value_before_the_first`: a run writes one key five
+        times, the store really does hold `guess 5`, and the rewind produces `the original`.
+      - >
+        Sabotage S6 — `INSERT OR IGNORE` changed to `INSERT OR REPLACE`, so the last write's
+        predecessor wins — failed exactly `five_writes_to_one_key_rewind_to_the_value_before_the_first`
+        (10 passed, 1 failed), a named test rather than a compile error.
+      - >
+        A case the criterion did not name and the code has to get right: a write REFUSED by a pin
+        writes nothing, so there is nothing to put back. The restore point is removed again, but
+        only when that call is what wrote it — an earlier successful write of the same key by the
+        same run owns that row and a later refusal must not discard it.
 
   - id: US-IO-HARNESS-0.36.0-T06
     summary: >
@@ -238,7 +256,7 @@ tasks:
       This is the release's second headline outcome. A partial undo that looks complete is the
       failure the release exists to fix, and an undo that deletes rows makes the ledger disagree
       with the invoice.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T05
     acceptance_criteria:
@@ -273,8 +291,64 @@ tasks:
       - src/state.rs
       - src/observe.rs
       - src/lib.rs
-      - tests/rewind_run.rs
-    evidence: []
+      - tests/rewind.rs
+    evidence:
+      - >
+        `cargo test --test rewind` — 11 passed, 0 failed. The four added tests are
+        `one_call_puts_back_the_files_the_memory_and_the_queue` (F5),
+        `a_rewind_writes_down_what_it_took_and_disturbs_nothing_else` (F7),
+        `five_writes_to_one_key_rewind_to_the_value_before_the_first` (F6) and
+        `a_rewind_leaves_a_commit_alone_and_does_not_touch_what_it_did_not_keep` (F8). The seven
+        0.28.0 tests pass unchanged.
+      - >
+        F5 in full, with all six effects asserted present BEFORE the call as the control: the
+        rewritten file comes back `Restored` with its original bytes, the created file comes back
+        `Removed` and is gone from disk, `memory_removed` names the key the run invented and
+        `memory_get` no longer finds it, and `memory_restored` names the overwritten key **whose
+        value is `three` — what was there before this run's first write** — rather than a deletion
+        or the run's own `nine`. Both queued goals are named in `queue_cleared` and
+        `queued_agents` is empty.
+      - >
+        F7: `steps`, the durable event stream, the spawn records and the summed provider-call
+        tokens are read into one tuple before and after the rewind and compared — identical. One
+        `rewinds` row names the file, the restored key, the empty removed list and the cleared
+        goal. The `EventKind::Rewound` the observer received carries `(1, 1, 1)`, asserted equal to
+        the returned `Rewound`'s own lengths.
+      - >
+        F8: a file over the 1 MiB cap comes back `NotKept` and is **byte-identical to what the run
+        left** — neither restored nor truncated — while the file beside it is put back. `Rewound`
+        makes no claim about a commit; the three lists are the whole of what a rewind touches.
+      - >
+        Sabotage S7 — the rewind deletes the run's `steps` rows, the obvious "undo means erase"
+        implementation — failed exactly `a_rewind_writes_down_what_it_took_and_disturbs_nothing_else`
+        (10 passed, 1 failed). It passes F5 entirely, which is why F7 exists.
+      - >
+        Sabotage S8 — the event's `queued` re-read from `queued_agents` after the clear instead of
+        taken from the returned value — failed the same named test (10 passed, 1 failed). This is
+        trap 32's defect in a new place: a number re-queried afterwards is true whether or not the
+        work happened.
+      - >
+        Sabotage S9 — `memory_restore` made a no-op — failed
+        `one_call_puts_back_the_files_the_memory_and_the_queue` and
+        `five_writes_to_one_key_rewind_to_the_value_before_the_first` (9 passed, 2 failed).
+      - >
+        **A defect the round-trip census caught, not production.** `EventKind::Rewound` first
+        carried its own `run_id`, justified in a doc comment as convenient for a reader filtering
+        on the tag. The kind is flattened into the envelope, so that is a duplicate key and serde
+        refuses to deserialise it — `every_variant_round_trips` failed with `duplicate field
+        \`run_id\``. The field was removed and the reason written where the variant is declared.
+      - >
+        **A criterion met in a slightly different form, stated not glossed.** F7 names "the row
+        counts of `steps`, `run_events`, `spawns` and the ledger". A run driven by `run_with`
+        rather than an observed entry point writes no `run_events` rows at all — the durable stream
+        is `Broadcast`'s, not the loop's — so that count is legitimately 0 both times. It is still
+        compared rather than dropped; the assertion that the trace holds something is made against
+        `steps`.
+      - >
+        The `rewind_run` / `rewind_run_observed` pair follows the crate's existing convention:
+        `rewind_run` is the observed one with `observe::Ignore`. A free function had no observer to
+        emit through, and adding one to `rewind_run`'s signature would have broken nothing that
+        exists but would have made the common call the noisy one.
 
   - id: US-IO-HARNESS-0.36.0-T07
     summary: >
