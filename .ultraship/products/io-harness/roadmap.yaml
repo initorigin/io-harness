@@ -901,5 +901,5 @@ versions:
       the trace keeps both branches rather than losing the one that was undone. What it still cannot
       undo — a commit already pushed, a migration already applied, a call already made — the crate
       states plainly rather than implying.
-    detail: hypothesis
+    detail: specified
     status: planned
