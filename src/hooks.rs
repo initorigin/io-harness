@@ -329,6 +329,12 @@ impl Hooks {
         self.hooks.is_empty()
     }
 
+    /// The tables these hooks were built from, so a plugin's can be added to a
+    /// configuration's without a second [`Observer`] to install (0.35.0).
+    pub(crate) fn declarations(&self) -> &[Hook] {
+        &self.hooks
+    }
+
     /// Validate every table, naming the one that is wrong by its index.
     pub(crate) fn check(hooks: &[Hook], path: &Path) -> Result<()> {
         for (i, hook) in hooks.iter().enumerate() {

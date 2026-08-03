@@ -60,7 +60,14 @@ use crate::verify::Verification;
 /// [`with_skills`](TaskContract::with_skills) — are workspace-mode only and are
 /// validated at run start, so a duplicate tool name or an unreadable skills
 /// directory fails the run before the first completion is billed.
+///
+/// `#[non_exhaustive]` since 0.35.0, which added [`TaskContract::plugins`]. A
+/// contract is built with [`TaskContract::new`] or [`TaskContract::workspace`]
+/// and narrowed with the `with_*` builders — every documented caller — and those
+/// are untouched; an external struct literal or an exhaustive destructuring is
+/// what stops compiling, once, so that the next field costs nobody anything.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TaskContract {
     /// Plain-language goal, e.g. "add a `hello` function that returns 42".
     pub goal: String,
@@ -164,6 +171,18 @@ pub struct TaskContract {
     /// [`Error::Config`](crate::Error::Config) naming the path — the same point
     /// and the same way [`TaskContract::tools`] is arbitrated.
     pub skills: Option<PathBuf>,
+    /// The capability bundles this run loaded (0.35.0).
+    ///
+    /// Empty by default, which is every release before 0.35.0. Set it with
+    /// [`Plugins::apply_to`](crate::Plugins::apply_to), which also folds each
+    /// bundle's agents and MCP servers into the fields above — this field carries
+    /// what neither of those can: the skills directories, which are one per
+    /// bundle where [`TaskContract::skills`] is one per contract.
+    ///
+    /// It is why this type is `#[non_exhaustive]` as of 0.35.0. Adding a public
+    /// field is a break for an external struct literal, and paying that once here
+    /// makes the next contract field free.
+    pub plugins: crate::plugin::Plugins,
     /// Named agent definitions a spawn may ask for by name (0.21.0).
     ///
     /// Empty by default, which is exactly the spawn behaviour of every release
@@ -266,6 +285,7 @@ impl TaskContract {
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
             skills: None,
+            plugins: crate::plugin::Plugins::none(),
             agents: crate::agent::Agents::new(),
             responder: None,
             web: None,
@@ -323,6 +343,7 @@ impl TaskContract {
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
             skills: None,
+            plugins: crate::plugin::Plugins::none(),
             agents: crate::agent::Agents::new(),
             responder: None,
             web: None,
@@ -479,6 +500,25 @@ impl TaskContract {
     /// the model then does is checked as it always is.
     pub fn with_skills(mut self, dir: impl Into<PathBuf>) -> Self {
         self.skills = Some(dir.into());
+        self
+    }
+
+    /// Carry these capability bundles through the run (0.35.0).
+    ///
+    /// Sets the field and nothing else. [`Plugins::apply_to`](crate::Plugins::apply_to)
+    /// is the call that also folds each bundle's agents and MCP servers in, and
+    /// is what a caller normally reaches for; this exists for a caller assembling
+    /// a contract in a different order.
+    ///
+    /// ```
+    /// use io_harness::{Plugins, TaskContract};
+    ///
+    /// let contract = TaskContract::workspace("tidy the crate", "/repo")
+    ///     .with_plugins(Plugins::none());
+    /// assert!(contract.plugins.is_empty());
+    /// ```
+    pub fn with_plugins(mut self, plugins: crate::plugin::Plugins) -> Self {
+        self.plugins = plugins;
         self
     }
 
@@ -641,13 +681,22 @@ impl TaskContract {
         self
     }
 
-    /// Discover the configured skills. Called at run start by every entry point,
-    /// alongside [`Toolbox::validate`](crate::tools::Toolbox::validate).
+    /// Discover the configured skills, and every loaded bundle's (0.35.0).
+    ///
+    /// Called at run start by every entry point, alongside
+    /// [`Toolbox::validate`](crate::tools::Toolbox::validate) — once, before the
+    /// first completion, never per step. A bundle's names are namespaced as they
+    /// are read, so a contributed skill cannot occupy a name the contract's own
+    /// directory uses and two bundles cannot collide with each other.
     pub(crate) fn discover_skills(&self) -> crate::Result<crate::skills::Skills> {
-        match &self.skills {
-            Some(dir) => crate::skills::Skills::discover(dir),
-            None => Ok(crate::skills::Skills::none()),
+        let mut skills = match &self.skills {
+            Some(dir) => crate::skills::Skills::discover(dir)?,
+            None => crate::skills::Skills::none(),
+        };
+        for (id, dir) in self.plugins.skill_dirs() {
+            skills = skills.merged(crate::skills::Skills::discover(dir)?.namespaced(&id))?;
         }
+        Ok(skills)
     }
 
     /// Override the step budget.

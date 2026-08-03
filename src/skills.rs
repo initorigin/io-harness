@@ -269,6 +269,41 @@ impl Skills {
         Ok(Self { skills })
     }
 
+    /// Every name prefixed with the plugin that contributed it (0.35.0).
+    ///
+    /// Applied once, as a bundle loads, so a contributed skill cannot occupy a
+    /// name the operator already uses and the catalogue the model reads says
+    /// which bundle each skill came from.
+    #[must_use]
+    pub(crate) fn namespaced(mut self, plugin: &str) -> Self {
+        for skill in &mut self.skills {
+            skill.name = crate::plugin::namespaced(plugin, &skill.name);
+        }
+        self
+    }
+
+    /// This catalogue and `other`, sorted by name (0.35.0).
+    ///
+    /// Refuses a duplicate name for the reason [`Skills::discover`] does: an
+    /// ambiguous catalogue resolved by picking one silently is how an operator
+    /// ends up debugging why their agent read the wrong instructions. Namespacing
+    /// is what keeps two bundles from ever reaching this.
+    pub(crate) fn merged(mut self, other: Self) -> Result<Self> {
+        self.skills.extend(other.skills);
+        self.skills.sort_by(|a, b| a.name.cmp(&b.name));
+        for pair in self.skills.windows(2) {
+            if pair[0].name == pair[1].name {
+                return Err(Error::Config(format!(
+                    "two skills are both named {:?}: {} and {}",
+                    pair[0].name,
+                    pair[0].path.display(),
+                    pair[1].path.display()
+                )));
+            }
+        }
+        Ok(self)
+    }
+
     /// True if nothing was discovered or configured.
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
