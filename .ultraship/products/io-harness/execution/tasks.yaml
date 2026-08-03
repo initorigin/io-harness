@@ -97,7 +97,7 @@ tasks:
       "Concurrent agents stop colliding on one working tree" is unreachable while `spawn_child`
       hard-codes the tree root, and the property is worth nothing unless the collision it removes is
       demonstrated.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T02
     acceptance_criteria:
@@ -117,7 +117,46 @@ tasks:
       - src/agent.rs
       - src/run.rs
       - tests/worktree.rs
-    evidence: []
+    evidence:
+      - >
+        `cargo test --test worktree` — 4 passed, 0 failed:
+        `two_concurrent_children_with_their_own_worktrees_do_not_collide`,
+        `the_same_two_children_sharing_one_tree_lose_a_write`,
+        `a_parents_git_status_reports_the_worktree_directory_as_untracked` and
+        `a_worktree_that_cannot_be_made_fails_the_spawn_instead_of_sharing_the_tree`.
+      - >
+        F3 in full: two children of one `worktree = true` definition, spawned in one step under
+        `max_concurrent_agents = 2`, produce two directories under `.worktrees/`, each holding its
+        own content (`alpha` and `beta`, sorted and compared), each on its own `worker-…` branch
+        carrying its own commit, with the parent's tree holding neither file and still on `main`.
+      - >
+        **The control is executed, not described.** The identical tree with `worktree = false`
+        leaves `.worktrees/` empty, writes one file into the parent's tree, and that file holds one
+        of the two answers — the other child's write is gone. The collision is real, so removing it
+        is worth something.
+      - >
+        The `git_status` measurement the criterion asked for rather than assumed: the parent
+        reports exactly one line for the worktrees, `?? .worktrees/` — git summarises the untracked
+        directory and does not descend into it. Carried into `docs/CONTRACT.md` by T09.
+      - >
+        Sabotage S3 — the goal digest dropped from the slug, so two children of one definition in
+        one step derive one path — failed exactly
+        `two_concurrent_children_with_their_own_worktrees_do_not_collide` (3 passed, 1 failed).
+      - >
+        Sabotage S4 — a worktree that cannot be made falls back to the parent's tree instead of
+        failing the spawn — failed exactly
+        `a_worktree_that_cannot_be_made_fails_the_spawn_instead_of_sharing_the_tree` (3 passed, 1
+        failed). One sabotage per arm, per trap 51: S3 covers "each child gets its own" and S4
+        covers "and a child that cannot have one does not start".
+      - >
+        **A criterion met in a different form, stated not glossed.** The contract's prose derives
+        the worktree path from `<agent>-<parent_run_id>-<step>`. That is not unique for the shape
+        F3 actually names — two children of the *same* definition in the *same* step differ only in
+        their goal — so the slug carries a fourth component, an FNV-1a digest of the goal, which is
+        the remaining part of the `(parent, step, goal)` key `find_spawn` adopts by. Found by
+        deriving the path before writing the test, not by a failure. FNV is written out rather than
+        `DefaultHasher` because `std`'s hasher is not stable across toolchain releases and a slug
+        that moved on rebuild would break the resume in T04.
 
   - id: US-IO-HARNESS-0.36.0-T04
     summary: >

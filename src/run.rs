@@ -4274,6 +4274,131 @@ struct Tree<'a, P: Provider> {
     web: Option<crate::web::WebAccess>,
 }
 
+/// The directory every per-agent worktree is made under, relative to the tree
+/// root (0.36.0).
+///
+/// One component, never a literal holding a separator, so the path is joined the
+/// way every other path in this crate is and a Windows checkout gets a Windows
+/// path rather than a string that happens to work.
+const WORKTREE_DIR: &str = ".worktrees";
+
+/// How much of `git`'s own output is kept when a worktree cannot be made.
+///
+/// Its own bound rather than the run's per-observation cap, because this text
+/// never becomes a tool result: it reaches the model as the reason one spawn did
+/// not happen, and a page of it would say nothing the first lines do not.
+const WORKTREE_ERR_CAP: usize = 4_000;
+
+/// One agent name as one path component and one branch name.
+///
+/// An allowlist, matching `check_branch_name`'s: a definition's name is the
+/// operator's free text and reaches both a directory and a ref. Truncated
+/// because it is only half of the slug — the run id and step that follow are what
+/// make it unique.
+fn slugify(name: &str) -> String {
+    let mapped: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed: String = mapped.trim_matches('-').chars().take(40).collect();
+    match trimmed.is_empty() {
+        true => "agent".into(),
+        false => trimmed,
+    }
+}
+
+/// A stable 32-bit digest of one goal, for the worktree slug (0.36.0).
+///
+/// FNV-1a written out rather than `std::hash::DefaultHasher`, which is documented
+/// as unstable across releases: a slug that changed when the crate was rebuilt on
+/// a newer toolchain would send a resumed spawn to a worktree that does not
+/// exist, and surviving a rebuild is the one property this derivation exists for.
+fn goal_digest(goal: &str) -> u32 {
+    let mut h: u32 = 0x811c_9dc5;
+    for b in goal.as_bytes() {
+        h ^= u32::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
+}
+
+/// The worktree one agent of one spawn works in, made if it is not there already
+/// (0.36.0).
+///
+/// The path is *derived* from `(agent, parent run, step, goal)` — the same key
+/// `find_spawn` adopts by, plus the agent's name — rather than allocated fresh,
+/// and an existing directory is reused rather than re-created. That is the whole
+/// of the resume story: a parent replaying a spawn after a crash finds the
+/// worktree it made last time, with the files the child had already written still
+/// in it. Creating unconditionally would fail on the branch that already exists,
+/// and deleting first would throw away the work the resume exists to keep.
+///
+/// The goal is in the slug as a digest and it is not decoration: two children of
+/// the *same* definition spawned in the *same* step — which is the ordinary shape
+/// of a fan-out — differ in nothing else, and would otherwise be handed one
+/// worktree between them. That is the collision this field exists to remove,
+/// reappearing one level down.
+///
+/// The path is checked against the parent's policy before `git` is asked,
+/// because the crate is writing somewhere the model did not name and an
+/// unchecked write is a claim this crate does not get to make. A policy denying
+/// `.worktrees/**` turns the feature off loudly rather than quietly.
+async fn worktree_for<P: Provider>(
+    tree: &Tree<'_, P>,
+    parent_policy: &Policy,
+    agent: &str,
+    goal: &str,
+    parent_run_id: i64,
+    step: u32,
+) -> std::result::Result<PathBuf, String> {
+    let slug = format!(
+        "{}-{parent_run_id}-{step}-{:08x}",
+        slugify(agent),
+        goal_digest(goal)
+    );
+    let rel = Path::new(WORKTREE_DIR).join(&slug);
+    let abs = tree.root.join(&rel);
+    if abs.exists() {
+        return Ok(abs);
+    }
+
+    let target = rel.to_string_lossy().into_owned();
+    let verdict = parent_policy.check(Act::Write, &target);
+    if verdict.effect != Effect::Allow {
+        return Err(match verdict.rule {
+            Some(rule) => format!("the policy refuses to write {target} (rule {rule})"),
+            None => format!("the policy refuses to write {target}"),
+        });
+    }
+
+    let cmd = GitCmd::Worktree {
+        name: slug,
+        path: target,
+    };
+    match Git::new(parent_policy, &tree.root, WORKTREE_ERR_CAP)
+        .run(&cmd)
+        .await
+    {
+        Ok(GitOutcome::Ran { code: Some(0), .. }) => Ok(abs),
+        Ok(GitOutcome::Ran { code, stderr, .. }) => Err(format!(
+            "`git worktree add` {} — {}",
+            match code {
+                Some(c) => format!("exited {c}"),
+                None => "was killed by a signal".to_string(),
+            },
+            stderr.trim()
+        )),
+        Ok(GitOutcome::Unavailable { reason }) => Err(reason),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 /// Run a workspace contract as the root of an agent tree under `containment`.
 ///
 /// The root agent runs the workspace loop with one extra tool, [`SPAWN_TOOL`],
@@ -4851,7 +4976,13 @@ fn run_agent<'f, P: Provider>(
         if planning {
             effective = effective.merge(plan_lock());
         }
-        let mut ws = Workspace::with_policy(&tree.root, effective);
+        // 0.36.0 — the contract's own root, which is the tree's for every agent
+        // except one given a worktree by its definition. Reading it from the
+        // contract rather than from the tree is what makes a per-child root a
+        // property of the contract the spawn built, so nothing else in this loop
+        // has to know a worktree exists.
+        let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
+        let mut ws = Workspace::with_policy(agent_root, effective);
         // The tree shares one MCP session, so every agent in it — root or child —
         // is offered the same server tools beside its built-ins. Connecting a
         // session and then not offering its tools would leave the model unable to
@@ -5585,11 +5716,40 @@ async fn spawn_child<P: Provider>(
     }
     let child_policy = parent_policy.contain(&overlay);
 
+    // 0.36.0 — a child of a `worktree = true` definition works in its own
+    // checkout instead of the tree's one working directory.
+    //
+    // Before anything is registered, admitted or written: a worktree that cannot
+    // be made is a spawn that does not happen, and doing it here means the
+    // failure costs no ledger entry, no queue row and no run row. The cost of
+    // that ordering is that a child refused by containment a few lines below may
+    // leave an empty worktree behind — harmless, reused by the next attempt
+    // because the path is derived rather than fresh, and cheaper than leaking a
+    // registered agent that never ran.
+    let child_root = match def.filter(|d| d.worktree) {
+        Some(d) => match worktree_for(tree, parent_policy, &d.name, goal, parent_run_id, step).await
+        {
+            Ok(root) => Some(root),
+            Err(why) => {
+                return Ok(SpawnResult::Composed {
+                    decision: "worktree unavailable".into(),
+                    obs: format!(
+                        "\n[spawn error] `{}` needs its own worktree and one could not be made: \
+                         {why}\n",
+                        d.name
+                    ),
+                });
+            }
+        },
+        None => None,
+    };
+    let child_root = child_root.unwrap_or_else(|| tree.root.clone());
+
     let verify = Verification::WorkspaceFileContains {
         file: file.into(),
         needle: needle.into(),
     };
-    let mut child_contract = TaskContract::workspace(goal, &tree.root).with_verification(verify);
+    let mut child_contract = TaskContract::workspace(goal, &child_root).with_verification(verify);
     // 0.22.0 — the tree's web declaration, not one the model asked for. A child
     // inherits exactly what the root was given and has no way to widen it: the
     // spawn arguments are never read for this, so "give the sub-agent web access"
@@ -5699,7 +5859,12 @@ async fn spawn_child<P: Provider>(
         None => {
             let child_run = tree.store.start_child_run(
                 goal,
-                &tree.root.display().to_string(),
+                // 0.36.0 — the child's OWN root, which is the tree's unless a
+                // definition gave it a worktree. The run row is what an operator
+                // reads to find where a child's files went, so recording the
+                // parent's root for a child that worked elsewhere would send them
+                // to the wrong directory.
+                &child_root.display().to_string(),
                 parent_run_id,
                 child_depth,
             )?;
