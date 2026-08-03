@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.36.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -498,3 +498,164 @@ open_questions:
   Whether a run should be able to land on a branch without being asked — a contract-level
   `branch_per_run` rather than a tool the model calls. It is the same argument as the worktree flag
   one level up, and the answer probably follows whatever `worktree` turns out to be.
+
+released_at: 2026-08-03T16:06:55Z
+mode: published
+delivered: >
+  A run lands as a branch, and can be put back.
+
+  `git_branch` renders `git switch --create=<name>` and `git_worktree` renders `git worktree add -b
+  <name> -- <path>`, built by the same closed-set construction as the five built-ins that existed.
+  `switch --create` is the one shape of a checkout that cannot discard a working-tree change — the
+  ref starts at HEAD, git refuses a name that already exists, and the tree is carried rather than
+  replaced — which is why it is reachable while `checkout`, `reset`, `rebase`, `stash`, `push`,
+  `fetch`, `clone`, `remote` and `filter-branch` stay unreachable and the test holding that list
+  passes **unchanged** rather than relaxed. A branch name is fused into `--create=<name>` where git
+  offers that form, and validated by an ASCII allowlist where it does not.
+
+  `AgentDef` gains `worktree`: a child of that definition is rooted at its own checkout under
+  `.worktrees/`, on its own branch, created before its first step. Two concurrent children of one
+  definition now both keep their writes; with the flag off, one of them loses. The path is derived
+  from `(agent, parent run, step, goal)` — the key a spawn is adopted by — so a resumed tree
+  continues in the worktree it already made rather than re-creating it and discarding the child's
+  work. A worktree that cannot be made fails the spawn instead of falling back to the shared tree.
+
+  `rewind_run` widens a rewind from a path to a run: every file it wrote with the four verdicts
+  0.28.0 already distinguishes, every memory entry restored to the value before this run's **first**
+  write to that key, and the spawn backlog it left queued. **Nothing in the trace is deleted** — the
+  steps, the event stream, the spawn records and the ledger are untouched, and what the rewind took
+  is written down before it goes, readable through `Store::rewinds` and reported as
+  `EventKind::Rewound`.
+
+  Two additive tables, `memory_snapshots` and `rewinds`. `CHECKPOINT_FORMAT` unmoved at 7, no
+  existing table altered, `cargo tree` still 402.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — **61 result lines, 1333 passed, 0 failed**, in its own
+    invocation, preceded by `cargo build --all-features --examples`.
+  - >
+    `cargo test --all-features` — **61 result lines, 1412 passed, 0 failed**. A separate invocation
+    with `rm -rf target` between the two, per the standing disk trap.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — clean, no lint raised.
+    `cargo fmt --check` — clean, run against the sealed tree.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — clean,
+    run BEFORE the release PR. The first release in five where that gate caught nothing; reported
+    rather than passed over, because a gate that goes quiet is worth noticing.
+  - >
+    `cargo test --test git` — 14 passed (F1, F2 and the worktree built-in with its denied-path
+    control). `cargo test --test worktree` — 5 passed (F3, F4, the executed collision control, and
+    the measured `git_status`). `cargo test --test rewind` — 13 passed (F5, F6, F7, F8, N3's two
+    halves, and the seven 0.28.0 tests unchanged). `cargo test --lib tools::git` — 13 passed.
+  - >
+    **Nine sabotages, each failing a NAMED test, none silent.** S1 the pre-argv branch-name check
+    removed -> `a_branch_name_git_could_read_as_an_option_is_refused_and_its_repaired_form_is_not`.
+    S2 `git_branch` dispatched to `GitCmd::Status`, exactly the 0.35.0 behaviour ->
+    `a_run_lands_its_commit_on_a_branch_it_made_and_leaves_the_one_it_found_alone`. S3 the goal
+    digest dropped from the worktree slug and S4 a failed worktree falling back to the parent tree
+    -> `two_concurrent_children_with_their_own_worktrees_do_not_collide` and
+    `a_worktree_that_cannot_be_made_fails_the_spawn_instead_of_sharing_the_tree`, one per arm as
+    trap 51 requires. S5 the worktree reuse short-circuit disabled ->
+    `a_resumed_child_continues_in_the_worktree_it_already_had`. S6 `INSERT OR IGNORE` changed to
+    `INSERT OR REPLACE` -> `five_writes_to_one_key_rewind_to_the_value_before_the_first`. S7 the
+    rewind deleting the run's `steps` rows and S8 the event's counts re-queried after the clear ->
+    both `a_rewind_writes_down_what_it_took_and_disturbs_nothing_else`, for different reasons. S9
+    `memory_restore` made a no-op -> two named tests.
+  - >
+    Cross-version, both directions: `cargo test --test cross_version` — 5 passed with
+    `ADDED_SINCE_0_22_0` fed exactly four names and `ALTERED_SINCE_0_22_0` untouched.
+    `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test
+    cross_version_0_29_0 -- --ignored` — `a_current_store_is_read_by_a_0_29_0_binary` passed.
+  - >
+    The documentation gates: `tests/public_api.rs` (9 passed) against a hand-edited
+    `docs/public-api.txt`, `tests/guide_pages.rs` (7), `tests/changelog.rs` (5) finding the
+    `*Migration:*` note under the one `**BREAKING (API)**` entry, `tests/readme.rs` (8) and
+    `tests/docs_drift.rs` (10).
+  - >
+    The new event round-trips: `EVENT_NAMES` gained `rewound`, and the source-reading census that
+    reads `pub enum EventKind` out of `src/observe.rs` and asserts the tags equal the list passes.
+  builds:
+  - >
+    `cargo clean && cargo package --locked` — exit 0 on a clean tree, **1,309,980 bytes**, and the
+    packaged crate compiles. `.worktrees` is absent from the packaged file list, and
+    `assets/initorigin-logo.png` is present.
+  - >
+    `cargo tree | wc -l` — **402**, unchanged since 0.23.0. A worktree is a `git` spawn through the
+    spawner the crate already had; a restore point is two tables in the SQLite already there.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **This record was sealed before the crates.io upload.** `mode: published` is the release's target
+  and the flow's last step: the develop merge, the main merge and the GitHub Release all come after
+  the record rides the `feat/0.36.0` commit, and `cargo publish --locked` comes after those. Sealing
+  it `release-ready` and correcting it afterwards would mean editing an immutable record, which is
+  worse.
+- >
+  **The worktree slug carries a fourth component the contract's prose did not name.** `included`
+  derives the path from `<agent>-<parent_run_id>-<step>`, which is not unique for the shape F3
+  actually names: two children of the same definition in the same step differ only in their goal.
+  The slug therefore ends in an FNV-1a digest of the goal — the remaining part of the
+  `(parent, step, goal)` key `find_spawn` adopts by. FNV is written out rather than
+  `std::hash::DefaultHasher`, which is documented as unstable across releases; a slug that moved on
+  rebuild would send a resumed spawn to a worktree that is not there.
+- >
+  **N3 is met in a different shape and the difference matters.** Its prose asks for "a source-reading
+  test in the shape 0.33.0 and 0.35.0 used" — those grep for a *module path*, which cannot work here
+  because `rewind_run` lives in `src/run.rs` beside the loop and there is no module boundary to grep
+  for. What is asserted instead is the load-bearing half: no `*_TOOL` constant names a rewind, and
+  outside doc comments `src/run.rs` holds exactly three lines mentioning one — the two definitions
+  and the delegation — with a splice-in control that makes the count four. Trap 70 applies: that is
+  what it proves, not "the loop does no rewind work".
+- >
+  **N4 lists two items the worked-example gate does not reach.** `GIT_BRANCH_TOOL` and
+  `GIT_WORKTREE_TOOL` are `io_harness::tools::` constants rather than crate-root re-exports, so
+  `every_public_item_has_a_worked_example` does not see them — and their five siblings carry prose
+  and no example. They are documented to exactly that standard rather than being made the only two
+  of seven with a doctest, which for a `&str` constant would assert its own spelling.
+- >
+  **F7 compares a row count that is legitimately zero.** Its prose names `run_events` among the
+  tables that must not move. A run driven by `run_with` rather than an observed entry point writes
+  no `run_events` rows at all — the durable stream is `Broadcast`'s, not the loop's — so that count
+  is 0 before and after. It is still compared rather than dropped, and the "the run left a trace"
+  assertion is made against `steps`.
+- >
+  **A worktree is visible to the parent, and this crate will not hide it.** The parent's own
+  `git_status` reports `?? .worktrees/` — measured, not assumed — so a `git_add` naming `.` in the
+  parent stages the children's trees. Writing to `.git/info/exclude` was considered and excluded: it
+  is a write outside what the caller asked for and outside what the policy governs. The operator
+  gets the one line instead.
+- >
+  **Nothing removes a worktree or deletes a branch**, so both accumulate until an operator clears
+  them. Removing a worktree deletes the work a child was spawned to produce, which is not a decision
+  this crate makes.
+- >
+  **A rewind bypasses the memory pin.** Restoring goes around `memory_write`, so an entry pinned
+  *after* the run wrote it is still put back. The alternative is telling a caller a rewind happened
+  when it had not.
+- >
+  **A rewind is one run, not a tree**, and is not transactional. A caller wanting a subtree loops
+  over it; choosing an ordering over children whose written paths may overlap is a decision this
+  crate does not make.
+- >
+  **A test failed once under disk pressure and passed twice afterwards.**
+  `tests/handles.rs::a_handle_that_exits_on_its_own_stops_reading_as_running` failed in the first
+  default-feature run on a volume at 11 GiB free with five rust-analyzer processes rebuilding into
+  the same tree, then passed under `--all-features` and again on the re-run. It reads as a store
+  assertion and is a wall-clock one: the exit is noticed by a poll that has to reach disk. This
+  release touches no handle code. Recorded rather than quietly re-run.
+- >
+  **The local suites ran with `CARGO_PROFILE_DEV_DEBUG=0` and `CARGO_PROFILE_TEST_DEBUG=0`,** and
+  `target/` was deleted three times during the release (4.6 GiB, 12 GiB and a 6.9 GiB `cargo clean`).
+  The volume reached 4.5 GiB free at its lowest. Debug info changes no test outcome and CI runs the
+  unmodified commands on a fresh runner; recorded because the numbers above were measured under it.
+- >
+  **Inherited and unresolved: 0.30.0's N2 wording.** "The aggregates do not scale with the trace"
+  over-claims — counting every row is the answer. Raised rather than read as satisfied, and
+  untouched by this release.
+supersedes: 0.35.0
+next_recommended_version: null
+immutable: true
