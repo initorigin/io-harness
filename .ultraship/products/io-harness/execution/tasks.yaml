@@ -166,7 +166,7 @@ tasks:
     why_required: >
       Creating unconditionally fails on resume and re-creating discards the child's files. Without
       this the worktree flag makes a crashed tree unresumable, which is a regression against 0.32.0.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T03
     acceptance_criteria:
@@ -181,7 +181,33 @@ tasks:
     files:
       - src/run.rs
       - tests/worktree.rs
-    evidence: []
+    evidence:
+      - >
+        `cargo test --test worktree` — 5 passed, 0 failed. The added test is
+        `a_resumed_child_continues_in_the_worktree_it_already_had`: a tree is cut off by a timeout
+        while its `worktree = true` child is parked, then resumed from a fresh `Store` against the
+        same database.
+      - >
+        F4 in full: after the resume there is still exactly ONE directory under `.worktrees/`, at
+        the same path and on the same branch as before the cut-off, so a second creation attempt
+        neither errored the spawn nor made a second tree. The child carried on in it and wrote
+        `OUT.md`.
+      - >
+        The discriminating assertion is `EARLY.md`, written by the child *before* the cut-off and
+        still holding `before the kill` afterwards. A resume that re-created the worktree would
+        still let the child finish and still leave one directory behind — it would simply have
+        thrown the work away, which is what this catches.
+      - >
+        Sabotage S5 — the `abs.exists()` reuse short-circuit disabled, so the worktree is created
+        unconditionally — failed exactly `a_resumed_child_continues_in_the_worktree_it_already_had`
+        (4 passed, 1 failed). It fails the way the doc comment predicts: `git worktree add` refuses
+        the branch that already exists, so the spawn does not happen at all.
+      - >
+        A defect in the test, found and fixed rather than worked around: the first attempt gave the
+        resumed provider no script for the ROOT. The root's spawn step never committed, so the
+        resumed root is asked for it again and must re-issue it — without that replay `find_spawn`
+        is never reached and the adoption path is not exercised at all. The test asserted a missing
+        file rather than silently passing, which is the right failure.
 
   - id: US-IO-HARNESS-0.36.0-T05
     summary: >

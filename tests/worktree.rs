@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::{
-    run_tree, AgentDef, Agents, ApproveAll, Containment, Policy, Provider, Store, TaskContract,
-    Verification,
+    resume_tree, run_tree, AgentDef, Agents, ApproveAll, Containment, Policy, Provider, Store,
+    TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -327,4 +327,153 @@ async fn a_worktree_that_cannot_be_made_fails_the_spawn_instead_of_sharing_the_t
         "no child wrote into the parent's tree, which is what a silent fallback \
          would have produced"
     );
+}
+
+// ------------------------------------------------------------------- F4
+
+/// A provider that plays one script per goal and can be told to park forever on
+/// one of a child's turns, so a tree can be cut off mid-child.
+struct Parking {
+    inner: ByGoal,
+    /// Park on this turn index of any goal holding this marker.
+    park_on: Option<(String, usize)>,
+}
+
+impl Provider for Parking {
+    async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+        if let Some((marker, turn)) = &self.park_on {
+            if req.user.contains(marker.as_str()) {
+                let seen = self
+                    .inner
+                    .at
+                    .lock()
+                    .unwrap()
+                    .get(marker.as_str())
+                    .copied()
+                    .unwrap_or(0);
+                if seen >= *turn {
+                    // Longer than the timeout the test wraps this in. The task is
+                    // dropped at the timeout, which is the cut-off.
+                    tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                }
+            }
+        }
+        self.inner.complete(req).await
+    }
+}
+
+/// F4 — a resumed tree reuses the worktree it already made, with the files the
+/// child had already written still in it.
+///
+/// The discriminating assertion is `EARLY.md`, written before the cut-off. A
+/// resume that re-created the worktree would still let the child finish and would
+/// still leave one directory behind — it would simply have thrown away the work.
+#[tokio::test]
+async fn a_resumed_child_continues_in_the_worktree_it_already_had() {
+    if !have_git() {
+        return;
+    }
+    let dir = repo();
+    let db = dir.path().join("trace.db");
+
+    let contract = TaskContract::workspace("fan out over two files", dir.path())
+        .with_verification(Verification::WorkspaceFileContains {
+            file: "README.md".into(),
+            needle: "hello".into(),
+        })
+        .with_max_steps(8)
+        .with_agents(Agents::new().with(AgentDef::new("worker").with_worktree()));
+
+    // First attempt: the child writes EARLY.md, then parks. The tree is cut off.
+    let store = Store::open(&db).unwrap();
+    let parking = Parking {
+        inner: ByGoal::new(vec![
+            (
+                "fan out over two files",
+                vec![vec![spawn_as("worker", "write the alpha part", "alpha")]],
+            ),
+            (
+                "write the alpha part",
+                vec![vec![call(
+                    "write_file",
+                    json!({ "path": "EARLY.md", "content": "before the kill\n" }),
+                )]],
+            ),
+        ]),
+        park_on: Some(("write the alpha part".to_string(), 1)),
+    };
+    let cut_off = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        run_tree(
+            &contract,
+            &parking,
+            &store,
+            &Policy::permissive(),
+            &ApproveAll,
+            &Containment::new(10, 4, 2, 10_000_000),
+        ),
+    )
+    .await;
+    assert!(cut_off.is_err(), "the tree should have been cut off");
+    drop(store);
+
+    // The worktree exists and holds the child's first write.
+    let before = worktrees(dir.path());
+    assert_eq!(before.len(), 1, "one worktree so far: {before:?}");
+    let wt = before[0].clone();
+    assert!(wt.join("EARLY.md").is_file(), "the child wrote before the cut");
+    let branch_before =
+        String::from_utf8_lossy(&git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+            .trim()
+            .to_string();
+
+    // Resume with a provider that lets the child finish.
+    let store = Store::open(&db).unwrap();
+    // The root's spawn step never committed, so the resumed root is asked for it
+    // again and must re-issue it — that replay is what reaches `find_spawn`,
+    // adopts the child, and puts this test on the adoption path at all.
+    let finish = ByGoal::new(vec![
+        (
+            "fan out over two files",
+            vec![vec![spawn_as("worker", "write the alpha part", "alpha")]],
+        ),
+        (
+            "write the alpha part",
+            vec![vec![call(
+                "write_file",
+                json!({ "path": SHARED, "content": "alpha" }),
+            )]],
+        ),
+    ]);
+    let resumed = resume_tree(
+        &contract,
+        &finish,
+        &store,
+        1,
+        &Policy::permissive(),
+        &ApproveAll,
+        &Containment::new(10, 4, 2, 10_000_000),
+    )
+    .await
+    .unwrap();
+    let _ = resumed;
+
+    // Still one worktree, at the same path, on the same branch: reused, not
+    // re-created, and a second creation attempt did not error the spawn.
+    let after = worktrees(dir.path());
+    assert_eq!(after, before, "the same worktree, not a new one: {after:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+            .trim(),
+        branch_before
+    );
+
+    // The discriminating assertion: the work from before the cut-off survived.
+    assert_eq!(
+        std::fs::read_to_string(wt.join("EARLY.md")).unwrap(),
+        "before the kill\n",
+        "a re-created worktree would have thrown this away"
+    );
+    // And the resumed child carried on in it.
+    assert_eq!(std::fs::read_to_string(wt.join(SHARED)).unwrap(), "alpha");
 }
