@@ -1,203 +1,269 @@
 product: io-harness
-version: 0.34.0
+version: 0.35.0
 tasks:
-- id: US-IO-HARNESS-0.34.0-T01
-  summary: >
-    The review criterion itself: `Verification::Review { rubric, allow_self_review }`,
-    `#[non_exhaustive]` on `Verification`, and the `Reviewer` trait with `ReviewRequest`, `Review`
-    and `ModelReviewer<P: Provider>`. The self-review refusal is built here, before the request is,
-    not bolted on afterwards.
-  why_required: >
-    Nothing else in the release exists without it. Per-gate retry has no gate that can error until a
-    criterion makes a provider call, and routing's whole motivation is a gate that a model answers.
+- id: US-IO-HARNESS-0.35.0-T01
+  summary: 'The manifest and the loader: `src/plugin.rs` with `Manifest`, `Plugin`, `Dropped` and `Plugins`.
+    A plugin.toml is parsed into the types `io.toml` already deserializes, its id is validated `[a-z0-9][a-z0-9-]{0,31}`,
+    `${cmd:}` is refused in every scope, and every failure becomes a `Dropped` rather than an error
+    — there is no error path out of loading.'
+  why_required: Nothing else in the release exists without a loaded plugin. Every other task either
+    feeds this one its declarations or consumes what it produced.
   status: todo
   depends_on: []
   acceptance_criteria:
-  - >
-    **F1 — a review criterion discriminates.** One workspace, one scripted reviewing provider, two
-    runs: a rubric the produced change satisfies and a rubric it does not. The first must reach
-    `RunOutcome::Verified` and the second must not, and the failing arm's `Review::reasons` must be
-    non-empty and reach the trace. The negative control is the same pair with the reviewer replaced
-    by a stub that always returns `passed: true` — under which both arms pass, proving the first
-    assertion was decided by the verdict and not by the run's own success.
-  - >
-    **F2 — a model does not review itself, and the refusal precedes the wire.** A contract whose run
-    model and whose `ModelReviewer` model are the same string, with `allow_self_review` false, fails
-    with `Error::Config` naming both. The discriminating assertion is that the scripted reviewing
-    provider recorded **zero** requests — an `assert_eq!(provider.calls(), 0)`, not a check of the
-    error text — so a refusal implemented after the response arrives fails. With
-    `allow_self_review: true` the same contract runs and the provider records exactly one.
-  - >
-    **N4 — a review costs exactly one provider call and nothing when it is not asked for.** A
-    contract with no `Review` criterion issues zero reviewing calls, asserted. A contract with one
-    issues exactly one per gate evaluation, asserted by call count and by
-    `Spend::unpriced_calls`/`Usage` attribution, so the review's tokens are in the ledger rather
-    than off it.
+  - '**F6 — a broken bundle costs exactly itself.** Four plugins declared: one valid, one with no `plugin.toml`,
+    one whose TOML does not parse, one whose manifest carries an unknown key. The run reaches its normal
+    outcome, `Plugins::dropped()` has exactly three entries whose errors name three different causes,
+    exactly three `EventKind::PluginDropped` events reach the observer, and every contribution of the
+    valid one is present. The control is the same four directories with every manifest repaired: `dropped()`
+    is empty and four `PluginLoaded` events fire. A duplicate id and a malformed id (`Rust_Review`,
+    `a__b`, 33 characters) are asserted the same way, each dropping only its own plugin.
+
+    '
+  - '**F8 — `${cmd:}` is refused in a manifest from every scope.** A manifest carrying `${cmd:...}`
+    in any value is dropped whether it was declared from the user file, `io.local.toml` or `io.toml`,
+    with the error naming the substitution. Asserted for all three scopes, because the rule that makes
+    this different from `io.toml`''s own `${cmd:}` rule is precisely that it does not depend on the
+    scope.
+
+    '
+  - '**N1 — no new dependency.** `cargo tree` on macOS and Linux still reads 402 lines. A manifest is
+    parsed by the `toml` and `serde` already present, into the `AgentDef`, `McpServer`, `Hook` and `Layer`
+    types already deserialized from `io.toml`.
+
+    '
   files:
-  - src/verify.rs
-  - src/run.rs
+  - src/plugin.rs
   - src/lib.rs
-  - tests/review.rs
+  - tests/plugin.rs
   evidence: []
-- id: US-IO-HARNESS-0.34.0-T02
-  summary: >
-    Durable gate attempts: the `gate_attempts` table and its `(run_id, id)` index, `GateOutcome`
-    with the `Errored` variant the crate has never had, `Store::put_gate_attempt` /
-    `gate_attempts` / `last_gate_attempt`, and the run loop recording every gate evaluation through
-    them. The read is written to seek from its first line, not corrected after a plan test fails.
-  why_required: >
-    A gate outcome the run throws away is why "the review said no" and "the review never happened"
-    are the same thing today, and retry has nothing to read without it.
+- id: US-IO-HARNESS-0.35.0-T02
+  summary: '`[[plugin]] path = "..."` in the configuration file, `plugin` added to `APPENDING`, the
+    declaring scope captured per entry as each scope is read, `Config::plugins()`, and the trust rule:
+    a project-scoped plugin contributes no `[[hook]]` and no `[[mcp]]`, and plugin policy may carry
+    deny rules only.'
+  why_required: The trust rule is the reason a bundle can be pointed at a cloned repository at all,
+    and the per-entry scope it rests on is unrecoverable after the merge concatenates the arrays.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.34.0-T01
+  - US-IO-HARNESS-0.35.0-T01
   acceptance_criteria:
-  - >
-    **F3 — a gate attempt is durable, and `Errored` is not `Failed`.** Three runs over the same
-    contract: a passing review writes one `gate_attempts` row with `Passed`; a failing review writes
-    `Failed` with the verdict's reasons in `detail`; a reviewer whose provider returns a transport
-    error writes `Errored` with the error's display, and the run's outcome is the paused/resumable
-    one rather than a completed failure. `Store::last_gate_attempt` returns each. The control is
-    that no `Command` gate's behaviour changes: an existing `Verification::Command` failure writes a
-    `Failed` row and the pre-0.34.0 assertions in `tests/verify.rs` still hold unchanged.
-  - >
-    **N3 — reading a run's gate history is an index seek, not a scan.** `EXPLAIN QUERY PLAN` for
-    `Store::gate_attempts` and `Store::last_gate_attempt` must name `gate_attempts_run` and must not
-    contain `SCAN gate_attempts`. The SQL is `EXPLAIN`ed as the `const` the crate executes, not
-    re-typed in the test (trap: a re-typed statement keeps passing after the real one is "tidied").
-    The control filters on `detail`, a column in no index at all — not a trailing column of the
-    composite one, which SQLite skip-scans.
+  - '**F4 — the trust rule, both arms, whole-plugin.** The same plugin directory, whose manifest declares
+    a `[[hook]]`, is declared once from `io.toml` and once from `io.local.toml`. From `io.toml` it is
+    dropped, `Dropped::error` names the `hook` key and the scope, and the discriminating assertion is
+    that **none** of its other contributions is present — no skill, no agent, no layer — because a half-applied
+    stranger''s manifest is the failure this rule exists to prevent. From `io.local.toml` it loads and
+    the hook fires on a real event. The same pair is run for `[[mcp]]`. Trap 51 applies: one sabotage
+    per arm.
+
+    '
+  - '**F5 — plugin policy may only narrow, asserted by effect.** A manifest whose layer carries an `allow_write`
+    for a path the application''s policy denies. The plugin is dropped naming the rule, **and the write
+    is still refused** — the assertion is the run''s outcome and the stored refusal, not the error text.
+    A loader that validated after merging the layer fails this and passes an error-text assertion. The
+    same pair for a manifest carrying `[policy.defaults]`.
+
+    '
+  - '**N6 — `[[hook]]`''s existing project-scope refusal is untouched.** The 0.28.0 rule that a project-scoped
+    `io.toml` may declare no `[[hook]]` at all, inside a `[profile]` too, still holds with the same
+    error, asserted by the pre-existing tests passing unchanged. This release adds a rule beside it
+    and weakens nothing.
+
+    '
   files:
-  - src/state.rs
-  - src/run.rs
-  - src/verify.rs
-  - tests/review.rs
+  - src/config.rs
+  - src/plugin.rs
+  - tests/plugin.rs
+  - tests/config.rs
   evidence: []
-- id: US-IO-HARNESS-0.34.0-T03
-  summary: >
-    `run::retry_gate` and `run::retry_gate_observed` — re-run the criterion, and nothing else,
-    against the workspace as the checkpoint left it, appending a new attempt rather than
-    overwriting the one that errored, and refusing a gate that honestly failed.
-  why_required: >
-    It is the piece the roadmap calls the one an operator asks for first, and the reason `Errored`
-    is a distinct outcome rather than a detail string.
+- id: US-IO-HARNESS-0.35.0-T03
+  summary: 'Namespacing as attribution: every contributed skill, agent, policy layer and MCP server
+    id becomes `<plugin>__<name>` at load, plus `Plugins::apply_to` and `Plugins::templates`.'
+  why_required: Attribution is the half of the roadmap outcome that makes a bundle auditable, and it
+    is the reason no new table is needed — without it a refusal or a spend draw names nothing.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.34.0-T02
+  - US-IO-HARNESS-0.35.0-T01
+  - US-IO-HARNESS-0.35.0-T02
   acceptance_criteria:
-  - >
-    **F4 — `retry_gate` re-runs the criterion and nothing else.** A run whose review gate `Errored`
-    is retried against a provider that answers. It must reach `Verified`, and the discriminating
-    assertions are three: the run's `steps` row count is **identical** before and after; `Spend` for
-    the run grows by exactly the retry's own review call and by nothing else; and the workspace's
-    files are byte-identical to what the run left. A `retry_gate` that quietly re-ran the task
-    passes none of the three.
-  - >
-    **F5 — `retry_gate` refuses what it cannot honestly do.** Retrying a run whose last gate attempt
-    is `Failed` — the work is wrong, not the transport — returns `Error::Resume` naming the outcome,
-    and writes no new attempt row. Retrying a run with no gate attempt at all does the same. Both
-    are asserted as an absence: `gate_attempts` for that run is unchanged in length.
+  - '**F2 — a refusal names the plugin that introduced the rule.** A plugin layer denying `secrets/**`;
+    the run attempts the write. The discriminating assertion is the stored `PolicyEvent.layer` for that
+    refusal, which must equal `<plugin>__<layer>` — not that a refusal occurred, because every deny
+    rule refuses. The control is the same layer declared by the application instead of the plugin, whose
+    event carries the bare layer name, proving the prefix is written by the loader and not by the policy.
+
+    '
+  - '**F3 — an MCP call and a spawned child are attributed the same way.** A plugin-contributed MCP
+    server is called: the stored `McpEvent.server` reads `<plugin>__<server>` and the tool the model
+    was offered is `mcp__<plugin>__<server>__<tool>`, and `bare_name` round-trips it back to the server-side
+    name — a namespacing scheme that broke the existing strip would fail here rather than in production.
+    A plugin-contributed agent is spawned: its run row and its ledger entry name `<plugin>__<agent>`,
+    so the tokens it spent are attributable to the bundle.
+
+    '
+  - '**F7 — namespacing makes collision impossible rather than unlikely.** Two plugins each contributing
+    a skill named `review`, plus a contract-level skills directory that also holds `review`. All three
+    are offered, under `a__review`, `b__review` and `review`; `Skills::discover`''s duplicate-name refusal
+    does not fire; and the catalogue the model is handed contains all three names. The negative control
+    is the same tree with namespacing removed, under which the run fails on the duplicate — the failure
+    proving the property is load-bearing.
+
+    '
   files:
-  - src/run.rs
-  - src/lib.rs
-  - tests/review.rs
+  - src/plugin.rs
+  - src/mcp.rs
+  - src/skills.rs
+  - src/agent.rs
+  - src/policy.rs
+  - tests/plugin.rs
   evidence: []
-- id: US-IO-HARNESS-0.34.0-T04
-  summary: >
-    Conditional routing: `Routing` on `TaskContract` via `with_routing` (`escalate_after`,
-    `downshift_under`, `require_primary`), the defaulted `Provider::reachable()`, and the two new
-    `EventKind` variants with their `EVENT_NAMES` entries. Every assertion is against the outbound
-    `CompletionRequest.model`, so the scripted provider records the model per call.
-  why_required: >
-    Without it the release delivers two of the roadmap's three named outcomes, and an unattended run
-    keeps starting on a fallback nobody chose.
+- id: US-IO-HARNESS-0.35.0-T04
+  summary: '`TaskContract` gains `#[non_exhaustive]` and a `plugins` field with `with_plugins`, and
+    `discover_skills` merges every plugin''s skills directory with the contract''s own.'
+  why_required: A run whose skills come from a contract directory and three bundles needs more than
+    the one `Option<PathBuf>` the contract has carried since 0.14.0. This is the release's one break
+    and the path by which every contribution reaches a run.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.34.0-T02
+  - US-IO-HARNESS-0.35.0-T03
   acceptance_criteria:
-  - >
-    **F6 — routing changes the model that is actually sent.** A contract with
-    `escalate_after: (2, "big-model")` under a scripted provider whose gate fails twice. The
-    assertion is against the **outbound `CompletionRequest.model`** the provider recorded: requests
-    one and two carry the run's original model, and every request after the second failure carries
-    `big-model`. `EventKind::Routed { from, to, why }` is emitted once, at the transition, not once
-    per step. `downshift_under` is asserted the same way, on the bytes the run has written so far.
-  - >
-    **F7 — `require_primary` refuses before it spends.** A provider whose `reachable()` returns
-    `Ok(false)` under a contract with `require_primary: true` must fail with an error naming the
-    provider, having issued **zero** completions — asserted on the provider's own call count. The
-    same contract with `require_primary: false` runs to completion. A provider that does not
-    override `reachable()` at all behaves exactly as it did in 0.33.0, which is what makes the
-    defaulted method additive rather than a silent new precondition.
-  - >
-    **F8 — the two new events round-trip.** `EventKind::Routed` and `EventKind::Reviewed` appear in
-    `EVENT_NAMES` and in `every_kind()`, and the source-reading test 0.28.0 added — which reads
-    `pub enum EventKind` from `src/observe.rs` and asserts the tags are *equal* to the list — passes
-    without being amended by hand. `Broadcast` carries both to an attached process, so 0.33.0's
-    durable stream includes them with no change to `attach`.
+  - '**F1 — a bundle''s contributions reach a run, and their absence is asserted too.** One plugin directory
+    contributing a skill, a template, an agent, an MCP server and a deny layer, declared from `io.local.toml`.
+    The run''s discovered skill catalogue, the contract''s agent roster, its MCP server list and its
+    policy layer stack each contain the contribution under its namespaced name. The control is the identical
+    tree with the `[[plugin]]` entry removed: all five are absent, and every other assertion in the
+    test is unchanged. A loader that discovered nothing passes the second half only.
+
+    '
+  - '**N2 — the break is exactly one, and it is stated as loudly as it is small.** `TaskContract` gains
+    `#[non_exhaustive]` and one field. An external struct literal or exhaustive destructuring stops
+    compiling; every `TaskContract::new`, `TaskContract::workspace` and `with_*` call site is untouched,
+    which is how every documented caller builds one. `CompletionRequest` and `CompletionResponse` are
+    not touched, so no `E0639` is owed. `tests/changelog.rs` finds the `*Migration:*` note under a `**BREAKING`
+    entry and `tests/public_api.rs` passes against a hand-edited `docs/public-api.txt`.
+
+    '
   files:
   - src/contract.rs
-  - src/provider/mod.rs
-  - src/observe.rs
   - src/run.rs
-  - src/lib.rs
-  - tests/routing.rs
+  - src/skills.rs
+  - tests/plugin.rs
   evidence: []
-- id: US-IO-HARNESS-0.34.0-T05
-  summary: >
-    The release's evidence and its documentation: cross-version both directions with the schema
-    guard fed by name, the docs that must ship in the same release as the code (`verify`'s page,
-    `providers.md`, the run module, `README.md`, `docs/CONTRACT.md`, `CHANGELOG.md`), and the four
-    gates — fmt, clippy, the nightly docs command, `cargo package --locked`.
-  why_required: >
-    A store change with no cross-version evidence and a public surface with no documentation are
-    both incomplete releases here, and the nightly docs gate has caught something in each of the
-    last two.
+- id: US-IO-HARNESS-0.35.0-T05
+  summary: '`EventKind::PluginLoaded { plugin, contributions }` and `EventKind::PluginDropped { plugin,
+    why }`, their `EVENT_NAMES` entries, their round trip through `every_kind()` and the source-reading
+    census.'
+  why_required: A plugin that is dropped and reported on no channel an operator watches is a plugin
+    that was silently ignored, which is the failure mode the drop-not-fatal rule creates.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.34.0-T03
-  - US-IO-HARNESS-0.34.0-T04
+  - US-IO-HARNESS-0.35.0-T01
   acceptance_criteria:
-  - >
-    **F9 — cross-version compatibility, both directions.** A database written by the pinned
-    generator opens, resumes and replays under 0.34.0 with nothing to migrate; a 0.34.0 store
-    carrying `gate_attempts` rows is read by that older binary, which never names the table.
-    `CHECKPOINT_FORMAT` does not move. The 0.22.0 schema guard in `tests/cross_version.rs` is fed
-    `gate_attempts` and `gate_attempts_run` **by name**, as trap 4 requires.
-  - >
-    **N2 — the break is exactly one enum and it is stated as loudly as it is small.**
-    `Verification` gains `Review` and gains `#[non_exhaustive]`. An external exhaustive `match` on
-    it stops compiling and must add a wildcard arm; every construction site, every
-    `with_verification` call and every existing variant is untouched. `CompletionRequest` and
-    `CompletionResponse` are not touched, so no `E0639` is owed. `Routing` is
-    `#[non_exhaustive]` from its first line so the next rule added to it is free.
-    `tests/changelog.rs` and `tests/public_api.rs` both pass.
-  - >
-    **N5 — every added public item carries a worked example**, enforced by the existing
-    `every_public_item_has_a_worked_example` surface test: `Verification::Review`, `Reviewer`,
-    `ReviewRequest`, `Review`, `ModelReviewer`, `GateOutcome`, `GateAttempt`, `Routing`,
-    `retry_gate`, `Provider::reachable` and the three new `Store` methods all appear in compiling
-    doctests.
-  - >
-    **N6 — the honest limitations are stated where a reader finds them.** `docs/CONTRACT.md` says
-    plainly that a review is a model's judgement and is therefore neither deterministic nor
-    reproducible; that `allow_self_review` compares model *strings* and cannot tell that two names
-    are the same weights behind a gateway; that `reachable()` is a point-in-time answer with no
-    bearing on the next minute; and that `retry_gate` re-runs the criterion against the workspace as
-    it *now* stands, which is the current tree and not a snapshot of the tree at gate time.
-  - >
-    **O2 — docs.rs builds**, proven by running the nightly job's exact command
-    (`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`) before
-    the release PR is opened, never inferred from a stable `cargo doc` — trap 28, which has now
-    caught something in two consecutive releases.
-  - >
-    **O3 — `cargo package --locked` succeeds** and the packaged crate compiles, run after a
-    `cargo clean`, because `target/` and this volume have collided in every release since 0.25.0.
+  - '**F6 — a broken bundle costs exactly itself.** Four plugins declared: one valid, one with no `plugin.toml`,
+    one whose TOML does not parse, one whose manifest carries an unknown key. The run reaches its normal
+    outcome, `Plugins::dropped()` has exactly three entries whose errors name three different causes,
+    exactly three `EventKind::PluginDropped` events reach the observer, and every contribution of the
+    valid one is present. The control is the same four directories with every manifest repaired: `dropped()`
+    is empty and four `PluginLoaded` events fire. A duplicate id and a malformed id (`Rust_Review`,
+    `a__b`, 33 characters) are asserted the same way, each dropping only its own plugin.
+
+    '
+  files:
+  - src/observe.rs
+  - src/plugin.rs
+  - tests/plugin.rs
+  evidence: []
+- id: US-IO-HARNESS-0.35.0-T06
+  summary: 'The compatibility and cost evidence: `ADDED_SINCE_0_22_0` asserted unchanged, both cross-version
+    directions executed, and the source-reading test that no function reachable from the per-step loop
+    calls into `plugin::`, with its splice-in control.'
+  why_required: A release that quietly added a table and forgot the guard is exactly what the 0.22.0
+    schema guard exists to catch, and a loader creeping into the step loop is how a bundle becomes a
+    per-step file read.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.35.0-T04
+  acceptance_criteria:
+  - '**F9 — cross-version compatibility, both directions, with nothing to migrate.** No table, column
+    or index is added, so `tests/cross_version.rs`''s `ADDED_SINCE_0_22_0` list is **unchanged** — asserted
+    rather than assumed, since a release that quietly added a table and forgot the list is exactly what
+    that guard exists to catch. A database written by the pinned 0.29.0 generator opens, resumes and
+    replays under 0.35.0; a 0.35.0 store is read by that binary. `CHECKPOINT_FORMAT` stays 7.
+
+    '
+  - '**N3 — plugin loading is bounded by what was declared and the run loop never touches it.** Discovery
+    is one manifest read plus one directory listing per skills or templates directory, per declared
+    plugin, performed once by the caller before the run starts — the same shape `Config::discover` and
+    `Skills::discover` already have. The assertion is a source-reading test in the shape 0.33.0 used
+    for its ownership boundary: no function reachable from the per-step loop in `src/run.rs` calls into
+    `plugin::`, with a splice-in control that makes the test fail when such a call is added. A configuration
+    declaring no plugin performs no plugin I/O at all, asserted by a plugins directory that does not
+    exist and a run that neither fails nor drops anything.
+
+    '
   files:
   - tests/cross_version.rs
+  - tests/plugin.rs
+  - src/run.rs
+  evidence: []
+- id: US-IO-HARNESS-0.35.0-T07
+  summary: 'Documentation as part of the release: `docs/guide/plugins.md`, its `docs/CAPABILITIES.md`
+    entry, the honest limits in `docs/CONTRACT.md`, `README.md`, `CHANGELOG.md` with the `*Migration:*`
+    note the break owes, and `docs/public-api.txt` edited by hand.'
+  why_required: Four checked-in surfaces have tests that fail without them, and the release workflow
+    refuses a version with no CHANGELOG section.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.35.0-T04
+  - US-IO-HARNESS-0.35.0-T05
+  acceptance_criteria:
+  - '**N4 — every added public item carries a worked example**, enforced by the existing `every_public_item_has_a_worked_example`
+    surface test: `Plugins`, `Plugin`, `Dropped`, `Config::plugins`, `Plugins::apply_to`, `Plugins::templates`,
+    `Plugins::dropped`, `TaskContract::with_plugins` and the manifest''s own module documentation.
+
+    '
+  - '**N5 — the honest limits are where a reader finds them.** `docs/CONTRACT.md` states: a plugin is
+    a directory the operator chose to point at and the crate verifies nothing about its origin; a hook
+    or MCP server contributed from a trusted scope runs a program with this process''s privileges and
+    is not sandboxed by the fact that a plugin declared it; namespacing changes the names a model sees,
+    so a prompt naming a skill by its bare name after it moves into a bundle stops matching; and the
+    standing `[[mcp]]` gap in `io.toml` itself is unchanged.
+
+    '
+  files:
+  - docs/guide/plugins.md
+  - docs/CAPABILITIES.md
   - docs/CONTRACT.md
-  - docs/guides/providers.md
+  - docs/public-api.txt
   - README.md
   - CHANGELOG.md
   - Cargo.toml
+  evidence: []
+- id: US-IO-HARNESS-0.35.0-T08
+  summary: 'The gates, run last against the tree that ships: fmt, clippy, both test invocations, the
+    nightly docs.rs command, the cross-version job, and `cargo package --locked` after a `cargo clean`.'
+  why_required: Evidence before assertions. The nightly command has caught something stable `cargo doc`
+    called clean in three consecutive releases.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.35.0-T06
+  - US-IO-HARNESS-0.35.0-T07
+  acceptance_criteria:
+  - '**O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job,
+    with no test skipped silently on Windows. A manifest path is joined from components rather than
+    from a slash-bearing literal, and any source-reading test normalises line endings.
+
+    '
+  - '**O2 — docs.rs builds**, proven by running the nightly job''s exact command (`RUSTDOCFLAGS="--cfg
+    docsrs -D warnings" cargo +nightly doc --all-features --no-deps`) before the release PR is opened,
+    never inferred from a stable `cargo doc`. It has caught something in three consecutive releases.
+
+    '
+  - '**O3 — `cargo package --locked` succeeds** and the packaged crate compiles, run after a `cargo
+    clean`, because `target/` and this volume have collided in every release since 0.25.0. Every local
+    build and test runs with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
+
+    '
+  files:
+  - .ultraship/products/io-harness/execution/tasks.yaml
   evidence: []
