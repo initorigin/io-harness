@@ -699,6 +699,33 @@ pub enum EventKind {
         /// Which rule fired, in words an operator reads.
         why: String,
     },
+    /// A capability bundle was loaded (0.35.0).
+    ///
+    /// Emitted once per plugin, by the caller that loaded them, before the run —
+    /// see [`crate::plugin`]. What a bundle contributed is worth a line in the
+    /// trace on its own: a run whose skill catalogue or policy stack is not what
+    /// its operator expected is answered by this event rather than by reading
+    /// four directories.
+    PluginLoaded {
+        /// The plugin's id, which namespaces every name it contributed.
+        plugin: String,
+        /// Which kinds it declared — `skills`, `templates`, `agents`, `mcp`,
+        /// `hooks`, `policy` — in that order.
+        contributions: Vec<String>,
+    },
+    /// A declared capability bundle was not loaded, and the run went on (0.35.0).
+    ///
+    /// The other half of "dropped and reported, never fatal": a bundle that fails
+    /// to load costs exactly itself, and this is how an operator finds out rather
+    /// than discovering three weeks later that deny rules they believed in were
+    /// never installed.
+    PluginDropped {
+        /// The plugin's id where its manifest named one, else the directory's own
+        /// name.
+        plugin: String,
+        /// What stopped it, worded for whoever has to fix it.
+        why: String,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -761,6 +788,8 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "handle_orphaned",
     "reviewed",
     "routed",
+    "plugin_loaded",
+    "plugin_dropped",
     "finished",
 ];
 
@@ -1273,6 +1302,14 @@ mod tests {
                 to: "big-model".into(),
                 why: "2 consecutive gate failures".into(),
             },
+            EventKind::PluginLoaded {
+                plugin: "rust-review".into(),
+                contributions: vec!["skills".into(), "policy".into()],
+            },
+            EventKind::PluginDropped {
+                plugin: "broken".into(),
+                why: "no plugin.toml".into(),
+            },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -1379,6 +1416,8 @@ mod tests {
                 // model it asks.
                 | EventKind::Reviewed { .. }
                 | EventKind::Routed { .. }
+                | EventKind::PluginLoaded { .. }
+                | EventKind::PluginDropped { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

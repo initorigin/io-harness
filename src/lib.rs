@@ -354,6 +354,7 @@ pub mod hooks;
 pub mod mcp;
 mod net;
 pub mod observe;
+pub mod plugin;
 pub mod policy;
 pub mod pricing;
 pub mod provider;
@@ -388,6 +389,7 @@ pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
 pub use attach::{Attach, Waiting, POLL_LIMIT};
 pub use net::REQUEST_TIMEOUT;
 pub use observe::{Broadcast, EventKind, Flow, Ignore, Observer, RunEvent};
+pub use plugin::{Dropped, Plugin, Plugins, MAX_ID, NAMESPACE, PLUGIN_FILE};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, ModelInfo, OpenAi,
