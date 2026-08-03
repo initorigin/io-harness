@@ -682,8 +682,8 @@ async fn a_run_lands_its_commit_on_a_branch_it_made_and_leaves_the_one_it_found_
     // The branch carries the commit, and the commit carries the change.
     let log = log(p);
     assert!(log.contains("add notes"), "{log}");
-    let show = String::from_utf8_lossy(&git(p, &["show", "--name-only", "--format="]).stdout)
-        .into_owned();
+    let show =
+        String::from_utf8_lossy(&git(p, &["show", "--name-only", "--format="]).stdout).into_owned();
     assert!(show.contains("NOTES.md"), "{show}");
 
     // The existing behaviour survives the branch: the commit is the contract's

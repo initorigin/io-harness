@@ -144,7 +144,10 @@ fn child_steps(content: &str) -> Vec<Vec<ToolCall>> {
             json!({ "path": SHARED, "content": content }),
         )],
         vec![call("git_add", json!({ "paths": [SHARED] }))],
-        vec![call("git_commit", json!({ "message": format!("{content} commit") }))],
+        vec![call(
+            "git_commit",
+            json!({ "message": format!("{content} commit") }),
+        )],
     ]
 }
 
@@ -236,9 +239,10 @@ async fn two_concurrent_children_with_their_own_worktrees_do_not_collide() {
 
     // Each child's branch carries its own commit, named for its own content.
     for t in &trees {
-        let branch = String::from_utf8_lossy(&git(t, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
-            .trim()
-            .to_string();
+        let branch =
+            String::from_utf8_lossy(&git(t, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+                .trim()
+                .to_string();
         assert!(branch.starts_with("worker-"), "{branch}");
         let log = String::from_utf8_lossy(&git(t, &["log", "--oneline", "-1"]).stdout).into_owned();
         let content = std::fs::read_to_string(t.join(SHARED)).unwrap();
@@ -246,9 +250,10 @@ async fn two_concurrent_children_with_their_own_worktrees_do_not_collide() {
     }
 
     // The parent is still on the branch it started on.
-    let head = String::from_utf8_lossy(&git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
-        .trim()
-        .to_string();
+    let head =
+        String::from_utf8_lossy(&git(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+            .trim()
+            .to_string();
     assert_eq!(head, "main");
 }
 
@@ -291,7 +296,11 @@ async fn a_parents_git_status_reports_the_worktree_directory_as_untracked() {
     fan_out(&dir, true).await;
 
     let status = String::from_utf8_lossy(
-        &git(dir.path(), &["status", "--porcelain=v1", "--untracked-files=normal"]).stdout,
+        &git(
+            dir.path(),
+            &["status", "--porcelain=v1", "--untracked-files=normal"],
+        )
+        .stdout,
     )
     .into_owned();
     // One line, for the directory rather than for each worktree inside it: git
@@ -421,7 +430,10 @@ async fn a_resumed_child_continues_in_the_worktree_it_already_had() {
     let before = worktrees(dir.path());
     assert_eq!(before.len(), 1, "one worktree so far: {before:?}");
     let wt = before[0].clone();
-    assert!(wt.join("EARLY.md").is_file(), "the child wrote before the cut");
+    assert!(
+        wt.join("EARLY.md").is_file(),
+        "the child wrote before the cut"
+    );
     let branch_before =
         String::from_utf8_lossy(&git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
             .trim()
@@ -463,8 +475,7 @@ async fn a_resumed_child_continues_in_the_worktree_it_already_had() {
     let after = worktrees(dir.path());
     assert_eq!(after, before, "the same worktree, not a new one: {after:?}");
     assert_eq!(
-        String::from_utf8_lossy(&git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
-            .trim(),
+        String::from_utf8_lossy(&git(&wt, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout).trim(),
         branch_before
     );
 

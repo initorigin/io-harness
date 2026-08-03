@@ -491,20 +491,33 @@ async fn one_call_puts_back_the_files_the_memory_and_the_queue() {
                 "write_file",
                 json!({ "path": "new.md", "content": "invented by the run\n" }),
             )],
-            vec![call("remember", json!({ "key": "retries", "value": "nine" }))],
-            vec![call("remember", json!({ "key": "flaky", "value": "always" }))],
+            vec![call(
+                "remember",
+                json!({ "key": "retries", "value": "nine" }),
+            )],
+            vec![call(
+                "remember",
+                json!({ "key": "flaky", "value": "always" }),
+            )],
         ],
     )
     .await;
 
     // And a backlog it never got to: two children still queued under it.
-    store.enqueue_agent(run_id, 5, "summarise chapter 7", 1).unwrap();
-    store.enqueue_agent(run_id, 5, "summarise chapter 8", 1).unwrap();
+    store
+        .enqueue_agent(run_id, 5, "summarise chapter 7", 1)
+        .unwrap();
+    store
+        .enqueue_agent(run_id, 5, "summarise chapter 8", 1)
+        .unwrap();
 
     // Everything is in place before the rewind — the control for all six effects.
     assert_eq!(bytes(dir.path(), "notes.md"), b"rewritten by the run\n");
     assert!(dir.path().join("new.md").exists());
-    assert_eq!(store.memory_get(&root, "retries").unwrap().unwrap().value, "nine");
+    assert_eq!(
+        store.memory_get(&root, "retries").unwrap().unwrap().value,
+        "nine"
+    );
     assert!(store.memory_get(&root, "flaky").unwrap().is_some());
     assert_eq!(store.queued_agents(run_id).unwrap().len(), 2);
 
@@ -514,7 +527,11 @@ async fn one_call_puts_back_the_files_the_memory_and_the_queue() {
     // created it.
     let verdicts: std::collections::HashMap<&str, &Rewind> =
         done.files.iter().map(|(p, v)| (p.as_str(), v)).collect();
-    assert!(matches!(verdicts["notes.md"], Rewind::Restored(_)), "{:?}", done.files);
+    assert!(
+        matches!(verdicts["notes.md"], Rewind::Restored(_)),
+        "{:?}",
+        done.files
+    );
     assert_eq!(verdicts["new.md"], &Rewind::Removed);
     assert_eq!(bytes(dir.path(), "notes.md"), ORIGINAL);
     assert!(!dir.path().join("new.md").exists());
@@ -567,11 +584,16 @@ async fn a_rewind_writes_down_what_it_took_and_disturbs_nothing_else() {
                 "write_file",
                 json!({ "path": "notes.md", "content": "rewritten\n" }),
             )],
-            vec![call("remember", json!({ "key": "retries", "value": "nine" }))],
+            vec![call(
+                "remember",
+                json!({ "key": "retries", "value": "nine" }),
+            )],
         ],
     )
     .await;
-    store.enqueue_agent(run_id, 3, "a child that never ran", 1).unwrap();
+    store
+        .enqueue_agent(run_id, 3, "a child that never ran", 1)
+        .unwrap();
 
     let before = trace_shape(&store, run_id);
     assert!(before.0 > 0, "the run left steps behind: {before:?}");
@@ -580,7 +602,12 @@ async fn a_rewind_writes_down_what_it_took_and_disturbs_nothing_else() {
     struct Seen<'a>(&'a std::sync::Mutex<Vec<(u32, u32, u32)>>);
     impl Observer for Seen<'_> {
         fn event(&self, e: &RunEvent) -> Flow {
-            if let EventKind::Rewound { files, memory, queued } = &e.kind {
+            if let EventKind::Rewound {
+                files,
+                memory,
+                queued,
+            } = &e.kind
+            {
                 self.0.lock().unwrap().push((*files, *memory, *queued));
             }
             Flow::Continue
@@ -631,14 +658,26 @@ async fn five_writes_to_one_key_rewind_to_the_value_before_the_first() {
 
     let earlier = store.start_run("learn", &root).unwrap();
     store
-        .memory_write(&root, "retries", "the original", earlier, 1, MemoryKind::Fact)
+        .memory_write(
+            &root,
+            "retries",
+            "the original",
+            earlier,
+            1,
+            MemoryKind::Fact,
+        )
         .unwrap();
 
     let (ws, run_id) = drive(
         dir.path(),
         &store,
         (1..=5)
-            .map(|n| vec![call("remember", json!({ "key": "retries", "value": format!("guess {n}") }))])
+            .map(|n| {
+                vec![call(
+                    "remember",
+                    json!({ "key": "retries", "value": format!("guess {n}") }),
+                )]
+            })
             .collect(),
     )
     .await;

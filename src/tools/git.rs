@@ -205,7 +205,9 @@ fn check_branch_name(name: &str) -> Result<()> {
         // Covers a leading `/`, a trailing `/`, an empty component and the
         // `.lock` suffix git reserves for its own lock files — per component,
         // because `refs/heads/a.lock/b` is as invalid as `a.lock`.
-        Some("<each `/`-separated part of a branch name must be non-empty and not end with `.lock`>")
+        Some(
+            "<each `/`-separated part of a branch name must be non-empty and not end with `.lock`>",
+        )
     } else if !name
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-'))
@@ -669,10 +671,8 @@ mod tests {
                 .find(|a| !a.starts_with('-') && !a.contains('='))
                 .expect("every argv has a subcommand");
             assert!(
-                [
-                    "status", "diff", "log", "add", "commit", "switch", "worktree"
-                ]
-                .contains(&sub.as_str()),
+                ["status", "diff", "log", "add", "commit", "switch", "worktree"]
+                    .contains(&sub.as_str()),
                 "{cmd:?} produced subcommand {sub:?}"
             );
         }

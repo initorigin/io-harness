@@ -5948,20 +5948,21 @@ async fn spawn_child<P: Provider>(
     // because the path is derived rather than fresh, and cheaper than leaking a
     // registered agent that never ran.
     let child_root = match def.filter(|d| d.worktree) {
-        Some(d) => match worktree_for(tree, parent_policy, &d.name, goal, parent_run_id, step).await
-        {
-            Ok(root) => Some(root),
-            Err(why) => {
-                return Ok(SpawnResult::Composed {
-                    decision: "worktree unavailable".into(),
-                    obs: format!(
+        Some(d) => {
+            match worktree_for(tree, parent_policy, &d.name, goal, parent_run_id, step).await {
+                Ok(root) => Some(root),
+                Err(why) => {
+                    return Ok(SpawnResult::Composed {
+                        decision: "worktree unavailable".into(),
+                        obs: format!(
                         "\n[spawn error] `{}` needs its own worktree and one could not be made: \
                          {why}\n",
                         d.name
                     ),
-                });
+                    });
+                }
             }
-        },
+        }
         None => None,
     };
     let child_root = child_root.unwrap_or_else(|| tree.root.clone());
@@ -8459,13 +8460,8 @@ async fn dispatch(
         // built-ins, and `Toolbox::validate` has already guaranteed the three
         // sets are disjoint, so the order is documentation rather than a
         // tie-break.
-        GIT_LOG_TOOL
-        | GIT_STATUS_TOOL
-        | GIT_DIFF_TOOL
-        | GIT_ADD_TOOL
-        | GIT_COMMIT_TOOL
-        | GIT_BRANCH_TOOL
-        | GIT_WORKTREE_TOOL => {
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL | GIT_ADD_TOOL | GIT_COMMIT_TOOL
+        | GIT_BRANCH_TOOL | GIT_WORKTREE_TOOL => {
             // Paths the model named, if any. Every one of them is data: `argv`
             // puts them after `--` and refuses a leading `-`.
             let mut paths: Vec<String> = a
