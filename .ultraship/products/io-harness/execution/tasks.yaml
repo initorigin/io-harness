@@ -538,7 +538,7 @@ tasks:
     why_required: >
       The record's evidence is these commands' output. A gate run before the last edit is evidence
       about a tree that no longer exists.
-    status: todo
+    status: done
     depends_on:
       - US-IO-HARNESS-0.36.0-T07
       - US-IO-HARNESS-0.36.0-T08
@@ -565,4 +565,41 @@ tasks:
         Every local build and test runs with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
     files:
       - Cargo.toml
-    evidence: []
+    evidence:
+      - >
+        N1: `cargo tree | wc -l` — **402**, unchanged since 0.23.0. A worktree is a `git` spawn
+        through the spawner the crate already had; a restore point is two tables in the SQLite
+        already there.
+      - >
+        `cargo fmt --check` — clean. `cargo clippy --all-targets --all-features -- -D warnings` —
+        clean, no lint raised.
+      - >
+        `cargo test` (default features) — **61 result lines, 1333 passed, 0 failed**. Preceded by
+        `cargo build --all-features --examples`, per the standing trap that `--lib --tests` cannot
+        build the fixtures.
+      - >
+        `cargo test --all-features` — **61 result lines, 1412 passed, 0 failed**. A separate
+        invocation with `rm -rf target` between the two.
+      - >
+        O2: `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` —
+        clean, run before the release PR. **This is the first release in five where that gate
+        caught nothing**; it is reported rather than passed over, because a gate that suddenly goes
+        quiet is worth noticing and the answer here is that the release added no intra-doc link to
+        a type not `use`d in its own file.
+      - >
+        O3: `cargo clean && cargo package --locked` — exit 0 on a clean tree, **1,309,980 bytes**,
+        and the packaged crate compiles. `.worktrees` is absent from the packaged file list (0
+        entries), and `assets/initorigin-logo.png` is present — the asset 0.35.0 could not ship
+        now ships.
+      - >
+        **A test failed once and passed on a re-run, reported rather than hidden.**
+        `tests/handles.rs::a_handle_that_exits_on_its_own_stops_reading_as_running` failed in the
+        first default-feature run, on a volume that was at 11 GiB free with five rust-analyzer
+        processes rebuilding into the same tree. It reads as a store assertion — the handle still
+        says `running` — and it is a wall-clock one: the exit is noticed by a poll that has to
+        reach disk. It passed in `cargo test --all-features` and again in the re-run of the
+        default suite, and this release touches no handle code. A third flaky Windows-style
+        clock test, on macOS and under load.
+      - >
+        O1 (the three-OS matrix including MSRV 1.95) is CI's and is checked on the release commit
+        rather than claimed here.
