@@ -195,6 +195,34 @@ scope:
     `tests/readme.rs` requires the first 60 lines to say what the crate is, show a runnable fence
     and name the MSRV, and requires no heading to be named after the release that introduced it.
   - >
+    **The badge block is rebuilt on one rule: a badge is a claim, and every claim must be live.**
+    Five badges exist today — crates.io version, docs.rs, CI, licence and MSRV — and four of them
+    read their value from a service at render time while the fifth,
+    `img.shields.io/badge/MSRV-1.95-blue.svg`, has the number **typed into the URL**. That is the
+    same defect as `io-harness = "0.25"` eleven lines below it, in the same file, for the same
+    reason, and it survives only because `tests/docs_drift.rs`'s MSRV checker reads the line and
+    finds the currently-correct number in it. It is replaced by `img.shields.io/crates/msrv/
+    io-harness`, which reads `rust-version` from the published manifest, so the badge cannot
+    disagree with the crate even in the release that raises the floor.
+
+    Then the block gains what a reader deciding whether to depend on this crate actually asks and
+    cannot currently see: **downloads** (`crates.io/d/io-harness`, the adoption signal — 855 today),
+    and **dependency freshness** (`deps.rs/repo/github/initorigin/io-harness`, which for a crate
+    that has held `cargo tree` at 402 lines since 0.23.0 and shipped a whole release over the
+    `links` wall is a first-class fact about it, not decoration).
+
+    What the block does **not** gain is a badge for something nothing measures. There is no coverage
+    tooling in this repository, so there is no coverage badge; there is no benchmark suite, so there
+    is no performance badge; "no unsafe" is false on the Windows path and will not be claimed. A
+    badge asserting a property no gate checks is a green light wired to nothing — the phrase
+    `tests/readme.rs` already uses about its own negative controls — and it is worse on the landing
+    page than in a test, because a reader cannot inspect it.
+
+    The block's cost is paid in the budget `tests/readme.rs` enforces: every badge is a line inside
+    the first 60, the checker excludes `[!`-prefixed lines from counting as prose, and the fence and
+    the MSRV must still be above the fold. Adding two badges spends two of those lines, and the
+    restructure is what pays for them.
+  - >
     **An accuracy sweep of `docs/CONTRACT.md`, `docs/CAPABILITIES.md` and the 22 guide pages**
     against what 0.30.0 through 0.36.0 shipped: a capability whose guide page does not mention it, a
     `known_limitations` entry that a later release fixed, and a limit that became true and was never
@@ -331,6 +359,21 @@ acceptance:
     must still read as open. `tests/guide_pages.rs` and `tests/changelog.rs` pass. What is corrected
     is enumerated in the record; a sweep that found nothing on a page says so rather than being
     silent, since a gate that goes quiet is worth a sentence (trap 82).
+  - >
+    **F10 - every badge renders, and no badge carries a typed-in value.** Each badge URL in the
+    block is requested once and must return an image rather than a 404, an error card or shields'
+    "invalid" render — checked, because a badge that silently renders `invalid` is exactly the
+    landing-page equivalent of a gate that exits 0 having done nothing, and a reader cannot tell the
+    difference from a working one. The discriminating assertion is the second half: **no badge URL
+    contains a version, a number or a status that a human typed**, which today
+    `img.shields.io/badge/MSRV-1.95-blue.svg` does. After this release every badge resolves its
+    value from crates.io, docs.rs, GitHub Actions or deps.rs at render time, so no badge can drift
+    from the crate the way the install snippet drifted for eleven releases. `tests/docs_drift.rs`'s
+    MSRV checker still finds the declared `rust-version` stated somewhere in the README, since the
+    MSRV badge no longer spells it out — if the badge was the only line carrying it, prose must
+    carry it, which is what the checker exists to force. The added badges are downloads and
+    dependency freshness, and no badge is added for coverage, benchmarks or unsafe-freedom, because
+    this repository measures none of the three.
   non_functional:
   - >
     **N1 - no acceptance criterion asserts a duration.** Not one. This repository has three traps
@@ -556,9 +599,22 @@ risks:
   gate. Mitigated by F6 asserting the job graph, and by the release run itself being the exercise.
 - >
   **A README restructure that breaks the gates it is supposed to satisfy.** `tests/readme.rs`
-  measures the first 60 lines; moving prose is exactly what perturbs it. Mitigated by running the
-  two README gates continuously during the rewrite rather than at the end, and by the fact that both
-  are pure functions that run in milliseconds.
+  measures the first 60 lines; moving prose is exactly what perturbs it, and adding two badges
+  spends two of those lines before a word of prose is written. The sharper case is the MSRV badge:
+  replacing `badge/MSRV-1.95` with a dynamic `crates/msrv/io-harness` removes the literal `1.95`
+  from the file, and if that badge was the only line carrying it, both `tests/readme.rs` (the MSRV
+  must be in the first screen) and `tests/docs_drift.rs` (some line must state the declared
+  `rust-version`) fail. That is the checkers working, not a problem — the fix is prose that says it,
+  which a reader needs anyway, since nobody reads a version out of a badge image. Mitigated by
+  running all three gates continuously during the rewrite rather than at the end; they are pure
+  functions over text and run in milliseconds.
+- >
+  **A badge that renders `invalid` and reads as working.** shields.io answers a bad path with a
+  rendered card rather than a 404, so a mistyped crate name or a route that changed produces a badge
+  the page displays and nobody notices — the landing-page form of a gate that exits 0 having done
+  nothing. deps.rs is the exposure here, being the one new service and the one whose URL shape is
+  not already proven in this file. Mitigated by F10 requesting each URL once and checking what came
+  back, and by dropping any badge whose service cannot be shown to answer for this crate.
 - >
   **Correcting documentation with a fact that is itself stale.** The product table is being fixed
   because it went stale; replacing it with today's numbers has the same failure mode a year out.
@@ -593,3 +649,16 @@ open_questions:
   Whether the four checker tests - MSRV, features, links, and now the dependency version - want to
   be one drift suite with one table of facts rather than four hand-written checkers. Four is not yet
   enough to justify the abstraction; the fifth might be.
+- >
+  **Whether the dependency-freshness badge is wanted, given what it says today.** All five candidate
+  URLs were requested during planning and all five return 200 with a real value:
+  `crates/msrv/io-harness` renders **1.95**, which is exactly what the hardcoded badge asserts, so
+  the dynamic replacement is a drop-in rather than a change of claim; `crates/d/io-harness` renders
+  **855**; and `deps.rs/repo/github/initorigin/io-harness/status.svg` renders **"3 of 25
+  outdated"**. That last one is the question. The badge is honest and it is the reason to have it -
+  a crate that held `cargo tree` at 402 lines since 0.23.0 and spent a whole release on the `links`
+  wall is one whose dependency currency is a real fact about it - but it puts an amber line on the
+  landing page until those three are bumped, and Dependabot targets `develop`, so they may already
+  have open PRs. Three courses: take the badge as-is because it is true, bump the three during this
+  release and take the badge green, or leave the badge out. This is an owner call and is not made
+  here.
