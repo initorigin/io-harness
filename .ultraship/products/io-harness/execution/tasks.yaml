@@ -9,7 +9,7 @@ tasks:
     from the source, the set becomes a list someone typed, and the next release that adds a fixture example
     rediscovers trap 18 for the fourth time. The test has to exist before the workflow shrinks, or the
     shrink is unguarded.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F3 - the matrix builds the fixture examples and no others, and a test keeps the two sets equal.**
@@ -23,7 +23,32 @@ tasks:
     '
   files:
   - tests/ci_workflow.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test ci_workflow` — 5 passed, 1 failed. The one failure is `the_matrix_builds_exactly_the_examples_the_tests_spawn`,
+    which is the point: the checker was written before ci.yml shrank, and it reports the whole spawned
+    set as unbuilt because the workflow names no example yet. It goes green in T02, against a workflow
+    built from this set rather than from a list anyone typed.'
+  - '**The derived set is EIGHT, not the five F3''s prose enumerates.** Reading `tests/` returns `attach_fixture`,
+    `crash_fixture`, `fleet_fixture`, `flood`, `mcp_fixture_server`, `orphan`, `plan_gate_fixture`, `tick`.
+    `tests/handles.rs` spawns `tick`, `orphan` and `flood` through its own `example_binary` helper, and
+    the contract''s parenthetical list omitted all three. The criterion says the set is ''derived by reading
+    `tests/` for spawns of an example binary'', so the criterion is met against the derived set — and
+    an incomplete hand-written enumeration inside the criterion that defines the checker is precisely
+    what the checker exists to stop anyone relying on. Recorded rather than silently widened.'
+  - 'Two real defects found by the controls before the checker was trusted. (1) The scan read its own
+    file: `tests/ci_workflow.rs`''s negative-control fixtures are Rust source containing spawn markers
+    and example names, so scanning `tests/*.rs` put `edit_file` — a tool name that is also an example
+    — into the real set. The checker now skips itself. (2) The window was eight lines and admitted a literal
+    five lines from a marker; every real spawn puts the name on the marker line or one line from it, so
+    the window is two. Both were found by `control_a_tool_name_far_from_a_spawn_is_not_spawned` failing,
+    not by inspection.'
+  - 'The controls, each shown to discriminate: `control_a_spawn_the_workflow_does_not_build_is_reported`
+    (a fixture spawning `ghost_fixture` the workflow does not name — the fifth occurrence of trap 18,
+    caught as a named failure); `control_an_example_built_for_nobody_is_reported` (the other direction,
+    link time nobody needs); `control_a_name_only_in_a_comment_is_not_spawned` (`tests/attach.rs` really
+    does name three sibling fixtures in prose); `control_a_tool_name_far_from_a_spawn_is_not_spawned`;
+    `control_the_plural_examples_flag_is_not_a_named_build` (`cargo check --examples` must not be read
+    as a named build, or the built set absorbs everything and the comparison proves nothing).'
 - id: US-IO-HARNESS-0.36.1-T02
   summary: 'Restructure `.github/workflows/ci.yml`: `test` becomes a matrix over `os` x `features`, the
     doctests become their own per-OS job, each matrix leg builds the library, the test binaries and the
