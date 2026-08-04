@@ -148,6 +148,57 @@ because no child exists to attribute it to. That is the point of a refusal.
 
 Run it live: `cargo run --example subagents`.
 
+## A child can have its own checkout (0.36.0)
+
+Everything above is about how many agents run at once. This is about what they
+run *on*, and until 0.36.0 the answer was: one working directory, shared by the
+whole tree. Two children editing the same file are one overwriting the other, so
+the concurrency the caps allow was usable only for work that does not overlap —
+a real bound on a feature whose whole point is overlap.
+
+`AgentDef::with_worktree()` gives a child its own git worktree and its own
+branch, created before its first step:
+
+```rust,no_run
+use io_harness::AgentDef;
+
+let shared = AgentDef::new("searcher");
+assert!(!shared.worktree, "one checkout, as every release before 0.36.0");
+
+let own = AgentDef::new("reviewer").with_worktree();
+assert!(own.worktree);
+```
+
+The worktree is placed at `<root>/.worktrees/<agent>-<parent run>-<step>-<goal
+digest>`. Every component of that path is load-bearing, and the last one is the
+least obvious: two children of the *same* definition spawned in the *same* step
+— the ordinary shape of a fan-out — differ in nothing but their goal, so without
+the digest they would be handed one worktree between them, which is the
+collision the field exists to remove reappearing one level down.
+
+It is derived from the key a spawn is *adopted* by, which is what makes it
+survive a crash: a resumed tree finds the worktree it already made and continues
+in it, rather than re-creating it and discarding what the child had written.
+
+Four bounds, stated rather than implied:
+
+- **A failure to create one fails the spawn.** No `git`, not a repository, or a
+  policy that refuses the path — the child does not start, and the reason is the
+  spawn's. It does **not** fall back to the parent's tree, because that fallback
+  is precisely the collision the field removes.
+- **The path is checked against the parent's policy before `git` is asked.** The
+  crate is writing somewhere the model did not name, and an unchecked write is a
+  claim it does not get to make. A policy denying `.worktrees/**` turns the
+  feature off loudly rather than quietly.
+- **Nothing removes a worktree or deletes a branch, ever.** Removing one deletes
+  the work a child was spawned to produce, so it stays the operator's call, and
+  worktrees a run created accumulate until someone removes them.
+- **A worktree is visible to the parent's own `git_status`**, as one untracked
+  `?? .worktrees/` entry, because git summarises an untracked directory rather
+  than descending into it — so a `git_add` naming `.` in the parent stages the
+  children's trees. This crate writes to no repository metadata on your behalf;
+  add `/.worktrees/` to `.git/info/exclude` if you want it hidden.
+
 ## See also
 
 - [Permissions and approval](permissions.md) — the policy `contain` narrows

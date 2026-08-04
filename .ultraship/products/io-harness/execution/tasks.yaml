@@ -365,7 +365,7 @@ tasks:
   why_required: Documentation is part of the release, not after it. Seven releases of capability landed
     against pages that were each written for one of them, and a limitation that is no longer true is a
     contract that lies in the reader's favour.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F9 - the documentation sweep is against the releases, not against a feeling.** Every capability
@@ -378,10 +378,53 @@ tasks:
 
     '
   files:
-  - docs/CONTRACT.md
   - docs/CAPABILITIES.md
-  - docs/guide
-  evidence: []
+  - docs/guide/composition.md
+  - docs/guide/verification.md
+  - src/agent.rs
+  evidence:
+  - '`cargo test --test guide_pages --test docs_drift --test changelog --test readme --test public_api`
+    — 5, 15, 7, 8 and 9 passed, 0 failed. `docs/public-api.txt` is untouched (`git status` reports it
+    unmodified), which is N2''s claim and is now a fact rather than an intention.'
+  - '**Gap 1 — a capability whose guide page does not mention it.** `docs/guide/composition.md` is the
+    guide for agent composition and in 158 lines it contained the strings `worktree` and `AgentDef` exactly
+    zero times. 0.36.0''s per-child worktree is the feature whose entire purpose is that concurrent children
+    stop overwriting each other''s files — which is the bound the rest of that page''s concurrency story
+    runs into. It was documented in `images-and-git.md`, `durable-runs.md` and `docs/CONTRACT.md`, and
+    absent from the one page a reader asking "can two children work at once" would open. Added, with its
+    four bounds stated rather than implied: the spawn fails rather than falling back, the path is policy-checked
+    before `git` is asked, nothing ever removes a worktree or deletes a branch, and the parent''s `git_status`
+    sees `?? .worktrees/`.'
+  - '**Gap 2 — a public doc comment that is stale in exactly the component a release paid to add.** `AgentDef::worktree`''s
+    rustdoc documented the path as `<root>/.worktrees/<agent>-<parent run>-<step>`. The shipped derivation
+    in `worktree_for` is `<agent>-<parent_run>-<step>-<goal digest>`. The digest is the whole reason the
+    feature works for a fan-out: two children of the same definition in the same step differ in nothing
+    else and would otherwise share one worktree. A caller reading the public doc and deriving that path
+    would not find the directory. Corrected, with why the component exists.'
+  - '**Gap 3 — an index entry that stopped being true.** `docs/CAPABILITIES.md` listed the git built-ins
+    as "status, diff, log, add and commit". 0.36.0 added branch and worktree, and the README''s own prose
+    already said so — the index alone was behind.'
+  - '**Gap 4 — a guide page over-claiming a rule that rests on a defaulted trait method.** `docs/guide/verification.md`
+    stated "A model may not review its own work" flatly. The rule compares `Provider::model_hint`, which
+    is defaulted to `None` — the default that kept 0.34.0 from breaking the crate''s one extension point
+    — so for a provider that does not override it the comparison has nothing to compare and **the rule
+    is a no-op, not a failure**: the review runs, possibly on the model that wrote the change. `docs/CONTRACT.md:587`
+    already said so; the guide did not. This is the standing rule that a defaulted method makes any feature
+    resting on it a no-op for a provider that does not override it, and that it must be stated honestly.'
+  - '**Pages where the sweep found nothing, said rather than left silent** (trap 82''s rule, that a gate
+    going quiet is worth a sentence). `providers.md` covers `Routing`, `Provider::models()` and `reachable()`
+    including the defaulted-no-op consequence, correctly and in the honest form gap 4 was missing. `verification.md`
+    covers `retry_gate` and `Verification::Review`''s three-way outcome. `plugins.md` covers `plugin.toml`
+    and what a project-scoped declaration may not contribute. `durable-runs.md` and `context-and-memory.md`
+    both cover `rewind_run`. `docs/CONTRACT.md`''s worktree section is the most complete account of the
+    0.36.0 git surface in the repository and needed no correction — including the version floors it deliberately
+    does not probe for.'
+  - '**Every `known_limitations` entry the brief lists as open was checked and still reads as open**,
+    so none was removed: `Containment::max_total_cost` is documented in `composition.md` as "reserved,
+    and not enforced" with the reason (no price telemetry) and the workaround; the narrowed `resume_tree`
+    / `resume_tree_observed` split that 0.32.0 half-fixed still reads in its narrowed form and was not
+    re-broadened into the blanket claim. Nothing was deleted from `docs/CONTRACT.md` on the strength of
+    a release having ''probably'' fixed it.'
 - id: US-IO-HARNESS-0.36.1-T11
   summary: '`CHANGELOG.md` gains its `## [0.36.1]` section, and the release''s own honesty criteria are
     settled: no criterion asserts a duration, the durations are read from the Actions API by run id and
