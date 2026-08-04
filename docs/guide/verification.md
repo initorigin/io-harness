@@ -124,6 +124,16 @@ reviewer whose model equals the model under review is refused with `Error::Confi
 already believes; the refusal is not a warning, and it costs nothing because it
 happens before the wire.
 
+**But the refusal can only fire for a provider that names its model.** It compares
+`Provider::model_hint`, which is a defaulted trait method returning `None` — the
+default every out-of-tree provider gets for free, and the reason adding the method
+did not break the crate's one extension point. For a provider that does not
+override it the comparison has nothing to compare, so **the rule is a no-op, not a
+failure**: the review runs, and it may well run on the model that wrote the change.
+The three providers this crate ships override it. If you have implemented
+`Provider` yourself and you want this rule to hold, override `model_hint` — nothing
+will tell you that it is silently not holding.
+
 **What a review does not prove.** It is one model's opinion of one change against
 one rubric, at one moment: not deterministic, not reproducible across model
 versions, and not a proof. It does not replace an execution gate — run the suite
