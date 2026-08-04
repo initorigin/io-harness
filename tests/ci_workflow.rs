@@ -75,7 +75,8 @@ const SELF: &str = "ci_workflow.rs";
 /// Every example target name, from `examples/*.rs`.
 fn examples_on_disk(dir: &Path) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "rs") {
@@ -150,7 +151,8 @@ fn spawned_examples(source: &str, known: &BTreeSet<String>) -> BTreeSet<String> 
 /// Every example spawned anywhere under `tests/`.
 fn spawned_across(dir: &Path, known: &BTreeSet<String>) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
-    let entries = fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+    let entries =
+        fs::read_dir(dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
     for entry in entries.flatten() {
         let path = entry.path();
         if path.file_name().is_some_and(|n| n == SELF) {
@@ -343,7 +345,8 @@ fn control_the_plural_examples_flag_is_not_a_named_build() {
     // `cargo check --examples` is how the thirty demonstrations keep their
     // compile check. If it were matched as a name, the built set would silently
     // absorb everything and the comparison would prove nothing.
-    let built = workflow_examples("- run: cargo check --examples\n- run: cargo build --example tick\n");
+    let built =
+        workflow_examples("- run: cargo check --examples\n- run: cargo build --example tick\n");
     assert_eq!(
         built,
         ["tick"]
