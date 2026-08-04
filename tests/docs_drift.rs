@@ -1,11 +1,19 @@
-//! Documentation drift checkers — F4, F9, F10 of 0.16.0.
+//! Documentation drift checkers — F4, F9, F10 of 0.16.0; F7 of 0.36.1.
 //!
-//! Three facts are stated in `Cargo.toml` and then retyped into prose, which is
-//! the shape that rots: the MSRV, the feature list, and every relative link.
-//! Each checker here is a pure function over text plus one test that runs it
-//! against the real files, and each carries a negative control — a fixture that
-//! must fail — because a checker that has never failed is a checker nobody has
-//! shown to work.
+//! Four facts are stated in `Cargo.toml` and then retyped into prose, which is
+//! the shape that rots: the MSRV, the feature list, every relative link, and
+//! the version a reader is told to depend on. Each checker here is a pure
+//! function over text plus one test that runs it against the real files, and
+//! each carries a negative control — a fixture that must fail — because a
+//! checker that has never failed is a checker nobody has shown to work.
+//!
+//! The fourth was added by 0.36.1 and it is the one that rotted furthest. The
+//! README's `[dependencies]` snippet said `io-harness = "0.25"` for eleven
+//! releases: a reader copying the single highest-traffic line in the repository
+//! got a crate without `Session`'s current surface, without plugins, without the
+//! git built-ins, without `rewind_run` — and got no error, because `0.25`
+//! resolves. Eleven releases of drift in a file that already had a drift
+//! checker is the argument for the fourth checker, not against the three.
 //!
 //! Two conventions this file fixes, so the prose tasks know what to write:
 //!
@@ -51,6 +59,23 @@ fn declared_msrv(cargo_toml: &str) -> String {
             Some(value.trim_matches('"').to_string())
         })
         .expect("Cargo.toml declares no rust-version")
+}
+
+/// The `version` value from a `Cargo.toml`'s `[package]` table.
+///
+/// The first `version = ` line in the file: `[package]` opens it, and the
+/// `[dependencies]` entries below use inline tables or their own `version` keys
+/// inside a nested table, never a bare top-level one. The same assumption
+/// `release.yml` already makes with `sed -n 's/^version = "\(.*\)"/\1/p' | head -1`.
+fn declared_version(cargo_toml: &str) -> String {
+    cargo_toml
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("version")?;
+            let value = rest.trim_start().strip_prefix('=')?.trim();
+            Some(value.trim_matches('"').to_string())
+        })
+        .expect("Cargo.toml declares no version")
 }
 
 /// The keys of the `[features]` table.
@@ -190,6 +215,119 @@ fn msrv_checker_accepts_the_real_declaration() {
                    - **MSRV:** Rust **1.88**. The floor comes from `rmcp`, which publishes no\n\
                      `rust-version` of its own — on 1.87 the build fails inside it.\n";
     assert_eq!(msrv_matches("1.88", fixture), Ok(()));
+}
+
+// ---------------------------------------------------------------------------
+// F7 of 0.36.1 — the version a reader is told to depend on
+// ---------------------------------------------------------------------------
+
+/// `major.minor` of a full version — what a reader writes in `[dependencies]`.
+///
+/// The snippet carries two components on purpose. `io-harness = "0.36"` is the
+/// requirement a caller wants (any 0.36.x), and it is also what a patch release
+/// must not churn: bumping the README on every patch would put a line in the
+/// diff of every release that says nothing.
+fn major_minor(version: &str) -> String {
+    version.split('.').take(2).collect::<Vec<_>>().join(".")
+}
+
+/// Every `io-harness = "<version>"` dependency line in `doc_text`, as
+/// `(line number, version)`.
+///
+/// Inside a fence, deliberately: this is the snippet a reader copies out of a
+/// ```toml block, and a mention of the crate name in prose is not a claim about
+/// which version to depend on.
+fn readme_dependency_versions(doc_text: &str) -> Vec<(usize, String)> {
+    let dep = Regex::new(r#"^\s*io-harness\s*=\s*"([^"]+)""#).unwrap();
+    doc_text
+        .lines()
+        .enumerate()
+        .filter_map(|(i, line)| dep.captures(line).map(|c| (i + 1, c[1].to_string())))
+        .collect()
+}
+
+/// Does every `[dependencies]` snippet name the current `major.minor`?
+///
+/// Silence is a failure for the same reason it is for the MSRV: a landing page
+/// with no install line is not a landing page, and a checker that accepts an
+/// absent claim stops noticing when the claim is deleted rather than corrected.
+fn dependency_version_matches(declared: &str, doc_text: &str) -> Result<(), String> {
+    let want = major_minor(declared);
+    let found = readme_dependency_versions(doc_text);
+
+    if found.is_empty() {
+        return Err(format!(
+            "states no dependency version — Cargo.toml declares {declared}, so this file needs \
+             an `io-harness = \"{want}\"` line in its install snippet"
+        ));
+    }
+
+    let stale: Vec<String> = found
+        .iter()
+        .filter(|(_, v)| *v != want)
+        .map(|(line, v)| format!("line {line}: io-harness = \"{v}\""))
+        .collect();
+
+    if stale.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "tells a reader to depend on a version that is not this one \
+             (Cargo.toml declares {declared}, so the snippet must say \"{want}\"):\n  {}",
+            stale.join("\n  ")
+        ))
+    }
+}
+
+#[test]
+fn readme_dependency_version_matches_cargo_toml() {
+    let declared = declared_version(&read("Cargo.toml"));
+    if let Err(e) = dependency_version_matches(&declared, &read("README.md")) {
+        panic!(
+            "README.md {e}\n\n\
+             This is the single highest-traffic line in the repository: it is what a reader \
+             copies from the crates.io landing page. A stale one produces no error — an old \
+             version resolves — so nobody reports it, which is how it went eleven releases \
+             without being noticed.\n"
+        );
+    }
+}
+
+#[test]
+fn dependency_version_checker_rejects_the_line_that_was_there_for_eleven_releases() {
+    // The real line, verbatim, as `README.md:28` carried it from 0.25.0 to
+    // 0.36.0. The control is the defect itself rather than an invented one.
+    let fixture = "```toml\n[dependencies]\nio-harness = \"0.25\"\n\
+                   tokio = { version = \"1\", features = [\"rt-multi-thread\"] }\n```\n";
+    let err = dependency_version_matches("0.36.1", fixture)
+        .expect_err("the stale install line must be reported");
+    assert!(err.contains("0.25"), "must quote the offending line: {err}");
+    assert!(err.contains("0.36"), "must name what it should say: {err}");
+}
+
+#[test]
+fn dependency_version_checker_accepts_the_corrected_line() {
+    let fixture = "```toml\n[dependencies]\nio-harness = \"0.36\"\n```\n";
+    assert_eq!(dependency_version_matches("0.36.1", fixture), Ok(()));
+}
+
+#[test]
+fn dependency_version_checker_rejects_silence() {
+    let err = dependency_version_matches("0.36.1", "# io-harness\n\nNo install line at all.\n")
+        .expect_err("a README with no install snippet must be reported");
+    assert!(err.contains("states no dependency version"), "{err}");
+}
+
+#[test]
+fn dependency_version_is_major_minor_so_a_patch_does_not_churn_the_readme() {
+    // The whole point of two components: 0.36.0 and 0.36.1 want the same line,
+    // so a patch release does not put a no-op edit in its own diff.
+    assert_eq!(major_minor("0.36.1"), "0.36");
+    assert_eq!(major_minor("0.36.0"), "0.36");
+    let fixture = "io-harness = \"0.36\"\n";
+    assert_eq!(dependency_version_matches("0.36.0", fixture), Ok(()));
+    assert_eq!(dependency_version_matches("0.36.1", fixture), Ok(()));
+    assert!(dependency_version_matches("0.37.0", fixture).is_err());
 }
 
 // ---------------------------------------------------------------------------

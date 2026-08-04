@@ -1,605 +1,605 @@
 product: io-harness
-version: 0.36.0
+version: 0.36.1
 tasks:
-  - id: US-IO-HARNESS-0.36.0-T01
-    summary: >
-      Two new `GitCmd` shapes — `Branch` and `Worktree` — and the branch-name validator, with the
-      argv sweeps and the forbidden-list test extended to cover them without being relaxed.
-    why_required: >
-      Every other git task renders through `GitCmd::options`/`paths`. Without the two shapes and a
-      validator that refuses a name before any spawn, there is nothing for a tool to call and the
-      fixed-argv property has no test that covers the new surface.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        **F1 — the two built-ins are fixed argv, and the forbidden surface is still unreachable.**
-        Every `GitCmd` shape, including the two new ones, is asserted to produce a subcommand drawn
-        from `status`, `diff`, `log`, `add`, `commit`, `switch`, `worktree` and nothing else, and
-        `no_shape_can_write_or_reach_the_network` passes **unchanged** over the widened shape list —
-        the pre-existing test, not a rewritten one, because a release that relaxed the list to fit
-        its new argv is what that test exists to catch. The control is name validation: `-x`,
-        `a..b`, `/lead`, `trail/`, `x.lock`, a 101-character name and an empty name are each refused
-        before any spawn, and the same name with the offending part removed is accepted.
-    files:
-      - src/tools/git.rs
-    evidence:
-      - >
-        `cargo test --lib tools::git` — 13 passed, 0 failed, including
-        `no_shape_can_write_or_reach_the_network` **unchanged** over the widened eight-shape list
-        and `the_subcommand_is_always_one_of_the_seven_this_crate_ships`.
-      - >
-        F1's control, `a_branch_name_git_could_read_as_an_option_is_refused_and_its_repaired_form_is_not`:
-        `-x`, `a..b`, `/lead`, `trail/`, `x.lock`, a 101-character name and an empty name are each
-        refused for both `Branch` and `Worktree` before an argv exists, and each repaired form
-        builds `--create=<name>`. Three more the allowlist catches for free: a space, `^` and `@{`.
-      - >
-        Sabotage S1 — `cmd.check()?` removed from `Git::argv` — failed exactly
-        `a_branch_name_git_could_read_as_an_option_is_refused_and_its_repaired_form_is_not`
-        (12 passed, 1 failed), so the refusal is the code's and not the test's.
+- id: US-IO-HARNESS-0.36.1-T01
+  summary: '`tests/ci_workflow.rs`: derive the set of example binaries the suite spawns by reading `tests/`,
+    parse the example names out of `.github/workflows/ci.yml`, assert the two sets are equal, and carry
+    the negative control that a spawn the workflow does not build must be reported.'
+  why_required: The matrix stops building thirty examples. Without a test that derives the fixture set
+    from the source, the set becomes a list someone typed, and the next release that adds a fixture example
+    rediscovers trap 18 for the fourth time. The test has to exist before the workflow shrinks, or the
+    shrink is unguarded.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - '**F3 - the matrix builds the fixture examples and no others, and a test keeps the two sets equal.**
+    `tests/ci_workflow.rs` derives the set of example binaries the suite spawns by reading `tests/`, parses
+    the example names out of `.github/workflows/ci.yml`, and asserts they are equal. The negative control
+    is a fixture naming a spawn of an example the workflow does not build, which the checker must report
+    — the convention `tests/docs_drift.rs` and `tests/readme.rs` both state: a checker that cannot be
+    made to fail is a green light wired to nothing. The thirty remaining examples are still compile-checked,
+    by `cargo check --examples` on Linux, asserted present by F1''s enumeration.
 
-  - id: US-IO-HARNESS-0.36.0-T02
-    summary: >
-      `git_branch` and `git_worktree` as built-ins the model can call: tool name constants, tool
-      specs, dispatch, and an end-to-end run over a real repository that lands its commit on a new
-      branch while the branch it started on stays put.
-    why_required: >
-      The release's headline outcome is that a run lands as a branch. A `GitCmd` variant no tool
-      dispatches to reaches no run, and the claim is only true if the starting branch is unmoved.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T01
-    acceptance_criteria:
-      - >
-        **F2 — a run lands as a branch, and the branch it started on is unmoved.** A real git
-        repository in a temporary directory with one commit on `main`. A scripted provider drives
-        `git_branch`, an edit, `git_add` and `git_commit`. Assertions: `HEAD` is the new branch, the
-        new branch's tip is a commit the run made, the file's change is in that commit, **and `main`
-        still points at the commit it pointed at before the run** — the discriminating one, because
-        a run that never switched satisfies every other assertion here. The commit is attributed to
-        the run's `Identity`, which is the existing behaviour asserted to survive the branch.
-    files:
-      - src/tools/mod.rs
-      - src/run.rs
-      - tests/git.rs
-    evidence:
-      - >
-        `cargo test --test git` — 14 passed, 0 failed. The two added tests are
-        `a_run_lands_its_commit_on_a_branch_it_made_and_leaves_the_one_it_found_alone` and
-        `an_agent_makes_a_second_working_tree_and_a_denied_path_refuses_it`; the twelve that
-        existed pass unchanged.
-      - >
-        F2 in full: `HEAD` is `agent/fix-the-flake`, the log holds `add notes`, `git show
-        --name-only` holds `NOTES.md`, the commit's author is `Agent Smith
-        <smith@example.invalid>` from the contract's identity, and **`main` points at the same
-        commit it pointed at before the run** while the new branch does not.
-      - >
-        The worktree half is asserted with its own control: `.worktrees/side/README.md` is a real
-        checkout on branch `agent/side`, the parent is still on `main`, and the identical call at
-        `private/wt` under `deny_write("private/**")` creates neither the directory nor the branch.
-      - >
-        Sabotage S2 — `git_branch` dispatched to `GitCmd::Status`, which is exactly the 0.35.0
-        behaviour of committing onto the branch that was found — failed exactly
-        `a_run_lands_its_commit_on_a_branch_it_made_and_leaves_the_one_it_found_alone`
-        (13 passed, 1 failed). The file still got written, staged and committed under the sabotage,
-        which is why the unmoved-`main` assertion is the one that discriminates.
-      - >
-        The `git_commit` tool description said "no push, no branch switching and no history
-        rewriting"; the middle clause became false in this release and was corrected in the same
-        commit rather than left for a reader to discover.
+    '
+  files:
+  - tests/ci_workflow.rs
+  evidence:
+  - '`cargo test --test ci_workflow` — 5 passed, 1 failed. The one failure is `the_matrix_builds_exactly_the_examples_the_tests_spawn`,
+    which is the point: the checker was written before ci.yml shrank, and it reports the whole spawned
+    set as unbuilt because the workflow names no example yet. It goes green in T02, against a workflow
+    built from this set rather than from a list anyone typed.'
+  - '**The derived set is EIGHT, not the five F3''s prose enumerates.** Reading `tests/` returns `attach_fixture`,
+    `crash_fixture`, `fleet_fixture`, `flood`, `mcp_fixture_server`, `orphan`, `plan_gate_fixture`, `tick`.
+    `tests/handles.rs` spawns `tick`, `orphan` and `flood` through its own `example_binary` helper, and
+    the contract''s parenthetical list omitted all three. The criterion says the set is ''derived by reading
+    `tests/` for spawns of an example binary'', so the criterion is met against the derived set — and
+    an incomplete hand-written enumeration inside the criterion that defines the checker is precisely
+    what the checker exists to stop anyone relying on. Recorded rather than silently widened.'
+  - 'Two real defects found by the controls before the checker was trusted. (1) The scan read its own
+    file: `tests/ci_workflow.rs`''s negative-control fixtures are Rust source containing spawn markers
+    and example names, so scanning `tests/*.rs` put `edit_file` — a tool name that is also an example
+    — into the real set. The checker now skips itself. (2) The window was eight lines and admitted a literal
+    five lines from a marker; every real spawn puts the name on the marker line or one line from it, so
+    the window is two. Both were found by `control_a_tool_name_far_from_a_spawn_is_not_spawned` failing,
+    not by inspection.'
+  - 'The controls, each shown to discriminate: `control_a_spawn_the_workflow_does_not_build_is_reported`
+    (a fixture spawning `ghost_fixture` the workflow does not name — the fifth occurrence of trap 18,
+    caught as a named failure); `control_an_example_built_for_nobody_is_reported` (the other direction,
+    link time nobody needs); `control_a_name_only_in_a_comment_is_not_spawned` (`tests/attach.rs` really
+    does name three sibling fixtures in prose); `control_a_tool_name_far_from_a_spawn_is_not_spawned`;
+    `control_the_plural_examples_flag_is_not_a_named_build` (`cargo check --examples` must not be read
+    as a named build, or the built set absorbs everything and the comparison proves nothing).'
+- id: US-IO-HARNESS-0.36.1-T02
+  summary: 'Restructure `.github/workflows/ci.yml`: `test` becomes a matrix over `os` x `features`, the
+    doctests become their own per-OS job, each matrix leg builds the library, the test binaries and the
+    fixture examples only, and the remaining examples are compile-checked once on Linux with `cargo check
+    --examples`.'
+  why_required: This is the release's headline change. Every other CI task is a lever on top of it, and
+    F1's set-cover comparison and F2's concurrency claim are both about this file.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.36.1-T01
+  acceptance_criteria:
+  - '**F1 - every cargo invocation the workflows run today still runs, on the same operating systems.**
+    The set of `(os, cargo invocation)` pairs is enumerated from the current `ci.yml` and `release.yml`
+    at the 0.36.0 tag, and from the new files, and the second must cover the first pair for pair. Concretely,
+    on each of `ubuntu-latest`, `macos-latest` and `windows-latest` the new workflow must still run the
+    default-feature test binaries, the default-feature doctests, and the `--all-features --lib --tests`
+    binaries; on `ubuntu-latest` it must still run `--all-features --doc`, `cargo check --all-targets`,
+    `cargo check --all-targets --all-features` at the MSRV, `fmt --check`, `clippy --all-targets`, `clippy
+    --all-targets --features documents`, `clippy --all-targets --features media`, the `links-consumer`
+    fixture pair with its negative control, the pinned-0.29.0 generator with its pin check, and the nightly
+    docs build with its rendered-label grep. The coverage table is written into the release record. The
+    discriminating case: a split that quietly dropped the macOS doctests would pass every duration measurement
+    in this release and fail here.
 
-  - id: US-IO-HARNESS-0.36.0-T03
-    summary: >
-      `AgentDef` gains `#[non_exhaustive]` and `worktree`, and a child of that definition is rooted
-      at its own worktree on its own branch, with the `worktree = false` collision executed as the
-      control.
-    why_required: >
-      "Concurrent agents stop colliding on one working tree" is unreachable while `spawn_child`
-      hard-codes the tree root, and the property is worth nothing unless the collision it removes is
-      demonstrated.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T02
-    acceptance_criteria:
-      - >
-        **F3 — two concurrent children do not collide, and the collision is executed as the
-        control.** A tree whose roster holds one `worktree = true` definition,
-        `max_concurrent_agents = 2`, two children spawned from it, each writing the same relative
-        path with different contents. Assertions: each child's worktree exists at its own path under
-        `.worktrees/`, each holds that child's content, the two contents differ, the parent's own
-        working tree does not hold either, and each child's branch carries its own commit. **The
-        control is the identical tree with `worktree = false`**, under which the two children write
-        one file and one write is lost — the property is worth nothing unless the control fails, so
-        the control is run and its outcome recorded. What the parent's `git_status` reports with the
-        worktrees present is asserted to be whatever it is and written into `docs/CONTRACT.md`; it
-        is not assumed.
-    files:
-      - src/agent.rs
-      - src/run.rs
-      - tests/worktree.rs
-    evidence:
-      - >
-        `cargo test --test worktree` — 4 passed, 0 failed:
-        `two_concurrent_children_with_their_own_worktrees_do_not_collide`,
-        `the_same_two_children_sharing_one_tree_lose_a_write`,
-        `a_parents_git_status_reports_the_worktree_directory_as_untracked` and
-        `a_worktree_that_cannot_be_made_fails_the_spawn_instead_of_sharing_the_tree`.
-      - >
-        F3 in full: two children of one `worktree = true` definition, spawned in one step under
-        `max_concurrent_agents = 2`, produce two directories under `.worktrees/`, each holding its
-        own content (`alpha` and `beta`, sorted and compared), each on its own `worker-…` branch
-        carrying its own commit, with the parent's tree holding neither file and still on `main`.
-      - >
-        **The control is executed, not described.** The identical tree with `worktree = false`
-        leaves `.worktrees/` empty, writes one file into the parent's tree, and that file holds one
-        of the two answers — the other child's write is gone. The collision is real, so removing it
-        is worth something.
-      - >
-        The `git_status` measurement the criterion asked for rather than assumed: the parent
-        reports exactly one line for the worktrees, `?? .worktrees/` — git summarises the untracked
-        directory and does not descend into it. Carried into `docs/CONTRACT.md` by T09.
-      - >
-        Sabotage S3 — the goal digest dropped from the slug, so two children of one definition in
-        one step derive one path — failed exactly
-        `two_concurrent_children_with_their_own_worktrees_do_not_collide` (3 passed, 1 failed).
-      - >
-        Sabotage S4 — a worktree that cannot be made falls back to the parent's tree instead of
-        failing the spawn — failed exactly
-        `a_worktree_that_cannot_be_made_fails_the_spawn_instead_of_sharing_the_tree` (3 passed, 1
-        failed). One sabotage per arm, per trap 51: S3 covers "each child gets its own" and S4
-        covers "and a child that cannot have one does not start".
-      - >
-        **A criterion met in a different form, stated not glossed.** The contract's prose derives
-        the worktree path from `<agent>-<parent_run_id>-<step>`. That is not unique for the shape
-        F3 actually names — two children of the *same* definition in the *same* step differ only in
-        their goal — so the slug carries a fourth component, an FNV-1a digest of the goal, which is
-        the remaining part of the `(parent, step, goal)` key `find_spawn` adopts by. Found by
-        deriving the path before writing the test, not by a failure. FNV is written out rather than
-        `DefaultHasher` because `std`'s hasher is not stable across toolchain releases and a slug
-        that moved on rebuild would break the resume in T04.
+    '
+  - '**F2 - the two feature polarities and the doctests are concurrent jobs, and each is self-sufficient.**
+    The `test` job is a matrix over `os` x `features` and a separate `doctest` job exists; asserted by
+    parsing `ci.yml` rather than by reading it. Self-sufficiency is the part that actually breaks: each
+    `--lib --tests` leg must build the fixture examples it needs before running, because `--lib --tests`
+    does not build `examples/` — traps 2, 18, 35 and 54, four separate releases discovering the same thing.
+    Proven by the legs passing on a runner, which is a clean tree by construction.
 
-  - id: US-IO-HARNESS-0.36.0-T04
-    summary: >
-      Worktree creation is idempotent by the key a spawn is adopted by, so a resumed tree reuses the
-      worktree and branch it already made rather than re-creating them or discarding the child's
-      work.
-    why_required: >
-      Creating unconditionally fails on resume and re-creating discards the child's files. Without
-      this the worktree flag makes a crashed tree unresumable, which is a regression against 0.32.0.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T03
-    acceptance_criteria:
-      - >
-        **F4 — an adopted child reuses its worktree rather than re-creating or re-deriving it.** A
-        tree with a `worktree = true` child is killed mid-child and resumed. The resumed parent
-        replays the spawn, finds the child by `(parent, step, goal)`, and the child continues in
-        **the same worktree, on the same branch, with the files it had already written still
-        there**. The discriminating assertion is a file the child wrote before the kill, present
-        after the resume: a resume that re-created the worktree passes "the child finished" and
-        fails this. A second creation attempt is asserted not to error the spawn.
-    files:
-      - src/run.rs
-      - tests/worktree.rs
-    evidence:
-      - >
-        `cargo test --test worktree` — 5 passed, 0 failed. The added test is
-        `a_resumed_child_continues_in_the_worktree_it_already_had`: a tree is cut off by a timeout
-        while its `worktree = true` child is parked, then resumed from a fresh `Store` against the
-        same database.
-      - >
-        F4 in full: after the resume there is still exactly ONE directory under `.worktrees/`, at
-        the same path and on the same branch as before the cut-off, so a second creation attempt
-        neither errored the spawn nor made a second tree. The child carried on in it and wrote
-        `OUT.md`.
-      - >
-        The discriminating assertion is `EARLY.md`, written by the child *before* the cut-off and
-        still holding `before the kill` afterwards. A resume that re-created the worktree would
-        still let the child finish and still leave one directory behind — it would simply have
-        thrown the work away, which is what this catches.
-      - >
-        Sabotage S5 — the `abs.exists()` reuse short-circuit disabled, so the worktree is created
-        unconditionally — failed exactly `a_resumed_child_continues_in_the_worktree_it_already_had`
-        (4 passed, 1 failed). It fails the way the doc comment predicts: `git worktree add` refuses
-        the branch that already exists, so the spawn does not happen at all.
-      - >
-        A defect in the test, found and fixed rather than worked around: the first attempt gave the
-        resumed provider no script for the ROOT. The root's spawn step never committed, so the
-        resumed root is asked for it again and must re-issue it — without that replay `find_spawn`
-        is never reached and the adoption path is not exercised at all. The test asserted a missing
-        file rather than silently passing, which is the right failure.
+    '
+  - '**F3 - the matrix builds the fixture examples and no others, and a test keeps the two sets equal.**
+    `tests/ci_workflow.rs` derives the set of example binaries the suite spawns by reading `tests/`, parses
+    the example names out of `.github/workflows/ci.yml`, and asserts they are equal. The negative control
+    is a fixture naming a spawn of an example the workflow does not build, which the checker must report
+    — the convention `tests/docs_drift.rs` and `tests/readme.rs` both state: a checker that cannot be
+    made to fail is a green light wired to nothing. The thirty remaining examples are still compile-checked,
+    by `cargo check --examples` on Linux, asserted present by F1''s enumeration.
 
-  - id: US-IO-HARNESS-0.36.0-T05
-    summary: >
-      A memory restore point written at the run's first write to a key, in the shape `snapshots`
-      already has, guarded by a unique index so a later write cannot move it.
-    why_required: >
-      Restoring memory needs the previous value, and `memory` rows are replaced in place. Without a
-      restore point the memory half of a rewind cannot exist at all.
-    status: done
-    depends_on: []
-    acceptance_criteria:
-      - >
-        **F6 — the memory restore point is the first write, guarded.** A run writes one key five
-        times. `rewind_run` restores the value that was there before write one. The sabotage removes
-        the insert's uniqueness guard so the last write's predecessor wins, and it must fail this
-        named test rather than a compile — trap 8's rule, and the same guard `record_snapshot` has
-        for files.
-    files:
-      - src/state.rs
-    evidence:
-      - >
-        `memory_snapshots` and its UNIQUE index `memory_snapshots_entry (run_id, workspace, key)`,
-        written inside `Store::memory_write` **before** the write, because after it the previous
-        value is gone. `INSERT OR IGNORE` against that index IS the first-write guard — the second
-        and fifth write of one key by one run insert nothing.
-      - >
-        `cargo test --test rewind` — 11 passed, 0 failed (7 that existed, 4 added). F6 is
-        `five_writes_to_one_key_rewind_to_the_value_before_the_first`: a run writes one key five
-        times, the store really does hold `guess 5`, and the rewind produces `the original`.
-      - >
-        Sabotage S6 — `INSERT OR IGNORE` changed to `INSERT OR REPLACE`, so the last write's
-        predecessor wins — failed exactly `five_writes_to_one_key_rewind_to_the_value_before_the_first`
-        (10 passed, 1 failed), a named test rather than a compile error.
-      - >
-        A case the criterion did not name and the code has to get right: a write REFUSED by a pin
-        writes nothing, so there is nothing to put back. The restore point is removed again, but
-        only when that call is what wrote it — an earlier successful write of the same key by the
-        same run owns that row and a later refusal must not discard it.
+    '
+  files:
+  - .github/workflows/ci.yml
+  - tests/ci_workflow.rs
+  evidence:
+  - '`cargo test --test ci_workflow` — 6 passed, 0 failed. The assertion that failed in T01 is green against
+    a workflow whose `--example` list was written from the derived set, not from the contract''s parenthetical.'
+  - '**F1, mechanically.** Every `(os, cargo invocation)` pair was enumerated from `ci.yml` and `release.yml`
+    at the `v0.36.0` tag and from the new files, expanding each matrix over its `os` and `features` axes
+    and honouring each step''s `if`. Old: 37 pairs. New: 46. Exactly five old pairs are absent as literal
+    strings, and each is a decomposition rather than a loss: `cargo build --all-targets` on all three
+    OSes becomes `cargo build [--all-features] --tests` plus the eight fixture examples by name on all
+    three, with the other twenty-seven examples covered by `cargo check --examples` AND `cargo check --examples
+    --all-features` on Linux; and `cargo test` on macOS and Windows becomes `cargo test [--all-features]
+    --lib --tests` on both plus `cargo test --doc` on both. `cargo test --all-features --lib --tests`
+    and `cargo test --all-features --doc` are still present per-OS and per-OS-Linux respectively, unchanged.
+    The nine net-new pairs are the two check invocations, the three doctest legs and the per-polarity
+    build and test legs.'
+  - '**The second `cargo check --examples --all-features` is not redundant and is not decoration.** `documents_live`
+    and `media_git_live` declare `required-features` in `Cargo.toml`, so `cargo check --examples` under
+    the default polarity SKIPS them outright. A single-polarity check would have silently stopped compiling
+    two examples that `--all-targets` compiled — a coverage loss invisible in every duration measurement,
+    which is the exact risk F1 exists to catch. Found by reading `Cargo.toml`''s `[[example]]` tables
+    before writing the job, not after.'
+  - 'The per-polarity `rust-cache` key (`key: ${{ matrix.features }}`) is what makes the split a saving
+    rather than the same recompile twice: the two legs compile different dependency sets, and one shared
+    key would have them overwrite each other''s cache every run.'
+  - '`python3 -c ''yaml.safe_load(...)''` over the new `ci.yml` lists eight jobs — `test`, `doctest`,
+    `examples`, `msrv`, `lint`, `links-consumer`, `cross-version-0-29-0`, `docs` — so the file parses
+    and no job id contains a dot (trap 4). Whether each job actually ran is O1''s question, answered from
+    the run''s own job list rather than from the file.'
+- id: US-IO-HARNESS-0.36.1-T03
+  summary: Answer whether stable MSVC will link with `rust-lld` on `windows-latest`, from the toolchain's
+    own account of the link — and either land it with that proof or drop the lever and record the finding.
+  why_required: The Windows leg is made of roughly 95 linked executables per polarity plus 251 doctest
+    links, so the linker is the lever aimed at what the leg actually is. Landed alone so its contribution
+    is attributable, and either answer is a result the release owes.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.36.1-T02
+  acceptance_criteria:
+  - '**F4 - `rust-lld` performed the link on Windows, or the lever is dropped and the reason is recorded.**
+    Not "the flag is set" - the flag being set and doing nothing is exactly the 0.16.0 `doc_auto_cfg`
+    failure, where the attribute was present, every command exited 0, and docs.rs had been broken for
+    two releases. The proof is the toolchain''s own account of the link (the linker the build actually
+    invoked, read from a verbose build or `--print link-args`), captured in the job log. If stable MSVC
+    will not use `rust-lld` without a nightly flag, the lever is removed from the release and the finding
+    is written into the record and the brief, because a future release must not spend the afternoon rediscovering
+    it.
 
-  - id: US-IO-HARNESS-0.36.0-T06
-    summary: >
-      `rewind_run`, `Rewound`, the rewinds record and `Store::rewinds`, plus `EventKind::Rewound` —
-      one call that puts back files, memory and the queued backlog while the trace keeps what it
-      undid.
-    why_required: >
-      This is the release's second headline outcome. A partial undo that looks complete is the
-      failure the release exists to fix, and an undo that deletes rows makes the ledger disagree
-      with the invoice.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T05
-    acceptance_criteria:
-      - >
-        **F5 — one call puts back files, memory and the queue.** A run that writes two files (one it
-        created, one it rewrote), writes two memory keys (one new, one overwriting an existing value
-        written by an earlier run), and queues two children past the concurrency cap. `rewind_run`
-        returns: the created file `Removed` and gone from disk, the rewritten file `Restored` with
-        its original bytes, `memory_removed` naming the new key which `memory_get` no longer finds,
-        and `memory_restored` naming the overwritten key **whose value is the one that was there
-        before this run's first write** — the discriminating assertion, since deleting the key or
-        leaving the run's value both satisfy "the entry changed". `queued_agents` for that run is
-        empty and `queue_cleared` names the two goals. The control is the identical run with no
-        `rewind_run` call, under which all six effects are still present.
-      - >
-        **F7 — the trace keeps both branches.** Before and after the rewind of F5, the row counts
-        and contents of `steps`, `run_events`, `spawns` and the ledger for that run are identical,
-        and `Store::rewinds(run_id)` returns exactly one row naming the two files, the two memory
-        keys and the two cleared goals. One `EventKind::Rewound` reaches the observer, and its four
-        numbers equal the `Rewound` value's own — **built from the returned value, not from a second
-        query**, which the sabotage proves by making the two disagree. A rewind implemented by
-        deleting rows passes F5 entirely and fails this.
-      - >
-        **F8 — what rewind does not undo, executed rather than implied.** A run that made a commit
-        is rewound: the commit is still reachable, `HEAD` is unmoved, no `reset` was spawned
-        (asserted against the recorded argv of every git spawn in the run, which the trace already
-        holds), and `Rewound` claims nothing about it. A file whose previous contents were over the
-        1 MiB cap comes back `NotKept` and is **byte-identical to what the run left**, not truncated
-        and not restored.
-    files:
-      - src/run.rs
-      - src/state.rs
-      - src/observe.rs
-      - src/lib.rs
-      - tests/rewind.rs
-    evidence:
-      - >
-        `cargo test --test rewind` — 11 passed, 0 failed. The four added tests are
-        `one_call_puts_back_the_files_the_memory_and_the_queue` (F5),
-        `a_rewind_writes_down_what_it_took_and_disturbs_nothing_else` (F7),
-        `five_writes_to_one_key_rewind_to_the_value_before_the_first` (F6) and
-        `a_rewind_leaves_a_commit_alone_and_does_not_touch_what_it_did_not_keep` (F8). The seven
-        0.28.0 tests pass unchanged.
-      - >
-        F5 in full, with all six effects asserted present BEFORE the call as the control: the
-        rewritten file comes back `Restored` with its original bytes, the created file comes back
-        `Removed` and is gone from disk, `memory_removed` names the key the run invented and
-        `memory_get` no longer finds it, and `memory_restored` names the overwritten key **whose
-        value is `three` — what was there before this run's first write** — rather than a deletion
-        or the run's own `nine`. Both queued goals are named in `queue_cleared` and
-        `queued_agents` is empty.
-      - >
-        F7: `steps`, the durable event stream, the spawn records and the summed provider-call
-        tokens are read into one tuple before and after the rewind and compared — identical. One
-        `rewinds` row names the file, the restored key, the empty removed list and the cleared
-        goal. The `EventKind::Rewound` the observer received carries `(1, 1, 1)`, asserted equal to
-        the returned `Rewound`'s own lengths.
-      - >
-        F8: a file over the 1 MiB cap comes back `NotKept` and is **byte-identical to what the run
-        left** — neither restored nor truncated — while the file beside it is put back. `Rewound`
-        makes no claim about a commit; the three lists are the whole of what a rewind touches.
-      - >
-        Sabotage S7 — the rewind deletes the run's `steps` rows, the obvious "undo means erase"
-        implementation — failed exactly `a_rewind_writes_down_what_it_took_and_disturbs_nothing_else`
-        (10 passed, 1 failed). It passes F5 entirely, which is why F7 exists.
-      - >
-        Sabotage S8 — the event's `queued` re-read from `queued_agents` after the clear instead of
-        taken from the returned value — failed the same named test (10 passed, 1 failed). This is
-        trap 32's defect in a new place: a number re-queried afterwards is true whether or not the
-        work happened.
-      - >
-        Sabotage S9 — `memory_restore` made a no-op — failed
-        `one_call_puts_back_the_files_the_memory_and_the_queue` and
-        `five_writes_to_one_key_rewind_to_the_value_before_the_first` (9 passed, 2 failed).
-      - >
-        **A defect the round-trip census caught, not production.** `EventKind::Rewound` first
-        carried its own `run_id`, justified in a doc comment as convenient for a reader filtering
-        on the tag. The kind is flattened into the envelope, so that is a duplicate key and serde
-        refuses to deserialise it — `every_variant_round_trips` failed with `duplicate field
-        \`run_id\``. The field was removed and the reason written where the variant is declared.
-      - >
-        **A criterion met in a slightly different form, stated not glossed.** F7 names "the row
-        counts of `steps`, `run_events`, `spawns` and the ledger". A run driven by `run_with`
-        rather than an observed entry point writes no `run_events` rows at all — the durable stream
-        is `Broadcast`'s, not the loop's — so that count is legitimately 0 both times. It is still
-        compared rather than dropped; the assertion that the trace holds something is made against
-        `steps`.
-      - >
-        The `rewind_run` / `rewind_run_observed` pair follows the crate's existing convention:
-        `rewind_run` is the observed one with `observe::Ignore`. A free function had no observer to
-        emit through, and adding one to `rewind_run`'s signature would have broken nothing that
-        exists but would have made the common call the noisy one.
+    '
+  files:
+  - .github/workflows/ci.yml
+  evidence:
+  - '**F4 answered YES, on a runner, and the proof is the toolchain''s own account of the link — not the
+    presence of a flag.** The probe job ran `cargo rustc --example tick -- --print link-args` on `windows-latest`
+    four times. Unmodified, rustc invoked `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\HostX64\x64\link.exe`.
+    With `RUSTFLAGS=-Clinker=rust-lld` it invoked `"rust-lld" "-flavor" "link"` and the link completed
+    (step conclusion `success`). Stable MSVC needs no nightly flag: rustc resolves the bare name `rust-lld`
+    itself.'
+  - '**What rust-lld actually bought, attributed as a single variable.** Warm cache in both cases, same
+    leg, same commit shape, nothing else changed: the Windows doctest step went 338s → **200s (-41%)**
+    and the Windows default build step 253s → **205s (-19%)**. The doctest win is the larger one and that
+    is the expected shape — 366 doctests are 366 separate links, where the build step is ~95. Measured
+    against run 30923664928 (warm, no lld) and run 30925715697 attempt 2 (warm, lld; `No cache found`
+    appears zero times in all three Windows jobs).'
+  - 'Three candidate forms were probed because only a runner could say which work, and all three do: A
+    `-Clinker=rust-lld`; B the absolute path `<sysroot>/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe`;
+    C a copy named `lld-link` on PATH. **A is what shipped** — it is the shortest, it needs no path construction
+    that a toolchain layout change would break, and the probe showed rustc resolving it without help.
+    The toolchain ships `rust-lld.exe` at that sysroot path, so nothing is installed and no action is
+    added.'
+  - '**Why Windows only, measured rather than assumed.** On the same tree locally: `cargo build --lib`
+    is 15.7s and `cargo build --tests` is 84.0s, so the library is 19% of the build step and the 59 test
+    binaries are the other 81% — and those are link-bound (user time 305s against 84s wall, already saturating
+    the cores). The Windows doctest job is 366 more links, one per doctest. Linux and macOS keep their
+    default linkers: neither is the critical path, and `rust-lld` for ELF and Mach-O is a separate question
+    that would need its own probe.'
+  - 'The probe job was deleted in the same release, as its own comment said it would be. It carried `continue-on-error:
+    true` on the three candidates — correct for a job whose purpose is to report which of three forms
+    works, and exactly the reason it could not stay.'
+  - 'Cost note recorded honestly: the probe was cancelled twice before it answered, both times by a push
+    to the same branch under `concurrency: cancel-in-progress`. The second cancellation was mine — I pushed
+    the changelog commit while the probe was still running. A long diagnostic job on a branch that is
+    still being pushed to needs either its own workflow or a pause in pushing.'
+- id: US-IO-HARNESS-0.36.1-T04
+  summary: '`cargo-nextest` runs the test binaries in the matrix legs, installed through a SHA-pinned
+    action, with the executed-test count matched against the 0.36.0 baseline and the three known wall-clock-sensitive
+    tests'' outcomes recorded.'
+  why_required: 59 test binaries run sequentially today. Without the count comparison the change is a
+    speed-up nobody has shown ran the same tests, which is the one way this release can silently stop
+    proving something.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.36.1-T02
+  acceptance_criteria:
+  - '**F5 - `cargo-nextest` runs the same tests, and the count is the discriminator.** The number of tests
+    executed per leg under nextest equals the number `cargo test` executed for that leg on run 30834723995,
+    and no test is filtered, skipped or silently retried. nextest defaults to process-per-test where `cargo
+    test` uses threads within a binary, so the criterion also requires the three known wall-clock-sensitive
+    tests (`skills::discovery_over_a_32_skill_directory_is_ under_50ms`, `hooks.rs::f4_an_executing_hook_gets_its_argv_whole...`,
+    `handles.rs::a_handle_that_exits_on_its_own_stops_reading_as_running` - traps 11, 73, 83) to be run
+    and their outcome recorded. If nextest makes any of them fail more often, nextest is dropped rather
+    than the test being weakened; the release''s purpose is to make CI faster, not flakier.
 
-  - id: US-IO-HARNESS-0.36.0-T07
-    summary: >
-      The two added tables and their indexes fed to `ADDED_SINCE_0_22_0` by name, with the
-      cross-version suites green in both directions and `CHECKPOINT_FORMAT` asserted unmoved.
-    why_required: >
-      The 0.22.0 schema guard fires on any new table and must be fed by name; a release that added
-      one and forgot the list is exactly what that guard exists to catch.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T06
-    acceptance_criteria:
-      - >
-        **F9 — cross-version, both directions, with the guard fed by name.** Two tables and their
-        indexes are added; `ADDED_SINCE_0_22_0` gains exactly those four names and
-        `tests/cross_version.rs` passes. A database written by the pinned 0.29.0 generator opens,
-        resumes and replays under 0.36.0, and a 0.36.0 store is read by that binary.
-        `CHECKPOINT_FORMAT` stays 7, asserted rather than assumed.
-    files:
-      - tests/cross_version.rs
-    evidence:
-      - >
-        `ADDED_SINCE_0_22_0` gained exactly four names — `memory_snapshots`,
-        `memory_snapshots_entry`, `rewinds`, `rewinds_run` — and nothing else. No existing table
-        is altered, so `ALTERED_SINCE_0_22_0` is untouched.
-      - >
-        `cargo test --test cross_version` — 5 passed, 0 failed, including
-        `the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it` and
-        `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing`.
-      - >
-        The other direction, executed rather than asserted on paper: `cargo build --manifest-path
-        tests/fixtures/gen-0.29.0/Cargo.toml` then `cargo test --test cross_version_0_29_0 --
-        --ignored` — `a_current_store_is_read_by_a_0_29_0_binary` passed. A 0.29.0 binary opens a
-        store carrying all four new objects and never names any of them.
+    '
+  files:
+  - .github/workflows/ci.yml
+  evidence:
+  - '**F5''s count discriminator, exact.** Comparing against run 30834723995''s numbers would have confounded
+    the comparison with the tests this release itself adds, so both invocations were run on the SAME tree
+    and the SAME machine instead, which is what the criterion actually claims: `cargo test --lib --tests`
+    → **978 passed, 1 ignored** across 61 result lines; `cargo nextest run --lib --tests` → **978 tests
+    run: 978 passed, 1 skipped**. Equal, and the one ignored test is the one skipped test. No test is
+    filtered, skipped or silently retried.'
+  - 'On CI (run 30923664928, ubuntu): the default polarity leg reports `978`-equivalent for its own tree
+    — `973 tests run, 973 passed, 1 skipped` — and the `--all-features` leg `1050 tests run, 1050 passed,
+    1 skipped`. These are not comparable with the macOS numbers above and are not used as the discriminator:
+    which tests exist varies by `cfg`, so a cross-OS count comparison would prove nothing. They are recorded
+    because F5 asks for the per-leg numbers.'
+  - '**The three known wall-clock-sensitive tests (traps 11, 73, 83) run under nextest and pass**, which
+    matters because nextest is process-per-test where `cargo test` uses threads within a binary, and all
+    three flakes are clocks in disguise. Three consecutive runs, all green: `skills::discovery_over_a_32_skill_directory_is_under_50ms`
+    at 0.017s / 0.019s / 0.018s against its 50ms bound; `hooks::f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin`
+    at 0.063s / 0.039s / 0.035s against a 20,000ms hook timeout; `handles::a_handle_that_exits_on_its_own_stops_reading_as_running`
+    at 3.034s / 3.036s / 3.029s. Process-per-test did not move any of them toward its bound. Nothing was
+    weakened; the standing rule was that nextest would be dropped before a test was, and it did not have
+    to be invoked.'
+  - 'N2 holds: nextest is installed by `taiki-e/install-action` pinned to `67729d5c413db75907f0ad1e39bb04b9c868ff60`
+    (v2.85.7, resolved with `gh api`, not guessed) and is not a manifest entry. `Cargo.toml`''s only edit
+    this release is the version bump.'
+- id: US-IO-HARNESS-0.36.1-T05
+  summary: Split `release.yml`'s `verify` job so its two test invocations run in parallel jobs, keeping
+    every refusal it performs today and the ordering that nothing is tagged until every check has passed.
+  why_required: The release run is 7m18s of which the two test invocations are 377s. The gates are cheap;
+    the ordering is the point, so the job graph has to be asserted rather than assumed.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.36.1-T02
+  acceptance_criteria:
+  - '**F6 - `release.yml` still refuses everything it refuses today, and still cuts one Release.** A tag
+    whose version does not match `Cargo.toml`, a commit that is not an ancestor of `origin/main`, an existing
+    tag on a dispatch, an existing Release on a tag push, and a version with no `## [x.y.z]` changelog
+    section are each still refused before anything is tagged - asserted by reading the split workflow,
+    since executing the refusals means pushing bad tags. `cargo package --locked` still produces the `.crate`,
+    the `release` job still consumes exactly one artifact, and the Release is still titled bare `io-harness
+    0.36.1` with notes taken verbatim from the changelog section. The parallel split must not let the
+    `release` job start before every check has passed; the job graph is asserted, not assumed.
 
-  - id: US-IO-HARNESS-0.36.0-T08
-    summary: >
-      The two reads a rewind makes asserted by query plan with a control column in no index, and the
-      source-reading boundary test proving the step loop does no rewind work, with its splice-in
-      control.
-    why_required: >
-      A cost claim asserted by clock is flaky on a loaded runner and passes on a fast machine
-      running a full scan, and a "the loop never touches it" claim with no control is decorative.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T06
-    acceptance_criteria:
-      - >
-        **N3 — the step loop does no rewind work, and a run that uses neither half pays for
-        neither.** `rewind_run` is the caller's call, never a tool and never a step; asserted by a
-        source-reading test in the shape 0.33.0 and 0.35.0 used, with a splice-in control that makes
-        it fail when such a call is added. A run that sets no `worktree` creates no `.worktrees`
-        directory and spawns no `git`. The one unconditional cost is stated rather than hidden: a
-        memory write now also writes a restore-point row **the first time this run touches that
-        key**, bounded by keys touched per run exactly as file snapshots are bounded by paths
-        written per run, and measured.
-      - >
-        **N6 — a query whose cost grows with the trace is asserted by plan, not by clock.** The two
-        reads a rewind makes (`memory_snapshots` by run, `agent_queue` by parent run) are `EXPLAIN
-        QUERY PLAN`-asserted to use their index, with a control column in no index at all — trap
-        38's rule, not a column that happens not to be a left prefix — and the measured number is
-        recorded. No wall-clock assertion is written.
-    files:
-      - src/state.rs
-      - tests/rewind.rs
-    evidence:
-      - >
-        N6: `a_rewinds_two_reads_seek_into_one_run_rather_than_scanning_every_runs` `EXPLAIN`s the
-        two `const`s the crate actually executes — `Store::MEMORY_SNAPSHOTS_SQL` and
-        `Store::QUEUED_UNDER_SQL` — over a fixture of 40 runs × 20 keys and 40 parents × 20 queued
-        children, after `ANALYZE`. Both plans seek on their index and neither reads a row belonging
-        to another run. No wall-clock assertion is written.
-      - >
-        The controls are `memory_snapshots.step` and `agent_queue.depth`, each in **no** index at
-        all — trap 38's rule rather than a trailing composite column, which SQLite skip-scans into
-        a full read wearing an index's name. Neither control's plan names an index.
-      - >
-        N3: `no_tool_dispatches_to_a_rewind_and_the_loop_never_calls_one` — no `*_TOOL` constant in
-        `src/tools/mod.rs` names a rewind, and outside doc comments `src/run.rs` holds exactly
-        three lines mentioning one: the two definitions and `rewind_run`'s delegation to the
-        observed form. The splice-in control adds a call above `async fn dispatch(` and the count
-        becomes four, so the test fails when such a call is added.
-      - >
-        **A criterion met in a different shape, stated not glossed.** N3's prose asks for "a
-        source-reading test in the shape 0.33.0 and 0.35.0 used" — those grep for a *module path*,
-        which cannot work here because `rewind_run` lives in `src/run.rs` beside the loop and there
-        is no module boundary to grep for. What the test claims instead is the load-bearing half:
-        no tool dispatches to a rewind and no line of the run module calls one. Trap 70 applies —
-        it is stated as what it proves, not as "the loop does no rewind work".
-      - >
-        The behavioural half, which no source read can give:
-        `a_run_that_rewinds_nothing_writes_no_rewind_rows_and_makes_no_worktree` drives an ordinary
-        run and asserts `rewinds` is empty and no `.worktrees` directory exists.
-      - >
-        The one unconditional cost, measured rather than hidden: a memory write now also writes a
-        restore-point row the first time a run touches that key. Bounded by keys touched per run,
-        exactly as file snapshots are bounded by paths written per run — the fixture above writes
-        800 memory entries and 800 restore points, one each.
+    '
+  files:
+  - .github/workflows/release.yml
+  evidence:
+  - '**F6''s job graph, asserted by parsing `release.yml` rather than by reading it** — executing the
+    refusals would mean pushing bad tags, which is why the criterion is written this way. `checks` has
+    no `needs`; `lint`, `test-default`, `test-all-features` and `package` each need `checks`; and **`release`
+    needs all five** — `[''checks'', ''lint'', ''test-default'', ''test-all-features'', ''package'']`.
+    That last list is the whole point of the split: nothing is tagged and no Release is cut until every
+    gate has passed, and a partial `needs:` would cut a Release for a tree that failed a gate.'
+  - '**Every refusal the old serial job performed is still performed**, in `checks`, in the same order:
+    `Version` (resolves the number from the tag or the dispatch input), `Version matches Cargo.toml`,
+    `Commit is on main` (an ancestor test, not a ref test), `Release does not exist` (a tag check on dispatch,
+    a Release check on a tag push), `Changelog has a section`. Nothing was dropped or relaxed to make
+    the split fit.'
+  - '**Every gate command is preserved verbatim**, redistributed rather than reduced: `lint` runs `cargo
+    fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`; `test-default` runs `cargo
+    test` (the plain invocation, deliberately, including the doctests — this is the release gate, not
+    CI''s split one); `test-all-features` runs `cargo test --all-features --lib --tests`; `package` runs
+    `cargo package --locked`.'
+  - '**The artifact path is unchanged and still singular.** `package` uploads `target/package/io-harness-<version>.crate`
+    under the name `package` with `if-no-files-found: error`, and `release` downloads exactly that one
+    artifact name. The Release is still titled bare `io-harness <version>` with `body_path: notes.md`
+    taken verbatim from the changelog section, `files: dist/*` and `fail_on_unmatched_files: true`.'
+  - 'Baseline for the comparison, from run 30834005895: `verify` 7m18s, of which `cargo test` was 222s
+    and `cargo test --all-features --lib --tests` 155s, run one after the other with fmt, clippy and `cargo
+    package` queued behind them. O4''s point stands and is stated plainly: a workflow file cannot be executed
+    locally, so `release.yml`''s split is exercised by this release''s own release run and its outcome
+    is recorded there — the structural assertions above are what can be checked before that, and they
+    are what F6 asks for.'
+- id: US-IO-HARNESS-0.36.1-T06
+  summary: The dependency-version checker in `tests/docs_drift.rs` — a pure function over text, one test
+    against the real `README.md`, and a negative control fixture carrying the `io-harness = "0.25"` line
+    — and `README.md`'s `[dependencies]` snippet corrected to the current `major.minor`.
+  why_required: '`README.md:28` is the single highest-traffic line in the repository and it has been eleven
+    releases stale. Correcting it without the checker leaves the same rot to happen again, which is the
+    argument the file''s own doc comment already makes about the three facts it guards.'
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - '**F7 - the README states the current version and a checker enforces it.** `README.md`''s `[dependencies]`
+    snippet names the `major.minor` of `Cargo.toml`''s `version`. The checker is a pure function over
+    text in `tests/docs_drift.rs`, run against the real `README.md` by one test, with a negative control
+    fixture carrying the current `io-harness = "0.25"` line that the checker must report. Fed the corrected
+    README it reports nothing. `tests/readme.rs`''s two existing properties still hold: the first 60 lines
+    say what the crate is, show a runnable fence and name the MSRV, and no heading is named after a release.
 
-  - id: US-IO-HARNESS-0.36.0-T09
-    summary: >
-      Every documentation surface in the same release as the code — the three guide pages,
-      `docs/CONTRACT.md`'s honest limits, `README.md`, `CHANGELOG.md` with the migration note the
-      one break owes, `docs/public-api.txt` by hand, and a worked example on every added item.
-    why_required: >
-      Four of these are guarded by tests that fail without them, and the changelog section must
-      exist before `release.yml` will cut the Release at all.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T06
-    acceptance_criteria:
-      - >
-        **N2 — the break is exactly one, and it is stated as loudly as it is small.** `AgentDef`
-        gains `#[non_exhaustive]` and `worktree`. An external struct literal or exhaustive
-        destructuring stops compiling; `AgentDef::new` and every builder call site is untouched, and
-        a roster deserialized from `io.toml` or a `plugin.toml` that names no `worktree` is
-        unchanged. `CompletionRequest`/`CompletionResponse` and `TaskContract` are not touched, so
-        no `E0639` is owed. `tests/changelog.rs` finds the `*Migration:*` note under the one
-        `**BREAKING` entry and `tests/public_api.rs` passes against a hand-edited
-        `docs/public-api.txt`.
-      - >
-        **N4 — every added public item carries a worked example**, enforced by the existing
-        `every_public_item_has_a_worked_example` gate: `rewind_run`, `Rewound`, `Store::rewinds` and
-        its row type, `GIT_BRANCH_TOOL`, `GIT_WORKTREE_TOOL`, `AgentDef::worktree`.
-      - >
-        **N5 — the honest limits are where a reader finds them.** `docs/CONTRACT.md` states: a
-        commit is not un-committed and a push is not recalled; a migration, a provider call and
-        anything else outside the workspace is not undone; the crate never removes a worktree or
-        deletes a branch; a rewind is per run, not per tree; the parent's `git_status` reports the
-        worktree directory (in whatever form F3 measured) and the operator's one-line exclusion is
-        given; `git switch` needs git 2.23 and `git worktree` needs git 2.5, and an older git
-        surfaces as the observation git itself prints rather than as a crate error.
-    files:
-      - docs/CONTRACT.md
-      - docs/public-api.txt
-      - docs/guide/images-and-git.md
-      - docs/guide/durable-runs.md
-      - docs/guide/context-and-memory.md
-      - README.md
-      - CHANGELOG.md
-      - src/lib.rs
-      - Cargo.toml
-    evidence:
-      - >
-        Every doc guard green: `tests/public_api.rs` 9 passed against a **hand-edited**
-        `docs/public-api.txt` carrying `fn rewind_run`, `fn rewind_run_observed`,
-        `struct RewindRecord` and `struct Rewound`; `tests/guide_pages.rs` 7;
-        `tests/changelog.rs` 5, finding the `*Migration:*` note under the one `**BREAKING (API)**`
-        entry; `tests/readme.rs` 8; `tests/docs_drift.rs` 10, including the relative-link check
-        over the new guide anchors.
-      - >
-        N4: `every_public_item_has_a_worked_example` passes, so all four added crate-root items
-        carry one. `Cargo.toml` is at 0.36.0 and the CHANGELOG section exists, which `release.yml`
-        refuses a version without.
-      - >
-        N5, all of it in `docs/CONTRACT.md`: a commit is not un-committed and `git reset` stays
-        unreachable; a push, a migration and a provider call are not undone; nothing removes a
-        worktree or deletes a branch; a rewind is one run and not a tree; the parent's
-        `git_status` reports `?? .worktrees/` (the number F3 measured) and the operator's
-        `echo '/.worktrees/' >> .git/info/exclude` is given; git 2.23 for `switch` and 2.5 for
-        `worktree`, surfacing as git's own message rather than a crate error. Plus two limits the
-        criterion did not name and the code has: a rewind bypasses the memory pin, and
-        `AgentDef::worktree` fails the spawn rather than falling back.
-      - >
-        Three guide pages extended rather than a new page added, so no `GUIDES`/`CAPABILITIES.md`
-        bookkeeping: `images-and-git.md` (the count moved from five tools to seven, plus
-        "Landing on a branch" and "A working tree per agent"), `durable-runs.md` ("Putting a whole
-        run back"), `context-and-memory.md` (the pin/rewind interaction).
-      - >
-        Two prose claims that this release made false, corrected in it rather than later: the
-        README and the crate-root docs both said "there is no push, no fetch, no branch switching
-        and no history rewriting". Branch switching now exists in one narrow form, so both now say
-        what is true and why `switch --create` is the only checkout that is reachable.
-      - >
-        **A criterion met in a different form, stated not glossed.** N4 lists `GIT_BRANCH_TOOL` and
-        `GIT_WORKTREE_TOOL` among the items owing a worked example. They are
-        `io_harness::tools::` constants and not crate-root re-exports, so the
-        `every_public_item_has_a_worked_example` gate does not reach them — and their five
-        siblings, `GIT_LOG_TOOL` and the rest, carry prose and no example. They are documented to
-        exactly that standard rather than being made the only two of seven with a doctest, which
-        for a `&str` constant would assert its own spelling.
+    '
+  files:
+  - tests/docs_drift.rs
+  - README.md
+  - Cargo.toml
+  - Cargo.lock
+  evidence:
+  - '`cargo test --test docs_drift` — 15 passed, 0 failed. Before the README was touched, the same command
+    reported exactly one failure and named the defect precisely: `README.md tells a reader to depend on
+    a version that is not this one (Cargo.toml declares 0.36.1, so the snippet must say "0.36"): line
+    28: io-harness = "0.25"`. Fed the corrected README it reports nothing, which is both halves of what
+    F7 asks.'
+  - 'The checker follows the file''s own convention rather than inventing a shape: a pure function over
+    text (`dependency_version_matches`), one test against the real `README.md`, and controls. The negative
+    control is the real defect verbatim — the `io-harness = "0.25"` line as `README.md:28` carried it
+    from 0.25.0 to 0.36.0 — not an invented one.'
+  - 'It checks `major.minor`, asserted by `dependency_version_is_major_minor_so_a_patch_does_not_churn_the_readme`:
+    0.36.0 and 0.36.1 both want `"0.36"`, so a patch release does not put a no-op edit in its own diff,
+    while 0.37.0 fails. That is what the snippet carries and what a caller actually wants — any 0.36.x.'
+  - 'Silence is a failure too (`dependency_version_checker_rejects_silence`), for the same reason it is
+    for the MSRV: a checker that accepts an absent claim stops noticing when the claim is deleted rather
+    than corrected, which would be a cheap way to make this test pass forever.'
+  - '`Cargo.toml` and `Cargo.lock` bumped to 0.36.1 (`cargo update -p io-harness --offline` — `Locking
+    1 package`, 15 dependencies unchanged), which is the fact the checker reads. `cargo test --test readme`
+    — 8 passed, 0 failed: the first-screen and no-version-named-heading properties are unaffected by the
+    one-line change.'
+- id: US-IO-HARNESS-0.36.1-T07
+  summary: 'The product table states what is true: io-cli Released and linked to its repository and to
+    crates.io, io-studio Not built, and the "only public repository today" sentence removed — each verified
+    against the registry and the repository rather than from memory.'
+  why_required: The table tells a reader that the two products built on this crate do not exist. io-cli
+    is the strongest available evidence that the crate is embeddable by something other than its author,
+    and the README currently hides it.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - '**F8 - the product table is true, checkably.** io-cli reads Released and links to `github.com/initorigin/io-cli`
+    and `crates.io/crates/io-cli` - verified against the registry (`0.10.0`, repository `https://github.com/initorigin/io-cli`)
+    and against the repository''s `PUBLIC` visibility rather than from memory. io-studio reads **Not built**,
+    which is what `io-studio/` holding documentation and no `src/` means. The "only public repository
+    today" sentence is gone. `tests/docs_drift.rs`''s existing dangling-link checker covers the two new
+    relative links, and the two absolute ones are verified once, by request, and the response recorded.
 
-  - id: US-IO-HARNESS-0.36.0-T10
-    summary: >
-      The release gates, run last against the sealed tree: the dependency count, fmt, clippy, both
-      test invocations, the nightly docs.rs command, and a clean `cargo package --locked`.
-    why_required: >
-      The record's evidence is these commands' output. A gate run before the last edit is evidence
-      about a tree that no longer exists.
-    status: done
-    depends_on:
-      - US-IO-HARNESS-0.36.0-T07
-      - US-IO-HARNESS-0.36.0-T08
-      - US-IO-HARNESS-0.36.0-T09
-    acceptance_criteria:
-      - >
-        **N1 — no new dependency.** `cargo tree` on macOS and Linux still reads **402** lines. A
-        worktree is a `git` spawn through the machinery that already spawns git; a restore point is
-        two tables in the SQLite already there.
-      - >
-        **O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95
-        job, with no test skipped silently on Windows. The git-dependent tests are the exposure: a
-        worktree path is joined from components rather than from a slash-bearing literal, any
-        source-reading test normalises line endings, and a test that reads git's output tolerates
-        the line ending git produces on that platform.
-      - >
-        **O2 — docs.rs builds**, proven by running the nightly job's exact command
-        (`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`)
-        before the release PR is opened, never inferred from a stable `cargo doc`. It has caught
-        something in four consecutive releases.
-      - >
-        **O3 — `cargo package --locked` succeeds** on a clean tree and the packaged crate compiles,
-        run after a `cargo clean`, with `.worktrees` proven absent from the packaged file list.
-        Every local build and test runs with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`.
-    files:
-      - Cargo.toml
-    evidence:
-      - >
-        N1: `cargo tree | wc -l` — **402**, unchanged since 0.23.0. A worktree is a `git` spawn
-        through the spawner the crate already had; a restore point is two tables in the SQLite
-        already there.
-      - >
-        `cargo fmt --check` — clean. `cargo clippy --all-targets --all-features -- -D warnings` —
-        clean, no lint raised.
-      - >
-        `cargo test` (default features) — **61 result lines, 1333 passed, 0 failed**. Preceded by
-        `cargo build --all-features --examples`, per the standing trap that `--lib --tests` cannot
-        build the fixtures.
-      - >
-        `cargo test --all-features` — **61 result lines, 1412 passed, 0 failed**. A separate
-        invocation with `rm -rf target` between the two.
-      - >
-        O2: `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` —
-        clean, run before the release PR. **This is the first release in five where that gate
-        caught nothing**; it is reported rather than passed over, because a gate that suddenly goes
-        quiet is worth noticing and the answer here is that the release added no intra-doc link to
-        a type not `use`d in its own file.
-      - >
-        O3: `cargo clean && cargo package --locked` — exit 0 on a clean tree, **1,309,980 bytes**,
-        and the packaged crate compiles. `.worktrees` is absent from the packaged file list (0
-        entries), and `assets/initorigin-logo.png` is present — the asset 0.35.0 could not ship
-        now ships.
-      - >
-        **A test failed once and passed on a re-run, reported rather than hidden.**
-        `tests/handles.rs::a_handle_that_exits_on_its_own_stops_reading_as_running` failed in the
-        first default-feature run, on a volume that was at 11 GiB free with five rust-analyzer
-        processes rebuilding into the same tree. It reads as a store assertion — the handle still
-        says `running` — and it is a wall-clock one: the exit is noticed by a poll that has to
-        reach disk. It passed in `cargo test --all-features` and again in the re-run of the
-        default suite, and this release touches no handle code. A third flaky Windows-style
-        clock test, on macOS and under load.
-      - >
-        O1 (the three-OS matrix including MSRV 1.95) is CI's and is checked on the release commit
-        rather than claimed here.
+    '
+  files:
+  - README.md
+  evidence:
+  - 'Verified against the registry and the repository rather than from memory, as F8 requires. crates.io:
+    `io-cli` max version **0.11.0**, 219 downloads, repository `https://github.com/initorigin/io-cli`.
+    `gh api repos/initorigin/io-cli` reports visibility **public**, not archived. `io-studio/` holds `docs/`,
+    a CHANGELOG, a LICENSE, a NOTICE, a README, a CODE_OF_CONDUCT, a CONTRIBUTING and a SECURITY file
+    — and no `src/` at all, which is what **Not built** means.'
+  - '**The plan''s own numbers were already stale when it was written**, which is the argument for the
+    row stating a status. It recorded io-cli at 0.10.0 with 186 downloads; the registry says 0.11.0 and
+    219. The table names no version and no count, so it stays true across io-cli''s next ten releases
+    — the failure mode of fixing a stale table with today''s numbers, avoided by construction rather than
+    by intending to come back.'
+  - 'The sentence "io-harness is the only public repository today, which is why it is the only one linked.
+    io-cli and io-studio open when they release" is removed. Both of its claims are false: io-cli''s repository
+    is public and it has released.'
+  - '`cargo test --test docs_drift` — 15 passed. The dangling-link checker covers the two new relative
+    links in the table region; the two absolute ones (the io-cli repository and its crates.io page) were
+    each requested once and answered, which is the check F8 asks for.'
+  - '**F8 met in a different form than its prose named — owner decision, 2026-08-04.** The criterion says
+    io-cli "links to `github.com/initorigin/io-cli` AND `crates.io/crates/io-cli`". The owner asked for
+    the crates.io link to be removed from the table, so the row carries the repository link only. The
+    substance of F8 is unchanged and still checkable: io-cli reads **Released**, it links to a repository
+    verified `public` via `gh api`, its released state was verified against the registry (0.11.0, 219
+    downloads) rather than from memory, io-studio reads **Not built**, and the false "only public repository
+    today" sentence is gone. What was dropped is one of two links, not a claim. Stated here rather than
+    glossed, and carried into the record''s `known_limitations`.'
+- id: US-IO-HARNESS-0.36.1-T08
+  summary: 'Rebuild the badge block on one rule: no badge carries a value a human typed. The MSRV badge
+    moves to the dynamic `crates/msrv` route, a downloads badge is added, every URL is requested once
+    and must return a real render.'
+  why_required: '`img.shields.io/badge/MSRV-1.95-blue.svg` is the same defect as the stale install line,
+    eleven lines above it, in the same file. A badge asserting a value nothing resolves is a green light
+    wired to nothing, and a reader cannot inspect it.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.36.1-T06
+  acceptance_criteria:
+  - '**F10 - every badge renders, and no badge carries a typed-in value.** Each badge URL in the block
+    is requested once and must return an image rather than a 404, an error card or shields'' "invalid"
+    render — checked, because a badge that silently renders `invalid` is exactly the landing-page equivalent
+    of a gate that exits 0 having done nothing, and a reader cannot tell the difference from a working
+    one. The discriminating assertion is the second half: **no badge URL contains a version, a number
+    or a status that a human typed**, which today `img.shields.io/badge/MSRV-1.95-blue.svg` does. After
+    this release every badge resolves its value from crates.io, docs.rs or GitHub Actions at render time,
+    so no badge can drift from the crate the way the install snippet drifted for eleven releases. `tests/docs_drift.rs`''s
+    MSRV checker still finds the declared `rust-version` stated somewhere in the README, since the MSRV
+    badge no longer spells it out — if the badge was the only line carrying it, prose must carry it, which
+    is what the checker exists to force. The one added badge is downloads. No badge is added for coverage,
+    benchmarks or unsafe-freedom, because this repository measures none of the three, and none for dependency
+    freshness, which was weighed and excluded.
+
+    '
+  files:
+  - README.md
+  evidence:
+  - '**Every badge URL requested once; all six answer 200 with a real rendered value**, read from the
+    `<title>` of the returned SVG rather than from the status code alone — shields answers a bad path
+    with a rendered card, so a 200 is not by itself evidence: `crates/v/io-harness.svg` → `crates.io:
+    v0.36.0`; `crates/d/io-harness.svg` → `downloads: 914`; `docsrs/io-harness` → `docs: passing`; the
+    Actions badge → `CI - passing`; `crates/msrv/io-harness` → **`msrv: 1.95`**; `crates/l/io-harness.svg`
+    → `license: Apache-2.0`. None rendered `invalid`.'
+  - '**No badge URL now carries a value a human typed.** The one that did — `img.shields.io/badge/MSRV-1.95-blue.svg`,
+    the same defect as the stale install line eleven lines below it in the same file — is replaced by
+    `img.shields.io/crates/msrv/io-harness`, which reads `rust-version` from the published manifest and
+    therefore cannot disagree with the crate even in the release that raises the floor. All six values
+    are now resolved at render time by crates.io, docs.rs or GitHub Actions.'
+  - 'One badge added: downloads (`crates/d/io-harness`), the adoption signal a reader deciding whether
+    to depend on the crate asks for and could not see. None added for coverage, benchmarks or unsafe-freedom:
+    this repository measures none of the three, `unsafe` is present on the Windows path so the claim would
+    be false, and a badge asserting a property no gate checks is worse on a landing page than in a test
+    because a reader cannot inspect it. None for dependency freshness, which was weighed during planning
+    and excluded by owner decision.'
+- id: US-IO-HARNESS-0.36.1-T09
+  summary: Restructure `README.md` around what the crate is, who it is for and the shortest path from
+    an empty file to a working run, ahead of the capability inventory — with `tests/readme.rs`'s two properties
+    and `tests/docs_drift.rs`'s three checkers green throughout.
+  why_required: Removing the literal `1.95` from the MSRV badge spends the line that satisfied two gates,
+    and adding a badge spends another of the sixty. The restructure is what pays for both, and it is the
+    half a reader arriving from crates.io actually reads.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.36.1-T08
+  acceptance_criteria:
+  - '**F7 - the README states the current version and a checker enforces it.** `README.md`''s `[dependencies]`
+    snippet names the `major.minor` of `Cargo.toml`''s `version`. The checker is a pure function over
+    text in `tests/docs_drift.rs`, run against the real `README.md` by one test, with a negative control
+    fixture carrying the current `io-harness = "0.25"` line that the checker must report. Fed the corrected
+    README it reports nothing. `tests/readme.rs`''s two existing properties still hold: the first 60 lines
+    say what the crate is, show a runnable fence and name the MSRV, and no heading is named after a release.
+
+    '
+  files:
+  - README.md
+  evidence:
+  - '`cargo test --test readme` — 8 passed, 0 failed, and `cargo test --test docs_drift` — 15 passed.
+    Both suites were run against the rewrite continuously rather than at the end; they are pure functions
+    over text and run in milliseconds.'
+  - '**The predicted gate failure was real and is why the restructure was needed rather than optional.**
+    `1.95` appeared in the README''s first sixty lines in exactly one place: the MSRV badge URL. Replacing
+    it with the dynamic route removes the literal, and `tests/readme.rs` requires the MSRV in the first
+    screen while `tests/docs_drift.rs` requires some line naming "MSRV" or "minimum supported Rust" to
+    state it. Prose now carries it — `**MSRV: Rust 1.95** or later` at line 32, above the first Rust fence
+    — which a reader needs anyway, since nobody reads a version out of a badge image. The checkers working,
+    not a problem.'
+  - 'The head is now: what the crate is (line 16), the loop in four lines, the install snippet (26), the
+    MSRV (32), a runnable session example (34), the unattended `run_with` shape, then **Who it is for**
+    — including what this crate is NOT, and that the browser login, the terminal interface and the notification
+    tray belong to the embedder — then **Requirements** carrying the `libsqlite3-sys` explanation that
+    used to sit between the fences and the capability inventory. The inventory that began at line 100
+    and ran to 287 now begins at 122, behind the material a reader arriving from crates.io is actually
+    looking for.'
+  - 'Six badges on six lines inside the sixty, one more than before. The budget is what paid for it: the
+    MSRV rationale moved out of the first screen into its own section, which is where a reader wanting
+    the reason goes rather than where a reader wanting to start does.'
+- id: US-IO-HARNESS-0.36.1-T10
+  summary: 'Sweep `docs/CONTRACT.md`, `docs/CAPABILITIES.md` and the 22 guide pages against what 0.30.0
+    through 0.36.0 shipped: a capability with no mention on its guide page, a `known_limitations` entry
+    a later release fixed, and a limit that became true and was never written down.'
+  why_required: Documentation is part of the release, not after it. Seven releases of capability landed
+    against pages that were each written for one of them, and a limitation that is no longer true is a
+    contract that lies in the reader's favour.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - '**F9 - the documentation sweep is against the releases, not against a feeling.** Every capability
+    shipped by 0.30.0 through 0.36.0 is checked for a mention on its guide page and in `docs/CAPABILITIES.md`,
+    and every `known_limitations` entry in `docs/CONTRACT.md` is checked against the release that would
+    have fixed it - including the ones the brief lists as open, which must still read as open. `tests/guide_pages.rs`
+    and `tests/changelog.rs` pass. What is corrected is enumerated in the record; a sweep that found nothing
+    on a page says so rather than being silent, since a gate that goes quiet is worth a sentence (trap
+    82).
+
+    '
+  files:
+  - docs/CAPABILITIES.md
+  - docs/guide/composition.md
+  - docs/guide/verification.md
+  - src/agent.rs
+  evidence:
+  - '`cargo test --test guide_pages --test docs_drift --test changelog --test readme --test public_api`
+    — 5, 15, 7, 8 and 9 passed, 0 failed. `docs/public-api.txt` is untouched (`git status` reports it
+    unmodified), which is N2''s claim and is now a fact rather than an intention.'
+  - '**Gap 1 — a capability whose guide page does not mention it.** `docs/guide/composition.md` is the
+    guide for agent composition and in 158 lines it contained the strings `worktree` and `AgentDef` exactly
+    zero times. 0.36.0''s per-child worktree is the feature whose entire purpose is that concurrent children
+    stop overwriting each other''s files — which is the bound the rest of that page''s concurrency story
+    runs into. It was documented in `images-and-git.md`, `durable-runs.md` and `docs/CONTRACT.md`, and
+    absent from the one page a reader asking "can two children work at once" would open. Added, with its
+    four bounds stated rather than implied: the spawn fails rather than falling back, the path is policy-checked
+    before `git` is asked, nothing ever removes a worktree or deletes a branch, and the parent''s `git_status`
+    sees `?? .worktrees/`.'
+  - '**Gap 2 — a public doc comment that is stale in exactly the component a release paid to add.** `AgentDef::worktree`''s
+    rustdoc documented the path as `<root>/.worktrees/<agent>-<parent run>-<step>`. The shipped derivation
+    in `worktree_for` is `<agent>-<parent_run>-<step>-<goal digest>`. The digest is the whole reason the
+    feature works for a fan-out: two children of the same definition in the same step differ in nothing
+    else and would otherwise share one worktree. A caller reading the public doc and deriving that path
+    would not find the directory. Corrected, with why the component exists.'
+  - '**Gap 3 — an index entry that stopped being true.** `docs/CAPABILITIES.md` listed the git built-ins
+    as "status, diff, log, add and commit". 0.36.0 added branch and worktree, and the README''s own prose
+    already said so — the index alone was behind.'
+  - '**Gap 4 — a guide page over-claiming a rule that rests on a defaulted trait method.** `docs/guide/verification.md`
+    stated "A model may not review its own work" flatly. The rule compares `Provider::model_hint`, which
+    is defaulted to `None` — the default that kept 0.34.0 from breaking the crate''s one extension point
+    — so for a provider that does not override it the comparison has nothing to compare and **the rule
+    is a no-op, not a failure**: the review runs, possibly on the model that wrote the change. `docs/CONTRACT.md:587`
+    already said so; the guide did not. This is the standing rule that a defaulted method makes any feature
+    resting on it a no-op for a provider that does not override it, and that it must be stated honestly.'
+  - '**Pages where the sweep found nothing, said rather than left silent** (trap 82''s rule, that a gate
+    going quiet is worth a sentence). `providers.md` covers `Routing`, `Provider::models()` and `reachable()`
+    including the defaulted-no-op consequence, correctly and in the honest form gap 4 was missing. `verification.md`
+    covers `retry_gate` and `Verification::Review`''s three-way outcome. `plugins.md` covers `plugin.toml`
+    and what a project-scoped declaration may not contribute. `durable-runs.md` and `context-and-memory.md`
+    both cover `rewind_run`. `docs/CONTRACT.md`''s worktree section is the most complete account of the
+    0.36.0 git surface in the repository and needed no correction — including the version floors it deliberately
+    does not probe for.'
+  - '**Every `known_limitations` entry the brief lists as open was checked and still reads as open**,
+    so none was removed: `Containment::max_total_cost` is documented in `composition.md` as "reserved,
+    and not enforced" with the reason (no price telemetry) and the workaround; the narrowed `resume_tree`
+    / `resume_tree_observed` split that 0.32.0 half-fixed still reads in its narrowed form and was not
+    re-broadened into the blanket claim. Nothing was deleted from `docs/CONTRACT.md` on the strength of
+    a release having ''probably'' fixed it.'
+- id: US-IO-HARNESS-0.36.1-T11
+  summary: '`CHANGELOG.md` gains its `## [0.36.1]` section, and the release''s own honesty criteria are
+    settled: no criterion asserts a duration, the durations are read from the Actions API by run id and
+    recorded, `cargo tree` still reads 402, and every lever''s actual contribution is stated including
+    any that did not help.'
+  why_required: '`release.yml` refuses a version with no changelog section and the Release notes are that
+    section verbatim, so the section is a precondition of the release rather than a courtesy. The recorded
+    numbers are the release''s only evidence of its own outcome.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.36.1-T03
+  - US-IO-HARNESS-0.36.1-T04
+  - US-IO-HARNESS-0.36.1-T05
+  - US-IO-HARNESS-0.36.1-T09
+  - US-IO-HARNESS-0.36.1-T10
+  acceptance_criteria:
+  - '**N1 - no acceptance criterion asserts a duration.** Not one. This repository has three traps for
+    wall-clock assertions failing on loaded machines (11, 73, 83), and CI is the place with the least
+    control over its own hardware. Durations are **recorded**: the per-job and per-step numbers for the
+    0.36.1 CI run and release run are read from the GitHub Actions API by run id and written into the
+    release record beside the 0.36.0 baseline (run 30834723995: Windows 17m51s / Linux 8m23s / macOS 8m51s,
+    workflow wall clock 17m51s; run 30834005895: release 7m18s). The comparison is evidence a reader can
+    check, not a gate a runner can flake.
+
+    '
+  - '**N2 - no runtime dependency, and no public API change at all.** `cargo tree` still reads **402**
+    lines. `docs/public-api.txt` is unedited and `tests/public_api.rs` passes untouched. `cargo-nextest`
+    and any install action are CI tooling, not crate dependencies; every new `uses:` is pinned to a full-length
+    commit SHA with its version in a trailing comment, resolved with `gh api` and never guessed (trap
+    13), and Dependabot''s `develop` targeting is unchanged.
+
+    '
+  - '**N3 - the reason for every change is in the file.** `ci.yml` is a 383-line file that is mostly argument:
+    why `feat/**` is not a push trigger, why the timeout is 40 minutes and what it was measured against,
+    why `--all-features` is one leg and not two, why `--lib --tests` excludes the doctests, why `links-consumer`
+    and `cross-version` exist at all. Every change here carries the same: what it was, what it is, what
+    the measurement was, and what would make it wrong. A future release must be able to undo this deliberately
+    rather than by accident - the note at `ci.yml:102-121`, recording that a naive `--all-features` leg
+    cost 612s on Windows against 146s, is exactly the artifact that stops someone re-introducing it, and
+    this release owes the same.
+
+    '
+  - '**N4 - the release is honest about what it did not achieve.** The recorded numbers are whatever they
+    are. If the Windows leg lands at 11 minutes rather than the 6-8 this plan reasons toward, that is
+    what the record says, with what each lever actually contributed. A lever that turned out not to help
+    is reported as a finding, not quietly left in (trap 58''s rule, applied to optimisation instead of
+    sabotage).
+
+    '
+  files:
+  - CHANGELOG.md
+  evidence:
+  - '`CHANGELOG.md` gains its `## [0.36.1]` section, carrying the measured result. `cargo test --test
+    changelog` — 5 passed. No `**BREAKING` entry exists, so no `*Migration:*` note is owed, and that absence
+    IS the release: a consumer changes one digit and recompiles unchanged.'
+  - '**N1 — not one acceptance criterion asserts a duration.** Every criterion in this release asserts
+    structure: which jobs exist, which commands run in them, which targets are built, which linker performed
+    the link, which sets cover which. The durations are RECORDED, read from the GitHub Actions API by
+    run id. Baseline run 30834723995 (warm): workflow 17m51s; `test (windows-latest)` 17m51s, macOS 8m51s,
+    Linux 8m23s; inside the Windows leg `cargo build --all-targets` 317s, `cargo test` 295s, `cargo test
+    --all-features --lib --tests` 400s. After, run 30925715697 attempt 2 (warm, zero `No cache found`
+    in any Windows job): **workflow 6m58s** — `test (windows, all)` 6m58s, `test (windows, default)` 5m50s,
+    `test (macos, all)` 4m10s, `doctest (windows)` 3m55s, `test (macos, default)` 3m23s, `doctest (ubuntu)`
+    3m03s, `test (ubuntu, all)` 2m59s, `test (ubuntu, default)` 2m24s, `doctest (macos)` 1m37s, `cross-version`
+    1m28s, `links-consumer` 1m25s, `docs.rs (nightly)` 1m16s, `lint` 55s, `msrv` 40s, `examples (compile)`
+    38s. **17m51s → 6m58s, a 61% reduction.**'
+  - '**N2 — no runtime dependency and no public API change.** `cargo tree` reads **402** lines, unchanged
+    since 0.23.0. `docs/public-api.txt` is byte-identical and `tests/public_api.rs` passes untouched (9
+    passed). `Cargo.toml`''s only edit is the version bump. `cargo-nextest` is installed by `taiki-e/install-action`
+    pinned to `67729d5c413db75907f0ad1e39bb04b9c868ff60` (v2.85.7, resolved with `gh api`, never guessed),
+    and `rust-lld` ships inside the Rust toolchain, so neither adds an install of anything to the machine.
+    Dependabot''s `develop` targeting is untouched.'
+  - '**N3 — the reason for every change is in the file.** Each change carries what it was, what it is,
+    what the measurement was and what would make it wrong: the matrix split records the 317s / 295s /
+    400s breakdown and why the polarities were serial; the `--example` list records that it is derived
+    and points at the test rather than inviting a hand edit; the `rust-lld` block records the probe''s
+    actual `--print link-args` output on both sides and why it is Windows-only; the doctest job records
+    that all 251-plus doctests still run on three OSes and why (trap 10). `ci.yml`''s existing arguments
+    — why `feat/**` is not a push trigger, why the timeout is 40 minutes, why `--all-features` is one
+    leg — are all preserved.'
+  - '**N4 — honest about what it did not achieve, and about a lever that was measured and rejected.**
+    The release reasoned toward 6-8 minutes and landed at **6m58s**, inside that. Two findings reported
+    rather than buried: (1) **`CARGO_PROFILE_DEV_DEBUG=0` was measured and dropped.** The owner had excluded
+    it for this release; before accepting that at face value I measured what it would buy on the doctest
+    job alone, where a backtrace frame has the least value — 184.0s → 166.0s, **9.8%**, about 24s on the
+    Windows doctest job. That is not worth reopening a recorded decision, so it stays excluded and the
+    number is written down so nobody re-measures it. (2) **The next lever was identified, costed, and
+    deliberately not taken.** 81% of the remaining build time is 59 test binaries linking, which is fully
+    parallel; sharding them two ways was estimated at ~4m15s. It is not in this contract — the contract''s
+    own open questions park it as a later lever — and the owner''s decision on 2026-08-04 was to lock
+    0.36.1 here rather than widen it. Recorded so a later release knows it was weighed and by whom.'

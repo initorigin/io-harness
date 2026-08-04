@@ -75,7 +75,8 @@ it, not when a release merely touched it.
 - **Documents** — spreadsheets, Word, PowerPoint text, PDF and barcode decoding,
   each behind its own cargo feature, all off by default
 - **Images** — passthrough to any provider whose model accepts one
-- **Git** — status, diff, log, add and commit as fixed-argv built-ins
+- **Git** — status, diff, log, add, commit, branch and worktree as fixed-argv
+  built-ins, so a run ends as a reviewable commit on a branch of its own
 
 ## What is off the roadmap
 

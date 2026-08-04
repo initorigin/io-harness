@@ -51,10 +51,36 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
-  # The three-OS matrix. fail-fast is off on purpose: Linux and Windows have
-  # never been built, so one platform failing must not hide the other two.
+  # The three-OS matrix, over both feature polarities. fail-fast is off on
+  # purpose: Linux and Windows have never been built, so one platform failing
+  # must not hide the other two.
+  #
+  # 0.36.1 — why this is a matrix over `os` x `features` rather than one job per
+  # OS running both polarities in sequence.
+  #
+  # Measured on run 30834723995 (`develop`, 0.36.0's merge), with the dependency
+  # cache hitting: the workflow's wall clock was 17m51s and effectively all of it
+  # was one leg. `test (windows-latest)` took 17m51s against 8m51s on macOS and
+  # 8m23s on Linux; every other job in the file finished inside 90 seconds and
+  # then waited. Inside the Windows leg the four steps were `cargo build
+  # --all-targets` 317s, `cargo test` 295s, `git --version` 1s, and `cargo test
+  # --all-features --lib --tests` 400s.
+  #
+  # The two polarities are independent questions, and running them one after the
+  # other in one job is what makes the leg serial: the feature flip invalidates
+  # every artifact the default half just produced, so the 400s step is largely
+  # the 317s step done again. Split, they compute at the same time. Each leg
+  # takes its own `rust-cache` key, which is what makes this a real saving
+  # rather than the same recompile in two places — one shared key would have the
+  # two legs overwriting each other's cache every run.
+  #
+  # What this does NOT do is reduce what is proven. Both polarities still run on
+  # all three operating systems, which is the point of the `--all-features` leg
+  # existing per-OS at all: path separators and line endings reach the document
+  # and media formats, so a Linux-only pass would not be evidence for the other
+  # two. Buying wall clock with coverage is the one trade this release refuses.
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, ${{ matrix.features }})
     runs-on: ${{ matrix.os }}
     # A cap that never fires means a process that is never killed, so a hung
     # test must not burn a six-hour default.
@@ -69,6 +95,146 @@ jobs:
     # 40 minutes, with the measurement that justifies it written down so the
     # next person to trim it knows what it was sized against.
     timeout-minutes: 40
+    # 0.36.1, F4 — `rust-lld` links on Windows, and it is proven rather than
+    # hoped. `cargo rustc -- --print link-args` on a `windows-latest` runner
+    # reported `link.exe` unmodified and `"rust-lld" "-flavor" "link"` with this
+    # flag set, and the link completed. That is the toolchain's own account of
+    # which linker ran; a flag that is present and silently ignored is exactly
+    # the 0.16.0 `doc_auto_cfg` failure, where the setting was there, every
+    # command exited 0, and docs.rs had been broken for two releases.
+    #
+    # Windows only. It is the platform where linking dominates — roughly 95
+    # linked executables per polarity, plus 366 doctests that are each their own
+    # compile and their own link — and `rust-lld` is the MSVC-flavour linker the
+    # toolchain already ships at
+    # lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe, so nothing is
+    # installed. Linux and macOS keep their default linkers: neither is the
+    # critical path, and `rust-lld` for ELF and Mach-O is a separate question
+    # with a separate answer.
+    #
+    # RUSTFLAGS is part of the cache key, so the first run after this lands
+    # rebuilds dependencies once and every run after it hits.
+    env:
+      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-Clinker=rust-lld' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        features: [default, all]
+        include:
+          - features: default
+            flags: ""
+          - features: all
+            flags: "--all-features"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      # rmcp and a bundled rusqlite are the expensive part of a cold build. The
+      # key is per-polarity: the two legs compile different dependency sets and a
+      # shared key would have them overwrite each other's cache on every run.
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.features }}
+      # nextest, installed from a prebuilt binary by a SHA-pinned action like
+      # every other `uses:` in this file. Not a crate dependency.
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-nextest
+      # `--tests` plus the fixture examples by name, NOT `--all-targets`.
+      #
+      # `--all-targets` linked all 35 examples, on three operating systems, for
+      # each of two polarities — 300s of the Windows leg's 317s build step was
+      # this crate's own targets, roughly 95 rustc invocations each producing a
+      # linked executable. Thirty of those examples are demonstrations no test
+      # ever executes; linking them proved only that they compile, which the
+      # `examples` job below proves once without linking anything.
+      #
+      # The five remaining are fixtures a test spawns as a child process, and
+      # `--lib --tests` does not build `examples/` — a fact this repository has
+      # rediscovered four times, each as a confusing failure about a missing
+      # file. `tests/ci_workflow.rs` now derives the spawned set from `tests/`
+      # and fails as a named test if this list and that set ever disagree, which
+      # is the only reason it is safe to stop building all 35. Do not edit this
+      # list by hand against a guess; run the test and it will say what to add.
+      - run: >
+          cargo build ${{ matrix.flags }} --tests
+          --example attach_fixture
+          --example crash_fixture
+          --example fleet_fixture
+          --example flood
+          --example mcp_fixture_server
+          --example orphan
+          --example plan_gate_fixture
+          --example tick
+      # 0.15.0: the git built-ins are in the default build but need the binary.
+      # Git is preinstalled on all three runners — asserted rather than
+      # installed, because "no system package on any runner" is the constraint
+      # that removed OCR and it applies here too.
+      - run: git --version
+      # 0.14.0: the document and media formats are optional, so the default
+      # polarity does not compile a line of them. Both polarities run on all
+      # three OSes rather than on Linux alone because path separators and line
+      # endings both reach these formats — a zip entry name is `/`-separated on
+      # every platform, and the text a reader hands back is compared against
+      # needles a test wrote — so a Linux-only pass would not be evidence for
+      # the other two. Eleven `#[cfg(not(feature = ..))]` sites across src/ only
+      # compile when a feature is OFF, so neither polarity alone covers both.
+      #
+      # One `--all-features` leg, not one per feature. Until 0.21.0 this was
+      # `--features documents --lib --tests` followed by `--features media`, and
+      # every feature flip recompiles the crate and that feature's dependency
+      # tree from scratch: 135s and then 205s on Linux, for 340s of the job's
+      # 9 minutes. `--all-features` compiles that superset once.
+      #
+      # What this leg no longer proves is that each feature compiles *in
+      # isolation* — `documents` without `media`, and so on. That coverage moved
+      # to the `lint` job, which clippy-compiles each feature set separately in
+      # 6-10 seconds each on a warm cache, rather than costing minutes per OS here.
+      #
+      # `--lib --tests`, so no leg here runs a doctest. A doctest is its own
+      # rustc invocation and its own link, which is the slow part on Windows:
+      # 251 of them were 172s of the 295s `cargo test` step on run 30834723995,
+      # and they share nothing with running the test binaries. They are the
+      # `doctest` job below, on the same three operating systems.
+      #
+      # `cargo nextest run`, not `cargo test`. 59 test binaries were executed
+      # sequentially — 122s of the Windows leg's 295s `cargo test` step, with
+      # the rest being the doctests that are now their own job. nextest runs
+      # them concurrently, process-per-test.
+      #
+      # It is CI tooling installed by an action, NOT a crate dependency:
+      # `cargo tree` still reads 402 lines and Cargo.toml is untouched by this
+      # release. nextest does not run doctests at all, which is the second
+      # reason the doctests are a job of their own rather than a flag here.
+      #
+      # The count is the discriminator, not the wall clock. A run that quietly
+      # filtered or skipped a binary would look like a speed-up and fail
+      # nothing, so the number of tests executed per leg is compared with the
+      # number `cargo test` executed for that leg on run 30834723995: 967 in
+      # the default polarity and 1044 with every feature on.
+      - run: cargo nextest run ${{ matrix.flags }} --lib --tests
+
+  # 0.36.1 — the doctests, as a job of their own, per operating system.
+  #
+  # They were 172s of the Windows `cargo test` step's 295s and they are not test
+  # binaries: rustdoc compiles and links each one separately, so this work
+  # overlaps with nothing the matrix does. Split out, it runs at the same time
+  # as both polarities instead of in front of one of them.
+  #
+  # All 251 still run on all three operating systems. That is deliberate and it
+  # is paid for: a doctest using `${env:HOME}` failed on `windows-latest` and
+  # nowhere else, which is why doc examples here prefer a literal. This release
+  # does not spend coverage to buy time.
+  doctest:
+    name: doctest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    # See the note on the `test` job: 366 doctests are 366 separate links, which
+    # is the single place `rust-lld` has the most to do.
+    env:
+      RUSTFLAGS: ${{ matrix.os == 'windows-latest' && '-Clinker=rust-lld' || '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -78,56 +244,47 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
-      # rmcp and a bundled rusqlite are the expensive part of a cold build.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-      # --all-targets also builds examples/: the mcp and checkpoint tests spawn
-      # examples/mcp_fixture_server and examples/crash_fixture as child processes.
-      # The default build. It is not redundant with the `--all-features` leg
-      # below: eleven `#[cfg(not(feature = ..))]` sites across src/ only compile
-      # when a feature is OFF, so the two legs cover the two polarities and
-      # neither alone covers both.
-      - run: cargo build --all-targets
-      - run: cargo test
-      # 0.15.0: the git built-ins are in the default build but need the binary.
-      # Git is preinstalled on all three runners — asserted rather than
-      # installed, because "no system package on any runner" is the constraint
-      # that removed OCR and it applies here too.
-      - run: git --version
-      # 0.14.0: the document and media formats are optional, so the default legs
-      # above do not compile a line of them. They run on all three OSes rather
-      # than on Linux alone because path separators and line endings both reach
-      # these formats — a zip entry name is `/`-separated on every platform, and
-      # the text a reader hands back is compared against needles a test wrote —
-      # so a Linux-only pass would not be evidence for the other two.
-      #
-      # One `--all-features` leg, not one per feature. Until 0.21.0 this was
-      # `--features documents --lib --tests` followed by `--features media`, and
-      # every feature flip recompiles the crate and that feature's dependency
-      # tree from scratch: 135s and then 205s on Linux, for 340s of the job's
-      # 9 minutes. `--all-features` compiles that superset once. It keeps the
-      # doctests, which the old `media` leg needed for the two public items gated
-      # on that feature, and the default leg above has already run the
-      # default-build doctests, so nothing is run twice.
-      #
-      # What this leg no longer proves is that each feature compiles *in
-      # isolation* — `documents` without `media`, and so on. That coverage moved
-      # to the `lint` job, which clippy-compiles each feature set separately in
-      # 6-10 seconds each on a warm cache, rather than costing minutes per OS here.
-      #
-      # `--lib --tests`, so this leg does not re-run the 251 doctests the default
-      # leg above already ran on this same OS. A doctest is its own rustc
-      # invocation and its own link, which is the slow part on Windows: the first
-      # `--all-features` leg written without this flag cost 612s there, against
-      # 146s for the whole default `cargo test`.
-      - run: cargo test --all-features --lib --tests
+        with:
+          key: doctest
+      - run: cargo test --doc
       # The doctests that only exist with a feature on — two public items are
-      # gated on `media` and their examples only compile with it. Linux only, and
-      # once: a doctest is a compile-and-link of an example, and nothing about
-      # these two is platform-specific. The cross-platform doctest proof is the
-      # default `cargo test` leg above, which runs all 251 on all three OSes.
-      # This step reuses the artifacts the step above just built.
+      # gated on `media` and their examples only compile with it. Linux only,
+      # and once: nothing about those two is platform-specific, and the
+      # cross-platform doctest proof is the step above, which runs all 251 on
+      # all three OSes.
       - run: cargo test --all-features --doc
         if: matrix.os == 'ubuntu-latest'
+
+  # 0.36.1 — the thirty demonstration examples, compile-checked rather than
+  # linked.
+  #
+  # Until this release they were built by `--all-targets` in every matrix leg:
+  # three operating systems, twice each, six linked copies of thirty binaries
+  # that no test executes, to prove they compile. `cargo check` proves exactly
+  # that and stops before codegen and linking, which is what the proof was made
+  # of on Windows.
+  #
+  # Both polarities, and the second is not redundant. `documents_live` and
+  # `media_git_live` carry `required-features` in Cargo.toml, so a default-only
+  # check SKIPS them entirely and would silently stop compiling two examples the
+  # old `--all-targets` leg compiled. Linux only: which examples compile is a
+  # front-end question and does not vary by OS, and the eight fixtures that do
+  # vary by OS are built and executed on all three by the matrix above.
+  examples:
+    name: examples (compile)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: examples
+      - run: cargo check --examples
+      - run: cargo check --examples --all-features
 
   # The MSRV is read from Cargo.toml rather than hardcoded, so the declared
   # rust-version and the version actually proven to build cannot drift apart.

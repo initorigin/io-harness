@@ -123,8 +123,14 @@ pub struct AgentDef {
     /// Every agent in a tree shares one checkout, so two children editing the
     /// same file are one overwriting the other — the concurrency 0.32.0 bought is
     /// usable only for work that does not overlap. With this set, a child is
-    /// rooted at `<root>/.worktrees/<agent>-<parent run>-<step>`, on a new branch
-    /// of that name, created before its first step.
+    /// rooted at `<root>/.worktrees/<agent>-<parent run>-<step>-<goal digest>`,
+    /// on a new branch of that name, created before its first step.
+    ///
+    /// The goal digest is the last component and it is not decoration: two
+    /// children of the *same* definition spawned in the *same* step — the
+    /// ordinary shape of a fan-out — differ in nothing else, and without it they
+    /// would share one worktree, which is the collision this field exists to
+    /// remove reappearing one level down.
     ///
     /// The path is derived from the key a spawn is *adopted* by, so a resumed
     /// tree finds the worktree it already made and continues in it rather than
