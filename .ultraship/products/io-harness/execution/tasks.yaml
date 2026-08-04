@@ -56,7 +56,7 @@ tasks:
     --examples`.'
   why_required: This is the release's headline change. Every other CI task is a lever on top of it, and
     F1's set-cover comparison and F2's concurrency claim are both about this file.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.36.1-T01
   acceptance_criteria:
@@ -94,7 +94,33 @@ tasks:
   files:
   - .github/workflows/ci.yml
   - tests/ci_workflow.rs
-  evidence: []
+  evidence:
+  - '`cargo test --test ci_workflow` — 6 passed, 0 failed. The assertion that failed in T01 is green against
+    a workflow whose `--example` list was written from the derived set, not from the contract''s parenthetical.'
+  - '**F1, mechanically.** Every `(os, cargo invocation)` pair was enumerated from `ci.yml` and `release.yml`
+    at the `v0.36.0` tag and from the new files, expanding each matrix over its `os` and `features` axes
+    and honouring each step''s `if`. Old: 37 pairs. New: 46. Exactly five old pairs are absent as literal
+    strings, and each is a decomposition rather than a loss: `cargo build --all-targets` on all three
+    OSes becomes `cargo build [--all-features] --tests` plus the eight fixture examples by name on all
+    three, with the other twenty-seven examples covered by `cargo check --examples` AND `cargo check --examples
+    --all-features` on Linux; and `cargo test` on macOS and Windows becomes `cargo test [--all-features]
+    --lib --tests` on both plus `cargo test --doc` on both. `cargo test --all-features --lib --tests`
+    and `cargo test --all-features --doc` are still present per-OS and per-OS-Linux respectively, unchanged.
+    The nine net-new pairs are the two check invocations, the three doctest legs and the per-polarity
+    build and test legs.'
+  - '**The second `cargo check --examples --all-features` is not redundant and is not decoration.** `documents_live`
+    and `media_git_live` declare `required-features` in `Cargo.toml`, so `cargo check --examples` under
+    the default polarity SKIPS them outright. A single-polarity check would have silently stopped compiling
+    two examples that `--all-targets` compiled — a coverage loss invisible in every duration measurement,
+    which is the exact risk F1 exists to catch. Found by reading `Cargo.toml`''s `[[example]]` tables
+    before writing the job, not after.'
+  - 'The per-polarity `rust-cache` key (`key: ${{ matrix.features }}`) is what makes the split a saving
+    rather than the same recompile twice: the two legs compile different dependency sets, and one shared
+    key would have them overwrite each other''s cache every run.'
+  - '`python3 -c ''yaml.safe_load(...)''` over the new `ci.yml` lists eight jobs — `test`, `doctest`,
+    `examples`, `msrv`, `lint`, `links-consumer`, `cross-version-0-29-0`, `docs` — so the file parses
+    and no job id contains a dot (trap 4). Whether each job actually ran is O1''s question, answered from
+    the run''s own job list rather than from the file.'
 - id: US-IO-HARNESS-0.36.1-T03
   summary: Answer whether stable MSVC will link with `rust-lld` on `windows-latest`, from the toolchain's
     own account of the link — and either land it with that proof or drop the lever and record the finding.
