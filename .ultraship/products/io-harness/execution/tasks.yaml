@@ -127,7 +127,7 @@ tasks:
   why_required: The Windows leg is made of roughly 95 linked executables per polarity plus 251 doctest
     links, so the linker is the lever aimed at what the leg actually is. Landed alone so its contribution
     is attributable, and either answer is a result the release owes.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.36.1-T02
   acceptance_criteria:
@@ -143,7 +143,38 @@ tasks:
     '
   files:
   - .github/workflows/ci.yml
-  evidence: []
+  evidence:
+  - '**F4 answered YES, on a runner, and the proof is the toolchain''s own account of the link — not the
+    presence of a flag.** The probe job ran `cargo rustc --example tick -- --print link-args` on `windows-latest`
+    four times. Unmodified, rustc invoked `C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\HostX64\x64\link.exe`.
+    With `RUSTFLAGS=-Clinker=rust-lld` it invoked `"rust-lld" "-flavor" "link"` and the link completed
+    (step conclusion `success`). Stable MSVC needs no nightly flag: rustc resolves the bare name `rust-lld`
+    itself.'
+  - '**What rust-lld actually bought, attributed as a single variable.** Warm cache in both cases, same
+    leg, same commit shape, nothing else changed: the Windows doctest step went 338s → **200s (-41%)**
+    and the Windows default build step 253s → **205s (-19%)**. The doctest win is the larger one and that
+    is the expected shape — 366 doctests are 366 separate links, where the build step is ~95. Measured
+    against run 30923664928 (warm, no lld) and run 30925715697 attempt 2 (warm, lld; `No cache found`
+    appears zero times in all three Windows jobs).'
+  - 'Three candidate forms were probed because only a runner could say which work, and all three do: A
+    `-Clinker=rust-lld`; B the absolute path `<sysroot>/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe`;
+    C a copy named `lld-link` on PATH. **A is what shipped** — it is the shortest, it needs no path construction
+    that a toolchain layout change would break, and the probe showed rustc resolving it without help.
+    The toolchain ships `rust-lld.exe` at that sysroot path, so nothing is installed and no action is
+    added.'
+  - '**Why Windows only, measured rather than assumed.** On the same tree locally: `cargo build --lib`
+    is 15.7s and `cargo build --tests` is 84.0s, so the library is 19% of the build step and the 59 test
+    binaries are the other 81% — and those are link-bound (user time 305s against 84s wall, already saturating
+    the cores). The Windows doctest job is 366 more links, one per doctest. Linux and macOS keep their
+    default linkers: neither is the critical path, and `rust-lld` for ELF and Mach-O is a separate question
+    that would need its own probe.'
+  - 'The probe job was deleted in the same release, as its own comment said it would be. It carried `continue-on-error:
+    true` on the three candidates — correct for a job whose purpose is to report which of three forms
+    works, and exactly the reason it could not stay.'
+  - 'Cost note recorded honestly: the probe was cancelled twice before it answered, both times by a push
+    to the same branch under `concurrency: cancel-in-progress`. The second cancellation was mine — I pushed
+    the changelog commit while the probe was still running. A long diagnostic job on a branch that is
+    still being pushed to needs either its own workflow or a pause in pushing.'
 - id: US-IO-HARNESS-0.36.1-T04
   summary: '`cargo-nextest` runs the test binaries in the matrix legs, installed through a SHA-pinned
     action, with the executed-test count matched against the 0.36.0 baseline and the three known wall-clock-sensitive
