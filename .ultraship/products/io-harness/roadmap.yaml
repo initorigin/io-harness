@@ -903,3 +903,32 @@ versions:
       states plainly rather than implying.
     detail: specified
     status: released
+  - version: 0.36.1
+    outcome: >
+      A contributor gets a verdict in minutes, and a reader gets a page that is true.
+
+      Every push waits about eighteen minutes for CI, and effectively all of it is one job: the
+      Windows leg links the crate's own targets — one library, fifty-nine test binaries and
+      thirty-five examples — then links the whole set a second time when the feature flip
+      invalidates it, then compiles and links two hundred and fifty-one doctests. Thirty of those
+      thirty-five examples are demonstrations no test executes, and they are linked on three
+      operating systems, twice each. The two feature polarities and the doctests are independent
+      questions run one after another in a single serial job.
+
+      After this release the same evidence arrives in well under half the wall clock: the same
+      three operating systems, the same two feature polarities, the same doctests, the same MSRV,
+      lint, docs.rs, links-consumer and cross-version gates. Nothing is dropped and nothing is
+      sampled — the work is reorganised, not reduced.
+
+      And the front page stops misinforming the reader in the two places it costs most. The install
+      snippet a reader copies from crates.io says `io-harness = "0.25"` against a crate that is
+      eleven releases past it. The product table calls io-cli "In development" and unlinked, beside
+      the sentence "io-harness is the only public repository today" — io-cli has been published to
+      crates.io and public on GitHub since 2026-08-03. io-studio is described as in development and
+      has no source at all. A reader gets a line that works, a truthful account of what each sibling
+      product is and is not, and a README organised around what the crate is and how to start rather
+      than around what accumulated. The dependency version joins the MSRV, the feature list and the
+      relative links as a fact stated in `Cargo.toml` and checked against the prose, so the eleven
+      releases of drift cannot happen a second time.
+    detail: specified
+    status: planned

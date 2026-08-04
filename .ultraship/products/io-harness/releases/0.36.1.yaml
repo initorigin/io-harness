@@ -1,0 +1,595 @@
+product: io-harness
+version: 0.36.1
+status: planned
+release_type: patch
+
+outcome:
+  user_can: >
+    Push a change and get the same verdict in well under half the wall clock, and read a front page
+    that is true.
+
+    CI takes about eighteen minutes and effectively all of it is one job. Measured on run
+    30834723995 (`develop`, 0.36.0's merge): `test (windows-latest)` 17m51s, against
+    `test (macos-latest)` 8m51s, `test (ubuntu-latest)` 8m23s, `docs.rs (nightly)` 1m31s,
+    `cross-version-0.29.0` 1m19s, `links-consumer` 1m10s, `lint` 58s and `msrv` 39s. Every job but
+    the matrix finishes inside 90 seconds; the workflow's wall clock is the Windows leg and nothing
+    else.
+
+    Inside that leg, with the dependency cache **hitting** — `Cache hit for:
+    v0-rust-test-Windows_NT-x64-d4c8f3f7-05810725`, dependencies compiled in 17 seconds — the four
+    steps are `cargo build --all-targets` 317s, `cargo test` 295s, `git --version` 1s, and
+    `cargo test --all-features --lib --tests` 400s. Of the build's 317s, **300s is io-harness's own
+    targets**: one library, 59 test binaries and 35 examples, which is roughly 95 separate rustc
+    invocations each producing a linked executable. Of the 295s, the test binaries run in 122s and
+    the **251 doctests take 172s** — a doctest is its own compile and its own link. Then the feature
+    flip invalidates every one of those artifacts and the 400s leg links the set again.
+
+    Three of those costs are avoidable without giving up a single piece of evidence. Thirty of the
+    thirty-five examples are demonstrations no test executes — they are linked on three operating
+    systems, twice each, to prove they compile, which `cargo check` proves without linking anything.
+    The two feature polarities and the doctest suite are independent questions answered one after
+    another in one serial job, on a public repository where a second concurrent runner costs
+    nothing. And the link step itself, which is what all of this is made of on Windows, runs under
+    the default MSVC linker when the toolchain already ships `rust-lld`.
+
+    After this release the workflow proves exactly what it proves today — three operating systems,
+    both feature polarities, all 251 doctests, the MSRV floor, `fmt`, `clippy` in three feature
+    shapes, the docs.rs nightly build, the `links` coexistence wall and the 0.29.0 cross-version
+    pair — reorganised so the answers arrive in parallel rather than in sequence. Nothing is
+    dropped, nothing is sampled, and nothing moves to "Linux only" that a paid-for trap says must
+    stay on three.
+
+    And the front page stops misinforming the reader. `README.md:28` tells a reader arriving from
+    crates.io to write `io-harness = "0.25"` — eleven releases stale, and the one line in the file
+    that is meant to be copied. `README.md:361-366` lists io-cli as "In development" and unlinked
+    and io-studio as "In development", under the sentence "io-harness is the only public repository
+    today"; io-cli 0.10.0 is on crates.io with 186 downloads and `initorigin/io-cli` is PUBLIC, and
+    io-studio holds documentation and no `src/` at all. A reader gets an install line that works, a
+    truthful account of each sibling product, guides reconciled against what 0.30.0-0.36.0 actually
+    shipped, and a README organised around what the crate is and how to start rather than around
+    what accumulated over thirty-six releases.
+
+  business_value: >
+    Both halves are about the same thing: the cost of finding out.
+
+    Eighteen minutes is the interval between a contributor pushing and knowing. It is paid on every
+    commit of every branch, on both PRs of every release, and twice more on the two pushes the
+    release flow makes — and because the Windows leg is 100% of it, every other job on the graph
+    finishes and waits. That is not a runner-cost problem; on a public repository the minutes are
+    free. It is a feedback-loop problem, and it compounds with the thing this repository does most:
+    the release brief's own §6 records that "a full suite rerun is the single biggest cost in this
+    repo — token, wall-clock and disk", and the flaky-test procedure in three separate traps (11,
+    73, 83) is *re-run before investigating*. A re-run is eighteen minutes. Halving that halves the
+    cost of the standard response to the most common false alarm.
+
+    It is also the right release to spend on it, precisely because it carries no feature. Every
+    change here is to `.github/workflows/`, to documentation, and to one test file. A build-time
+    change landed beside a feature is a change whose regression hides inside the feature's noise;
+    landed alone, the before and after are the same tree and the difference is attributable. The
+    same argument 0.23.0 made for shipping the `rusqlite` upgrade by itself.
+
+    The documentation half is smaller and sharper. The install snippet is the single highest-traffic
+    line in the repository: it is what a reader copies from the crates.io landing page, and it has
+    said `0.25` since that release. A reader who copies it gets a crate without `Session`'s current
+    surface, without plugins, without the git built-ins, without `rewind_run` — and gets no error,
+    because `0.25` resolves. They simply get an eleven-release-old library and conclude that is what
+    the crate is. The product table compounds it in the other direction: it tells a reader that the
+    two things built on this crate do not exist yet, which was true when it was written and stopped
+    being true on 2026-08-03. io-cli is the strongest available evidence that this crate is
+    embeddable by something other than its author, and the README currently hides it.
+
+    Adding the check is what makes the fix last. `tests/docs_drift.rs` exists because three facts
+    are "stated in `Cargo.toml` and then retyped into prose, which is the shape that rots" — its own
+    words — and it guards the MSRV, the feature list and every relative link. The dependency version
+    is a fourth fact of exactly that shape and is the one that rotted furthest. Eleven releases of
+    drift in a file with a drift-checker test is the argument for the fourth checker, not against
+    the three.
+
+  evidence_of_value: >
+    Structural, never clocked. This release is about wall-clock time, which makes a wall-clock
+    acceptance criterion the obvious mistake and the wrong one: this repository has three separate
+    traps for tests that assert a duration and fail on a loaded runner (11, 73, 83), and a CI
+    threshold would be a fourth in the place with the least control over its own machine. So every
+    criterion asserts **structure** — which jobs exist, which commands run in them, which targets
+    are built, which linker did the linking, which set of cargo invocations the workflow contains
+    before and after — and the durations are **recorded as evidence** in the release record, taken
+    from the GitHub Actions API for a named run id, never asserted against a bound.
+
+    The claim that nothing is lost is the load-bearing one, and it is proven as a set comparison
+    rather than by reading the diff. The set of cargo invocations the two workflow files contain
+    today is enumerated per operating system from the current `ci.yml` and `release.yml`; the same
+    enumeration is made of the new files; and the second must cover the first, invocation for
+    invocation and OS for OS, with the coverage shown rather than asserted in prose. A leg that
+    stopped running the doctests on macOS would pass every timing measurement and fail this.
+
+    The example-set change is proven against the source rather than against a list someone typed.
+    The fixture examples are the ones a test actually spawns as a child process; that set is derived
+    by reading `tests/` for spawns of an example binary, and a test asserts the set named in the
+    workflow equals the set the tests spawn — with a control that adds a fictional spawn and must
+    make it fail. This is the trap-18/35/54 failure mode (an example a `--lib --tests` run cannot
+    build) converted from a confusing CI break into a named test failure, which is the only reason
+    it is safe to stop building all thirty-five.
+
+    The linker claim is proven by what linked, not by the flag being present. A flag that a
+    toolchain silently ignores is exactly the `doc_auto_cfg` failure of 0.16.0 — the setting was
+    there, it did nothing, and every gate passed — so the criterion asserts `rust-lld` actually
+    performed the link on `windows-latest`, and if it cannot be made to do so on stable the lever is
+    dropped with the reason recorded rather than shipped as a flag nobody proved.
+
+    The documentation claims are proven by the gate, not by inspection. The dependency-version
+    checker lands in `tests/docs_drift.rs` beside the three checkers already there and follows that
+    file's own stated convention — a pure function over text, one test that runs it against the real
+    files, and a negative control fixture that must fail — "because a checker that has never failed
+    is a checker nobody has shown to work". Fed today's README it must report the `0.25` line; fed
+    the corrected README it must report nothing.
+
+scope:
+  included:
+  - >
+    **The matrix splits by feature polarity.** `test` becomes a matrix over `os` x `features`
+    (`default`, `all`), each leg building and running `--lib --tests` for its own polarity, so the
+    two answers are computed concurrently instead of one invalidating the other's artifacts. Each
+    leg gets its own `Swatinem/rust-cache` key, which is what makes the split a real saving rather
+    than the same recompile in two places.
+  - >
+    **The doctests become their own job**, per operating system, running the default-feature
+    doctests on all three and the `--all-features --doc` pass on Linux exactly as today. They are
+    separated because a doctest is its own compile and its own link — 172s of the Windows leg's 295s
+    — and because that work shares nothing with running the test binaries. All 251 keep running on
+    all three operating systems: trap 10 is a paid-for counter-example (a doctest using
+    `${env:HOME}` failed on `windows-latest` and nowhere else), and this release does not spend
+    coverage to buy time.
+  - >
+    **The matrix stops linking thirty demonstration examples.** Each leg builds the library, the
+    test binaries, and the fixture examples a test spawns as a child process — currently
+    `crash_fixture`, `plan_gate_fixture`, `fleet_fixture`, `attach_fixture` and
+    `mcp_fixture_server`, the set traps 18, 35 and 54 accumulated one painful discovery at a time.
+    The remaining thirty are compile-checked once, on Linux, with `cargo check --examples`, which
+    proves what building them proved (they compile) without producing thirty linked executables on
+    three operating systems twice each.
+  - >
+    **A test that keeps that set honest.** `tests/ci_workflow.rs` reads `.github/workflows/ci.yml`
+    and `tests/` and asserts the example names the workflow builds equal the example binaries the
+    test suite spawns, so a fixture example added by a later release fails a named test rather than
+    reappearing as trap 18 for the fourth time. With the negative control that file family requires:
+    a fixture naming a spawn of an example the workflow does not build must make the checker report
+    it.
+  - >
+    **`rust-lld` links on Windows**, if it can be shown to do so on the stable MSVC toolchain. This
+    is the lever aimed at what the Windows leg is actually made of: roughly 95 linked executables
+    per polarity, plus 251 doctest links. It is included conditionally and honestly — the criterion
+    is that lld performed the link, proven from the toolchain's own output, and the release drops it
+    with the reason recorded if stable will not do it. A flag that is present and inert is the
+    0.16.0 `doc_auto_cfg` failure, and this release will not ship one.
+  - >
+    **`cargo-nextest` runs the test binaries.** 59 binaries are executed sequentially today (122s on
+    Windows); nextest runs them concurrently. Installed through a SHA-pinned action like every other
+    `uses:` in the file. It is **not** a crate dependency and `cargo tree` is untouched. The doctest
+    job keeps `cargo test --doc`, which nextest does not run — which is a second reason the doctests
+    are a job of their own.
+  - >
+    **`release.yml`'s `verify` job splits its two test invocations into parallel jobs**, keeping
+    every gate it runs today: the version-matches-`Cargo.toml` check, the ancestor-of-`main` check,
+    the release-does-not-exist check, the changelog-section check, `fmt`, `clippy --all-targets
+    --all-features -D warnings`, both test invocations, and `cargo package --locked` producing the
+    attached artifact. Measured at 7m18s on run 30834005895, of which `cargo test` is 222s and
+    `cargo test --all-features --lib --tests` is 155s. The gate ordering that matters is preserved:
+    nothing tags, and no Release is cut, until every check has passed.
+  - >
+    **`README.md:28` states the current version**, and the dependency version joins the MSRV, the
+    feature list and the relative links as a fact checked against `Cargo.toml`. The checker lands in
+    `tests/docs_drift.rs` — the file whose own doc comment says it exists for facts "stated in
+    `Cargo.toml` and then retyped into prose, which is the shape that rots" — not in a new file,
+    with the pure-function-plus-control shape that file already establishes. It checks the
+    `major.minor` a reader would write in `[dependencies]`, since that is what the snippet carries
+    and what a patch release must not churn.
+  - >
+    **The product table tells the truth.** io-cli: Released, linked to `initorigin/io-cli` and to
+    crates.io. io-studio: **Not built**. The sentence "io-harness is the only public repository
+    today, which is why it is the only one linked. io-cli and io-studio open when they release" is
+    removed, because both of its claims are now false.
+  - >
+    **The README is restructured**, not merely corrected: what the crate is, who it is for, and the
+    shortest path from an empty file to a working run, ahead of the capability inventory that
+    currently begins at line 100 and runs to line 287. The two existing gates hold throughout —
+    `tests/readme.rs` requires the first 60 lines to say what the crate is, show a runnable fence
+    and name the MSRV, and requires no heading to be named after the release that introduced it.
+  - >
+    **An accuracy sweep of `docs/CONTRACT.md`, `docs/CAPABILITIES.md` and the 22 guide pages**
+    against what 0.30.0 through 0.36.0 shipped: a capability whose guide page does not mention it, a
+    `known_limitations` entry that a later release fixed, and a limit that became true and was never
+    written down. `tests/guide_pages.rs` guards the page set and the honest-limits blocks;
+    `tests/docs_drift.rs` guards the MSRV, the feature list and every relative link.
+  - >
+    **`CHANGELOG.md` gains a `## [0.36.1]` section** before `release.yml` is run, since the workflow
+    refuses a version with no section and the Release notes are that section verbatim.
+  excluded:
+  - >
+    **`CARGO_PROFILE_DEV_DEBUG=0`.** The workflows set `line-tables-only` deliberately, and the
+    comment at `ci.yml:42-51` records what it buys: a panic carries its own file and line, and a
+    backtrace keeps frame file and line, "which is how the 0.21.0 Windows CRLF failure was
+    diagnosed". Dropping to `0` would cut link time further — trap 42 measured test binaries going
+    from 91 MB to a fraction locally — and it would cost the frames that diagnose a Windows-only
+    failure on a machine nobody can attach a debugger to. Declined by the owner for this release.
+  - >
+    **Larger runners.** They would cut the Windows leg by buying a bigger machine rather than by
+    removing work, they cost money on a repository whose minutes are currently free, and they would
+    make every future measurement incomparable with the ones recorded here.
+  - >
+    **`sccache`, or caching the workspace crate's own artifacts across runs.** `Swatinem/rust-cache`
+    drops workspace-crate artifacts before saving on purpose, because they are the ones that change;
+    defeating that is a correctness risk (a stale artifact passing as a fresh one) taken for a
+    saving this release gets structurally instead.
+  - >
+    **Moving any per-OS coverage to Linux-only.** The `--all-features` leg runs on three operating
+    systems because path separators and line endings reach the document and media formats, the
+    doctests run on three because of trap 10, and the whole matrix exists because "Linux and Windows
+    have never been built" was once true and one platform failing must not hide the other two.
+    Buying wall clock with coverage is the one trade this release refuses.
+  - >
+    **Any change to what the crate does.** No public item is added, removed or changed. No schema,
+    no `CHECKPOINT_FORMAT`, no dependency. This is a patch: `docs/public-api.txt` is unchanged and
+    `tests/public_api.rs` passes without being edited.
+  - >
+    **Rewriting the guide pages.** The sweep corrects what is wrong and fills what is missing
+    against 0.30.0-0.36.0. Restructuring twenty-two pages is a different piece of work with a
+    different argument.
+  fallback_scope:
+  - >
+    The matrix split by feature polarity, the doctests as their own job, the thirty examples dropped
+    from the matrix with their keeping-honest test, `README.md:28` corrected with its new checker in
+    `tests/docs_drift.rs`, and the product table made true. That alone reorganises the entire
+    Windows serial chain and fixes both misinforming lines, and it is all structural — no linker to
+    prove, no new tool in CI, no restructure to review. What drops is `rust-lld`, `cargo-nextest`,
+    the `release.yml` split and the README restructure. The roadmap's headline still holds: a
+    verdict in minutes and a page that is true.
+
+acceptance:
+  functional:
+  - >
+    **F1 - every cargo invocation the workflows run today still runs, on the same operating systems.**
+    The set of `(os, cargo invocation)` pairs is enumerated from the current `ci.yml` and
+    `release.yml` at the 0.36.0 tag, and from the new files, and the second must cover the first
+    pair for pair. Concretely, on each of `ubuntu-latest`, `macos-latest` and `windows-latest` the
+    new workflow must still run the default-feature test binaries, the default-feature doctests, and
+    the `--all-features --lib --tests` binaries; on `ubuntu-latest` it must still run
+    `--all-features --doc`, `cargo check --all-targets`, `cargo check --all-targets --all-features`
+    at the MSRV, `fmt --check`, `clippy --all-targets`, `clippy --all-targets --features documents`,
+    `clippy --all-targets --features media`, the `links-consumer` fixture pair with its negative
+    control, the pinned-0.29.0 generator with its pin check, and the nightly docs build with its
+    rendered-label grep. The coverage table is written into the release record. The discriminating
+    case: a split that quietly dropped the macOS doctests would pass every duration measurement in
+    this release and fail here.
+  - >
+    **F2 - the two feature polarities and the doctests are concurrent jobs, and each is
+    self-sufficient.** The `test` job is a matrix over `os` x `features` and a separate `doctest`
+    job exists; asserted by parsing `ci.yml` rather than by reading it. Self-sufficiency is the part
+    that actually breaks: each `--lib --tests` leg must build the fixture examples it needs before
+    running, because `--lib --tests` does not build `examples/` — traps 2, 18, 35 and 54, four
+    separate releases discovering the same thing. Proven by the legs passing on a runner, which is a
+    clean tree by construction.
+  - >
+    **F3 - the matrix builds the fixture examples and no others, and a test keeps the two sets
+    equal.** `tests/ci_workflow.rs` derives the set of example binaries the suite spawns by reading
+    `tests/`, parses the example names out of `.github/workflows/ci.yml`, and asserts they are
+    equal. The negative control is a fixture naming a spawn of an example the workflow does not
+    build, which the checker must report — the convention `tests/docs_drift.rs` and
+    `tests/readme.rs` both state: a checker that cannot be made to fail is a green light wired to
+    nothing. The thirty remaining examples are still compile-checked, by `cargo check --examples` on
+    Linux, asserted present by F1's enumeration.
+  - >
+    **F4 - `rust-lld` performed the link on Windows, or the lever is dropped and the reason is
+    recorded.** Not "the flag is set" - the flag being set and doing nothing is exactly the 0.16.0
+    `doc_auto_cfg` failure, where the attribute was present, every command exited 0, and docs.rs had
+    been broken for two releases. The proof is the toolchain's own account of the link (the linker
+    the build actually invoked, read from a verbose build or `--print link-args`), captured in the
+    job log. If stable MSVC will not use `rust-lld` without a nightly flag, the lever is removed
+    from the release and the finding is written into the record and the brief, because a future
+    release must not spend the afternoon rediscovering it.
+  - >
+    **F5 - `cargo-nextest` runs the same tests, and the count is the discriminator.** The number of
+    tests executed per leg under nextest equals the number `cargo test` executed for that leg on run
+    30834723995, and no test is filtered, skipped or silently retried. nextest defaults to
+    process-per-test where `cargo test` uses threads within a binary, so the criterion also requires
+    the three known wall-clock-sensitive tests (`skills::discovery_over_a_32_skill_directory_is_
+    under_50ms`, `hooks.rs::f4_an_executing_hook_gets_its_argv_whole...`,
+    `handles.rs::a_handle_that_exits_on_its_own_stops_reading_as_running` - traps 11, 73, 83) to be
+    run and their outcome recorded. If nextest makes any of them fail more often, nextest is dropped
+    rather than the test being weakened; the release's purpose is to make CI faster, not flakier.
+  - >
+    **F6 - `release.yml` still refuses everything it refuses today, and still cuts one Release.** A
+    tag whose version does not match `Cargo.toml`, a commit that is not an ancestor of `origin/main`,
+    an existing tag on a dispatch, an existing Release on a tag push, and a version with no
+    `## [x.y.z]` changelog section are each still refused before anything is tagged - asserted by
+    reading the split workflow, since executing the refusals means pushing bad tags. `cargo package
+    --locked` still produces the `.crate`, the `release` job still consumes exactly one artifact,
+    and the Release is still titled bare `io-harness 0.36.1` with notes taken verbatim from the
+    changelog section. The parallel split must not let the `release` job start before every check
+    has passed; the job graph is asserted, not assumed.
+  - >
+    **F7 - the README states the current version and a checker enforces it.** `README.md`'s
+    `[dependencies]` snippet names the `major.minor` of `Cargo.toml`'s `version`. The checker is a
+    pure function over text in `tests/docs_drift.rs`, run against the real `README.md` by one test,
+    with a negative control fixture carrying the current `io-harness = "0.25"` line that the checker
+    must report. Fed the corrected README it reports nothing. `tests/readme.rs`'s two existing
+    properties still hold: the first 60 lines say what the crate is, show a runnable fence and name
+    the MSRV, and no heading is named after a release.
+  - >
+    **F8 - the product table is true, checkably.** io-cli reads Released and links to
+    `github.com/initorigin/io-cli` and `crates.io/crates/io-cli` - verified against the registry
+    (`0.10.0`, repository `https://github.com/initorigin/io-cli`) and against the repository's
+    `PUBLIC` visibility rather than from memory. io-studio reads **Not built**, which is what
+    `io-studio/` holding documentation and no `src/` means. The "only public repository today"
+    sentence is gone. `tests/docs_drift.rs`'s existing dangling-link checker covers the two new
+    relative links, and the two absolute ones are verified once, by request, and the response
+    recorded.
+  - >
+    **F9 - the documentation sweep is against the releases, not against a feeling.** Every
+    capability shipped by 0.30.0 through 0.36.0 is checked for a mention on its guide page and in
+    `docs/CAPABILITIES.md`, and every `known_limitations` entry in `docs/CONTRACT.md` is checked
+    against the release that would have fixed it - including the ones the brief lists as open, which
+    must still read as open. `tests/guide_pages.rs` and `tests/changelog.rs` pass. What is corrected
+    is enumerated in the record; a sweep that found nothing on a page says so rather than being
+    silent, since a gate that goes quiet is worth a sentence (trap 82).
+  non_functional:
+  - >
+    **N1 - no acceptance criterion asserts a duration.** Not one. This repository has three traps
+    for wall-clock assertions failing on loaded machines (11, 73, 83), and CI is the place with the
+    least control over its own hardware. Durations are **recorded**: the per-job and per-step
+    numbers for the 0.36.1 CI run and release run are read from the GitHub Actions API by run id
+    and written into the release record beside the 0.36.0 baseline (run 30834723995: Windows 17m51s
+    / Linux 8m23s / macOS 8m51s, workflow wall clock 17m51s; run 30834005895: release 7m18s). The
+    comparison is evidence a reader can check, not a gate a runner can flake.
+  - >
+    **N2 - no runtime dependency, and no public API change at all.** `cargo tree` still reads
+    **402** lines. `docs/public-api.txt` is unedited and `tests/public_api.rs` passes untouched.
+    `cargo-nextest` and any install action are CI tooling, not crate dependencies; every new `uses:`
+    is pinned to a full-length commit SHA with its version in a trailing comment, resolved with
+    `gh api` and never guessed (trap 13), and Dependabot's `develop` targeting is unchanged.
+  - >
+    **N3 - the reason for every change is in the file.** `ci.yml` is a 383-line file that is mostly
+    argument: why `feat/**` is not a push trigger, why the timeout is 40 minutes and what it was
+    measured against, why `--all-features` is one leg and not two, why `--lib --tests` excludes the
+    doctests, why `links-consumer` and `cross-version` exist at all. Every change here carries the
+    same: what it was, what it is, what the measurement was, and what would make it wrong. A future
+    release must be able to undo this deliberately rather than by accident - the note at
+    `ci.yml:102-121`, recording that a naive `--all-features` leg cost 612s on Windows against 146s,
+    is exactly the artifact that stops someone re-introducing it, and this release owes the same.
+  - >
+    **N4 - the release is honest about what it did not achieve.** The recorded numbers are whatever
+    they are. If the Windows leg lands at 11 minutes rather than the 6-8 this plan reasons toward,
+    that is what the record says, with what each lever actually contributed. A lever that turned out
+    not to help is reported as a finding, not quietly left in (trap 58's rule, applied to
+    optimisation instead of sabotage).
+  operational:
+  - >
+    **O1 - the full graph is green on the commit being released**, on all three operating systems,
+    including MSRV 1.95, `lint`, `docs.rs (nightly)`, `links-consumer` and `cross-version-0.29.0`.
+    A restructured workflow's first failure mode is a job that does not run at all - a GitHub
+    Actions job id may not contain a dot (trap 4), and a parse error is a 0-second run that reads
+    like a broken pipeline, not like a test failure. Every job in the new graph is confirmed to have
+    actually executed and reported, by name, from the run's job list.
+  - >
+    **O2 - docs.rs builds**, proven by running the nightly job's exact command
+    (`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`) before
+    the release PR is opened, never inferred from a stable `cargo doc`. It caught something in four
+    of the last five releases, and this one edits doc comments during the README and guide sweep,
+    which is precisely the input it reads. Traps 26, 28, 45, 61, 65.
+  - >
+    **O3 - `cargo package --locked` succeeds on a clean tree** after a `cargo clean`, and the
+    packaged crate compiles. `cargo fmt` runs and is committed **before** packaging, never after -
+    `cargo package` refuses on any uncommitted file, including one that is not the crate's (traps 64
+    and 84). Every local build and test runs with `CARGO_PROFILE_DEV_DEBUG=0` and
+    `CARGO_PROFILE_TEST_DEBUG=0`, with `df -h .` before and between build steps, and the sibling
+    repositories checked before blaming this one's `target/` (traps 42, 85).
+  - >
+    **O4 - the workflow changes are validated on a branch before the release PR.** A workflow file
+    is the one thing in this repository that cannot be tested locally: it is only executed by
+    GitHub, and its failure mode on a release-day push is a Release that does not cut. Every change
+    here runs on `feat/0.36.1`'s own PR - which is what a PR to `develop` already triggers - and
+    `release.yml`'s split is exercised by the actual release run, whose outcome is recorded.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.36.1, GitHub at initorigin/io-harness with the tag `v0.36.1` and a
+    Release titled `io-harness 0.36.1`, and docs.rs. GitHub Actions is also the *subject* of this
+    release, not only its vehicle: the artifact whose behaviour changes is
+    `.github/workflows/ci.yml` and `.github/workflows/release.yml`, and its only runtime is the
+    hosted runner.
+  deployment_method: >
+    The standing flow. All work on `feat/0.36.1` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button (`gh pr merge <n> --merge`), never a local merge. Release PR `develop`
+    into `main`, merged the same way; `main`'s only source is `develop`. The GitHub Release is cut
+    by `release.yml` - `gh workflow run release.yml --ref main -f version=0.36.1` - which takes its
+    notes verbatim from the changelog section. `cargo publish --locked` by hand afterwards, always
+    last, after both merges and the Release exist, with `CARGO_REGISTRY_TOKEN` sourced from the
+    repository's gitignored `.env` in the same shell invocation (trap 63). `develop` synced to
+    `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    None. No schema, no stored format, no `CHECKPOINT_FORMAT` change (it stays 7), no table added or
+    altered, and `tests/cross_version.rs`'s `ADDED_SINCE_0_22_0` and `ALTERED_SINCE_0_22_0` are
+    untouched. A database written by 0.36.0 is a database 0.36.1 reads, and the reverse.
+  - >
+    No public API change. No item is added, removed, renamed or deprecated; no signature moves; no
+    type gains a field. `docs/public-api.txt` is byte-identical. A consumer upgrades by changing one
+    digit and recompiles unchanged - which is the whole meaning of the patch bump.
+  - >
+    The one visible change to a contributor is the CI job list: the names in a PR's status checks
+    change as the matrix gains a `features` dimension and the doctests become their own job. Any
+    required-check configuration on the rulesets is checked against the new names before the release
+    PR, because a required check whose job no longer exists blocks every merge afterwards.
+  observability:
+  - >
+    The evidence for this release is the GitHub Actions API itself: per-job and per-step durations
+    read by run id for the 0.36.1 runs, recorded beside the 0.36.0 baselines (30834723995 and
+    30834005895) in the record. That comparison is the release's own instrumentation and it is
+    reproducible by anyone with the run ids.
+  - >
+    The keeping-honest tests are the ongoing signal: `tests/ci_workflow.rs` fails when a new fixture
+    example is not built by the matrix, and `tests/docs_drift.rs` fails when the README's dependency
+    version drifts from `Cargo.toml`. Both fail as a named test in an ordinary run rather than as a
+    confusing CI break or as eleven releases of silence.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.36.2 and `cargo yank --version
+    0.36.1` is the escape hatch, leaving 0.36.0 as what `cargo install` resolves. But the published
+    crate is the half with almost nothing in it: no code changes, so a consumer on 0.36.1 who
+    reverts to 0.36.0 loses corrected documentation and nothing else, keeps every database, and
+    recompiles untouched. The half that could actually go wrong is the workflows, and that reverts
+    by `git revert` of the workflow commits on `develop` and a merge to `main` - no version is
+    involved, because a workflow is not published. A CI graph that turns out to be wrong is
+    therefore fixable in minutes without a release, which is the argument for landing the workflow
+    change in the same PR as its own proof rather than saving it for a feature release.
+
+dependencies:
+  products: []
+  services:
+  - >
+    GitHub Actions hosted runners for `ubuntu-latest`, `macos-latest` and `windows-latest` - the
+    subject of the release. The repository is **PUBLIC**, so runner minutes are free and concurrency
+    is the only budget; the current graph uses 8 jobs and the new one uses more, well inside the
+    limit for a public repository. A private repository would make this release's central trade -
+    buying wall clock with parallelism - cost money instead of nothing, so the visibility is a
+    premise and is stated rather than assumed.
+  - >
+    `Swatinem/rust-cache`, `dtolnay/rust-toolchain`, `actions/checkout`, `actions/upload-artifact`,
+    `actions/download-artifact` and `softprops/action-gh-release` at their pinned SHAs, plus any
+    action added to install `cargo-nextest`, pinned the same way.
+  - >
+    crates.io and docs.rs for the release itself, as every version.
+  human_approvals:
+  - >
+    The owner has pre-authorised the PR, both merges, the Release and the publish for this version.
+    Two decisions are already made and are not to be reopened: the version is a **patch** (0.36.1,
+    not 0.37.0), and `CARGO_PROFILE_DEV_DEBUG=0` is **out of scope** while `rust-lld` is in.
+
+resource_profile:
+  complexity: small
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    A workflow file cannot be tested locally. Every hypothesis about it costs a push and a CI round,
+    and the two levers with genuine uncertainty - whether stable MSVC will use `rust-lld`, and
+    whether nextest's process-per-test model disturbs the three wall-clock-sensitive tests - are
+    both answerable only on a runner. Budget for several rounds, and land the levers separately so a
+    regression is attributable to one of them.
+  - >
+    The measurement itself. Before-and-after numbers have to be read per job and per step from the
+    Actions API for named run ids, on a warm dependency cache in both cases, or the comparison is
+    between a cold run and a warm one and means nothing. The 0.36.0 baseline is already taken
+    (30834723995, cache hit confirmed in the log).
+  - >
+    The documentation sweep is the larger half by reading time: 381 README lines, 1,399 in
+    `docs/CONTRACT.md`, 110 in `docs/CAPABILITIES.md`, 22 guide pages, against seven releases of
+    changes. The README body is in better shape than the metadata around it - the 0.36.0 branch,
+    worktree and `rewind_run` prose is already present and correct - so the sweep is targeted, but
+    it is targeted only after it has been read.
+  - >
+    The restructure has to keep two existing gates green while moving the text that satisfies them:
+    `tests/readme.rs` requires the first 60 lines to carry what the crate is, a runnable fence and
+    the MSRV, and forbids a heading named after a release.
+  preferred_tools:
+  - >
+    `gh api repos/initorigin/io-harness/actions/runs/<id>/jobs` for per-job and per-step timings,
+    and `gh api .../actions/jobs/<id>/logs` for what a step actually did - which is how the 300s of
+    workspace compilation inside the 317s build step and the 172s doctest block inside the 295s test
+    step were both located. Read the log before theorising about a step.
+  - >
+    `gh api repos/initorigin/io-harness/rulesets` to check required status-check names against the
+    new job names before the release PR, since branch-protection endpoints 404 on this repository.
+  - >
+    The existing checker family as the template for both new tests: `tests/docs_drift.rs` and
+    `tests/readme.rs` are pure functions over text plus one test against the real file plus a
+    fixture control, and the new checkers are written the same way rather than inventing a shape.
+  - >
+    `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` on every local build - 19 GiB to 159 MiB
+    - `df -h .` before and between build steps, `cargo build --all-features --examples` before any
+    `--lib --tests` run, and the sibling repositories' `target/` checked before blaming this one's
+    (traps 42, 85).
+  constraints:
+  - >
+    No new runtime dependency; `cargo tree` stays at 402. MSRV 1.95, edition 2021. Every version
+    stays 0.x.
+  - >
+    A patch release changes no public API. If the work reveals something that needs one, it is not
+    in this release.
+  - >
+    Coverage is not currency. No leg may buy wall clock by running on fewer operating systems, with
+    fewer features, or over fewer tests than the graph runs today.
+  - >
+    Every `uses:` is pinned to a full-length commit SHA with its version in a trailing comment,
+    resolved with `gh api` and never guessed.
+
+risks:
+- >
+  **A restructured workflow that silently stops proving something.** This is the central risk and it
+  is quiet by construction: a leg that no longer runs the macOS doctests makes every number in this
+  release look better and fails nothing. Mitigated by F1, which is a set-cover comparison of
+  `(os, invocation)` pairs between the old files and the new, written into the record as a table
+  rather than asserted in prose.
+- >
+  **A workflow file that does not parse, or a job that never runs.** A GitHub Actions job id may not
+  contain a dot; the whole file fails at parse time and the run is 0 seconds, which reads like a
+  broken pipeline rather than a test failure (trap 4). Mitigated by O1 confirming every expected job
+  actually executed and reported by name, from the run's own job list, rather than from the file.
+- >
+  **A required status check pointing at a job name that no longer exists.** The matrix gains a
+  `features` dimension, so `test (windows-latest)` becomes something else. If a ruleset requires the
+  old name, every PR afterwards blocks on a check that can never report. Mitigated by reading
+  `gh api repos/initorigin/io-harness/rulesets` before the release PR, not after the merge stalls.
+- >
+  **A linker flag that is set and does nothing.** Exactly the 0.16.0 `doc_auto_cfg` shape: the
+  setting was present, every command exited 0, and the result was broken for two releases because
+  nothing asserted the setting had taken effect. Mitigated by F4 requiring proof that `rust-lld`
+  performed the link, and by the release dropping the lever rather than shipping an inert flag.
+- >
+  **nextest changing how the three wall-clock-sensitive tests behave.** Process-per-test changes
+  process count, scheduling and start-up cost on the runner, and all three known flakes are clocks
+  in disguise (traps 11, 73, 83). Mitigated by F5 requiring their outcome to be recorded, and by the
+  standing rule that nextest is dropped before a test is weakened.
+- >
+  **Splitting the release's `verify` job and losing an ordering.** The gates are cheap; the ordering
+  is the point - nothing is tagged and no Release is cut until every check has passed. A parallel
+  split that lets `release` start on a partial `needs:` would cut a Release for a tree that failed a
+  gate. Mitigated by F6 asserting the job graph, and by the release run itself being the exercise.
+- >
+  **A README restructure that breaks the gates it is supposed to satisfy.** `tests/readme.rs`
+  measures the first 60 lines; moving prose is exactly what perturbs it. Mitigated by running the
+  two README gates continuously during the rewrite rather than at the end, and by the fact that both
+  are pure functions that run in milliseconds.
+- >
+  **Correcting documentation with a fact that is itself stale.** The product table is being fixed
+  because it went stale; replacing it with today's numbers has the same failure mode a year out.
+  Mitigated by stating status (Released / Not built) rather than version numbers in the table, so
+  the row stays true across io-cli's next ten releases, and by verifying io-cli's state against the
+  registry and the repository rather than from memory.
+- >
+  **Disk, again.** `target/` has taken this volume to zero in four separate releases and
+  rust-analyzer rebuilds into the same tree; during 0.36.0 a sibling repository's `target/` was the
+  larger half. Mitigated operationally: debuginfo off locally, `df -h .` before and between build
+  steps, separate `cargo test` invocations, `cargo clean` between the full suite and packaging, and
+  the siblings checked before this repository is blamed (traps 42, 85).
+
+open_questions:
+- >
+  Whether stable MSVC can be made to link with `rust-lld` without a nightly flag. This is the
+  release's one genuine unknown and it is answerable only on a `windows-latest` runner. F4 is
+  written so that either answer is a result: it links and the numbers say what it bought, or it does
+  not and the finding goes into the record and the brief so nobody spends the afternoon again.
+- >
+  Whether the doctests deserve to be split further. 251 doctests are 172s on Windows in one
+  `--doc` invocation and there is no per-doctest parallelism knob; if the doctest job becomes the
+  new critical path after everything else is parallel, the next lever is sharding them, which needs
+  a way to split them that does not amount to maintaining a list.
+- >
+  Whether `release.yml`'s `verify` should re-run the gates at all, given that CI has already run
+  them on the same commit on the push to `main`. It is deliberate today - the same gate against the
+  exact commit being released - and it is a real duplicate of about seven minutes. Gating on "CI
+  passed for this SHA" instead would be faster and would move the trust from a command to a status
+  API. Not changed here, and worth an argument rather than a silent optimisation.
+- >
+  Whether the four checker tests - MSRV, features, links, and now the dependency version - want to
+  be one drift suite with one table of facts rather than four hand-written checkers. Four is not yet
+  enough to justify the abstraction; the fifth might be.
