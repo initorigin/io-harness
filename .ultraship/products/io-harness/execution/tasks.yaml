@@ -151,7 +151,7 @@ tasks:
   why_required: 59 test binaries run sequentially today. Without the count comparison the change is a
     speed-up nobody has shown ran the same tests, which is the one way this release can silently stop
     proving something.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.36.1-T02
   acceptance_criteria:
@@ -167,7 +167,29 @@ tasks:
     '
   files:
   - .github/workflows/ci.yml
-  evidence: []
+  evidence:
+  - '**F5''s count discriminator, exact.** Comparing against run 30834723995''s numbers would have confounded
+    the comparison with the tests this release itself adds, so both invocations were run on the SAME tree
+    and the SAME machine instead, which is what the criterion actually claims: `cargo test --lib --tests`
+    → **978 passed, 1 ignored** across 61 result lines; `cargo nextest run --lib --tests` → **978 tests
+    run: 978 passed, 1 skipped**. Equal, and the one ignored test is the one skipped test. No test is
+    filtered, skipped or silently retried.'
+  - 'On CI (run 30923664928, ubuntu): the default polarity leg reports `978`-equivalent for its own tree
+    — `973 tests run, 973 passed, 1 skipped` — and the `--all-features` leg `1050 tests run, 1050 passed,
+    1 skipped`. These are not comparable with the macOS numbers above and are not used as the discriminator:
+    which tests exist varies by `cfg`, so a cross-OS count comparison would prove nothing. They are recorded
+    because F5 asks for the per-leg numbers.'
+  - '**The three known wall-clock-sensitive tests (traps 11, 73, 83) run under nextest and pass**, which
+    matters because nextest is process-per-test where `cargo test` uses threads within a binary, and all
+    three flakes are clocks in disguise. Three consecutive runs, all green: `skills::discovery_over_a_32_skill_directory_is_under_50ms`
+    at 0.017s / 0.019s / 0.018s against its 50ms bound; `hooks::f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin`
+    at 0.063s / 0.039s / 0.035s against a 20,000ms hook timeout; `handles::a_handle_that_exits_on_its_own_stops_reading_as_running`
+    at 3.034s / 3.036s / 3.029s. Process-per-test did not move any of them toward its bound. Nothing was
+    weakened; the standing rule was that nextest would be dropped before a test was, and it did not have
+    to be invoked.'
+  - 'N2 holds: nextest is installed by `taiki-e/install-action` pinned to `67729d5c413db75907f0ad1e39bb04b9c868ff60`
+    (v2.85.7, resolved with `gh api`, not guessed) and is not a manifest entry. `Cargo.toml`''s only edit
+    this release is the version bump.'
 - id: US-IO-HARNESS-0.36.1-T05
   summary: Split `release.yml`'s `verify` job so its two test invocations run in parallel jobs, keeping
     every refusal it performs today and the ordering that nothing is tagged until every check has passed.

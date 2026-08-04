@@ -26,6 +26,103 @@ notes are produced from it.
 
 ### Security
 
+## [0.36.1] - 2026-08-04
+
+A verdict in minutes, and a front page that is true.
+
+No public item is added, removed or changed. `docs/public-api.txt` is
+byte-identical, `CHECKPOINT_FORMAT` stays 7, no table is added or altered, and no
+dependency moves — `cargo tree` still reads 402 lines. A database written by
+0.36.0 is a database 0.36.1 reads, and the reverse. Upgrading is one digit and a
+recompile.
+
+### Changed
+
+- **CI answers in a fraction of the time, proving exactly what it proved before.**
+  The workflow took 17m51s on the run that merged 0.36.0, and effectively all of
+  it was one leg: `test (windows-latest)` 17m51s against 8m51s on macOS and 8m23s
+  on Linux, with every other job finishing inside 90 seconds and then waiting.
+  Inside that leg, on a warm cache, `cargo build --all-targets` was 317s, `cargo
+  test` 295s and `cargo test --all-features --lib --tests` 400s — largely the
+  same work three times, because the feature flip invalidated what the build had
+  just produced and the doctests are their own compile and their own link.
+
+  The matrix is now a matrix over operating system *and* feature polarity, each
+  leg on its own cache key, so the two polarities are computed at the same time
+  instead of one after the other. The doctests are their own per-OS job. The
+  matrix builds the eight fixture examples a test actually spawns rather than
+  linking all 35 six times a run; the rest are compile-checked once on Linux in
+  both polarities. `cargo-nextest` runs the test binaries concurrently.
+
+  **Nothing was traded away for it.** Both polarities still run on all three
+  operating systems, all doctests still run on all three, and the MSRV floor,
+  `fmt`, `clippy` in three feature shapes, the docs.rs nightly build, the `links`
+  coexistence wall and the 0.29.0 cross-version pair are untouched. Every
+  `(operating system, cargo invocation)` pair the old workflow ran is still run.
+
+- **The release workflow's gates run in parallel**, behind one `checks` job that
+  still refuses everything it refused before: a tag that does not match
+  `Cargo.toml`, a commit that is not an ancestor of `main`, a tag or Release that
+  already exists, and a version with no changelog section. No tag is pushed and no
+  Release is cut until every gate has passed.
+
+- **The install snippet says the version you are reading about.** `README.md` told
+  a reader to write `io-harness = "0.25"` — eleven releases stale, and the one
+  line in the file meant to be copied. A stale snippet raises no error, because an
+  old version resolves; a reader simply gets an eleven-release-old library and
+  concludes that is the crate. The dependency version now joins the MSRV, the
+  feature list and every relative link as a fact checked against `Cargo.toml` by
+  `tests/docs_drift.rs`, so it cannot drift again.
+
+- **No badge on the README carries a value a human typed.** The MSRV badge had
+  `1.95` written into its URL — the same defect as the stale install line, eleven
+  lines below it in the same file. It now reads `rust-version` from the published
+  manifest, so it cannot disagree with the crate even in a release that raises the
+  floor. A downloads badge is added. None is added for coverage, benchmarks or
+  unsafe-freedom, because this crate measures none of the three.
+
+- **The product table is true.** io-cli is released, public and on crates.io; it
+  was listed as "in development" and unlinked. io-studio is **not built**. The
+  sentence claiming this was the only public repository is gone. The table states
+  status rather than version numbers, so it stays true as the sibling products
+  release.
+
+- **The README leads with what the crate is, how to start, and who it is for**,
+  ahead of the capability inventory — which now begins at line 122 rather than
+  line 100 and no longer sits between a reader and the quickstart.
+
+### Fixed
+
+- **`AgentDef::worktree`'s documented path was missing a component.** It named
+  `<root>/.worktrees/<agent>-<parent run>-<step>`; the path a spawn actually
+  creates ends in a digest of the child's goal. That component is what stops two
+  children of the same definition, spawned in the same step — the ordinary shape
+  of a fan-out — being handed one worktree between them. Documentation only; the
+  behaviour was already correct.
+
+- **The agent-composition guide never mentioned per-child worktrees.** The
+  capability 0.36.0 added to lift that page's central bound — one shared checkout,
+  so concurrent children overwrite each other — was documented on three other
+  pages and not on the one a reader asking "can two children work at once" opens.
+
+- **The verification guide over-claimed the self-review refusal.** "A model may
+  not review its own work" rests on `Provider::model_hint`, which is a defaulted
+  trait method returning `None`. For a provider that does not override it the rule
+  is a **no-op, not a failure**: the review runs, possibly on the model that wrote
+  the change. The public contract already said so; the guide did not.
+
+- **The capability index still listed the git built-ins as status, diff, log, add
+  and commit.** Branch and worktree shipped in 0.36.0.
+
+### Added
+
+- **`tests/ci_workflow.rs`** — a test that fails when the CI matrix and the test
+  suite disagree about which example binaries exist. `--lib --tests` does not
+  build `examples/`, and this repository has rediscovered that four separate
+  times, each as a confusing CI failure about a missing file. Both sets are
+  derived — one from `tests/`, one from the workflow — so the fifth occurrence is
+  a named test failure that says what to add.
+
 ## [0.36.0] - 2026-08-03
 
 A run lands as a branch, and can be put back.
