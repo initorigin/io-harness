@@ -28,13 +28,30 @@ env:
   CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
+  # 0.36.1 — the gates that were one serial `verify` job are now five jobs that
+  # run at once. Measured at 7m18s on run 30834005895, of which `cargo test` was
+  # 222s and `cargo test --all-features --lib --tests` was 155s, one after the
+  # other, with fmt, clippy and `cargo package` in the same queue behind them.
+  #
+  # What must NOT change is the ordering that matters: nothing is tagged and no
+  # Release is cut until every check has passed. That is preserved by `release`
+  # naming every gate in its `needs:`, not by the gates being sequential — a
+  # parallel split that let `release` start on a partial `needs:` would cut a
+  # Release for a tree that failed a gate, which is the one way this change can
+  # do real damage.
+  #
+  # `checks` stays first and alone because it is the cheap half and everything
+  # else is pointless without it: a tag that does not match the manifest, a
+  # commit that is not on main, a Release that already exists, or a version with
+  # no changelog section. It also resolves the version every other job reads.
+  #
   # A tag is the only thing that says which version this release is, and nothing
   # else checks it against the crate. Without this a v0.24.0 tag on a tree still
   # declaring 0.23.0 would cut a Release labelled with a version it was not
   # built from.
-  verify:
+  checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 10
     outputs:
       version: ${{ steps.resolve.outputs.number }}
     steps:
@@ -102,30 +119,84 @@ jobs:
             exit 1
           fi
 
+  # The lint gate: the same commands CI runs, against the exact commit being
+  # released.
+  lint:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      # The same gate CI runs, against the exact commit being released.
+        with:
+          key: release-lint
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  # The default polarity, including the doctests. `cargo test` unqualified, as
+  # it was in the old verify job: this is the release gate and it is deliberately
+  # the plain invocation, not CI's split one.
+  test-default:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-default
       - run: cargo test
+
+  # The other polarity. 155s on run 30834005895, run after the 222s above it
+  # rather than beside it, and the feature flip invalidated the artifacts that
+  # step had just produced. Its own job and its own cache key for the same
+  # reason the CI matrix split.
+  test-all-features:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-all
       - run: cargo test --all-features --lib --tests
 
-      # Catches a file the manifest forgot, and produces the attached artifact.
+  # Catches a file the manifest forgot, and produces the attached artifact.
+  package:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-package
       - run: cargo package --locked
-
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: package
-          path: target/package/io-harness-${{ steps.resolve.outputs.number }}.crate
+          path: target/package/io-harness-${{ needs.checks.outputs.version }}.crate
           retention-days: 7
           if-no-files-found: error
 
+  # Every gate is named here. This list is the ordering the split had to keep:
+  # a Release is cut only when all five have passed.
   release:
-    needs: verify
+    needs: [checks, lint, test-default, test-all-features, package]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -149,7 +220,7 @@ jobs:
       # dropped; they would render as stray `[x]: url`.
       - name: Notes
         env:
-          VERSION: ${{ needs.verify.outputs.version }}
+          VERSION: ${{ needs.checks.outputs.version }}
         run: |
           awk -v v="$VERSION" '
             $0 ~ "^## \\[" v "\\]" { on = 1; next }
@@ -181,8 +252,8 @@ jobs:
       # `target_commitish` only on a dispatch, where the tag does not exist yet.
       - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3
         with:
-          tag_name: v${{ needs.verify.outputs.version }}
-          name: io-harness ${{ needs.verify.outputs.version }}
+          tag_name: v${{ needs.checks.outputs.version }}
+          name: io-harness ${{ needs.checks.outputs.version }}
           body_path: notes.md
           files: dist/*
           target_commitish: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
@@ -190,7 +261,7 @@ jobs:
 
       - name: What is left for a human
         env:
-          VERSION: ${{ needs.verify.outputs.version }}
+          VERSION: ${{ needs.checks.outputs.version }}
         run: |
           echo "::notice::Released io-harness $VERSION. By hand, in this order:"
           echo "::notice::  1. cargo publish --locked   (from main; IRREVERSIBLE, always last)"
