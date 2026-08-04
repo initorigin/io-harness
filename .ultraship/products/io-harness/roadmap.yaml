@@ -933,10 +933,10 @@ versions:
 
       The badges are rebuilt on the same rule. One of the five has its value typed into the URL,
       which is the install snippet's defect eleven lines higher in the same file; after this release
-      every badge resolves what it claims from crates.io, docs.rs, GitHub Actions or deps.rs at
-      render time, and the block gains what a reader deciding whether to depend on this crate
-      actually asks — how many people already do, and whether its dependencies are current. It gains
-      no badge for coverage, benchmarks or unsafe-freedom, because this repository measures none of
-      the three and a badge asserting what nothing checks is worse on a landing page than in a test.
+      every badge resolves what it claims from crates.io, docs.rs or GitHub Actions at render time,
+      and the block gains the one thing a reader deciding whether to depend on this crate asks and
+      cannot currently see — how many people already do. It gains no badge for coverage, benchmarks
+      or unsafe-freedom, because this repository measures none of the three and a badge asserting
+      what nothing checks is worse on a landing page than in a test.
     detail: specified
     status: planned
