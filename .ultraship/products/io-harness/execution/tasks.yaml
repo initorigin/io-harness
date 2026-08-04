@@ -226,7 +226,7 @@ tasks:
     every refusal it performs today and the ordering that nothing is tagged until every check has passed.
   why_required: The release run is 7m18s of which the two test invocations are 377s. The gates are cheap;
     the ordering is the point, so the job graph has to be asserted rather than assumed.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.36.1-T02
   acceptance_criteria:
@@ -242,7 +242,33 @@ tasks:
     '
   files:
   - .github/workflows/release.yml
-  evidence: []
+  evidence:
+  - '**F6''s job graph, asserted by parsing `release.yml` rather than by reading it** — executing the
+    refusals would mean pushing bad tags, which is why the criterion is written this way. `checks` has
+    no `needs`; `lint`, `test-default`, `test-all-features` and `package` each need `checks`; and **`release`
+    needs all five** — `[''checks'', ''lint'', ''test-default'', ''test-all-features'', ''package'']`.
+    That last list is the whole point of the split: nothing is tagged and no Release is cut until every
+    gate has passed, and a partial `needs:` would cut a Release for a tree that failed a gate.'
+  - '**Every refusal the old serial job performed is still performed**, in `checks`, in the same order:
+    `Version` (resolves the number from the tag or the dispatch input), `Version matches Cargo.toml`,
+    `Commit is on main` (an ancestor test, not a ref test), `Release does not exist` (a tag check on dispatch,
+    a Release check on a tag push), `Changelog has a section`. Nothing was dropped or relaxed to make
+    the split fit.'
+  - '**Every gate command is preserved verbatim**, redistributed rather than reduced: `lint` runs `cargo
+    fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`; `test-default` runs `cargo
+    test` (the plain invocation, deliberately, including the doctests — this is the release gate, not
+    CI''s split one); `test-all-features` runs `cargo test --all-features --lib --tests`; `package` runs
+    `cargo package --locked`.'
+  - '**The artifact path is unchanged and still singular.** `package` uploads `target/package/io-harness-<version>.crate`
+    under the name `package` with `if-no-files-found: error`, and `release` downloads exactly that one
+    artifact name. The Release is still titled bare `io-harness <version>` with `body_path: notes.md`
+    taken verbatim from the changelog section, `files: dist/*` and `fail_on_unmatched_files: true`.'
+  - 'Baseline for the comparison, from run 30834005895: `verify` 7m18s, of which `cargo test` was 222s
+    and `cargo test --all-features --lib --tests` 155s, run one after the other with fmt, clippy and `cargo
+    package` queued behind them. O4''s point stands and is stated plainly: a workflow file cannot be executed
+    locally, so `release.yml`''s split is exercised by this release''s own release run and its outcome
+    is recorded there — the structural assertions above are what can be checked before that, and they
+    are what F6 asks for.'
 - id: US-IO-HARNESS-0.36.1-T06
   summary: The dependency-version checker in `tests/docs_drift.rs` — a pure function over text, one test
     against the real `README.md`, and a negative control fixture carrying the `io-harness = "0.25"` line
@@ -486,7 +512,7 @@ tasks:
   why_required: '`release.yml` refuses a version with no changelog section and the Release notes are that
     section verbatim, so the section is a precondition of the release rather than a courtesy. The recorded
     numbers are the release''s only evidence of its own outcome.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.36.1-T03
   - US-IO-HARNESS-0.36.1-T04
@@ -529,4 +555,43 @@ tasks:
     '
   files:
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - '`CHANGELOG.md` gains its `## [0.36.1]` section, carrying the measured result. `cargo test --test
+    changelog` — 5 passed. No `**BREAKING` entry exists, so no `*Migration:*` note is owed, and that absence
+    IS the release: a consumer changes one digit and recompiles unchanged.'
+  - '**N1 — not one acceptance criterion asserts a duration.** Every criterion in this release asserts
+    structure: which jobs exist, which commands run in them, which targets are built, which linker performed
+    the link, which sets cover which. The durations are RECORDED, read from the GitHub Actions API by
+    run id. Baseline run 30834723995 (warm): workflow 17m51s; `test (windows-latest)` 17m51s, macOS 8m51s,
+    Linux 8m23s; inside the Windows leg `cargo build --all-targets` 317s, `cargo test` 295s, `cargo test
+    --all-features --lib --tests` 400s. After, run 30925715697 attempt 2 (warm, zero `No cache found`
+    in any Windows job): **workflow 6m58s** — `test (windows, all)` 6m58s, `test (windows, default)` 5m50s,
+    `test (macos, all)` 4m10s, `doctest (windows)` 3m55s, `test (macos, default)` 3m23s, `doctest (ubuntu)`
+    3m03s, `test (ubuntu, all)` 2m59s, `test (ubuntu, default)` 2m24s, `doctest (macos)` 1m37s, `cross-version`
+    1m28s, `links-consumer` 1m25s, `docs.rs (nightly)` 1m16s, `lint` 55s, `msrv` 40s, `examples (compile)`
+    38s. **17m51s → 6m58s, a 61% reduction.**'
+  - '**N2 — no runtime dependency and no public API change.** `cargo tree` reads **402** lines, unchanged
+    since 0.23.0. `docs/public-api.txt` is byte-identical and `tests/public_api.rs` passes untouched (9
+    passed). `Cargo.toml`''s only edit is the version bump. `cargo-nextest` is installed by `taiki-e/install-action`
+    pinned to `67729d5c413db75907f0ad1e39bb04b9c868ff60` (v2.85.7, resolved with `gh api`, never guessed),
+    and `rust-lld` ships inside the Rust toolchain, so neither adds an install of anything to the machine.
+    Dependabot''s `develop` targeting is untouched.'
+  - '**N3 — the reason for every change is in the file.** Each change carries what it was, what it is,
+    what the measurement was and what would make it wrong: the matrix split records the 317s / 295s /
+    400s breakdown and why the polarities were serial; the `--example` list records that it is derived
+    and points at the test rather than inviting a hand edit; the `rust-lld` block records the probe''s
+    actual `--print link-args` output on both sides and why it is Windows-only; the doctest job records
+    that all 251-plus doctests still run on three OSes and why (trap 10). `ci.yml`''s existing arguments
+    — why `feat/**` is not a push trigger, why the timeout is 40 minutes, why `--all-features` is one
+    leg — are all preserved.'
+  - '**N4 — honest about what it did not achieve, and about a lever that was measured and rejected.**
+    The release reasoned toward 6-8 minutes and landed at **6m58s**, inside that. Two findings reported
+    rather than buried: (1) **`CARGO_PROFILE_DEV_DEBUG=0` was measured and dropped.** The owner had excluded
+    it for this release; before accepting that at face value I measured what it would buy on the doctest
+    job alone, where a backtrace frame has the least value — 184.0s → 166.0s, **9.8%**, about 24s on the
+    Windows doctest job. That is not worth reopening a recorded decision, so it stays excluded and the
+    number is written down so nobody re-measures it. (2) **The next lever was identified, costed, and
+    deliberately not taken.** 81% of the remaining build time is 59 test binaries linking, which is fully
+    parallel; sharding them two ways was estimated at ~4m15s. It is not in this contract — the contract''s
+    own open questions park it as a later lever — and the owner''s decision on 2026-08-04 was to lock
+    0.36.1 here rather than widen it. Recorded so a later release knows it was weighed and by whom.'

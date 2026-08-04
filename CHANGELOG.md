@@ -52,7 +52,24 @@ recompile.
   instead of one after the other. The doctests are their own per-OS job. The
   matrix builds the eight fixture examples a test actually spawns rather than
   linking all 35 six times a run; the rest are compile-checked once on Linux in
-  both polarities. `cargo-nextest` runs the test binaries concurrently.
+  both polarities. `cargo-nextest` runs the test binaries concurrently. And
+  Windows links with `rust-lld`, the linker the toolchain already ships, which
+  is the lever aimed at what that platform's cost actually is — roughly 95
+  linked executables per polarity plus one link per doctest.
+
+  **Measured, warm cache to warm cache: 17m51s to 6m58s.** Per lever, on the
+  same leg with nothing else changed, `rust-lld` took the Windows doctest step
+  from 338s to 200s and the Windows build step from 253s to 205s. The remaining
+  critical path is the Windows `--all-features` leg at 6m58s, of which 267s is
+  building the 59 test binaries.
+
+  No acceptance criterion in this release asserts a duration. This repository
+  has three separate flaky tests that are wall-clock assertions failing on
+  loaded machines, and CI is the place with the least control over its own
+  hardware. The criteria assert structure — which jobs exist, which commands run
+  in them, which targets are built, which linker performed the link — and the
+  durations above are recorded from the GitHub Actions API by run id
+  (baseline 30834723995, after 30925715697) rather than gated on.
 
   **Nothing was traded away for it.** Both polarities still run on all three
   operating systems, all doctests still run on all three, and the MSRV floor,
