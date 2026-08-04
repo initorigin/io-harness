@@ -197,7 +197,7 @@ tasks:
   why_required: '`README.md:28` is the single highest-traffic line in the repository and it has been eleven
     releases stale. Correcting it without the checker leaves the same rot to happen again, which is the
     argument the file''s own doc comment already makes about the three facts it guards.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F7 - the README states the current version and a checker enforces it.** `README.md`''s `[dependencies]`
@@ -211,7 +211,28 @@ tasks:
   files:
   - tests/docs_drift.rs
   - README.md
-  evidence: []
+  - Cargo.toml
+  - Cargo.lock
+  evidence:
+  - '`cargo test --test docs_drift` — 15 passed, 0 failed. Before the README was touched, the same command
+    reported exactly one failure and named the defect precisely: `README.md tells a reader to depend on
+    a version that is not this one (Cargo.toml declares 0.36.1, so the snippet must say "0.36"): line
+    28: io-harness = "0.25"`. Fed the corrected README it reports nothing, which is both halves of what
+    F7 asks.'
+  - 'The checker follows the file''s own convention rather than inventing a shape: a pure function over
+    text (`dependency_version_matches`), one test against the real `README.md`, and controls. The negative
+    control is the real defect verbatim — the `io-harness = "0.25"` line as `README.md:28` carried it
+    from 0.25.0 to 0.36.0 — not an invented one.'
+  - 'It checks `major.minor`, asserted by `dependency_version_is_major_minor_so_a_patch_does_not_churn_the_readme`:
+    0.36.0 and 0.36.1 both want `"0.36"`, so a patch release does not put a no-op edit in its own diff,
+    while 0.37.0 fails. That is what the snippet carries and what a caller actually wants — any 0.36.x.'
+  - 'Silence is a failure too (`dependency_version_checker_rejects_silence`), for the same reason it is
+    for the MSRV: a checker that accepts an absent claim stops noticing when the claim is deleted rather
+    than corrected, which would be a cheap way to make this test pass forever.'
+  - '`Cargo.toml` and `Cargo.lock` bumped to 0.36.1 (`cargo update -p io-harness --offline` — `Locking
+    1 package`, 15 dependencies unchanged), which is the fact the checker reads. `cargo test --test readme`
+    — 8 passed, 0 failed: the first-screen and no-version-named-heading properties are unaffected by the
+    one-line change.'
 - id: US-IO-HARNESS-0.36.1-T07
   summary: 'The product table states what is true: io-cli Released and linked to its repository and to
     crates.io, io-studio Not built, and the "only public repository today" sentence removed — each verified

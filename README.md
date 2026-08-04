@@ -25,7 +25,7 @@ the language the project is written in is not the harness's business.
 
 ```toml
 [dependencies]
-io-harness = "0.25"
+io-harness = "0.36"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
