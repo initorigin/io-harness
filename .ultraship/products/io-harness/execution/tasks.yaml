@@ -240,7 +240,7 @@ tasks:
   why_required: The table tells a reader that the two products built on this crate do not exist. io-cli
     is the strongest available evidence that the crate is embeddable by something other than its author,
     and the README currently hides it.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F8 - the product table is true, checkably.** io-cli reads Released and links to `github.com/initorigin/io-cli`
@@ -253,7 +253,23 @@ tasks:
     '
   files:
   - README.md
-  evidence: []
+  evidence:
+  - 'Verified against the registry and the repository rather than from memory, as F8 requires. crates.io:
+    `io-cli` max version **0.11.0**, 219 downloads, repository `https://github.com/initorigin/io-cli`.
+    `gh api repos/initorigin/io-cli` reports visibility **public**, not archived. `io-studio/` holds `docs/`,
+    a CHANGELOG, a LICENSE, a NOTICE, a README, a CODE_OF_CONDUCT, a CONTRIBUTING and a SECURITY file
+    — and no `src/` at all, which is what **Not built** means.'
+  - '**The plan''s own numbers were already stale when it was written**, which is the argument for the
+    row stating a status. It recorded io-cli at 0.10.0 with 186 downloads; the registry says 0.11.0 and
+    219. The table names no version and no count, so it stays true across io-cli''s next ten releases
+    — the failure mode of fixing a stale table with today''s numbers, avoided by construction rather than
+    by intending to come back.'
+  - 'The sentence "io-harness is the only public repository today, which is why it is the only one linked.
+    io-cli and io-studio open when they release" is removed. Both of its claims are false: io-cli''s repository
+    is public and it has released.'
+  - '`cargo test --test docs_drift` — 15 passed. The dangling-link checker covers the two new relative
+    links in the table region; the two absolute ones (the io-cli repository and its crates.io page) were
+    each requested once and answered, which is the check F8 asks for.'
 - id: US-IO-HARNESS-0.36.1-T08
   summary: 'Rebuild the badge block on one rule: no badge carries a value a human typed. The MSRV badge
     moves to the dynamic `crates/msrv` route, a downloads badge is added, every URL is requested once
@@ -261,7 +277,7 @@ tasks:
   why_required: '`img.shields.io/badge/MSRV-1.95-blue.svg` is the same defect as the stale install line,
     eleven lines above it, in the same file. A badge asserting a value nothing resolves is a green light
     wired to nothing, and a reader cannot inspect it.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.36.1-T06
   acceptance_criteria:
@@ -282,7 +298,24 @@ tasks:
     '
   files:
   - README.md
-  evidence: []
+  evidence:
+  - '**Every badge URL requested once; all six answer 200 with a real rendered value**, read from the
+    `<title>` of the returned SVG rather than from the status code alone — shields answers a bad path
+    with a rendered card, so a 200 is not by itself evidence: `crates/v/io-harness.svg` → `crates.io:
+    v0.36.0`; `crates/d/io-harness.svg` → `downloads: 914`; `docsrs/io-harness` → `docs: passing`; the
+    Actions badge → `CI - passing`; `crates/msrv/io-harness` → **`msrv: 1.95`**; `crates/l/io-harness.svg`
+    → `license: Apache-2.0`. None rendered `invalid`.'
+  - '**No badge URL now carries a value a human typed.** The one that did — `img.shields.io/badge/MSRV-1.95-blue.svg`,
+    the same defect as the stale install line eleven lines below it in the same file — is replaced by
+    `img.shields.io/crates/msrv/io-harness`, which reads `rust-version` from the published manifest and
+    therefore cannot disagree with the crate even in the release that raises the floor. All six values
+    are now resolved at render time by crates.io, docs.rs or GitHub Actions.'
+  - 'One badge added: downloads (`crates/d/io-harness`), the adoption signal a reader deciding whether
+    to depend on the crate asks for and could not see. None added for coverage, benchmarks or unsafe-freedom:
+    this repository measures none of the three, `unsafe` is present on the Windows path so the claim would
+    be false, and a badge asserting a property no gate checks is worse on a landing page than in a test
+    because a reader cannot inspect it. None for dependency freshness, which was weighed during planning
+    and excluded by owner decision.'
 - id: US-IO-HARNESS-0.36.1-T09
   summary: Restructure `README.md` around what the crate is, who it is for and the shortest path from
     an empty file to a working run, ahead of the capability inventory — with `tests/readme.rs`'s two properties
@@ -290,7 +323,7 @@ tasks:
   why_required: Removing the literal `1.95` from the MSRV badge spends the line that satisfied two gates,
     and adding a badge spends another of the sixty. The restructure is what pays for both, and it is the
     half a reader arriving from crates.io actually reads.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.36.1-T08
   acceptance_criteria:
@@ -304,7 +337,27 @@ tasks:
     '
   files:
   - README.md
-  evidence: []
+  evidence:
+  - '`cargo test --test readme` — 8 passed, 0 failed, and `cargo test --test docs_drift` — 15 passed.
+    Both suites were run against the rewrite continuously rather than at the end; they are pure functions
+    over text and run in milliseconds.'
+  - '**The predicted gate failure was real and is why the restructure was needed rather than optional.**
+    `1.95` appeared in the README''s first sixty lines in exactly one place: the MSRV badge URL. Replacing
+    it with the dynamic route removes the literal, and `tests/readme.rs` requires the MSRV in the first
+    screen while `tests/docs_drift.rs` requires some line naming "MSRV" or "minimum supported Rust" to
+    state it. Prose now carries it — `**MSRV: Rust 1.95** or later` at line 32, above the first Rust fence
+    — which a reader needs anyway, since nobody reads a version out of a badge image. The checkers working,
+    not a problem.'
+  - 'The head is now: what the crate is (line 16), the loop in four lines, the install snippet (26), the
+    MSRV (32), a runnable session example (34), the unattended `run_with` shape, then **Who it is for**
+    — including what this crate is NOT, and that the browser login, the terminal interface and the notification
+    tray belong to the embedder — then **Requirements** carrying the `libsqlite3-sys` explanation that
+    used to sit between the fences and the capability inventory. The inventory that began at line 100
+    and ran to 287 now begins at 122, behind the material a reader arriving from crates.io is actually
+    looking for.'
+  - 'Six badges on six lines inside the sixty, one more than before. The budget is what paid for it: the
+    MSRV rationale moved out of the first screen into its own section, which is where a reader wanting
+    the reason goes rather than where a reader wanting to start does.'
 - id: US-IO-HARNESS-0.36.1-T10
   summary: 'Sweep `docs/CONTRACT.md`, `docs/CAPABILITIES.md` and the 22 guide pages against what 0.30.0
     through 0.36.0 shipped: a capability with no mention on its guide page, a `known_limitations` entry

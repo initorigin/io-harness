@@ -5,10 +5,11 @@
 # IO Harness
 
 [![crates.io](https://img.shields.io/crates/v/io-harness.svg)](https://crates.io/crates/io-harness)
+[![downloads](https://img.shields.io/crates/d/io-harness.svg)](https://crates.io/crates/io-harness)
 [![docs.rs](https://img.shields.io/docsrs/io-harness)](https://docs.rs/io-harness)
 [![CI](https://github.com/initorigin/io-harness/actions/workflows/ci.yml/badge.svg)](https://github.com/initorigin/io-harness/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/crates/l/io-harness.svg)](LICENSE)
-[![MSRV 1.95](https://img.shields.io/badge/MSRV-1.95-blue.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/crates/msrv/io-harness)](Cargo.toml)
+[![License](https://img.shields.io/crates/l/io-harness.svg)](LICENSE)
 
 </div>
 
@@ -18,8 +19,7 @@ with a permission boundary, a sandbox, and a durable trace you own.**
 You hand it a contract: the task, the workspace it may touch, and what it may
 read, write, run and dial. It runs the loop — observe, reason, act, check, stop —
 and hands back an outcome, with every step, refusal and budget draw in a SQLite
-trace you can read afterwards. The agent can run the project's own toolchain, so
-the language the project is written in is not the harness's business.
+trace you can read afterwards.
 
 ## Quickstart
 
@@ -28,6 +28,8 @@ the language the project is written in is not the harness's business.
 io-harness = "0.36"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
+
+**MSRV: Rust 1.95** or later. The whole surface below is on that floor.
 
 ```rust,no_run
 use io_harness::{ApproveAll, OpenRouter, Policy, Session, Store};
@@ -90,12 +92,32 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
 println!("{:?}", result.outcome);
 ```
 
-**Requires Rust 1.95** or later. The floor comes from `libsqlite3-sys`, which
-publishes no `rust-version` of its own, so cargo cannot catch it at resolve
-time — on 1.94 the build fails inside that dependency's build script rather
-than here, with an error about a missing `cfg_select` macro. It rose from 1.88
-in 0.23.0; see [docs/CONTRACT.md](docs/CONTRACT.md) for why there was no
-version of that dependency which avoided it.
+## Who it is for
+
+You are writing a Rust program that needs an agent inside it — a CLI, a service,
+a desktop app, a test harness — and you want the loop, the boundary and the trace
+to be yours rather than a vendor's. The agent can run the project's own
+toolchain, so the language the *project* is written in is not the harness's
+business; only the language the *embedder* is written in is.
+
+It is a library and nothing else. There is no binary to install, no daemon, no
+UI, no account, and no telemetry. The browser dance for a subscription login, the
+terminal interface, the keybindings and the notification tray all belong to the
+program that embeds this crate — [io-cli](https://github.com/initorigin/io-cli)
+is one such program. If what you want is an agent to *use* rather than one to
+*build with*, this is the wrong layer.
+
+## Requirements
+
+The MSRV floor comes from `libsqlite3-sys`, which publishes no `rust-version` of
+its own, so cargo cannot catch it at resolve time — on 1.94 the build fails
+inside that dependency's build script rather than here, with an error about a
+missing `cfg_select` macro. It rose from 1.88 in 0.23.0; see
+[docs/CONTRACT.md](docs/CONTRACT.md) for why there was no version of that
+dependency which avoided it.
+
+The default build compiles no optional dependency at all, and the whole
+dependency tree is held deliberately small.
 
 ## What it does
 
@@ -359,11 +381,12 @@ goes through a deprecation cycle rather than vanishing between two releases.
 | Product | What it is | Status |
 | --- | --- | --- |
 | [io-harness](https://github.com/initorigin/io-harness) | The Rust agent harness (the center product) | Released |
-| io-cli | Terminal app on io-harness | In development |
-| io-studio | Desktop coding studio on io-harness | In development |
+| [io-cli](https://github.com/initorigin/io-cli) | Terminal app on io-harness — [on crates.io](https://crates.io/crates/io-cli) | Released |
+| io-studio | Desktop coding studio on io-harness | Not built |
 
-io-harness is the only public repository today, which is why it is the only one
-linked. io-cli and io-studio open when they release.
+io-cli is the crate embedded by something other than its own author, which is
+the only evidence a library like this one can offer that its API survives
+contact with a second program.
 
 ## Contributing
 
