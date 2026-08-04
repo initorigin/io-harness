@@ -349,6 +349,14 @@ tasks:
   - '`cargo test --test docs_drift` — 15 passed. The dangling-link checker covers the two new relative
     links in the table region; the two absolute ones (the io-cli repository and its crates.io page) were
     each requested once and answered, which is the check F8 asks for.'
+  - '**F8 met in a different form than its prose named — owner decision, 2026-08-04.** The criterion says
+    io-cli "links to `github.com/initorigin/io-cli` AND `crates.io/crates/io-cli`". The owner asked for
+    the crates.io link to be removed from the table, so the row carries the repository link only. The
+    substance of F8 is unchanged and still checkable: io-cli reads **Released**, it links to a repository
+    verified `public` via `gh api`, its released state was verified against the registry (0.11.0, 219
+    downloads) rather than from memory, io-studio reads **Not built**, and the false "only public repository
+    today" sentence is gone. What was dropped is one of two links, not a claim. Stated here rather than
+    glossed, and carried into the record''s `known_limitations`.'
 - id: US-IO-HARNESS-0.36.1-T08
   summary: 'Rebuild the badge block on one rule: no badge carries a value a human typed. The MSRV badge
     moves to the dynamic `crates/msrv` route, a downloads badge is added, every URL is requested once

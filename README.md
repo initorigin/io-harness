@@ -381,7 +381,7 @@ goes through a deprecation cycle rather than vanishing between two releases.
 | Product | What it is | Status |
 | --- | --- | --- |
 | [io-harness](https://github.com/initorigin/io-harness) | The Rust agent harness (the center product) | Released |
-| [io-cli](https://github.com/initorigin/io-cli) | Terminal app on io-harness — [on crates.io](https://crates.io/crates/io-cli) | Released |
+| [io-cli](https://github.com/initorigin/io-cli) | Terminal app on io-harness | Released |
 | io-studio | Desktop coding studio on io-harness | Not built |
 
 io-cli is the crate embedded by something other than its own author, which is
