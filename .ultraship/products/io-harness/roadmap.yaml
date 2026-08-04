@@ -915,10 +915,10 @@ versions:
       operating systems, twice each. The two feature polarities and the doctests are independent
       questions run one after another in a single serial job.
 
-      After this release the same evidence arrives in well under half the wall clock: the same
-      three operating systems, the same two feature polarities, the same doctests, the same MSRV,
-      lint, docs.rs, links-consumer and cross-version gates. Nothing is dropped and nothing is
-      sampled — the work is reorganised, not reduced.
+      After this release the same evidence arrives in well under half the wall clock: the same three
+      operating systems, the same two feature polarities, the same doctests, the same MSRV, lint,
+      docs.rs, links-consumer and cross-version gates. Nothing is dropped and nothing is sampled —
+      the work is reorganised, not reduced.
 
       And the front page stops misinforming the reader in the two places it costs most. The install
       snippet a reader copies from crates.io says `io-harness = "0.25"` against a crate that is
@@ -939,4 +939,4 @@ versions:
       or unsafe-freedom, because this repository measures none of the three and a badge asserting
       what nothing checks is worse on a landing page than in a test.
     detail: specified
-    status: planned
+    status: released

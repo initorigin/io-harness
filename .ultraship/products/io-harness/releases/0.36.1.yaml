@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.36.1
-status: planned
+status: released
 release_type: patch
 
 outcome:
@@ -663,3 +663,146 @@ open_questions:
   wrong place to move a dependency, and this repository has an entire release (0.23.0) about what a
   dependency bump can cost. Recorded so it is a decision someone makes rather than something nobody
   noticed.
+
+released_at: 2026-08-04T16:30:00Z
+mode: published
+delivered: >
+  A contributor pushes and gets the same verdict in 6m58s instead of 17m51s, and a reader arriving
+  from crates.io copies an install line that works and reads a product table that is true.
+
+  Measured warm cache to warm cache, from the GitHub Actions API by run id. Baseline run
+  30834723995: workflow 17m51s, `test (windows-latest)` 17m51s, macOS 8m51s, Linux 8m23s. After,
+  run 30925715697 attempt 2 (zero `No cache found` in any Windows job): workflow **6m58s** —
+  `test (windows, all)` 6m58s, `test (windows, default)` 5m50s, `test (macos, all)` 4m10s,
+  `doctest (windows)` 3m55s, `test (macos, default)` 3m23s, `doctest (ubuntu)` 3m03s,
+  `test (ubuntu, all)` 2m59s, `test (ubuntu, default)` 2m24s, `doctest (macos)` 1m37s,
+  `cross-version` 1m28s, `links-consumer` 1m25s, `docs.rs (nightly)` 1m16s, `lint` 55s, `msrv` 40s,
+  `examples (compile)` 38s. A 61% reduction, and every job in the new graph is confirmed to have
+  executed and reported by name.
+
+evidence:
+  tests:
+  - >
+    `cargo test` — all binaries passed plus **366 doctests** passed, 0 failed, run against the tree
+    being tagged.
+  - >
+    `cargo test --all-features --lib --tests` — passed, 0 failed, as a SEPARATE invocation (trap 31).
+  - >
+    F5's discriminator, same tree and same machine so the comparison is single-variable:
+    `cargo test --lib --tests` → 978 passed, 1 ignored; `cargo nextest run --lib --tests` →
+    978 tests run, 978 passed, 1 skipped. Equal. No test filtered, skipped or silently retried.
+  - >
+    The three known wall-clock-sensitive tests (traps 11, 73, 83) under nextest's process-per-test
+    model, three consecutive runs, all green and nowhere near their bounds:
+    `skills::discovery_over_a_32_skill_directory_is_under_50ms` 0.017/0.019/0.018s against 50ms;
+    `hooks::f4_an_executing_hook_gets_its_argv_whole_and_the_event_on_stdin` 0.063/0.039/0.035s;
+    `handles::a_handle_that_exits_on_its_own_stops_reading_as_running` 3.034/3.036/3.029s.
+  - >
+    `cargo test --test ci_workflow` — 6 passed, including five negative controls each shown to
+    discriminate before the checker was trusted.
+  - >
+    `cargo test --test docs_drift --test readme --test guide_pages --test changelog --test
+    public_api` — 15, 8, 5, 5 and 9 passed, 0 failed, re-run against the final tree after the
+    io-cli table edit.
+  builds:
+  - "`cargo fmt --check` — clean, run and committed BEFORE packaging (traps 64, 84)."
+  - "`cargo clippy --all-targets --all-features -- -D warnings` — exit 0, zero warnings."
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0,
+    zero warnings, run before the release PR. It caught nothing for the second consecutive release;
+    reported rather than passed over, because a gate that goes quiet is worth a sentence (trap 82).
+    This release did edit a public doc comment, so it had real input to read.
+  - >
+    `cargo clean` (removed 52,717 files, 14.9 GiB) then `cargo package --locked` — succeeded on a
+    clean tree, producing `io-harness-0.36.1.crate` at **1,319,620 bytes** (0.36.0 was 1,309,980).
+  - "`cargo tree` — **402** lines, unchanged since 0.23.0."
+  reviews:
+  - >
+    F1's set-cover comparison, mechanical rather than by reading the diff: every `(os, cargo
+    invocation)` pair enumerated from `ci.yml` and `release.yml` at the `v0.36.0` tag and from the
+    new files, each matrix expanded over its `os` and `features` axes with every step `if` honoured.
+    Old 37 pairs, new 46. The five old pairs absent as literal strings each decompose into their
+    replacements; nothing moved to Linux-only that was not already there.
+  - >
+    F6's job graph, asserted by parsing `release.yml`: `checks` has no `needs`; `lint`,
+    `test-default`, `test-all-features` and `package` each need `checks`; `release` needs all five.
+    All four refusals and every gate command are preserved verbatim.
+  - >
+    F4's proof is the toolchain's own account of the link. On `windows-latest`, `cargo rustc
+    --example tick -- --print link-args` reported MSVC `link.exe` unmodified and
+    `"rust-lld" "-flavor" "link"` with `-Clinker=rust-lld`, and the link completed. Round A of
+    CI then linked the whole crate, all 59 test binaries, the 8 fixture examples and all 366
+    doctests with it, all green.
+  deployments: []
+  health_checks:
+  - >
+    Every badge URL requested once and read from the returned SVG's `<title>` rather than from the
+    status code, because shields answers a bad path with a rendered card: `crates/v` →
+    `crates.io: v0.36.0`; `crates/d` → `downloads: 914`; `docsrs` → `docs: passing`; the Actions
+    badge → `CI - passing`; `crates/msrv` → `msrv: 1.95`; `crates/l` → `license: Apache-2.0`. None
+    rendered `invalid`.
+  - >
+    io-cli verified against the registry and the repository rather than from memory: crates.io
+    reports 0.11.0 with 219 downloads and repository `https://github.com/initorigin/io-cli`;
+    `gh api repos/initorigin/io-cli` reports visibility `public`. `io-studio/` holds documentation
+    and no `src/`.
+  - >
+    `gh api repos/initorigin/io-harness/rulesets` — `branch-ruleset` carries `deletion`,
+    `non_fast_forward` and `pull_request` and **no required status-check rule**, so the matrix
+    gaining a `features` dimension and the release job renames block no merge. Checked before the
+    release PR rather than after a merge stalled.
+
+known_limitations:
+- >
+  **This record was sealed before the crates.io upload.** The publish follows the develop-to-main
+  merge and the GitHub Release, by hand, and is always last.
+- >
+  **F8 was met in a different form than its prose named, by owner decision on 2026-08-04.** The
+  criterion asked for io-cli to link to its repository AND to crates.io; the owner asked for the
+  crates.io link to be removed from the table. The row keeps the repository link and the Released
+  status, both verified against the registry and the repository, so what the table claims is
+  unchanged — one of two links was dropped, not a claim.
+- >
+  **The contract's own prose carried three stale figures, each found by deriving rather than
+  trusting it.** F3 enumerated five fixture examples; reading `tests/` returns EIGHT
+  (`tests/handles.rs` also spawns `tick`, `orphan` and `flood`). The plan says 251 doctests; the
+  baseline log says **366**. The plan records io-cli at 0.10.0 with 186 downloads; the registry says
+  0.11.0 and 219 — which is exactly why the table states status rather than numbers. In each case
+  the criterion was met against the derived value, and the criterion was phrased to derive for
+  precisely this reason.
+- >
+  **`rust-lld` is proven on Windows only.** Linux and macOS keep their default linkers. Neither is
+  the critical path and ELF and Mach-O are separate questions needing their own probe; nothing here
+  claims otherwise.
+- >
+  **`rust-lld`'s attribution comes from two legs, not three.** Warm-to-warm on the same leg it took
+  the Windows doctest step 338s → 200s (-41%) and the Windows default build step 253s → 205s (-19%).
+  There is no warm no-lld measurement of the Windows `--all-features` leg: that cache key is new in
+  this release and the runs that would have populated it were cancelled, twice by a push to the same
+  branch under `concurrency: cancel-in-progress`. Its 449s and 462s figures are cold-cache and are
+  not used as a baseline.
+- >
+  **`CARGO_PROFILE_DEV_DEBUG=0` was measured and remains excluded.** The owner declined it for this
+  release to keep the backtrace frames that diagnosed the 0.21.0 Windows CRLF failure. Measured
+  anyway on the doctest job, where a backtrace frame has the least value: 184.0s → 166.0s, **9.8%**,
+  about 24s on the Windows doctest job. Not worth reopening a recorded decision. The number is
+  written down so nobody re-measures it.
+- >
+  **The next lever was identified, costed, and deliberately not taken.** 81% of the remaining build
+  time is 59 test binaries linking (`cargo build --lib` 15.7s against `cargo build --tests` 84.0s on
+  one tree), which is fully parallel; sharding them two ways was estimated at ~4m15s and would take
+  the job count from 15 to 17, under the 20-concurrent ceiling. It is not in this contract — the
+  contract's own open questions park it as a later lever — and the owner's decision on 2026-08-04
+  was to lock 0.36.1 here. Recorded so a later release knows it was weighed and by whom.
+- >
+  **Three dependencies are behind and this release does not move them.** deps.rs reports 3 of 25
+  outdated. Out of scope for a patch release whose subject is CI wall clock and documentation, and
+  this repository has an entire release (0.23.0) about what a dependency bump can cost.
+- >
+  Every `known_limitations` entry in `docs/CONTRACT.md` that the release brief lists as open was
+  checked and still reads as open. None was deleted on the strength of a release having probably
+  fixed it.
+
+supersedes: 0.36.0
+next_recommended_version: null
+immutable: true
