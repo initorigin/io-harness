@@ -116,6 +116,11 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: ${{ matrix.features }}
+      # nextest, installed from a prebuilt binary by a SHA-pinned action like
+      # every other `uses:` in this file. Not a crate dependency.
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-nextest
       # `--tests` plus the fixture examples by name, NOT `--all-targets`.
       #
       # `--all-targets` linked all 35 examples, on three operating systems, for
@@ -172,7 +177,23 @@ jobs:
       # 251 of them were 172s of the 295s `cargo test` step on run 30834723995,
       # and they share nothing with running the test binaries. They are the
       # `doctest` job below, on the same three operating systems.
-      - run: cargo test ${{ matrix.flags }} --lib --tests
+      #
+      # `cargo nextest run`, not `cargo test`. 59 test binaries were executed
+      # sequentially — 122s of the Windows leg's 295s `cargo test` step, with
+      # the rest being the doctests that are now their own job. nextest runs
+      # them concurrently, process-per-test.
+      #
+      # It is CI tooling installed by an action, NOT a crate dependency:
+      # `cargo tree` still reads 402 lines and Cargo.toml is untouched by this
+      # release. nextest does not run doctests at all, which is the second
+      # reason the doctests are a job of their own rather than a flag here.
+      #
+      # The count is the discriminator, not the wall clock. A run that quietly
+      # filtered or skipped a binary would look like a speed-up and fail
+      # nothing, so the number of tests executed per leg is compared with the
+      # number `cargo test` executed for that leg on run 30834723995: 967 in
+      # the default polarity and 1044 with every feature on.
+      - run: cargo nextest run ${{ matrix.flags }} --lib --tests
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.
   #
@@ -239,6 +260,65 @@ jobs:
           key: examples
       - run: cargo check --examples
       - run: cargo check --examples --all-features
+
+  # 0.36.1, F4 — does stable MSVC link with `rust-lld`?
+  #
+  # TEMPORARY. This job exists to answer one question that cannot be answered
+  # off a `windows-latest` runner, and it is deleted in this same release once
+  # it has: either `rust-lld` is wired into the matrix with this job's output as
+  # the proof it performed the link, or the lever is dropped and the finding is
+  # recorded so nobody spends the afternoon rediscovering it.
+  #
+  # The proof is the toolchain's own account of the link, not the presence of a
+  # flag. 0.16.0 shipped `#![cfg_attr(docsrs, feature(doc_auto_cfg))]`, every
+  # command exited 0, and docs.rs was broken for two releases because nothing
+  # asserted the setting had taken effect. A linker flag that is silently
+  # ignored is the same shape, and this release will not ship one.
+  #
+  # `continue-on-error` on the candidates is deliberate and is the reason this
+  # job is temporary: a probe whose whole purpose is to report which of three
+  # forms works must not go red on the two that do not.
+  lld-probe:
+    name: lld probe (windows, F4)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: lld-probe
+      - name: where the toolchain keeps rust-lld
+        run: |
+          $sysroot = (rustc --print sysroot)
+          echo "sysroot: $sysroot"
+          Get-ChildItem -Recurse -Filter "rust-lld*" $sysroot | ForEach-Object { echo $_.FullName }
+      - name: baseline - which linker does an unmodified build invoke
+        run: cargo rustc --quiet --example tick -- --print link-args
+      - name: candidate A - -Clinker=rust-lld
+        continue-on-error: true
+        env:
+          RUSTFLAGS: -Clinker=rust-lld
+        run: cargo rustc --quiet --example tick -- --print link-args
+      - name: candidate B - -Clinker=<sysroot path to rust-lld.exe>
+        continue-on-error: true
+        run: |
+          $sysroot = (rustc --print sysroot)
+          $lld = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-msvc\bin\rust-lld.exe"
+          echo "using: $lld"
+          $env:RUSTFLAGS = "-Clinker=$lld"
+          cargo rustc --quiet --example tick -- --print link-args
+      - name: candidate C - -Clink-arg=/link-time-lld via lld-link on PATH
+        continue-on-error: true
+        run: |
+          $sysroot = (rustc --print sysroot)
+          $bin = Join-Path $sysroot "lib\rustlib\x86_64-pc-windows-msvc\bin"
+          Copy-Item (Join-Path $bin "rust-lld.exe") (Join-Path $bin "lld-link.exe") -ErrorAction SilentlyContinue
+          $env:PATH = "$bin;$env:PATH"
+          $env:RUSTFLAGS = "-Clinker=lld-link"
+          cargo rustc --quiet --example tick -- --print link-args
 
   # The MSRV is read from Cargo.toml rather than hardcoded, so the declared
   # rust-version and the version actually proven to build cannot drift apart.
