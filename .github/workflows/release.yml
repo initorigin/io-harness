@@ -170,6 +170,18 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: release-all
+      # `--lib --tests` does not build `examples/`, and four tests spawn an
+      # example binary as a child process. Until 0.36.1 this job did not need
+      # the step: it lived inside the serial `verify` job, where `cargo test`
+      # ran first and built every example as a side effect. Splitting the two
+      # invocations into separate jobs removed that accident and the attach
+      # tests failed on the 0.36.1 release run — traps 2, 18, 35 and 54, in the
+      # one place four previous discoveries had not looked.
+      #
+      # `--examples` rather than the fixture list CI names: this job is a
+      # release gate and not the wall-clock target, and a list here would be a
+      # second list to keep in step with `tests/ci_workflow.rs`'s.
+      - run: cargo build --all-features --examples
       - run: cargo test --all-features --lib --tests
 
   # Catches a file the manifest forgot, and produces the attached artifact.
