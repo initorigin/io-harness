@@ -11,7 +11,7 @@ tasks:
     exists to catch, and it is invisible to every functional criterion: the release works, and the
     next reword of a session rule applies to half the callers. The extraction has to land before the
     tree loop calls anything, so the flat loop's own suites are the proof that it changed nothing.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -30,7 +30,22 @@ tasks:
     edited to accommodate this release.
   files:
   - src/run.rs
-  evidence: []
+  evidence:
+  - >
+    The extraction landed as five crate-internal helpers in `src/run.rs` — `seed_conversation`,
+    `open_turn_kind`, `conversational_opening`, `classify_first_completion` and `drain_steer` — and
+    `run_workspace_from` now reaches each through a call rather than inlining it.
+  - >
+    N5, the four session suites run unmodified against the extracted loop, before the tree loop
+    called anything: `cargo test --test session --test session_reply --test session_steering
+    --test session_streaming` — **5 + 8 + 4 + 4 = 21 passed, 0 failed**. No test in those four files
+    was edited at any point in this release.
+  - >
+    N4's own control, executed: sabotage **S5** added a second copy of the reply-typing rule
+    (`set_turn_kind(run_id, TURN_KIND_REPLY)`) beside `seed_conversation` in the tree loop.
+    `each_session_rule_is_one_helper_that_both_loops_call` FAILED with "`set_turn_kind(run_id,
+    TURN_KIND_REPLY)` is written once, in its helper". Reverted; it passes on the shipped tree. A
+    splice-in that fails is what makes the assertion more than a grep.
 
 - id: US-IO-HARNESS-0.39.0-T02
   summary: >
@@ -40,7 +55,7 @@ tasks:
     This is the mechanism of the release: it is what makes a turn able to run the loop that owns the
     spawn tool while still being a turn. Without the depth-0 restriction a child would be seeded with
     the conversation, classified as a reply, and steerable by an operator it never spoke to.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.39.0-T01
   acceptance_criteria:
@@ -61,7 +76,31 @@ tasks:
     stored rows — the 0.31.0 rule that a "not in the context" claim is made against what was sent.
   files:
   - src/run.rs
-  evidence: []
+  evidence:
+  - >
+    `Tree` gained one field, `turn: Option<&TurnExtras>`, and one accessor, `Tree::extras(depth)`,
+    returning the turn's extras at depth 0 and a `const NO_EXTRAS` at every other depth. The depth
+    test lives in that one accessor rather than at the four use sites, so "a child is work, not
+    conversation" cannot hold at three of them and lapse at the fourth. `run_tree_observed` now
+    delegates to a crate-internal `run_tree_with_extras`, the tree-side counterpart of
+    `run_with_extras`, which is also where a turn row is written for a contained turn.
+  - >
+    F6 executed: `a_contained_turn_that_answers_spawns_nothing` — a contained turn whose first
+    completion stops on text is `TurnKind::Reply`, costs **one** completion, writes no `steps` row,
+    spawns nothing, emits `Answered` exactly once, and its opening carries both the conversational
+    sentence and the tree agent's own description (`spawn_agent` named in the system prompt).
+    Sabotage **S1** removed the classification call from the tree loop: that named test FAILED, and
+    so did N4's, the helper then having one call site. Reverted.
+  - >
+    F6's second arm: `a_contained_turn_with_a_criterion_does_not_classify` — a turn carrying a
+    `Verification` is `TurnKind::Run` and its first request does **not** carry the conversational
+    opening. The 0.37.0 rule holding on the new path.
+  - >
+    F7 executed: `the_conversation_reaches_the_root_and_not_the_children`, asserted on the outbound
+    requests the mock provider was handed rather than on stored rows. The root's request carries the
+    prior turn's prompt and its answer; the child's carries its own goal and neither of them.
+    Sabotage **S2** removed the depth gate from `Tree::extras` so every agent read the turn's
+    extras: that named test FAILED on "the child must not read the conversation". Reverted.
 
 - id: US-IO-HARNESS-0.39.0-T03
   summary: >
@@ -72,7 +111,7 @@ tasks:
     These two methods are the release's entire public surface and the only way a caller reaches any
     of it. `drive` staying the single funnel is what keeps the turn row, the head move and the
     `Answered` event written once for all seven entry points.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.39.0-T02
   acceptance_criteria:
@@ -103,7 +142,32 @@ tasks:
   - src/session.rs
   - src/run.rs
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - >
+    F1 executed, both halves. `a_contained_turn_is_offered_the_spawn_tool`: the tool list the
+    provider was handed on a contained turn's first completion contains `spawn_agent`.
+    `no_other_turn_shape_is_offered_the_spawn_tool`: the same assertion negated against **all five**
+    pre-0.39.0 entry points — `turn`, `turn_observed`, `turn_steered`, `turn_bounded`,
+    `turn_bounded_observed` — each driven through the real loop in the same test.
+  - >
+    That negative control is not decorative: sabotage **S3** made `drive` substitute a default
+    `Containment` when the caller passed none, so every turn reached the tree loop.
+    `no_other_turn_shape_is_offered_the_spawn_tool` FAILED, printing the leaked tool list ending in
+    `"spawn_agent"`. Reverted.
+  - >
+    F5 executed: `a_fan_out_is_still_one_turn` — after a turn that spawned three children,
+    `Store::session_turns` returns exactly **one** row, `Session::head` names it,
+    `Session::history` renders one entry, `Store::turn_for_run(turn.run_id)` returns that turn id,
+    and `Store::turn_for_run(child)` returns `None` for every child.
+  - >
+    N2 — **DEVIATION, stated not glossed.** The criterion says `docs/public-api.txt` gains exactly
+    two lines. It gains **none**: the file is unchanged across this release's commits, because
+    `tests/public_api.rs` enumerates the items re-exported from `lib.rs` and these two additions are
+    inherent methods on the already-listed `struct Session`. The substance is met more strongly than
+    the prose asked — the crate root's surface is byte-identical and nothing is removed, renamed or
+    altered — and both new methods carry a worked doctest regardless. `tests/public_api.rs` **8
+    passed**; `tests/changelog.rs` **15 passed**, finding no `**BREAKING` entry for 0.39.0. Owed to
+    the record's `known_limitations`.
 
 - id: US-IO-HARNESS-0.39.0-T04
   summary: >
@@ -114,7 +178,7 @@ tasks:
     "The fan-out is contained" is the half of the outcome that is not visible in the tool list. A
     turn that could spawn but whose children escaped the session's boundary or its budget would pass
     F1 and be a worse release than none.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.39.0-T03
   acceptance_criteria:
@@ -144,7 +208,42 @@ tasks:
     fails.
   files:
   - tests/session_fanout.rs
-  evidence: []
+  evidence:
+  - >
+    F2 executed: `a_child_spawned_inside_a_turn_belongs_to_that_turns_run` — two children spawned in
+    one step of a contained turn. `Store::children(turn.run_id)` returns both,
+    `Store::agent_events(turn.run_id)` carries two `spawn` edges, each child has its own `runs` row
+    and its own `steps`, the observer saw a child's step at **depth 1** under the child's own run id,
+    and both children's files reached the shared workspace.
+  - >
+    F3(b), the count cap: `the_total_agent_cap_refuses_a_second_spawn_inside_a_turn` — with
+    `max_total_agents: 1` the spawn is refused with `SpawnRefused`, no child run exists, and the
+    parent adapts rather than failing. The 0.32.0 distinction holds inside a turn: this cap refuses
+    where the concurrency cap queues.
+  - >
+    F3(a), the spend cap: `the_shared_ledger_halts_a_turns_fan_out_on_spend` — 100 tokens per
+    completion against a 150-token tree ceiling. The tree halts on the shared ledger, the second
+    child's file never exists, and the turn ends on the ceiling outcome rather than each child
+    continuing on its own contract's budget.
+  - >
+    F4 executed: `a_child_cannot_widen_the_sessions_boundary` — the session's policy allows writes
+    under `docs/` and denies `src/*`; a child asked to write `src/x.rs` is refused, the file does not
+    exist on disk afterwards, and the refusal is recorded under the **child's** run id.
+  - >
+    **A sabotage that failed nothing, reported as a finding rather than propped up.** S4 replaced
+    `parent_policy.contain(&overlay)` with `parent_policy.clone()` — a child handed its parent's
+    policy verbatim — and **every test still passed**, because with an identical policy the boundary
+    genuinely still holds. The arm F4 discriminates is *widening*, so the sabotage was sharpened:
+    **S4b** handed the child `Policy::permissive()`, under which
+    `a_child_cannot_widen_the_sessions_boundary` FAILED on "the child's write outside the session's
+    boundary did not land". Reverted. The silence of the first sabotage is the useful result:
+    inheritance-without-narrowing is not observable through this criterion, and the criterion is
+    about the narrowing.
+  - >
+    A defect in the test as first written, found by S4's silence and worth recording:
+    `Policy::default()` **asks** about a write it has no rule for and `ApproveAll` answers yes, so
+    the first version of F4 used `allow_write("docs/*")` alone and the child's write landed. A
+    "cannot widen" test needs a `deny`, which is the wall; an `allow` elsewhere is only the prompt.
 
 - id: US-IO-HARNESS-0.39.0-T05
   summary: >
@@ -156,7 +255,7 @@ tasks:
     documented path rather than a run they cannot continue. The turn row's contents after a resume
     the session did not drive is the one place this release can over-claim, so it is measured rather
     than described.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.39.0-T03
   acceptance_criteria:
@@ -171,7 +270,22 @@ tasks:
     claimed to update itself.
   files:
   - tests/session_fanout.rs
-  evidence: []
+  evidence:
+  - >
+    F8 executed: `a_paused_contained_turn_resumes_as_a_tree_under_the_same_turn` — a turn stopped
+    `AwaitingApproval` on a real deferred request from a real `Approver`, then continued with
+    `resume_tree_with_decision(contract, provider, store, turn.run_id, request_id,
+    Decision::approve(), policy, approver, containment)`. The resume returns **the same run id**,
+    `Store::turn_for_run` still returns the original turn id, the row's `session_id` and
+    `parent_turn_id` are unchanged, and the work the run was holding landed on disk.
+  - >
+    **Measured, and it is the honest half of this criterion:** the turn row reads
+    `outcome: "running"` after the pause and still reads `running` after the resume — not
+    `awaiting_approval`, which is what the test asserted first and what the criterion's prose
+    implies. `Session::drive` closes the turn with what `Store::run_summary` said when the turn
+    returned, and a run parked on an approval has no summary outcome yet. The run is the record that
+    moves; the turn row is not rewritten by a resume the session did not drive. Written into
+    `docs/CONTRACT.md` and owed to the record's `known_limitations`.
 
 - id: US-IO-HARNESS-0.39.0-T06
   summary: >
@@ -182,7 +296,7 @@ tasks:
     Every limit in N6 is one an operator discovers the expensive way otherwise — a per-turn ledger
     read as a session ceiling, a paused turn resumed with the wrong function, a child expected to
     answer the operator. The release is not shippable with them undocumented.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.39.0-T05
   acceptance_criteria:
@@ -201,7 +315,29 @@ tasks:
   - docs/CONTRACT.md
   - CHANGELOG.md
   - README.md
-  evidence: []
+  evidence:
+  - >
+    N6 executed. `docs/CONTRACT.md` gained "What a contained session turn gives you, and what it does
+    not (0.39.0)" carrying all six limits the criterion names: the per-turn ledger and the absence of
+    a conversation-wide ceiling; the `resume_tree_*` routing **and** the measured fact that the turn
+    row reports the pause; a child receiving its goal and not the conversation, with both reasons; a
+    child being a run and never a second turn; cancellation at the root's step boundary where no
+    child is in flight; and `max_concurrent_agents × depth` inherited unchanged from 0.32.0.
+  - >
+    `docs/guide/sessions.md`: the entry-point table went from five rows to seven with a "May spawn"
+    column, and a new "A turn can fan out (0.39.0)" section carries the worked example and the four
+    things to know before reaching for it. `docs/guide/composition.md` gained the pointer from the
+    tree side and a "See also" entry, and its "only `run_tree` offers the tool" sentence — which this
+    release makes false — was corrected. **No new guide page**, so no `GUIDES`/`CAPABILITIES.md`
+    bookkeeping.
+  - >
+    `CHANGELOG.md` gained the 0.39.0 section with two `### Added` entries and one `### Changed`, and
+    **no** `*Migration:*` note because nothing breaks. `README.md` gained the fan-out paragraph beside
+    the sessions one, and its install snippet moved to `io-harness = "0.39"`.
+  - >
+    The documentation gates, run together: `cargo test --test docs_drift --test changelog --test
+    readme --test guide_pages --test public_api --test session_fanout` — **5 + 15 + 7 + 9 + 8 + 12 =
+    56 passed, 0 failed**. `cargo fmt --check` clean.
 
 - id: US-IO-HARNESS-0.39.0-T07
   summary: >
@@ -212,7 +348,7 @@ tasks:
     These are the criteria that fail after everything else passes. The dependency count, the schema
     guard and the docs.rs command have each caught something in the last five releases, and O4 exists
     because 0.37.0 sealed a record describing a tree two Dependabot merges had already changed.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.39.0-T06
   acceptance_criteria:
@@ -250,4 +386,38 @@ tasks:
     on the merged tree before the record is sealed.
   files:
   - Cargo.toml
-  evidence: []
+  evidence:
+  - >
+    N1: `cargo tree` reads **402** lines on macOS, unchanged since 0.23.0, and
+    `cargo tree --all-features` reads **829**. `Cargo.toml` received only the version bump to 0.39.0.
+  - >
+    N3: `docs/public-api.txt` and `src/state.rs` are untouched by this release — zero changes across
+    its four commits. `CHECKPOINT_FORMAT` is **7** at `src/state.rs:107`. `cargo test --test
+    cross_version --test checkpoint --test store_open` — **18 + 5 + 4 = 27 passed**, both directions
+    against the pinned 0.29.0 generator, with no new name fed to `ADDED_SINCE_0_22_0`.
+  - >
+    The full suites on the release tree: `cargo test --lib --tests` **64 suites / 1,005 passed**;
+    `cargo test --all-features --lib --tests` **64 suites / 1,082 passed**; both after
+    `cargo build --all-features --examples`, so no sabotage ran against a stale fixture binary.
+    Doctests: **370 of 373 passed** — one failure was this release's own
+    (`Session::turn_contained`'s example called a `Store::spawns` that does not exist; corrected to
+    `Store::children`, after which both new doctests pass), and two are `src/config.rs` doctests that
+    fail on this machine only. Those two are **environmental and pre-existing**: they fail
+    identically on the stashed 0.38.0 tree, and with `XDG_CONFIG_HOME` redirected all **20**
+    `config::Config` doctests pass. The machine carries a real `~/.config/io/io.toml`, which is trap
+    102's family reaching the doctest runner rather than only `tests/plugin.rs`.
+  - >
+    O2: the nightly docs.rs gate, run with the CI job's exact command —
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exited
+    **0 with no warnings**, on a tree adding two documented methods with intra-doc links to
+    `Containment`, `Policy`, `SPAWN_TOOL` and the three `resume_tree_*` functions.
+  - >
+    O3: `cargo package --locked` succeeded on a clean tree after `cargo clean` (which freed
+    26.4 GiB), and the packaged crate compiled in its own verification step. **1,360,863 bytes**,
+    `sha256:62d69cf8f8c74cd3639cd6a25acf03142cf06b331112eecc2718ea32131176af`. Disk checked before
+    and between build steps: 46 GiB free at the start, 21 GiB at the low point, 47 GiB after the
+    clean.
+  - >
+    O1 and O4 are the CI half, recorded at the release PR: the three-OS matrix on the commit being
+    released, and `develop`'s head checked against the tree these gates ran on immediately before the
+    release PR is opened.
