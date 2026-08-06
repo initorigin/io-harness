@@ -60,7 +60,9 @@ fn measured() -> [Usage; 2] {
 
 fn store_the_pair() -> (Store, i64) {
     let store = Store::memory().unwrap();
-    let run_id = store.start_run("a cached conversation", "NOTES.md").unwrap();
+    let run_id = store
+        .start_run("a cached conversation", "NOTES.md")
+        .unwrap();
     for (step, usage) in measured().into_iter().enumerate() {
         store
             .record_provider_call(

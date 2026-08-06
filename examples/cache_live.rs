@@ -76,10 +76,7 @@ fn report(label: &str, model: &Option<String>, usage: Option<Usage>) -> u64 {
             println!(
                 "  {label:<28} model={model:<32} prompt={:<7} cache_read={:<7} cache_write={:<7} \
                  completion={}",
-                u.prompt_tokens,
-                u.cache_read_tokens,
-                u.cache_write_tokens,
-                u.completion_tokens,
+                u.prompt_tokens, u.cache_read_tokens, u.cache_write_tokens, u.completion_tokens,
             );
             u.cache_read_tokens
         }
@@ -115,7 +112,9 @@ async fn main() -> io_harness::Result<()> {
     // ---- the marked arm: OpenRouter, which since 0.38.0 sends the breakpoint ---
     println!("marked (OpenRouter, cache_control sent):");
     let marked = OpenRouter::new(&key, &model);
-    let first = marked.complete(request(&system, "In one word: yes?")).await?;
+    let first = marked
+        .complete(request(&system, "In one word: yes?"))
+        .await?;
     let a1 = report("call 1 (writes the cache)", &first.model, first.usage);
     let second = marked
         .complete(request(&system, "In one word: still yes?"))
@@ -125,14 +124,11 @@ async fn main() -> io_harness::Result<()> {
     // ---- the control: the same endpoint and model, with no marker -------------
     // `Compatible` builds with `WebFlavor::OpenAi`, so no `cache_control` is sent.
     println!("\ncontrol (same endpoint and model, no cache_control):");
-    let plain = Compatible::new(
-        "https://openrouter.ai/api/v1",
-        Auth::Bearer,
-        &key,
-        &model,
-    )
-    .with_name("openrouter-unmarked");
-    let third = plain.complete(request(&system, "In one word: yes?")).await?;
+    let plain = Compatible::new("https://openrouter.ai/api/v1", Auth::Bearer, &key, &model)
+        .with_name("openrouter-unmarked");
+    let third = plain
+        .complete(request(&system, "In one word: yes?"))
+        .await?;
     let b1 = report("call 1", &third.model, third.usage);
     let fourth = plain
         .complete(request(&system, "In one word: still yes?"))
