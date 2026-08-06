@@ -61,7 +61,40 @@ pub(crate) fn body(
     if let Some((key, value)) = effort_key(flavor, request.effort) {
         body[key] = value;
     }
+    // 0.38.0 — the cache breakpoint, added the third time in the shape the two
+    // above established: a per-vendor difference resolved here rather than in each
+    // provider, and absent entirely for a wire that does not take one — which is
+    // what keeps an OpenAI-flavoured body byte-identical to the one 0.37.0 sent.
+    if let Some(content) = cached_system(flavor, &request.system) {
+        body["messages"][0]["content"] = content;
+    }
     body
+}
+
+/// The system message's `content` for a wire that takes a request-side cache
+/// breakpoint, or `None` for one that does not and keeps the bare string.
+///
+/// The breakpoint sits at the end of the instructions and nowhere else. That block
+/// — the system prompt, the skill catalogue folded into it, and the tool schemas
+/// the vendor orders ahead of it — is what this crate re-sends identically on every
+/// step of a run and every turn of a session. The transcript deliberately carries
+/// no breakpoint: [`crate::context::assemble`] supersedes, invalidates, re-reads
+/// and re-fits earlier observations on each turn, so it is not a byte-stable prefix
+/// and marking it would be billed as a cache *write* on nearly every turn.
+fn cached_system(flavor: WebFlavor, system: &str) -> Option<serde_json::Value> {
+    match flavor {
+        // OpenAI caches a repeated prefix by itself with no request-side control,
+        // so there is nothing to ask for. This flavour also serves every endpoint
+        // reached through `Compatible` — 21 of them this crate does not control —
+        // where an unknown body key is a 400 nobody asked for. New surface starts
+        // closed.
+        WebFlavor::OpenAi => None,
+        WebFlavor::OpenRouter => Some(json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": { "type": "ephemeral" },
+        }])),
+    }
 }
 
 /// The vendor-specific key an [`Effort`] adds to the shared body, or `None` when
@@ -620,6 +653,80 @@ mod tests {
     }
 }
 
+/// 0.38.0 — the cache breakpoint reaches one of the two wire vendors and not the
+/// other, and the pair of tests here is what keeps it that way.
+#[cfg(test)]
+mod cache_wire {
+    use super::*;
+
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn req() -> CompletionRequest {
+        CompletionRequest {
+            system: "you are a careful agent".into(),
+            user: "hi".into(),
+            ..Default::default()
+        }
+    }
+
+    /// F2 — OpenAI's body did not move, and this is F3's negative control.
+    ///
+    /// `WebFlavor::OpenAi` serves both [`OpenAi`](crate::OpenAi) and every endpoint
+    /// reached through [`Compatible`](crate::Compatible) — 21 of them this crate
+    /// does not control — where an unknown body key is a 400 nobody asked for.
+    /// OpenAI caches a repeated prefix by itself with no request-side control, so
+    /// there is nothing here to ask for and nothing is sent.
+    #[test]
+    fn the_openai_body_carries_no_breakpoint_and_keeps_its_bare_system_string() {
+        let b = body("gpt-x", &req(), WebFlavor::OpenAi);
+        assert_eq!(
+            b["messages"][0]["content"], "you are a careful agent",
+            "the system content must stay a bare string for this flavour"
+        );
+        assert!(
+            b["messages"][0]["content"].is_string(),
+            "not a parts array: {b}"
+        );
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            0,
+            "no breakpoint anywhere in an OpenAI-flavoured body, got {b}"
+        );
+    }
+
+    /// F3 — OpenRouter's body carries the marker in the shape that wire spells it,
+    /// and the two flavours differ in that one value and nothing else.
+    #[test]
+    fn the_openrouter_body_carries_one_breakpoint_on_its_system_part() {
+        let b = body("vendor/model", &req(), WebFlavor::OpenRouter);
+        let content = &b["messages"][0]["content"];
+        assert_eq!(content.as_array().expect("a parts array").len(), 1);
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "you are a careful agent");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+
+        // The user turn is untouched — the breakpoint sits at the end of the
+        // instructions, never inside the transcript.
+        assert_eq!(b["messages"][1]["content"], "hi");
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            1,
+            "exactly one breakpoint, got {b}"
+        );
+
+        // The discriminating comparison with F2: strip the system message from both
+        // and nothing else may differ. This is what fails an implementation that
+        // reshapes the shared body for one flavour and quietly changes the rest.
+        let strip = |mut v: serde_json::Value| {
+            v["messages"] = json!([v["messages"][1]]);
+            v
+        };
+        assert_eq!(
+            strip(body("m", &req(), WebFlavor::OpenRouter)),
+            strip(body("m", &req(), WebFlavor::OpenAi)),
+        );
+    }
+}
+
 /// 0.22.0 — the two web keys these vendors spell differently, what each refuses,
 /// and the citations both annotate their answers with.
 #[cfg(test)]
@@ -708,7 +815,18 @@ mod web_wire {
             let before = body("m", &asked, flavor);
             assert!(before.get("reasoning_effort").is_none());
             assert!(before.get("reasoning").is_none());
-            // The whole body, not only the absence of the two keys.
+            // The whole body, not only the absence of the two keys. 0.38.0 — the
+            // system message's content differs by flavour, because the cache
+            // breakpoint reaches OpenRouter and deliberately does not reach OpenAI;
+            // everything else is what 0.30.0 sent.
+            let system_content = match flavor {
+                WebFlavor::OpenAi => json!("sys"),
+                WebFlavor::OpenRouter => json!([{
+                    "type": "text",
+                    "text": "sys",
+                    "cache_control": { "type": "ephemeral" },
+                }]),
+            };
             assert_eq!(
                 before,
                 json!({
@@ -716,7 +834,7 @@ mod web_wire {
                     "stream": true,
                     "stream_options": { "include_usage": true },
                     "messages": [
-                        { "role": "system", "content": "sys" },
+                        { "role": "system", "content": system_content },
                         { "role": "user", "content": "what shipped this week" },
                     ],
                     "tools": [],

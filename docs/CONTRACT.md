@@ -764,6 +764,63 @@ matches `hi` and not `namaste`, and answers `hi, the login page is broken`
 correctly only by accident. If the classification needed a lookup table to work,
 it would not work.
 
+## What prompt caching asks for, and what it cannot promise (0.38.0)
+
+The crate marks one cache breakpoint per request, at the end of the system block.
+On the Anthropic wire that block is preceded by the tool schemas, so the single
+marker covers the tool definitions and the instructions together — the part of a
+request that is identical on every step of a run and every turn of a session.
+
+| provider | what is sent | why |
+| --- | --- | --- |
+| `Anthropic` | `system` as a content-block array whose one block carries `cache_control: {"type":"ephemeral"}` | that vendor's caching is request-side |
+| `OpenRouter` | the system message's `content` as a one-part array carrying the same object | it translates the marker for the vendors that take one |
+| `OpenAi` | **nothing** | OpenAI caches a repeated prefix by itself; there is no request-side control to use |
+| `Compatible` | **nothing** | 21 endpoints this crate does not control, where an unknown body key is a 400 nobody asked for |
+
+Six things follow that a caller should hear plainly rather than find on an
+invoice.
+
+**This crate declares a cache; it does not operate one.** Whether anything is
+cached, for how long, and what it costs are the vendor's decisions. What is sent
+is a request in exactly the sense `CompletionRequest::model` is a request.
+
+**A short prefix is silently not cached.** Every vendor that caches sets a minimum
+length below which it declines, and declines without saying so: the marker is
+accepted, the response is normal, and `cache_read_tokens` stays zero. An embedder
+with a small system prompt will see no effect and there is no error to read.
+
+**A miss is invisible.** A cache entry expires on the vendor's own clock, and a
+request that arrives after it has gone is served fresh with no signal that it was
+ever meant to hit. `Usage::cache_read_tokens` is the only observable, and its
+absence means "not served from cache" without saying why.
+
+**A prefix used exactly once costs more, not less.** Vendors bill a cache *write*
+above a fresh read and a cache *read* far below one — the rate shape in this
+crate's own price table is 1.25× and 0.1× against input. So the block pays for
+itself from the **second** use (1.25 + 0.1 against 2.0) and a single-call run pays
+about a quarter more for it than it did in 0.37.0. This is accepted deliberately:
+a run makes more than one call, and a session more than one turn.
+
+**A run cached through OpenRouter under-reports what it cost.** That wire reports
+no cache-write counter, so `Usage::cache_write_tokens` is zero by construction and
+the tokens that were written are priced as ordinary fresh input. Measured on the
+live run that proved this release: `cache_write_tokens` came back zero on all four
+calls, including the one that must have written the entry the next call read. The
+crate does **not** infer the write from the prompt length — that would put a
+number in the trace the invoice does not contain.
+
+**The transcript is not cached, and that is a design decision.** A cache
+breakpoint needs a byte-identical prefix. `context::assemble` re-derives what the
+model sees on every turn: a later observation supersedes an earlier one of the
+same kind and target, a write invalidates an earlier read of that path, an
+invalidated read is re-read and its text replaced, and what does not fit the
+ceiling becomes a stub. Earlier bytes therefore change between turns by design, so
+a breakpoint inside the observation log would miss on nearly every turn and be
+billed as a write each time — it would cost money rather than save it. The
+assembler and prefix caching want opposite things; reconciling them is a change to
+the assembler, not an addition here.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

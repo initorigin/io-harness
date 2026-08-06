@@ -410,6 +410,73 @@ therefore not into the next turn's prompt. A vendor bills thinking once as outpu
 folding it into the next request would bill it again as input, every turn, for
 the rest of the run.
 
+## Not paying twice for the same instructions (0.38.0)
+
+Every request this crate builds opens with the same block: the system
+instructions, the skill catalogue folded into them, and the JSON schema of every
+tool on offer. It is assembled once per turn and handed to every step of the loop,
+so a twenty-step run sends it twenty times. Until 0.38.0 it was billed twenty
+times too.
+
+Since 0.38.0 the request marks the end of that block as a cache breakpoint, and
+the vendors that cache serve it back instead of re-reading it. There is nothing to
+switch on and nothing to configure:
+
+```rust,no_run
+use io_harness::{Anthropic, CompletionRequest, Provider};
+
+# async fn demo() -> io_harness::Result<()> {
+let provider = Anthropic::new(std::env::var("ANTHROPIC_API_KEY").unwrap(), "claude-x");
+
+// The same instructions on both calls. The second is served from the vendor's
+// cache — nothing here asks for that, because the request already did.
+let ask = |question: &str| CompletionRequest {
+    system: "…several thousand tokens of instructions and skills…".into(),
+    user: question.into(),
+    ..Default::default()
+};
+let first = provider.complete(ask("what does this crate do?")).await?;
+let second = provider.complete(ask("and what does it refuse to do?")).await?;
+
+// The counter has existed since 0.18.0. Before 0.38.0 it was structurally zero,
+// because nothing ever asked. `first` writes the entry and `second` reads it —
+// though whether it does is the vendor's decision and its clock, not this crate's.
+println!("wrote: {}", first.usage.unwrap().cache_write_tokens);
+println!("read:  {}", second.usage.unwrap().cache_read_tokens);
+# Ok(())
+# }
+```
+
+Which vendors are asked, and why the other two are not:
+
+| provider | marker sent | note |
+| --- | --- | --- |
+| `Anthropic` | yes, on the one `system` block | that wire orders tools before system, so one marker covers both |
+| `OpenRouter` | yes, on the system message part | it translates the marker for the vendors that take one |
+| `OpenAi` | no | it caches a repeated prefix by itself; there is no request-side control |
+| `Compatible` | no | 21 endpoints this crate does not control, where an unknown key is a 400 |
+
+Three things worth knowing before you read an invoice.
+
+**It pays from the second call, not the first.** A cache write is billed above a
+fresh read and a cache read far below one, so a block used exactly once costs more
+than it used to. Runs make more than one call and sessions more than one turn,
+which is why this is unconditional rather than a setting.
+
+**A short block is not cached at all,** silently — every vendor sets a minimum
+length and declines below it without saying so. If `cache_read_tokens` stays zero,
+the prefix being too short is the first thing to check.
+
+**Only the instructions are marked, never the transcript.** The observation ledger
+is re-derived on every turn — superseded, invalidated, re-read, re-fitted — so it
+is not the byte-identical prefix a cache needs, and marking it would be billed as
+a write on nearly every turn. See
+[the contract](../CONTRACT.md#what-prompt-caching-asks-for-and-what-it-cannot-promise-0380)
+for the full statement.
+
+`examples/cache_live.rs` measures all of this against a real endpoint, with an
+unmarked control over the same route so the numbers mean something.
+
 ## The limits, stated plainly
 
 **`Compatible` sends one wire. It is not a compatibility layer.** Every vendor
