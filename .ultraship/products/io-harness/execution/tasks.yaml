@@ -229,7 +229,7 @@ tasks:
     "Zero breaks and zero schema change" is the whole reason this release costs a consumer nothing,
     and it is a claim about absence — which is worth nothing unless it is asserted rather than
     described. Every other task can pass while this one fails.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.38.0-T01
   acceptance_criteria:
@@ -251,7 +251,38 @@ tasks:
     for a field on the request has turned a zero-break release into a breaking one.
   files:
   - tests/cross_version.rs
-  evidence: []
+  evidence:
+  - >
+    F6, `docs/public-api.txt` byte-identical: `git log -1 -- docs/public-api.txt` still points at
+    `82ed9d4`, a 0.37.0 commit — the file has not been touched in this release, and
+    `git diff --stat` against the plan commit reports nothing. `cargo test --test public_api` —
+    **9 passed, 0 failed**. This is N2's assertion as well as F6's: the enumerated public surface is
+    the surface 0.37.0 shipped.
+  - >
+    F6, `ADDED_SINCE_0_22_0` unchanged: `tests/cross_version.rs` is untouched by this release
+    (`git diff --stat` empty against the plan commit) and needed no new name, because no table,
+    column or index was added. The task declared that file because it is where a schema change would
+    have had to be registered; that it required no edit is the evidence, not an omission.
+  - >
+    F6, cross-version in both directions: `cargo test --test cross_version` — **5 passed, 0 failed**,
+    which includes F5's assertion that `CHECKPOINT_FORMAT` is 7
+    (`tests/cross_version.rs:973`) and that opening a 0.22.0 store does not move it (`:983`), so the
+    format is asserted unmoved rather than assumed. Then the pinned generator, built and run rather
+    than reasoned about: `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`
+    succeeded and `cargo test --test cross_version_0_29_0 -- --ignored` — **1 passed, 0 failed**
+    (`a_current_store_is_read_by_a_0_29_0_binary`). A store written by this tree is read by a 0.29.0
+    binary, nine releases back.
+  - >
+    F6, no breaking entry: `cargo test --test changelog` — **15 passed, 0 failed**. The suite reports
+    any entry marked `**BREAKING` without a `*Migration:*` note; the 0.38.0 section carries no
+    `**BREAKING` marker at all, which is the release's claim.
+  - >
+    N2, the reason the claim is cheap to make: nothing in this release touches a public type. The
+    marker is computed inside `Anthropic::body` and `openai_wire::cached_system` from
+    `request.system`, which the request already carried. `CompletionRequest` and `CompletionResponse`
+    were verified to be plain `Default`-deriving structs with no `#[non_exhaustive]`
+    (`src/provider/mod.rs:450` and `:675`), so adding a field to either would have been a real break
+    for an out-of-tree exhaustive literal — and neither was touched.
 
 - id: US-IO-HARNESS-0.38.0-T05
   summary: >
