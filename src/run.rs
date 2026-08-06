@@ -983,7 +983,20 @@ pub(crate) struct TurnExtras<'a> {
     /// process dies mid-answer is in the tree with a run id a resume can continue
     /// from.
     pub turn: Option<crate::session::SessionTurn<'a>>,
+    /// Whether this turn's own first completion is allowed to decide that the turn
+    /// was conversation rather than work (0.37.0).
+    ///
+    /// `false` by default, which is what keeps every one-shot entry point exactly
+    /// as it was: `run_with` and `run_with_observed` drive the loop with
+    /// `TurnExtras::default()`, so no classification code is reachable from them.
+    pub classify: bool,
 }
+
+/// A session turn that answered rather than ran, as `runs.turn_kind` spells it.
+pub(crate) const TURN_KIND_REPLY: &str = "reply";
+
+/// A session turn that reached for a tool, as `runs.turn_kind` spells it.
+pub(crate) const TURN_KIND_RUN: &str = "run";
 
 /// [`run_with_observed`] with the session layer's extras. Crate-internal: the
 /// public surface gains named session methods, not a seventh parameter on the
@@ -3823,6 +3836,26 @@ async fn run_workspace_from<P: Provider>(
         true => format!("{base_system}{}", planning_directive(&contract.agents)),
         false => base_system.clone(),
     };
+    // 0.37.0 — the prompt the first completion of a conversational turn is made
+    // with, and only the first. Today's prompt tells the agent it is executing a
+    // task, which is why a diligent model reaches for a tool to answer a question
+    // about itself; a turn that is allowed to answer has to be allowed to say so.
+    // Built with the same wrappers `base_system` is, planning directive included,
+    // so a classifying turn under a plan gate is still told about the gate.
+    //
+    // Every later step of a promoted turn uses `system`, unchanged from 0.36.1:
+    // permitting an answer is a decision about the turn's opening, not a licence
+    // to stop at a plan in prose on step nine.
+    let conversational = extras.classify.then(|| {
+        let base = with_skill_catalog(
+            with_extra_tools(conversational_system_prompt(), &extra),
+            skills,
+        );
+        match planning {
+            true => format!("{base}{}", planning_directive(&contract.agents)),
+            false => base,
+        }
+    });
     let mut tools = workspace_tools();
     tools.extend(extra);
     // Offered only while the phase is on, and withdrawn the moment it ends: a tool
@@ -3899,6 +3932,16 @@ async fn run_workspace_from<P: Provider>(
     // of the conversation: the model that wants it again asks again, and the
     // request stays bounded by what one step actually needed.
     let pending_media = &mut PendingMedia::default();
+    // 0.37.0 — a turn that may answer is typed as a reply before its first
+    // completion is billed, and corrected to a run the moment that completion
+    // reaches for a tool. Written in this order rather than at the close, so a
+    // process killed mid-answer leaves a row that says what it was doing:
+    // `Store::check_resumable` refuses it as work to continue, because there is no
+    // committed step to continue from and re-asking replaces the one completion at
+    // the same price.
+    if extras.classify {
+        store.set_turn_kind(run_id, TURN_KIND_REPLY)?;
+    }
 
     for step in start_step..=contract.max_steps {
         // The store's copy of each live handle's processes, refreshed each step.
@@ -4014,7 +4057,14 @@ async fn run_workspace_from<P: Provider>(
         let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
         #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
-            system: system.clone(),
+            // 0.37.0 — the conversational prompt is this turn's opening only. Every
+            // later step is the loop of 0.36.1, asked the way it has always been
+            // asked: permitting an answer is a decision about a turn's first
+            // completion, not a licence to stop at a plan in prose on step nine.
+            system: match &conversational {
+                Some(c) if step == start_step => c.clone(),
+                _ => system.clone(),
+            },
             user: user.clone(),
             tools: tools.clone(),
             // 0.22.0 — the run's web declaration, unchanged per step.
@@ -4127,6 +4177,58 @@ async fn run_workspace_from<P: Provider>(
             ));
             decisions.push("no tool call".into());
         }
+
+        // 0.37.0 — the turn's own first completion decides what the turn was, and
+        // it decides for free: this is the completion the loop was going to make
+        // anyway, read rather than assumed.
+        //
+        // Stopped on text with nothing to do → the turn is an answer, and it ends
+        // here, before anything that would report work having happened. Carrying a
+        // tool call → the turn is work, the row is corrected, and the loop carries
+        // on **from this same completion**, so the run's first step is the call
+        // that was already paid for and nothing is asked twice.
+        //
+        // Only the first completion. A later one that stops on text is the loop
+        // finishing a run, which is what it has always been and is left alone
+        // below.
+        if extras.classify && step == start_step {
+            // `finished` and not `tool_calls.is_empty()`: a provider that paused a
+            // long server-side search hands back text with no call, which is a
+            // continuation and not an ending. Reading it as an answer would stop an
+            // unverified turn in the middle of the search it was told to make. It
+            // also carries the `Verification::None` half, which is the same
+            // condition `Session` classifies on.
+            if !finished(contract, &response) {
+                store.set_turn_kind(run_id, TURN_KIND_RUN)?;
+            } else {
+                // A reply is billed like everything else and is bounded by the same
+                // ceiling. Checked before the answer is served, so a turn whose one
+                // completion has already spent the budget is refused rather than
+                // served free — the same order the loop applies it in below.
+                if let Some(max) = contract.max_tokens {
+                    if tokens_used > max {
+                        finish(store, watch, run_id, 0, 0, "cost_budget_exceeded")?;
+                        return Ok(RunResult::new(
+                            RunOutcome::CostBudgetExceeded { steps: 0 },
+                            run_id,
+                        )
+                        .with_remembered(remembered));
+                    }
+                }
+                // What the model said is made durable, and nothing else is: no
+                // `steps` row, no gate attempt, no checkpoint, no snapshot, no
+                // spawn and no deferred approval. The observation is how `Session`
+                // reads the reply back — the same `(no tool call)` marker every
+                // turn's closing message is read through — so a reply needs no
+                // second channel out of this loop.
+                persist_ledger(store, run_id, &ledger, written)?;
+                info!(run_id, "turn answered without opening a run");
+                finish(store, watch, run_id, 0, 0, "finished")?;
+                return Ok(RunResult::new(RunOutcome::Finished { steps: 0 }, run_id)
+                    .with_remembered(remembered));
+            }
+        }
+
         let mut paused: Option<i64> = None;
         // 0.21.0 — the other reason a step can stop short: a question nobody here
         // would answer. Kept separate from `paused` so the two pauses cannot be
@@ -9702,13 +9804,42 @@ fn write_file_tool() -> ToolSpec {
 }
 
 fn workspace_system_prompt() -> String {
-    "You are an agent working across a repository to meet a stated specification. \
-     Use `grep` to search file contents and `find` to locate files by name, then \
-     `read_file` to inspect a file before changing it, and `write_file` with the \
-     file's path and full new contents to edit it. You may edit several files. \
-     Work in small steps; after each of your steps the whole set is checked \
-     against the success criterion. Do not explain; call tools."
-        .to_string()
+    format!("{WORKSPACE_PROMPT} Do not explain; call tools.")
+}
+
+/// What the agent is and what its tools are, without the sentence that says how a
+/// turn must end.
+///
+/// Split out in 0.37.0 so the conversational opening below can say something else
+/// about the ending while describing the same agent and the same tools. The two
+/// prompts must not drift into describing two different worlds.
+const WORKSPACE_PROMPT: &str = "You are an agent working across a repository to meet a stated \
+     specification. Use `grep` to search file contents and `find` to locate files by name, then \
+     `read_file` to inspect a file before changing it, and `write_file` with the file's path and \
+     full new contents to edit it. You may edit several files. Work in small steps; after each of \
+     your steps the whole set is checked against the success criterion.";
+
+/// The prompt a conversational turn's **first** completion is made with (0.37.0).
+///
+/// The one sentence that differs is the one about the ending, and it is the whole
+/// release: what the operator said may be work, and it may be conversation, and
+/// the model is the thing best placed to tell them apart. It says so in terms of
+/// what is wanted rather than in terms of a category of message, because a rule
+/// phrased over categories is a word list with better manners — it would work in
+/// one language and answer "hi, the login page is broken" correctly by accident.
+///
+/// The asymmetry is stated to the model as well as to the reader of
+/// `docs/CONTRACT.md`: answering something meant as work costs the operator one
+/// retype, and the instruction leans against it accordingly.
+fn conversational_system_prompt() -> String {
+    format!(
+        "{WORKSPACE_PROMPT} What the operator has said may not be work at all — it may be a \
+         greeting, a question about you or what you can do, or a remark that wants nothing done. \
+         If a plain answer is the whole of what is wanted, write that answer and call no tool. If \
+         any part of it needs the repository read or changed, call a tool and start: do not \
+         describe what you are about to do instead of doing it, and do not promise to act in \
+         prose. When the two readings are both possible, act."
+    )
 }
 
 /// Tell the model about tools the built-in prompt does not enumerate.

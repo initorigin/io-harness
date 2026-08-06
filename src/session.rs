@@ -37,6 +37,7 @@ use crate::policy::Policy;
 use crate::provider::Provider;
 use crate::run::{RunOutcome, TurnExtras, NO_TOOL_CALL};
 use crate::state::{Store, Turn};
+use crate::verify::Verification;
 use crate::TaskContract;
 
 /// A durable conversation over one workspace.
@@ -484,6 +485,18 @@ impl Session {
         let seed = self.seed(store, contract)?;
         extras.seed = &seed;
 
+        // 0.37.0 — may this turn's first completion decide that the turn was
+        // conversation? Only when the caller declared no criterion. A caller who
+        // said how the turn is judged has said it is work, and handing back an
+        // answer instead of running the gate would be answering a different
+        // question. An unbounded turn carries `Verification::None` by
+        // construction, so `turn` and `turn_observed` always classify and
+        // `turn_bounded` classifies exactly when its contract has no gate.
+        //
+        // One place, not five: every entry point reaches the loop through here, so
+        // the rule cannot hold at four of them and lapse at the fifth.
+        extras.classify = matches!(contract.verify, Verification::None);
+
         // The run row and the turn row before the first completion is billed, so a
         // turn whose process dies mid-answer is in the tree with a run id a resume
         // can continue from — the same order `run_with_observed` starts a run in.
@@ -509,11 +522,40 @@ impl Session {
         self.head = Some(turn_id);
         store.set_session_head(self.id, self.head)?;
 
+        // What the loop decided, read from the row it wrote rather than re-derived
+        // here from a step count — the "built from what the run recorded, not from
+        // a second guess" rule 0.32.0 and 0.36.0 both paid for. A run that is not a
+        // classifying turn has no kind recorded and is a run, which is what it has
+        // always been.
+        let kind = match store.turn_kind(result.run_id)?.as_deref() {
+            Some(crate::run::TURN_KIND_REPLY) => TurnKind::Reply,
+            _ => TurnKind::Run,
+        };
+        // Emitted here rather than in the loop because this is the first place that
+        // knows the turn's id: the loop is told a session's bookkeeping, not asked
+        // to read it back. An attached process, a hook and a transcript can now
+        // tell an answer from a run without opening the store.
+        //
+        // Only for a turn that was actually answered. A turn refused at the token
+        // ceiling before its answer was served is a `Reply` that said nothing, and
+        // announcing it as an answer would be reporting a message nobody wrote.
+        if kind == TurnKind::Reply && matches!(result.outcome, RunOutcome::Finished { .. }) {
+            observer.event(&crate::observe::RunEvent::new(
+                result.run_id,
+                0,
+                // The run is the envelope's own id. A second copy in the kind is a
+                // duplicate key once the kind is flattened onto the wire, which is
+                // the constraint `Rewound` records.
+                crate::observe::EventKind::Answered { turn_id },
+            ));
+        }
+
         Ok(TurnResult {
             turn_id,
             run_id: result.run_id,
             outcome: result.outcome,
             reply,
+            kind,
         })
     }
 
@@ -567,6 +609,7 @@ impl Session {
 /// # Ok(()) }
 /// ```
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TurnResult {
     /// This turn's id in the conversation tree.
     pub turn_id: i64,
@@ -578,6 +621,71 @@ pub struct TurnResult {
     /// turn that stopped on a ceiling, a refusal or an interrupt mid-work — there
     /// was no closing message, and inventing one would misreport the ending.
     pub reply: Option<String>,
+    /// Whether this turn was answered or run (0.37.0).
+    ///
+    /// Branch on this rather than inferring it from a step count: a run that was
+    /// refused at its first step also has no steps, and the two are not the same
+    /// thing at all.
+    ///
+    /// ```no_run
+    /// use io_harness::{ApproveAll, OpenRouter, Policy, Session, Store, TurnKind};
+    ///
+    /// # async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+    /// let mut session = Session::open(store, "/repo")?;
+    /// let turn = session.turn("hi", &OpenRouter::from_env()?, store, policy, &ApproveAll).await?;
+    ///
+    /// match turn.kind {
+    ///     // Nothing was staged: no step, no gate, no checkpoint. Print it and wait
+    ///     // for the next thing the operator says.
+    ///     TurnKind::Reply => println!("{}", turn.reply.unwrap_or_default()),
+    ///     // A run happened, and everything the crate offers about a run applies.
+    ///     _ => println!("{:?} after a real run", turn.outcome),
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub kind: TurnKind,
+}
+
+/// What a turn turned out to be: conversation, or work (0.37.0).
+///
+/// Decided by the turn's own first completion, at no extra cost — the completion
+/// the loop was going to make anyway is read rather than assumed. A completion
+/// that stops on text is a [`Reply`](TurnKind::Reply); one carrying a tool call is
+/// a [`Run`](TurnKind::Run), and the loop continues from that same completion, so
+/// neither shape pays for a second call.
+///
+/// There is no list of greetings behind this, in this crate or in the program
+/// embedding it. A list is a list in one language, matches `hi` and not `namaste`,
+/// and answers `hi, the login page is broken` correctly only by accident.
+///
+/// ```
+/// use io_harness::TurnKind;
+///
+/// // Two states and one meaning each: did this turn stage work, or answer?
+/// assert_ne!(TurnKind::Reply, TurnKind::Run);
+///
+/// // `#[non_exhaustive]`, so match with a wildcard — a later release may record
+/// // *why* a turn was classified as it was without breaking this.
+/// let describe = |kind: TurnKind| match kind {
+///     TurnKind::Reply => "answered",
+///     _ => "ran",
+/// };
+/// assert_eq!(describe(TurnKind::Reply), "answered");
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TurnKind {
+    /// The turn was answered. One completion was made, billed and recorded, and
+    /// nothing was staged: no step, no gate attempt, no checkpoint, no snapshot,
+    /// no plan gate and no call to the [`Approver`].
+    ///
+    /// Also what a turn reports when its one completion crossed the token ceiling
+    /// and was refused rather than served: no run was opened either way, and
+    /// `outcome` is what says how it ended.
+    Reply,
+    /// The turn was work: the first completion reached for a tool and the loop ran
+    /// from there. Everything the crate offers about a run applies, unchanged.
+    Run,
 }
 
 /// The tree bookkeeping one turn needs, handed to the run loop so the turn row is

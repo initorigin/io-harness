@@ -752,6 +752,54 @@ pub enum EventKind {
         /// How many queued children were dropped.
         queued: u32,
     },
+    /// A conversational turn was answered rather than run (0.37.0).
+    ///
+    /// Emitted by [`Session`](crate::Session) when a turn's own first completion
+    /// stopped on text: one completion was made, billed and recorded, and nothing
+    /// was staged — no step, no gate attempt, no checkpoint, no snapshot, no plan
+    /// gate and no call to the [`Approver`](crate::Approver). An attached process,
+    /// a hook and a transcript can tell an answer from a run without opening the
+    /// store.
+    ///
+    /// Emitted once, before [`Finished`](EventKind::Finished), and never for a
+    /// [`run_with`](crate::run_with) — a one-shot contract is work by declaration
+    /// and is never classified.
+    ///
+    /// Which run served the turn is the envelope's own `run_id`. A second copy
+    /// here does not survive the wire at all: the kind is flattened into the
+    /// envelope, so a `run_id` field is a duplicate key and serde refuses it — the
+    /// same constraint [`Rewound`](EventKind::Rewound) records, caught by
+    /// `every_variant_round_trips` rather than in production.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    /// use std::sync::atomic::{AtomicI64, Ordering};
+    ///
+    /// /// Counts what a conversation cost in runs rather than in turns.
+    /// #[derive(Default)]
+    /// struct Answered(AtomicI64);
+    ///
+    /// impl Observer for Answered {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::Answered { turn_id } = &event.kind {
+    ///             // No run was opened for this one; `event.run_id` is the run row
+    ///             // that records what the single completion cost.
+    ///             println!("turn {turn_id} answered under run {}", event.run_id);
+    ///             self.0.fetch_add(1, Ordering::Relaxed);
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let seen = Answered::default();
+    /// seen.event(&RunEvent::new(7, 0, EventKind::Answered { turn_id: 3 }));
+    /// assert_eq!(seen.0.load(Ordering::Relaxed), 1);
+    /// ```
+    Answered {
+        /// The turn that was answered, in the session's tree — the handle
+        /// [`Session::branch_from`](crate::Session::branch_from) takes.
+        turn_id: i64,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -817,6 +865,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "plugin_loaded",
     "plugin_dropped",
     "rewound",
+    "answered",
     "finished",
 ];
 
@@ -1342,6 +1391,7 @@ mod tests {
                 memory: 1,
                 queued: 0,
             },
+            EventKind::Answered { turn_id: 3 },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -1452,6 +1502,8 @@ mod tests {
                 | EventKind::PluginDropped { .. }
                 // 0.36.0 — a whole run put back.
                 | EventKind::Rewound { .. }
+                // 0.37.0 — a turn answered instead of run.
+                | EventKind::Answered { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

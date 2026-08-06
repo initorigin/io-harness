@@ -192,6 +192,13 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // asserts on paper.
     "gate_attempts",
     "gate_attempts_run",
+    // 0.37.0 — the index a reply's token read rests on. A turn that answered has
+    // no `steps` row, so its spend is summed from `provider_calls`, and that sum
+    // is an index seek rather than a scan of every attempt in the file. An index
+    // added over a table that already existed: a 0.29.0 binary opens a store
+    // carrying it and never names it, which `tests/cross_version_0_29_0.rs`
+    // executes rather than asserts on paper.
+    "provider_calls_run",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].
@@ -219,8 +226,14 @@ fn is_added_since_0_22_0(stmt: &str) -> bool {
 /// permitted "some columns were added to `memory`" would absorb the next column
 /// somebody adds without a word about it, and absorbing the next one is exactly
 /// what these tests exist to prevent.
-const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] =
-    &[("memory", &["kind TEXT", "pinned INTEGER"])];
+/// 0.37.0 adds the second: `runs` gains `turn_kind`, naming what a session turn
+/// turned out to be. Nullable, unread by every binary before it, and — like
+/// `memory`'s two — an addition the 0.29.0 generator's own database is made to
+/// prove rather than an alteration asserted on paper.
+const COLUMNS_ADDED_SINCE_0_22_0: &[(&str, &[&str])] = &[
+    ("memory", &["kind TEXT", "pinned INTEGER"]),
+    ("runs", &["turn_kind TEXT"]),
+];
 
 /// Whether `new` is `old` with exactly the declared columns added, and nothing
 /// else changed.
