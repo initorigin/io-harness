@@ -10,7 +10,7 @@ tasks:
     This is the release. Anthropic orders a request's cacheable prefix tools-then-system, so this
     single marker is what makes the tool schemas and the instructions stop being re-billed on every
     call. Without it there is nothing to measure in F4 and nothing to price in F5.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -26,7 +26,31 @@ tasks:
     is two `serde_json` objects built where the body is already built.
   files:
   - src/provider/anthropic.rs
-  evidence: []
+  evidence:
+  - >
+    F1, written before the implementation and watched fail: `cargo test --lib
+    provider::anthropic::tests::body_` on the unmodified body panicked at
+    `src/provider/anthropic.rs:737` with "a system block array" — `body["system"]` was still the bare
+    string 0.37.0 sent, so there was nothing for a breakpoint to hang off. That failure is the
+    sabotage for this criterion: the marker removed is exactly the tree the test ran against.
+  - >
+    F1 after the implementation: `cargo test --lib provider::anthropic` — **19 passed, 0 failed**.
+    `body_marks_one_cache_breakpoint_at_the_end_of_system` asserts the system array has length 1, the
+    block's `type` is `text`, its `text` is the request's own string unaltered, its
+    `cache_control.type` is `ephemeral`, that **no** entry of `tools` carries a `cache_control`, and
+    that the whole serialised body contains the string `cache_control` exactly **once**. The last
+    assertion is what fails a marker sprayed across every block the wire would accept.
+  - >
+    F1, the neighbours that had to keep passing and did:
+    `no_declaration_sends_the_0_21_0_body`, `no_effort_leaves_the_anthropic_body_exactly_as_it_was`,
+    `the_effort_tier_becomes_a_thinking_budget_below_max_tokens` and the two web-tool body tests are
+    all green, so the 0.22.0 and 0.31.0 body keys are untouched by this change.
+    `body_maps_tools_to_input_schema_and_system_top_level` was updated in the same commit to read the
+    block array — an in-crate test edit, not a public change.
+  - >
+    N1, no new dependency: `cargo tree` reads **402** lines on this tree, unchanged, and
+    `cargo tree --all-features` reads 829. `Cargo.toml` was not touched by this task. The marker is
+    two `serde_json` objects built inside the `json!` literal that already builds the body.
 
 - id: US-IO-HARNESS-0.38.0-T02
   summary: >
