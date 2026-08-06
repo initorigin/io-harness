@@ -264,7 +264,7 @@ tasks:
     one-call write premium, and the counter OpenRouter does not report — is invisible in the API and
     discoverable only in an invoice. A release that changes what an operator is billed and does not
     say so in `docs/CONTRACT.md` has hidden its own cost.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.38.0-T03
   acceptance_criteria:
@@ -289,7 +289,39 @@ tasks:
   - CHANGELOG.md
   - README.md
   - Cargo.toml
-  evidence: []
+  evidence:
+  - >
+    N3, written where a reader finds it: `docs/CONTRACT.md` gains "What prompt caching asks for, and
+    what it cannot promise (0.38.0)" — a per-provider table of what is sent and why, then six
+    statements: that this crate declares a cache and does not operate one; that a prefix below the
+    vendor's minimum is silently not cached and the marker inert; that a miss is invisible because
+    expiry is the vendor's clock and `cache_read_tokens` is the only observable; that a prefix used
+    exactly once costs about a quarter more, with the break-even derived from the crate's own price
+    shape (1.25 + 0.1 against 2.0, so from the second use); that a run cached through OpenRouter
+    under-reports its cost; and that the transcript is deliberately unmarked, with the assembler
+    argument stated rather than summarised.
+  - >
+    N4 in both places it was owed: the `docs/CONTRACT.md` section states the OpenRouter cache-write
+    gap **with the measured figure** — zero on all four live calls, including the one that wrote the
+    entry — and says plainly that the crate does not infer the write from the prompt length. The
+    same fact carries into the record's `known_limitations`.
+  - >
+    N3, the operator-facing half: `docs/guide/providers.md` gains "Not paying twice for the same
+    instructions (0.38.0)" with a worked snippet, the four-row per-provider table, and the three
+    things worth knowing before reading an invoice. Guides are not compiled as doctests in this
+    crate (no `include_str!` of `docs/guide/` in `src/lib.rs`), so the snippet is illustrative — and
+    for that reason its two assertions were replaced with prints, since asserting a cache hit would
+    be asserting the vendor's clock.
+  - >
+    The release's own paperwork: `CHANGELOG.md` gains the 0.38.0 section, stating the saving and the
+    one-call surcharge with equal weight, and carrying **no** `*Migration:*` note because nothing
+    breaks. `Cargo.toml` is at `0.38.0` and `README.md`'s install snippet at `io-harness = "0.38"` —
+    the snippet that sat stale at `0.25` for eleven releases until 0.36.1 put a checker on it.
+  - >
+    Gates run after the edits: `cargo test --test docs_drift --test changelog --test public_api` —
+    **5, 15 and 9 passed, 0 failed**. `public_api` passing on an untouched `docs/public-api.txt` is
+    the zero-break assertion, and `changelog` passing confirms no entry is marked breaking without a
+    migration note.
 
 - id: US-IO-HARNESS-0.38.0-T06
   summary: >
