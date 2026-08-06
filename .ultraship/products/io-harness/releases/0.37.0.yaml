@@ -597,6 +597,19 @@ known_limitations:
   so nothing else needed it; if a later release makes a promoted turn distinguishable in the trace
   (an open question below), that is where it will be read.
 - >
+  **A pre-existing test flaked once on the release branch and is recorded rather than waved
+  through.** `worktree::two_concurrent_children_with_their_own_worktrees_do_not_collide` — a
+  0.36.0 test, untouched by this release — failed once on `test (macos-latest, default)` in run
+  31064349963, finding **one** worktree where it expects two. That run's source is byte-identical
+  to run 31063716477, where the same job passed: the only diff between the two commits is nine
+  files under `.ultraship/`. It passed on re-run of the same job, and 8 of 8 locally (3 full
+  `--test worktree` runs plus 5 of the single test). So it is a flake and not a regression, and it
+  is not this release's. What it most likely indicates is real and belongs to 0.36.0's feature:
+  two children running `git worktree add` concurrently in one repository contend for the index
+  lock, and the loser's spawn fails rather than sharing the parent tree — which is the behaviour
+  0.36.0 chose, seen from the outside as a missing worktree. Nobody has confirmed that cause. It
+  is written here so the next person who sees it starts from evidence rather than from scratch.
+- >
   Every `known_limitations` entry in `docs/CONTRACT.md` that predates this release was left standing.
   None was deleted on the strength of a release having probably fixed it.
 
