@@ -1,0 +1,51 @@
+product: io-harness
+version: 0.38.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: high
+  reasons:
+    - >
+      The recorded constraint that decides the assessment is the standing "no new runtime
+      dependency" limit — `cargo tree` reads 402 lines and a new dependency is a criterion failure
+      rather than a trade-off. This release cannot violate it by construction: the marker is two
+      `serde_json` objects built where the body is already built, and `Cargo.toml` receives only the
+      version bump.
+    - >
+      The second recorded constraint, "a break is a minor bump and every version stays 0.x", is not
+      even exercised: this release plans zero breaks. `docs/public-api.txt` being byte-identical is
+      the assertion, and it is checkable before any code is written.
+    - >
+      The change has an exact precedent in the same two files. `web_key` (0.22.0) and `effort_key`
+      (0.31.0) at `src/provider/openai_wire.rs:55` and `:61` are per-vendor body differences
+      resolved inside the shared builder and absent when they do not apply. The caching marker is
+      the third of that shape, and the body tests that pin those two keys are the template for F1,
+      F2 and F3.
+    - >
+      Three of the six acceptance criteria are deterministic body tests over JSON values, and a
+      fourth (F6) asserts that four checked-in artefacts did not change. Those four can fail only in
+      ways a local `cargo test` sees, which is what makes the assessment `high` rather than
+      `probable`.
+    - >
+      The store is untouched. No table, no column, no index, `CHECKPOINT_FORMAT` unmoved and
+      `ADDED_SINCE_0_22_0` unchanged — so the cross-version job, which has been the most expensive
+      part of the last four releases, has nothing new to be fed.
+  major_cost_drivers:
+    - >
+      The live arm, F4 and F5, is the only genuinely uncertain part. What a vendor requires for a
+      prefix to be cacheable — the minimum length, where a breakpoint may sit, how the OpenRouter
+      translation treats a marker on a system part — is knowable only by making real calls and
+      reading the counters back. Expect at least one round where the marker is emitted, accepted,
+      and produces zero cached tokens because the prefix was too short. This is the reason
+      `uncertainty` on the contract is `medium` while fit is `high`: the crate-side work is
+      predictable, the wire is not.
+    - >
+      The suppressed-marker control in F4 has to be real. Without it, a live pair run against a
+      model whose vendor caches automatically would report cached tokens that owe nothing to this
+      release, and the release would look proven while shipping nothing.
+    - >
+      OpenRouter is the only provider in this checkout with working credentials, so the live
+      evidence has exactly one route. If it declines to honour the marker on the model it selects,
+      the evidence has to be re-aimed at another model rather than reinterpreted.
+  recommended_scope_change: null
