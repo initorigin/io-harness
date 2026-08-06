@@ -141,7 +141,28 @@ impl Anthropic {
             "model": request.model.as_deref().unwrap_or(&self.model),
             "max_tokens": MAX_TOKENS,
             "stream": true,
-            "system": request.system,
+            // 0.38.0 — the one cache breakpoint. Anthropic orders a request's
+            // cacheable prefix tools-then-system, so a marker at the end of
+            // `system` covers the tool schemas *and* the instructions — the block
+            // this crate re-sends identically on every step of a run and every turn
+            // of a session. A second marker on the last tool would buy a cache
+            // entry that can never outlive this one, since a changed tool list
+            // invalidates everything after it in that same ordering.
+            //
+            // `system` therefore becomes a content-block array rather than the bare
+            // string it was through 0.37.0; the text it carries is unchanged.
+            //
+            // The cost, stated because it is real: a prefix used exactly once is
+            // billed at the cache-write premium instead of the input rate. It pays
+            // for itself from the second use — see `docs/CONTRACT.md`, and
+            // `Price::cache_read`/`cache_write` in `src/pricing.rs` for the rates the
+            // break-even is computed from. A prefix under the vendor's minimum
+            // cacheable length is silently not cached and this marker is inert.
+            "system": [{
+                "type": "text",
+                "text": request.system,
+                "cache_control": { "type": "ephemeral" },
+            }],
             "messages": [
                 { "role": "user", "content": Self::user_content(request) },
             ],
@@ -692,11 +713,72 @@ mod tests {
             ..Default::default()
         };
         let b = a.body(&req);
-        assert_eq!(b["system"], "sys");
+        // 0.38.0 — `system` is a content-block array rather than a bare string, so
+        // the cache breakpoint has something to hang off. The text is unchanged.
+        assert_eq!(b["system"][0]["type"], "text");
+        assert_eq!(b["system"][0]["text"], "sys");
         assert_eq!(b["messages"][0]["content"], "hi");
         assert_eq!(b["tools"][0]["name"], "write_file");
         assert_eq!(b["tools"][0]["input_schema"], json!({"type":"object"}));
         assert!(b["max_tokens"].is_u64());
+    }
+
+    /// F1 — exactly one cache breakpoint, at the end of `system`.
+    ///
+    /// Anthropic orders a request's cacheable prefix tools-then-system, so one
+    /// marker after `system` covers the tool schemas *and* the instructions. The
+    /// count assertion is the load-bearing one: it fails the implementation that
+    /// marks nothing and the one that marks everything it can reach.
+    #[test]
+    fn body_marks_one_cache_breakpoint_at_the_end_of_system() {
+        let a = Anthropic::new("k", "claude-x");
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let req = CompletionRequest {
+            system: "you are a careful agent".into(),
+            user: "hi".into(),
+            tools: vec![
+                ToolSpec {
+                    name: "read_file".into(),
+                    description: "r".into(),
+                    parameters: json!({"type":"object"}),
+                },
+                ToolSpec {
+                    name: "write_file".into(),
+                    description: "w".into(),
+                    parameters: json!({"type":"object"}),
+                },
+            ],
+            ..Default::default()
+        };
+        let b = a.body(&req);
+
+        // The breakpoint is on the one system block, and the text it carries is
+        // the request's own, unaltered.
+        assert_eq!(
+            b["system"].as_array().expect("a system block array").len(),
+            1
+        );
+        assert_eq!(b["system"][0]["type"], "text");
+        assert_eq!(b["system"][0]["text"], "you are a careful agent");
+        assert_eq!(b["system"][0]["cache_control"]["type"], "ephemeral");
+
+        // Not on the tools. A second breakpoint there could never outlive the one
+        // after it, because a changed tool list invalidates everything downstream
+        // of it in Anthropic's ordering.
+        for tool in b["tools"].as_array().expect("a tools array") {
+            assert!(
+                tool.get("cache_control").is_none(),
+                "a tool carried a breakpoint: {tool}"
+            );
+        }
+
+        // One, in the whole body. This is what fails a marker sprayed across every
+        // block the wire would accept it on.
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            1,
+            "exactly one breakpoint in the body, got {b}"
+        );
     }
 
     #[test]

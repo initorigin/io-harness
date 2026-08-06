@@ -26,6 +26,79 @@ notes are produced from it.
 
 ### Security
 
+## [0.38.0] - 2026-08-06
+
+A long conversation stops paying full price for the part of itself that never
+changes.
+
+Every completion this crate makes carries the same block ahead of anything new:
+the system instructions, the skill catalogue folded into them, and the JSON schema
+of every tool on offer. It is built once per turn and handed to every step of the
+loop, so a twenty-step run sent it twenty times and a fifty-turn session sent it
+fifty times — and paid full price each time. The vendors have offered to serve a
+repeated prefix from their own cache for years, this crate has read the counters
+back since 0.18.0 and priced them since the same release, and it had never asked.
+`Usage::cache_read_tokens` was structurally zero.
+
+**It asks now.** The Anthropic request marks the end of its `system` block as a
+cache breakpoint. That wire orders a request's cacheable prefix tools-then-system,
+so the one marker covers the tool schemas *and* the instructions. The OpenRouter
+request carries the same marker in the shape that wire spells it.
+
+**Measured, not asserted.** Two consecutive calls over an identical system block
+through OpenRouter against `anthropic/claude-haiku-4.5`: the second read **7,408
+of its 7,421 prompt tokens** from the vendor's cache. The control — the same
+endpoint and the same model reached through `Compatible`, which sends no marker —
+read none on either call.
+
+**Nothing else moved.** No public item is added, removed or altered, no table is
+created or migrated, `CHECKPOINT_FORMAT` is unchanged, and `docs/public-api.txt`
+is byte-identical to 0.37.0's. Upgrading changes no code.
+
+**OpenAI and `Compatible` send nothing, deliberately.** OpenAI caches a repeated
+prefix by itself with no request-side control, and that path also serves the 21
+endpoints reached through `Compatible`, where an unknown body key would be a 400
+this crate had caused. Their request bodies are byte-identical to the ones 0.37.0
+sent.
+
+**The honest cost, stated as loudly as the saving.** A cache write is billed above
+a fresh read and a cache read far below one, so the block pays for itself from its
+*second* use — a prefix used exactly once now costs about a quarter more than it
+did. A prefix below the vendor's minimum cacheable length is silently not cached
+and the marker does nothing. And OpenRouter reports no cache-write counter, so a
+run cached through it under-reports what the writing call cost. All three are in
+`docs/CONTRACT.md` rather than left to an invoice.
+
+**What is deliberately not cached: the transcript.** The context assembler
+supersedes, invalidates, re-reads and re-fits earlier observations on every turn,
+so it is not a byte-stable prefix — and a breakpoint that misses is billed as a
+write, which would cost money rather than save it. Making the assembler
+prefix-stable is a larger change than this release.
+
+### Added
+
+### Changed
+
+- Requests to `Anthropic` now send `system` as a one-element content-block array
+  carrying `cache_control: {"type": "ephemeral"}`, rather than as a bare string.
+  The instruction text itself is unchanged, and no marker is placed on the `tools`
+  array — a changed tool list already invalidates everything after it in that
+  vendor's ordering.
+- Requests to `OpenRouter` now send the system message's `content` as a
+  one-element parts array carrying the same `cache_control` object.
+- The first call of a run against those two vendors is billed at the cache-write
+  rate for that block rather than the input rate; from the second call it is
+  billed at the cache-read rate. This is a change to what an operator is charged,
+  not to any API.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.37.0] - 2026-08-06
 
 A conversation answers without opening a run.
