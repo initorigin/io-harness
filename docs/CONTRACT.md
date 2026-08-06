@@ -706,6 +706,64 @@ application that wants a broken bundle to be fatal writes one `if` — see
 **`version` in a manifest is documentation.** Nothing resolves it, compares two
 bundles, orders their loading, or checks one against the crate.
 
+## When a turn is answered instead of run, and what that costs (0.37.0)
+
+A **session turn** may close without opening a run. Its own first completion
+decides: stopped on text with no tool call, the turn is a `TurnKind::Reply`;
+carrying a tool call, it is a `TurnKind::Run` and the loop continues from that
+same completion. The decision is the model's, made inside the completion the loop
+was going to make anyway.
+
+**Only the first completion of a turn can be a reply.** A run whose fifth step
+stops on text is a run that finished, which is what it has always been. Nothing
+about the loop's ending changed.
+
+**A completion carrying both prose and a tool call is work.** The call decides.
+Stated here rather than left to be discovered, because the opposite reading —
+prose present, therefore an answer — would swallow the work silently.
+
+**A model that answers in prose where it should have acted costs the operator one
+retype.** This is the asymmetry the design accepts by choice, and it is a real
+cost rather than a theoretical one: "I'll fix that for you", with no tool call,
+closes the turn having done nothing. It is a retype and not a silence — the reply
+is on screen — and the alternative asymmetry is worse: running something meant as
+a greeting plans it, gates it, checkpoints it and bills it.
+
+**The system prompt for a turn's first completion changed**, and it changed for
+*every* session turn rather than only for greetings. It says the operator's
+message may not be work at all, that a plain answer should be written where a
+plain answer is the whole of what is wanted, and that where both readings are
+possible the agent should act. Every later step of a promoted turn is asked
+exactly as 0.36.1 asked it.
+
+**A reply is billed.** One completion was made and it cost money, so the run row
+is written, `Store::run_summary` reports its tokens, and the per-call accounting
+row carries its model and its latency. The token ceiling is applied before the
+answer is served: a turn that cannot afford its own reply is refused rather than
+served free.
+
+**A reply is not resumable.** There is nothing to resume — a reply is one
+completion, and a process that dies during it loses one completion, which asking
+again replaces at the same price. A turn killed while it was still deciding what
+it was is refused by `Store::check_resumable` rather than offered as work to
+continue. A reply that *finished* is a completed run like any other and a resume
+reports its outcome, unchanged.
+
+**A contract carrying a `Verification` is never a reply.** A caller who declared
+how the turn is judged has said it is work; handing back an answer instead of
+running the gate would be answering a different question. A bounded contract with
+no verification classifies exactly as an unbounded turn does.
+
+**`run_with` and `run_with_observed` never classify.** A one-shot contract is work
+by declaration, and an entry point that sometimes answers instead of running is a
+worse contract than one that always runs.
+
+**There is no word list.** Not in this crate, in any form — no constant, no regex,
+no match over literals, no shipped data file. A list is a list in one language,
+matches `hi` and not `namaste`, and answers `hi, the login page is broken`
+correctly only by accident. If the classification needed a lookup table to work,
+it would not work.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

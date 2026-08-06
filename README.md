@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.36"
+io-harness = "0.37"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -264,6 +264,13 @@ to an observer as the model produces it, a mid-turn steer or an interrupt honour
 at the next step boundary, and a tree an operator can branch from any earlier turn.
 A turn is a run, so every turn is budgeted, policy-bounded, checkpointed and
 resumable — see the [sessions guide](docs/guide/sessions.md).
+
+**And not every turn is work.** A turn's own first completion decides what the
+turn was: stopped on text, it closes as `TurnKind::Reply` with no step, no gate,
+no checkpoint and no plan gate; carrying a tool call, the loop continues from that
+same completion. So `hi` costs one completion and stages nothing, while `hi, the
+login page is broken` runs — decided by the model, at no extra call, with no list
+of greetings anywhere in this crate or in yours.
 
 **Configuration in a file.** `Config::discover(root)` reads one `io.toml` across
 four scopes — the crate's defaults, a user file, a committed project file, and a
