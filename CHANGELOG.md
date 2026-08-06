@@ -121,6 +121,11 @@ it.
 - `Store::spent_tokens` reads a reply's spend from its one `provider_calls` row,
   because a turn that answered has no `steps` row to sum. Every other run is
   summed from its steps exactly as before.
+- `rmcp` moves from 3.0.0 to 3.1.0 and `zip` from 2 to 8. The second is a
+  major-version jump, and it is confined to the optional `documents` feature —
+  `zip` is how a `.docx`, `.xlsx` or `.pptx` is opened. Neither changes anything
+  this crate exposes: no public item moves, `cargo tree` still reads 402 lines,
+  and both feature polarities pass on all three operating systems.
 
 ### Deprecated
 

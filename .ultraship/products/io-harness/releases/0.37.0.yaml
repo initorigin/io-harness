@@ -537,15 +537,30 @@ evidence:
     `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — finished,
     zero warnings, `target/doc/io_harness/index.html` generated.
   - >
-    O3: `cargo clean` (36,766 files, 13.5 GiB removed) then `cargo package --locked` — the packaged
-    crate compiled from `target/package/io-harness-0.37.0`, producing
-    `io-harness-0.37.0.crate` at **1,336,862 bytes**. `df -h .` before and between build steps
-    throughout; the volume never fell below 30 GiB free.
+    O3: `cargo clean` then `cargo package --locked` — the packaged crate compiled from
+    `target/package/io-harness-0.37.0`. On the tree first sealed: **1,336,862 bytes**. On the tree
+    actually shipped, after the two dependency bumps below: **1,336,755 bytes**. `df -h .` before and
+    between build steps throughout; the volume never fell below 24 GiB free.
   reviews: []
   deployments: []
   health_checks: []
 
 known_limitations:
+- >
+  **The tree this release shipped is not the tree this record was first sealed against, and every
+  gate was re-run rather than assumed.** After `feat/0.37.0` merged into `develop`, the owner merged
+  two Dependabot pull requests into `develop` above it: **#114 `rmcp` 3.0.0 to 3.1.0** and **#115
+  `zip` 2.4.2 to 8.6.0**, the second a major-version jump inside the optional `documents` feature.
+  The owner decided on 2026-08-06 that 0.37.0 ships with both, on the condition that the whole gate
+  set is re-run first. It was, on `develop` at 79b47ca: `cargo fmt --check` clean;
+  `cargo clippy --all-targets --all-features -- -D warnings` clean; `cargo test --all-features`
+  exit 0 with **63 suites and 1435 passed**, identical to before; `cargo test` exit 0 with **63
+  suites and 1356 passed**, identical to before; `cargo test --test cross_version_0_29_0 --
+  --ignored` 1 passed; the nightly `docs.rs` command clean; `cargo tree` still **402**; and
+  `cargo clean && cargo package --locked` producing 1,336,755 bytes. Nothing this release claims
+  changed. What did change is that the record was amended and re-pinned after being sealed once,
+  which is only legitimate before the merge into `main` — it had not happened, and the amendment
+  preceded it.
 - >
   **This record was sealed before the crates.io upload.** The publish follows the develop-to-main
   merge and the GitHub Release, by hand, and is always last.
