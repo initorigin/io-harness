@@ -1,0 +1,96 @@
+id: US-IO-HARNESS-0.41.0-I01
+timestamp: 2026-08-06T00:00:00Z
+category:
+  - portfolio-level
+  - release-level
+trigger: >
+  The observation surface tells an embedder that a tool ran and never what it returned, and it
+  reports an edit as two integers rather than as the change that was made. Both are visible from
+  outside the crate, both are consumed today by io-cli — which pins `io-harness = "0.36"` and draws
+  a transcript that cannot state what a tool found or show a hunk — and neither can be closed by the
+  program embedding the crate, because the information it would need is read inside the loop and
+  discarded there. The roadmap ends at 0.40.0 with nothing that addresses either.
+evidence:
+  - >
+    `src/observe.rs:317` — `EventKind::ToolCall { name, target }`, documented in the line above as
+    "A tool was invoked, before its result is known." The variant carries the tool's name and its
+    target and nothing about the outcome, so an observer learns that a search ran and not whether it
+    matched, that a command executed and not what it printed or whether it failed.
+  - >
+    `src/observe.rs:290` — `EventKind` is `#[non_exhaustive]`. A **new** variant, such as
+    `ToolResult`, is therefore backward compatible for every downstream match. Adding a field to the
+    existing `ToolCall` variant is not, which is what makes the shape of this release a new event
+    rather than a widened one.
+  - >
+    `src/state.rs:2293` — `pub struct Edit { step, tool, path, lines_added, lines_removed }`.
+    `Edit::measure(step, tool, path, old, new)` is handed both the old text and the new text and
+    keeps only the two counts. The material a diff hunk would be drawn from is present at the moment
+    the measurement is taken and is dropped there, so no embedder can reconstruct it afterwards.
+  - >
+    Storing what an edit changed is a change to what the store holds for a step, not a change
+    confined to a public type. That is a release-sized unit of work, and it is the reason the two
+    gaps are planned together rather than folded into an existing entry.
+before:
+  scope:
+    - >
+      The roadmap's planned tail is 0.38.0 (prefix caching), 0.39.0 (fan-out inside a conversation)
+      and 0.40.0 (`exec` and `shell` run contained). None of the three touches the observation
+      surface or the store's record of an edit.
+  assumptions:
+    - >
+      That announcing a tool call is enough observation of a tool. It is enough to draw activity and
+      not enough to draw a result, which is what a transcript in front of an operator has to state.
+    - >
+      That two line counts describe an edit adequately for an embedder. They describe its size and
+      not its content, and the content is available at measurement time.
+  implementation: >
+    `EventKind::ToolCall` at `src/observe.rs:317` emits name and target only; `Edit` at
+    `src/state.rs:2293` persists five fields, of which the two derived from the old and new text are
+    counts.
+change:
+  summary: >
+    A `0.41.0` entry is added to the roadmap, after `0.40.0`, as `detail: outline` /
+    `status: planned`: a tool's result is carried out to observers as its own event, and what an
+    edit changed is kept rather than only how much it changed. Nothing is renumbered and no existing
+    entry is touched — the two gaps are additive to the planned sequence, not a resequencing of it.
+
+    This is a plan, not an implementation. No Rust is written, no contract is specified, and the
+    entry stays at outline detail until the release is planned on its own terms.
+  added:
+    - >
+      Roadmap entry `0.41.0` — a tool's result as a new `EventKind` variant, backward compatible
+      because `EventKind` is `#[non_exhaustive]`, and the content of an edit kept in the store
+      alongside its counts.
+  removed: []
+  deferred:
+    - >
+      Taking either gap into io-cli 0.14.0. io-cli carries the matching consumer-side entry as its
+      own 0.16.0, and cannot draw either surface until this crate exposes it.
+    - >
+      The contract: which fields the result event carries, how much of an edit is stored and under
+      what bound, and the store migration. All of it belongs to planning 0.41.0, not to this record.
+  replaced: []
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.41.0
+  tasks: []
+  dependencies: []
+  resource_effect: >
+    None to any shipped or in-flight release. It adds one planned entry to the end of the roadmap
+    and no work to 0.38.0, 0.39.0 or 0.40.0. The cost it names for later is a new public enum
+    variant, an addition to what the store holds for a step with the migration that implies, and the
+    documentation of both.
+versioning:
+  previous_target: 0.40.0
+  new_target: 0.41.0
+  consequence: minor-bump
+approval:
+  source: user
+  reference: >
+    The owner decided on 2026-08-06, while io-cli 0.14.0's design port was in flight, to defer this
+    rather than take it into that release. It is deferred, not dropped: io-cli carries the matching
+    consumer entry as its own 0.16.0, and this entry is what that consumer entry depends on.
+canonical_updates:
+  - products/io-harness/roadmap.yaml
