@@ -213,7 +213,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time", 
 # The image half only. Already compiled in every build as a transitive
 # dependency of reqwest, so enabling the feature costs a `cargo tree` line and
 # no build time; declaring it optional is what keeps it off the default tree.
-version = "0.22"
+version = "0.23"
 optional = true
 
 [features]
