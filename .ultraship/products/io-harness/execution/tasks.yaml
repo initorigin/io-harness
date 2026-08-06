@@ -134,7 +134,7 @@ tasks:
     criterion that can distinguish a marker that was honoured from one that was accepted and
     ignored, and F5 is the first time the cache branch of `src/pricing.rs` executes against a
     non-zero count — which is the product-level claim this release exists to make true.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.38.0-T02
   acceptance_criteria:
@@ -160,9 +160,65 @@ tasks:
     number.
   files:
   - examples/cache_live.rs
-  - Cargo.toml
   - tests/pricing_cache.rs
-  evidence: []
+  evidence:
+  - >
+    F4, executed live on 2026-08-06 through OpenRouter against
+    `anthropic/claude-haiku-4.5`, with a system block of 34,146 characters
+    (~8,500 estimated tokens) chosen to clear any vendor's minimum cacheable length. The marked arm
+    is `OpenRouter`; the control is `Compatible` pointed at OpenRouter's **own** base URL, which
+    builds with `WebFlavor::OpenAi` and therefore sends no marker — the same endpoint, the same
+    model, the same block, differing in exactly the one key this release adds. Measured, verbatim
+    from the run:
+    marked call 1 `prompt=7420 cache_read=0 cache_write=0 completion=5`;
+    marked call 2 `prompt=7421 cache_read=7408 cache_write=0 completion=5`;
+    control call 1 `prompt=7420 cache_read=0`; control call 2 `prompt=7421 cache_read=0`.
+    The second marked call read **7,408 of its 7,421 prompt tokens** from the vendor's cache and the
+    unmarked control read none — which is the whole discriminating result, since a route that cached
+    without being asked would have shown a non-zero control.
+  - >
+    F4, the model that answered is recorded rather than assumed: every one of the four calls reports
+    `model=anthropic/claude-haiku-4.5` from `CompletionResponse::model`. This matters because
+    `OPENROUTER_MODEL` in this checkout is `openai/gpt-5.6-luna` — an OpenAI-family model, which
+    caches a repeated prefix by itself and would have produced a confident false pass. The example
+    deliberately does not read that variable and defaults to an Anthropic slug.
+  - >
+    F4, a deviation stated rather than glossed: the fixture is `examples/cache_live.rs` with **no**
+    `required-features`. The criterion's wording named one, but the two existing live examples carry
+    `required-features` because they need optional *dependencies* (`documents`, `media`), not
+    because they are live. This example needs none, and inventing a feature to gate it would add a
+    name to the crate's public feature surface in a release whose whole claim is that it adds
+    nothing. It is an example, so no CI job runs it; the substance of the criterion — a live check
+    off the three-OS matrix path, with no wall-clock assertion — is met.
+  - >
+    F4, a blocked first attempt worth recording: the same run against
+    `anthropic/claude-sonnet-4.5` returned HTTP **402** from OpenRouter, refusing the request
+    because the account's remaining credit could not cover that model's default maximum output. The
+    OpenAI wire sends no `max_tokens`, so the vendor applies the model's own. Not a defect in this
+    release, and re-aimed at a cheaper model of the same vendor rather than worked around.
+  - >
+    F5: `cargo test --test pricing_cache` — **3 passed, 0 failed**. The four measured rows are written
+    to a real `Store` through `record_provider_call`, read back through `Store::provider_calls`, and
+    priced through the shipped `PriceTable::cost_micros`. The uncached call costs **22,335**
+    micro-units and the cached one **2,336** — both computed by hand from the stored counts and
+    asserted as exact figures, not as an inequality that any smaller number would satisfy. This is
+    the first time the cache branch of `src/pricing.rs:280` has executed against a non-zero count.
+  - >
+    F5's sabotage, kept as a permanent control rather than run once by hand:
+    `with_no_cache_discount_the_cached_call_is_not_cheaper` prices the identical stored rows against
+    a table whose `cache_read` equals its `input`. The cached call then costs **22,338** against the
+    first call's 22,335 — it stops being cheaper, and the assertion that it is cheaper would fail.
+    That is what proves the first test reads the cache *rate* rather than merely observing fewer
+    fresh tokens.
+  - >
+    N4 measured in the field, not predicted: `cache_write_tokens` came back **zero on all four
+    calls**, including the marked call that must have written the entry the next one read.
+    `openai_wire` sets that field to zero by construction (`src/provider/openai_wire.rs:310`)
+    because the OpenAI wire reports no write counter. `an_unreported_cache_write_is_billed_as_fresh_input`
+    pins the consequence: with the write unreported, those tokens are billed as ordinary fresh
+    input, so a run cached through OpenRouter under-reports the write premium. Carried into
+    `docs/CONTRACT.md` and the record's `known_limitations` under T05, and explicitly **not** closed
+    by inferring the write from the prompt length.
 
 - id: US-IO-HARNESS-0.38.0-T04
   summary: >
