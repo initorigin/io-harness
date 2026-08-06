@@ -821,6 +821,61 @@ billed as a write each time — it would cost money rather than save it. The
 assembler and prefix caching want opposite things; reconciling them is a change to
 the assembler, not an addition here.
 
+## What a contained session turn gives you, and what it does not (0.39.0)
+
+A **session turn may fan out**. `Session::turn_contained` and
+`Session::turn_contained_observed` take a `Containment` and drive the turn through
+the agent-tree loop, so the agent answering it is offered `spawn_agent` and can
+decompose the work into contained children. The five turn entry points that
+predate this are untouched and still never offer the tool: a session that does not
+pass a `Containment` behaves exactly as it did in 0.38.0.
+
+What the fan-out inherits is what `run_tree` has always given a tree — the
+caller's policy narrowed per child through `Policy::contain`, one shared `Ledger`
+no child contract can raise, per-tier concurrency slots with a durable queue, and
+the whole graph reconstructable from `Store::agent_events`. Six things follow that
+a caller should hear plainly.
+
+**The ledger is per turn, not per session.** Each contained turn builds a fresh
+ledger from the `Containment` passed to that call, so turn five gets the ceiling
+turn one got and a conversation's total spend is the sum of its turns'. There is
+no single ceiling across a conversation, and this crate does not offer one — it is
+the same rule as "a session has no aggregate budget" below, applied to the tree.
+
+**A child is given its goal, not the conversation.** The turn's seed — the prior
+turns on the path — reaches the root agent and stops there. A child receives its
+own goal, its own contract and its narrowed policy. Two reasons, and neither is
+effort: forty children each carrying the transcript is the multiplied version of
+the cost `ContextBudget` exists to bound, and a child that has read the
+conversation is one that can act on an instruction the operator has since
+withdrawn. A child's result composes back into its parent's next step, which is
+where the conversation and the fan-out actually meet.
+
+**A child is a run, never a second turn.** `Store::session_turns` returns one row
+for a turn that spawned forty agents, `Session::history` renders one entry, and
+`Store::turn_for_run` on a child's run id returns `None`. The children are runs
+under the turn's run.
+
+**A paused contained turn is resumed with the tree resumes.** A turn that stops
+`AwaitingApproval`, `AwaitingAnswer` or `AwaitingPlan` is continued with
+`resume_tree_with_decision`, `resume_tree_with_answer` or
+`resume_tree_with_plan_decision` on `TurnResult::run_id` — not the flat
+`resume_with_*` family, which does not rebuild the tree. **The turn row reports
+the pause, not the continuation:** it is closed with what the run said when the
+turn returned, so a turn parked on an approval reads `running`, and it still reads
+`running` after a resume the session did not drive. The run itself is the record
+that moves. There is no `Session::resume_turn`.
+
+**Cancellation and interruption are honoured at the root's step boundary**, which
+is the one point at which no child is in flight — children are awaited inside the
+step that spawned them. A `Flow::Cancel` from the observer stops the whole tree
+there, as it does for `run_tree`.
+
+**The worst-case concurrency is `max_concurrent_agents × depth`**, inherited
+unchanged from the per-tier slot design: a parent holds a slot at its own tier and
+waits only on the tier below, which is what makes the wait graph acyclic. A
+contained turn is a tree like any other in this respect.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

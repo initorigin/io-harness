@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.38"
+io-harness = "0.39"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -264,6 +264,13 @@ to an observer as the model produces it, a mid-turn steer or an interrupt honour
 at the next step boundary, and a tree an operator can branch from any earlier turn.
 A turn is a run, so every turn is budgeted, policy-bounded, checkpointed and
 resumable — see the [sessions guide](docs/guide/sessions.md).
+
+**And a conversation can fan out.** `Session::turn_contained` takes a
+`Containment` and lets the agent answering that turn decompose the work into
+contained sub-agents — under the session's own policy, one shared ledger for the
+turn, and the observer the operator is already reading. It stays one turn in the
+conversation whatever it spawned, and the five turn entry points that predate it
+still never offer the spawn tool.
 
 **And not every turn is work.** A turn's own first completion decides what the
 turn was: stopped on text, it closes as `TurnKind::Reply` with no step, no gate,
