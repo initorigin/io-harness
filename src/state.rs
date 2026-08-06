@@ -3362,6 +3362,33 @@ impl Store {
              CREATE INDEX IF NOT EXISTS gate_attempts_run ON gate_attempts (run_id, id);",
         )?;
 
+        // 0.37.0 — what a session turn turned out to be. `'reply'` for a turn whose
+        // first completion answered instead of acting, `'run'` for one that reached
+        // for a tool, and NULL for every run that is not a session turn at all,
+        // which is every run written before this release.
+        //
+        // Written `'reply'` when the run row is created for a turn that is allowed
+        // to answer, and corrected to `'run'` the moment that first completion
+        // carries a tool call. That order is what lets [`Self::check_resumable`]
+        // refuse a turn killed mid-answer: a row still typed `'reply'` and still
+        // `running` has one unfinished completion behind it and no step to adopt,
+        // and re-asking replaces it at the same price.
+        //
+        // Additive, and NOT a `CHECKPOINT_FORMAT` bump: no checkpoint layout
+        // changed, and bumping it would make `check_resumable` refuse every 0.36.x
+        // store over a column an older binary never reads.
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN turn_kind TEXT", []);
+        // The index the reply's token read rests on. A run that answered has no
+        // `steps` row, so its spend is the total on its one `provider_calls` row,
+        // and that read happens on the turn-close path of every reply.
+        //
+        // `finish_reason` is deliberately in **no** index: it is the control column
+        // the query-plan test filters on, for the reason `gate_attempts.detail` is —
+        // a trailing composite column is skip-scanned and is not a control.
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS provider_calls_run ON provider_calls (run_id);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4592,13 +4619,57 @@ impl Store {
 
     /// Total tokens recorded across this run's steps — the durable spend, so a
     /// resume restores the token budget instead of restarting it at zero.
+    ///
+    /// A turn that answered rather than ran (0.37.0) has no `steps` row to sum, so
+    /// its spend is read from the one `provider_calls` row its single completion
+    /// wrote. Branching on `turn_kind` rather than on "this run has no steps": a
+    /// run killed inside its first step also has no step row, and reading its
+    /// attempts as a total would change what every pre-0.37.0 caller was told about
+    /// an interrupted run.
     pub fn spent_tokens(&self, run_id: i64) -> Result<u64> {
         let n: i64 = self.conn.query_row(
-            "SELECT COALESCE(SUM(tokens), 0) FROM steps WHERE run_id = ?1",
+            "SELECT CASE
+                      WHEN (SELECT turn_kind FROM runs WHERE id = ?1) = 'reply'
+                      THEN (SELECT COALESCE(SUM(total_tokens), 0)
+                            FROM provider_calls WHERE run_id = ?1)
+                      ELSE (SELECT COALESCE(SUM(tokens), 0)
+                            FROM steps WHERE run_id = ?1)
+                    END",
             [run_id],
             |r| r.get(0),
         )?;
         Ok(n as u64)
+    }
+
+    /// Type this run as a session turn that answered, or as one that did work.
+    ///
+    /// Called twice at most: once when the run row is created for a turn that is
+    /// allowed to answer, and once more if its first completion reaches for a tool.
+    /// A run that is not a session turn is never typed at all.
+    pub(crate) fn set_turn_kind(&self, run_id: i64, kind: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE runs SET turn_kind = ?1 WHERE id = ?2",
+            (kind, run_id),
+        )?;
+        Ok(())
+    }
+
+    /// What this run turned out to be, for a run that is a session turn.
+    ///
+    /// `None` for every one-shot run and for every run written before 0.37.0 — a
+    /// run that was never a turn has no kind to report, which is not the same as
+    /// having done no work.
+    ///
+    /// `pub(crate)`: what a turn was is reported to a caller as
+    /// [`TurnKind`](crate::TurnKind) on the [`TurnResult`](crate::TurnResult) they
+    /// already hold. A second public reader of the same fact would be a second
+    /// thing to keep true.
+    pub(crate) fn turn_kind(&self, run_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT turn_kind FROM runs WHERE id = ?1", [run_id], |r| {
+                r.get(0)
+            })?)
     }
 
     /// Every run id in the tree rooted at `root` (the root plus all descendants),
@@ -5165,6 +5236,33 @@ impl Store {
         if !exists {
             return Err(Error::Resume {
                 reason: format!("no run with id {run_id} in the store"),
+            });
+        }
+        // 0.37.0 — a conversational turn that was still deciding whether it was
+        // work when the process died. There is nothing to continue: no step was
+        // committed, and what it was doing was one completion, which asking again
+        // replaces at the same price. Offered as resumable work it would be a turn
+        // the operator never sees an answer to and a run that reports having done
+        // something.
+        //
+        // Only while it is still `running`. A reply that finished is a completed
+        // run like any other, and `resume` reports its outcome rather than
+        // re-driving it — the idempotence every finished run has had since 0.7.0.
+        let dead_reply: bool = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM runs
+                 WHERE id = ?1 AND turn_kind = 'reply' AND status = 'running'",
+                [run_id],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if dead_reply {
+            return Err(Error::Resume {
+                reason: format!(
+                    "run {run_id} is a conversational turn that was answering when it stopped; \
+                     it committed no step, so there is nothing to continue — take the turn again"
+                ),
             });
         }
         Ok(())
@@ -6905,6 +7003,74 @@ mod tests {
         // an index — without it, a plan string that said "USING INDEX" for anything
         // would pass the assertion above and prove nothing.
         let scan = plan_for("SELECT COUNT(*) FROM plans WHERE steps = 'x'");
+        assert!(
+            !scan.contains("USING INDEX"),
+            "the check cannot tell an index from a scan: {scan}"
+        );
+    }
+
+    /// 0.37.0 N6. Every turn that answers closes through [`Store::spent_tokens`],
+    /// and for a reply that read is a sum over `provider_calls` rather than over
+    /// `steps`. `provider_calls` grows with every attempt of every step of every
+    /// run in the file, so a scan there is a cost that grows with the trace and is
+    /// paid on the close of each reply.
+    ///
+    /// The plan is the property, not a stopwatch: a wall-clock threshold is flaky
+    /// on a loaded runner and green on a fast machine running a full scan. The
+    /// measured number is recorded in the release record instead.
+    #[test]
+    fn a_replys_token_read_reaches_its_rows_through_an_index() {
+        let store = Store::memory().unwrap();
+        // A plan is chosen against the tables as they stand, so they cannot be
+        // empty: SQLite scans a handful of rows whatever the index says.
+        for _ in 0..64 {
+            let run = store.start_run("goal", "/repo").unwrap();
+            store
+                .record_provider_call(
+                    run,
+                    &ProviderCall {
+                        step: 1,
+                        attempt: 0,
+                        provider: "mock".into(),
+                        model: Some("m".into()),
+                        usage: Some(crate::provider::Usage {
+                            total_tokens: 11,
+                            ..Default::default()
+                        }),
+                        latency_ms: 3,
+                        ttft_ms: None,
+                        finish_reason: Some("stop".into()),
+                        failure: None,
+                    },
+                )
+                .unwrap();
+        }
+        store.conn.execute_batch("ANALYZE").unwrap();
+
+        let plan_for = |sql: &str| -> String {
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ")
+        };
+
+        let spend =
+            plan_for("SELECT COALESCE(SUM(total_tokens), 0) FROM provider_calls WHERE run_id = 7");
+        assert!(
+            spend.contains("USING INDEX") || spend.contains("USING COVERING INDEX"),
+            "a reply's token read is a scan of every provider call in the file: {spend}"
+        );
+
+        // The control, and it is a column in **no** index rather than one that
+        // merely is not a left prefix: a trailing composite column is skip-scanned
+        // and would prove nothing. Without this, a plan string that said
+        // "USING INDEX" for anything would pass the assertion above.
+        let scan = plan_for("SELECT COUNT(*) FROM provider_calls WHERE finish_reason = 'stop'");
         assert!(
             !scan.contains("USING INDEX"),
             "the check cannot tell an index from a scan: {scan}"

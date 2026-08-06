@@ -26,6 +26,110 @@ notes are produced from it.
 
 ### Security
 
+## [0.37.0] - 2026-08-06
+
+A conversation answers without opening a run.
+
+`Session::turn` had one shape: build a contract, open a run, drive the loop. That
+is the right machinery for "migrate the forty handlers" and it was the whole
+machinery for "hi". An operator who said hello got a run in their trace, a plan
+gate they might have to answer, a checkpoint on disk and a row in the ledger that
+said work happened. Nothing did.
+
+**The turn's own first completion now decides what the turn was.** The completion
+is made the way it has always been made — the workspace tools offered, the
+conversation seeded, the operator's text as the goal — and what comes back is read
+rather than assumed. A completion that stops on text is an answer: the turn closes
+as `TurnKind::Reply` with no step, no gate attempt, no checkpoint, no snapshot, no
+plan gate and no call to the `Approver`. A completion carrying a tool call is work:
+the turn is a `TurnKind::Run` and the loop continues **from that same completion**,
+so the run's first step is the call that was already paid for.
+
+**The classification is therefore free, and it is the model's.** A turn that
+answers makes one provider call. A turn that promotes and takes two steps makes
+two, not three. There is no list of greetings in this crate and none is needed in
+the program embedding it — which is the point, because a list is a list in one
+language, matches `hi` and not `namaste`, and answers `hi, the login page is
+broken` correctly only by accident.
+
+**A reply is billed, and says so.** The completion happened and cost money, so the
+run row is written, `Store::run_summary` reports its tokens, the per-call
+accounting row carries its model and its latency, and the token ceiling is applied
+*before* the answer is served — a turn that cannot afford its own reply is refused
+rather than served free. A reply that recorded nothing would satisfy every
+assertion about what is absent and would make the crate's own cost reconstruction
+wrong.
+
+**A reply is part of the conversation.** It is in `history()`, the next turn reads
+both the prompt and the answer, and `branch_from` takes it like any other turn.
+
+**What is deliberately not classified.** A contract carrying a `Verification` is
+always work: a caller who declared how the turn is judged has said it is work, and
+handing back an answer instead of running the gate would be answering a different
+question. `run_with` and `run_with_observed` are untouched — a one-shot contract is
+work by declaration, and an entry point that sometimes answers instead of running
+is a worse contract than one that always runs.
+
+**Only the first completion of a turn can be a reply.** A run whose fifth step
+stops on text is a run that finished, exactly as in 0.36.1.
+
+**The honest cost.** The system prompt for a turn's first completion now permits
+answering, which is a real behaviour change for every session turn rather than
+only for greetings. A model that answers in prose where it should have acted costs
+the operator one retype — the turn's reply is on screen — and that asymmetry is
+accepted by choice: answering something meant as work costs a retype, while
+running something meant as a greeting plans it, checkpoints it, gates it and bills
+it.
+
+### Added
+
+- `TurnKind`, with `Reply` and `Run`, and `TurnResult::kind`. Branch on this
+  rather than inferring from a step count — a run refused at its first step also
+  has no steps, and the two are not the same thing.
+- `EventKind::Answered { turn_id }`, with its `EVENT_NAMES` entry. Emitted once,
+  before `Finished`, when a turn closes as a reply. Which run served it is the
+  event envelope's own `run_id`; a second copy in the kind is a duplicate key once
+  the kind is flattened onto the wire, which is the constraint `Rewound` already
+  records.
+- One additive column, `runs.turn_kind`, and one index, `provider_calls_run`.
+  `CHECKPOINT_FORMAT` is unmoved at 7 and no existing table is otherwise altered.
+- `Store::check_resumable` refuses a conversational turn that was still answering
+  when it stopped: it committed no step, so there is nothing to continue, and
+  asking again replaces the one completion at the same price. A reply that
+  *finished* is a completed run like any other and a resume reports its outcome,
+  unchanged.
+
+### Changed
+
+- **BREAKING (API)** `TurnResult` gains the `kind` field and becomes
+  `#[non_exhaustive]`. Both are the same break for a struct literal or an
+  exhaustive destructuring outside this crate, so they are paid together rather
+  than twice — and the second one means the next field this type gains is free.
+  *Migration:* `TurnResult` is constructed only inside this crate and every method
+  returning one keeps its signature, so a caller that reads `turn.reply`,
+  `turn.outcome`, `turn.run_id` or `turn.turn_id` needs no change at all. Add a
+  `..` to any exhaustive `let TurnResult { .. } = turn` destructuring. No field was
+  removed and no signature moved.
+- **BREAKING (behaviour)** a session turn whose model stops on text without
+  calling a tool now closes without running the loop. An embedder that inferred
+  "a turn happened, therefore work was attempted" from the existence of a
+  `TurnResult` was reading something that was never guaranteed and now differs.
+  *Migration:* read `TurnResult::kind`. `TurnKind::Run` is every turn that would
+  have opened a run in 0.36.1 and did work; `TurnKind::Reply` is the turn that
+  answered. A caller that wants a turn always to be work gives its contract a
+  `Verification`, which is never classified.
+- `Store::spent_tokens` reads a reply's spend from its one `provider_calls` row,
+  because a turn that answered has no `steps` row to sum. Every other run is
+  summed from its steps exactly as before.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.36.1] - 2026-08-04
 
 A verdict in minutes, and a front page that is true.

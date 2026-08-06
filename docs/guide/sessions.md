@@ -60,6 +60,76 @@ would be answering about a different project.
 on a turn, or a headless one-shot for unattended work. It stopped being the only
 way in.
 
+## Not every turn is work (0.37.0)
+
+Someone types `hi`. Through 0.36.1 that opened a run: a `runs` row, a plan gate
+they might have had to answer, a checkpoint on disk, and a ledger entry saying
+work happened. Nothing did.
+
+Since 0.37.0 the turn's **own first completion** decides. It is made exactly as it
+has always been made — the workspace tools offered, the conversation seeded, the
+operator's text as the goal — and what comes back is read rather than assumed:
+
+- **Stopped on text, no tool call** → the turn is an answer. `TurnResult::kind` is
+  `TurnKind::Reply`, and the turn wrote no step, no gate attempt, no checkpoint, no
+  snapshot, no plan gate and no call to your `Approver`.
+- **Carrying a tool call** → the turn is work. `kind` is `TurnKind::Run` and the
+  loop continues **from that same completion**, so the run's first step is the call
+  that was already paid for.
+
+```rust,no_run
+use io_harness::{ApproveAll, OpenRouter, Policy, Session, Store, TurnKind};
+
+# async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+let provider = OpenRouter::from_env()?;
+let mut session = Session::open(store, "/path/to/repo")?;
+let turn = session.turn("hi", &provider, store, policy, &ApproveAll).await?;
+
+match turn.kind {
+    // Print it and wait for the next thing they say. Nothing was staged.
+    TurnKind::Reply => println!("{}", turn.reply.unwrap_or_default()),
+    // A run happened; everything the crate offers about a run applies.
+    _ => println!("{:?}", turn.outcome),
+}
+# Ok(()) }
+```
+
+An `EventKind::Answered { turn_id }` reaches every `Observer` — and therefore
+every attached process — when a turn closes as a reply, so a transcript can tell an
+answer from a run without opening the store.
+
+**It costs nothing extra.** A turn that answers makes one provider call. A turn
+that promotes and takes two steps makes two, not three. The classification is not
+a separate cheaper model, a pre-pass, or a second request: it is the reading of a
+completion that had to happen anyway.
+
+**There is no list of greetings**, here or in your program. That is the point. A
+list is a list in one language, matches `hi` and not `namaste`, and answers
+`hi, the login page is broken` correctly only by accident. A model reading the
+sentence has strictly more to go on.
+
+### The limits of it
+
+- **Only the first completion of a turn can be a reply.** A run whose fifth step
+  stops on text is a run that finished, as it always was.
+- **Prose *and* a tool call is work.** The call decides.
+- **A contract carrying a `Verification` is never a reply.** You said how the turn
+  is judged, so you said it is work. A bounded contract with no verification
+  classifies like an unbounded turn.
+- **`run_with` never classifies.** A one-shot contract is work by declaration.
+- **A reply is billed.** `Store::run_summary` reports its tokens and the per-call
+  accounting row carries its model and latency. A turn that cannot afford its own
+  reply under its token budget is refused rather than served free.
+- **A reply is not resumable**, and a turn killed while it was still deciding is
+  refused by `Store::check_resumable` rather than offered as work to continue.
+  There is nothing to continue: one completion, which asking again replaces at the
+  same price.
+- **The prompt changed for every session turn**, not only for greetings. The first
+  completion is told the message may not be work at all — and told to act where
+  both readings are possible. A model that answers in prose when it should have
+  acted costs you one retype; that asymmetry is chosen, and the alternative is
+  worse.
+
 ## Durability, and what "a later process" means
 
 `Session::open` returns a session whose `id()` is durable. `Session::reopen` picks
