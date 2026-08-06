@@ -363,7 +363,7 @@ tasks:
     These are the gates that have caught a defect in four of the last five releases, and they are
     the last thing that may touch the tree before the record is sealed. A release that runs them
     before its final edit has proven nothing about what it shipped.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.38.0-T05
   acceptance_criteria:
@@ -383,4 +383,40 @@ tasks:
     `cargo build --all-features --examples` before any `--lib --tests` run or sabotage.
   files:
   - .ultraship/products/io-harness/execution/tasks.yaml
-  evidence: []
+  evidence:
+  - >
+    The full suites, run after every edit to the tree and in separate invocations, with
+    `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` and `df -h .` before and between:
+    `cargo test` — **64 suites, 1362 passed, 0 failed**; `cargo test --all-features` — **64 suites,
+    1441 passed, 0 failed**. Against 0.37.0's 63 / 1356 and 63 / 1435, the deltas are the three new
+    library tests (one Anthropic body test, two `cache_wire` tests) and the new
+    `tests/pricing_cache.rs` suite's three, which is the whole of what this release adds.
+  - >
+    Trap 102 paid for itself again and is recorded rather than re-learned: the first full run
+    reported **11 failures in `tests/plugin.rs`**, every one of them environmental — that suite reads
+    this machine's real `~/.config/io/io.toml`, which carries an `api_key` key the config schema
+    rejects. Re-run with `XDG_CONFIG_HOME` redirected to a scratch directory (never `HOME`, which
+    breaks `CARGO_HOME`): **12 passed, 0 failed**. Every figure above was taken with that redirect in
+    place. Nothing in this release touches config.
+  - >
+    `cargo fmt --check` clean — it failed first on `examples/cache_live.rs` and
+    `tests/pricing_cache.rs`, `cargo fmt` was applied and committed **before** the packaging step, so
+    the gate is the last thing that touched the tree rather than something run before a later edit.
+    `cargo clippy --all-features --all-targets -- -D warnings` exits 0.
+  - >
+    O2, docs.rs: the nightly job's exact command,
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`, exits **0**
+    with no warning. Run by hand before the release PR rather than inferred from a stable
+    `cargo doc`, which has missed something in four of the last five releases.
+  - >
+    O3, packaging: `cargo clean` removed 61,861 files and 19.6 GiB, then `cargo package --locked`
+    compiled the packaged crate from `target/package/io-harness-0.38.0` and produced
+    `io-harness-0.38.0.crate` at **1,347,234 bytes** (0.37.0 was 1,336,755 locally). Free space never
+    fell below 27 GiB.
+  - >
+    N1 re-checked on the released tree: `cargo tree` reads **402** lines, `cargo tree --all-features`
+    829. The only `Cargo.toml` change this release is the version bump to `0.38.0`.
+  - >
+    O1, the three-OS matrix: PR #121 (`feat/0.38.0` into `develop`) carries the tree these gates ran
+    on. The matrix result is recorded against this criterion from that PR's checks rather than
+    predicted here.
