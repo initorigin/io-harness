@@ -976,11 +976,11 @@ versions:
       What the release covers is the prefix that is genuinely stable: the instructions, the skill
       catalogue and the tool schemas, which are re-sent identically on every step of every run and
       every turn of every session. The transcript is deliberately not marked — the context assembler
-      supersedes, invalidates, re-reads and re-fits earlier observations on each turn, so it is not a
-      byte-stable prefix and marking it would buy cache *writes* rather than reads. Making the
+      supersedes, invalidates, re-reads and re-fits earlier observations on each turn, so it is not
+      a byte-stable prefix and marking it would buy cache *writes* rather than reads. Making the
       assembler prefix-stable is a larger change than this release.
     detail: specified
-    status: planned
+    status: released
   - version: 0.39.0
     outcome: >
       A conversation can fan out. An operator asks for something wide inside a session — migrate

@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.38.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -448,3 +448,169 @@ open_questions:
   vendor did. Today the only signal is the counter, so "the marker was sent and ignored" and "the
   marker was never sent" look the same to an operator reading a trace. Left open because the honest
   answer may be that the body is the trace, and the record provider already captures it.
+
+released_at: 2026-08-06T00:00:00Z
+mode: published
+delivered: >
+  A long conversation, and a long run, stop paying full price for the part of the request that never
+  changes. The system instructions, the skill catalogue folded into them and the JSON schema of every
+  tool on offer are marked as a cache breakpoint, and the vendors that cache serve them back instead
+  of re-reading them.
+
+  The Anthropic request sends `system` as a one-element content-block array carrying
+  `cache_control: {"type": "ephemeral"}`. That wire orders a request's cacheable prefix
+  tools-then-system, so the single marker covers the tool schemas and the instructions together, and
+  no marker is placed on the tools array — a changed tool list already invalidates everything after
+  it in that ordering. The OpenRouter request carries the same marker in the shape that wire spells
+  it, added by `cached_system(flavor, system)` beside `web_key` (0.22.0) and `effort_key` (0.31.0).
+
+  OpenAI and every endpoint reached through `Compatible` send nothing and their bodies are
+  byte-identical to the ones 0.37.0 sent. OpenAI caches a repeated prefix by itself with no
+  request-side control, and that path also fronts 21 endpoints this crate does not control, where an
+  unknown body key would be a 400 it had caused.
+
+  Measured rather than asserted: two consecutive calls over an identical system block through
+  OpenRouter against `anthropic/claude-haiku-4.5` — the second read 7,408 of its 7,421 prompt tokens
+  from the vendor's cache, while the control over the identical endpoint and model with no marker
+  read none on either call. Those stored rows priced through the shipped table cost 2,336
+  micro-units against the uncached call's 22,335, which is the first time the cache branch of
+  `src/pricing.rs` has executed against a non-zero count.
+
+  Nothing else moved. No public item was added, removed or altered; no table, column or index;
+  `CHECKPOINT_FORMAT` unmoved; `docs/public-api.txt` byte-identical. Zero breaks, and therefore no
+  migration note owed.
+
+evidence:
+  tests:
+  - >
+    `cargo test` — **64 suites, 1362 passed, 0 failed**. `cargo test --all-features` — **64 suites,
+    1441 passed, 0 failed**. Both run locally with `CARGO_PROFILE_DEV_DEBUG=0
+    CARGO_PROFILE_TEST_DEBUG=0`, in separate invocations, with `df -h .` before and between.
+  - >
+    F1: `cargo test --lib provider::anthropic` — 19 passed, 0 failed.
+    `body_marks_one_cache_breakpoint_at_the_end_of_system` asserts a one-element system array whose
+    text is the request's own string, `cache_control.type == "ephemeral"`, **no** `cache_control` on
+    any tool, and exactly **one** occurrence of the string in the whole serialised body. It was
+    written first and watched fail against the unmarked body.
+  - >
+    F2 and F3: `cargo test --lib provider::openai_wire` — 18 passed, 0 failed. The OpenAI-flavoured
+    body keeps a bare system string with **zero** occurrences of `cache_control`; the
+    OpenRouter-flavoured body carries exactly one, on a one-part system array, with the user turn
+    untouched; and the two bodies are asserted **equal** with the system message stripped from both.
+  - >
+    F2's sabotage, executed: `cached_system` changed to return the marker for
+    `WebFlavor::OpenAi | WebFlavor::OpenRouter` — the failure that would put an unknown body key in
+    front of 21 endpoints. Result **2 failed, 16 passed**, and the two were exactly
+    `the_openai_body_carries_no_breakpoint_and_keeps_its_bare_system_string` and
+    `no_effort_leaves_both_bodies_exactly_as_they_were`. Restored from a pre-sabotage copy: 18
+    passed.
+  - >
+    F4, live: `cargo run --example cache_live` with `CACHE_LIVE_MODEL=anthropic/claude-haiku-4.5`,
+    2026-08-06, system block 34,146 characters. Marked arm — call 1 `prompt=7420 cache_read=0
+    cache_write=0`, call 2 `prompt=7421 cache_read=7408 cache_write=0`. Control arm, the same
+    endpoint and model through `Compatible` (which sends no marker) — call 1 `cache_read=0`, call 2
+    `cache_read=0`. The model that answered is read from `CompletionResponse::model` on all four
+    calls, not assumed from the slug.
+  - >
+    F5: `cargo test --test pricing_cache` — 3 passed, 0 failed. The measured rows go through a real
+    `Store`, come back via `Store::provider_calls`, and price at **22,335** micro-units uncached
+    against **2,336** cached — both computed by hand from the stored counts and asserted as exact
+    figures. Its sabotage is permanent rather than run once: with `cache_read` set equal to `input`
+    the cached call costs 22,338 and stops being cheaper.
+  - >
+    F6: `cargo test --test public_api` — 9 passed; `docs/public-api.txt` untouched, still pointing at
+    its 0.37.0 commit. `cargo test --test cross_version` — 5 passed, including `CHECKPOINT_FORMAT`
+    asserted at 7 and unmoved by opening a 0.22.0 store. `cargo test --test cross_version_0_29_0 --
+    --ignored` — 1 passed, after building the pinned generator: a store written by this tree is read
+    by a 0.29.0 binary. `cargo test --test changelog` — 15 passed, no `**BREAKING` entry for this
+    version. `cargo test --test docs_drift` — 5 passed.
+  - >
+    Trap 102, recorded rather than re-learned: the first full run reported **11 failures in
+    `tests/plugin.rs`**, all environmental — that suite reads this machine's real
+    `~/.config/io/io.toml`, which carries an `api_key` key the config schema rejects. Re-run with
+    `XDG_CONFIG_HOME` redirected to a scratch directory (never `HOME`, which breaks `CARGO_HOME`):
+    **12 passed, 0 failed**. Every figure above was taken with that redirect in place.
+  builds:
+  - >
+    `cargo clippy --all-features --all-targets -- -D warnings` — exit 0. `cargo fmt --check` — exit 0,
+    after `cargo fmt` was applied to the new example and test and committed **before** packaging, so
+    the gates are the last thing that touched the tree.
+  - >
+    O2, docs.rs: `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features
+    --no-deps` — exit 0, no warning. Run by hand before the release PR rather than inferred from a
+    stable `cargo doc`.
+  - >
+    O3, packaging: `cargo clean` removed 61,861 files and 19.6 GiB, then `cargo package --locked`
+    compiled the packaged crate from `target/package/io-harness-0.38.0` and produced
+    `io-harness-0.38.0.crate` at **1,347,234 bytes**. Free space never fell below 27 GiB.
+  - >
+    N1: `cargo tree` reads **402** lines and `cargo tree --all-features` 829, both unchanged. The only
+    `Cargo.toml` edit this release is the version bump.
+  reviews:
+  - >
+    O1, the three-OS matrix: GitHub Actions run **31108905987** on `d3030de`, the head of
+    `feat/0.38.0` — **completed / success, all 15 jobs green**, no re-run and nothing skipped. The
+    jobs are `test` and `doctest` across ubuntu, macos and windows in both feature polarities, `msrv`
+    (1.95), `lint`, `examples (compile)`, `links-consumer (rusqlite 0.40 coexistence)`,
+    `cross-version-0.29.0` and `docs.rs (nightly)`. An earlier run on `0a8a176` was cancelled by
+    `cancel-in-progress` when the next commit was pushed; the recorded run is the one on the tree
+    being released.
+  - >
+    PR #121, `feat/0.38.0` into `develop`, carrying the whole release including the sealed record and
+    the hand-appended lock pin.
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The transcript is not cached, and will not be until the assembler changes.** The breakpoint
+  covers the instructions, the skill catalogue and the tool schemas — not the observation log, which
+  `context::assemble` supersedes, invalidates, re-reads and re-fits on every turn and which is
+  therefore not the byte-stable prefix a cache needs. This is the larger half of the available
+  saving and it is deliberately unclaimed; the roadmap outcome for this version named "the settled
+  part of the transcript" and the release does not deliver that half. Marking it would be billed as
+  a cache write on nearly every turn, costing money rather than saving it.
+- >
+  **A run cached through OpenRouter under-reports what it cost, and this was measured rather than
+  predicted.** `cache_write_tokens` came back **zero on all four live calls**, including the one that
+  must have written the entry the next call read, because that wire reports no write counter and
+  `src/provider/openai_wire.rs:310` records zero by construction. The tokens that were written are
+  therefore priced as ordinary fresh input, below what the vendor charged. Not closed by inferring
+  the write from the prompt length — that would put a number in the trace the invoice does not
+  contain.
+- >
+  **A prefix used exactly once now costs more than it did in 0.37.0** — roughly a quarter more on
+  that block, since a cache write is billed above a fresh read. The break-even is the second use.
+  Accepted deliberately: a run makes more than one call and a session more than one turn. There is
+  no switch to turn it off; an operator whose endpoint rejects the key uses `Compatible`, which never
+  sends it.
+- >
+  **A prefix below the vendor's minimum cacheable length is silently not cached**, and a cache entry
+  expires on the vendor's own clock. In both cases the marker is accepted, the response is normal,
+  and `cache_read_tokens` is zero with nothing to say why. The crate declares a cache; it does not
+  operate one.
+- >
+  **The live evidence is one vendor, one route, one model, one moment.** It was taken through
+  OpenRouter because that is the only provider with working credentials in this checkout — the
+  Anthropic and OpenAI entries in `.env` are empty placeholders — so the **native `Anthropic`
+  provider's marker has never been exercised against Anthropic's own endpoint.** Its body is
+  asserted by F1 and the wire shape is the vendor's documented one, but no live call has confirmed
+  it end to end.
+- >
+  **F4 deviates from its own wording and the substance is met in a different form.** The criterion
+  named an `examples/` fixture with `required-features`; the fixture carries none, because the two
+  existing live examples are gated only for optional *dependencies* and this one needs none —
+  inventing a feature would have added a name to the public feature surface in a release whose claim
+  is that it adds nothing. It is an example, so no CI job runs it.
+- >
+  **This record was sealed before the crates.io upload.** `mode: published` states the authorised
+  target; the upload follows the merge into `develop`, the release PR into `main`, and the GitHub
+  Release, in that order.
+- >
+  **A first attempt at the live evidence was refused with HTTP 402** against
+  `anthropic/claude-sonnet-4.5`, because the account's remaining credit could not cover that model's
+  default maximum output — the OpenAI wire sends no `max_tokens`, so the vendor applies the model's
+  own. Re-aimed at a cheaper model of the same vendor rather than worked around, and recorded because
+  the absence of a `max_tokens` on that wire is a real property of the crate.
+supersedes: 0.37.0
+next_recommended_version: 0.39.0
+immutable: true
