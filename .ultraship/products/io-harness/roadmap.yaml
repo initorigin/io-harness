@@ -989,7 +989,7 @@ versions:
       boundary, reporting into the same transcript. Today that requires leaving the conversation for
       a one-shot run, because the sub-agent tool is registered only inside the tree loop, which the
       conversation entry points cannot reach: a run is a tree or a turn and not both.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.40.0
     outcome: >
