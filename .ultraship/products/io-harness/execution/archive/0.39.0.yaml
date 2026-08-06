@@ -35,9 +35,9 @@ release_fit:
     - >
       Keeping two loops from becoming two implementations. `run_workspace_from` (`src/run.rs:3792`)
       and `run_agent` (`src/run.rs:5276`) are already near-parallel, and this release adds four
-      session rules to the second. Copying them in is fast, passes every functional criterion, and is
-      precisely the defect N4 exists to catch. The extraction has to come first, and the flat loop
-      has to stay behaviourally identical while it happens.
+      session rules to the second. Copying them in is fast, passes every functional criterion, and
+      is precisely the defect N4 exists to catch. The extraction has to come first, and the flat
+      loop has to stay behaviourally identical while it happens.
     - >
       `run_agent` is recursive, boxed and lifetime-heavy (`Pin<Box<dyn Future + 'f>>`,
       `src/run.rs:5288`). Threading a borrowed seed slice and a steer inbox into it, while keeping

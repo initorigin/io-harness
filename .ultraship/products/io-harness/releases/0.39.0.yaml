@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.39.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -491,3 +491,118 @@ open_questions:
   the plan gate exists at depth 0 in the tree loop (`src/run.rs:5295`) and a contained turn is depth
   0, so the combination works today, but nothing has designed what a plan and a conversation mean
   together.
+
+released_at: 2026-08-06T22:45:00Z
+mode: published
+delivered: >
+  An operator asks for something wide inside a conversation and the conversation does it.
+  `Session::turn_contained` and `Session::turn_contained_observed` take a `Containment` and drive
+  the turn through the agent-tree loop, so the agent answering it is offered `spawn_agent` and
+  decomposes the work into contained children — under the session's own policy narrowed per child
+  through `Policy::contain`, one shared `Ledger` built for that turn, and the observer the operator
+  is already reading. The turn stays one turn: one `session_turns` row, one `Session::history`
+  entry, one move of the head, with the children as runs under the turn's own run id.
+
+  The five turn entry points that predate this are untouched and still never offer the spawn tool,
+  so a session that passes no `Containment` behaves exactly as it did in 0.38.0. Nothing public is
+  removed, renamed or altered; no table, column or index is added; `CHECKPOINT_FORMAT` is unmoved
+  at 7; and `docs/public-api.txt` is byte-identical.
+
+evidence:
+  tests:
+  - >
+    `cargo test --lib --tests` — **64 suites, 1,005 passed, 0 failed** (default features).
+    `cargo test --all-features --lib --tests` — **64 suites, 1,082 passed, 0 failed**. Both run
+    after `cargo build --all-features --examples`, so nothing ran against a stale fixture binary.
+  - >
+    `cargo test --test session_fanout` — **12 passed, 0 failed**, the release's own suite: F1 and
+    its five-way negative control, F2, F3(a) and F3(b), F4, F5, F6 and its second arm, F7, F8, and
+    N4's source-reading test with a splice-in control.
+  - >
+    `cargo test --test session --test session_reply --test session_steering --test session_streaming`
+    — **21 passed, 0 failed**, unmodified. No test in those four files was edited for this release,
+    which is N5's evidence.
+  - >
+    `cargo test --test cross_version --test checkpoint --test store_open` — **27 passed**, both
+    directions against the pinned 0.29.0 generator, with no new name fed to `ADDED_SINCE_0_22_0`.
+  - >
+    `cargo test --test docs_drift --test changelog --test readme --test guide_pages --test public_api`
+    — **44 passed**. `public_api` green against a byte-identical snapshot; `changelog` finds no
+    `**BREAKING` entry for this version.
+  - >
+    Doctests: `cargo test --all-features --doc` — **370 of 373 passed**. One failure was this
+    release's own (`Session::turn_contained`'s example called a `Store::spawns` that does not
+    exist), corrected to `Store::children`, after which both new doctests pass. The other two are
+    `src/config.rs` doctests that fail on this machine only: they fail identically on a stashed
+    0.38.0 tree, and with `XDG_CONFIG_HOME` redirected all 20 `config::Config` doctests pass. The
+    machine carries a real `~/.config/io/io.toml`.
+  - >
+    **Six sabotages, five of which failed a named test.** S1 (the tree loop stops classifying) →
+    `a_contained_turn_that_answers_spawns_nothing`. S2 (the depth gate removed, so children read the
+    conversation) → `the_conversation_reaches_the_root_and_not_the_children`. S3 (`drive`
+    substitutes a default `Containment`, so every turn reaches the tree loop) →
+    `no_other_turn_shape_is_offered_the_spawn_tool`. S4b (the child runs permissively) →
+    `a_child_cannot_widen_the_sessions_boundary`. S5 (a second copy of the reply-typing rule spliced
+    into one loop) → `each_session_rule_is_one_helper_that_both_loops_call`. **S4 failed nothing**
+    and is recorded as a finding under `known_limitations`.
+  builds:
+  - >
+    `cargo build --all-features --examples` — exit 0. `cargo fmt --check` — clean.
+    `cargo check --lib` — exit 0 with no warnings.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — **exit
+    0, no warnings**, the docs.rs gate run with the CI job's exact command rather than inferred from
+    a stable `cargo doc`.
+  - >
+    `cargo package --locked` on a clean tree after `cargo clean` — exit 0, and the packaged crate
+    compiled in its own verification step. **1,360,863 bytes**,
+    `sha256:62d69cf8f8c74cd3639cd6a25acf03142cf06b331112eecc2718ea32131176af`.
+  - >
+    `cargo tree` — **402** lines, unchanged since 0.23.0; `cargo tree --all-features` — 829.
+    `Cargo.toml` received only the version bump.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **This record was sealed before the merges, the GitHub Release and the crates.io upload**, which
+  follow it in that order. `mode: published` states the release's target and what was actually done
+  is reported with the merge. A record can never cite CI on the commit that contains it: the
+  three-OS matrix runs on the pull request that carries this commit, so O1's evidence is stated in
+  the merge and the final report rather than amended into a sealed record — the 0.29.0 precedent.
+- >
+  **N2 was met in a different form than its prose names, and this is the deviation.** The criterion
+  said `docs/public-api.txt` gains exactly two lines. It gains none: `tests/public_api.rs`
+  enumerates the items re-exported from `lib.rs`, and `Session::turn_contained` and
+  `Session::turn_contained_observed` are inherent methods on the already-listed `struct Session`.
+  The substance is stronger than the criterion asked — the crate root's surface is byte-identical —
+  and both methods carry a worked doctest anyway. Adding lines by hand would have failed the
+  checker, which compares the parse against the snapshot.
+- >
+  **A paused contained turn's row reports the pause, not the continuation, and it reads `running`
+  rather than `awaiting_approval`.** `Session::drive` closes the turn with what `Store::run_summary`
+  said when the turn returned, and a run parked on an approval has no summary outcome yet. F8
+  asserts the value as measured rather than as first assumed, and `docs/CONTRACT.md` states it. The
+  run is the record that moves; there is no session-side refresh, which was not scoped here.
+- >
+  **One sabotage failed nothing, and it is a finding rather than an omission.** S4 handed a child
+  its parent's policy verbatim instead of `parent_policy.contain(&overlay)`, and every test still
+  passed — with an identical policy the boundary genuinely still holds. What F4 discriminates is
+  *widening*, which S4b (a permissive child) does fail. Inheritance-without-narrowing is not
+  observable through this criterion, and the criterion is about the narrowing.
+- >
+  **The ledger is per turn, not per session**, by owner decision. A conversation has no single spend
+  ceiling; its total is the sum of its turns'. Recorded in `docs/CONTRACT.md` and left in
+  `open_questions`.
+- >
+  **A contained turn cannot be steered.** `turn_contained` and `turn_contained_observed` ship
+  without a `turn_contained_steered`; an operator stops a fan-out with `Flow::Cancel` from the
+  observer, honoured at the root's step boundary. Whether a mid-turn message should reach children
+  in flight is an open question rather than an omission.
+- >
+  **No live provider exercised this release.** Every criterion is deterministic against fixture
+  providers, which is what the contract specified — the fan-out's evidence is stored rows, outbound
+  requests and refusals, none of which needs a vendor. No live smoke run was made.
+supersedes: 0.38.0
+next_recommended_version: 0.40.0
+immutable: true

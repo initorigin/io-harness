@@ -990,7 +990,7 @@ versions:
       a one-shot run, because the sub-agent tool is registered only inside the tree loop, which the
       conversation entry points cannot reach: a run is a tree or a turn and not both.
     detail: specified
-    status: planned
+    status: released
   - version: 0.40.0
     outcome: >
       The project's own commands run contained. `exec` and `shell` execute under the same
