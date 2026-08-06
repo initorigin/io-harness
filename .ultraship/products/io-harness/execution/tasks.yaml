@@ -11,7 +11,7 @@ tasks:
     A reply writes no `steps` row, so every existing token read — `run_summary`, the `Finished`
     event, cost reconstruction — reports zero for it unless the store knows the run was answered
     rather than run. F3 fails without this and F6 has nothing to assert on.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - >
@@ -27,7 +27,31 @@ tasks:
   files:
   - src/state.rs
   - tests/cross_version.rs
-  evidence: []
+  evidence:
+  - >
+    F8, the guard fed by name: `COLUMNS_ADDED_SINCE_0_22_0` gains `("runs", &["turn_kind TEXT"])`
+    and `ADDED_SINCE_0_22_0` gains `provider_calls_run`. `cargo test --test cross_version` — 5
+    passed, 0 failed. The comparison is not a whitelist: `is_only_added_columns` removes exactly the
+    declared column text from the new `CREATE TABLE` and requires the result to reproduce the old
+    one character for character, so a changed type or a loosened constraint would fail.
+  - >
+    F8, both directions, executed rather than asserted on paper:
+    `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml` then
+    `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed, 0 failed. A database written
+    by the pinned 0.29.0 binary opens, resumes and replays under 0.37.0, and a 0.37.0 store is read
+    by that binary.
+  - >
+    F8, `CHECKPOINT_FORMAT` asserted unmoved rather than assumed: `tests/cross_version.rs:973`
+    asserts it equals 7 and `:983` asserts opening a 0.22.0 store does not move it. Both in the 5
+    passing above. Bumping it would have made `check_resumable` refuse every 0.36.x store over a
+    column an older binary never reads.
+  - >
+    N6: `state::tests::a_replys_token_read_reaches_its_rows_through_an_index` — passed.
+    `EXPLAIN QUERY PLAN SELECT COALESCE(SUM(total_tokens), 0) FROM provider_calls WHERE run_id = 7`
+    reports `SEARCH provider_calls USING INDEX provider_calls_run (run_id=?)` against 64 runs after
+    `ANALYZE`. The control is `finish_reason`, a column in **no** index rather than a trailing
+    composite column that would be skip-scanned, and it reports a scan. No wall-clock assertion is
+    written; the plan is the property.
 
 - id: US-IO-HARNESS-0.37.0-T02
   summary: >
@@ -36,7 +60,7 @@ tasks:
     stops on text — after the ceiling check, before `commit_step`.
   why_required: >
     This is the release. Everything else reports or documents what this branch decides.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.37.0-T01
   acceptance_criteria:
@@ -57,7 +81,33 @@ tasks:
     `TurnKind` values throughout the suite and must fail this named test on the count alone.
   files:
   - src/run.rs
-  evidence: []
+  evidence:
+  - >
+    F1: `session_reply::a_turn_that_needs_no_tool_leaves_no_work_behind` — passed. Arm A
+    (`Say::Text`) closes as `TurnKind::Reply` with `TurnResult.reply` equal to the model's text, and
+    for that run the step, gate-attempt, spawn, deferred-approval and restore-point counts are each
+    0, with `last_step` 0. Arm B is the control on the same fixture and the same store — a
+    `write_file` call — and every one of those is non-zero: steps > 0, `last_step` > 0, one restore
+    point. The zeroes mean something because the same reads are non-zero on the control.
+  - >
+    F2: `session_reply::a_turn_pays_for_exactly_the_completions_it_needed` — passed. The scripted
+    provider counts calls. A turn that replies makes **1**. A turn that promotes and takes two steps
+    makes **2**, not 3, and writes 2 step rows, because the classifying completion is step one. The
+    same test asserts the prompt half: the first completion's system prompt contains "may not be
+    work at all" and the second contains "Do not explain; call tools." — the conversational opening
+    is this turn's first completion only.
+  - >
+    Sabotage 1, F2's named forbidden implementation (classify with a call, discard it, re-ask), spliced
+    in as a `continue` on the promotion arm: `a_turn_pays_for_exactly_the_completions_it_needed`
+    FAILED and `a_turn_that_needs_no_tool_leaves_no_work_behind` FAILED — 6 passed, 2 failed. It
+    produces correct `TurnKind` values throughout and dies on the count alone, which is what the
+    criterion exists for.
+  - >
+    Sabotage 2, the reply's early return deleted so it falls through to `commit_step`: 5 passed, 3
+    failed — F1, F3 and F7 all report it.
+  - >
+    Sabotage 7, the conversational prompt left on for every step rather than the first: 7 passed, 1
+    failed — F2.
 
 - id: US-IO-HARNESS-0.37.0-T03
   summary: >
@@ -68,7 +118,7 @@ tasks:
   why_required: >
     An embedder branches on `TurnKind` instead of inferring from a step count; without it io-cli
     cannot delete its greeting list, which is the release's own argument for existing.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.37.0-T02
   acceptance_criteria:
@@ -94,7 +144,37 @@ tasks:
   - src/observe.rs
   - src/lib.rs
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - >
+    F4: `session_reply::a_reply_is_read_by_the_turn_that_follows_it` — passed. `history()` lists both
+    turns; the second turn's assembled prompt contains the first turn's prompt **and**
+    `you answered: I read repositories and change them.`; `branch_from` on the reply produces a turn
+    whose `parent_turn_id` is the reply's id.
+  - >
+    Sabotage 4, the reply dropped from `finish_turn` (`store.finish_turn(turn_id, None, &outcome)`):
+    7 passed, 1 failed — F4 alone, exactly as the criterion predicted. It passes F1 and F3.
+  - >
+    N2: `cargo test --test public_api` — 8 passed, including
+    `every_public_item_has_a_worked_example` against a hand-edited `docs/public-api.txt` that gains
+    exactly one line, `enum TurnKind src/session.rs`. `cargo test --test changelog` — 5 passed: the
+    `*Migration:*` note is found under each `**BREAKING` entry. Two breaks are marked and both carry
+    one — `**BREAKING (API)**` for `TurnResult` and `**BREAKING (behaviour)**` for a turn that now
+    closes without running the loop. `CompletionRequest`/`CompletionResponse` are untouched, so no
+    `E0639` is owed.
+  - >
+    N4: worked examples on `TurnKind` (a compiled doctest, not `no_run`), on `TurnResult::kind`, and
+    on `EventKind::Answered` — the last one constructs a `RunEvent` and runs the observer, so the
+    example executes the variant rather than naming it. All three are in the 369 passing doctests.
+  - >
+    `EventKind::Answered` carries **`turn_id` only, not `run_id`**, which the contract's prose named.
+    Stated rather than glossed: the kind is flattened into the event envelope, so a `run_id` field is
+    a duplicate serde key and the variant would not round-trip — the same constraint
+    `EventKind::Rewound` records in its own doc comment. Which run served the turn is the envelope's
+    own `run_id`, which is where every other variant reads it from, so the substance of the criterion
+    ("an attached process can tell an answer from a run without reading the store", and it knows
+    which run) holds in full. `observe::tests::every_kind_produces_one_of_every_tag_and_no_others`
+    and `event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained` both pass with
+    `"answered"` in `EVENT_NAMES`.
 
 - id: US-IO-HARNESS-0.37.0-T04
   summary: >
@@ -104,7 +184,7 @@ tasks:
   why_required: >
     Each of these is the assertion that kills an implementation which passes F1. Without them the
     release ships a reply that is quietly free, quietly ungated, or quietly resumable.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.37.0-T03
   acceptance_criteria:
@@ -134,8 +214,61 @@ tasks:
     is deliberate — a soft assertion on a call that should never happen is a test that passes when
     the call is made once and swallowed.
   files:
-  - tests/session.rs
-  evidence: []
+  - tests/session_reply.rs
+  evidence:
+  - >
+    F3: `session_reply::a_reply_is_billed_and_the_trace_says_what_it_cost` — passed.
+    `Store::run_summary` reports 7 tokens and 0 steps for the reply; the `provider_calls` row exists
+    with provider `mock`, model `mock-1` and its usage. The control is a `with_token_budget(1)`
+    contract, under which the reply's one completion is refused as `CostBudgetExceeded` rather than
+    served free, and `spent_tokens` still reads 7 — the ceiling is enforced against a number the
+    store actually holds.
+  - >
+    Sabotage 3, `Store::spent_tokens` made to ignore `turn_kind` so a reply's spend reads 0: 7
+    passed, 1 failed — F3 alone. This is the "quietly free" failure the criterion exists to catch:
+    it passes every assertion in F1.
+  - >
+    F5: `session_reply::a_contract_carrying_a_criterion_is_never_answered` — passed. `turn_bounded`
+    with `Verification::WorkspaceFileContains` and a provider that stops on text on the first
+    completion reports `TurnKind::Run`, and `store.gate_attempts` is non-empty. The control is the
+    identical contract with no verification, which classifies as `TurnKind::Reply` and records no
+    gate attempt.
+  - >
+    **A sabotage that failed nothing, reported rather than propped up.** The first F5 sabotage —
+    `extras.classify = true` in `Session::drive`, ignoring the caller's `Verification` — changed no
+    test result (8 passed). The second — dropping the criterion check inside the loop's classify
+    branch — also changed nothing (8 passed). The finding is that F5 was **over-determined**: the
+    session refuses to ask for classification when a criterion is declared, and the loop's
+    `finished()` predicate independently carries the same condition, so removing either alone leaves
+    the other holding. Removing **both** does fail F5 (7 passed, 1 failed), so the criterion is
+    genuinely tested rather than vacuous. The outer guard was nevertheless doing work no test read:
+    it also decides the system prompt, so a gated turn would have been offered the conversational
+    opening. F5 gained an assertion that a gated turn's first completion is asked with
+    `"Do not explain; call tools."`, and the first sabotage now fails (7 passed, 1 failed). Both
+    guards are kept — one is the session stating the rule, the other is the loop refusing to act on
+    it — and the test now distinguishes them.
+  - >
+    F6: `session_reply::a_turn_that_died_while_answering_is_not_resumable_work` — passed. The
+    fixture is a provider whose completion never returns, driven under a 100ms timeout and then
+    dropped: the run row is left `running`, typed `reply`, with **0** step rows.
+    `Store::check_resumable` returns `Err(Error::Resume { .. })` naming it, and taking the turn again
+    produces a different `run_id`. The control is a plain `start_run` left in the same unfinished
+    state, which `check_resumable` still accepts — so the refusal is about what the run was, not
+    about it having no steps.
+  - >
+    A provider returning `Err` was tried as F6's fixture first and is the **wrong** shape: the loop
+    records an escalation step, so `steps` was 1 and the test failed. A run that got to explain
+    itself is not a run that was killed. Recorded because it is the kind of fixture that looks right
+    and measures the wrong thing.
+  - >
+    Sabotage 6, `turn_kind` written at the close instead of before the first completion: 6 passed, 2
+    failed — F6 (the dead turn is offered as resumable work) and F3.
+  - >
+    F7: `session_reply::a_reply_never_reaches_the_approver_or_the_plan_gate` — passed. Arm A re-run
+    with an `Approver` whose `decide` panics unconditionally and a policy that asks about writes. The
+    approver is not called (the test would panic rather than assert), no `pending_approvals` row is
+    written, no sandbox `selected` event is recorded, an `EventKind::Answered` carrying this turn's
+    `turn_id` reaches the observer, and **no** `EventKind::Step` does.
 
 - id: US-IO-HARNESS-0.37.0-T05
   summary: >
@@ -144,7 +277,7 @@ tasks:
     control that makes it fail when such a call is added; plus the dependency count.
   why_required: >
     Classification for `run_with` is an excluded item, and an exclusion nothing checks is a comment.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.37.0-T02
   acceptance_criteria:
@@ -158,8 +291,22 @@ tasks:
     executes the same loop as 0.36.1 from step one onward, asserted by the step-row shape rather than
     by inspection.
   files:
-  - tests/session.rs
-  evidence: []
+  - tests/session_reply.rs
+  evidence:
+  - >
+    N1: `cargo tree | wc -l` reads **402** on macOS, unchanged from 0.36.1. No manifest entry moves;
+    the classification reads a `CompletionResponse` the loop already holds.
+  - >
+    N3: `session_reply::the_one_shot_entry_points_reach_no_classification` — passed. The test reads
+    `src/run.rs`, extracts the bodies of `run_with` and `run_with_observed`, and asserts neither sets
+    the only switch there is. It carries two controls: a spliced-in
+    `TurnExtras { classify: true, .. }` line the checker must report, and a comment mentioning the
+    word which it must not — so it reports where the field is set rather than where the word appears.
+    Line endings are normalised first, so a Windows checkout parses the same file.
+  - >
+    N3, second half: a promoted turn executes the same loop as 0.36.1 from step one onward, asserted
+    by the step-row shape in F2 (two completions, two step rows, the first being the call that
+    classified it) rather than by inspection.
 
 - id: US-IO-HARNESS-0.37.0-T06
   summary: >
@@ -169,7 +316,7 @@ tasks:
   why_required: >
     N5 is an acceptance criterion, and the asymmetry this design accepts by choice is only honest if
     a reader finds it where they look for limits rather than in a commit message.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.37.0-T03
   acceptance_criteria:
@@ -186,7 +333,25 @@ tasks:
   - docs/guide/sessions.md
   - README.md
   - CHANGELOG.md
-  evidence: []
+  - Cargo.toml
+  evidence:
+  - >
+    N5: `docs/CONTRACT.md` gains "When a turn is answered instead of run, and what that costs
+    (0.37.0)", stating all seven bounds the criterion names — only the first completion of a turn can
+    be a reply; prose plus a tool call is work; the retype asymmetry, named as accepted by choice; a
+    reply is billed; a reply is not resumable; a contract carrying a criterion is never a reply;
+    `run_with` never classifies; and the system prompt for a turn's first completion changed for
+    every session turn rather than only for greetings. The no-word-list rule is stated there too.
+  - >
+    `docs/guide/sessions.md` gains "Not every turn is work (0.37.0)" with a compiled-shape example
+    and its own "The limits of it" list. No new guide page, so no `GUIDES` or `CAPABILITIES.md`
+    bookkeeping — sessions already have a page, which is the 0.31.0 and 0.36.0 precedent.
+    `cargo test --test guide_pages` — 9 passed.
+  - >
+    `cargo test --test docs_drift --test readme --test changelog --test public_api` — 15, 7, 5 and 8
+    passed. The version bump to 0.37.0 and README's `io-harness = "0.37"` are what
+    `readme_dependency_version_matches_cargo_toml` checks, and it caught the README line before this
+    was committed.
 
 - id: US-IO-HARNESS-0.37.0-T07
   summary: >
