@@ -62,7 +62,7 @@ tasks:
     the live evidence takes — and `WebFlavor::OpenAi` serves both OpenAI and the 21 endpoints
     reached through `Compatible`, where an unknown body key is a 400 this crate would have caused.
     The gate and its negative control are the same piece of work.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.38.0-T01
   acceptance_criteria:
@@ -88,7 +88,40 @@ tasks:
     method and no request field changed.
   files:
   - src/provider/openai_wire.rs
-  evidence: []
+  evidence:
+  - >
+    F3, written before the implementation and watched fail: `cargo test --lib provider::openai_wire`
+    on the unmarked body failed `cache_wire::the_openrouter_body_carries_one_breakpoint_on_its_system_part`
+    at `src/provider/openai_wire.rs:669` ("a parts array" — the content was still a bare string) and
+    `web_wire::no_effort_leaves_both_bodies_exactly_as_they_were` at `:797`. F2's test passed at that
+    point, correctly: nothing was being sent to either flavour yet.
+  - >
+    F2 and F3 after the implementation: `cargo test --lib provider::openai_wire` — **18 passed, 0
+    failed**. `the_openai_body_carries_no_breakpoint_and_keeps_its_bare_system_string` asserts the
+    system content is still a bare string and that `cache_control` appears **zero** times anywhere in
+    an OpenAI-flavoured body. `the_openrouter_body_carries_one_breakpoint_on_its_system_part` asserts
+    a one-element parts array whose `text` is the request's own string, `cache_control.type` is
+    `ephemeral`, the **user** turn is untouched, and the marker appears exactly once.
+  - >
+    F3's discriminating comparison, which is what makes the pair mean something: both bodies are
+    rebuilt with the system message stripped and asserted **equal**. An implementation that reshapes
+    the shared body for one flavour and quietly changes anything else fails there rather than
+    passing on the one key it was asked about.
+  - >
+    F2's sabotage, executed rather than described. `cached_system` was changed to
+    `WebFlavor::OpenAi | WebFlavor::OpenRouter => Some(...)` — the marker sprayed at both wires, which
+    is the failure that would put an unknown body key in front of the 21 endpoints reached through
+    `Compatible`. Result: **2 failed, 16 passed**, and the two that failed were exactly
+    `cache_wire::the_openai_body_carries_no_breakpoint_and_keeps_its_bare_system_string` and
+    `web_wire::no_effort_leaves_both_bodies_exactly_as_they_were`. The file was restored from a copy
+    taken before the sabotage and re-run: 18 passed, 0 failed.
+  - >
+    N5, the shape rather than a promise: the marker is applied by `cached_system(flavor, &request.system)`,
+    a `match` on the flavour that returns `None` for `WebFlavor::OpenAi`. It is the third
+    per-vendor difference resolved inside the shared builder, after `web_key` (0.22.0) and
+    `effort_key` (0.31.0), and it is absent from the body entirely rather than sent as a default —
+    which is what keeps every non-asking request byte-identical. No `Provider` trait method and no
+    field on `CompletionRequest` changed, so an out-of-tree provider sends what it sent in 0.37.0.
 
 - id: US-IO-HARNESS-0.38.0-T03
   summary: >
