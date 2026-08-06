@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.37.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -447,3 +447,159 @@ open_questions:
   the first token. They are the same run and the distinction may be worth nothing — but if the
   prompt-wording risk above turns out to bite, the count of promotions is the measurement that would
   show it.
+
+released_at: 2026-08-06T00:00:00Z
+mode: published
+delivered: >
+  An embedder holds a conversation in which not every turn is work. "hi", "thanks" and "what can you
+  do" cost one completion each and leave behind no step, no gate attempt, no checkpoint, no
+  snapshot, no plan gate and no call to the approver — while the same entry point, given the same
+  words followed by work, runs the full loop exactly as 0.36.1 did, from step one onward.
+
+  The decision is the model's and it costs nothing extra. The turn's first completion is made with
+  the workspace tools offered, the conversation seeded and the operator's text as the goal, and what
+  the model does with it decides what the turn was: stopping on text is an answer, reaching for a
+  tool promotes the turn and the loop continues from that same completion. A turn that answers makes
+  one provider call; a turn that promotes and takes two steps makes two, not three.
+
+  There is no word list in this crate, in any form. io-cli's twenty-two-entry table of English
+  greetings — the workaround that motivated the release — can be deleted rather than relocated,
+  because `TurnResult::kind` is the fact an embedder branches on.
+
+evidence:
+  tests:
+  - >
+    `cargo test --all-features` — exit 0, **63 suites, 1435 tests passed, 0 failed**, run against
+    the tree being tagged.
+  - >
+    `cargo test` (default polarity) — exit 0, **63 suites, 1356 tests passed, 0 failed**,
+    including 369 doctests. A SEPARATE invocation from the all-features one, run last against the
+    shipped tree, per trap 31.
+  - >
+    `cargo test --test session_reply` — **8 passed, 0 failed**. F1 through F7 plus N3's
+    source-reading check. Every criterion's evidence is recorded task by task in
+    `execution/archive/0.37.0.yaml` and `execution/tasks.yaml`.
+  - >
+    **Seven sabotages, each one aimed at a named criterion, each spliced into the shipped source and
+    reverted:** (1) classify-with-a-call-then-re-ask, F2's own forbidden implementation → F2 and F1
+    fail on the call count while `TurnKind` stays perfectly correct throughout; (2) the reply's early
+    return deleted → F1, F3 and F7 fail; (3) `spent_tokens` made to ignore `turn_kind` → F3 fails
+    alone, the "quietly free" reply; (4) the reply dropped from `finish_turn` → F4 fails alone;
+    (5) the criterion guard removed → see the finding below; (6) `turn_kind` written at the close
+    instead of before the first completion → F6 and F3 fail; (7) the conversational prompt left on
+    past the first completion → F2 fails.
+  - >
+    **The sabotage that failed nothing, and what it found.** `extras.classify = true` — the session
+    ignoring the caller's `Verification` — changed no test result. Nor did removing the loop's own
+    criterion check. F5 was **over-determined**: the session refuses to ask for classification when a
+    criterion is declared, and the loop's `finished()` predicate independently carries the same
+    condition, so removing either alone left the other holding. Removing both does fail F5, so the
+    criterion was tested rather than vacuous. But the outer guard was doing work nothing read — it
+    also decides which system prompt the first completion is made with, so a gated turn would have
+    been offered the conversational opening with no test objecting. F5 gained that assertion, the
+    sabotage now fails, and both guards are kept: one is the session stating the rule, the other is
+    the loop refusing to act on it.
+  - >
+    `cargo test --test cross_version` — 5 passed, and
+    `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed, after
+    `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`. Both directions executed
+    against a real 0.29.0 binary rather than asserted on paper. `CHECKPOINT_FORMAT` asserted equal to
+    7 and asserted unmoved by opening a 0.22.0 store.
+  - >
+    N6, the query plan rather than a clock:
+    `state::tests::a_replys_token_read_reaches_its_rows_through_an_index` passes.
+    `EXPLAIN QUERY PLAN` on the reply's token read reports
+    `SEARCH provider_calls USING INDEX provider_calls_run (run_id=?)` against 64 runs after
+    `ANALYZE`; the control filters `finish_reason`, a column in **no** index, and reports a scan. No
+    wall-clock assertion was written.
+  - >
+    **O1, the three-OS matrix, on the commit being released:** GitHub Actions run **31063716477**
+    on PR #118 — `completed / success`, **all 18 checks pass**, no job skipped. Both feature
+    polarities on all three operating systems, all three doctest legs, `msrv`, `lint`,
+    `docs.rs (nightly)`, `examples (compile)`, `cross-version-0.29.0`, `links-consumer`, and both
+    CodeQL analyses. Wall clock per leg: `test (windows, all)` 12m, `test (windows, default)` 9.2m,
+    `doctest (windows)` 5.9m, `doctest (ubuntu)` 4.8m, `test (macos, all)` 3.4m,
+    `test (macos, default)` 2.7m, `test (ubuntu, all)` 2.8m, `test (ubuntu, default)` 2.6m,
+    `doctest (macos)` 2.5m. Nothing in this release is skipped on Windows: its one source-reading
+    test normalises `\r\n` before parsing and joins no path from a slash-bearing literal.
+  builds:
+  - >
+    `cargo tree | wc -l` — **402**, unchanged from 0.36.1. No manifest entry moved; the
+    classification reads a `CompletionResponse` the loop already held.
+  - >
+    `cargo fmt --check` — clean. `cargo clippy --all-targets --all-features -- -D warnings` — clean.
+  - >
+    MSRV, both feature polarities, on the declared 1.95 toolchain: `cargo +1.95 check --all-targets`
+    and `cargo +1.95 check --all-targets --all-features` — both finished, 0 errors.
+  - >
+    O2, the nightly docs.rs gate run before the release PR was opened rather than inferred from a
+    stable `cargo doc`:
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — finished,
+    zero warnings, `target/doc/io_harness/index.html` generated.
+  - >
+    O3: `cargo clean` (36,766 files, 13.5 GiB removed) then `cargo package --locked` — the packaged
+    crate compiled from `target/package/io-harness-0.37.0`, producing
+    `io-harness-0.37.0.crate` at **1,336,862 bytes**. `df -h .` before and between build steps
+    throughout; the volume never fell below 30 GiB free.
+  reviews: []
+  deployments: []
+  health_checks: []
+
+known_limitations:
+- >
+  **This record was sealed before the crates.io upload.** The publish follows the develop-to-main
+  merge and the GitHub Release, by hand, and is always last.
+- >
+  **The system-prompt wording was never put in front of a live vendor.** The contract's
+  `resource_profile` expected "live runs against at least two vendors before the wording settles",
+  and its risk register named that as the mitigation for the one genuinely uncertain part of this
+  release. It did not happen: every arm of every criterion is driven by a scripted provider. What is
+  proven is that the wording reaches the first completion and only the first, that a scripted
+  completion which stops on text closes as a reply and one carrying a call promotes — that is, the
+  machinery. What is **not** proven is how often a real model answers in prose where it should have
+  acted. That is the release's accepted asymmetry and its size is unmeasured. It is stated in
+  `docs/CONTRACT.md` under the same heading, so a reader meets it where they look for limits, and it
+  is the first thing a 0.37.1 should measure.
+- >
+  **`EventKind::Answered` carries `turn_id` only, not `{ turn_id, run_id }` as the contract's prose
+  named.** Stated rather than glossed: the kind is flattened into the event envelope, so a `run_id`
+  field is a duplicate serde key and the variant would not round-trip — the same constraint
+  `EventKind::Rewound` records in its own doc comment, and `every_variant_round_trips` is what would
+  have caught it. Which run served the turn is the envelope's own `run_id`, where every other variant
+  reads it from, so the criterion's substance — an attached process can tell an answer from a run,
+  and knows which run, without reading the store — holds in full.
+- >
+  **F1's "snapshot row count is zero" is read through `rewind_run`, not off the `snapshots` table.**
+  The store exposes no public listing of snapshots (`snapshot_paths` is `pub(crate)`), so rather
+  than widen the public API for a test, the assertion is behavioural: a rewind of the reply's run
+  puts **0** files back, and a rewind of the control arm — which writes a file — puts **1** back. The
+  same fact, stated as a behaviour, with the control that makes the zero mean something.
+- >
+  **`cargo tree` was counted on macOS only.** The contract asked for macOS and Linux. The Linux legs
+  of CI build and test the crate but do not count the tree, and no dependency edge in this release is
+  platform-conditional — nothing was added at all. The number is 402 on this machine and the claim
+  for Linux rests on the manifest being unchanged rather than on a second count.
+- >
+  **`Store::check_resumable` now refuses one run it did not refuse before**, and that is wider than
+  "a reply". A session turn typed as a classifying turn and left `running` is refused whatever it
+  *would* have become — including one killed after its first completion reached for a tool but
+  before the row was corrected to `run`. That window is one completion long and holds no committed
+  step, so the refusal costs a re-ask rather than work; but it is a behaviour change to a public
+  method for a class of run slightly larger than the one the criterion named.
+- >
+  **A run that answers is still a `runs` row.** "How many runs did this session do" is answerable
+  only by reading `turn_kind`, which is `pub(crate)`. That was deliberate — the fact reaches a caller
+  as `TurnResult::kind`, and a second public reader is a second thing to keep true — but it means a
+  reader with only a `Store` and a run id cannot ask the question. Recorded because the contract's
+  own `business_value` names that query as one of the costs of the old behaviour.
+- >
+  **`turn_kind` is not read on any resume path except `check_resumable`.** A reply cannot be resumed,
+  so nothing else needed it; if a later release makes a promoted turn distinguishable in the trace
+  (an open question below), that is where it will be read.
+- >
+  Every `known_limitations` entry in `docs/CONTRACT.md` that predates this release was left standing.
+  None was deleted on the strength of a release having probably fixed it.
+
+supersedes: 0.36.1
+next_recommended_version: null
+immutable: true

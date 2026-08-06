@@ -18,10 +18,10 @@ release_fit:
     - >
       The change is small where the file is large. `src/run.rs` is over 10,500 lines, but the
       classification is one branch taken directly after the first completion returns, in a place the
-      loop already special-cases — `response.tool_calls.is_empty()` already pushes the
-      `(no tool call)` observation, so the reply's text reaches `Session` through the same
-      `last_message` read that serves every turn today. No new channel back from the loop is needed
-      and no signature moves.
+      loop already special-cases — `response.tool_calls.is_empty()` already pushes the `(no tool
+      call)` observation, so the reply's text reaches `Session` through the same `last_message` read
+      that serves every turn today. No new channel back from the loop is needed and no signature
+      moves.
     - >
       Every absence F1 asserts is an absence of something written *after* the point the branch
       returns from — `commit_step`, the gate, the snapshot, the plan decision — so "a reply writes

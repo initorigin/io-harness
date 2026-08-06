@@ -360,7 +360,7 @@ tasks:
   why_required: >
     Every one of these has caught something in a previous release, and the nightly rustdoc line has
     caught something in four of the last five.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.37.0-T04
   - US-IO-HARNESS-0.37.0-T05
@@ -382,4 +382,31 @@ tasks:
   files:
   - Cargo.toml
   - Cargo.lock
-  evidence: []
+  evidence:
+  - >
+    O1, locally: MSRV 1.95 in both feature polarities — `cargo +1.95 check --all-targets` and
+    `cargo +1.95 check --all-targets --all-features`, both finished with 0 errors, which is exactly
+    what the CI `msrv` job runs. `cargo test --all-features` exit 0, 63 suites, 1435 passed;
+    `cargo test` exit 0, 63 suites, 369 doctests. No test is skipped on Windows by this release: the
+    one source-reading test it adds normalises `\r\n` before parsing, and no path in it is joined
+    from a slash-bearing literal.
+  - >
+    O1, the three-OS matrix itself: GitHub Actions run 31063716477 on PR #118 —
+    `completed / success`, all 18 checks pass, no job skipped.
+  - >
+    O2: `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` —
+    finished, zero warnings, `target/doc/io_harness/index.html` generated. Run before the release PR
+    was opened, not inferred from a stable `cargo doc`.
+  - >
+    O3: `cargo clean` removed 36,766 files and 13.5 GiB, then `cargo package --locked` compiled the
+    packaged crate from `target/package/io-harness-0.37.0` and produced
+    `io-harness-0.37.0.crate` at 1,336,862 bytes. Every local build ran with
+    `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0`, with `df -h .` before and between build
+    steps; free space never fell below 30 GiB.
+  - >
+    A trap worth recording: `tests/plugin.rs` reads this machine's real `~/.config/io/io.toml`,
+    which carries an `api_key` field the harness's config schema rejects, so 11 of its tests failed
+    for a reason that has nothing to do with this release. Confirmed environmental by running the
+    same suite with `XDG_CONFIG_HOME` redirected — 12 passed — and by running it on the release base
+    with the same redirect, where it also passes. Every gate figure above was taken with
+    `XDG_CONFIG_HOME` redirected.

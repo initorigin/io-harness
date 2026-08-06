@@ -943,13 +943,13 @@ versions:
   - version: 0.37.0
     outcome: >
       A conversation answers without opening a run. An embedder holds a session in which "hi",
-      "thanks" or "what can you do" costs one completion and leaves behind no plan gate, no
-      sandbox, no verification gate, no checkpoint and no step — while the same entry point,
-      given the same words followed by work, runs the full loop exactly as it does today.
+      "thanks" or "what can you do" costs one completion and leaves behind no plan gate, no sandbox,
+      no verification gate, no checkpoint and no step — while the same entry point, given the same
+      words followed by work, runs the full loop exactly as it does today.
 
-      The classification is the model's own and costs nothing extra: the turn's first completion
-      is made with the workspace tools offered, and what the model does with them decides what the
-      turn was. A completion that stops on text is an answer. A completion that reaches for a tool
+      The classification is the model's own and costs nothing extra: the turn's first completion is
+      made with the workspace tools offered, and what the model does with them decides what the turn
+      was. A completion that stops on text is an answer. A completion that reaches for a tool
       promotes the turn to a run and continues from that same completion, so neither shape pays for
       a second call. There is no word list, in this crate or in the program embedding it, and
       therefore nothing that only works in English.
@@ -958,7 +958,7 @@ versions:
       readable in the trace as an answer rather than as work, and part of the conversation the next
       turn reads. What it is not is a run that reports having done something.
     detail: specified
-    status: planned
+    status: released
   - version: 0.38.0
     outcome: >
       A long conversation stops paying full price for its own history. Where a provider caches a
@@ -979,9 +979,9 @@ versions:
       A conversation can fan out. An operator asks for something wide inside a session — migrate
       these forty handlers, review these twelve files — and the turn decomposes into contained
       children under the same session, the same shared ledger and the same inherit-and-narrow
-      boundary, reporting into the same transcript. Today that requires leaving the conversation
-      for a one-shot run, because the sub-agent tool is registered only inside the tree loop, which
-      the conversation entry points cannot reach: a run is a tree or a turn and not both.
+      boundary, reporting into the same transcript. Today that requires leaving the conversation for
+      a one-shot run, because the sub-agent tool is registered only inside the tree loop, which the
+      conversation entry points cannot reach: a run is a tree or a turn and not both.
     detail: outline
     status: planned
   - version: 0.40.0
