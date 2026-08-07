@@ -187,7 +187,7 @@ tasks:
   why_required: '`shell` is in scope and it is the tool whose containment is easiest to half-implement:
     a line''s first stage wrapped and its later stages spawned free passes any test written against
     a one-stage line, while leaving the escape the release exists to close.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.40.0-T01
   acceptance_criteria:
@@ -202,7 +202,36 @@ tasks:
   - src/run.rs
   - src/tools/shell.rs
   - tests/shell_contained.rs
-  evidence: []
+  evidence:
+  - '`shell` cannot hand an argv to `Sandbox::run` at all — its stages are piped into one another, so
+    the tool owns every `Child` and cannot delegate the spawn. Containment therefore attaches by **wrapping
+    each stage''s argv** with the backend''s own wrapper (`sandbox-exec -p <profile>` on macOS, `unshare`
+    on Linux) plus the same rlimits the sandbox''s runner applies.'
+  - 'Two crate-internal helpers were extracted in `src/sandbox.rs` so there is one definition rather
+    than two copies: `apply_rlimits(&mut Command, &SandboxLimits)` — lifted out of `run_capped_hooked`,
+    which now calls it — and `wrap_argv(config, workdir, allow_network, argv) -> (Backend, Vec<String>)`.
+    Two copies of a `pre_exec` block is two places for a cap to lapse, and the lapse is silent because
+    an uncapped child runs fine.'
+  - '`wrap_argv` returns the backend that **actually applied**, not the one asked for, so a host whose
+    primitive failed its probe returns `PortableFloor` with an unwrapped argv and the caller records
+    what really happened.'
+  - 'The extraction is behaviour-neutral, proven before `shell` used any of it: `cargo test --test sandbox`
+    — **8 passed, 0 failed** — with no test in that file edited.'
+  - 'F4, `cargo test --test exec_contained` — **10 passed, 0 failed in 0.13s**. The line is `echo contained
+    | tee <path outside the workspace>`: stage one is harmless and must succeed, stage two is the one
+    that tries to leave. Contained, the file does not appear. The negative control — the identical line
+    with the field absent — still writes it.'
+  - Sabotage **S7** — wrap only stage 0 (`self.sandbox.as_ref().filter(|_| i == 0)`), which is the cheapest
+    wrong implementation and the one a one-stage test cannot see. `a_contained_shell_line_contains_its_later_stages_too`
+    FAILED and the other nine passed. Reverted.
+  - '`cargo test --test shell --test handles` — **14 + 11 = 25 passed, 0 failed**, neither file edited.
+    The `shell_start` handles are untouched and uncontained by design: a handle outlives the call that
+    made it, and `Shell::contained` is set only for a foreground line.'
+  - '**A limit this task creates and owes to `docs/CONTRACT.md` (T07).** A contained `shell` stage gets
+    filesystem confinement, egress denial and the CPU/open-files rlimits, but **not** the memory RSS
+    monitor and **no cap attribution** — those live in the sandbox''s own runner, which a piped line
+    does not go through. So a `shell` stage killed by a cap is not reported as `Capped` the way an `exec`
+    command is. Stated rather than discovered.'
 - id: US-IO-HARNESS-0.40.0-T05
   summary: Populate the mount namespace `LinuxSandbox` already unshares, so writes outside the workdir
     fail on Linux, and keep the probe, the wrapper-failure path and the floor fallback intact.

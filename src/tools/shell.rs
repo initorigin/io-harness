@@ -1095,6 +1095,25 @@ pub(crate) struct Shell {
     timeout: Option<Duration>,
     cap: usize,
     capture: Option<Capture>,
+    /// The containment this run asked for (0.40.0), or `None` for the 0.17.0
+    /// default. Set only for a foreground line: a `shell_start` handle outlives
+    /// the call that made it, and what a resumed run should do with a handle
+    /// whose sandbox no longer exists is a design question this release
+    /// deliberately does not answer.
+    sandbox: Option<ShellSandbox>,
+}
+
+/// What a contained line needs at each stage's spawn site.
+///
+/// Held rather than resolved once because the wrapping is per stage: a line is
+/// several processes and the escape this release closes is a *later* stage, not
+/// the first one.
+pub(crate) struct ShellSandbox {
+    pub(crate) config: crate::sandbox::SandboxConfig,
+    /// The workspace root — the directory writes are confined to. Not the
+    /// stage's `cwd`, which `cd` may have moved somewhere below it.
+    pub(crate) workdir: std::path::PathBuf,
+    pub(crate) allow_network: bool,
 }
 
 /// Where a detached line's output goes, and who to tell about its processes.
@@ -1129,6 +1148,7 @@ impl Shell {
             timeout: Some(timeout),
             cap,
             capture: None,
+            sandbox: None,
         }
     }
 
@@ -1144,7 +1164,19 @@ impl Shell {
             timeout: None,
             cap,
             capture: Some(capture),
+            sandbox: None,
         }
+    }
+
+    /// Run every stage of the line inside the sandbox this contract asked for.
+    ///
+    /// Per stage, and that is the whole of it. A line is several processes, and
+    /// an implementation that wrapped only the first would pass any test written
+    /// against a one-stage line while leaving the escape open — the second stage
+    /// of `true | tee /somewhere/else` is as much a command as the first.
+    pub(crate) fn contained(mut self, sandbox: Option<ShellSandbox>) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Execute an authorised line.
@@ -1254,10 +1286,32 @@ impl Shell {
                 );
                 continue;
             }
-            let mut cmd = TokioCommand::new(&stage.argv[0]);
-            cmd.args(&stage.argv[1..])
+            // 0.40.0 — every stage is wrapped, not just the first. The wrapper
+            // is the backend's own (`sandbox-exec` on macOS, `unshare` on Linux),
+            // taken from `wrap_argv` rather than rebuilt here, because a line's
+            // stages are piped into one another and this tool therefore owns
+            // every `Child` and cannot hand an argv to `Sandbox::run`.
+            let argv = match &self.sandbox {
+                Some(sb) => {
+                    crate::sandbox::wrap_argv(
+                        &sb.config,
+                        &sb.workdir,
+                        sb.allow_network,
+                        &stage.argv,
+                    )
+                    .1
+                }
+                None => stage.argv.clone(),
+            };
+            let mut cmd = TokioCommand::new(&argv[0]);
+            cmd.args(&argv[1..])
                 .current_dir(&planned.cwd)
                 .kill_on_drop(true);
+            // The same caps the sandbox's own runner applies, through the same
+            // helper rather than a second copy of the `pre_exec` block.
+            if let Some(sb) = &self.sandbox {
+                crate::sandbox::apply_rlimits(&mut cmd, &sb.config.limits);
+            }
 
             // A detached line's stages go into containment of their own, and a
             // foreground line's stages deliberately do not. The foreground case

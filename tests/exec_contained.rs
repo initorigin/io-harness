@@ -466,3 +466,76 @@ async fn egress_under_containment_is_all_hosts_or_none_and_never_the_named_host(
     );
     server.abort();
 }
+
+// ---------------------------------------------------------------------------
+// F4 — `shell` contains every sub-command, not the first
+// ---------------------------------------------------------------------------
+
+fn shell_call(line: &str) -> ToolCall {
+    ToolCall {
+        name: "shell".into(),
+        arguments: json!({ "line": line }),
+    }
+}
+
+/// The hole most likely to be left open, because it is invisible to any test
+/// written against a one-stage line. `shell` parses a line into sub-commands and
+/// spawns each of them; an implementation that wraps only the first has closed
+/// nothing — the escape is simply written by the second.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_contained_shell_line_contains_its_later_stages_too() {
+    let dir = workspace();
+    let escape = EscapeDir::new("shell-stage-two");
+    let target = escape.file();
+    let store = Store::memory().unwrap();
+    // Stage one is harmless and must succeed; stage two is the one that tries to
+    // leave. `tee` writes the path it is given.
+    let line = format!("echo contained | tee {}", target.display());
+    let provider = MockScript::new(vec![vec![shell_call(&line)]]);
+
+    run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !target.exists(),
+        "the second stage of a contained line wrote outside the workspace: {}",
+        target.display()
+    );
+}
+
+/// The negative control for the line above, and the same protection F1's control
+/// gives `exec`: with the field absent, `shell` still does what it did in 0.39.0.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_uncontained_shell_line_still_writes_outside_the_workspace() {
+    let dir = workspace();
+    let escape = EscapeDir::new("shell-uncontained");
+    let target = escape.file();
+    let store = Store::memory().unwrap();
+    let line = format!("echo uncontained | tee {}", target.display());
+    let provider = MockScript::new(vec![vec![shell_call(&line)]]);
+
+    run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        target.exists(),
+        "0.39.0 shell behaviour is unchanged when the field is absent: {} should exist",
+        target.display()
+    );
+}

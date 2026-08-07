@@ -7955,7 +7955,16 @@ async fn dispatch(
                 ShellCheck::Stop(d) => return Ok(d),
             };
 
-            let outcome = Shell::new(exec_timeout, cap).run(&parsed, &plan).await?;
+            let outcome = Shell::new(exec_timeout, cap)
+                .contained(
+                    exec_sandbox.map(|config| crate::tools::shell::ShellSandbox {
+                        allow_network: ws.policy().permits_any_egress(),
+                        config: config.clone(),
+                        workdir: ws.root().to_path_buf(),
+                    }),
+                )
+                .run(&parsed, &plan)
+                .await?;
             let (decision, obs) = match &outcome {
                 ShellOutcome::Unavailable { reason } => (
                     "shell command unavailable".to_string(),
