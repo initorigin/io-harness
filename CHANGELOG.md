@@ -26,6 +26,71 @@ notes are produced from it.
 
 ### Security
 
+## [0.39.0] - 2026-08-06
+
+A conversation can fan out.
+
+An operator asks for something wide inside a session — migrate these forty
+handlers, review these twelve files — and until now they got one agent working
+through forty items in one context window, or they left the conversation. The
+reason was structural rather than a missing feature: the `spawn_agent` tool is
+registered inside the agent-tree loop, and no session turn reached that loop. A
+run was a tree or a turn and not both.
+
+**A turn can now be a tree.** `Session::turn_contained` and
+`Session::turn_contained_observed` take a `Containment` and drive the turn through
+the tree loop, so the agent answering it may decompose the work into contained
+sub-agents. Every mechanism the fan-out uses already shipped — inherit-and-narrow
+policy, one shared ledger, per-tier concurrency slots with a durable queue, spawn
+accounting, tree-wide resume. What 0.39.0 adds is the caller.
+
+**It is still one turn.** A turn that spawned forty agents is one row in
+`session_turns`, one entry in `Session::history`, and one move of the session
+head. The children are runs under the turn's own run, reconstructable through
+`Store::agent_events` and `Store::children`.
+
+**A child is given its goal, not the conversation.** The transcript reaches the
+root agent and stops there — forty children each carrying it is the multiplied
+version of the cost the context budget exists to bound, and a child that has read
+the conversation is one that can act on an instruction the operator has since
+withdrawn.
+
+**Nothing else moved.** No public item is removed or altered, no type gains a
+field, no table is created or migrated, `CHECKPOINT_FORMAT` is unchanged, and
+`docs/public-api.txt` is byte-identical: the two additions are methods on an
+existing type, and the crate root's surface is unchanged. The five turn entry
+points that predate this still never offer the spawn tool, so a session that does
+not pass a `Containment` behaves exactly as it did in 0.38.0. Upgrading changes no
+code.
+
+**The limits, stated rather than discovered.** The ledger is per turn and not per
+session, so a conversation has no single ceiling. A contained turn that pauses is
+continued with the `resume_tree_*` family on `TurnResult::run_id`, and its turn row
+reports the pause rather than the continuation. Both are in `docs/CONTRACT.md`.
+
+### Added
+
+- `Session::turn_contained` — take a turn that may fan out, under a `Containment`
+  that bounds the whole resulting tree.
+- `Session::turn_contained_observed` — the same, reporting to an `Observer` as the
+  fan-out happens, and streaming the root's text. `EventKind::Spawned`,
+  `SpawnRefused`, `Fleet` and `SpendDraw` reach a session's observer for the first
+  time.
+
+### Changed
+
+- `docs/guide/sessions.md` and `docs/guide/composition.md` document the fan-out
+  from both sides; `docs/CONTRACT.md` states what a contained turn gives and what
+  it does not.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.38.0] - 2026-08-06
 
 A long conversation stops paying full price for the part of itself that never

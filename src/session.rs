@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::mpsc;
 
 use crate::approve::Approver;
+use crate::containment::Containment;
 use crate::context::{bound, entry_cap_chars, ObsKind};
 use crate::error::{Error, Result};
 use crate::observe::{Ignore, Observer};
@@ -257,6 +258,7 @@ impl Session {
             policy,
             approver,
             &Ignore,
+            None,
             TurnExtras::default(),
         )
         .await
@@ -310,6 +312,7 @@ impl Session {
             policy,
             approver,
             observer,
+            None,
             TurnExtras {
                 stream: true,
                 ..Default::default()
@@ -365,6 +368,7 @@ impl Session {
             policy,
             approver,
             observer,
+            None,
             TurnExtras {
                 stream: true,
                 steer: Some(steer),
@@ -422,6 +426,7 @@ impl Session {
             policy,
             approver,
             &Ignore,
+            None,
             TurnExtras::default(),
         )
         .await
@@ -446,6 +451,166 @@ impl Session {
             policy,
             approver,
             observer,
+            None,
+            TurnExtras {
+                stream: true,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Take a turn that may fan out: the agent answering it is offered
+    /// [`SPAWN_TOOL`](crate::SPAWN_TOOL) and can decompose the work into contained
+    /// sub-agents, under `containment` (0.39.0).
+    ///
+    /// This is the one turn shape that can. The five above drive the flat
+    /// workspace loop, which has never offered the spawn tool and still does not,
+    /// so a session that never calls this behaves exactly as it did in 0.38.0.
+    ///
+    /// What the fan-out inherits, and what bounds it:
+    ///
+    /// - **The session's policy.** A child gets it through
+    ///   [`Policy::contain`](crate::Policy::contain) and may only narrow it, at any
+    ///   depth, however its goal is worded.
+    /// - **One shared [`Ledger`](crate::Ledger), per turn.** Every agent in the
+    ///   turn draws on it and no child's contract can raise it. It is built fresh
+    ///   for each turn, so a conversation's total spend is the sum of its turns'
+    ///   rather than one ceiling across all of them.
+    /// - **The transcript.** Children report to the same observer with their own
+    ///   `run_id` and a non-zero `depth`, and the whole fan-out is reconstructable
+    ///   from [`Store::agent_events`](crate::Store::agent_events) on
+    ///   [`TurnResult::run_id`].
+    ///
+    /// A child is given its goal, not the conversation — forty children each
+    /// carrying the transcript is the multiplied version of the cost the context
+    /// budget exists to bound — and a child is a run, never a second turn:
+    /// [`Session::history`] still renders one entry for this turn.
+    ///
+    /// ```no_run
+    /// use io_harness::{ApproveAll, Containment, OpenRouter, Policy, Session, Store};
+    ///
+    /// # async fn demo(store: &Store) -> io_harness::Result<()> {
+    /// let mut session = Session::open(store, "/repo")?;
+    ///
+    /// // The boundary for the whole fan-out: a child inherits it and may only
+    /// // narrow it, so no descendant writes outside docs/ whatever it is asked.
+    /// let policy = Policy::default().layer("app").allow_read("*").allow_write("docs/*");
+    ///
+    /// let turn = session
+    ///     .turn_contained(
+    ///         "document every public module under docs/, one file per module",
+    ///         &OpenRouter::from_env()?,
+    ///         store,
+    ///         &policy,
+    ///         &ApproveAll,
+    ///         // Twelve agents in all, four at once per tier, two deep, and one
+    ///         // token ceiling for the turn. A spawn past the concurrency cap
+    ///         // queues; one past the total cap is refused.
+    ///         &Containment::new(12, 4, 2, 500_000),
+    ///     )
+    ///     .await?;
+    ///
+    /// // Still one turn in the conversation, whatever it spawned — the children
+    /// // are runs under this turn's run, which is where they are counted.
+    /// println!("{:?} {}", turn.kind, store.children(turn.run_id)?.len());
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// A turn that stops for an approval, a question or a plan is continued with
+    /// the tree resumes — [`resume_tree_with_decision`](crate::resume_tree_with_decision),
+    /// [`resume_tree_with_answer`](crate::resume_tree_with_answer) or
+    /// [`resume_tree_with_plan_decision`](crate::resume_tree_with_plan_decision) —
+    /// on `TurnResult::run_id`, not the flat ones.
+    pub async fn turn_contained<P: Provider>(
+        &mut self,
+        text: impl Into<String>,
+        provider: &P,
+        store: &Store,
+        policy: &Policy,
+        approver: &dyn Approver,
+        containment: &Containment,
+    ) -> Result<TurnResult> {
+        let contract = self.default_contract(text);
+        self.drive(
+            &contract,
+            provider,
+            store,
+            policy,
+            approver,
+            &Ignore,
+            Some(containment),
+            TurnExtras::default(),
+        )
+        .await
+    }
+
+    /// [`turn_contained`](Session::turn_contained), reporting to `observer` as the
+    /// fan-out happens.
+    ///
+    /// A tree is where an observer stops being a nicety: children run at once and
+    /// their output interleaves, so `depth` and `run_id` are what turn the stream
+    /// back into something readable. `EventKind::Spawned`, `SpawnRefused`, `Fleet`
+    /// and `SpendDraw` reach a session's observer here for the first time.
+    ///
+    /// ```no_run
+    /// use io_harness::{ApproveAll, Containment, EventKind, Flow, Observer, OpenRouter,
+    ///                  Policy, RunEvent, Session, Store};
+    ///
+    /// struct Transcript;
+    ///
+    /// impl Observer for Transcript {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         let pad = "  ".repeat(event.depth as usize);
+    ///         match &event.kind {
+    ///             EventKind::Spawned { child_run_id, goal } => {
+    ///                 println!("{pad}+ run {child_run_id}: {goal}");
+    ///             }
+    ///             EventKind::Fleet { tier, working, queued, done } => {
+    ///                 println!("{pad}  tier {tier}: {working} working, {queued} queued, {done} done");
+    ///             }
+    ///             _ => {}
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// # async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+    /// let mut session = Session::open(store, "/repo")?;
+    /// let turn = session
+    ///     .turn_contained_observed(
+    ///         "review every file under src/, one sub-agent per file",
+    ///         &OpenRouter::from_env()?, store, policy, &ApproveAll,
+    ///         &Containment::new(12, 4, 2, 500_000), &Transcript,
+    ///     )
+    ///     .await?;
+    /// println!("{:?}", turn.outcome);
+    /// # Ok(()) }
+    /// ```
+    ///
+    /// Returning [`Flow::Cancel`](crate::Flow::Cancel) from the observer stops the
+    /// whole turn at the next step boundary — one flag for the tree, honoured at
+    /// the point where no child is in flight.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn turn_contained_observed<P: Provider>(
+        &mut self,
+        text: impl Into<String>,
+        provider: &P,
+        store: &Store,
+        policy: &Policy,
+        approver: &dyn Approver,
+        containment: &Containment,
+        observer: &dyn Observer,
+    ) -> Result<TurnResult> {
+        let contract = self.default_contract(text);
+        self.drive(
+            &contract,
+            provider,
+            store,
+            policy,
+            approver,
+            observer,
+            Some(containment),
             TurnExtras {
                 stream: true,
                 ..Default::default()
@@ -480,6 +645,11 @@ impl Session {
         policy: &Policy,
         approver: &dyn Approver,
         observer: &dyn Observer,
+        // 0.39.0 — `Some` for a contained turn, which is the only shape that
+        // reaches the loop owning the spawn tool. `None` for the five turn
+        // entry points that predate it, which therefore drive exactly the loop
+        // they always drove.
+        containment: Option<&Containment>,
         mut extras: TurnExtras<'_>,
     ) -> Result<TurnResult> {
         let seed = self.seed(store, contract)?;
@@ -505,10 +675,30 @@ impl Session {
             parent_turn_id: self.head,
             prompt: &contract.goal,
         });
-        let result = crate::run::run_with_extras(
-            contract, provider, store, policy, approver, observer, &extras,
-        )
-        .await?;
+        // The one branch, and it decides which loop answers the turn — not what a
+        // turn is. Everything below this call is the same for both: the turn row
+        // is read back from the run, closed once, and the head moves once.
+        let result = match containment {
+            Some(containment) => {
+                crate::run::run_tree_with_extras(
+                    contract,
+                    provider,
+                    store,
+                    policy,
+                    approver,
+                    containment,
+                    observer,
+                    &extras,
+                )
+                .await?
+            }
+            None => {
+                crate::run::run_with_extras(
+                    contract, provider, store, policy, approver, observer, &extras,
+                )
+                .await?
+            }
+        };
 
         let turn_id = store
             .turn_for_run(result.run_id)?

@@ -9,8 +9,9 @@ or more — each running the same observe/reason/act/verify/stop loop over the
 **same workspace and the same trace**. A child's result composes back so the
 parent continues from what it produced, and children may nest.
 
-Sub-agents are **opt-in**: only `run_tree` offers the `spawn_agent` tool. Pass a
-`Containment` and the tree runs under it.
+Sub-agents are **opt-in**: `run_tree` and — since 0.39.0 —
+`Session::turn_contained` are the entry points that offer the `spawn_agent` tool.
+Pass a `Containment` and the tree runs under it.
 
 ```rust
 use io_harness::{run_tree, ApproveAll, Containment, Policy, Store, TaskContract, Verification};
@@ -199,8 +200,23 @@ Four bounds, stated rather than implied:
   children's trees. This crate writes to no repository metadata on your behalf;
   add `/.worktrees/` to `.git/info/exclude` if you want it hidden.
 
+## A conversation can fan out too (0.39.0)
+
+Everything on this page is reachable from a session turn:
+`Session::turn_contained` takes the same `Containment` and drives the same loop,
+so an operator who asks for something wide *inside a conversation* gets a tree
+under the session's own policy, one shared ledger, and the same events — without
+leaving the transcript for a one-shot run.
+
+Two differences worth knowing, both about the turn rather than the tree: the
+ledger is built per turn, so it is not a ceiling across the conversation; and a
+child is given its goal rather than the conversation, so what the operator said
+three turns ago reaches the root and stops there. [Sessions](sessions.md) has the
+rest.
+
 ## See also
 
+- [Sessions](sessions.md) — the same tree, driven from a conversation
 - [Permissions and approval](permissions.md) — the policy `contain` narrows
 - [Durable runs](durable-runs.md) — how a crashed tree resumes agent by agent
 - [Execution sandbox](sandbox.md) — what confines many concurrent agents' code
