@@ -1,7 +1,7 @@
 product: io-harness
 version: 0.40.0
 timestamp: '2026-08-07T00:00:00Z'
-reason: redirected
+reason: capacity
 repository_state: passing
 completed_acceptance:
   - F1, F2, F3, F4, F5, F6 (Linux arm CI-only), F7

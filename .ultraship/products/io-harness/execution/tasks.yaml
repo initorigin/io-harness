@@ -337,7 +337,7 @@ tasks:
     states a Linux property that is not true until T05 lands. Both are read by people deciding what
     to trust the crate with. The public-API file, the changelog and the roadmap withdrawal are the same
     job: the record matching the tree.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.40.0-T01
   - US-IO-HARNESS-0.40.0-T02
@@ -449,3 +449,12 @@ tasks:
   - '`cargo test --all-features` — **66 suites, 1470 passed, 0 failed**, exit 0, including 374 doctests.
     `XDG_CONFIG_HOME` redirected to a scratch directory, because this machine carries a real `~/.config/io/io.toml`
     that fails `src/config.rs` doctests and `tests/plugin.rs` independently of any change.'
+  - '**Re-verified against the tree at `ee2932e` before the task was closed**, because the evidence above
+    was written in an earlier session and a claim nobody re-ran is a claim nobody holds. N1: `cargo tree`
+    reads **402**. N3: `src/state.rs` carries `CHECKPOINT_FORMAT = 7` and is not in this branch''s diff
+    at all; `ADDED_SINCE_0_22_0` (`tests/cross_version.rs:149`) is untouched; no migration, table, column
+    or index. N2: `git diff develop..HEAD -- docs/public-api.txt` is **empty**. N4: the only file added
+    under `tests/` is the new `tests/exec_contained.rs` — no existing suite was edited to accommodate
+    this release. Gates re-run green: `docs_drift` 5, `public_api` 6, `changelog` 5, `cross_version`
+    15, `ci_workflow` 9; `exec_tool` 12, `exec_contained` 12, `sandbox` 14, `verify_gate` 8, `shell`
+    11, `handles` 5 — **102 passed, 0 failed**, exit 0 on both invocations.'
