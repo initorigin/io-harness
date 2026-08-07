@@ -993,10 +993,24 @@ versions:
     status: released
   - version: 0.40.0
     outcome: >
-      The project's own commands run contained. `exec` and `shell` execute under the same
-      containment model-produced code already gets — resource caps that kill rather than throttle,
-      an isolated working directory, and network denied unless the policy grants it — instead of at
-      the full privileges of the process that embedded the crate. The widest grant the crate makes
-      stops being the one thing outside its own boundary.
-    detail: outline
+      The project's own commands can run contained. A caller asks for it on the contract, and from
+      then on `exec` and `shell` execute under the same containment model-produced code already
+      gets — resource caps that kill rather than throttle, filesystem writes confined to the
+      workspace, and outbound network denied unless the policy grants it — instead of at the full
+      privileges of the process that embedded the crate. The widest grant the crate makes stops
+      being the one thing that cannot be brought inside its own boundary.
+
+      The containment is opt-in and the default is unchanged, because the un-sandboxed default is a
+      granted owner decision (`US-IO-HARNESS-0.17.0-I02`) taken on a real argument: the sandbox as
+      0.6.0 built it discards its working directory, so `npm install` and `cargo build` cannot work
+      inside it. This release answers the working-directory half rather than overruling it — a
+      contained command is given the workspace root and its writes are confined there, so the tree
+      the run is editing is the tree the command builds — and leaves the choice with the caller who
+      knows whether their build reaches outside it.
+
+      Linux is brought up to the claim rather than exempted from it. Today `unshare` gives a mount
+      namespace that nothing is remounted into, so filesystem confinement is macOS-only and the
+      crate's own documentation over-reads it; 0.40.0 binds the workdir so "writes are confined to
+      the workspace" is true on both, or says plainly which platform enforces what.
+    detail: specified
     status: planned
