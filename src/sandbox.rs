@@ -666,7 +666,7 @@ pub(crate) fn wrap_argv(
     }
     #[cfg(target_os = "linux")]
     if backend == Backend::LinuxNamespaces {
-        return (backend, linux::unshare_argv(argv, allow_network));
+        return (backend, linux::unshare_argv(argv, workdir, allow_network));
     }
     (backend, argv.to_vec())
 }

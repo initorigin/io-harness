@@ -239,7 +239,7 @@ tasks:
     does the same, so the crate over-reads its own boundary on the platform most of its CI runs on.
     This is the task the contract's `fallback_scope` drops if it does not converge, which is why it
     is isolated rather than folded into T01.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.40.0-T01
   acceptance_criteria:
@@ -254,7 +254,40 @@ tasks:
   files:
   - src/sandbox/linux.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`unshare_argv` now takes the workdir and populates the mount namespace `--mount` creates. Before
+    this it created a namespace and remounted **nothing** into it, so the filesystem view was identical
+    to the host''s and a write outside the workdir landed — only `--net` was doing real work, while
+    `src/lib.rs` told a reader Linux confined writes the way macOS does.'
+  - 'The setup remounts the tree read-only and binds back exactly two places: the run''s workdir and
+    the system temporary directory. The second is not a convenience — it is the same allowance the macOS
+    profile already makes for `/private/var/folders`, and without it most toolchains fail on their first
+    temporary file. Both are owed to `docs/CONTRACT.md` (T07).'
+  - '`sh` in the wrapper is not a shell for the payload. The command arrives as positional parameters
+    and leaves through `exec "$@"`, so nothing re-parses it — the property `src/tools/exec.rs` is built
+    on. Asserted by a unit test that passes `; rm -rf /` as an argument and checks it never reaches
+    the script text and is still the final argv element.'
+  - '**The probe was changed with it, and that is the load-bearing part.** `unshare_works` now spawns
+    the *exact* wrapper including the mount setup, against a real temp dir. A kernel can permit the
+    namespace and still refuse the remounts; a probe that only tried `unshare` would have reported `LinuxNamespaces`
+    for runs confining nothing. The fail-safe is unchanged in shape: a host that refuses degrades to
+    `Backend::PortableFloor` and reports the floor.'
+  - 'Three unit tests in `src/sandbox/linux.rs` cover the argv shape and run on **any** host, including
+    this macOS one: `cargo test --lib` — **388 passed, 0 failed**. One pre-existing test was rewritten
+    rather than accommodated: it asserted the payload was adjacent to `--`, which 0.40.0 deliberately
+    changes by putting the setup in between; it now asserts the payload is the untouched tail.'
+  - 'F6 is written so the dangerous outcome fails rather than passes. If the backend is not `LinuxNamespaces`
+    the test skips **only when `CI` is unset** and fails outright on CI, because a silent fall back
+    to the floor would let the confinement assertion pass having confined nothing. It also carries an
+    in-run control: a write *inside* the workspace must still succeed and report `exit 0`, or ''confined''
+    would just mean ''broken''.'
+  - '**Not verifiable on this host, and that is stated rather than papered over.** This build machine
+    is macOS, so the Linux behaviour claim rests on the `ubuntu-latest` matrix job. The argv shape,
+    the non-interpolation property and the probe change are proven locally; whether the remounts are
+    permitted by the runner''s kernel is proven on the runner or not at all. If CI reports the floor
+    or a wrapper failure, the contract''s `fallback_scope` drops exactly this task and the release ships
+    macOS-only with the per-platform table saying so — that decision goes to the owner via `/ultraship:iterate`,
+    not taken here.'
 - id: US-IO-HARNESS-0.40.0-T06
   summary: Write the `SandboxEvent` lifecycle rows for a contained `exec` or `shell`, carrying the backend
     that actually applied.

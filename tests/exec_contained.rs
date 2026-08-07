@@ -539,3 +539,73 @@ async fn an_uncontained_shell_line_still_writes_outside_the_workspace() {
         target.display()
     );
 }
+
+// ---------------------------------------------------------------------------
+// F6 — Linux confines writes, on Linux
+// ---------------------------------------------------------------------------
+
+/// The claim `src/lib.rs` has been making about Linux, asserted where Linux runs.
+///
+/// Before 0.40.0 the backend unshared a mount namespace and remounted nothing
+/// into it, so the filesystem view was the host's and this assertion would have
+/// failed. Only `--net` was real.
+///
+/// The skip is guarded rather than silent. A runner whose kernel refuses user
+/// namespaces reports `PortableFloor`, which confines nothing — and a test that
+/// quietly returned there would pass having proven exactly nothing, which is the
+/// failure mode this release is most exposed to. On CI that is a hard failure.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn linux_confines_a_contained_commands_writes_to_the_workspace() {
+    use io_harness::sandbox::{select, Backend, Sandbox};
+
+    let backend = select(&SandboxConfig::new()).backend();
+    if backend != Backend::LinuxNamespaces {
+        assert!(
+            std::env::var("CI").is_err(),
+            "this runner reported {backend:?} rather than LinuxNamespaces. On CI that is a \
+             failure and not a skip: the confinement assertion below would pass without \
+             confining anything, and the release would claim a boundary it never applied."
+        );
+        eprintln!("skipped: this host reports {backend:?}, which claims no filesystem boundary");
+        return;
+    }
+
+    let dir = workspace();
+    let escape = EscapeDir::new("linux-namespaces");
+    let target = escape.file();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![
+        vec![exec_call(&["touch", target.to_str().unwrap()])],
+        // The control, in the same run: a write *inside* the workspace must still
+        // succeed, or "confined" would just mean "broken".
+        vec![exec_call(&["touch", "inside-the-workspace.txt"])],
+    ]);
+
+    let result = run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !target.exists(),
+        "the mount namespace confined nothing: {} was written",
+        target.display()
+    );
+    assert!(
+        dir.path().join("inside-the-workspace.txt").exists(),
+        "a write inside the workspace must still land — otherwise the namespace \
+         is not confining writes, it is preventing them"
+    );
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        steps[1].decision.contains("exit 0"),
+        "and it must succeed rather than merely leave a file: {:?}",
+        steps[1].decision
+    );
+}
