@@ -246,19 +246,30 @@ jobs:
         if: runner.os == 'Linux'
         continue-on-error: true
         run: |
-          set -x
+          OUT="$RUNNER_TEMP/probe-target"; mkdir -p "$OUT"
+          echo "=== V3: drop the bind of /, remount / ro directly, then TRY TO WRITE ==="
           unshare --user --map-root-user --mount --pid --fork --net -- sh -c '
-            set -e
-            mount --make-rprivate / || echo "STEP1 make-rprivate FAILED rc=$?"
-            mount --bind / / || echo "STEP2 bind / FAILED rc=$?"
-            mount -o remount,bind,ro / || echo "STEP3 remount ro FAILED rc=$?"
-            echo "STEP4 reached"
-          ' ; echo "wrapper rc=$?"
-          echo "--- variant: no ro remount of /, bind the workdir only ---"
+            mount --make-rprivate / || { echo "V3 rprivate failed"; exit 9; }
+            mount -o remount,bind,ro / || { echo "V3 remount ro failed rc=$?"; exit 9; }
+            if touch "$1/escaped" 2>/dev/null; then
+              echo "V3 VERDICT: NOT READ-ONLY — the write landed"
+            else
+              echo "V3 VERDICT: READ-ONLY — the write was refused"
+            fi
+          ' sh "$OUT" ; echo "V3 rc=$?"
+          ls -l "$OUT" || true
+          rm -f "$OUT/escaped"
+          echo "=== V4: same, plus binding the workdir back rw ==="
+          WD="$RUNNER_TEMP/probe-wd"; mkdir -p "$WD"
           unshare --user --map-root-user --mount --pid --fork --net -- sh -c '
-            mount --make-rprivate / && echo "v2 rprivate ok"
-            mount --bind /tmp /tmp && echo "v2 bind /tmp ok"
-          ' ; echo "variant rc=$?"
+            mount --make-rprivate / || exit 9
+            mount -o remount,bind,ro / || exit 9
+            mount --bind "$2" "$2" 2>/dev/null && mount -o remount,bind,rw "$2" 2>/dev/null \
+              && echo "V4 workdir rebound rw" || echo "V4 could not rebind the workdir"
+            touch "$2/inside" 2>/dev/null && echo "V4 write INSIDE workdir ok" || echo "V4 write inside workdir REFUSED"
+            touch "$1/escaped" 2>/dev/null && echo "V4 escape LANDED" || echo "V4 escape refused"
+          ' sh "$OUT" "$WD" ; echo "V4 rc=$?"
+          ls -l "$OUT" "$WD" || true
       - run: cargo nextest run ${{ matrix.flags }} --lib --tests
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.
