@@ -458,3 +458,41 @@ tasks:
     this release. Gates re-run green: `docs_drift` 5, `public_api` 6, `changelog` 5, `cross_version`
     15, `ci_workflow` 9; `exec_tool` 12, `exec_contained` 12, `sandbox` 14, `verify_gate` 8, `shell`
     11, `handles` 5 — **102 passed, 0 failed**, exit 0 on both invocations.'
+- id: US-IO-HARNESS-0.40.0-T08
+  summary: Remove every io-cli link, state the product as not built, and bring the README and guide
+    surface up to what the crate does at 0.40.0.
+  why_required: >
+    Added by US-IO-HARNESS-0.40.0-I01 on owner request during the completion phase. The landing page
+    sends readers to a repository the owner does not want linked, argues a point from that link, and
+    tells them a command cannot be sandboxed in the one release that makes it possible to ask for.
+    Its platform table disagrees with the identical table in docs/CONTRACT.md, which this release
+    already corrected. A reader deciding whether to depend on the crate meets all of it on the first
+    screen.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.40.0-T07
+  acceptance_criteria:
+  - >
+    **N7 — no io-cli link anywhere, and the product table says what is true.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. `grep -rn "github.com/initorigin/io-cli"` and
+    `grep -rn "crates.io/crates/io-cli"` return nothing outside `CHANGELOG.md` and
+    `.ultraship/views/`, which are historical records and are not edited. The README's product
+    table carries io-cli unlinked with the status **Not built**, and the paragraph beneath it that
+    argued from io-cli being a second embedder is gone rather than left to contradict the row two
+    lines above it. The "Who it is for" section still explains that a terminal app is not this
+    layer's job, without naming a repository a reader cannot be sent to.
+  - >
+    **N8 — the README and the guides describe the crate as it is at 0.40.0.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. Three specific corrections are checkable: the
+    README no longer tells a reader a command "is **not** sandboxed" without saying it can now be
+    asked to be, and neither does `src/lib.rs`; the README's platform table matches
+    `docs/CONTRACT.md`'s, both reading mount **and** network namespaces for Linux; and no
+    capability paragraph narrates the release it arrived in — no "since 0.34.0", no "(0.34.0)",
+    no "0.33.0's" — because a landing page states what the crate does, and `tests/readme.rs`
+    already forbids the same narration one level up in headings and in the crate root. Every
+    README checker, `tests/docs_drift.rs`, `tests/guide_pages.rs` and `tests/public_api.rs` pass,
+    and the nightly docs command is re-run because `src/lib.rs` is edited.
+  files:
+  - README.md
+  - src/lib.rs
+  evidence: []

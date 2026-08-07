@@ -297,6 +297,26 @@ acceptance:
     user cache — **fails under containment on macOS** and is the concrete price of the confinement,
     with the workaround being to leave the field unset or to point the toolchain's cache inside the
     workspace; and on Windows nothing but the resource caps applies.
+  - >
+    **N7 — no io-cli link anywhere, and the product table says what is true.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. `grep -rn "github.com/initorigin/io-cli"` and
+    `grep -rn "crates.io/crates/io-cli"` return nothing outside `CHANGELOG.md` and
+    `.ultraship/views/`, which are historical records and are not edited. The README's product
+    table carries io-cli unlinked with the status **Not built**, and the paragraph beneath it that
+    argued from io-cli being a second embedder is gone rather than left to contradict the row two
+    lines above it. The "Who it is for" section still explains that a terminal app is not this
+    layer's job, without naming a repository a reader cannot be sent to.
+  - >
+    **N8 — the README and the guides describe the crate as it is at 0.40.0.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. Three specific corrections are checkable: the
+    README no longer tells a reader a command "is **not** sandboxed" without saying it can now be
+    asked to be, and neither does `src/lib.rs`; the README's platform table matches
+    `docs/CONTRACT.md`'s, both reading mount **and** network namespaces for Linux; and no
+    capability paragraph narrates the release it arrived in — no "since 0.34.0", no "(0.34.0)",
+    no "0.33.0's" — because a landing page states what the crate does, and `tests/readme.rs`
+    already forbids the same narration one level up in headings and in the crate root. Every
+    README checker, `tests/docs_drift.rs`, `tests/guide_pages.rs` and `tests/public_api.rs` pass,
+    and the nightly docs command is re-run because `src/lib.rs` is edited.
   operational:
   - >
     **O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job,
