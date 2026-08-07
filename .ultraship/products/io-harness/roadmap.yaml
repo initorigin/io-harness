@@ -1000,27 +1000,3 @@ versions:
       stops being the one thing outside its own boundary.
     detail: outline
     status: planned
-  - version: 0.41.0
-    outcome: >
-      A transcript can say what a tool found, and show the change an edit made.
-
-      Every tool a run invokes is announced and none of them is answered. `EventKind::ToolCall`
-      carries the tool's name and its target and is documented as "A tool was invoked, before its
-      result is known", so a program embedding this crate is told that a search ran and never
-      whether it matched, that a command executed and never what it printed or whether it failed.
-      The result is not missing — the loop reads it, prices the turn on it, and feeds it back to the
-      model — it is simply the one part of a tool's life the observer is not handed. After this
-      release it is carried out as its own event, which `EventKind` being non-exhaustive makes an
-      addition rather than a break; widening the existing variant would not be.
-
-      And an edit stops being reported as two numbers. `Edit::measure` is handed the old text and
-      the new text and keeps `lines_added` and `lines_removed`, so an operator watching a run is
-      told that four lines went and six arrived and cannot be shown which. The material to say more
-      is in hand at the moment the count is taken and is discarded there. Keeping it is a change to
-      what the store holds for a step, which is why this is a release rather than something folded
-      into one.
-
-      An operator sees the effect where they already look: a tool line that states what it found
-      instead of only that it ran, and an edit that can be read as the hunk it was.
-    detail: outline
-    status: planned
