@@ -35,7 +35,7 @@ use std::sync::Mutex;
 
 use io_harness::policy::Policy;
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, ToolSpec};
-use io_harness::sandbox::SandboxConfig;
+use io_harness::sandbox::{SandboxConfig, SandboxLimits};
 use io_harness::{run_with, ApproveAll, Provider, Store, TaskContract};
 use serde_json::json;
 
@@ -231,5 +231,94 @@ async fn a_contained_command_writes_into_the_workspace_and_the_next_one_reads_it
         "the second command found what the first one wrote, so nothing was \
          discarded between them: {:?}",
         steps[1].decision
+    );
+}
+
+// ---------------------------------------------------------------------------
+// F2 — a cap kills, and the trace names which cap
+// ---------------------------------------------------------------------------
+
+/// Both arms below are deterministic by construction rather than by waiting:
+/// a zero ceiling fires on the first check, so nothing here asserts a duration
+/// and nothing sleeps for real. A cap test that waits for a real second is a
+/// cap test that flakes on a loaded runner.
+fn capped(limits: SandboxLimits) -> SandboxConfig {
+    SandboxConfig {
+        limits,
+        ..SandboxConfig::new()
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_command_killed_by_a_cap_is_reported_as_that_cap() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    // Killed the moment the ceiling is checked; the `5` is never waited out.
+    let provider = MockScript::new(vec![vec![exec_call(&["sleep", "5"])]]);
+
+    let result = run_with(
+        &contract(dir.path()).with_contained_exec(capped(SandboxLimits {
+            max_wall_secs: Some(0),
+            ..SandboxLimits::default()
+        })),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        steps[0].decision.contains("hit the wall cap"),
+        "the trace names the ceiling that was crossed: {:?}",
+        steps[0].decision
+    );
+    // The model is told which resource ran out, not merely that something died.
+    assert!(
+        steps[1].prompt.contains("killed by the wall cap"),
+        "the next turn is told which cap: {:?}",
+        steps[1].prompt
+    );
+}
+
+/// The second arm, and the one that keeps two different ceilings from being read
+/// as one. `exec_timeout` is the contract's ceiling on a wedged command and is
+/// raised with `with_exec_timeout`; `max_wall_secs` is the sandbox's and is
+/// raised in `SandboxLimits`. A trace that called both "timed out" would send a
+/// reader to the wrong one.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_contracts_exec_timeout_is_not_reported_as_a_sandbox_cap() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&["sleep", "5"])]]);
+
+    let result = run_with(
+        &contract(dir.path())
+            // The sandbox's own wall ceiling is left at its roomy default, so the
+            // only ceiling in play is the contract's.
+            .with_contained_exec(SandboxConfig::new())
+            .with_exec_timeout(std::time::Duration::ZERO),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        steps[0].decision.contains("timed out"),
+        "the contract's ceiling reports as a timeout: {:?}",
+        steps[0].decision
+    );
+    assert!(
+        !steps[0].decision.contains("cap"),
+        "and is not dressed up as a sandbox cap: {:?}",
+        steps[0].decision
     );
 }

@@ -8451,6 +8451,33 @@ async fn dispatch(
                         after.as_secs()
                     ),
                 ),
+                // 0.40.0 — the sandbox's own ceiling, named. The model is told
+                // which resource ran out, because "run something narrower" and
+                // "this needs more memory than it was given" are different next
+                // moves, and an exit status alone distinguishes neither.
+                ExecOutcome::Capped {
+                    cap,
+                    stdout,
+                    stderr,
+                    ..
+                } => {
+                    let body = crate::verify::joined_streams(stdout, stderr);
+                    (
+                        format!("exec {program} hit the {} cap", cap.as_str()),
+                        format!(
+                            "\n[exec `{joined}` killed by the {} cap] The sandbox stopped it \
+                             because it crossed the {} limit this run set, not because the \
+                             command failed. Anything it printed first is below.\n{}\n",
+                            cap.as_str(),
+                            cap.as_str(),
+                            if body.trim().is_empty() {
+                                "(no output)"
+                            } else {
+                                body.trim_end()
+                            }
+                        ),
+                    )
+                }
                 ExecOutcome::Ran {
                     code,
                     stdout,

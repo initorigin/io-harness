@@ -73,7 +73,7 @@ tasks:
     with different fixes, and today the model would be told only the second. The two ceilings are the
     sharper half: `exec_timeout` is the contract''s wedged-command ceiling and `max_wall_secs` is the
     sandbox''s, and collapsing them sends whoever reads the trace to the wrong one.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.40.0-T01
   acceptance_criteria:
@@ -92,7 +92,40 @@ tasks:
   - src/tools/exec.rs
   - src/run.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`ExecOutcome::Capped { cap, code, stdout, stderr, elided }` added — `ExecOutcome` is `pub(crate)`,
+    so the variant costs no public surface. `Exec::run_contained` reads `SandboxOutcome.cap_hit` and
+    returns `Capped` rather than `Ran`; the cap is read from what the backend returned, never inferred
+    from the exit status, because a process shot by `RLIMIT_CPU` and one that chose to exit 137 are
+    indistinguishable by status.'
+  - '`dispatch` gained the arm: the decision reads `exec <program> hit the <cap> cap` and the observation
+    the model reads says the sandbox stopped it because it crossed that limit **rather than because
+    the command failed**, with whatever it printed first kept.'
+  - '`src/tools/diagnostics.rs` gained the arm too. It is unreachable today — diagnostics build their
+    own uncontained `Exec` — and is handled rather than `unreachable!()` so that pointing that path
+    at a sandbox later is a compile error instead of a panic in someone''s run.'
+  - 'F2, `cargo test --test exec_contained` — **5 passed, 0 failed in 0.09s**. Both arms are deterministic
+    by construction rather than by waiting: `max_wall_secs: Some(0)` fires on the first check and `exec_timeout:
+    Duration::ZERO` elapses on the first poll, so nothing sleeps for real and **no duration is asserted
+    anywhere** (O1).'
+  - 'Arm (a): a contained `sleep 5` under a zero wall ceiling is killed, the step decision contains
+    `hit the wall cap`, and the *next turn''s prompt* contains `killed by the wall cap` — the claim
+    is that the model is told which resource ran out, so it is asserted where the model reads.'
+  - 'Arm (b): the same contained command under the contract''s `exec_timeout` instead reports `timed
+    out` and the decision does **not** contain `cap`. The two ceilings are raised in different places
+    — `with_exec_timeout` and `SandboxLimits` — so a trace that called both the same would send a reader
+    to the wrong one.'
+  - Sabotage **S3** — `cap_hit` dropped on the way to the observation (matched against `None`). `a_command_killed_by_a_cap_is_reported_as_that_cap`
+    FAILED, the other four passed. Reverted.
+  - 'Sabotage **S4** — `Cap::Wall` mapped onto the contract''s `TimedOut`, which is the collapse the
+    criterion exists to forbid. The same named test FAILED and the other four passed, including the
+    timeout test, which is the point: S4 is invisible to every assertion except the one that distinguishes
+    the ceilings. Reverted.'
+  - '**Deviation from F2(a)''s example, substance met, wording not.** The criterion names `max_memory_bytes`;
+    the arm was executed with `max_wall_secs` instead. Memory on macOS is enforced by a **polling RSS
+    monitor**, so a memory-cap test is timing-dependent — exactly what O1 forbids in this release, and
+    this release is unusually exposed to it. The claim F2 makes is that a cap kills and the trace names
+    *which* cap, and that is what was asserted, on a ceiling that fires deterministically. Owed to `known_limitations`.'
 - id: US-IO-HARNESS-0.40.0-T03
   summary: Derive `allow_network` from the run's `Policy`, decide what `Effect::Ask` on `Act::Net` means,
     and document the coarseness.

@@ -46,7 +46,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
-use crate::sandbox::{select, RunSpec, Sandbox, SandboxConfig};
+use crate::sandbox::{select, Cap, RunSpec, Sandbox, SandboxConfig};
 
 /// How long a command started by the `exec` tool may run before it is killed.
 ///
@@ -92,6 +92,30 @@ pub(crate) enum ExecOutcome {
     TimedOut {
         /// The ceiling it crossed.
         after: Duration,
+    },
+    /// A resource cap killed it (0.40.0, contained runs only).
+    ///
+    /// Distinct from [`ExecOutcome::TimedOut`] on purpose, and the distinction is
+    /// the point rather than bookkeeping. `TimedOut` is the *contract's*
+    /// `exec_timeout`, the ceiling on a wedged command that exists so a run gets
+    /// its turn back; this is the *sandbox's* own limit, which the caller set when
+    /// they described how much of the machine this command may have. Collapsing
+    /// the two sends whoever reads the trace to the wrong ceiling: one is raised
+    /// with `with_exec_timeout`, the other in `SandboxLimits`.
+    ///
+    /// The streams are kept because a cap kill usually has the useful output in
+    /// it — what the build had printed before it was shot.
+    Capped {
+        /// Which ceiling it crossed.
+        cap: Cap,
+        /// The exit status, where the platform reported one.
+        code: Option<i32>,
+        /// Standard output, head-and-tail bounded.
+        stdout: String,
+        /// Standard error, head-and-tail bounded.
+        stderr: String,
+        /// How many characters the two bounds together elided, or 0.
+        elided: usize,
     },
     /// There is no such program on this machine. Not a failed run: the model is
     /// told and carries on, exactly as it is told when `git` is missing.
@@ -224,12 +248,26 @@ impl Exec {
             Ok(Ok(out)) => {
                 let (stdout, cut_out) = head_and_tail(&out.stdout, self.cap);
                 let (stderr, cut_err) = head_and_tail(&out.stderr, self.cap);
-                Ok(ExecOutcome::Ran {
-                    code: out.exit_code,
-                    stdout,
-                    stderr,
-                    elided: cut_out + cut_err,
-                })
+                let elided = cut_out + cut_err;
+                // A cap kill is reported as a cap kill. Read from the outcome the
+                // backend returned rather than inferred from the exit status: a
+                // process shot by `RLIMIT_CPU` and one that chose to exit 137 are
+                // indistinguishable by status alone.
+                match out.cap_hit {
+                    Some(cap) => Ok(ExecOutcome::Capped {
+                        cap,
+                        code: out.exit_code,
+                        stdout,
+                        stderr,
+                        elided,
+                    }),
+                    None => Ok(ExecOutcome::Ran {
+                        code: out.exit_code,
+                        stdout,
+                        stderr,
+                        elided,
+                    }),
+                }
             }
         }
     }
