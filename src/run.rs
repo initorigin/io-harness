@@ -4363,6 +4363,7 @@ async fn run_workspace_from<P: Provider>(
                 pending_media,
                 &contract.commit_identity,
                 contract.exec_timeout,
+                contract.exec_sandbox.as_ref(),
                 toolchain.as_ref(),
                 handles,
                 PlanPhase {
@@ -5784,6 +5785,7 @@ fn run_agent<'f, P: Provider>(
                     pending_media,
                     &contract.commit_identity,
                     contract.exec_timeout,
+                    contract.exec_sandbox.as_ref(),
                     toolchain.as_ref(),
                     handles,
                     PlanPhase {
@@ -7102,6 +7104,11 @@ async fn dispatch(
     pending_media: &mut PendingMedia,
     identity: &crate::tools::git::Identity,
     exec_timeout: Duration,
+    // 0.40.0 — the containment this contract asked for, or `None` for the 0.17.0
+    // default. Carried beside `exec_timeout` because they bound the same tool and
+    // arrive from the same place; resolved to a backend inside the tool rather
+    // than here, so a run that never calls `exec` never probes the host.
+    exec_sandbox: Option<&crate::sandbox::SandboxConfig>,
     // The project's ecosystem, detected once by the loop rather than per edit:
     // `toolchain::detect` reads the directory, and an edit is a hot path.
     toolchain: Option<&crate::toolchain::Toolchain>,
@@ -8423,7 +8430,10 @@ async fn dispatch(
                 }
             }
 
-            let outcome = Exec::new(ws.root(), exec_timeout, cap).run(&argv).await?;
+            let outcome = Exec::new(ws.root(), exec_timeout, cap)
+                .contained(exec_sandbox)
+                .run(&argv)
+                .await?;
             let (decision, obs) = match &outcome {
                 ExecOutcome::Unavailable { reason } => (
                     format!("{program} unavailable"),

@@ -9,7 +9,7 @@ tasks:
     a file that does or does not appear outside the root. Without it there is no containment to cap,
     deny egress from, or audit. The negative control lands here too, because the moment `exec` can be
     contained is the moment it can be contained by accident.'
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F1 — a contained command cannot write outside the workspace, and an uncontained one still can.**
@@ -35,7 +35,37 @@ tasks:
   - src/run.rs
   - src/tools/exec.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`TaskContract::exec_sandbox: Option<SandboxConfig>` and `TaskContract::with_contained_exec` landed
+    in `src/contract.rs`, defaulting to `None` in both constructors. `Exec` gained a `sandbox` field
+    and an `Exec::contained(Option<&SandboxConfig>)` builder rather than a fourth argument to `new`,
+    so every pre-0.40.0 construction reads exactly as it did. `dispatch` carries `exec_sandbox` beside
+    `exec_timeout` and both call sites pass `contract.exec_sandbox.as_ref()`.'
+  - 'A contained command''s `RunSpec.workdir` is `ws.root()` — the workspace — and `sandbox::workdir()`
+    and `copy_back` are not called on this path at all. That is the whole of the answer to `US-IO-HARNESS-0.17.0-I02`:
+    nothing is copied in, nothing is copied out, nothing is discarded.'
+  - 'F1 and F5, `cargo test --test exec_contained` — **3 passed, 0 failed**. F1''s two arms are separate
+    tests: a contained `touch` of a path outside the workspace leaves the file absent and the trace
+    does not say `exit 0`; the identical argv on the identical contract with the field absent leaves
+    the file present.'
+  - 'F5 is also F1''s control, and it is why the escape denial means containment rather than breakage:
+    within one contained run a first `exec` writes a relative path and a second reads it back, both
+    `exit 0`, and the file is in the workspace after the run.'
+  - Sabotage **S1** — `Exec::contained` ignores the config and stores `None`. `a_contained_command_cannot_write_outside_the_workspace`
+    FAILED; the other two passed. Reverted.
+  - Sabotage **S2** — `RunSpec.workdir` set to `sandbox::workdir()`'s `TempDir`, the shape 0.17.0 refused.
+    `a_contained_command_writes_into_the_workspace_and_the_next_one_reads_it` FAILED; the other two
+    passed. Reverted. Two sabotages, two different named tests, neither silent.
+  - '**A measured fact that decided the test design, 2026-08-07 on this host.** The macOS profile (`src/sandbox/macos.rs`,
+    `profile_for`) denies writes under `/` and re-allows the workdir *and the whole of `/private/var/folders`*
+    — where `tempfile::tempdir()` puts everything. Probed directly with `sandbox-exec`: a write inside
+    the workspace succeeded, a write into a **second temp directory succeeded**, and a write to `$HOME`
+    was refused `Operation not permitted`. An escape test using a second `tempdir()` would therefore
+    have passed on Linux and proven nothing on macOS. The escape target is a directory under the crate''s
+    own `target/`, removed by a `Drop` guard. N6 already commits to stating this allowance, so it is
+    a test-design constraint rather than a scope change.'
+  - 'N4''s first instalment: `cargo test --test exec_tool --test shell --test sandbox` — **12 + 8 +
+    11 = 31 passed, 0 failed**, with no test in any of those three files edited.'
 - id: US-IO-HARNESS-0.40.0-T02
   summary: Carry `SandboxOutcome.cap_hit` into the observation the model reads and the step the store
     records, and keep the sandbox wall cap distinct from the contract's `exec_timeout`.

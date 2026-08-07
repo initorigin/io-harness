@@ -46,6 +46,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
+use crate::sandbox::{select, RunSpec, Sandbox, SandboxConfig};
 
 /// How long a command started by the `exec` tool may run before it is killed.
 ///
@@ -115,6 +116,13 @@ pub(crate) struct Exec {
     workdir: PathBuf,
     timeout: Duration,
     cap: usize,
+    /// The containment this run asked for, or `None` for the 0.17.0 default.
+    ///
+    /// Held rather than resolved to a backend at construction because
+    /// [`select`](crate::sandbox::select) probes the host, and an `Exec` is built
+    /// per tool call while the probe's answer does not change under a running
+    /// process.
+    sandbox: Option<SandboxConfig>,
 }
 
 impl Exec {
@@ -130,7 +138,18 @@ impl Exec {
             workdir: workdir.into(),
             timeout,
             cap,
+            sandbox: None,
         }
+    }
+
+    /// Run inside the sandbox this contract asked for, or leave it on the host.
+    ///
+    /// A builder rather than a fourth argument to [`Exec::new`] so the uncontained
+    /// construction — every caller before 0.40.0, and every test that is not about
+    /// containment — reads exactly as it did.
+    pub(crate) fn contained(mut self, sandbox: Option<&SandboxConfig>) -> Self {
+        self.sandbox = sandbox.cloned();
+        self
     }
 
     /// Run `argv`, already authorised by the caller.
@@ -141,6 +160,9 @@ impl Exec {
         let Some(program) = argv.first() else {
             return Err(Error::Config("exec needs a non-empty argv".into()));
         };
+        if let Some(config) = &self.sandbox {
+            return self.run_contained(config, argv).await;
+        }
         let mut cmd = command(program, &argv[1..], &self.workdir);
         match tokio::time::timeout(self.timeout, cmd.output()).await {
             // Dropping the `output()` future drops the `Child`, and the child was
@@ -164,6 +186,46 @@ impl Exec {
                     head_and_tail(&String::from_utf8_lossy(&out.stderr), self.cap);
                 Ok(ExecOutcome::Ran {
                     code: out.status.code(),
+                    stdout,
+                    stderr,
+                    elided: cut_out + cut_err,
+                })
+            }
+        }
+    }
+
+    /// The same command, wrapped by whichever backend this host offers.
+    ///
+    /// The working directory is the workspace root, not a temporary directory —
+    /// that is the whole difference between this and the verification gate's use
+    /// of the same machinery, and it is what makes a contained `exec` able to
+    /// build a project rather than only to run one command in an empty room.
+    /// Nothing is copied in and nothing is copied out, so
+    /// [`copy_back`](crate::sandbox::copy_back) has no part here.
+    ///
+    /// Both ceilings still apply and they are not the same ceiling. The contract's
+    /// `exec_timeout` wraps the whole sandboxed call, so a backend that wedges is
+    /// bounded by the same rule an unsandboxed command is; the config's
+    /// `max_wall_secs` is the sandbox's own, and a command it kills comes back as
+    /// a cap rather than as this timeout.
+    async fn run_contained(&self, config: &SandboxConfig, argv: &[String]) -> Result<ExecOutcome> {
+        let sandbox = select(config);
+        let spec = RunSpec {
+            argv,
+            workdir: &self.workdir,
+            limits: &config.limits,
+            allow_network: config.allow_network,
+        };
+        match tokio::time::timeout(self.timeout, sandbox.run(spec)).await {
+            Err(_elapsed) => Ok(ExecOutcome::TimedOut {
+                after: self.timeout,
+            }),
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(out)) => {
+                let (stdout, cut_out) = head_and_tail(&out.stdout, self.cap);
+                let (stderr, cut_err) = head_and_tail(&out.stderr, self.cap);
+                Ok(ExecOutcome::Ran {
+                    code: out.exit_code,
                     stdout,
                     stderr,
                     elided: cut_out + cut_err,
