@@ -34,15 +34,17 @@ let id = session.id();
 # Ok(()) }
 ```
 
-## The five entry points
+## The seven entry points
 
-| Method | Bound | Observer | Streams | Steerable |
-| --- | --- | --- | --- | --- |
-| `turn` | no criterion | — | no | no |
-| `turn_observed` | no criterion | yes | yes | no |
-| `turn_steered` | no criterion | yes | yes | yes |
-| `turn_bounded` | your `TaskContract` | — | no | no |
-| `turn_bounded_observed` | your `TaskContract` | yes | yes | no |
+| Method | Bound | Observer | Streams | Steerable | May spawn |
+| --- | --- | --- | --- | --- | --- |
+| `turn` | no criterion | — | no | no | no |
+| `turn_observed` | no criterion | yes | yes | no | no |
+| `turn_steered` | no criterion | yes | yes | yes | no |
+| `turn_bounded` | your `TaskContract` | — | no | no | no |
+| `turn_bounded_observed` | your `TaskContract` | yes | yes | no | no |
+| `turn_contained` | no criterion | — | no | no | **yes** |
+| `turn_contained_observed` | no criterion | yes | yes | no | **yes** |
 
 An unbounded turn runs with `Verification::None`: it ends when the agent stops
 calling tools, reported as `RunOutcome::Finished`. That is the conversational
@@ -273,6 +275,72 @@ has: in between, a tool call is in flight and a file may be half-written.
 
 A message sent after its turn has ended is an error rather than a shrug. An
 operator whose correction went nowhere needs to know it went nowhere.
+
+## A turn can fan out (0.39.0)
+
+An operator asks for something wide inside the conversation — *migrate these forty
+handlers*, *review these twelve files*. Through 0.38.0 that was one agent working
+through forty items in one context window, because the sub-agent tool was
+registered only inside the tree loop and no session turn reached it: a run was a
+tree or a turn and not both.
+
+`turn_contained` takes a `Containment` and drives the turn through that loop, so
+the agent answering it may decompose the work:
+
+```no_run
+use io_harness::{ApproveAll, Containment, OpenRouter, Policy, Session, Store};
+
+# async fn demo(store: &Store) -> io_harness::Result<()> {
+let mut session = Session::open(store, "/repo")?;
+
+// The boundary for the whole fan-out. A child inherits it through
+// `Policy::contain` and may only narrow it, at any depth.
+let policy = Policy::default().layer("app").allow_read("*").allow_write("docs/*");
+
+let turn = session
+    .turn_contained(
+        "document every public module under docs/, one file per module",
+        &OpenRouter::from_env()?, store, &policy, &ApproveAll,
+        // Twelve agents in all, four at once per tier, two deep, one token
+        // ceiling for this turn. A spawn past the concurrency cap queues; one
+        // past the total cap is refused and the parent adapts.
+        &Containment::new(12, 4, 2, 500_000),
+    )
+    .await?;
+
+// One turn, whatever it spawned. The children are runs under this turn's run.
+println!("{} children", store.children(turn.run_id)?.len());
+# Ok(()) }
+```
+
+What the fan-out inherits is what [composition.md](composition.md) already
+describes — inherit-and-narrow policy, one shared ledger, per-tier concurrency
+slots with a durable queue, the whole tree reconstructable from
+`Store::agent_events`. What is new is only the caller.
+
+Four things are worth knowing before you reach for it:
+
+* **The ledger is per turn, not per session.** Each contained turn builds a fresh
+  ledger from the `Containment` you pass, so turn five gets the ceiling turn one
+  got. A conversation's total spend is the sum of its turns'; there is no single
+  ceiling across them. This is the same rule the guide's "a turn is a run,
+  including the cost" states below, applied to the tree.
+* **A child is given its goal, not the conversation.** Forty children each
+  carrying the transcript is the multiplied version of the cost `ContextBudget`
+  exists to bound — and a child that has read the conversation is one that can act
+  on an instruction three turns old that the operator has since withdrawn. The
+  parent composes each child's result back into its own next step.
+* **A child is a run, never a second turn.** `Session::history` renders one entry
+  for a turn that spawned forty agents. Their traces are under the turn's run id.
+* **A paused contained turn takes the tree resumes.** If the turn stops on an
+  approval, a question or a plan, continue it with `resume_tree_with_decision`,
+  `resume_tree_with_answer` or `resume_tree_with_plan_decision` on
+  `TurnResult::run_id` — not the flat `resume_with_*` family. The turn row was
+  closed when the turn returned, so it reports the state at the pause and is not
+  rewritten by a resume the session did not drive.
+
+The five entry points above are untouched by this and still never offer the spawn
+tool: a session that does not ask for containment behaves exactly as it did.
 
 ## The limits, stated plainly
 

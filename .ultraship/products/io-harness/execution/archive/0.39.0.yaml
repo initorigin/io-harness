@@ -1,0 +1,54 @@
+product: io-harness
+version: 0.39.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The recorded constraint that decides the assessment is the standing "no new runtime
+      dependency" limit — `cargo tree` reads 402 lines and a new dependency is a criterion failure
+      rather than a trade-off. This release cannot violate it by construction: every mechanism it
+      needs (the tree loop, the ledger, per-tier slots, `Policy::contain`, spawn accounting) already
+      ships, and `Cargo.toml` receives only the version bump.
+    - >
+      The second recorded constraint — "two public items, no more; no field on any existing type, no
+      new `EventKind`, no new table" — is checkable before any code is written and stays checkable
+      throughout: the diff of `docs/public-api.txt` is the assertion, and it must gain exactly two
+      lines and lose none.
+    - >
+      The capability itself is not being built. `run_agent`, `Ledger`, `Containment`,
+      `Policy::contain`, the per-tier queue and tree-wide resume have shipped across 0.5.0, 0.21.0,
+      0.31.0, 0.32.0 and 0.36.0 and are exercised by `tests/subagents.rs` and `tests/fleet.rs`. What
+      0.39.0 adds is a caller. That is why fit is `probable` rather than `uncertain` despite a
+      `medium` complexity.
+    - >
+      The store is untouched. No table, no column, no index, `CHECKPOINT_FORMAT` unmoved and
+      `ADDED_SINCE_0_22_0` unchanged — so the cross-version job, historically the most expensive
+      gate, has nothing new to be fed.
+    - >
+      No live provider is required by any criterion. Every assertion is against fixture providers,
+      stored rows, outbound requests or refusals, which removes the whole class of uncertainty that
+      made 0.38.0's live arm the release's cost centre.
+  major_cost_drivers:
+    - >
+      Keeping two loops from becoming two implementations. `run_workspace_from` (`src/run.rs:3792`)
+      and `run_agent` (`src/run.rs:5276`) are already near-parallel, and this release adds four
+      session rules to the second. Copying them in is fast, passes every functional criterion, and
+      is precisely the defect N4 exists to catch. The extraction has to come first, and the flat
+      loop has to stay behaviourally identical while it happens.
+    - >
+      `run_agent` is recursive, boxed and lifetime-heavy (`Pin<Box<dyn Future + 'f>>`,
+      `src/run.rs:5288`). Threading a borrowed seed slice and a steer inbox into it, while keeping
+      both out of the recursion into children, is where the compile rounds will go.
+    - >
+      Two public items means trap 45's cost twice — a worked doctest per item, a hand-edited
+      `docs/public-api.txt`, and the guide prose — and the doctests link to `Containment`, `Policy`
+      and the `resume_tree_*` family, which is the exact shape the nightly docs gate fires on.
+    - >
+      Test-fixture reuse rather than a third harness. F2, F3, F6 and F8 need a provider that spawns
+      on demand and one that stops on text; `tests/subagents.rs`, `tests/fleet.rs` and
+      `examples/fleet_fixture` already carry both shapes, and standing up a new one would cost more
+      than the feature.
+  recommended_scope_change: null

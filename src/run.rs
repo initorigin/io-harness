@@ -2606,6 +2606,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 watch,
                 ledger,
                 containment,
+                turn: None,
                 root,
                 root_run_id: run_id,
                 web: contract.web.clone(),
@@ -2696,6 +2697,7 @@ pub async fn resume_tree_with_decision_observed<P: Provider>(
                 watch,
                 ledger,
                 containment,
+                turn: None,
                 root,
                 root_run_id: run_id,
                 web: contract.web.clone(),
@@ -3605,6 +3607,169 @@ fn finish(
     Ok(())
 }
 
+/// The conversation, pushed into a fresh turn's ledger before its first step.
+///
+/// One of the four session rules that 0.39.0 made shared. Both loops call it:
+/// the flat one because a turn has always reached it, the tree one because
+/// [`crate::Session::turn_contained`] reaches it now. A rule copied into the
+/// second loop would work today and lapse the first time one copy was reworded —
+/// which is what [`NO_TOOL_CALL`] exists to prevent one literal at a time.
+///
+/// Step 0, because no step of THIS run produced them; and only into an empty
+/// ledger, which is a fresh turn — a resumed one already has the seed from the
+/// store, and seeding again would say everything twice.
+fn seed_conversation(ledger: &mut ContextLedger, extras: &TurnExtras<'_>) {
+    if !ledger.is_empty() {
+        return;
+    }
+    for entry in extras.seed {
+        ledger.push(Observation::new(0, ObsKind::Message, None, entry.clone()));
+    }
+}
+
+/// Type a classifying turn as a reply before its first completion is billed.
+///
+/// Written in this order rather than at the close, so a process killed
+/// mid-answer leaves a row that says what it was doing: `check_resumable`
+/// refuses it as work to continue, because there is no committed step to
+/// continue from and re-asking replaces the one completion at the same price.
+fn open_turn_kind(store: &Store, run_id: i64, extras: &TurnExtras<'_>) -> Result<()> {
+    if extras.classify {
+        store.set_turn_kind(run_id, TURN_KIND_REPLY)?;
+    }
+    Ok(())
+}
+
+/// The prompt a classifying turn's **first** completion is made with, or `None`
+/// when the turn is not allowed to decide it was conversation.
+///
+/// `base` is the loop's own conversational opening — the two loops describe
+/// different worlds (one of them has sub-agents) and must keep saying so — but
+/// what is wrapped around it, and the condition under which it is used at all,
+/// is one rule in one place.
+fn conversational_opening(
+    base: String,
+    extras: &TurnExtras<'_>,
+    extra: &[ToolSpec],
+    skills: &Skills,
+    planning: bool,
+    agents: &Agents,
+) -> Option<String> {
+    if !extras.classify {
+        return None;
+    }
+    let base = with_skill_catalog(with_extra_tools(base, extra), skills);
+    Some(match planning {
+        true => format!("{base}{}", planning_directive(agents)),
+        false => base,
+    })
+}
+
+/// What the turn's own first completion decided, for the loop that made it.
+///
+/// `Ok(None)` means the turn is work and the caller carries on **from that same
+/// completion**, so the run's first step is the call already paid for and
+/// nothing is asked twice. `Ok(Some(outcome))` means the turn is over: it
+/// answered, or it had already spent its ceiling answering.
+///
+/// Only the first completion. A later one that stops on text is the loop
+/// finishing a run, which is what it has always been.
+#[allow(clippy::too_many_arguments)]
+fn classify_first_completion(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    contract: &TaskContract,
+    response: &CompletionResponse,
+    tokens_used: u64,
+    ledger: &ContextLedger,
+    written: usize,
+    extras: &TurnExtras<'_>,
+    step: u32,
+    start_step: u32,
+) -> Result<Option<RunOutcome>> {
+    if !extras.classify || step != start_step {
+        return Ok(None);
+    }
+    // `finished` and not `tool_calls.is_empty()`: a provider that paused a long
+    // server-side search hands back text with no call, which is a continuation
+    // and not an ending. Reading it as an answer would stop an unverified turn in
+    // the middle of the search it was told to make. It also carries the
+    // `Verification::None` half, which is the same condition `Session`
+    // classifies on.
+    if !finished(contract, response) {
+        store.set_turn_kind(run_id, TURN_KIND_RUN)?;
+        return Ok(None);
+    }
+    // A reply is billed like everything else and is bounded by the same ceiling.
+    // Checked before the answer is served, so a turn whose one completion has
+    // already spent the budget is refused rather than served free.
+    if let Some(max) = contract.max_tokens {
+        if tokens_used > max {
+            finish(store, watch, run_id, 0, 0, "cost_budget_exceeded")?;
+            return Ok(Some(RunOutcome::CostBudgetExceeded { steps: 0 }));
+        }
+    }
+    // What the model said is made durable, and nothing else is: no `steps` row,
+    // no gate attempt, no checkpoint, no snapshot, no spawn and no deferred
+    // approval. The observation is how `Session` reads the reply back — the same
+    // `(no tool call)` marker every turn's closing message is read through — so a
+    // reply needs no second channel out of a loop.
+    persist_ledger(store, run_id, ledger, written)?;
+    info!(run_id, "turn answered without opening a run");
+    finish(store, watch, run_id, 0, 0, "finished")?;
+    Ok(Some(RunOutcome::Finished { steps: 0 }))
+}
+
+/// The operator's channel into a running turn, read at a step boundary.
+///
+/// The same boundary a cancellation is honoured at, for the same reason: the
+/// points in between are not safe to stop at or to change course from — a tool
+/// call is in flight and a file may be half-written. In a tree that boundary is
+/// also the point at which no child is running, because children are awaited
+/// inside the step that spawned them.
+///
+/// `Ok(Some(_))` is the interrupt: the turn is finished rather than abandoned,
+/// so `runs.status` stops being `running` and a resume reports the cancellation
+/// instead of re-driving the loop.
+fn drain_steer(
+    store: &Store,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    ledger: &mut ContextLedger,
+    extras: &TurnExtras<'_>,
+) -> Result<Option<RunOutcome>> {
+    let Some(inbox) = extras.steer else {
+        return Ok(None);
+    };
+    let steered = inbox.drain();
+    if steered.interrupted {
+        // The cancel path, not a second one.
+        finish(store, watch, run_id, 0, step - 1, "cancelled")?;
+        info!(run_id, steps = step - 1, "turn interrupted by its operator");
+        return Ok(Some(RunOutcome::Cancelled { steps: step - 1 }));
+    }
+    for message in steered.messages {
+        // An observation like any other: bounded by the same budget, recorded in
+        // the same trace, and — carrying no target — never superseded away. It is
+        // text the model reads, not permission the model has: every tool call it
+        // leads to is checked against the same policy by the same code.
+        info!(run_id, step, "operator steered the turn");
+        store.record_context_event(
+            run_id,
+            &ContextEvent::steered(step, format!("operator message ({} chars)", message.len())),
+        )?;
+        ledger.push(Observation::new(
+            step,
+            ObsKind::Message,
+            None,
+            format!("\n[operator, mid-turn] {message}\n"),
+        ));
+    }
+    Ok(None)
+}
+
 async fn run_from<P: Provider>(
     contract: &TaskContract,
     provider: &P,
@@ -3846,16 +4011,14 @@ async fn run_workspace_from<P: Provider>(
     // Every later step of a promoted turn uses `system`, unchanged from 0.36.1:
     // permitting an answer is a decision about the turn's opening, not a licence
     // to stop at a plan in prose on step nine.
-    let conversational = extras.classify.then(|| {
-        let base = with_skill_catalog(
-            with_extra_tools(conversational_system_prompt(), &extra),
-            skills,
-        );
-        match planning {
-            true => format!("{base}{}", planning_directive(&contract.agents)),
-            false => base,
-        }
-    });
+    let conversational = conversational_opening(
+        conversational_system_prompt(),
+        extras,
+        &extra,
+        skills,
+        planning,
+        &contract.agents,
+    );
     let mut tools = workspace_tools();
     tools.extend(extra);
     // Offered only while the phase is on, and withdrawn the moment it ends: a tool
@@ -3886,11 +4049,7 @@ async fn run_workspace_from<P: Provider>(
     // Only when the ledger is empty, which is a fresh turn. A resumed turn already
     // has them from the store — the seed was persisted with the first step — and
     // seeding again would say everything twice.
-    if ledger.is_empty() {
-        for entry in extras.seed {
-            ledger.push(Observation::new(0, ObsKind::Message, None, entry.clone()));
-        }
-    }
+    seed_conversation(&mut ledger, extras);
     // Is the agent getting anywhere? Restored from nothing on resume by design: a
     // resumed run has just been given a fresh chance, and condemning it for the
     // window it stalled in before the crash would be a poor welcome.
@@ -3939,9 +4098,7 @@ async fn run_workspace_from<P: Provider>(
     // `Store::check_resumable` refuses it as work to continue, because there is no
     // committed step to continue from and re-asking replaces the one completion at
     // the same price.
-    if extras.classify {
-        store.set_turn_kind(run_id, TURN_KIND_REPLY)?;
-    }
+    open_turn_kind(store, run_id, extras)?;
 
     for step in start_step..=contract.max_steps {
         // The store's copy of each live handle's processes, refreshed each step.
@@ -3980,41 +4137,8 @@ async fn run_workspace_from<P: Provider>(
         // The same boundary is where an operator's steering lands, for the same
         // reason: the points in between are not safe to stop at or to change course
         // from — a tool call is in flight and a file may be half-written.
-        if let Some(inbox) = extras.steer {
-            let steered = inbox.drain();
-            if steered.interrupted {
-                // The cancel path, not a second one. An interrupted turn is
-                // finished rather than abandoned: `runs.status` stops being
-                // `running`, a summary is written, and a resume reports the
-                // cancellation instead of re-driving the loop.
-                finish(store, watch, run_id, 0, step - 1, "cancelled")?;
-                info!(run_id, steps = step - 1, "turn interrupted by its operator");
-                return Ok(
-                    RunResult::new(RunOutcome::Cancelled { steps: step - 1 }, run_id)
-                        .with_remembered(remembered),
-                );
-            }
-            for message in steered.messages {
-                // An observation like any other: bounded by the same budget,
-                // recorded in the same trace, and — carrying no target — never
-                // superseded away. It is text the model reads, not permission the
-                // model has: every tool call it leads to is checked against the
-                // same policy by the same code.
-                info!(run_id, step, "operator steered the turn");
-                store.record_context_event(
-                    run_id,
-                    &ContextEvent::steered(
-                        step,
-                        format!("operator message ({} chars)", message.len()),
-                    ),
-                )?;
-                ledger.push(Observation::new(
-                    step,
-                    ObsKind::Message,
-                    None,
-                    format!("\n[operator, mid-turn] {message}\n"),
-                ));
-            }
+        if let Some(o) = drain_steer(store, watch, run_id, step, &mut ledger, extras)? {
+            return Ok(RunResult::new(o, run_id).with_remembered(remembered));
         }
         if let Some(max) = contract.max_duration {
             if store.elapsed_secs(run_id)? > max.as_secs_f64() {
@@ -4191,42 +4315,20 @@ async fn run_workspace_from<P: Provider>(
         // Only the first completion. A later one that stops on text is the loop
         // finishing a run, which is what it has always been and is left alone
         // below.
-        if extras.classify && step == start_step {
-            // `finished` and not `tool_calls.is_empty()`: a provider that paused a
-            // long server-side search hands back text with no call, which is a
-            // continuation and not an ending. Reading it as an answer would stop an
-            // unverified turn in the middle of the search it was told to make. It
-            // also carries the `Verification::None` half, which is the same
-            // condition `Session` classifies on.
-            if !finished(contract, &response) {
-                store.set_turn_kind(run_id, TURN_KIND_RUN)?;
-            } else {
-                // A reply is billed like everything else and is bounded by the same
-                // ceiling. Checked before the answer is served, so a turn whose one
-                // completion has already spent the budget is refused rather than
-                // served free — the same order the loop applies it in below.
-                if let Some(max) = contract.max_tokens {
-                    if tokens_used > max {
-                        finish(store, watch, run_id, 0, 0, "cost_budget_exceeded")?;
-                        return Ok(RunResult::new(
-                            RunOutcome::CostBudgetExceeded { steps: 0 },
-                            run_id,
-                        )
-                        .with_remembered(remembered));
-                    }
-                }
-                // What the model said is made durable, and nothing else is: no
-                // `steps` row, no gate attempt, no checkpoint, no snapshot, no
-                // spawn and no deferred approval. The observation is how `Session`
-                // reads the reply back — the same `(no tool call)` marker every
-                // turn's closing message is read through — so a reply needs no
-                // second channel out of this loop.
-                persist_ledger(store, run_id, &ledger, written)?;
-                info!(run_id, "turn answered without opening a run");
-                finish(store, watch, run_id, 0, 0, "finished")?;
-                return Ok(RunResult::new(RunOutcome::Finished { steps: 0 }, run_id)
-                    .with_remembered(remembered));
-            }
+        if let Some(o) = classify_first_completion(
+            store,
+            watch,
+            run_id,
+            contract,
+            &response,
+            tokens_used,
+            &ledger,
+            written,
+            extras,
+            step,
+            start_step,
+        )? {
+            return Ok(RunResult::new(o, run_id).with_remembered(remembered));
         }
 
         let mut paused: Option<i64> = None;
@@ -4581,6 +4683,15 @@ struct Tree<'a, P: Provider> {
     watch: &'a Watch<'a>,
     ledger: Arc<Ledger>,
     containment: &'a Containment,
+    /// What a session turn adds to this tree's ROOT, and nothing else (0.39.0).
+    ///
+    /// `None` for every `run_tree`/`resume_tree` entry point, which is what keeps
+    /// them exactly as they were. `Some` only when
+    /// [`crate::Session::turn_contained`] drove the tree, and even then the root
+    /// is the only agent that reads it: `Tree::extras` hands a child the empty
+    /// set, so a child is never seeded with the conversation, never classified as
+    /// a reply, and never steerable by an operator it has not spoken to.
+    turn: Option<&'a TurnExtras<'a>>,
     root: PathBuf,
     /// The tree root's run id, so `Containment::max_total_duration` can be
     /// measured against when the TREE started rather than when this agent did.
@@ -4595,6 +4706,34 @@ struct Tree<'a, P: Provider> {
     /// would leave a sub-agent answering from memory on a task that needs the
     /// current answer.
     web: Option<crate::web::WebAccess>,
+}
+
+/// What an agent that is not a session turn's root runs with: nothing.
+///
+/// A `const` rather than `TurnExtras::default()` so it can be borrowed for as
+/// long as the tree lives — a value built inside the loop would not outlive the
+/// recursion into a child.
+const NO_EXTRAS: TurnExtras<'static> = TurnExtras {
+    seed: &[],
+    steer: None,
+    turn: None,
+    stream: false,
+    classify: false,
+};
+
+impl<P: Provider> Tree<'_, P> {
+    /// The session extras this agent runs under — the turn's at the root, and
+    /// nothing at any other depth.
+    ///
+    /// The depth test lives here rather than at each of the four use sites, so
+    /// "a child is work, not conversation" is one rule that cannot hold at three
+    /// of them and lapse at the fourth.
+    fn extras(&self, depth: u32) -> &TurnExtras<'_> {
+        match depth {
+            0 => self.turn.unwrap_or(&NO_EXTRAS),
+            _ => &NO_EXTRAS,
+        }
+    }
 }
 
 /// The directory every per-agent worktree is made under, relative to the tree
@@ -4867,6 +5006,38 @@ pub async fn run_tree_observed<P: Provider>(
     containment: &Containment,
     observer: &dyn Observer,
 ) -> Result<RunResult> {
+    run_tree_with_extras(
+        contract,
+        provider,
+        store,
+        policy,
+        approver,
+        containment,
+        observer,
+        &NO_EXTRAS,
+    )
+    .await
+}
+
+/// [`run_tree_observed`] with the session layer's extras, applied to the root
+/// agent only (0.39.0).
+///
+/// Crate-internal, and the exact tree-side counterpart of [`run_with_extras`]:
+/// the public entry points above drive it with [`NO_EXTRAS`] and therefore
+/// behave exactly as they did, while [`crate::Session::turn_contained`] passes a
+/// turn's seed, steer inbox, classification flag and streaming choice through to
+/// the one agent that is a conversation — the root.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tree_with_extras<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    store: &Store,
+    policy: &Policy,
+    approver: &dyn Approver,
+    containment: &Containment,
+    observer: &dyn Observer,
+    extras: &TurnExtras<'_>,
+) -> Result<RunResult> {
     contract.tools.validate()?;
     let skills = contract.discover_skills()?;
     let root = contract.root.clone().ok_or_else(|| {
@@ -4876,6 +5047,13 @@ pub async fn run_tree_observed<P: Provider>(
     })?;
     let ledger = Arc::new(Ledger::new(containment));
     let run_id = store.start_run(&contract.goal, &root.display().to_string())?;
+    // A session turn joins the tree here, in the same order and for the same
+    // reason `run_with_extras` does it: after the run exists, before the first
+    // completion is billed. A turn row with no run to point at would be a
+    // conversation entry nothing can explain.
+    if let Some(turn) = &extras.turn {
+        store.record_turn(turn.session_id, turn.parent_turn_id, run_id, turn.prompt)?;
+    }
     store.set_provider(run_id, provider.name())?;
     // As in [`run_with_observed`]: the caller's policy, recorded before the
     // provider layer is merged in. A tree's own resume already takes a policy,
@@ -4920,6 +5098,7 @@ pub async fn run_tree_observed<P: Provider>(
         watch,
         ledger,
         containment,
+        turn: Some(extras),
         root,
         root_run_id: run_id,
         web: contract.web.clone(),
@@ -5118,6 +5297,7 @@ pub async fn resume_tree_observed<P: Provider>(
         watch,
         ledger,
         containment,
+        turn: None,
         root,
         root_run_id: run_id,
         web: contract.web.clone(),
@@ -5288,6 +5468,10 @@ fn run_agent<'f, P: Provider>(
 ) -> Pin<Box<dyn Future<Output = Result<RunOutcome>> + 'f>> {
     // Boxed so the loop can recurse into itself when an agent spawns a child.
     Box::pin(async move {
+        // 0.39.0 — what a session turn adds, and only at the root. Every child
+        // reads the empty set, so the four rules below are structurally inert for
+        // anything this agent spawns rather than inert by four separate tests.
+        let extras = tree.extras(depth);
         // 0.31.0 — the plan gate, at the root only. A child that could hold its own
         // plan open would mean a hundred pending plans from one `run_tree`, which is
         // the problem the gate exists to prevent rather than a feature of it. As in
@@ -5327,6 +5511,18 @@ fn run_agent<'f, P: Provider>(
             true => format!("{base_system}{}", planning_directive(&contract.agents)),
             false => base_system.clone(),
         };
+        // 0.39.0 — the opening a contained turn's first completion is made with,
+        // and only the first, exactly as the flat loop builds it. `None` for every
+        // agent that is not a classifying turn's root, which is every child and
+        // every agent of every `run_tree`.
+        let conversational = conversational_opening(
+            tree_conversational_system_prompt(),
+            extras,
+            &extra,
+            tree.skills,
+            planning,
+            &contract.agents,
+        );
         let mut tools = tree_tools(tree.agents);
         tools.extend(extra);
         if planning {
@@ -5343,6 +5539,12 @@ fn run_agent<'f, P: Provider>(
         // same restore, keyed on this agent's own run id. A child that is resumed
         // is the same child, at whatever depth it sits.
         let (mut ledger, mut written) = restore_ledger(tree.store, run_id)?;
+        // The conversation this turn continues, at the root and nowhere else: a
+        // child is given its goal, not the transcript.
+        seed_conversation(&mut ledger, extras);
+        // And the turn is typed before its first completion is billed, the same
+        // order the flat loop writes it in.
+        open_turn_kind(tree.store, run_id, extras)?;
         let mut progress = Progress::new();
         // Per agent, not per tree. A child's handles are the child's: it is the
         // one that knows when they are finished with, and a shared registry
@@ -5371,6 +5573,13 @@ fn run_agent<'f, P: Provider>(
             // One flag for the whole tree, so a cancel asked for while a sibling was
             // mid-flight stops this agent too.
             if let Some(o) = cancelled(tree.store, tree.watch, run_id, depth, step - 1)? {
+                return Ok(o);
+            }
+            // The same boundary carries an operator's steering, and it is the one
+            // point at which no child of this agent is in flight: children are
+            // awaited inside the step that spawned them.
+            if let Some(o) = drain_steer(tree.store, tree.watch, run_id, step, &mut ledger, extras)?
+            {
                 return Ok(o);
             }
             if let Some(max) = contract.max_duration {
@@ -5412,7 +5621,13 @@ fn run_agent<'f, P: Provider>(
             let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
-                system: system.clone(),
+                // 0.39.0 — a contained turn's opening is its first completion
+                // only. Every later step is the tree loop of 0.38.0, asked the way
+                // it has always been asked.
+                system: match &conversational {
+                    Some(c) if step == start_step => c.clone(),
+                    _ => system.clone(),
+                },
                 user: user.clone(),
                 tools: tools.clone(),
                 // 0.21.0 — a named agent's model. `None` for the root and for any
@@ -5441,7 +5656,9 @@ fn run_agent<'f, P: Provider>(
                 step,
                 tree.watch,
                 depth,
-                false,
+                // Streaming is the turn's choice and reaches the root only: a
+                // child's text is composed back into its parent, not shown.
+                extras.stream,
             )
             .await?;
 
@@ -5508,6 +5725,27 @@ fn run_agent<'f, P: Provider>(
                     ),
                 ));
                 decisions.push("no tool call".into());
+            }
+            // 0.39.0 — the same first-completion verdict the flat loop reads, in
+            // the same place and through the same helper. A contained turn that
+            // was conversation ends here, before a single child exists: the
+            // classification happens on the completion that would have carried the
+            // spawn call, so an answered turn spawns nothing by construction
+            // rather than by a cap.
+            if let Some(o) = classify_first_completion(
+                tree.store,
+                tree.watch,
+                run_id,
+                contract,
+                &response,
+                tokens_used,
+                &ledger,
+                written,
+                extras,
+                step,
+                start_step,
+            )? {
+                return Ok(o);
             }
             // Non-spawn tools mutate the workspace and the observation log, so
             // they run in order. Spawn calls are independent sub-agents, so they
@@ -9832,15 +10070,22 @@ const WORKSPACE_PROMPT: &str = "You are an agent working across a repository to 
 /// `docs/CONTRACT.md`: answering something meant as work costs the operator one
 /// retype, and the instruction leans against it accordingly.
 fn conversational_system_prompt() -> String {
-    format!(
-        "{WORKSPACE_PROMPT} What the operator has said may not be work at all — it may be a \
-         greeting, a question about you or what you can do, or a remark that wants nothing done. \
-         If a plain answer is the whole of what is wanted, write that answer and call no tool. If \
-         any part of it needs the repository read or changed, call a tool and start: do not \
-         describe what you are about to do instead of doing it, and do not promise to act in \
-         prose. When the two readings are both possible, act."
-    )
+    format!("{WORKSPACE_PROMPT}{CONVERSATIONAL_ENDING}")
 }
+
+/// The one sentence that differs, and it is 0.37.0's whole release: what the
+/// operator said may be work, and it may be conversation, and the model is the
+/// thing best placed to tell them apart.
+///
+/// A `const` since 0.39.0 because two prompts now carry it — the flat loop's and
+/// the tree loop's — and a rule reworded in one of them and not the other is a
+/// session that classifies differently depending on whether it may spawn.
+const CONVERSATIONAL_ENDING: &str = " What the operator has said may not be work at all — it may \
+     be a greeting, a question about you or what you can do, or a remark that wants nothing done. \
+     If a plain answer is the whole of what is wanted, write that answer and call no tool. If \
+     any part of it needs the repository read or changed, call a tool and start: do not \
+     describe what you are about to do instead of doing it, and do not promise to act in \
+     prose. When the two readings are both possible, act.";
 
 /// Tell the model about tools the built-in prompt does not enumerate.
 ///
@@ -9934,16 +10179,39 @@ fn workspace_user_prompt(
     )
 }
 
-fn tree_system_prompt() -> String {
-    "You are an agent working across a repository to meet a stated specification. \
-     Use `grep`, `find`, `read_file`, and `write_file` as in a normal run. You may \
+/// What an agent inside a tree is and what its tools are, without the sentence
+/// that says how a turn must end.
+///
+/// Split out in 0.39.0 for the reason [`WORKSPACE_PROMPT`] was split out in
+/// 0.37.0: a contained session turn's first completion is allowed to answer, and
+/// it has to be told so while still being described the world it is actually in —
+/// one where it may spawn. The two prompts must not drift into describing two
+/// different agents.
+const TREE_PROMPT: &str = "You are an agent working across a repository to meet a stated \
+     specification. Use `grep`, `find`, `read_file`, and `write_file` as in a normal run. You may \
      also decompose the work: call `spawn_agent` to launch a sub-agent that pursues \
      a smaller goal over the same workspace, and its result is reported back to you. \
      A sub-agent inherits your permissions and can only be more restricted, never \
      less. Prefer spawning when parts of the task are independent. Work in small \
-     steps; the whole set is checked against the success criterion after each. Do \
-     not explain; call tools."
-        .to_string()
+     steps; the whole set is checked against the success criterion after each.";
+
+/// The ending every tree agent is given, except a contained turn's opening.
+const TREE_ENDING: &str = " Do not explain; call tools.";
+
+fn tree_system_prompt() -> String {
+    format!("{TREE_PROMPT}{TREE_ENDING}")
+}
+
+/// The prompt a contained session turn's **first** completion is made with
+/// (0.39.0), when that turn is allowed to decide it was conversation.
+///
+/// The same sentence about the ending that [`conversational_system_prompt`]
+/// carries, over the tree agent's own description. A turn that fans out is still
+/// a turn: "migrate these forty handlers" is work and opens a run, and "what can
+/// you do?" is a question and does not, and the model is the thing best placed to
+/// tell them apart whether or not it has sub-agents.
+fn tree_conversational_system_prompt() -> String {
+    format!("{TREE_PROMPT}{CONVERSATIONAL_ENDING}")
 }
 
 /// Workspace tools plus [`SPAWN_TOOL`] — offered only inside an agent tree.
