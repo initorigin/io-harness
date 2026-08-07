@@ -66,9 +66,14 @@
 //! is no `;`, `&&` or `$( )` to parse and therefore none to get wrong. Every call
 //! is an [`Act::Exec`] check on the program *and* on the whole argv, so
 //! `allow_exec("cargo test*")` beside `deny_exec("cargo publish*")` means what it
-//! reads. A command runs in the workspace with the embedding program's privileges
-//! and is **not** sandboxed — see [`tools::exec`] for the whole of that bound,
-//! and [`DEFAULT_EXEC_TIMEOUT`] for the ceiling on one that wedges.
+//! reads. By default a command runs in the workspace with the embedding
+//! program's privileges and is **not** sandboxed — see [`tools::exec`] for the
+//! whole of that bound, and [`DEFAULT_EXEC_TIMEOUT`] for the ceiling on one that
+//! wedges. A contract that wants the narrower thing asks for it:
+//! [`TaskContract::with_contained_exec`] puts every command `exec` and the
+//! foreground `shell` start inside the [`Sandbox`] backend this host offers,
+//! keeping the workspace as the working directory so an incremental build
+//! survives between commands.
 //!
 //! **Verification in any language, or none.** [`Verification::Command`] runs a
 //! caller-supplied command in the sandbox and asserts its exit status — one

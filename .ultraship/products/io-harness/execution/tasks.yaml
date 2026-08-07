@@ -468,7 +468,7 @@ tasks:
     Its platform table disagrees with the identical table in docs/CONTRACT.md, which this release
     already corrected. A reader deciding whether to depend on the crate meets all of it on the first
     screen.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.40.0-T07
   acceptance_criteria:
@@ -495,4 +495,47 @@ tasks:
   files:
   - README.md
   - src/lib.rs
-  evidence: []
+  evidence:
+  - '**N7.** Both io-cli URLs are gone. `grep -rn "github.com/initorigin/io-cli"` and `grep -rn
+    "crates.io/crates/io-cli"` across `*.md`, `*.rs` and `*.toml`, excluding `target/`, `.ultraship/`
+    and `CHANGELOG.md`, return **nothing**. The product table row reads `| io-cli | Terminal app on
+    io-harness | Not built |`, unlinked, matching io-studio''s row. The paragraph that argued from
+    io-cli being a second embedder is deleted rather than reworded — it existed to support a claim
+    the table no longer makes, and a paragraph arguing against the row two lines above it is the
+    same self-contradiction N5 exists to catch.'
+  - 'The "Who it is for" section keeps its point — a terminal UI, a login flow and a notification
+    tray belong to the embedder, not to this layer — and no longer names a repository a reader
+    cannot be sent to.'
+  - '**N8, correction 1.** `README.md` and `src/lib.rs` both said a command "is **not** sandboxed"
+    full stop. Both now say that is the **default** and name `TaskContract::with_contained_exec` as
+    the way to change it. The README gains a paragraph stating what containment covers, that the
+    workspace stays the working directory, that the per-platform enforcement differs, that a refused
+    host records the floor, and the three honest costs.'
+  - '**N8, correction 2.** The README''s platform table read "Linux | Native, namespaces and
+    rlimits" while `docs/CONTRACT.md:131` — corrected earlier in this release — read "mount and
+    network namespaces plus rlimits". One table had been updated and its twin had not. They now
+    match.'
+  - '**N8, correction 3.** Three capability paragraphs narrated their own release: "and, since
+    0.34.0, a second model", "**One failed gate is retried on its own (0.34.0).**" and "**Which model
+    answers can change mid-run (0.34.0).**". All three now state the capability. `grep -n
+    "0\.[0-9]*\.[0-9]" README.md` leaves **one** hit, line 115, which explains why the MSRV rose in
+    0.23.0 — provenance for a number a reader has to satisfy, not a capability narrating itself, and
+    deliberately kept.'
+  - '**Two shipped capabilities were missing from the landing page entirely and were added.** The
+    plan gate, the question-about-intent, the named agent roster and the effort level had no
+    paragraph in "What it does" — only a row in the guides table. Prompt caching had **no mention at
+    all**, including the part that matters most: nothing is marked in the transcript, because context
+    assembly re-fits earlier observations every turn and a breakpoint there would bill as a cache
+    write nearly every turn.'
+  - 'The headline is unchanged, and that was checked rather than assumed. "with a permission
+    boundary, a sandbox, and a durable trace you own" was already true — the verification gate has
+    run inside a sandbox since 0.6.0. This release widens what the sandbox reaches, so the line
+    covers more than it did while claiming no more than it did.'
+  - '`CHANGELOG.md` and `.ultraship/views/` still name io-cli and are deliberately untouched, per
+    `US-IO-HARNESS-0.40.0-I01`. They record what past releases said at the time; editing them to
+    match a decision taken today is what `iterate` prohibits.'
+  - 'Gates re-run after these edits, because `src/lib.rs` is source: `cargo fmt --check` **exit 0**;
+    `cargo clippy --all-targets --all-features -- -D warnings` **exit 0**; `RUSTDOCFLAGS="--cfg
+    docsrs -D warnings" cargo +nightly doc --all-features --no-deps` **exit 0**; `cargo test
+    --all-features --doc` — **374 passed, 0 failed**; `cargo test --all-features --test readme --test
+    docs_drift --test guide_pages --test public_api --test changelog` — **44 passed, 0 failed**.'

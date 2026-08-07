@@ -103,9 +103,9 @@ business; only the language the *embedder* is written in is.
 It is a library and nothing else. There is no binary to install, no daemon, no
 UI, no account, and no telemetry. The browser dance for a subscription login, the
 terminal interface, the keybindings and the notification tray all belong to the
-program that embeds this crate — [io-cli](https://github.com/initorigin/io-cli)
-is one such program. If what you want is an agent to *use* rather than one to
-*build with*, this is the wrong layer.
+program that embeds this crate, and none of them is in scope here. If what you
+want is an agent to *use* rather than one to *build with*, this is the wrong
+layer.
 
 ## Requirements
 
@@ -137,12 +137,30 @@ beside `deny_exec("cargo publish*")` means what it reads. A whole command line �
 pipelines, redirects, `&&` — is `shell`, parsed in this crate rather than by a
 shell and checked stage by stage before the first process starts. `shell_start`,
 `shell_poll` and `shell_kill` are the same line with a longer life, for a dev
-server or a log tail that has to outlive the step that started it. A command runs
-with your process's privileges and is **not** sandboxed — that bound is stated in
-full in the [command execution guide](docs/guide/command-execution.md), because
-it is the widest thing the crate grants.
+server or a log tail that has to outlive the step that started it. By default a
+command runs with your process's privileges and is **not** sandboxed — that bound
+is stated in full in the [command execution guide](docs/guide/command-execution.md),
+because it is the widest thing the crate grants.
 
-**Verification in any language, or none — and, since 0.34.0, a second model.** A
+**And a contract can ask for the narrower thing.**
+`TaskContract::with_contained_exec(SandboxConfig)` puts every command `exec` and
+the foreground `shell` start inside the sandbox backend this host offers: the
+config's resource caps, filesystem writes confined to the workspace, and outbound
+network denied unless the run's policy would permit it. The **workspace root**
+stays the working directory — nothing is copied in and nothing is discarded — so
+an incremental build survives between commands, which is what made containment
+unusable for a project's own toolchain before. What each platform actually
+enforces differs and the difference is not cosmetic: macOS and Linux confine
+writes and deny egress, a Windows Job Object applies the resource caps and has no
+filesystem or network facility at all, and a host that refuses the native
+primitive falls back to the portable floor and **records the floor**, so a run
+contained less than you asked for is legible afterwards. The costs — egress is one
+boolean per run, the long-lived `shell_start` handles are not contained, and a
+toolchain writing to a user-level cache like `~/.cargo/registry` fails under
+containment on macOS — are stated in
+[docs/CONTRACT.md](docs/CONTRACT.md) rather than discovered.
+
+**Verification in any language, or none — or a second model.** A
 criterion can be the project's own test command in whatever language it is
 written, or nothing at all when the task has no checkable criterion — "work out
 why the deploy fails" is a run, not a gate. `Verification::Review` is the other
@@ -161,17 +179,37 @@ that can approve, deny, or defer past the end of the process and resume on a
 human decision later. Every refusal and decision is in the trace, attributed to
 the rule and the layer that produced it.
 
+**A plan before anything is written.** `TaskContract::with_plan_gate` opens a run
+in a planning phase: the agent reads, writes nothing, and the only exit is an
+ordered plan — each step optionally naming the agent that owns it — which a
+`PlanGate` approves, corrects or cancels. With no in-process answer the plan
+persists and the run stops, so the decision can be made after the process exits.
+Beside it the agent can ask a question about intent rather than guessing, run
+under a named roster of agent definitions, and be told to think harder or less
+through an effort level each vendor projects into its own shape — see the
+[agency guide](docs/guide/agency.md).
+
 **Budgets and stop conditions.** Steps, wall-clock time, and token spend are
 capped. A tree of agents draws from one shared ledger no spawned contract can
 raise.
 
-**One failed gate is retried on its own (0.34.0).** Every gate evaluation is
-recorded as `Passed`, `Failed` or `Errored` — the last being a criterion that
-could not run at all, a distinction the crate did not have before. `retry_gate`
+**The stable prefix is cached, where the vendor sells it.** One cache breakpoint
+sits at the end of the system block, which on the Anthropic wire covers the tool
+schemas and the instructions together, and OpenRouter carries the same marker.
+The reads land in the accounting rows beside every other token, so a long
+conversation over one workspace stops paying full price for the part of the
+request that never changes. Nothing is marked in the transcript, deliberately:
+context assembly supersedes, invalidates and re-reads earlier observations every
+turn, so a breakpoint there would be billed as a cache *write* almost every turn
+and cost money rather than save it.
+
+**One failed gate is retried on its own.** Every gate evaluation is recorded as
+`Passed`, `Failed` or `Errored` — the last being a criterion that could not run at
+all, which is a different problem from one that ran and said no. `retry_gate`
 re-runs *only* the criterion, against the workspace the run left, so a transport
 failure on the gate does not cost the forty steps that produced the work.
 
-**Which model answers can change mid-run (0.34.0).** `Routing` escalates to a
+**Which model answers can change mid-run.** `Routing` escalates to a
 stronger model after repeated gate failures, downshifts while the change is small,
 and — the rule an unattended job needs — refuses to start at all when the primary
 provider reports it is unreachable, rather than quietly spending the night on a
@@ -189,7 +227,8 @@ grant itself what the parent lacks.
 **An execution sandbox.** Model-produced code runs in an ephemeral sandbox with
 an isolated workdir, resource caps that kill rather than throttle, and network
 denied by default. Native backends on macOS and Linux over a portable floor that
-runs everywhere.
+runs everywhere — and the same machine is what a contained `exec` reaches, so the
+project's own commands can run behind it rather than beside it.
 
 **Durable, unattended runs.** After every completed step the trace, the budget
 draw, and a checkpoint commit in one transaction. A crash resumes the whole tree
@@ -372,7 +411,7 @@ dependency at all.
 | Platform | Sandbox containment |
 | --- | --- |
 | macOS | Native, `sandbox-exec` |
-| Linux | Native, namespaces and rlimits |
+| Linux | Native, mount and network namespaces plus rlimits |
 | Windows | Native resource containment (memory, CPU, process count, tree kill); no filesystem or network boundary |
 
 The full suite runs on all three in CI.
@@ -395,12 +434,12 @@ goes through a deprecation cycle rather than vanishing between two releases.
 | Product | What it is | Status |
 | --- | --- | --- |
 | [io-harness](https://github.com/initorigin/io-harness) | The Rust agent harness (the center product) | Released |
-| [io-cli](https://github.com/initorigin/io-cli) | Terminal app on io-harness | Released |
+| io-cli | Terminal app on io-harness | Not built |
 | io-studio | Desktop coding studio on io-harness | Not built |
 
-io-cli is the crate embedded by something other than its own author, which is
-the only evidence a library like this one can offer that its API survives
-contact with a second program.
+io-harness is the one you can go and read. The other two are named so the shape
+of the whole is visible, and carry no link because there is nothing to send you
+to.
 
 ## Contributing
 
