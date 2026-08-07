@@ -60,6 +60,17 @@ notes are produced from it.
   affects the verification gate as well as contained commands, and it is a
   tightening: a gate command that wrote outside its working directory on Linux
   succeeded before and fails now.
+- **Read this before relying on the Linux row: a stock Ubuntu 24.04 host does not
+  get filesystem confinement.** The backend needs an unprivileged user namespace,
+  and Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which
+  refuses one. There a contained command takes the portable floor: the resource
+  caps still apply and the filesystem confinement and egress denial do not. It is
+  reported rather than hidden — `select().backend()` says `PortableFloor` before
+  the run and the `SandboxEvent` rows say it afterwards — but it is not what the
+  per-platform table's Linux row reads like at a glance. Setting
+  `kernel.apparmor_restrict_unprivileged_userns=0`, which most other
+  distributions already ship, gives the real backend. `docs/CONTRACT.md` states
+  it in full.
 
 ### Deprecated
 

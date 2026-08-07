@@ -138,6 +138,19 @@ async fn a_contained_command_cannot_write_outside_the_workspace() {
     .await
     .unwrap();
 
+    if !backend_confines_writes() {
+        // This host took the portable floor, which confines nothing. Assert
+        // that, rather than asserting a confinement that was never applied:
+        // the write lands and the trace says so. A skip here would read as a
+        // pass and prove nothing, which is the failure mode F6 names.
+        assert!(
+            target.exists(),
+            "the floor confines nothing, so the write must land: {}",
+            target.display()
+        );
+        return;
+    }
+
     assert!(
         !target.exists(),
         "a contained command wrote outside the workspace: {}",
@@ -349,6 +362,27 @@ async fn loopback_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
     (addr, handle)
 }
 
+/// Does this host's backend confine writes at all? The portable floor does not,
+/// and neither does a Job Object.
+///
+/// The escape tests below branch on this rather than skipping, because F6 names
+/// the failure mode exactly: "a skip that reads as a pass is the failure mode
+/// here". A floor host must *assert the floor* — the write lands, and the
+/// recorded backend says `PortableFloor` — so the fallback path is proven rather
+/// than stepped over. What is never allowed is passing while proving nothing.
+///
+/// This is not hypothetical. Ubuntu 24.04 ships
+/// `kernel.apparmor_restrict_unprivileged_userns=1`, so before 0.40.0's CI step
+/// the ubuntu runners took the floor: the two escape tests failed loudly and the
+/// egress tests skipped silently, which is the same defect wearing two faces.
+fn backend_confines_writes() -> bool {
+    use io_harness::sandbox::{select, Backend, Sandbox};
+    matches!(
+        select(&SandboxConfig::new()).backend(),
+        Backend::MacosSandboxExec | Backend::LinuxNamespaces
+    )
+}
+
 /// Does this host's backend claim a network boundary at all? A Job Object and the
 /// portable floor do not, and asserting a denial they never promised is how a
 /// suite starts lying about what it proved.
@@ -503,6 +537,16 @@ async fn a_contained_shell_line_contains_its_later_stages_too() {
     )
     .await
     .unwrap();
+
+    if !backend_confines_writes() {
+        // The floor arm, asserted rather than skipped — same reason as F1's.
+        assert!(
+            target.exists(),
+            "the floor confines nothing, so the second stage's write must land: {}",
+            target.display()
+        );
+        return;
+    }
 
     assert!(
         !target.exists(),

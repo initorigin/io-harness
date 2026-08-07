@@ -416,6 +416,15 @@ dependency at all.
 
 The full suite runs on all three in CI.
 
+The Linux row needs one caveat, because it is the easiest thing on this page to
+over-read. The backend needs an unprivileged user namespace, and Ubuntu 24.04
+ships `kernel.apparmor_restrict_unprivileged_userns=1`, which refuses one — so
+on a stock 24.04 host the sandbox takes the portable floor: the resource caps
+still apply, the filesystem confinement and egress denial do not. It is
+reported, not hidden (`select().backend()` answers before the run and the trace
+records it afterwards), and setting that sysctl to `0` — what most other
+distributions already ship — gives the real backend.
+
 ## Stability
 
 The crate is **pre-1.0 and stays pre-1.0** until its owner says otherwise. A

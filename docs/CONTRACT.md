@@ -910,6 +910,20 @@ remounts degrades to `PortableFloor` and **reports the floor** rather than namin
 an isolation that was never applied — the recorded backend is the one that
 applied, which is the point of recording it.
 
+**On Linux the "Yes" in that table depends on the host's kernel policy, and one
+common distribution says no by default.** The backend needs an unprivileged user
+namespace. Ubuntu 24.04 ships
+`kernel.apparmor_restrict_unprivileged_userns=1`, which refuses one, so on a
+stock Ubuntu 24.04 host a contained command takes `PortableFloor`: the resource
+caps still apply, and **the filesystem confinement and the egress denial do
+not**. Nothing is hidden — `select().backend()` answers `PortableFloor` before
+the run and the `SandboxEvent` rows record it afterwards — but a caller who
+assumes the table's Linux row without reading the backend will not get what it
+says. An operator who wants the real backend sets
+`kernel.apparmor_restrict_unprivileged_userns=0`, which is what most other
+distributions already ship; this repository's own CI does exactly that so its
+Linux legs exercise the backend rather than the fallback.
+
 **Egress under containment is all hosts or none.** The backends take one boolean:
 a network namespace either exists or it does not. So the run's `Policy` decides
 whether a contained command has a route out — `true` when the policy would permit

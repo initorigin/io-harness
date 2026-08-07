@@ -562,11 +562,17 @@ delivered: >
 evidence:
   tests:
   - >
-    `cargo test` (default features) on the shipping tree at `85ad8f3` — **66 suites, 1391 passed,
-    0 failed**, exit 0.
+    `cargo test` (default features) — **66 suites, 1391 passed, 0 failed**, exit 0. Run twice: once
+    on the tree first sealed at `85ad8f3`, and again on the tree carrying the CI and escape-test fix
+    the matrix forced, with the identical result.
   - >
     `cargo test --all-features` as a separate invocation on the same tree — **66 suites, 1470
-    passed, 0 failed**, exit 0, including **374** doctests.
+    passed, 0 failed**, exit 0, including **374** doctests. Also run twice, for the same reason.
+  - >
+    The documentation-reading gates were re-run **last**, after the changelog, contract and README
+    gained the Ubuntu 24.04 caveat, because those suites read the files the caveat changed:
+    `readme` 8, `docs_drift` 15, `guide_pages` 7, `changelog` 5, `public_api` 9, `ci_workflow` 6 —
+    **50 passed, 0 failed**, with `cargo fmt --check` exit 0 after them.
   - >
     Both runs with `XDG_CONFIG_HOME` redirected to a scratch directory. This machine carries a real
     `~/.config/io/io.toml` whose `api_key` key the config schema rejects, which fails
@@ -586,10 +592,42 @@ evidence:
     at **7**, `src/state.rs` absent from this branch's diff entirely, `ADDED_SINCE_0_22_0`
     untouched, no table, column, index or migration.
   - >
-    Cross-version both directions: `tests/cross_version.rs` (15 passed) in the main suite, and the
+    Cross-version both directions: `tests/cross_version.rs` (**5** passed) in the main suite, and the
     pinned generator gate — `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`
     followed by `cargo test --all-features --test cross_version_0_29_0 -- --ignored`, **1 passed,
-    0 failed** (`a_current_store_is_read_by_a_0_29_0_binary`).
+    0 failed** (`a_current_store_is_read_by_a_0_29_0_binary`). This figure was **15** in the first
+    sealing of this record and was wrong: `cargo test` prints one `test result` line per binary in
+    an order that does not follow the `--test` flags, and five counts were read off against the
+    wrong five names. Each suite was re-run alone to fix it — `cross_version` is 5, `docs_drift` is
+    15. Corrected before the merge, which is the only time a sealed record may be corrected.
+  - >
+    **The three-OS matrix failed on the first attempt, and what it found is the most valuable thing
+    in this release.** Run 31146278623 on PR #125: every job green except `test (ubuntu-latest,
+    default)` and `test (ubuntu-latest, all)`, which failed
+    `a_contained_command_cannot_write_outside_the_workspace` and
+    `a_contained_shell_line_contains_its_later_stages_too` — a contained command wrote outside the
+    workspace on Linux. The cause was not the mount population: `LinuxSandbox::run`
+    (`src/sandbox/linux.rs:33`) probes the wrapper and, when the kernel refuses unprivileged user
+    namespaces, degrades to `PortableFloor` and reports it. Ubuntu 24.04 ships
+    `kernel.apparmor_restrict_unprivileged_userns=1`, so **the runner was on the floor**, which
+    confines nothing. The mount script fails loudly (`exit 125`, an `unshare:`-prefixed line,
+    `Error::Sandbox`) and no such error appeared, which is what rules the remounts out as the cause.
+  - >
+    **The same condition had been hiding F3's Linux arms, silently.** `backend_claims_a_network_boundary`
+    (`tests/exec_contained.rs`) returns false on a floor host and the egress tests `return` early,
+    so on every ubuntu run before this fix they *skipped and reported success*. The escape tests
+    failed loudly and the egress tests passed vacuously — the same defect wearing two faces, and
+    exactly the "skip that reads as a pass" F6 was written to forbid.
+  - >
+    **Both halves were fixed.** `.github/workflows/ci.yml` and **both** ubuntu legs of
+    `.github/workflows/release.yml` now set
+    `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` before the suite, restoring the
+    setting that is the default on most distributions so the leg exercises the real backend.
+    release.yml was changed alongside ci.yml deliberately: trap 87 is that a guard written for one
+    workflow does not cover its sibling, and a release gate testing the floor would pass while
+    proving nothing. And the two escape tests now **branch** on `select(&config).backend()` instead
+    of asserting confinement unconditionally: on a native backend the write must not land, on the
+    floor it must, so the fallback path is asserted rather than skipped.
   builds:
   - '`cargo fmt --check` — exit 0.'
   - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
@@ -619,6 +657,23 @@ known_limitations:
   release is therefore sealed on macOS evidence plus the matrix, and O1 is the criterion that closes
   it. If the runner's kernel refuses the remounts the backend reports `PortableFloor` and the test
   asserts *that* rather than asserting confinement that was never applied.
+- >
+  **Linux confinement is verified on a host whose apparmor restriction has been lifted, and that is
+  not the Ubuntu 24.04 default.** CI now sets
+  `kernel.apparmor_restrict_unprivileged_userns=0` before the suite, which is what most
+  distributions ship and what makes the namespaces backend reachable at all. The honest consequence
+  for a user: on Ubuntu 24.04 with the stock setting and no privilege to change it, a contained
+  command takes `PortableFloor` — the resource caps still apply, and the filesystem confinement and
+  egress denial **do not**. The backend reports the floor and the `SandboxEvent` row records it, so
+  this is legible rather than silent, but a caller who assumes containment on a stock Ubuntu 24.04
+  host will not get the filesystem half. This is the single most likely way for this release's
+  promise to be misread in the field.
+- >
+  **The two escape tests assert the floor on a floor host rather than skipping**, which is what F6
+  demanded and what the first implementation did not do. The consequence worth stating: a green
+  suite on an unknown host no longer proves confinement — it proves the backend's *reported*
+  behaviour matches what it applied. Which of the two branches ran is the thing to read, and on the
+  ubuntu legs after this fix it is the native one.
 - >
   **This record cites CI on a commit that does not contain it.** A release record can never cite a
   run on the commit that carries the record, because the record is written first. The ordering is
