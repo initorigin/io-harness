@@ -26,6 +26,74 @@ notes are produced from it.
 
 ### Security
 
+## [0.40.0] - 2026-08-07
+
+### Added
+
+- **The project's own commands can run contained.**
+  `TaskContract::with_contained_exec(SandboxConfig)` puts every command the `exec`
+  tool and the foreground `shell` tool start inside the sandbox backend this host
+  offers: the config's resource caps, filesystem writes confined to the workspace,
+  and outbound network denied unless the run's `Policy` would permit `Act::Net`.
+  The new field is `TaskContract::exec_sandbox`.
+- A contained command keeps the **workspace root** as its working directory.
+  Nothing is copied to a temporary directory and nothing is discarded, so an
+  incremental build survives from one command to the next — which is what makes
+  containment usable for a build rather than only for a verification gate.
+- A command stopped by a resource cap is now reported as *that cap* — the model is
+  told which resource ran out, and `sandbox_events` records a `cap_hit` row —
+  rather than surfacing as an ordinary non-zero exit.
+- A contained command writes the `sandbox_events` lifecycle rows the verification
+  gate has written since 0.6.0, carrying the backend that **actually applied**, so
+  a run that fell back to the portable floor is legible afterwards instead of
+  looking identical to one contained as asked.
+
+### Changed
+
+- **Linux now confines filesystem writes, which it did not before.** The Linux
+  backend unshared a mount namespace and remounted nothing into it, so the
+  namespace existed while the filesystem view stayed the host's and a write
+  outside the working directory landed; only the network namespace was doing real
+  work. It now remounts the tree read-only inside its namespace and binds back the
+  working directory and the system temporary directory. A host whose kernel
+  refuses the remounts degrades to the portable floor and reports the floor. This
+  affects the verification gate as well as contained commands, and it is a
+  tightening: a gate command that wrote outside its working directory on Linux
+  succeeded before and fails now.
+- **Read this before relying on the Linux row: a stock Ubuntu 24.04 host does not
+  get filesystem confinement.** The backend needs an unprivileged user namespace,
+  and Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, which
+  refuses one. There a contained command takes the portable floor: the resource
+  caps still apply and the filesystem confinement and egress denial do not. It is
+  reported rather than hidden — `select().backend()` says `PortableFloor` before
+  the run and the `SandboxEvent` rows say it afterwards — but it is not what the
+  per-platform table's Linux row reads like at a glance. Setting
+  `kernel.apparmor_restrict_unprivileged_userns=0`, which most other
+  distributions already ship, gives the real backend. `docs/CONTRACT.md` states
+  it in full.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- `src/lib.rs` claimed Linux confined writes the way macOS does. It did not, until
+  this release.
+
+### Security
+
+- Nothing about the default changes. With `exec_sandbox` unset — every contract
+  written before this release — `exec` and `shell` run exactly where and as they
+  did in 0.39.0. This release makes containment *available*; it does not apply it.
+  The standing bound is unchanged for anyone who does not opt in: the policy
+  decides what may start, not what a started process then does.
+- Two limits worth reading before turning it on. Egress at the sandbox wall is one
+  boolean, so a policy allowing a single host gives a contained command a route to
+  every host; per-host checking of the crate's own tools is unchanged. And the
+  `shell_start` / `shell_poll` / `shell_kill` handles are **not** contained,
+  because a handle outlives the call that made it.
+
 ## [0.39.0] - 2026-08-06
 
 A conversation can fan out.

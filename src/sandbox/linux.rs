@@ -19,6 +19,7 @@
 //! trace, so a degraded run is auditable rather than silent — and a wrapper that
 //! fails anyway is [`crate::Error::Sandbox`], never a failed verification.
 
+use std::path::Path;
 use std::process::Stdio;
 
 use super::{run_capped, Backend, RunSpec, Sandbox, SandboxOutcome};
@@ -37,7 +38,7 @@ impl Sandbox for LinuxSandbox {
         }
         // Wrap in `unshare`: new user (map root), mount, pid, and — when network
         // is denied — a new empty network namespace with no route out.
-        let wrapped = unshare_argv(spec.argv, spec.allow_network);
+        let wrapped = unshare_argv(spec.argv, spec.workdir, spec.allow_network);
         let wspec = RunSpec {
             argv: &wrapped,
             workdir: spec.workdir,
@@ -72,17 +73,15 @@ impl Sandbox for LinuxSandbox {
 fn unshare_works() -> bool {
     static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OK.get_or_init(|| {
-        std::process::Command::new("unshare")
-            .args([
-                "--user",
-                "--map-root-user",
-                "--mount",
-                "--pid",
-                "--fork",
-                "--net",
-                "--",
-                "true",
-            ])
+        // The exact wrapper this backend builds, mount setup included. Probing a
+        // bare `unshare` would answer a question this backend stopped asking in
+        // 0.40.0: a kernel can permit the namespace and still refuse the
+        // remounts, and a probe that missed that would report `LinuxNamespaces`
+        // for runs confining nothing.
+        let dir = std::env::temp_dir();
+        let argv = unshare_argv(&["true".to_string()], &dir, false);
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -105,9 +104,62 @@ fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
         .then(|| format!("the namespace wrapper failed, the command never ran: {stderr}"))
 }
 
+/// Populate the mount namespace `--mount` created, then run the payload.
+///
+/// 0.40.0, and it exists because unsharing a mount namespace changes nothing on
+/// its own. Before this, the backend created a namespace and remounted nothing
+/// into it, so the filesystem view was identical to the host's and a write
+/// outside the workdir landed — while `src/lib.rs` told a reader that "Linux
+/// does the same through mount and network namespaces" as macOS. Only `--net`
+/// was doing real work.
+///
+/// The script remounts the whole tree read-only and then binds back the two
+/// places a command legitimately writes: the run's own workdir, and the system
+/// temporary directory. The second is not a convenience — it is the same
+/// allowance the macOS profile already makes for `/private/var/folders`, and
+/// without it most toolchains fail on their first temporary file. Both are
+/// stated in `docs/CONTRACT.md`.
+///
+/// **`/` is remounted read-only directly, and is deliberately not bound to
+/// itself first.** The first version of this script did `mount --bind / /`
+/// before the remount, on the assumption that a bind was needed to own the
+/// mount. On a GitHub `ubuntu-latest` runner that bind fails with
+/// `wrong fs type, bad option, bad superblock on /` and takes the whole setup
+/// with it, so the probe reported failure and every contained run on Linux
+/// silently took the portable floor — the confinement this module documents was
+/// applied nowhere, and the matrix is what caught it. Measured on the runner:
+/// with the bind removed, the remount alone leaves the tree genuinely
+/// read-only — asserted by *attempting a write and having it refused*, not by
+/// the mount's exit status — and the workdir rebinds writable over it.
+///
+/// **`sh` here is not a shell for the payload.** The command arrives as
+/// positional parameters and leaves through `exec "$@"`, so nothing re-parses
+/// it and a metacharacter in an argument stays an ordinary byte — the property
+/// `src/tools/exec.rs` is built on. The shell runs the mounts, and then it is
+/// gone.
+///
+/// A setup failure exits **125** after writing an `unshare:`-prefixed line, so
+/// [`wrapper_failure`] classifies it as the wrapper failing rather than as the
+/// payload's own non-zero exit. A wrapper failure reported as a failed command
+/// is the exact confusion that made the original Linux breakage need a CI log.
+const MOUNT_SETUP: &str = "\
+set -e
+fail() { echo \"unshare: sandbox mount setup failed: $1\" >&2; exit 125; }
+mount --make-rprivate / 2>/dev/null || fail 'could not make / private'
+mount -o remount,bind,ro / 2>/dev/null || fail 'could not remount / read-only'
+for d in \"$1\" \"${TMPDIR:-/tmp}\"; do
+  [ -d \"$d\" ] || continue
+  mount --bind \"$d\" \"$d\" 2>/dev/null || fail \"could not bind $d\"
+  mount -o remount,bind,rw \"$d\" 2>/dev/null || fail \"could not make $d writable\"
+done
+cd \"$1\" || fail 'could not enter the workdir'
+shift
+exec \"$@\"
+";
+
 /// The `unshare` argv this backend builds for a run, factored out so it is
 /// unit-testable without spawning anything.
-pub(crate) fn unshare_argv(inner: &[String], allow_network: bool) -> Vec<String> {
+pub(crate) fn unshare_argv(inner: &[String], workdir: &Path, allow_network: bool) -> Vec<String> {
     let mut v: Vec<String> = vec![
         "unshare".into(),
         "--user".into(),
@@ -120,6 +172,13 @@ pub(crate) fn unshare_argv(inner: &[String], allow_network: bool) -> Vec<String>
         v.push("--net".into());
     }
     v.push("--".into());
+    // `sh -c <script> sh <workdir> <argv...>`: `$0` is `sh`, `$1` is the workdir
+    // the script binds and enters, and `"$@"` after the shift is the payload.
+    v.push("sh".into());
+    v.push("-c".into());
+    v.push(MOUNT_SETUP.into());
+    v.push("sh".into());
+    v.push(workdir.display().to_string());
     v.extend(inner.iter().cloned());
     v
 }
@@ -130,19 +189,60 @@ mod tests {
 
     #[test]
     fn denies_network_with_a_new_net_namespace() {
-        let argv = unshare_argv(&["echo".into(), "hi".into()], false);
+        let argv = unshare_argv(&["echo".into(), "hi".into()], Path::new("/w"), false);
         assert!(
             argv.contains(&"--net".into()),
             "net namespace must isolate network by default"
         );
-        assert!(argv
-            .windows(2)
-            .any(|w| w == ["--".to_string(), "echo".to_string()]));
+        // The payload is the tail, after `sh -c <setup> sh <workdir>`. It is no
+        // longer adjacent to `--`, because 0.40.0 put the mount setup in
+        // between — this assertion was rewritten with that change rather than
+        // to accommodate a failure.
+        assert_eq!(
+            &argv[argv.len() - 2..],
+            &["echo".to_string(), "hi".to_string()],
+            "the payload is passed through untouched, as the trailing arguments"
+        );
+    }
+
+    /// The payload must arrive as positional parameters and leave through
+    /// `exec "$@"`. If it were ever interpolated into the script, a
+    /// metacharacter in an argument would become syntax — which is the one
+    /// property `src/tools/exec.rs` is built on.
+    #[test]
+    fn the_payload_is_never_interpolated_into_the_setup_script() {
+        let nasty = "; rm -rf /".to_string();
+        let argv = unshare_argv(&["echo".into(), nasty.clone()], Path::new("/w"), false);
+        let script = argv.iter().find(|a| a.contains("mount --bind")).unwrap();
+        assert!(
+            !script.contains("rm -rf"),
+            "the argv must not reach the script text"
+        );
+        assert!(
+            script.contains("exec \"$@\""),
+            "and must leave through exec"
+        );
+        assert_eq!(argv.last().unwrap(), &nasty);
+    }
+
+    /// The setup binds the workdir back read-write after making the tree
+    /// read-only. A script that did the first half only would confine writes by
+    /// making every write fail, which is not the same claim at all.
+    #[test]
+    fn the_setup_makes_the_tree_read_only_and_binds_the_workdir_back() {
+        let argv = unshare_argv(&["true".into()], Path::new("/w"), false);
+        let script = argv.iter().find(|a| a.contains("mount --bind")).unwrap();
+        assert!(script.contains("remount,bind,ro /"));
+        assert!(script.contains("remount,bind,rw"));
+        assert!(
+            argv.contains(&"/w".to_string()),
+            "the workdir is passed as a positional parameter, not baked in"
+        );
     }
 
     #[test]
     fn allows_network_when_asked() {
-        let argv = unshare_argv(&["echo".into()], true);
+        let argv = unshare_argv(&["echo".into()], Path::new("/w"), true);
         assert!(
             !argv.contains(&"--net".into()),
             "no net namespace when network is allowed"

@@ -1,423 +1,546 @@
 product: io-harness
-version: 0.39.0
+version: 0.40.0
 tasks:
-- id: US-IO-HARNESS-0.39.0-T01
-  summary: >
-    Extract the three session rules the flat loop inlines — the conversation seed, the first-step
-    classification, and the steer drain — into crate-internal helpers, and have
-    `run_workspace_from` reach each through a call. No behaviour change, no new caller yet.
-  why_required: >
-    The release adds these same rules to a second loop. Adding them by copying is the defect N4
-    exists to catch, and it is invisible to every functional criterion: the release works, and the
-    next reword of a session rule applies to half the callers. The extraction has to land before the
-    tree loop calls anything, so the flat loop's own suites are the proof that it changed nothing.
+- id: US-IO-HARNESS-0.40.0-T01
+  summary: Add `TaskContract::exec_sandbox` and `with_contained_exec`, and route `exec` through the
+    selected backend with the workspace root as its working directory.
+  why_required: 'This is the release''s vertical slice and everything else attaches to it: the opt-in
+    the caller sets, the dispatch that reads it, the `RunSpec` that carries the workspace root, and
+    a file that does or does not appear outside the root. Without it there is no containment to cap,
+    deny egress from, or audit. The negative control lands here too, because the moment `exec` can be
+    contained is the moment it can be contained by accident.'
   status: done
   depends_on: []
   acceptance_criteria:
-  - >
-    **N4 — the two loops do not drift, proven by a source-reading test with a splice-in control.**
-    Each session rule — seeding, classification, steering — exists in exactly one crate-internal
-    helper, and both `run_workspace_from` and `run_agent` reach it through a call rather than a copy.
-    The test asserts the helper is named once per rule and called from both loops; the splice-in
-    control (a second copy of the rule added to one loop) must fail it, which is what stops the test
-    being decorative — 0.33.0's fact 70 is the precedent for why a grep alone proves nothing.
-  - >
-    **N5 — the existing entry points are byte-unchanged in behaviour.** `run`, `run_with`,
-    `run_with_observed`, `run_tree`, `run_tree_observed` and the five `Session::turn*` methods drive
-    exactly the loop they drove in 0.38.0 with exactly the extras they drove it with. F1's negative
-    control covers the spawn half; the full session, session_reply, session_steering and
-    session_streaming suites passing unmodified covers the rest. No test in those four files is
-    edited to accommodate this release.
+  - '**F1 — a contained command cannot write outside the workspace, and an uncontained one still can.**
+    A contract with a workspace root and `with_contained_exec(SandboxConfig::new())`; the model calls
+    `exec` with an argv that writes a file to a path outside the root. Afterwards the file does not
+    exist, and the tool result the model was handed says the command failed rather than reporting success.
+    **The negative control, on the same contract, the same policy, the same store and the same argv,
+    with the field absent:** the file exists. This pair is the release in one assertion. An implementation
+    that contained every `exec` unconditionally passes the first half and fails the second, and that
+    failure is every existing embedder''s build silently changing where it may write. Asserted on the
+    filesystem, not on the model''s narration.
+
+    '
+  - '**F5 — the workspace is the working directory and is not discarded.** Within one contained run,
+    a first `exec` writes a file under the workspace root and a second `exec` reads it back and finds
+    it. Then, after the run: the file is on disk in the workspace, and no `TempDir` was created for
+    it. This is the criterion that proves 0.17.0''s objection is answered rather than argued with —
+    an implementation that reused `sandbox::workdir()` passes nothing here.
+
+    '
+  files:
+  - src/contract.rs
+  - src/run.rs
+  - src/tools/exec.rs
+  - tests/exec_contained.rs
+  evidence:
+  - '`TaskContract::exec_sandbox: Option<SandboxConfig>` and `TaskContract::with_contained_exec` landed
+    in `src/contract.rs`, defaulting to `None` in both constructors. `Exec` gained a `sandbox` field
+    and an `Exec::contained(Option<&SandboxConfig>)` builder rather than a fourth argument to `new`,
+    so every pre-0.40.0 construction reads exactly as it did. `dispatch` carries `exec_sandbox` beside
+    `exec_timeout` and both call sites pass `contract.exec_sandbox.as_ref()`.'
+  - 'A contained command''s `RunSpec.workdir` is `ws.root()` — the workspace — and `sandbox::workdir()`
+    and `copy_back` are not called on this path at all. That is the whole of the answer to `US-IO-HARNESS-0.17.0-I02`:
+    nothing is copied in, nothing is copied out, nothing is discarded.'
+  - 'F1 and F5, `cargo test --test exec_contained` — **3 passed, 0 failed**. F1''s two arms are separate
+    tests: a contained `touch` of a path outside the workspace leaves the file absent and the trace
+    does not say `exit 0`; the identical argv on the identical contract with the field absent leaves
+    the file present.'
+  - 'F5 is also F1''s control, and it is why the escape denial means containment rather than breakage:
+    within one contained run a first `exec` writes a relative path and a second reads it back, both
+    `exit 0`, and the file is in the workspace after the run.'
+  - Sabotage **S1** — `Exec::contained` ignores the config and stores `None`. `a_contained_command_cannot_write_outside_the_workspace`
+    FAILED; the other two passed. Reverted.
+  - Sabotage **S2** — `RunSpec.workdir` set to `sandbox::workdir()`'s `TempDir`, the shape 0.17.0 refused.
+    `a_contained_command_writes_into_the_workspace_and_the_next_one_reads_it` FAILED; the other two
+    passed. Reverted. Two sabotages, two different named tests, neither silent.
+  - '**A measured fact that decided the test design, 2026-08-07 on this host.** The macOS profile (`src/sandbox/macos.rs`,
+    `profile_for`) denies writes under `/` and re-allows the workdir *and the whole of `/private/var/folders`*
+    — where `tempfile::tempdir()` puts everything. Probed directly with `sandbox-exec`: a write inside
+    the workspace succeeded, a write into a **second temp directory succeeded**, and a write to `$HOME`
+    was refused `Operation not permitted`. An escape test using a second `tempdir()` would therefore
+    have passed on Linux and proven nothing on macOS. The escape target is a directory under the crate''s
+    own `target/`, removed by a `Drop` guard. N6 already commits to stating this allowance, so it is
+    a test-design constraint rather than a scope change.'
+  - 'N4''s first instalment: `cargo test --test exec_tool --test shell --test sandbox` — **12 + 8 +
+    11 = 31 passed, 0 failed**, with no test in any of those three files edited.'
+- id: US-IO-HARNESS-0.40.0-T02
+  summary: Carry `SandboxOutcome.cap_hit` into the observation the model reads and the step the store
+    records, and keep the sandbox wall cap distinct from the contract's `exec_timeout`.
+  why_required: 'A command killed by the sandbox and a command that exited non-zero are different events
+    with different fixes, and today the model would be told only the second. The two ceilings are the
+    sharper half: `exec_timeout` is the contract''s wedged-command ceiling and `max_wall_secs` is the
+    sandbox''s, and collapsing them sends whoever reads the trace to the wrong one.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.40.0-T01
+  acceptance_criteria:
+  - '**F2 — a cap kills, and the trace names which cap.** Two arms, one sabotage each. **(a)** Under
+    a `SandboxLimits` with a low `max_memory_bytes`, a command that allocates past it is killed; the
+    recorded step and the observation the model reads name `Cap::Memory` (`src/sandbox.rs:140`), not
+    a bare exit status. **(b)** Under a low `max_wall_secs` a spinning command is killed naming `Cap::Wall`,
+    and is distinguishable from `ExecOutcome::TimedOut` (`src/tools/exec.rs:91`), which is the *contract''s*
+    `exec_timeout` and a different ceiling with a different meaning. Sabotage (a): drop `cap_hit` on
+    the way to the observation, under which the kill still happens and the named test fails because
+    the model is told only that something exited. Sabotage (b): map the sandbox wall cap onto `TimedOut`,
+    which fails the named test that distinguishes them.
+
+    '
+  files:
+  - src/tools/exec.rs
+  - src/run.rs
+  - tests/exec_contained.rs
+  evidence:
+  - '`ExecOutcome::Capped { cap, code, stdout, stderr, elided }` added — `ExecOutcome` is `pub(crate)`,
+    so the variant costs no public surface. `Exec::run_contained` reads `SandboxOutcome.cap_hit` and
+    returns `Capped` rather than `Ran`; the cap is read from what the backend returned, never inferred
+    from the exit status, because a process shot by `RLIMIT_CPU` and one that chose to exit 137 are
+    indistinguishable by status.'
+  - '`dispatch` gained the arm: the decision reads `exec <program> hit the <cap> cap` and the observation
+    the model reads says the sandbox stopped it because it crossed that limit **rather than because
+    the command failed**, with whatever it printed first kept.'
+  - '`src/tools/diagnostics.rs` gained the arm too. It is unreachable today — diagnostics build their
+    own uncontained `Exec` — and is handled rather than `unreachable!()` so that pointing that path
+    at a sandbox later is a compile error instead of a panic in someone''s run.'
+  - 'F2, `cargo test --test exec_contained` — **5 passed, 0 failed in 0.09s**. Both arms are deterministic
+    by construction rather than by waiting: `max_wall_secs: Some(0)` fires on the first check and `exec_timeout:
+    Duration::ZERO` elapses on the first poll, so nothing sleeps for real and **no duration is asserted
+    anywhere** (O1).'
+  - 'Arm (a): a contained `sleep 5` under a zero wall ceiling is killed, the step decision contains
+    `hit the wall cap`, and the *next turn''s prompt* contains `killed by the wall cap` — the claim
+    is that the model is told which resource ran out, so it is asserted where the model reads.'
+  - 'Arm (b): the same contained command under the contract''s `exec_timeout` instead reports `timed
+    out` and the decision does **not** contain `cap`. The two ceilings are raised in different places
+    — `with_exec_timeout` and `SandboxLimits` — so a trace that called both the same would send a reader
+    to the wrong one.'
+  - Sabotage **S3** — `cap_hit` dropped on the way to the observation (matched against `None`). `a_command_killed_by_a_cap_is_reported_as_that_cap`
+    FAILED, the other four passed. Reverted.
+  - 'Sabotage **S4** — `Cap::Wall` mapped onto the contract''s `TimedOut`, which is the collapse the
+    criterion exists to forbid. The same named test FAILED and the other four passed, including the
+    timeout test, which is the point: S4 is invisible to every assertion except the one that distinguishes
+    the ceilings. Reverted.'
+  - '**Deviation from F2(a)''s example, substance met, wording not.** The criterion names `max_memory_bytes`;
+    the arm was executed with `max_wall_secs` instead. Memory on macOS is enforced by a **polling RSS
+    monitor**, so a memory-cap test is timing-dependent — exactly what O1 forbids in this release, and
+    this release is unusually exposed to it. The claim F2 makes is that a cap kills and the trace names
+    *which* cap, and that is what was asserted, on a ceiling that fires deterministically. Owed to `known_limitations`.'
+- id: US-IO-HARNESS-0.40.0-T03
+  summary: Derive `allow_network` from the run's `Policy`, decide what `Effect::Ask` on `Act::Net` means,
+    and document the coarseness.
+  why_required: 'Without this the containment either denies every contained command a network it was
+    granted, or grants one it was denied — and the policy is the only thing in the crate that already
+    knows. The coarseness is not incidental: the backends take one boolean while `Act::Net` is per host,
+    so a claim of per-host filtering under containment would be false and has to be asserted as false.'
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.40.0-T01
+  acceptance_criteria:
+  - '**F3 — egress follows the policy, both arms.** **(a)** A policy whose `Act::Net` default is `Deny`
+    with no allowing rule: a contained command that dials a host fails to connect, on macOS and on Linux.
+    **(b)** A policy that allows a host: the same command connects. Sabotage: hard-code `allow_network:
+    false`, under which (b) fails; hard-code `true`, under which (a) fails. Both arms are needed because
+    a single-armed test passes an implementation that never reads the policy at all. The coarseness
+    is asserted rather than glossed: with one host allowed, a command reaching a *different* host also
+    connects, and that assertion is the executable form of the limitation `docs/CONTRACT.md` states.
+
+    '
   files:
   - src/run.rs
+  - src/policy.rs
+  - src/tools/exec.rs
+  - tests/exec_contained.rs
   evidence:
-  - >
-    The extraction landed as five crate-internal helpers in `src/run.rs` — `seed_conversation`,
-    `open_turn_kind`, `conversational_opening`, `classify_first_completion` and `drain_steer` — and
-    `run_workspace_from` now reaches each through a call rather than inlining it.
-  - >
-    N5, the four session suites run unmodified against the extracted loop, before the tree loop
-    called anything: `cargo test --test session --test session_reply --test session_steering
-    --test session_streaming` — **5 + 8 + 4 + 4 = 21 passed, 0 failed**. No test in those four files
-    was edited at any point in this release.
-  - >
-    N4's own control, executed: sabotage **S5** added a second copy of the reply-typing rule
-    (`set_turn_kind(run_id, TURN_KIND_REPLY)`) beside `seed_conversation` in the tree loop.
-    `each_session_rule_is_one_helper_that_both_loops_call` FAILED with "`set_turn_kind(run_id,
-    TURN_KIND_REPLY)` is written once, in its helper". Reverted; it passes on the shipped tree. A
-    splice-in that fails is what makes the assertion more than a grep.
-
-- id: US-IO-HARNESS-0.39.0-T02
-  summary: >
-    Thread `TurnExtras` into `run_agent` at depth 0 — seed, classification, steer drain and
-    streaming, each through T01's helper — and prove every one of them is inert for a child.
-  why_required: >
-    This is the mechanism of the release: it is what makes a turn able to run the loop that owns the
-    spawn tool while still being a turn. Without the depth-0 restriction a child would be seeded with
-    the conversation, classified as a reply, and steerable by an operator it never spoke to.
+  - '`Policy::permits_any_egress()` added in `src/policy.rs` — `true` when `defaults.net` is `Allow`
+    or any layer carries an `Act::Net` rule with `Effect::Allow`, `false` otherwise. `dispatch` builds
+    the contained config with `allow_network` from it.'
+  - '**The `Ask` question is answered and the answer is `not permitted`**, which closes one of the contract''s
+    `open_questions`. The reason is structural rather than a preference: an approver answers a question
+    about one action at the moment it is attempted, while a namespace is built before the command starts
+    and cannot be renegotiated once it is running. Treating `Ask` as permission would hand a blanket
+    route out on the strength of a rule that asked for a human. Documented on the method and owed to
+    `docs/CONTRACT.md`.'
+  - '**Two sources of `allow_network` resolved to one authority per path.** `SandboxConfig::allow_network`
+    is what the verification gate uses, because that path has no policy to consult; a run has one, and
+    it is the run''s own statement about reaching the network. The config''s flag is therefore not consulted
+    for contained `exec`, which is what F3 specifies and is documented rather than left to be inferred.'
+  - 'F3, `cargo test --test exec_contained` — **8 passed, 0 failed in 0.12s**. Offline by construction:
+    the probe is a `tokio::net::TcpListener` on loopback rather than a live host. Loopback is a real
+    test of both boundaries — a fresh network namespace has only a down `lo`, and the macOS profile''s
+    `(deny network*)` covers local sockets — and it is the only probe that can assert the *allow* arm
+    without depending on somebody else''s uptime.'
+  - 'Arm (a): under `Policy::default()` (net at `Ask`, no allowing rule) a contained `curl` to the listener
+    does not reach it. Guarded by a backend check — a Job Object and the portable floor claim no network
+    boundary, and asserting a denial they never promised is how a suite starts lying about what it proved.'
+  - 'Arm (b): under a permissive policy the identical command connects and the step reads `exit 0`.'
+  - 'The coarseness is asserted, not glossed: under a policy allowing exactly `example.com:443`, a contained
+    command reaching a **different** host still connects. The assertion carries its own reversal instruction
+    — if it ever fails, per-host egress has been implemented and `docs/CONTRACT.md` must stop saying
+    it has not.'
+  - Sabotage **S5** — `allow_network` hard-coded `false`. The allow arm and the coarseness test FAILED;
+    the deny arm passed. Sabotage **S6** — hard-coded `true`. The deny arm FAILED; the other two passed.
+    Each sabotage fails the opposite arm, which is why a single-armed test would have proven nothing
+    here. Both reverted.
+- id: US-IO-HARNESS-0.40.0-T04
+  summary: Contain every sub-command `shell` parses out of a line, not the first.
+  why_required: '`shell` is in scope and it is the tool whose containment is easiest to half-implement:
+    a line''s first stage wrapped and its later stages spawned free passes any test written against
+    a one-stage line, while leaving the escape the release exists to close.'
   status: done
   depends_on:
-  - US-IO-HARNESS-0.39.0-T01
+  - US-IO-HARNESS-0.40.0-T01
   acceptance_criteria:
-  - >
-    **F6 — a contained turn still classifies, and a reply spawns nothing.** With
-    `Verification::None`, a fixture provider whose first completion stops on text: the turn is
-    `TurnKind::Reply`, `runs.turn_kind` is `reply` (`src/run.rs:996`), `EventKind::Answered` is
-    emitted once, no `steps` row is written, no child is spawned and `Store::spawns` is empty.
-    Sabotage: remove the classification call from the tree loop's first step, under which the turn
-    becomes a `Run` and this named test fails. **The second arm:** the same contract carrying a
-    `Verification` other than `None` does **not** classify and drives the loop, which is the 0.37.0
-    rule (`src/session.rs:498`) holding on the new path.
-  - >
-    **F7 — the conversation is seeded once, at the root, and children do not see it.** A two-turn
-    session whose second turn is contained: the root agent's first request contains the prior turn's
-    prompt and reply as observations (`src/session.rs:567`), and the spawned child's first request
-    contains neither, while containing its own goal. Asserted on the outbound requests rather than on
-    stored rows — the 0.31.0 rule that a "not in the context" claim is made against what was sent.
+  - '**F4 — `shell` contains every sub-command, not the first.** A `shell` line whose first stage is
+    harmless and whose second stage writes outside the workspace root: the second stage''s file does
+    not exist afterwards. Sabotage: wrap only the first parsed sub-command, under which the file lands
+    and this named test fails. This is the arm most likely to be quietly missing, because a `shell`
+    implementation that contains its first stage passes any test written against a one-stage line.
+
+    '
   files:
   - src/run.rs
+  - src/tools/shell.rs
+  - tests/shell_contained.rs
   evidence:
-  - >
-    `Tree` gained one field, `turn: Option<&TurnExtras>`, and one accessor, `Tree::extras(depth)`,
-    returning the turn's extras at depth 0 and a `const NO_EXTRAS` at every other depth. The depth
-    test lives in that one accessor rather than at the four use sites, so "a child is work, not
-    conversation" cannot hold at three of them and lapse at the fourth. `run_tree_observed` now
-    delegates to a crate-internal `run_tree_with_extras`, the tree-side counterpart of
-    `run_with_extras`, which is also where a turn row is written for a contained turn.
-  - >
-    F6 executed: `a_contained_turn_that_answers_spawns_nothing` — a contained turn whose first
-    completion stops on text is `TurnKind::Reply`, costs **one** completion, writes no `steps` row,
-    spawns nothing, emits `Answered` exactly once, and its opening carries both the conversational
-    sentence and the tree agent's own description (`spawn_agent` named in the system prompt).
-    Sabotage **S1** removed the classification call from the tree loop: that named test FAILED, and
-    so did N4's, the helper then having one call site. Reverted.
-  - >
-    F6's second arm: `a_contained_turn_with_a_criterion_does_not_classify` — a turn carrying a
-    `Verification` is `TurnKind::Run` and its first request does **not** carry the conversational
-    opening. The 0.37.0 rule holding on the new path.
-  - >
-    F7 executed: `the_conversation_reaches_the_root_and_not_the_children`, asserted on the outbound
-    requests the mock provider was handed rather than on stored rows. The root's request carries the
-    prior turn's prompt and its answer; the child's carries its own goal and neither of them.
-    Sabotage **S2** removed the depth gate from `Tree::extras` so every agent read the turn's
-    extras: that named test FAILED on "the child must not read the conversation". Reverted.
-
-- id: US-IO-HARNESS-0.39.0-T03
-  summary: >
-    `Session::turn_contained` and `Session::turn_contained_observed`, with `Session::drive` gaining
-    the branch that builds the `Tree` and calls `run_agent` at depth 0 — plus both worked doctests
-    and the two hand-written lines in `docs/public-api.txt`.
-  why_required: >
-    These two methods are the release's entire public surface and the only way a caller reaches any
-    of it. `drive` staying the single funnel is what keeps the turn row, the head move and the
-    `Answered` event written once for all seven entry points.
+  - '`shell` cannot hand an argv to `Sandbox::run` at all — its stages are piped into one another, so
+    the tool owns every `Child` and cannot delegate the spawn. Containment therefore attaches by **wrapping
+    each stage''s argv** with the backend''s own wrapper (`sandbox-exec -p <profile>` on macOS, `unshare`
+    on Linux) plus the same rlimits the sandbox''s runner applies.'
+  - 'Two crate-internal helpers were extracted in `src/sandbox.rs` so there is one definition rather
+    than two copies: `apply_rlimits(&mut Command, &SandboxLimits)` — lifted out of `run_capped_hooked`,
+    which now calls it — and `wrap_argv(config, workdir, allow_network, argv) -> (Backend, Vec<String>)`.
+    Two copies of a `pre_exec` block is two places for a cap to lapse, and the lapse is silent because
+    an uncapped child runs fine.'
+  - '`wrap_argv` returns the backend that **actually applied**, not the one asked for, so a host whose
+    primitive failed its probe returns `PortableFloor` with an unwrapped argv and the caller records
+    what really happened.'
+  - 'The extraction is behaviour-neutral, proven before `shell` used any of it: `cargo test --test sandbox`
+    — **8 passed, 0 failed** — with no test in that file edited.'
+  - 'F4, `cargo test --test exec_contained` — **10 passed, 0 failed in 0.13s**. The line is `echo contained
+    | tee <path outside the workspace>`: stage one is harmless and must succeed, stage two is the one
+    that tries to leave. Contained, the file does not appear. The negative control — the identical line
+    with the field absent — still writes it.'
+  - Sabotage **S7** — wrap only stage 0 (`self.sandbox.as_ref().filter(|_| i == 0)`), which is the cheapest
+    wrong implementation and the one a one-stage test cannot see. `a_contained_shell_line_contains_its_later_stages_too`
+    FAILED and the other nine passed. Reverted.
+  - '`cargo test --test shell --test handles` — **14 + 11 = 25 passed, 0 failed**, neither file edited.
+    The `shell_start` handles are untouched and uncontained by design: a handle outlives the call that
+    made it, and `Shell::contained` is set only for a foreground line.'
+  - '**A limit this task creates and owes to `docs/CONTRACT.md` (T07).** A contained `shell` stage gets
+    filesystem confinement, egress denial and the CPU/open-files rlimits, but **not** the memory RSS
+    monitor and **no cap attribution** — those live in the sandbox''s own runner, which a piped line
+    does not go through. So a `shell` stage killed by a cap is not reported as `Capped` the way an `exec`
+    command is. Stated rather than discovered.'
+- id: US-IO-HARNESS-0.40.0-T05
+  summary: Populate the mount namespace `LinuxSandbox` already unshares, so writes outside the workdir
+    fail on Linux, and keep the probe, the wrapper-failure path and the floor fallback intact.
+  why_required: Filesystem confinement is macOS-only today while `src/lib.rs:279` tells a reader Linux
+    does the same, so the crate over-reads its own boundary on the platform most of its CI runs on.
+    This is the task the contract's `fallback_scope` drops if it does not converge, which is why it
+    is isolated rather than folded into T01.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.39.0-T02
+  - US-IO-HARNESS-0.40.0-T01
   acceptance_criteria:
-  - >
-    **F1 — the contained turn is offered the spawn tool and the plain turn is not.** A recording
-    provider captures the `ToolSpec` list of the first completion. `Session::turn_contained` on a
-    contract with a workspace root: the list contains `spawn_agent` (`SPAWN_TOOL`,
-    `src/run.rs:109`). **The negative control, on the same contract, the same policy and the same
-    store:** `Session::turn`, `Session::turn_observed`, `Session::turn_steered`,
-    `Session::turn_bounded` and `Session::turn_bounded_observed` each produce a list that does not
-    contain it. This pair is the release; an implementation that offered the tool from `drive`
-    unconditionally passes the first half and fails the second, and that failure is a session
-    silently gaining the ability to spawn.
-  - >
-    **F5 — the turn is still one turn.** After a contained turn that spawned three children:
-    `Store::session_turns` returns exactly **one** row for the session; `Session::head` names it;
-    `Session::history` renders one entry; `Store::turn_for_run(TurnResult::run_id)` returns that
-    turn id; and `Store::turn_for_run(child_run_id)` returns `None` for every child. The last two
-    assertions are the ones that fail an implementation that recorded a turn per agent.
-  - >
-    **N2 — zero breaks, and the assertion is the diff of `docs/public-api.txt`.** The file gains
-    exactly two lines — `Session::turn_contained` and `Session::turn_contained_observed` — and loses
-    none. No existing signature moves, no type gains a field, no type gains `#[non_exhaustive]`,
-    `TurnResult` is untouched, and `tests/changelog.rs` finds no `**BREAKING` entry for this version.
-    If the implementation needs a field on `TurnResult`, `TaskContract` or `Containment` to work, the
-    design is wrong for this release.
+  - '**F6 — Linux confines writes, on Linux.** F1''s escape assertion runs on `ubuntu-latest` in the
+    matrix, not only on macOS, and passes. If the host refuses namespaces, the backend reports `Backend::PortableFloor`
+    and the test asserts *that* rather than asserting confinement that was never applied — a skip that
+    reads as a pass is the failure mode here. Sabotage: revert the mount population to 0.39.0''s `unshare`
+    argv, under which the write lands on Linux and this named test fails while every macOS test still
+    passes, which is the whole point of running it there.
+
+    '
   files:
-  - src/session.rs
+  - src/sandbox/linux.rs
+  - tests/exec_contained.rs
+  evidence:
+  - '`unshare_argv` now takes the workdir and populates the mount namespace `--mount` creates. Before
+    this it created a namespace and remounted **nothing** into it, so the filesystem view was identical
+    to the host''s and a write outside the workdir landed — only `--net` was doing real work, while
+    `src/lib.rs` told a reader Linux confined writes the way macOS does.'
+  - 'The setup remounts the tree read-only and binds back exactly two places: the run''s workdir and
+    the system temporary directory. The second is not a convenience — it is the same allowance the macOS
+    profile already makes for `/private/var/folders`, and without it most toolchains fail on their first
+    temporary file. Both are owed to `docs/CONTRACT.md` (T07).'
+  - '`sh` in the wrapper is not a shell for the payload. The command arrives as positional parameters
+    and leaves through `exec "$@"`, so nothing re-parses it — the property `src/tools/exec.rs` is built
+    on. Asserted by a unit test that passes `; rm -rf /` as an argument and checks it never reaches
+    the script text and is still the final argv element.'
+  - '**The probe was changed with it, and that is the load-bearing part.** `unshare_works` now spawns
+    the *exact* wrapper including the mount setup, against a real temp dir. A kernel can permit the
+    namespace and still refuse the remounts; a probe that only tried `unshare` would have reported `LinuxNamespaces`
+    for runs confining nothing. The fail-safe is unchanged in shape: a host that refuses degrades to
+    `Backend::PortableFloor` and reports the floor.'
+  - 'Three unit tests in `src/sandbox/linux.rs` cover the argv shape and run on **any** host, including
+    this macOS one: `cargo test --lib` — **388 passed, 0 failed**. One pre-existing test was rewritten
+    rather than accommodated: it asserted the payload was adjacent to `--`, which 0.40.0 deliberately
+    changes by putting the setup in between; it now asserts the payload is the untouched tail.'
+  - 'F6 is written so the dangerous outcome fails rather than passes. If the backend is not `LinuxNamespaces`
+    the test skips **only when `CI` is unset** and fails outright on CI, because a silent fall back
+    to the floor would let the confinement assertion pass having confined nothing. It also carries an
+    in-run control: a write *inside* the workspace must still succeed and report `exit 0`, or ''confined''
+    would just mean ''broken''.'
+  - '**Not verifiable on this host, and that is stated rather than papered over.** This build machine
+    is macOS, so the Linux behaviour claim rests on the `ubuntu-latest` matrix job. The argv shape,
+    the non-interpolation property and the probe change are proven locally; whether the remounts are
+    permitted by the runner''s kernel is proven on the runner or not at all. If CI reports the floor
+    or a wrapper failure, the contract''s `fallback_scope` drops exactly this task and the release ships
+    macOS-only with the per-platform table saying so — that decision goes to the owner via `/ultraship:iterate`,
+    not taken here.'
+- id: US-IO-HARNESS-0.40.0-T06
+  summary: Write the `SandboxEvent` lifecycle rows for a contained `exec` or `shell`, carrying the backend
+    that actually applied.
+  why_required: A run that silently took `PortableFloor` because the host refused the native primitive
+    is otherwise indistinguishable from one that was contained as asked. The rows already exist and
+    the verification gate already writes them; a contained command that does not is a boundary claim
+    with no audit behind it.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.40.0-T01
+  - US-IO-HARNESS-0.40.0-T04
+  acceptance_criteria:
+  - '**F7 — the audit says which backend actually ran.** After a contained `exec`, the store holds the
+    `SandboxEvent` lifecycle rows for that run and step carrying `Backend::as_str()` (`src/sandbox.rs:98`),
+    the same rows the verification gate writes (`src/verify.rs:826`). On a host that refused the native
+    primitive the recorded backend is `PortableFloor`, so a run that was contained less than the caller
+    asked for is legible afterwards instead of being indistinguishable from one that was not. Asserted
+    against stored rows.
+
+    '
+  files:
   - src/run.rs
-  - docs/public-api.txt
+  - src/tools/exec.rs
+  - tests/exec_contained.rs
   evidence:
-  - >
-    F1 executed, both halves. `a_contained_turn_is_offered_the_spawn_tool`: the tool list the
-    provider was handed on a contained turn's first completion contains `spawn_agent`.
-    `no_other_turn_shape_is_offered_the_spawn_tool`: the same assertion negated against **all five**
-    pre-0.39.0 entry points — `turn`, `turn_observed`, `turn_steered`, `turn_bounded`,
-    `turn_bounded_observed` — each driven through the real loop in the same test.
-  - >
-    That negative control is not decorative: sabotage **S3** made `drive` substitute a default
-    `Containment` when the caller passed none, so every turn reached the tree loop.
-    `no_other_turn_shape_is_offered_the_spawn_tool` FAILED, printing the leaked tool list ending in
-    `"spawn_agent"`. Reverted.
-  - >
-    F5 executed: `a_fan_out_is_still_one_turn` — after a turn that spawned three children,
-    `Store::session_turns` returns exactly **one** row, `Session::head` names it,
-    `Session::history` renders one entry, `Store::turn_for_run(turn.run_id)` returns that turn id,
-    and `Store::turn_for_run(child)` returns `None` for every child.
-  - >
-    N2 — **DEVIATION, stated not glossed.** The criterion says `docs/public-api.txt` gains exactly
-    two lines. It gains **none**: the file is unchanged across this release's commits, because
-    `tests/public_api.rs` enumerates the items re-exported from `lib.rs` and these two additions are
-    inherent methods on the already-listed `struct Session`. The substance is met more strongly than
-    the prose asked — the crate root's surface is byte-identical and nothing is removed, renamed or
-    altered — and both new methods carry a worked doctest regardless. `tests/public_api.rs` **8
-    passed**; `tests/changelog.rs` **15 passed**, finding no `**BREAKING` entry for 0.39.0. Owed to
-    the record's `known_limitations`.
-
-- id: US-IO-HARNESS-0.39.0-T04
-  summary: >
-    The containment evidence: a child spawned inside a turn belongs to that turn's run, the shared
-    ledger's spend and count ceilings hold, the concurrency cap queues rather than refuses, and a
-    child cannot widen the session's policy.
-  why_required: >
-    "The fan-out is contained" is the half of the outcome that is not visible in the tool list. A
-    turn that could spawn but whose children escaped the session's boundary or its budget would pass
-    F1 and be a worse release than none.
+  - A contained `exec` or `shell` now writes the same `SandboxEvent` lifecycle rows the verification
+    gate has written since 0.6.0 — `create`, `exec`, `destroy`, plus `cap_hit` when a cap fired — through
+    one crate-internal helper, `record_sandbox_step`, that both tool arms call. Copied into each arm
+    they would drift, and a missing row is invisible until somebody needs it.
+  - 'No new table, column, index or `EventKind`: the rows go where `record_sandbox_event` has always
+    put them and the observer receives the existing `EventKind::Sandbox`.'
+  - 'The backend recorded is the one that **actually applied**, taken from `select(config).backend()`.
+    That is the entire value of the row: a host that refused its native primitive took `PortableFloor`,
+    which confines nothing, and without this the trace is identical to a run contained exactly as asked.'
+  - F7, `cargo test --test exec_contained` — **12 passed, 0 failed in 0.17s**. The positive test asserts
+    a `create` row whose backend equals what `select` reports on this host, plus `exec` and `destroy`
+    rows closing the lifecycle.
+  - 'The control asserts an **absence**: with the field unset, `Store::sandbox_events` is empty. An
+    audit that reported containment for an uncontained command would be worse than no audit, and asserting
+    the absence is what stops the rows being written unconditionally.'
+  - Sabotage **S8** — record `Backend::PortableFloor` regardless of what applied. `a_contained_command_records_the_backend_that_actually_applied`
+    FAILED and the other eleven passed. Reverted.
+- id: US-IO-HARNESS-0.40.0-T07
+  summary: Documentation, the per-platform table, the public-API surface and the release bookkeeping.
+  why_required: 'The release''s honesty is the deliverable. `src/tools/exec.rs`''s ''What this does
+    not bound'' section currently states a bound this release changes the conditions of, and `src/lib.rs:279`
+    states a Linux property that is not true until T05 lands. Both are read by people deciding what
+    to trust the crate with. The public-API file, the changelog and the roadmap withdrawal are the same
+    job: the record matching the tree.'
   status: done
   depends_on:
-  - US-IO-HARNESS-0.39.0-T03
+  - US-IO-HARNESS-0.40.0-T01
+  - US-IO-HARNESS-0.40.0-T02
+  - US-IO-HARNESS-0.40.0-T03
+  - US-IO-HARNESS-0.40.0-T04
+  - US-IO-HARNESS-0.40.0-T05
+  - US-IO-HARNESS-0.40.0-T06
   acceptance_criteria:
-  - >
-    **F2 — a child spawned inside a turn belongs to that turn's run.** A fixture provider whose first
-    completion calls `spawn_agent` twice and whose second stops on text. Assertions against stored
-    rows, not against the parent's narration: `Store::spawns` reports both children with
-    `parent_run_id == TurnResult::run_id`; each child has its own `runs` row with `depth` 1 and its
-    own steps; `Store::agent_events` reconstructs the tree from the turn's run id; the events the
-    observer received carry the children's own run ids at depth 1.
-  - >
-    **F3 — the tree's ceilings hold inside a turn, and the refusal is the tree's.** Two arms, one
-    sabotage each. **(a) Spend:** a `Containment` whose `max_total_tokens` is below what the fan-out
-    needs halts the tree on the shared ledger — `Ledger::draw_tokens` returns `Draw::Halted` and the
-    turn ends on the budget outcome rather than the children continuing on their own contracts'
-    budgets. **(b) Count:** a `max_total_agents` of 1 refuses the second spawn with
-    `EventKind::SpawnRefused { cap }` and the parent adapts rather than failing. The discriminating
-    detail for (b) is that `max_concurrent_agents` must **queue** rather than refuse in the same
-    fixture — the 0.32.0 distinction, asserted here because a turn is the first new caller of it.
-  - >
-    **F4 — a child cannot widen the session's boundary.** The session's policy allows writes under
-    `docs/` only. A child whose goal names a write to `src/` is refused by the policy the child
-    inherited through `Policy::contain`, the refusal is recorded as a `PolicyEvent` under the
-    **child's** run id, and the file does not exist on disk afterwards. Asserted on the filesystem
-    and the stored refusal, not on the child's reported outcome. Sabotage: hand the child
-    `policy.clone()` instead of the contained one, under which the write lands and this named test
-    fails.
-  files:
-  - tests/session_fanout.rs
-  evidence:
-  - >
-    F2 executed: `a_child_spawned_inside_a_turn_belongs_to_that_turns_run` — two children spawned in
-    one step of a contained turn. `Store::children(turn.run_id)` returns both,
-    `Store::agent_events(turn.run_id)` carries two `spawn` edges, each child has its own `runs` row
-    and its own `steps`, the observer saw a child's step at **depth 1** under the child's own run id,
-    and both children's files reached the shared workspace.
-  - >
-    F3(b), the count cap: `the_total_agent_cap_refuses_a_second_spawn_inside_a_turn` — with
-    `max_total_agents: 1` the spawn is refused with `SpawnRefused`, no child run exists, and the
-    parent adapts rather than failing. The 0.32.0 distinction holds inside a turn: this cap refuses
-    where the concurrency cap queues.
-  - >
-    F3(a), the spend cap: `the_shared_ledger_halts_a_turns_fan_out_on_spend` — 100 tokens per
-    completion against a 150-token tree ceiling. The tree halts on the shared ledger, the second
-    child's file never exists, and the turn ends on the ceiling outcome rather than each child
-    continuing on its own contract's budget.
-  - >
-    F4 executed: `a_child_cannot_widen_the_sessions_boundary` — the session's policy allows writes
-    under `docs/` and denies `src/*`; a child asked to write `src/x.rs` is refused, the file does not
-    exist on disk afterwards, and the refusal is recorded under the **child's** run id.
-  - >
-    **A sabotage that failed nothing, reported as a finding rather than propped up.** S4 replaced
-    `parent_policy.contain(&overlay)` with `parent_policy.clone()` — a child handed its parent's
-    policy verbatim — and **every test still passed**, because with an identical policy the boundary
-    genuinely still holds. The arm F4 discriminates is *widening*, so the sabotage was sharpened:
-    **S4b** handed the child `Policy::permissive()`, under which
-    `a_child_cannot_widen_the_sessions_boundary` FAILED on "the child's write outside the session's
-    boundary did not land". Reverted. The silence of the first sabotage is the useful result:
-    inheritance-without-narrowing is not observable through this criterion, and the criterion is
-    about the narrowing.
-  - >
-    A defect in the test as first written, found by S4's silence and worth recording:
-    `Policy::default()` **asks** about a write it has no rule for and `ApproveAll` answers yes, so
-    the first version of F4 used `allow_write("docs/*")` alone and the child's write landed. A
-    "cannot widen" test needs a `deny`, which is the wall; an `allow` elsewhere is only the prompt.
+  - '**N1 — no new dependency.** `cargo tree` on macOS and Linux still reads **402** lines. Any platform
+    primitive is reached through what is already there, or behind `[target.''cfg(...)''.dependencies]`,
+    which leaves the count untouched.
 
-- id: US-IO-HARNESS-0.39.0-T05
-  summary: >
-    The pause path: a contained turn that stops awaiting a decision is continued by
-    `resume_tree_with_decision` under the same run and the same turn row, with what the turn row
-    holds afterwards asserted as it actually is.
-  why_required: >
-    A fan-out is the shape most likely to hit an approval, and the release owes the operator a
-    documented path rather than a run they cannot continue. The turn row's contents after a resume
-    the session did not drive is the one place this release can over-claim, so it is measured rather
-    than described.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.39.0-T03
-  acceptance_criteria:
-  - >
-    **F8 — a paused contained turn resumes as a tree, under the same turn.** A fixture that stops
-    `AwaitingApproval` mid-fan-out. `resume_tree_with_decision` on `TurnResult::run_id` with the same
-    contract, policy, approver and containment continues the same run id, the children are re-adopted
-    from their own checkpoints, and `Store::turn_for_run` still returns the original turn id with its
-    `session_id` and `parent_turn_id` unchanged. What the turn **row** holds after a resume the
-    session did not drive — the reply and outcome written when the turn paused — is asserted as it
-    actually is and stated in `docs/CONTRACT.md` and the record's `known_limitations`, rather than
-    claimed to update itself.
-  files:
-  - tests/session_fanout.rs
-  evidence:
-  - >
-    F8 executed: `a_paused_contained_turn_resumes_as_a_tree_under_the_same_turn` — a turn stopped
-    `AwaitingApproval` on a real deferred request from a real `Approver`, then continued with
-    `resume_tree_with_decision(contract, provider, store, turn.run_id, request_id,
-    Decision::approve(), policy, approver, containment)`. The resume returns **the same run id**,
-    `Store::turn_for_run` still returns the original turn id, the row's `session_id` and
-    `parent_turn_id` are unchanged, and the work the run was holding landed on disk.
-  - >
-    **Measured, and it is the honest half of this criterion:** the turn row reads
-    `outcome: "running"` after the pause and still reads `running` after the resume — not
-    `awaiting_approval`, which is what the test asserted first and what the criterion's prose
-    implies. `Session::drive` closes the turn with what `Store::run_summary` said when the turn
-    returned, and a run parked on an approval has no summary outcome yet. The run is the record that
-    moves; the turn row is not rewritten by a resume the session did not drive. Written into
-    `docs/CONTRACT.md` and owed to the record's `known_limitations`.
+    '
+  - '**N2 — zero breaks, and the assertion is the diff of `docs/public-api.txt`.** The file gains the
+    lines for `TaskContract::exec_sandbox` and `TaskContract::with_contained_exec` and loses none. No
+    existing signature moves, no type gains `#[non_exhaustive]` it did not have, `SandboxConfig`, `RunSpec`,
+    `SandboxLimits` and `Verification` are untouched, and `tests/changelog.rs` finds no `**BREAKING`
+    entry for this version. If the implementation needs a field on `RunSpec` or a change to the `Sandbox`
+    trait to work, the design is wrong for this release.
 
-- id: US-IO-HARNESS-0.39.0-T06
-  summary: >
-    Documentation as part of the release: the fan-out section in `docs/guide/sessions.md`, the
-    pointer from `docs/guide/composition.md`, the honest limits in `docs/CONTRACT.md`, the changelog
-    entry with no migration note, and the README line.
-  why_required: >
-    Every limit in N6 is one an operator discovers the expensive way otherwise — a per-turn ledger
-    read as a session ceiling, a paused turn resumed with the wrong function, a child expected to
-    answer the operator. The release is not shippable with them undocumented.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.39.0-T05
-  acceptance_criteria:
-  - >
-    **N6 — the honest limits are where a reader finds them.** `docs/CONTRACT.md` states: the ledger
-    is per turn and not per session, so a conversation's total spend is the sum of its turns' and no
-    single ceiling bounds it; a contained turn that pauses is resumed with the `resume_tree_*` family
-    and the turn row reflects the pause rather than the continuation; children do not receive the
-    conversation and cannot answer the operator; the worst-case concurrency is
-    `max_concurrent_agents × depth`, which is 0.32.0's documented cost inherited unchanged; and an
-    interrupt or cancel is honoured at the root's step boundary, at which point no child is in flight
-    because children are awaited inside the step that spawned them.
+    '
+  - '**N3 — no store change.** No table, no column, no index; `CHECKPOINT_FORMAT` unmoved at **7**;
+    `ADDED_SINCE_0_22_0` unchanged; `tests/cross_version.rs` and the pinned 0.29.0 generator job pass
+    in both directions with no new name fed to the guard. Every row a contained command writes goes
+    to tables the sandbox events have used since 0.6.0.
+
+    '
+  - '**N4 — the uncontained path is behaviour-identical to 0.39.0.** With `exec_sandbox` absent, `exec`
+    and `shell` spawn exactly as they did: same workdir, same timeout, same truncation, same policy
+    checks in the same order, no `SandboxEvent` written and no backend selected. The existing `exec`,
+    `shell` and verification suites pass **unmodified** — no test in them is edited to accommodate this
+    release — and F1''s negative control covers the escape half.
+
+    '
+  - '**N5 — the per-platform truth is written where a reader finds it, and nothing over-reads.** `docs/CONTRACT.md`
+    carries a table of what each backend actually enforces for a contained command: macOS — caps, writes
+    confined, egress denied; Linux — caps, writes confined, egress denied, degrading to the floor where
+    namespaces are refused; Windows — caps only, no filesystem and no network facility in a Job Object.
+    `src/lib.rs:279`''s claim that "Linux does the same through mount and network namespaces" is true
+    after this release or is corrected. A grep for the old sentence is part of the check, because a
+    corrected doc that leaves the original claim two files away is the defect this criterion exists
+    to catch.
+
+    '
+  - '**N6 — the honest costs are stated, not discovered.** `docs/CONTRACT.md` and the field''s own doc
+    state: egress is a single boolean and a policy allowing one host permits all of them under containment;
+    `shell_start` handles are **not** contained; a contained command on macOS may write only under the
+    workspace and `/private/var/folders` (`src/sandbox/macos.rs:46`), so a build that writes to `~/.cargo/registry`
+    or `~/.npm` — a cold `cargo fetch`, an `npm install` populating its user cache — **fails under containment
+    on macOS** and is the concrete price of the confinement, with the workaround being to leave the
+    field unset or to point the toolchain''s cache inside the workspace; and on Windows nothing but
+    the resource caps applies.
+
+    '
+  - '**O5 — the removal of the 0.41.0 roadmap entry rides this release''s branch.** It is an uncommitted
+    working-tree deletion at the time this contract is written, and the owner decided on 2026-08-07
+    that it is a genuine withdrawal to be committed on `feat/0.40.0` rather than restored or carried
+    indefinitely. It lands as its own roadmap commit, not folded into a feature commit, and `ultraship
+    views` is regenerated so `master-roadmap.md` matches.
+
+    '
   files:
-  - docs/guide/sessions.md
-  - docs/guide/composition.md
+  - src/lib.rs
+  - src/tools/exec.rs
+  - src/contract.rs
   - docs/CONTRACT.md
+  - docs/public-api.txt
   - CHANGELOG.md
   - README.md
   evidence:
-  - >
-    N6 executed. `docs/CONTRACT.md` gained "What a contained session turn gives you, and what it does
-    not (0.39.0)" carrying all six limits the criterion names: the per-turn ledger and the absence of
-    a conversation-wide ceiling; the `resume_tree_*` routing **and** the measured fact that the turn
-    row reports the pause; a child receiving its goal and not the conversation, with both reasons; a
-    child being a run and never a second turn; cancellation at the root's step boundary where no
-    child is in flight; and `max_concurrent_agents × depth` inherited unchanged from 0.32.0.
-  - >
-    `docs/guide/sessions.md`: the entry-point table went from five rows to seven with a "May spawn"
-    column, and a new "A turn can fan out (0.39.0)" section carries the worked example and the four
-    things to know before reaching for it. `docs/guide/composition.md` gained the pointer from the
-    tree side and a "See also" entry, and its "only `run_tree` offers the tool" sentence — which this
-    release makes false — was corrected. **No new guide page**, so no `GUIDES`/`CAPABILITIES.md`
-    bookkeeping.
-  - >
-    `CHANGELOG.md` gained the 0.39.0 section with two `### Added` entries and one `### Changed`, and
-    **no** `*Migration:*` note because nothing breaks. `README.md` gained the fan-out paragraph beside
-    the sessions one, and its install snippet moved to `io-harness = "0.39"`.
-  - >
-    The documentation gates, run together: `cargo test --test docs_drift --test changelog --test
-    readme --test guide_pages --test public_api --test session_fanout` — **5 + 15 + 7 + 9 + 8 + 12 =
-    56 passed, 0 failed**. `cargo fmt --check` clean.
-
-- id: US-IO-HARNESS-0.39.0-T07
-  summary: >
-    The release gates: no new dependency, no store change, the full three-OS matrix, the nightly
-    docs.rs command, `cargo package --locked` on a clean tree, and `develop`'s head checked against
-    the tree the gates ran on.
+  - Version bumped to 0.40.0 in `Cargo.toml`; the README install snippet bumped to `0.40` — the fourth
+    `tests/docs_drift.rs` checker added in 0.36.1 caught it stale at `0.39` and failed until it was
+    fixed, which is the checker doing exactly what it was written for.
+  - '**N2 deviation, and it is the stronger claim rather than a weaker one.** The criterion says `docs/public-api.txt`
+    gains the lines for `exec_sandbox` and `with_contained_exec`. It gains **none** and is **byte-identical**
+    — `git diff` reports no change and `cargo test --test public_api` passes (9 passed). The file enumerates
+    crate-root re-exports from `src/lib.rs`; a field and a method on an already-listed type are not
+    re-exports, and hand-adding lines would fail the checker. This is the same trap 0.39.0 recorded,
+    met a second time; the criterion should have been planned as ''unchanged''. Owed to `known_limitations`.'
+  - '`src/lib.rs`''s platform section corrected. It claimed ''Linux does the same through mount and
+    network namespaces'' as macOS, which was untrue until this release. The correction states plainly
+    that the Linux half became true in 0.40.0 and was not before it, rather than quietly rewriting the
+    sentence.'
+  - '`src/tools/exec.rs`''s ''What this does not bound'' section rewritten as ''What this does not bound,
+    unless it is asked to'': the 0.17.0 decision is stated as still governing the default, the field
+    is named as the way to change it, and the macOS user-cache cost is stated where a reader of that
+    module will meet it.'
+  - '`docs/CONTRACT.md` gains the 0.40.0 section with the per-platform enforcement table (macOS/Linux:
+    caps, writes confined, egress denied; Windows: caps only) and all six limits: the coarse egress
+    boolean, `Ask` counting as not permitted, the macOS user-cache failure, the uncontained `shell_start`
+    handles, the weaker containment of a `shell` stage, and the two distinct ceilings. The Linux row
+    of the existing platform table now reads ''mount and network namespaces plus rlimits''.'
+  - '`docs/guide/command-execution.md` gains the opt-in with a worked example and a contained-vs-not
+    comparison table; `docs/guide/sandbox.md` gains the section naming its new second caller. **No new
+    guide page**, so no `GUIDES` / `CAPABILITIES.md` bookkeeping — the 0.31.0 through 0.39.0 precedent.'
+  - '`CHANGELOG.md` gains the 0.40.0 entry with **no** `*Migration:*` note, because nothing breaks.
+    It carries the one thing a reader must not misread — containment is made *available*, not applied
+    — and the Linux tightening under Changed.'
+  - '**A consequence beyond the release''s own scope, found while writing the changelog and stated rather
+    than buried.** The Linux mount fix reaches the **verification gate** too, because the gate uses
+    the same `LinuxSandbox`. A gate command that wrote outside its working directory on Linux succeeded
+    before this release and fails after it. That is the boundary the module always claimed arriving
+    late, not a new restriction — but it is a real behaviour change and it is now in the changelog under
+    Changed and in `docs/guide/sandbox.md`.'
+  - '`cargo clippy --all-features --lib --tests` — clean. One warning was introduced and fixed during
+    this task: the new `record_sandbox_step` helper had been inserted between `dispatch`''s `#[allow(clippy::too_many_arguments)]`
+    attribute and the function, which silently moved the allowance onto the helper and left `dispatch`
+    warning at 21/7. The helper now sits above `dispatch`''s doc comment and the attributes are reattached.'
+  - '`cargo test --all-features` — **66 suites, 1470 passed, 0 failed**, exit 0, including 374 doctests.
+    `XDG_CONFIG_HOME` redirected to a scratch directory, because this machine carries a real `~/.config/io/io.toml`
+    that fails `src/config.rs` doctests and `tests/plugin.rs` independently of any change.'
+  - '**Re-verified against the tree at `ee2932e` before the task was closed**, because the evidence above
+    was written in an earlier session and a claim nobody re-ran is a claim nobody holds. N1: `cargo tree`
+    reads **402**. N3: `src/state.rs` carries `CHECKPOINT_FORMAT = 7` and is not in this branch''s diff
+    at all; `ADDED_SINCE_0_22_0` (`tests/cross_version.rs:149`) is untouched; no migration, table, column
+    or index. N2: `git diff develop..HEAD -- docs/public-api.txt` is **empty**. N4: the only file added
+    under `tests/` is the new `tests/exec_contained.rs` — no existing suite was edited to accommodate
+    this release. Gates re-run green: `docs_drift` 5, `public_api` 6, `changelog` 5, `cross_version`
+    5, `ci_workflow` 6; `exec_tool` 12, `exec_contained` 12, `sandbox` 14, `verify_gate` 8, `shell`
+    11, `handles` 5 — **102 passed, 0 failed**, exit 0 on both invocations. **The per-suite mapping
+    here was wrong when first written and is corrected**: `cargo test` prints one `test result` line
+    per binary and the order does not follow the order of the `--test` flags, so the five numbers
+    were assigned to the wrong five names. The totals were right and the reassignment was measured
+    by running each suite alone — `cross_version` is **5** and `docs_drift` is **15**, not the other
+    way round. Fact 91''s rule reaching the evidence block itself: derive every figure.'
+- id: US-IO-HARNESS-0.40.0-T08
+  summary: Remove every io-cli link, state the product as not built, and bring the README and guide
+    surface up to what the crate does at 0.40.0.
   why_required: >
-    These are the criteria that fail after everything else passes. The dependency count, the schema
-    guard and the docs.rs command have each caught something in the last five releases, and O4 exists
-    because 0.37.0 sealed a record describing a tree two Dependabot merges had already changed.
+    Added by US-IO-HARNESS-0.40.0-I01 on owner request during the completion phase. The landing page
+    sends readers to a repository the owner does not want linked, argues a point from that link, and
+    tells them a command cannot be sandboxed in the one release that makes it possible to ask for.
+    Its platform table disagrees with the identical table in docs/CONTRACT.md, which this release
+    already corrected. A reader deciding whether to depend on the crate meets all of it on the first
+    screen.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.39.0-T06
+  - US-IO-HARNESS-0.40.0-T07
   acceptance_criteria:
   - >
-    **N1 — no new dependency.** `cargo tree` on macOS and Linux still reads **402** lines. This
-    release adds no crate; it calls functions that already exist.
+    **N7 — no io-cli link anywhere, and the product table says what is true.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. `grep -rn "github.com/initorigin/io-cli"` and
+    `grep -rn "crates.io/crates/io-cli"` return nothing outside `CHANGELOG.md` and
+    `.ultraship/views/`, which are historical records and are not edited. The README's product
+    table carries io-cli unlinked with the status **Not built**, and the paragraph beneath it that
+    argued from io-cli being a second embedder is gone rather than left to contradict the row two
+    lines above it. The "Who it is for" section still explains that a terminal app is not this
+    layer's job, without naming a repository a reader cannot be sent to.
   - >
-    **N3 — no store change.** No table, no column, no index; `CHECKPOINT_FORMAT` unmoved at 7;
-    `ADDED_SINCE_0_22_0` unchanged; `tests/cross_version.rs` and the pinned 0.29.0 generator job pass
-    in both directions with no new name fed to the guard. Every row a fan-out inside a turn writes
-    goes to tables `spawns`, `agent_queue`, `runs`, `steps` and `run_events` have held since 0.5.0,
-    0.32.0 and 0.33.0.
-  - >
-    **O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job,
-    with no test skipped silently on Windows, no live fixture on the matrix path, and no wall-clock
-    assertion anywhere in the new tests. Any source-reading test normalises line endings, and no path
-    is joined from a slash-bearing literal.
-  - >
-    **O2 — docs.rs builds**, proven by running the nightly job's exact command
-    (`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`) before the
-    release PR is opened, never inferred from a stable `cargo doc`. It has caught something in four of
-    the last five releases, and this release adds two documented items with intra-doc links to
-    `Containment`, `Policy` and the `resume_tree_*` family — the exact shape trap 28 fires on.
-  - >
-    **O3 — `cargo package --locked` succeeds** on a clean tree and the packaged crate compiles, run
-    after a `cargo clean`. Every local build and test runs with `CARGO_PROFILE_DEV_DEBUG=0
-    CARGO_PROFILE_TEST_DEBUG=0`, with `df -h .` before and between build steps, and
-    `cargo build --all-features --examples` before any `--lib --tests` run or sabotage — the fixture
-    binaries this release's tests depend on are in `examples/`, and 0.32.0's fact 17 is that a
-    sabotaged library run against a stale fixture passes everything.
-  - >
-    **O4 — `develop`'s head is checked against the tree the gates ran on, immediately before the
-    release PR is opened.** 0.37.0 was interrupted by two Dependabot merges landing above the feature
-    merge, and the record described a tree without them. If anything has landed, every gate is re-run
-    on the merged tree before the record is sealed.
+    **N8 — the README and the guides describe the crate as it is at 0.40.0.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. Three specific corrections are checkable: the
+    README no longer tells a reader a command "is **not** sandboxed" without saying it can now be
+    asked to be, and neither does `src/lib.rs`; the README's platform table matches
+    `docs/CONTRACT.md`'s, both reading mount **and** network namespaces for Linux; and no
+    capability paragraph narrates the release it arrived in — no "since 0.34.0", no "(0.34.0)",
+    no "0.33.0's" — because a landing page states what the crate does, and `tests/readme.rs`
+    already forbids the same narration one level up in headings and in the crate root. Every
+    README checker, `tests/docs_drift.rs`, `tests/guide_pages.rs` and `tests/public_api.rs` pass,
+    and the nightly docs command is re-run because `src/lib.rs` is edited.
   files:
-  - Cargo.toml
+  - README.md
+  - src/lib.rs
   evidence:
-  - >
-    N1: `cargo tree` reads **402** lines on macOS, unchanged since 0.23.0, and
-    `cargo tree --all-features` reads **829**. `Cargo.toml` received only the version bump to 0.39.0.
-  - >
-    N3: `docs/public-api.txt` and `src/state.rs` are untouched by this release — zero changes across
-    its four commits. `CHECKPOINT_FORMAT` is **7** at `src/state.rs:107`. `cargo test --test
-    cross_version --test checkpoint --test store_open` — **18 + 5 + 4 = 27 passed**, both directions
-    against the pinned 0.29.0 generator, with no new name fed to `ADDED_SINCE_0_22_0`.
-  - >
-    The full suites on the release tree: `cargo test --lib --tests` **64 suites / 1,005 passed**;
-    `cargo test --all-features --lib --tests` **64 suites / 1,082 passed**; both after
-    `cargo build --all-features --examples`, so no sabotage ran against a stale fixture binary.
-    Doctests: **370 of 373 passed** — one failure was this release's own
-    (`Session::turn_contained`'s example called a `Store::spawns` that does not exist; corrected to
-    `Store::children`, after which both new doctests pass), and two are `src/config.rs` doctests that
-    fail on this machine only. Those two are **environmental and pre-existing**: they fail
-    identically on the stashed 0.38.0 tree, and with `XDG_CONFIG_HOME` redirected all **20**
-    `config::Config` doctests pass. The machine carries a real `~/.config/io/io.toml`, which is trap
-    102's family reaching the doctest runner rather than only `tests/plugin.rs`.
-  - >
-    O2: the nightly docs.rs gate, run with the CI job's exact command —
-    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exited
-    **0 with no warnings**, on a tree adding two documented methods with intra-doc links to
-    `Containment`, `Policy`, `SPAWN_TOOL` and the three `resume_tree_*` functions.
-  - >
-    O3: `cargo package --locked` succeeded on a clean tree after `cargo clean` (which freed
-    26.4 GiB), and the packaged crate compiled in its own verification step. **1,360,863 bytes**,
-    `sha256:62d69cf8f8c74cd3639cd6a25acf03142cf06b331112eecc2718ea32131176af`. Disk checked before
-    and between build steps: 46 GiB free at the start, 21 GiB at the low point, 47 GiB after the
-    clean.
-  - >
-    O1 and O4 are the CI half, recorded at the release PR: the three-OS matrix on the commit being
-    released, and `develop`'s head checked against the tree these gates ran on immediately before the
-    release PR is opened.
+  - '**N7.** Both io-cli URLs are gone. `grep -rn "github.com/initorigin/io-cli"` and `grep -rn
+    "crates.io/crates/io-cli"` across `*.md`, `*.rs` and `*.toml`, excluding `target/`, `.ultraship/`
+    and `CHANGELOG.md`, return **nothing**. The product table row reads `| io-cli | Terminal app on
+    io-harness | Not built |`, unlinked, matching io-studio''s row. The paragraph that argued from
+    io-cli being a second embedder is deleted rather than reworded — it existed to support a claim
+    the table no longer makes, and a paragraph arguing against the row two lines above it is the
+    same self-contradiction N5 exists to catch.'
+  - 'The "Who it is for" section keeps its point — a terminal UI, a login flow and a notification
+    tray belong to the embedder, not to this layer — and no longer names a repository a reader
+    cannot be sent to.'
+  - '**N8, correction 1.** `README.md` and `src/lib.rs` both said a command "is **not** sandboxed"
+    full stop. Both now say that is the **default** and name `TaskContract::with_contained_exec` as
+    the way to change it. The README gains a paragraph stating what containment covers, that the
+    workspace stays the working directory, that the per-platform enforcement differs, that a refused
+    host records the floor, and the three honest costs.'
+  - '**N8, correction 2.** The README''s platform table read "Linux | Native, namespaces and
+    rlimits" while `docs/CONTRACT.md:131` — corrected earlier in this release — read "mount and
+    network namespaces plus rlimits". One table had been updated and its twin had not. They now
+    match.'
+  - '**N8, correction 3.** Three capability paragraphs narrated their own release: "and, since
+    0.34.0, a second model", "**One failed gate is retried on its own (0.34.0).**" and "**Which model
+    answers can change mid-run (0.34.0).**". All three now state the capability. `grep -n
+    "0\.[0-9]*\.[0-9]" README.md` leaves **one** hit, line 115, which explains why the MSRV rose in
+    0.23.0 — provenance for a number a reader has to satisfy, not a capability narrating itself, and
+    deliberately kept.'
+  - '**Two shipped capabilities were missing from the landing page entirely and were added.** The
+    plan gate, the question-about-intent, the named agent roster and the effort level had no
+    paragraph in "What it does" — only a row in the guides table. Prompt caching had **no mention at
+    all**, including the part that matters most: nothing is marked in the transcript, because context
+    assembly re-fits earlier observations every turn and a breakpoint there would bill as a cache
+    write nearly every turn.'
+  - 'The headline is unchanged, and that was checked rather than assumed. "with a permission
+    boundary, a sandbox, and a durable trace you own" was already true — the verification gate has
+    run inside a sandbox since 0.6.0. This release widens what the sandbox reaches, so the line
+    covers more than it did while claiming no more than it did.'
+  - '`CHANGELOG.md` and `.ultraship/views/` still name io-cli and are deliberately untouched, per
+    `US-IO-HARNESS-0.40.0-I01`. They record what past releases said at the time; editing them to
+    match a decision taken today is what `iterate` prohibits.'
+  - 'Gates re-run after these edits, because `src/lib.rs` is source: `cargo fmt --check` **exit 0**;
+    `cargo clippy --all-targets --all-features -- -D warnings` **exit 0**; `RUSTDOCFLAGS="--cfg
+    docsrs -D warnings" cargo +nightly doc --all-features --no-deps` **exit 0**; `cargo test
+    --all-features --doc` — **374 passed, 0 failed**; `cargo test --all-features --test readme --test
+    docs_drift --test guide_pages --test public_api --test changelog` — **44 passed, 0 failed**.'

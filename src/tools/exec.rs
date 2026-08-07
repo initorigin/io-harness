@@ -21,17 +21,38 @@
 //! command with a metacharacter in it does not become two commands, because
 //! nothing on this path ever parses one.
 //!
-//! ## What this does not bound
+//! ## What this does not bound, unless it is asked to
 //!
-//! A command runs in the workspace root **with the embedding program's
-//! privileges**, not inside the [`Sandbox`](crate::Sandbox). That is the owner's
-//! decision of 2026-07-29, recorded in `US-IO-HARNESS-0.17.0-I02`, and it is
-//! taken with its cost stated: the sandbox denies network egress by default and
-//! discards its working directory, which is right for a verification gate and
-//! makes `npm install` impossible. So the policy decides what may *start*, and
-//! not what a started process then does — the same honest bound this crate
-//! already states for a registered [`Tool`](super::Tool) and for a stdio MCP
-//! server.
+//! By default a command runs in the workspace root **with the embedding
+//! program's privileges**, not inside the [`Sandbox`]. That is
+//! the owner's decision of 2026-07-29, recorded in `US-IO-HARNESS-0.17.0-I02`,
+//! and it is taken with its cost stated: the sandbox denies network egress by
+//! default and discards its working directory, which is right for a verification
+//! gate and makes `npm install` impossible. So the policy decides what may
+//! *start*, and not what a started process then does — the same honest bound this
+//! crate already states for a registered [`Tool`](super::Tool) and for a stdio
+//! MCP server.
+//!
+//! **0.40.0 makes the other choice available without changing that default.**
+//! [`TaskContract::with_contained_exec`](crate::TaskContract::with_contained_exec)
+//! puts every command this tool and `shell` start inside the selected backend.
+//! The half of the 0.17.0 objection that was about the working directory is
+//! answered rather than argued with: the discarding was never the sandbox's, it
+//! was the verification gate's choice of [`sandbox::workdir`](crate::sandbox::workdir)
+//! and [`copy_back`](crate::sandbox::copy_back). A contained command is given the
+//! **workspace root**, so nothing is copied in, nothing is copied out, and an
+//! incremental build survives from one command to the next.
+//!
+//! What a contained command loses is everything outside that root — on macOS and
+//! Linux its writes are confined to the workspace, and its egress is denied
+//! unless this run's [`Policy`](crate::Policy) would permit
+//! [`Act::Net`](crate::Act::Net). The half of the objection that was about the
+//! network therefore stands: a build that must fetch needs a policy that allows
+//! it. And there is a real cost on macOS in particular — writes outside the
+//! workspace and the system temporary directory are refused, so a toolchain
+//! populating a user-level cache such as `~/.cargo/registry` or `~/.npm` fails
+//! under containment. `docs/CONTRACT.md` states this, and the answer is to leave
+//! the field unset or to point the cache inside the workspace.
 //!
 //! Two ceilings apply to what a started process may do to the *run*: a wall-clock
 //! timeout, so a wedged command dies naming itself instead of consuming the
@@ -46,6 +67,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
+use crate::sandbox::{select, Cap, RunSpec, Sandbox, SandboxConfig};
 
 /// How long a command started by the `exec` tool may run before it is killed.
 ///
@@ -92,6 +114,30 @@ pub(crate) enum ExecOutcome {
         /// The ceiling it crossed.
         after: Duration,
     },
+    /// A resource cap killed it (0.40.0, contained runs only).
+    ///
+    /// Distinct from [`ExecOutcome::TimedOut`] on purpose, and the distinction is
+    /// the point rather than bookkeeping. `TimedOut` is the *contract's*
+    /// `exec_timeout`, the ceiling on a wedged command that exists so a run gets
+    /// its turn back; this is the *sandbox's* own limit, which the caller set when
+    /// they described how much of the machine this command may have. Collapsing
+    /// the two sends whoever reads the trace to the wrong ceiling: one is raised
+    /// with `with_exec_timeout`, the other in `SandboxLimits`.
+    ///
+    /// The streams are kept because a cap kill usually has the useful output in
+    /// it — what the build had printed before it was shot.
+    Capped {
+        /// Which ceiling it crossed.
+        cap: Cap,
+        /// The exit status, where the platform reported one.
+        code: Option<i32>,
+        /// Standard output, head-and-tail bounded.
+        stdout: String,
+        /// Standard error, head-and-tail bounded.
+        stderr: String,
+        /// How many characters the two bounds together elided, or 0.
+        elided: usize,
+    },
     /// There is no such program on this machine. Not a failed run: the model is
     /// told and carries on, exactly as it is told when `git` is missing.
     Unavailable {
@@ -115,6 +161,13 @@ pub(crate) struct Exec {
     workdir: PathBuf,
     timeout: Duration,
     cap: usize,
+    /// The containment this run asked for, or `None` for the 0.17.0 default.
+    ///
+    /// Held rather than resolved to a backend at construction because
+    /// [`select`](crate::sandbox::select) probes the host, and an `Exec` is built
+    /// per tool call while the probe's answer does not change under a running
+    /// process.
+    sandbox: Option<SandboxConfig>,
 }
 
 impl Exec {
@@ -130,7 +183,18 @@ impl Exec {
             workdir: workdir.into(),
             timeout,
             cap,
+            sandbox: None,
         }
+    }
+
+    /// Run inside the sandbox this contract asked for, or leave it on the host.
+    ///
+    /// A builder rather than a fourth argument to [`Exec::new`] so the uncontained
+    /// construction — every caller before 0.40.0, and every test that is not about
+    /// containment — reads exactly as it did.
+    pub(crate) fn contained(mut self, sandbox: Option<&SandboxConfig>) -> Self {
+        self.sandbox = sandbox.cloned();
+        self
     }
 
     /// Run `argv`, already authorised by the caller.
@@ -141,6 +205,9 @@ impl Exec {
         let Some(program) = argv.first() else {
             return Err(Error::Config("exec needs a non-empty argv".into()));
         };
+        if let Some(config) = &self.sandbox {
+            return self.run_contained(config, argv).await;
+        }
         let mut cmd = command(program, &argv[1..], &self.workdir);
         match tokio::time::timeout(self.timeout, cmd.output()).await {
             // Dropping the `output()` future drops the `Child`, and the child was
@@ -168,6 +235,60 @@ impl Exec {
                     stderr,
                     elided: cut_out + cut_err,
                 })
+            }
+        }
+    }
+
+    /// The same command, wrapped by whichever backend this host offers.
+    ///
+    /// The working directory is the workspace root, not a temporary directory —
+    /// that is the whole difference between this and the verification gate's use
+    /// of the same machinery, and it is what makes a contained `exec` able to
+    /// build a project rather than only to run one command in an empty room.
+    /// Nothing is copied in and nothing is copied out, so
+    /// [`copy_back`](crate::sandbox::copy_back) has no part here.
+    ///
+    /// Both ceilings still apply and they are not the same ceiling. The contract's
+    /// `exec_timeout` wraps the whole sandboxed call, so a backend that wedges is
+    /// bounded by the same rule an unsandboxed command is; the config's
+    /// `max_wall_secs` is the sandbox's own, and a command it kills comes back as
+    /// a cap rather than as this timeout.
+    async fn run_contained(&self, config: &SandboxConfig, argv: &[String]) -> Result<ExecOutcome> {
+        let sandbox = select(config);
+        let spec = RunSpec {
+            argv,
+            workdir: &self.workdir,
+            limits: &config.limits,
+            allow_network: config.allow_network,
+        };
+        match tokio::time::timeout(self.timeout, sandbox.run(spec)).await {
+            Err(_elapsed) => Ok(ExecOutcome::TimedOut {
+                after: self.timeout,
+            }),
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(out)) => {
+                let (stdout, cut_out) = head_and_tail(&out.stdout, self.cap);
+                let (stderr, cut_err) = head_and_tail(&out.stderr, self.cap);
+                let elided = cut_out + cut_err;
+                // A cap kill is reported as a cap kill. Read from the outcome the
+                // backend returned rather than inferred from the exit status: a
+                // process shot by `RLIMIT_CPU` and one that chose to exit 137 are
+                // indistinguishable by status alone.
+                match out.cap_hit {
+                    Some(cap) => Ok(ExecOutcome::Capped {
+                        cap,
+                        code: out.exit_code,
+                        stdout,
+                        stderr,
+                        elided,
+                    }),
+                    None => Ok(ExecOutcome::Ran {
+                        code: out.exit_code,
+                        stdout,
+                        stderr,
+                        elided,
+                    }),
+                }
             }
         }
     }

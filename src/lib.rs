@@ -66,9 +66,14 @@
 //! is no `;`, `&&` or `$( )` to parse and therefore none to get wrong. Every call
 //! is an [`Act::Exec`] check on the program *and* on the whole argv, so
 //! `allow_exec("cargo test*")` beside `deny_exec("cargo publish*")` means what it
-//! reads. A command runs in the workspace with the embedding program's privileges
-//! and is **not** sandboxed — see [`tools::exec`] for the whole of that bound,
-//! and [`DEFAULT_EXEC_TIMEOUT`] for the ceiling on one that wedges.
+//! reads. By default a command runs in the workspace with the embedding
+//! program's privileges and is **not** sandboxed — see [`tools::exec`] for the
+//! whole of that bound, and [`DEFAULT_EXEC_TIMEOUT`] for the ceiling on one that
+//! wedges. A contract that wants the narrower thing asks for it:
+//! [`TaskContract::with_contained_exec`] puts every command `exec` and the
+//! foreground `shell` start inside the [`Sandbox`] backend this host offers,
+//! keeping the workspace as the working directory so an incremental build
+//! survives between commands.
 //!
 //! **Verification in any language, or none.** [`Verification::Command`] runs a
 //! caller-supplied command in the sandbox and asserts its exit status — one
@@ -286,6 +291,18 @@
 //! one. macOS confines writes to the working directory and denies outbound
 //! network; Linux does the same through mount and network namespaces; Windows
 //! does neither.
+//!
+//! The Linux half of that sentence became true in **0.40.0** and was not before
+//! it, which is worth stating rather than quietly correcting. Until then the
+//! backend unshared a mount namespace and remounted nothing into it: the
+//! namespace existed, the filesystem view was the host's, and a write outside the
+//! working directory landed. Only the network namespace was doing real work. The
+//! backend now remounts the tree read-only inside its namespace and binds back
+//! the working directory and the system temporary directory — the same two places
+//! the macOS profile has always allowed — so "confines writes to the working
+//! directory" describes both platforms. A host whose kernel refuses the remounts
+//! degrades to [`Backend::PortableFloor`] and **reports the floor**, because the
+//! one thing worse than no boundary is a boundary that is named and absent.
 //!
 //! The access half is `AppContainer`, and 0.26.0 built it — `sandbox::appcontainer`
 //! creates a container, grants paths to its SID, and spawns into it with an empty

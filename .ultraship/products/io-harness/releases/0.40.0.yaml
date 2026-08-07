@@ -1,0 +1,765 @@
+product: io-harness
+version: 0.40.0
+status: released
+release_type: minor
+
+outcome:
+  user_can: >
+    Ask for the project's own commands to run contained, and have them run contained — the same
+    resource caps, filesystem confinement and egress denial the crate already applies to
+    model-produced code, applied to `exec` and `shell`.
+
+    Today it cannot be asked for at all. `Exec::new(ws.root(), exec_timeout, cap)`
+    (`src/run.rs:8426`) and `Shell::new(exec_timeout, cap)` (`src/run.rs:7951`) spawn straight onto
+    the host, and `src/tools/exec.rs:24` says so plainly: a command runs "with the embedding
+    program's privileges", not inside the `Sandbox`. Every isolation primitive the crate owns —
+    `SandboxConfig`, `SandboxLimits`, `RunSpec`, `select`, three native backends and a portable
+    floor, built across 0.6.0, 0.24.0 and 0.26.0 — is reachable from exactly one caller,
+    `verify.rs`'s gate (`src/verify.rs:826`). The widest capability the crate hands a model is the
+    one capability its own containment cannot be pointed at.
+
+    That is a granted owner decision (`US-IO-HARNESS-0.17.0-I02`, 2026-07-29), not an oversight, and
+    it rests on an argument that was true when it was made: the sandbox "denies network egress by
+    default and discards its working directory", which is right for a verification gate and makes
+    `npm install` impossible. 0.40.0 does not overrule it. It answers the working-directory half and
+    then leaves the choice with the caller.
+
+    The working-directory half is answerable because the discarding was never the sandbox's.
+    `RunSpec.workdir` is any `&Path` (`src/sandbox.rs:342`); it is `sandbox::workdir()`
+    (`src/sandbox.rs:1057`) returning a `tempfile::TempDir` that the *verification gate* chooses,
+    and `copy_back` (`src/sandbox.rs:1106`) that carries results out of it. A contained `exec` is
+    given the workspace root instead — the directory it already runs in today — and on macOS
+    `profile_for` (`src/sandbox/macos.rs:46`) then confines its writes there. The tree the run is
+    editing is the tree the command builds; `node_modules/`, `target/` and an incremental build all
+    survive, because nothing is discarded.
+
+    So `TaskContract` gains one optional field. Absent, `exec` and `shell` behave exactly as they
+    did in 0.39.0 and `src/tools/exec.rs`'s stated bound stands unchanged. Present, every command
+    either tool starts is wrapped by the selected backend: caps that kill rather than throttle,
+    writes confined to the workspace, egress denied unless the run's own `Policy` grants
+    `Act::Net`, and the backend that actually applied recorded as a `SandboxEvent` under the run so
+    an audit shows how the command was isolated rather than that it was claimed to be.
+
+    And Linux is brought up to the claim rather than exempted from it. `LinuxSandbox`
+    (`src/sandbox/linux.rs:38`) unshares `--user --map-root-user --mount --pid --fork`, and — this
+    is the defect — remounts nothing into the mount namespace it just created. The namespace is
+    unshared and the filesystem view is identical, so a write outside the workdir lands. Only
+    `--net` is doing real work there today. `src/lib.rs:279` nonetheless tells a reader that "Linux
+    does the same through mount and network namespaces" as macOS. 0.40.0 makes that sentence true
+    or replaces it.
+
+  business_value: >
+    The crate's honesty about its own boundary is the thing it sells. `docs/CONTRACT.md`, the
+    `custom::Tool` docs (`src/tools/custom.rs:20`) and `src/tools/exec.rs:31` all say the same
+    careful sentence — the harness decides what *starts*, not what a started thing then does — and
+    that sentence is what makes an operator willing to hand an agent a toolbox. It is also, for
+    `exec`, a limit the crate could lift and had chosen not to. Every ingredient has shipped: caps
+    that kill (0.6.0), a portable floor and three native backends, Windows Job Objects (0.24.0),
+    AppContainer (0.26.0), and a `Policy` that already models `Act::Net` per host. What was missing
+    was a caller.
+
+    An embedding application cannot close this itself. `Exec` and `Shell` are `pub(crate)`, the
+    dispatch that constructs them is inside `run.rs`, and `Sandbox` is RPITIT and not
+    object-safe — there is no seam where an app could wrap the spawn. As with 0.37.0's greeting
+    list, 0.38.0's cache marker and 0.39.0's spawn tool, the gap is in the library and only the
+    library can close it.
+
+    The cost of closing it is one optional field and no break. That is the second half of the
+    argument: five releases of isolation machinery become reachable from the tool that most needed
+    them, for a public surface of one field and one builder method, and a caller who does not ask
+    for it cannot tell the release happened.
+
+  evidence_of_value: >
+    Executed in the technique the last ten releases used: a discriminating pair, a negative control
+    that must not move, one sabotage per arm of every two-armed claim, and a sabotage that fails
+    nothing reported as a finding rather than propped up.
+
+    The containment claim is proven where containment is either applied or not — on the host, by a
+    command that tries to leave. A contained `exec` whose argv writes a file outside the workspace
+    root finds that file absent afterwards; the identical argv on the identical contract without the
+    field finds it present. That pair is the release in one assertion, and the negative control is
+    the half that fails an implementation which contained everything unconditionally.
+
+    The caps claim is proven by a command that is killed rather than throttled, and by *which* cap
+    is reported: a memory hog under a low `max_memory_bytes` comes back naming `Cap::Memory`, not a
+    bare exit status, because "killed by the sandbox" and "exited 137" send whoever reads the trace
+    to different diagnoses.
+
+    The egress claim is proven on both arms and per platform, because `allow_network` is one bool
+    and `Act::Net` is per host: a policy denying `Act::Net` produces a run with no route out, a
+    policy allowing one host produces a run with a route out to *every* host, and the second of
+    those is asserted and documented as a limitation rather than described as filtering.
+
+    The Linux claim is proven by the same escape test that proves macOS, running on `ubuntu-latest`
+    in the matrix rather than inferred from a wrapper argv — 0.32.0's fact 17 is that a wrapper
+    which looks right and a containment which holds are different assertions.
+
+    The no-change claim is proven by absence: the existing `exec`, `shell` and verification suites
+    pass unmodified, and no test in them is edited to accommodate this release.
+
+scope:
+  included:
+  - >
+    **One optional field on `TaskContract`, and one builder method.**
+    `TaskContract::exec_sandbox: Option<SandboxConfig>` with
+    `TaskContract::with_contained_exec(SandboxConfig)`, mirroring `Verification::sandboxed`
+    (`src/verify.rs:699`) — the crate's existing spelling for "opt this path into the sandbox".
+    `None` is the default and means what it means today. Free of breaks: `TaskContract` has been
+    `#[non_exhaustive]` since 0.35.0 (`src/contract.rs:70`), which is exactly the cost that release
+    paid so the next field would cost nobody anything. These are the only two public names this
+    release adds.
+  - >
+    **`exec` and `shell` route through the selected backend when the field is set.**
+    `Exec::new` (`src/run.rs:8426`) and `Shell::new` (`src/run.rs:7951`) take the config through to
+    their spawn and build a `RunSpec { argv, workdir: ws.root(), limits, allow_network }`, dispatched
+    through `select()` (`src/sandbox.rs:551`). `shell` parses its line into sub-commands and every
+    sub-command it starts is contained, not only the first — a contained `shell` whose second stage
+    escapes is the hole that would make the claim false.
+  - >
+    **The workspace root is the working directory, and that is the whole answer to 0.17.0.**
+    `RunSpec.workdir` is the run's own workspace, not a `TempDir`. `sandbox::workdir()` and
+    `copy_back` are untouched and stay what the verification gate uses. Nothing is copied, nothing
+    is discarded, and a second `exec` in the same run sees what the first one wrote.
+  - >
+    **Egress follows the run's `Policy`, and the mapping is stated rather than implied.**
+    `allow_network` is `true` when the policy would permit any `Act::Net` — its default effect for
+    that act is not `Deny`, or at least one rule allows a host — and `false` otherwise. Per-host
+    filtering is **not** enforced by the sandbox: the backends take one boolean. A policy that
+    allows exactly one host produces a contained command that can reach all of them, and the
+    per-host check remains what it has always been, a check on what the crate's own tools do. This
+    is written in `docs/CONTRACT.md` and on the field, in those words.
+  - >
+    **Linux gains real filesystem confinement.** The mount namespace `unshare` already creates
+    (`src/sandbox/linux.rs:38`) is populated so that writes outside the workdir fail, bringing Linux
+    to the property macOS has had since 0.6.0 and `src/lib.rs:279` already claims for it. The probe
+    shape is kept: `unshare_works` (`src/sandbox/linux.rs:72`) spawns the exact wrapper this backend
+    builds and falls back to `Backend::PortableFloor` when the host refuses it, so a restricted CI
+    runner degrades to the floor and reports the floor rather than naming an isolation that was
+    never applied.
+  - >
+    **A cap kill is reported as a cap kill.** `SandboxOutcome.cap_hit` (`src/sandbox.rs:385`)
+    reaches the observation the model reads and the step the store records, so a command killed by
+    the memory ceiling says so instead of surfacing as an exit code. `ExecOutcome`
+    (`src/tools/exec.rs:78`) is `pub(crate)` and may gain a variant freely.
+  - >
+    **The audit says how a command was isolated.** A contained `exec` or `shell` writes the same
+    `SandboxEvent` lifecycle rows the verification gate writes (`src/verify.rs:826`), carrying
+    `Backend::as_str()` — so a run that silently took `PortableFloor` because the host refused
+    namespaces is legible afterwards. No new table, no new column, no new `EventKind`.
+  - >
+    **Documentation as part of the release.** `src/tools/exec.rs`'s "What this does not bound"
+    section is rewritten: the 0.17.0 decision is stated as still governing the default and the field
+    is named as the way to change it. `docs/CONTRACT.md` gains the per-platform table of what is
+    actually enforced and the two limitations (coarse egress, the home-directory cost below).
+    `docs/guide/` gains the opt-in on the page that already covers running commands, and
+    `src/lib.rs:279`'s Linux sentence is corrected to whatever ends up true. `CHANGELOG.md` gains
+    the entry with **no** `*Migration:*` note, because nothing breaks. **No new guide page**, and
+    therefore no `GUIDES` / `CAPABILITIES.md` bookkeeping — the 0.31.0, 0.36.0, 0.37.0, 0.38.0 and
+    0.39.0 precedent. `docs/public-api.txt` is updated by hand; both new items carry a worked
+    doctest for the `every_public_item_has_a_worked_example` gate.
+  excluded:
+  - >
+    **Containment by default, by owner decision.** The un-sandboxed default is a granted approval
+    with a live argument behind it, and a minor release that changes where every existing embedder's
+    builds execute is a behaviour break of the 0.37.0 kind for a caller who never asked. The field
+    says at the call site that these commands are contained, which is the property worth having.
+  - >
+    **`shell_start` / `shell_poll` / `shell_kill`.** A backgrounded handle outlives the call that
+    made it, is polled across steps, and is reported orphaned after a process restart
+    (`src/tools/mod.rs:76`). Holding a sandbox open across that lifetime, and deciding what a
+    resumed run does with a handle whose sandbox is gone, is a design question rather than an
+    extension of this one. The contained/uncontained split is stated in `docs/CONTRACT.md` so it is
+    read rather than discovered.
+  - >
+    **Per-host egress inside the sandbox.** The backends take a boolean; per-host filtering means a
+    proxy or a packet filter, which is a dependency and a daemon. Stated as a limitation, recorded
+    in `open_questions`.
+  - >
+    **Windows filesystem and network confinement.** A Job Object contains resources and nothing else
+    (`src/lib.rs:279`), and the access half is `AppContainer`, which 0.26.0 built for the
+    verification path. Wiring `exec` through AppContainer is a release about Windows, not about
+    reaching the sandbox from a new caller. On Windows this release delivers the caps and says so.
+  - >
+    **Any change to `Sandbox`, `RunSpec`, `SandboxConfig`, `SandboxLimits`, `select`, `copy_back` or
+    the verification gate's use of them**, beyond the Linux mount fix. This release points an
+    existing machine at a new caller. Changing what the machine does is a different release.
+  - >
+    **Any new dependency, table, column, index or `EventKind` variant.**
+  fallback_scope:
+  - >
+    The field, `exec` and `shell` contained through the selected backend, the workspace root as the
+    working directory, egress from the policy, cap kills named, and the `SandboxEvent` audit — with
+    **the Linux mount fix dropped**. Filesystem confinement is then macOS-only, Linux delivers caps
+    and egress denial, Windows delivers caps, and `docs/CONTRACT.md` carries the per-platform table
+    stating exactly that while `src/lib.rs:279`'s over-reading Linux sentence is corrected to match.
+    The headline still holds in full on the platform this work is done on, the opt-in and its whole
+    public surface are unchanged, and what drops is one platform's enforcement rather than any part
+    of the claim's honesty. The limitation is then stated in the contract and the record rather than
+    discovered by whoever trusted the sentence.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a contained command cannot write outside the workspace, and an uncontained one still
+    can.** A contract with a workspace root and `with_contained_exec(SandboxConfig::new())`; the
+    model calls `exec` with an argv that writes a file to a path outside the root. Afterwards the
+    file does not exist, and the tool result the model was handed says the command failed rather
+    than reporting success. **The negative control, on the same contract, the same policy, the same
+    store and the same argv, with the field absent:** the file exists. This pair is the release in
+    one assertion. An implementation that contained every `exec` unconditionally passes the first
+    half and fails the second, and that failure is every existing embedder's build silently changing
+    where it may write. Asserted on the filesystem, not on the model's narration.
+  - >
+    **F2 — a cap kills, and the trace names which cap.** Two arms, one sabotage each.
+    **(a)** Under a `SandboxLimits` with a low `max_memory_bytes`, a command that allocates past it
+    is killed; the recorded step and the observation the model reads name `Cap::Memory`
+    (`src/sandbox.rs:140`), not a bare exit status. **(b)** Under a low `max_wall_secs` a spinning
+    command is killed naming `Cap::Wall`, and is distinguishable from `ExecOutcome::TimedOut`
+    (`src/tools/exec.rs:91`), which is the *contract's* `exec_timeout` and a different ceiling with a
+    different meaning. Sabotage (a): drop `cap_hit` on the way to the observation, under which the
+    kill still happens and the named test fails because the model is told only that something exited.
+    Sabotage (b): map the sandbox wall cap onto `TimedOut`, which fails the named test that
+    distinguishes them.
+  - >
+    **F3 — egress follows the policy, both arms.** **(a)** A policy whose `Act::Net` default is
+    `Deny` with no allowing rule: a contained command that dials a host fails to connect, on macOS
+    and on Linux. **(b)** A policy that allows a host: the same command connects. Sabotage: hard-code
+    `allow_network: false`, under which (b) fails; hard-code `true`, under which (a) fails. Both
+    arms are needed because a single-armed test passes an implementation that never reads the policy
+    at all. The coarseness is asserted rather than glossed: with one host allowed, a command reaching
+    a *different* host also connects, and that assertion is the executable form of the limitation
+    `docs/CONTRACT.md` states.
+  - >
+    **F4 — `shell` contains every sub-command, not the first.** A `shell` line whose first stage is
+    harmless and whose second stage writes outside the workspace root: the second stage's file does
+    not exist afterwards. Sabotage: wrap only the first parsed sub-command, under which the file
+    lands and this named test fails. This is the arm most likely to be quietly missing, because a
+    `shell` implementation that contains its first stage passes any test written against a one-stage
+    line.
+  - >
+    **F5 — the workspace is the working directory and is not discarded.** Within one contained run,
+    a first `exec` writes a file under the workspace root and a second `exec` reads it back and finds
+    it. Then, after the run: the file is on disk in the workspace, and no `TempDir` was created for
+    it. This is the criterion that proves 0.17.0's objection is answered rather than argued with —
+    an implementation that reused `sandbox::workdir()` passes nothing here.
+  - >
+    **F6 — Linux confines writes, on Linux.** F1's escape assertion runs on `ubuntu-latest` in the
+    matrix, not only on macOS, and passes. If the host refuses namespaces, the backend reports
+    `Backend::PortableFloor` and the test asserts *that* rather than asserting confinement that was
+    never applied — a skip that reads as a pass is the failure mode here. Sabotage: revert the mount
+    population to 0.39.0's `unshare` argv, under which the write lands on Linux and this named test
+    fails while every macOS test still passes, which is the whole point of running it there.
+  - >
+    **F7 — the audit says which backend actually ran.** After a contained `exec`, the store holds
+    the `SandboxEvent` lifecycle rows for that run and step carrying `Backend::as_str()`
+    (`src/sandbox.rs:98`), the same rows the verification gate writes (`src/verify.rs:826`). On a host
+    that refused the native primitive the recorded backend is `PortableFloor`, so a run that was
+    contained less than the caller asked for is legible afterwards instead of being indistinguishable
+    from one that was not. Asserted against stored rows.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` on macOS and Linux still reads **402** lines. Any
+    platform primitive is reached through what is already there, or behind
+    `[target.'cfg(...)'.dependencies]`, which leaves the count untouched.
+  - >
+    **N2 — zero breaks, and the assertion is the diff of `docs/public-api.txt`.** The file gains the
+    lines for `TaskContract::exec_sandbox` and `TaskContract::with_contained_exec` and loses none. No
+    existing signature moves, no type gains `#[non_exhaustive]` it did not have, `SandboxConfig`,
+    `RunSpec`, `SandboxLimits` and `Verification` are untouched, and `tests/changelog.rs` finds no
+    `**BREAKING` entry for this version. If the implementation needs a field on `RunSpec` or a change
+    to the `Sandbox` trait to work, the design is wrong for this release.
+  - >
+    **N3 — no store change.** No table, no column, no index; `CHECKPOINT_FORMAT` unmoved at **7**;
+    `ADDED_SINCE_0_22_0` unchanged; `tests/cross_version.rs` and the pinned 0.29.0 generator job pass
+    in both directions with no new name fed to the guard. Every row a contained command writes goes
+    to tables the sandbox events have used since 0.6.0.
+  - >
+    **N4 — the uncontained path is behaviour-identical to 0.39.0.** With `exec_sandbox` absent,
+    `exec` and `shell` spawn exactly as they did: same workdir, same timeout, same truncation, same
+    policy checks in the same order, no `SandboxEvent` written and no backend selected. The existing
+    `exec`, `shell` and verification suites pass **unmodified** — no test in them is edited to
+    accommodate this release — and F1's negative control covers the escape half.
+  - >
+    **N5 — the per-platform truth is written where a reader finds it, and nothing over-reads.**
+    `docs/CONTRACT.md` carries a table of what each backend actually enforces for a contained
+    command: macOS — caps, writes confined, egress denied; Linux — caps, writes confined, egress
+    denied, degrading to the floor where namespaces are refused; Windows — caps only, no filesystem
+    and no network facility in a Job Object. `src/lib.rs:279`'s claim that "Linux does the same
+    through mount and network namespaces" is true after this release or is corrected. A grep for the
+    old sentence is part of the check, because a corrected doc that leaves the original claim two
+    files away is the defect this criterion exists to catch.
+  - >
+    **N6 — the honest costs are stated, not discovered.** `docs/CONTRACT.md` and the field's own doc
+    state: egress is a single boolean and a policy allowing one host permits all of them under
+    containment; `shell_start` handles are **not** contained; a contained command on macOS may write
+    only under the workspace and `/private/var/folders` (`src/sandbox/macos.rs:46`), so a build that
+    writes to `~/.cargo/registry` or `~/.npm` — a cold `cargo fetch`, an `npm install` populating its
+    user cache — **fails under containment on macOS** and is the concrete price of the confinement,
+    with the workaround being to leave the field unset or to point the toolchain's cache inside the
+    workspace; and on Windows nothing but the resource caps applies.
+  - >
+    **N7 — no io-cli link anywhere, and the product table says what is true.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. `grep -rn "github.com/initorigin/io-cli"` and
+    `grep -rn "crates.io/crates/io-cli"` return nothing outside `CHANGELOG.md` and
+    `.ultraship/views/`, which are historical records and are not edited. The README's product
+    table carries io-cli unlinked with the status **Not built**, and the paragraph beneath it that
+    argued from io-cli being a second embedder is gone rather than left to contradict the row two
+    lines above it. The "Who it is for" section still explains that a terminal app is not this
+    layer's job, without naming a repository a reader cannot be sent to.
+  - >
+    **N8 — the README and the guides describe the crate as it is at 0.40.0.** Added by
+    `US-IO-HARNESS-0.40.0-I01` on owner request. Three specific corrections are checkable: the
+    README no longer tells a reader a command "is **not** sandboxed" without saying it can now be
+    asked to be, and neither does `src/lib.rs`; the README's platform table matches
+    `docs/CONTRACT.md`'s, both reading mount **and** network namespaces for Linux; and no
+    capability paragraph narrates the release it arrived in — no "since 0.34.0", no "(0.34.0)",
+    no "0.33.0's" — because a landing page states what the crate does, and `tests/readme.rs`
+    already forbids the same narration one level up in headings and in the crate root. Every
+    README checker, `tests/docs_drift.rs`, `tests/guide_pages.rs` and `tests/public_api.rs` pass,
+    and the nightly docs command is re-run because `src/lib.rs` is edited.
+  operational:
+  - >
+    **O1 — the three-OS matrix is green** on the commit being released, including the MSRV 1.95 job,
+    with no test skipped silently on Windows and no live fixture on the matrix path. The escape and
+    egress tests are the ones most likely to be quietly inert on a runner: each asserts the backend
+    that actually applied, so a floor fallback fails the confinement assertion instead of passing it
+    vacuously. **No wall-clock number is asserted anywhere** — F2's caps are asserted by which
+    `Cap` came back, never by how long the kill took — a wall-clock assertion has flaked this
+    matrix twice, one release apart, and a release about *time and memory ceilings* is unusually
+    exposed to writing one by reflex. No path is joined from a slash-bearing literal, and any
+    source-reading test normalises line endings.
+  - >
+    **O2 — docs.rs builds**, proven by running the nightly job's exact command
+    (`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`) before the
+    release PR is opened, never inferred from a stable `cargo doc`. It has caught something in four of
+    the last six releases, and this release adds documented items linking to `SandboxConfig`,
+    `Sandbox`, `Cap` and `Act` — the exact shape trap 28 fires on, and several of those types are
+    behind cfg-gated modules.
+  - >
+    **O3 — `cargo package --locked` succeeds** on a clean tree and the packaged crate compiles, run
+    after a `cargo clean`. Every local build and test runs with `CARGO_PROFILE_DEV_DEBUG=0
+    CARGO_PROFILE_TEST_DEBUG=0`, with `df -h .` before and between build steps, and
+    `cargo build --all-features --examples` before any `--lib --tests` run or sabotage — 0.32.0's
+    fact 17 is that a sabotaged library run against a stale fixture binary passes everything, and
+    this release's sabotages are exactly the kind that would.
+  - >
+    **O4 — `develop`'s head is checked against the tree the gates ran on, immediately before the
+    release PR is opened.** 0.37.0 was interrupted by two Dependabot merges landing above the feature
+    merge and the record described a tree without them. If anything has landed, every gate is re-run
+    on the merged tree before the record is sealed.
+  - >
+    **O5 — the removal of the 0.41.0 roadmap entry rides this release's branch.** It is an
+    uncommitted working-tree deletion at the time this contract is written, and the owner decided on
+    2026-08-07 that it is a genuine withdrawal to be committed on `feat/0.40.0` rather than restored
+    or carried indefinitely. It lands as its own roadmap commit, not folded into a feature commit,
+    and `ultraship views` is regenerated so `master-roadmap.md` matches.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.40.0, GitHub at initorigin/io-harness with the tag `v0.40.0` and a
+    Release titled `io-harness 0.40.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.40.0` off `develop`, committed incrementally as it lands,
+    including the 0.41.0 roadmap withdrawal, the sealed UltraShip release record and the
+    hand-appended lock pin. PR into `develop`, merged with the PR button. `develop`'s head checked
+    against the tree the gates ran on immediately before the release PR is opened. Release PR
+    `develop` into `main`, merged the same way. The GitHub Release is cut by `release.yml` —
+    `gh workflow run release.yml --ref main -f version=0.40.0` — which takes its notes verbatim from
+    the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and
+    the Release exist, with the registry token sourced from the repo-local `.env` in the same shell
+    invocation. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    None. No table is created or altered, no index is added, no column is added, `CHECKPOINT_FORMAT`
+    is unmoved at 7, and `ADDED_SINCE_0_22_0` gains no name. A 0.40.0 store and a 0.39.0 store are
+    the same store.
+  - >
+    No public break. Two items are added and none is removed or altered. A consumer who never sets
+    `exec_sandbox` compiles unchanged and behaves identically — `exec` and `shell` run where they ran
+    in 0.39.0, at the privileges they ran with.
+  - >
+    One thing a reader must not misread: this release makes containment *available* for `exec` and
+    `shell`, it does not apply it. The changelog says so beside the addition, in the same breath as
+    the 0.17.0 decision it leaves standing.
+  observability:
+  - >
+    A contained command writes the `SandboxEvent` lifecycle rows the verification gate has written
+    since 0.6.0, carrying the backend that actually applied — so an audit distinguishes a command
+    contained by `MacosSandboxExec` or `LinuxNamespaces` from one that silently took
+    `PortableFloor` because the host refused the primitive. No new event and no new query.
+  - >
+    A cap kill reaches the model's observation and the stored step naming the `Cap`, so a run killed
+    by the memory ceiling is diagnosable from the trace rather than from an exit status.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.40.1 and `cargo yank --version
+    0.40.0` is the escape hatch, leaving 0.39.0 as what `cargo install` resolves. Reverting is
+    cheap and unusually so here: there is no schema change, no public API removal, and the whole
+    behaviour change is gated behind a field that defaults to absent, so a consumer pinning back to
+    0.39.0 keeps every database, checkpoint and ledger row and loses only the ability to ask. A
+    consumer who has set the field and hits the macOS home-directory cost (N6) can unset it without
+    changing anything else about their contract.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    No live provider is required. Every criterion here is deterministic against fixture providers —
+    the evidence is files on disk, stored rows and connection failures, none of which needs a vendor.
+  - >
+    GitHub Actions `ubuntu-latest` and `macos-latest` runners are load-bearing for F6 rather than
+    incidental: the Linux confinement claim is asserted where Linux runs. A runner that refuses user
+    namespaces makes the backend report `PortableFloor`, which F6 asserts explicitly rather than
+    skipping.
+  human_approvals:
+  - >
+    The owner decided all four design questions on 2026-08-07, each at the recommended option:
+    containment is **opt-in per contract** rather than default-on, which leaves
+    `US-IO-HARNESS-0.17.0-I02` standing as the default; a contained command gets the **workspace
+    root** with writes confined to it rather than a temp dir with `copy_back`; **Linux is fixed**
+    rather than documented as exempt; and the scope is **`exec` and `shell`**, not the `shell_*`
+    handles.
+  - >
+    The owner decided on 2026-08-07 that the 0.41.0 roadmap entry is genuinely withdrawn and its
+    deletion is committed on this release's branch.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: medium
+  uncertainty: high
+  likely_cost_drivers:
+  - >
+    **The Linux mount work is the single largest driver and the least predictable.** `unshare` is
+    invoked as an argv (`src/sandbox/linux.rs:40`), and populating a mount namespace is not something
+    an `unshare` argv expresses on its own. Whatever shape it takes must keep three properties the
+    current backend has: the probe spawns the *exact* wrapper the backend builds
+    (`src/sandbox/linux.rs:63`), a wrapper failure is `Error::Sandbox` and never a failed command
+    (`src/sandbox/linux.rs:48`), and a host that refuses degrades to the floor and reports the floor.
+    Budget for this to be measured on a runner rather than reasoned about locally, and for the
+    fallback scope to be exercised if it does not converge.
+  - >
+    `shell` parsing a line into sub-commands means the containment attaches per sub-command
+    (`src/run.rs:7951`, `src/tools/shell.rs`), which is a different threading job from `exec`'s
+    single argv and is where F4's hole lives. Two call sites, not one.
+  - >
+    Mapping `Policy` to one boolean requires deciding what "would permit any `Act::Net`" means
+    against a rule stack with defaults, layers and `Ask`. `Ask` in particular has no obvious mapping:
+    the sandbox cannot ask. Expect this to want a small helper with its own unit tests, and expect
+    the answer for `Ask` to need writing down in `docs/CONTRACT.md` whichever way it goes.
+  - >
+    Trap 45's three-files cost, twice: the worked doctest per public item, the hand-edited
+    `docs/public-api.txt`, and the guide prose. No new `EventKind`, so no census entry.
+  - >
+    The escape tests write outside the workspace by design. Every one of them must target a path
+    under a `TempDir` the test owns and must assert cleanup, or a failing run leaves files on a
+    developer's machine and on the runner.
+  preferred_tools:
+  - >
+    The existing suites this release must not disturb and can borrow from: the `exec` and `shell`
+    tool suites, `tests/sandbox*`, the verification suites, `tests/policy.rs`, `tests/public_api.rs`,
+    `tests/changelog.rs`, `tests/docs_drift.rs` and `tests/cross_version.rs`.
+  - >
+    `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` on every local build — 19 GiB to 159 MiB —
+    `df -h .` before and between build steps, separate `cargo test` invocations for default and
+    all-features, and `cargo build --all-features --examples` before any `--lib --tests` run or
+    sabotage.
+  - >
+    `XDG_CONFIG_HOME` redirected for any suite that reaches `Config::discover` — this machine carries
+    a real `~/.config/io/io.toml` that fails `src/config.rs` doctests and `tests/plugin.rs`
+    independently of any change (traps 102 and 115). Never redirect `HOME`, which breaks `CARGO_HOME`.
+  constraints:
+  - >
+    No new runtime dependency; `cargo tree` stays at 402; MSRV 1.95; edition 2021; every version
+    stays 0.x.
+  - >
+    Two public names, no more. No change to the `Sandbox` trait, `RunSpec`, `SandboxConfig` or
+    `SandboxLimits`. No new `EventKind`, table, column or index.
+  - >
+    The default path is untouched. A contract without the field produces the same spawns, the same
+    observations and the same rows as 0.39.0.
+  - >
+    Nothing in this release narrows an existing surface. The trust rule's shape holds: new surface
+    starts closed, existing surface is not narrowed unasked — which is precisely why the containment
+    is a field the caller sets rather than a default they must discover and turn off.
+
+risks:
+- >
+  **The Linux mount fix does not converge, and the release is quietly reduced to macOS while still
+  claiming both.** This is the highest-probability failure here and it has a designed answer:
+  `fallback_scope` drops the Linux work explicitly, and N5 requires the per-platform table and the
+  correction of `src/lib.rs:279` in *either* case. The unacceptable outcome is not a macOS-only
+  release; it is a macOS-only release whose documentation says otherwise.
+- >
+  **A confinement test passes vacuously on a runner.** If the host refuses namespaces the backend
+  takes `PortableFloor`, which confines nothing — and a test asserting "the write failed" would then
+  fail honestly, while a test asserting "no error" would pass having proven nothing. F6 and O1 both
+  require asserting the backend that actually applied, and 0.32.0's fact 17 (a sabotage that ran
+  against a stale fixture binary and passed everything) is the precedent for why this is stated
+  twice.
+- >
+  **The negative control is the criterion most likely to be skipped, and it is the one protecting
+  every existing user.** An implementation that contains unconditionally is simpler, passes every
+  positive assertion, and silently changes where every embedder's builds may write. F1's second half
+  and N4 exist for this and neither is optional.
+- >
+  **The macOS home-directory cost turns out to be worse than stated.** `profile_for` permits writes
+  under the workdir and `/private/var/folders` and nothing else, so toolchains that write to a user
+  cache fail under containment. N6 requires this to be measured against at least one real build and
+  written down as what it actually is — if a common toolchain proves unusable under containment on
+  macOS, that is a finding for `known_limitations`, not a reason to widen the profile late.
+- >
+  **`Ask` on `Act::Net` has no honest mapping to a boolean.** Whichever way it is resolved, a caller
+  can be surprised: mapping it to allowed grants egress the operator wanted to be asked about,
+  mapping it to denied breaks a contract that would have been approved. It is written down in
+  `docs/CONTRACT.md` and recorded in `open_questions` rather than settled silently in code.
+- >
+  **Scope creep toward `shell_start`.** Containing a one-shot command and containing a handle that
+  outlives its call are different problems, and the second will look like a small extension while
+  the tests are fresh. It is excluded by owner decision and stays excluded.
+
+open_questions:
+- >
+  What `Effect::Ask` on `Act::Net` should mean for a boolean `allow_network`. Recorded rather than
+  guessed; whichever answer is taken is documented at the field and in `docs/CONTRACT.md`.
+- >
+  Whether per-host egress under containment is worth a future release, given it means a proxy or a
+  packet filter and therefore a dependency and a daemon — both of which the crate's standing
+  constraints refuse today.
+- >
+  Whether `shell_start` handles should be containable, and what a resumed run does with a handle
+  whose sandbox no longer exists. Deferred with its reason, not omitted.
+- >
+  Whether `exec` on Windows should reach `AppContainer` (built in 0.26.0 for the verification path),
+  which is the only route to filesystem and network confinement there. Out of scope here; a Windows
+  release.
+- >
+  Whether a toolchain cache inside the workspace should be something the crate helps arrange, given
+  N6's macOS cost. Possibly nothing more than documentation; measured first.
+
+released_at: 2026-08-07T00:00:00Z
+mode: published
+delivered: >
+  A contract can ask for the project's own commands to run inside the sandbox.
+  `TaskContract::with_contained_exec(SandboxConfig)` puts every command the `exec` tool and the
+  foreground `shell` tool start behind the backend this host offers — the config's resource caps,
+  filesystem writes confined to the workspace, and outbound network denied unless the run's `Policy`
+  would permit `Act::Net` — with the **workspace root** as the working directory, so nothing is
+  copied in, nothing is discarded, and an incremental build survives between commands. That working
+  directory is the whole answer to `US-IO-HARNESS-0.17.0-I02`, which refused containment for `exec`
+  precisely because the sandbox discarded what it ran on. A `shell` line is contained per
+  sub-command rather than at its first stage, a cap kill reaches the model and the store naming the
+  `Cap` that fired rather than a bare exit status, and the `SandboxEvent` lifecycle rows record the
+  backend that **actually applied**, so a run that silently took `PortableFloor` is legible instead
+  of indistinguishable from one contained as asked. On Linux the filesystem half became true in this
+  release: the backend had unshared a mount namespace and remounted nothing into it, so the
+  namespace existed and a write outside the working directory landed. It now remounts the tree
+  read-only and binds back the working directory and the system temporary directory. The default is
+  untouched — with the field unset, `exec` and `shell` behave exactly as they did in 0.39.0.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — **66 suites, 1391 passed, 0 failed**, exit 0. Run twice: once
+    on the tree first sealed at `85ad8f3`, and again on the tree carrying the CI and escape-test fix
+    the matrix forced, with the identical result.
+  - >
+    `cargo test --all-features` as a separate invocation on the same tree — **66 suites, 1470
+    passed, 0 failed**, exit 0, including **374** doctests. Also run twice, for the same reason.
+  - >
+    The documentation-reading gates were re-run **last**, after the changelog, contract and README
+    gained the Ubuntu 24.04 caveat, because those suites read the files the caveat changed:
+    `readme` 8, `docs_drift` 15, `guide_pages` 7, `changelog` 5, `public_api` 9, `ci_workflow` 6 —
+    **50 passed, 0 failed**, with `cargo fmt --check` exit 0 after them.
+  - >
+    Both runs with `XDG_CONFIG_HOME` redirected to a scratch directory. This machine carries a real
+    `~/.config/io/io.toml` whose `api_key` key the config schema rejects, which fails
+    `tests/plugin.rs` and two `src/config.rs` doctests independently of any change (traps 102, 115).
+  - >
+    `tests/exec_contained.rs` is the release's own suite — **12 tests**, covering F1's positive and
+    negative arms, F2's two caps, F3's two egress arms and the coarseness assertion, F4's second
+    shell stage, F5's write-then-read, and F7's recorded backend plus its absence control.
+  - >
+    Eight sabotages, each failing a **named** test and nothing else, each reverted: S1 (the builder
+    ignores the config), S2 (`RunSpec.workdir` set to `sandbox::workdir()`'s `TempDir`), S3 (drop
+    `cap_hit` before the observation), S4 (map the sandbox wall cap onto `TimedOut`), S5 (hard-code
+    `allow_network: false`), S6 (hard-code it `true`), S7 (wrap only the first parsed sub-command),
+    S8 (record `PortableFloor` regardless of what applied). None was silent.
+  - >
+    N1 — `cargo tree` reads **402** lines, unchanged since 0.32.0. N3 — `CHECKPOINT_FORMAT` unmoved
+    at **7**, `src/state.rs` absent from this branch's diff entirely, `ADDED_SINCE_0_22_0`
+    untouched, no table, column, index or migration.
+  - >
+    Cross-version both directions: `tests/cross_version.rs` (**5** passed) in the main suite, and the
+    pinned generator gate — `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`
+    followed by `cargo test --all-features --test cross_version_0_29_0 -- --ignored`, **1 passed,
+    0 failed** (`a_current_store_is_read_by_a_0_29_0_binary`). This figure was **15** in the first
+    sealing of this record and was wrong: `cargo test` prints one `test result` line per binary in
+    an order that does not follow the `--test` flags, and five counts were read off against the
+    wrong five names. Each suite was re-run alone to fix it — `cross_version` is 5, `docs_drift` is
+    15. Corrected before the merge, which is the only time a sealed record may be corrected.
+  - >
+    **The three-OS matrix failed on the first attempt, and what it found is the most valuable thing
+    in this release.** Run 31146278623 on PR #125: every job green except `test (ubuntu-latest,
+    default)` and `test (ubuntu-latest, all)`, which failed
+    `a_contained_command_cannot_write_outside_the_workspace` and
+    `a_contained_shell_line_contains_its_later_stages_too` — a contained command wrote outside the
+    workspace on Linux. The cause was not the mount population: `LinuxSandbox::run`
+    (`src/sandbox/linux.rs:33`) probes the wrapper and, when the kernel refuses unprivileged user
+    namespaces, degrades to `PortableFloor` and reports it. Ubuntu 24.04 ships
+    `kernel.apparmor_restrict_unprivileged_userns=1`, so **the runner was on the floor**, which
+    confines nothing. The mount script fails loudly (`exit 125`, an `unshare:`-prefixed line,
+    `Error::Sandbox`) and no such error appeared, which is what rules the remounts out as the cause.
+  - >
+    **The same condition had been hiding F3's Linux arms, silently.** `backend_claims_a_network_boundary`
+    (`tests/exec_contained.rs`) returns false on a floor host and the egress tests `return` early,
+    so on every ubuntu run before this fix they *skipped and reported success*. The escape tests
+    failed loudly and the egress tests passed vacuously — the same defect wearing two faces, and
+    exactly the "skip that reads as a pass" F6 was written to forbid.
+  - >
+    **The matrix then caught the real defect, which the first diagnosis had missed.** With the
+    apparmor sysctl applied, `kernel.apparmor_restrict_unprivileged_userns = 0` confirmed in the log,
+    the backend *still* reported `PortableFloor` — and the F6 test now said so as a failure instead
+    of a skip. So the namespace was permitted and the **mount setup itself** was failing. The probe
+    swallows stderr by design, so a temporary CI step ran the same script with stderr shown:
+    `mount --make-rprivate /` succeeded and `mount --bind / /` failed **rc=32**, `wrong fs type, bad
+    option, bad superblock on /`, while binding a subdirectory worked. That failure hit `fail`,
+    exited 125, and took the whole setup down.
+  - >
+    **The fix is the deletion of one line, and it was measured rather than reasoned about.** A second
+    probe asked the only question that decides it — not whether `mount` returns 0, but whether a
+    write is actually refused. Dropping the bind and remounting `/` read-only directly returned
+    `V3 VERDICT: READ-ONLY — the write was refused`, and with the workdir rebound rw,
+    `V4 write INSIDE workdir ok` beside `V4 escape refused`. `mount --bind / /` was never needed;
+    it was the assumption that a bind was required to own the mount, and it was the only thing
+    breaking Linux. Both temporary diagnostic steps were removed once the cause was known.
+  - >
+    **What this means about every earlier claim in this release, stated plainly.** Until this fix
+    the Linux confinement was applied on **no machine anywhere** — the probe failed, the backend
+    took the floor, and the escape tests either failed loudly or (for egress) skipped silently. The
+    release spent two matrix runs believing the Linux work was sound because the failure looked like
+    a runner policy. It was not. The three-OS matrix is the only reason this is a fixed defect
+    rather than a shipped one, which is the strongest argument for O1 this project has produced.
+  - >
+    **F6 is now executed rather than reasoned about, and this was read out of the log rather than
+    inferred from a green tick.** On the run for commit `e867423`, job `test (ubuntu-latest,
+    default)`: `linux_confines_a_contained_commands_writes_to_the_workspace` **PASS** — a test
+    written to *fail* on CI if the backend reports `PortableFloor`, so its passing is the positive
+    statement that `LinuxNamespaces` applied. Beside it
+    `a_contained_command_cannot_write_outside_the_workspace` **PASS** and
+    `a_contained_shell_line_contains_its_later_stages_too` **PASS**, both on the native branch, and
+    `a_policy_that_denies_the_network_denies_it_to_a_contained_command` **PASS** with **zero**
+    occurrences of the `skipped: this host` message anywhere in the job — so F3's Linux arm ran for
+    the first time in this release's history instead of returning early. Both ubuntu legs green,
+    all three OSes green.
+  - >
+    **Both halves of the original CI problem were fixed too.** `.github/workflows/ci.yml` and **both** ubuntu legs of
+    `.github/workflows/release.yml` now set
+    `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` before the suite, restoring the
+    setting that is the default on most distributions so the leg exercises the real backend.
+    release.yml was changed alongside ci.yml deliberately: trap 87 is that a guard written for one
+    workflow does not cover its sibling, and a release gate testing the floor would pass while
+    proving nothing. And the two escape tests now **branch** on `select(&config).backend()` instead
+    of asserting confinement unconditionally: on a native backend the write must not land, on the
+    floor it must, so the fallback path is asserted rather than skipped.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0,
+    zero warnings. It **failed first** with `rustdoc::redundant_explicit_links` on
+    ``[`Sandbox`](crate::Sandbox)`` at `src/tools/exec.rs:27`, which stable `cargo doc` reported as
+    clean. Fixed in `9cbcc9e` and re-run green. Sixth catch in seven releases.
+  - >
+    `cargo clean && cargo package --locked` — exit 0, the packaged crate compiled by the `Verifying`
+    step. **1,379,674 bytes** at `target/package/io-harness-0.40.0.crate`.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **N2 was met in a weaker letter and a stronger substance, and this is the second release running
+  to hit it.** The criterion said `docs/public-api.txt` "gains the lines for
+  `TaskContract::exec_sandbox` and `TaskContract::with_contained_exec`". It gains **none** and is
+  **byte-identical**. The file enumerates the names re-exported from `src/lib.rs`; a field and a
+  method on an already-listed type are not re-exports, and hand-adding lines fails the checker.
+  Byte-identical is the stronger zero-break claim, not a weaker one. 0.39.0 recorded the same trap
+  and the criterion was still written this way — plan such a criterion as "unchanged".
+- >
+  **F6 cannot be verified on the machine this release was built on, and that nearly shipped a
+  boundary that existed nowhere.** The Linux assertion runs on `ubuntu-latest`; a macOS developer
+  host can only run the macOS arm, and every local gate passed throughout while Linux confined
+  nothing. It is verified now — asserted on the runner, on the native backend, read out of the job
+  log — but the standing limitation is the shape of the risk, not this instance of it: a
+  platform-specific boundary is only ever as true as the platform that runs its test, and this
+  project has exactly one such platform in CI and none on the developer's desk.
+- >
+  **Linux confinement is verified on a host whose apparmor restriction has been lifted, and that is
+  not the Ubuntu 24.04 default.** CI now sets
+  `kernel.apparmor_restrict_unprivileged_userns=0` before the suite, which is what most
+  distributions ship and what makes the namespaces backend reachable at all. The honest consequence
+  for a user: on Ubuntu 24.04 with the stock setting and no privilege to change it, a contained
+  command takes `PortableFloor` — the resource caps still apply, and the filesystem confinement and
+  egress denial **do not**. The backend reports the floor and the `SandboxEvent` row records it, so
+  this is legible rather than silent, but a caller who assumes containment on a stock Ubuntu 24.04
+  host will not get the filesystem half. This is the single most likely way for this release's
+  promise to be misread in the field.
+- >
+  **The two escape tests assert the floor on a floor host rather than skipping**, which is what F6
+  demanded and what the first implementation did not do. The consequence worth stating: a green
+  suite on an unknown host no longer proves confinement — it proves the backend's *reported*
+  behaviour matches what it applied. Which of the two branches ran is the thing to read, and on the
+  ubuntu legs after this fix it is the native one.
+- >
+  **This record cites CI on a commit that does not contain it.** A release record can never cite a
+  run on the commit that carries the record, because the record is written first. The ordering is
+  stated in the merge and the final report rather than amended into the sealed file — the 0.29.0
+  precedent, applied for the fourth time.
+- >
+  **The record is sealed before the registry upload.** `mode: published` is the delivery target and
+  the flow is fixed: both merges, then the GitHub Release, then `cargo publish` by hand, last. The
+  upload follows this seal rather than preceding it.
+- >
+  **N6's macOS cost was measured by probing the mechanism, not by running a cold `cargo fetch` or
+  an `npm install` end to end.** `sandbox-exec` with the crate's own profile was given three writes:
+  inside the workspace (succeeded), into a second temporary directory (succeeded, because the
+  profile re-allows the whole of `/private/var/folders`), and into `$HOME` (refused, `Operation not
+  permitted`). The third is exactly the claim — a toolchain populating `~/.cargo/registry` or
+  `~/.npm` fails under containment on macOS — and it decided the escape tests' target directory.
+  A full cold toolchain run was not performed.
+- >
+  **Egress under containment is one boolean per run and cannot be otherwise today.** A policy that
+  allows exactly one host gives a contained command a route to every host. Per-host filtering at the
+  sandbox wall means a proxy or a packet filter, therefore a dependency and a daemon, both of which
+  the crate's standing constraints refuse. The coarseness is asserted by a test rather than only
+  documented.
+- >
+  **`Effect::Ask` on `Act::Net` counts as not permitted, and it has no honest mapping.** A namespace
+  is built before the command starts and an approver answers about one action at the moment it is
+  attempted, so the sandbox cannot ask. Denying is the safer of two surprising answers; it remains
+  an open question rather than a settled one.
+- >
+  **The Linux mount fix reaches the verification gate too, and that is a real behaviour change
+  beyond this release's own scope.** The gate uses the same `LinuxSandbox`. A gate command that
+  wrote outside its working directory on Linux succeeded before this release and fails after it.
+  That is the boundary the module always claimed arriving late rather than a new restriction, and it
+  is in the changelog under Changed and in `docs/guide/sandbox.md` rather than left to be discovered.
+- >
+  **`shell_start` / `shell_poll` / `shell_kill` handles are not contained**, and a contained `shell`
+  stage is contained slightly less than an `exec` command: it gets the wrapper, the filesystem
+  confinement, the egress denial and the CPU and open-file rlimits, but not the memory monitor, and
+  a stage killed by a cap is not attributed to a `Cap`. Both are stated at the field and in
+  `docs/CONTRACT.md`.
+- >
+  **Two criteria, N7 and N8, were added during the completion phase** by `US-IO-HARNESS-0.40.0-I01`
+  on owner request, after every functional criterion had passed. They are documentation only — every
+  io-cli link removed with the product marked "Not built", and the README brought up to what the
+  crate does at 0.40.0. `src/lib.rs` is edited, so `fmt`, `clippy`, the nightly docs command, the
+  doctests and both suite polarities were re-run afterwards and are the figures reported above.
+  `CHANGELOG.md` and `.ultraship/views/` still name io-cli and are deliberately untouched, because
+  they record what past releases said at the time.
+supersedes: null
+next_recommended_version: null
+immutable: true
