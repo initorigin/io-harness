@@ -322,3 +322,147 @@ async fn the_contracts_exec_timeout_is_not_reported_as_a_sandbox_cap() {
         steps[0].decision
     );
 }
+
+// ---------------------------------------------------------------------------
+// F3 — egress follows the policy, both arms, and the coarseness is asserted
+// ---------------------------------------------------------------------------
+
+/// A listener on loopback, so the egress arms need no internet and no live host.
+///
+/// Loopback is a real test of the boundary on both backends that claim one: a
+/// fresh network namespace has only a down `lo`, and the macOS profile's
+/// `(deny network*)` covers local sockets as well as remote ones. It is also the
+/// only egress probe that can assert the *allow* arm without depending on
+/// somebody else's uptime.
+async fn loopback_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            use tokio::io::AsyncWriteExt;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await;
+            let _ = socket.shutdown().await;
+        }
+    });
+    (addr, handle)
+}
+
+/// Does this host's backend claim a network boundary at all? A Job Object and the
+/// portable floor do not, and asserting a denial they never promised is how a
+/// suite starts lying about what it proved.
+fn backend_claims_a_network_boundary() -> bool {
+    use io_harness::sandbox::{select, Backend, Sandbox};
+    matches!(
+        select(&SandboxConfig::new()).backend(),
+        Backend::MacosSandboxExec | Backend::LinuxNamespaces
+    )
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_policy_that_denies_the_network_denies_it_to_a_contained_command() {
+    if !backend_claims_a_network_boundary() {
+        eprintln!("skipped: this host's backend claims no network boundary");
+        return;
+    }
+    let dir = workspace();
+    let (addr, server) = loopback_listener().await;
+    let store = Store::memory().unwrap();
+    let url = format!("http://{addr}/");
+    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-s", "-m", "5", &url])]]);
+
+    // `Policy::default()` leaves `net` at `Ask` and carries no allowing rule, so
+    // nothing here would permit an outbound connection.
+    let result = run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &Policy::default().allow_exec("curl"),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        !steps[0].decision.contains("exit 0"),
+        "a contained command reached the network under a policy that permits none: {:?}",
+        steps[0].decision
+    );
+    server.abort();
+}
+
+/// The other arm. Without it, an implementation that hard-codes `allow_network:
+/// false` — or one whose containment is simply broken — passes the test above
+/// having proven nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_policy_that_allows_the_network_allows_it_to_a_contained_command() {
+    let dir = workspace();
+    let (addr, server) = loopback_listener().await;
+    let store = Store::memory().unwrap();
+    let url = format!("http://{addr}/");
+    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-s", "-m", "5", &url])]]);
+
+    let result = run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        steps[0].decision.contains("exit 0"),
+        "a contained command was denied a network its policy permits: {:?}",
+        steps[0].decision
+    );
+    server.abort();
+}
+
+/// The executable form of the limitation, asserted rather than glossed.
+///
+/// The backends take one boolean, so a policy that names a single host and a
+/// policy that opens everything produce the same sandbox. A contained command
+/// under a one-host allowance reaches a *different* host, and `docs/CONTRACT.md`
+/// says so in those words.
+#[cfg(unix)]
+#[tokio::test]
+async fn egress_under_containment_is_all_hosts_or_none_and_never_the_named_host() {
+    let dir = workspace();
+    let (addr, server) = loopback_listener().await;
+    let store = Store::memory().unwrap();
+    let url = format!("http://{addr}/");
+    let provider = MockScript::new(vec![vec![exec_call(&["curl", "-s", "-m", "5", &url])]]);
+
+    // One host allowed, and it is not the host the command dials.
+    let policy = Policy::default()
+        .allow_exec("curl")
+        .allow_net("example.com:443");
+
+    let result = run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &policy,
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        steps[0].decision.contains("exit 0"),
+        "the coarseness is real and documented: one allowed host opens all of \
+         them under containment, so this connection to an unnamed host succeeds. \
+         If this assertion ever fails, per-host egress has been implemented and \
+         docs/CONTRACT.md must stop saying it has not: {:?}",
+        steps[0].decision
+    );
+    server.abort();
+}

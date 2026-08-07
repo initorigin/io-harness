@@ -133,7 +133,7 @@ tasks:
     granted, or grants one it was denied — and the policy is the only thing in the crate that already
     knows. The coarseness is not incidental: the backends take one boolean while `Act::Net` is per host,
     so a claim of per-host filtering under containment would be false and has to be asserted as false.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.40.0-T01
   acceptance_criteria:
@@ -151,7 +151,37 @@ tasks:
   - src/policy.rs
   - src/tools/exec.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`Policy::permits_any_egress()` added in `src/policy.rs` — `true` when `defaults.net` is `Allow`
+    or any layer carries an `Act::Net` rule with `Effect::Allow`, `false` otherwise. `dispatch` builds
+    the contained config with `allow_network` from it.'
+  - '**The `Ask` question is answered and the answer is `not permitted`**, which closes one of the contract''s
+    `open_questions`. The reason is structural rather than a preference: an approver answers a question
+    about one action at the moment it is attempted, while a namespace is built before the command starts
+    and cannot be renegotiated once it is running. Treating `Ask` as permission would hand a blanket
+    route out on the strength of a rule that asked for a human. Documented on the method and owed to
+    `docs/CONTRACT.md`.'
+  - '**Two sources of `allow_network` resolved to one authority per path.** `SandboxConfig::allow_network`
+    is what the verification gate uses, because that path has no policy to consult; a run has one, and
+    it is the run''s own statement about reaching the network. The config''s flag is therefore not consulted
+    for contained `exec`, which is what F3 specifies and is documented rather than left to be inferred.'
+  - 'F3, `cargo test --test exec_contained` — **8 passed, 0 failed in 0.12s**. Offline by construction:
+    the probe is a `tokio::net::TcpListener` on loopback rather than a live host. Loopback is a real
+    test of both boundaries — a fresh network namespace has only a down `lo`, and the macOS profile''s
+    `(deny network*)` covers local sockets — and it is the only probe that can assert the *allow* arm
+    without depending on somebody else''s uptime.'
+  - 'Arm (a): under `Policy::default()` (net at `Ask`, no allowing rule) a contained `curl` to the listener
+    does not reach it. Guarded by a backend check — a Job Object and the portable floor claim no network
+    boundary, and asserting a denial they never promised is how a suite starts lying about what it proved.'
+  - 'Arm (b): under a permissive policy the identical command connects and the step reads `exit 0`.'
+  - 'The coarseness is asserted, not glossed: under a policy allowing exactly `example.com:443`, a contained
+    command reaching a **different** host still connects. The assertion carries its own reversal instruction
+    — if it ever fails, per-host egress has been implemented and `docs/CONTRACT.md` must stop saying
+    it has not.'
+  - Sabotage **S5** — `allow_network` hard-coded `false`. The allow arm and the coarseness test FAILED;
+    the deny arm passed. Sabotage **S6** — hard-coded `true`. The deny arm FAILED; the other two passed.
+    Each sabotage fails the opposite arm, which is why a single-armed test would have proven nothing
+    here. Both reverted.
 - id: US-IO-HARNESS-0.40.0-T04
   summary: Contain every sub-command `shell` parses out of a line, not the first.
   why_required: '`shell` is in scope and it is the tool whose containment is easiest to half-implement:

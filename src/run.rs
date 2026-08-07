@@ -8430,8 +8430,17 @@ async fn dispatch(
                 }
             }
 
+            // Egress on a contained command follows this run's policy, not the
+            // config's flag: the config is shared with the verification gate,
+            // which has no policy to consult, while a run has one and it is the
+            // run's own statement about reaching the network. One authority per
+            // path, rather than two that can disagree.
+            let contained = exec_sandbox.map(|config| crate::sandbox::SandboxConfig {
+                allow_network: ws.policy().permits_any_egress(),
+                ..config.clone()
+            });
             let outcome = Exec::new(ws.root(), exec_timeout, cap)
-                .contained(exec_sandbox)
+                .contained(contained.as_ref())
                 .run(&argv)
                 .await?;
             let (decision, obs) = match &outcome {
