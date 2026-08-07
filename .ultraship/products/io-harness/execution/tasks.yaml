@@ -407,4 +407,45 @@ tasks:
   - docs/public-api.txt
   - CHANGELOG.md
   - README.md
-  evidence: []
+  evidence:
+  - Version bumped to 0.40.0 in `Cargo.toml`; the README install snippet bumped to `0.40` — the fourth
+    `tests/docs_drift.rs` checker added in 0.36.1 caught it stale at `0.39` and failed until it was
+    fixed, which is the checker doing exactly what it was written for.
+  - '**N2 deviation, and it is the stronger claim rather than a weaker one.** The criterion says `docs/public-api.txt`
+    gains the lines for `exec_sandbox` and `with_contained_exec`. It gains **none** and is **byte-identical**
+    — `git diff` reports no change and `cargo test --test public_api` passes (9 passed). The file enumerates
+    crate-root re-exports from `src/lib.rs`; a field and a method on an already-listed type are not
+    re-exports, and hand-adding lines would fail the checker. This is the same trap 0.39.0 recorded,
+    met a second time; the criterion should have been planned as ''unchanged''. Owed to `known_limitations`.'
+  - '`src/lib.rs`''s platform section corrected. It claimed ''Linux does the same through mount and
+    network namespaces'' as macOS, which was untrue until this release. The correction states plainly
+    that the Linux half became true in 0.40.0 and was not before it, rather than quietly rewriting the
+    sentence.'
+  - '`src/tools/exec.rs`''s ''What this does not bound'' section rewritten as ''What this does not bound,
+    unless it is asked to'': the 0.17.0 decision is stated as still governing the default, the field
+    is named as the way to change it, and the macOS user-cache cost is stated where a reader of that
+    module will meet it.'
+  - '`docs/CONTRACT.md` gains the 0.40.0 section with the per-platform enforcement table (macOS/Linux:
+    caps, writes confined, egress denied; Windows: caps only) and all six limits: the coarse egress
+    boolean, `Ask` counting as not permitted, the macOS user-cache failure, the uncontained `shell_start`
+    handles, the weaker containment of a `shell` stage, and the two distinct ceilings. The Linux row
+    of the existing platform table now reads ''mount and network namespaces plus rlimits''.'
+  - '`docs/guide/command-execution.md` gains the opt-in with a worked example and a contained-vs-not
+    comparison table; `docs/guide/sandbox.md` gains the section naming its new second caller. **No new
+    guide page**, so no `GUIDES` / `CAPABILITIES.md` bookkeeping — the 0.31.0 through 0.39.0 precedent.'
+  - '`CHANGELOG.md` gains the 0.40.0 entry with **no** `*Migration:*` note, because nothing breaks.
+    It carries the one thing a reader must not misread — containment is made *available*, not applied
+    — and the Linux tightening under Changed.'
+  - '**A consequence beyond the release''s own scope, found while writing the changelog and stated rather
+    than buried.** The Linux mount fix reaches the **verification gate** too, because the gate uses
+    the same `LinuxSandbox`. A gate command that wrote outside its working directory on Linux succeeded
+    before this release and fails after it. That is the boundary the module always claimed arriving
+    late, not a new restriction — but it is a real behaviour change and it is now in the changelog under
+    Changed and in `docs/guide/sandbox.md`.'
+  - '`cargo clippy --all-features --lib --tests` — clean. One warning was introduced and fixed during
+    this task: the new `record_sandbox_step` helper had been inserted between `dispatch`''s `#[allow(clippy::too_many_arguments)]`
+    attribute and the function, which silently moved the allowance onto the helper and left `dispatch`
+    warning at 21/7. The helper now sits above `dispatch`''s doc comment and the attributes are reattached.'
+  - '`cargo test --all-features` — **66 suites, 1470 passed, 0 failed**, exit 0, including 374 doctests.
+    `XDG_CONFIG_HOME` redirected to a scratch directory, because this machine carries a real `~/.config/io/io.toml`
+    that fails `src/config.rs` doctests and `tests/plugin.rs` independently of any change.'

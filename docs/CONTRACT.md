@@ -128,7 +128,7 @@ change for every `match` a caller wrote.
 | Platform | Status | Sandbox containment |
 | --- | --- | --- |
 | macOS | Supported, full suite in CI | Native, `sandbox-exec` |
-| Linux | Supported, full suite in CI | Native, namespaces and rlimits |
+| Linux | Supported, full suite in CI | Native, mount and network namespaces plus rlimits |
 | Windows | Supported, full suite in CI | **Native resource containment only** |
 
 Since 0.24.0 a Windows run is contained by a Job Object. Memory, CPU and active
@@ -875,6 +875,78 @@ there, as it does for `run_tree`.
 unchanged from the per-tier slot design: a parent holds a slot at its own tier and
 waits only on the tier below, which is what makes the wait graph acyclic. A
 contained turn is a tree like any other in this respect.
+
+## What contained `exec` and `shell` give you, and what they do not (0.40.0)
+
+The project's own commands **can** run inside the sandbox, and by default they
+still do not. `TaskContract::with_contained_exec(SandboxConfig)` is the opt-in;
+with the field unset, `exec` and `shell` behave exactly as they did in 0.39.0 —
+in the workspace root, at the embedding program's privileges, with the policy
+deciding what may *start* and nothing bounding what a started process then does.
+That default is the owner's decision of 2026-07-29 (`US-IO-HARNESS-0.17.0-I02`)
+and this release leaves it standing.
+
+**A contained command keeps the workspace root as its working directory.** This is
+what makes containment usable for a build at all. The sandbox never discarded a
+working directory — the verification gate chose a `TempDir` and copied results
+back out — so a contained command is simply given the workspace instead. Nothing
+is copied in, nothing is copied out, and a second command sees what the first one
+wrote, which is what an incremental build depends on.
+
+**What each platform actually enforces differs, and the differences are not
+cosmetic.**
+
+| Platform | Resource caps | Writes confined | Egress denied |
+| --- | --- | --- | --- |
+| macOS | Yes | Yes, to the workspace and the system temporary directory | Yes |
+| Linux | Yes | Yes, to the workspace and the system temporary directory (0.40.0) | Yes |
+| Windows | Yes | **No** | **No** |
+
+A Job Object contains resources and nothing else, so on Windows a contained
+command gets the caps and nothing more. On Linux the filesystem half is new in
+0.40.0: before it, the backend unshared a mount namespace and remounted nothing
+into it, so only the network namespace was real. A host whose kernel refuses the
+remounts degrades to `PortableFloor` and **reports the floor** rather than naming
+an isolation that was never applied — the recorded backend is the one that
+applied, which is the point of recording it.
+
+**Egress under containment is all hosts or none.** The backends take one boolean:
+a network namespace either exists or it does not. So the run's `Policy` decides
+whether a contained command has a route out — `true` when the policy would permit
+any `Act::Net`, `false` otherwise — and a policy that allows exactly one host
+gives a contained command a route to **every** host. Per-host filtering is
+unchanged for the crate's own tools and is not, and cannot cheaply be, applied at
+the sandbox wall. `Effect::Ask` counts as *not* permitted: an approver answers
+about one action at the moment it is attempted, and a namespace is built before
+the command starts and cannot be renegotiated afterwards.
+
+**A contained command on macOS may write only under the workspace and
+`/private/var/folders`.** The concrete cost is a toolchain that populates a
+user-level cache: a cold `cargo fetch` writing `~/.cargo/registry`, or
+`npm install` writing `~/.npm`, fails under containment. The answers are to leave
+the field unset for that run, or to point the toolchain's cache inside the
+workspace. Linux carries the same shape for the same reason — without the
+temporary directory bound back, most toolchains fail on their first temporary
+file.
+
+**The `shell_start` / `shell_poll` / `shell_kill` handles are not contained.** A
+handle outlives the call that made it, and what a resumed run should do with a
+handle whose sandbox no longer exists is a design question rather than an
+extension of this one. Only the foreground `shell` line and `exec` are contained.
+
+**A contained `shell` stage is contained slightly less than an `exec` command.**
+`shell` pipes its stages into one another, so it owns every child process and
+cannot delegate the spawn to the sandbox's own runner. Each stage gets the
+backend's wrapper — filesystem confinement and egress denial — and the CPU and
+open-file rlimits, but **not** the memory monitor, and a stage killed by a cap is
+not attributed to a `Cap` the way an `exec` command is. Every stage is wrapped,
+not just the first.
+
+**Two ceilings, and they are not the same ceiling.** `TaskContract::exec_timeout`
+is the contract's bound on a wedged command and is raised with
+`with_exec_timeout`; `SandboxLimits::max_wall_secs` is the sandbox's own and is
+raised in the config. A command stopped by the second is reported as a cap kill
+naming the resource, and one stopped by the first is reported as a timeout.
 
 ## Limits that hold today
 

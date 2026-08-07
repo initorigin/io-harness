@@ -7079,11 +7079,6 @@ fn parse_todo_items(args: &serde_json::Value) -> std::result::Result<Vec<TodoIte
     Ok(out)
 }
 
-/// observations the agent can recover from rather than failing the run — only
-/// the model can decide what to do about them.
-#[allow(clippy::too_many_arguments)]
-// `pending_media` is `()` without the feature, and nothing reads it there.
-#[cfg_attr(not(feature = "media"), allow(unused_variables))]
 /// Record one sandbox lifecycle row for a contained tool call, and tell the
 /// observer.
 ///
@@ -7115,6 +7110,11 @@ fn record_sandbox_step(
     ));
 }
 
+/// observations the agent can recover from rather than failing the run — only
+/// the model can decide what to do about them.
+#[allow(clippy::too_many_arguments)]
+// `pending_media` is `()` without the feature, and nothing reads it there.
+#[cfg_attr(not(feature = "media"), allow(unused_variables))]
 async fn dispatch(
     ws: &Workspace,
     call: &ToolCall,

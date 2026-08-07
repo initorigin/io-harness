@@ -134,6 +134,29 @@ caps instead of the defaults.
 
 Run it live: `cargo run --example sandbox_run`.
 
+## What else runs in here (0.40.0)
+
+Until 0.40.0 the sandbox had exactly one caller: the verification gate. The
+project's own commands — `exec` and the `shell` tools — ran on the host, which was
+a decision rather than an omission, and it still is the default. A contract can now
+opt them in with `TaskContract::with_contained_exec`; see
+[Running commands](command-execution.md) for what that costs and what it buys.
+
+Two consequences land here rather than there:
+
+**Linux confines filesystem writes now, and did not before.** The backend unshared
+a mount namespace and then remounted nothing into it, so the namespace existed
+while the filesystem view stayed the host's. Only the network namespace was real.
+It now remounts the tree read-only and binds back the working directory and the
+system temporary directory — the same two places the macOS profile has always
+allowed.
+
+**That change reaches the verification gate too**, because the gate uses the same
+backend. A gate command that wrote outside its working directory on Linux
+succeeded before this release and fails after it. That is the boundary this module
+always claimed, arriving late rather than a new restriction — but it is a real
+behaviour change and worth knowing if a gate starts failing on Linux only.
+
 ## See also
 
 - [Verification](verification.md) — what the gate the sandbox confines actually proves
