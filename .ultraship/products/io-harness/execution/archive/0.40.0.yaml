@@ -11,8 +11,8 @@ release_fit:
       is grounded in the contract's own recorded `resource_profile.constraints` rather than in
       user-estimate figures — and it names no number the framework did not measure.
     - >
-      The standing "no new runtime dependency" constraint cannot be violated by construction.
-      `cargo tree` reads 402 lines; every isolation primitive this release needs — `SandboxConfig`,
+      The standing "no new runtime dependency" constraint cannot be violated by construction. `cargo
+      tree` reads 402 lines; every isolation primitive this release needs — `SandboxConfig`,
       `SandboxLimits`, `RunSpec`, `select`, three native backends and the portable floor — already
       ships and is exercised by the verification gate. `Cargo.toml` receives only the version bump.
     - >
@@ -26,9 +26,9 @@ release_fit:
       than `uncertain` despite the contract recording `uncertainty: high`.
     - >
       Zero breaks by construction. `TaskContract` has been `#[non_exhaustive]` since 0.35.0
-      (`src/contract.rs:70`), so the new field costs no caller anything, and the store is untouched —
-      no table, no column, no index, `CHECKPOINT_FORMAT` unmoved, `ADDED_SINCE_0_22_0` unchanged — so
-      the cross-version job has nothing new to be fed.
+      (`src/contract.rs:70`), so the new field costs no caller anything, and the store is untouched
+      — no table, no column, no index, `CHECKPOINT_FORMAT` unmoved, `ADDED_SINCE_0_22_0` unchanged —
+      so the cross-version job has nothing new to be fed.
     - >
       No live provider is required by any criterion. The evidence is files on disk, stored rows,
       connection failures and which `Cap` came back, none of which needs a vendor.

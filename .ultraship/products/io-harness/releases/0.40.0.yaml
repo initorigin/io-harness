@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.40.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -539,3 +539,134 @@ open_questions:
 - >
   Whether a toolchain cache inside the workspace should be something the crate helps arrange, given
   N6's macOS cost. Possibly nothing more than documentation; measured first.
+
+released_at: 2026-08-07T00:00:00Z
+mode: published
+delivered: >
+  A contract can ask for the project's own commands to run inside the sandbox.
+  `TaskContract::with_contained_exec(SandboxConfig)` puts every command the `exec` tool and the
+  foreground `shell` tool start behind the backend this host offers — the config's resource caps,
+  filesystem writes confined to the workspace, and outbound network denied unless the run's `Policy`
+  would permit `Act::Net` — with the **workspace root** as the working directory, so nothing is
+  copied in, nothing is discarded, and an incremental build survives between commands. That working
+  directory is the whole answer to `US-IO-HARNESS-0.17.0-I02`, which refused containment for `exec`
+  precisely because the sandbox discarded what it ran on. A `shell` line is contained per
+  sub-command rather than at its first stage, a cap kill reaches the model and the store naming the
+  `Cap` that fired rather than a bare exit status, and the `SandboxEvent` lifecycle rows record the
+  backend that **actually applied**, so a run that silently took `PortableFloor` is legible instead
+  of indistinguishable from one contained as asked. On Linux the filesystem half became true in this
+  release: the backend had unshared a mount namespace and remounted nothing into it, so the
+  namespace existed and a write outside the working directory landed. It now remounts the tree
+  read-only and binds back the working directory and the system temporary directory. The default is
+  untouched — with the field unset, `exec` and `shell` behave exactly as they did in 0.39.0.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) on the shipping tree at `85ad8f3` — **66 suites, 1391 passed,
+    0 failed**, exit 0.
+  - >
+    `cargo test --all-features` as a separate invocation on the same tree — **66 suites, 1470
+    passed, 0 failed**, exit 0, including **374** doctests.
+  - >
+    Both runs with `XDG_CONFIG_HOME` redirected to a scratch directory. This machine carries a real
+    `~/.config/io/io.toml` whose `api_key` key the config schema rejects, which fails
+    `tests/plugin.rs` and two `src/config.rs` doctests independently of any change (traps 102, 115).
+  - >
+    `tests/exec_contained.rs` is the release's own suite — **12 tests**, covering F1's positive and
+    negative arms, F2's two caps, F3's two egress arms and the coarseness assertion, F4's second
+    shell stage, F5's write-then-read, and F7's recorded backend plus its absence control.
+  - >
+    Eight sabotages, each failing a **named** test and nothing else, each reverted: S1 (the builder
+    ignores the config), S2 (`RunSpec.workdir` set to `sandbox::workdir()`'s `TempDir`), S3 (drop
+    `cap_hit` before the observation), S4 (map the sandbox wall cap onto `TimedOut`), S5 (hard-code
+    `allow_network: false`), S6 (hard-code it `true`), S7 (wrap only the first parsed sub-command),
+    S8 (record `PortableFloor` regardless of what applied). None was silent.
+  - >
+    N1 — `cargo tree` reads **402** lines, unchanged since 0.32.0. N3 — `CHECKPOINT_FORMAT` unmoved
+    at **7**, `src/state.rs` absent from this branch's diff entirely, `ADDED_SINCE_0_22_0`
+    untouched, no table, column, index or migration.
+  - >
+    Cross-version both directions: `tests/cross_version.rs` (15 passed) in the main suite, and the
+    pinned generator gate — `cargo build --manifest-path tests/fixtures/gen-0.29.0/Cargo.toml`
+    followed by `cargo test --all-features --test cross_version_0_29_0 -- --ignored`, **1 passed,
+    0 failed** (`a_current_store_is_read_by_a_0_29_0_binary`).
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0,
+    zero warnings. It **failed first** with `rustdoc::redundant_explicit_links` on
+    ``[`Sandbox`](crate::Sandbox)`` at `src/tools/exec.rs:27`, which stable `cargo doc` reported as
+    clean. Fixed in `9cbcc9e` and re-run green. Sixth catch in seven releases.
+  - >
+    `cargo clean && cargo package --locked` — exit 0, the packaged crate compiled by the `Verifying`
+    step. **1,379,674 bytes** at `target/package/io-harness-0.40.0.crate`.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **N2 was met in a weaker letter and a stronger substance, and this is the second release running
+  to hit it.** The criterion said `docs/public-api.txt` "gains the lines for
+  `TaskContract::exec_sandbox` and `TaskContract::with_contained_exec`". It gains **none** and is
+  **byte-identical**. The file enumerates the names re-exported from `src/lib.rs`; a field and a
+  method on an already-listed type are not re-exports, and hand-adding lines fails the checker.
+  Byte-identical is the stronger zero-break claim, not a weaker one. 0.39.0 recorded the same trap
+  and the criterion was still written this way — plan such a criterion as "unchanged".
+- >
+  **F6 is the one criterion this host cannot verify, by construction.** The Linux confinement
+  assertion runs on `ubuntu-latest`; a macOS developer machine can only run the macOS arm. The
+  release is therefore sealed on macOS evidence plus the matrix, and O1 is the criterion that closes
+  it. If the runner's kernel refuses the remounts the backend reports `PortableFloor` and the test
+  asserts *that* rather than asserting confinement that was never applied.
+- >
+  **This record cites CI on a commit that does not contain it.** A release record can never cite a
+  run on the commit that carries the record, because the record is written first. The ordering is
+  stated in the merge and the final report rather than amended into the sealed file — the 0.29.0
+  precedent, applied for the fourth time.
+- >
+  **The record is sealed before the registry upload.** `mode: published` is the delivery target and
+  the flow is fixed: both merges, then the GitHub Release, then `cargo publish` by hand, last. The
+  upload follows this seal rather than preceding it.
+- >
+  **N6's macOS cost was measured by probing the mechanism, not by running a cold `cargo fetch` or
+  an `npm install` end to end.** `sandbox-exec` with the crate's own profile was given three writes:
+  inside the workspace (succeeded), into a second temporary directory (succeeded, because the
+  profile re-allows the whole of `/private/var/folders`), and into `$HOME` (refused, `Operation not
+  permitted`). The third is exactly the claim — a toolchain populating `~/.cargo/registry` or
+  `~/.npm` fails under containment on macOS — and it decided the escape tests' target directory.
+  A full cold toolchain run was not performed.
+- >
+  **Egress under containment is one boolean per run and cannot be otherwise today.** A policy that
+  allows exactly one host gives a contained command a route to every host. Per-host filtering at the
+  sandbox wall means a proxy or a packet filter, therefore a dependency and a daemon, both of which
+  the crate's standing constraints refuse. The coarseness is asserted by a test rather than only
+  documented.
+- >
+  **`Effect::Ask` on `Act::Net` counts as not permitted, and it has no honest mapping.** A namespace
+  is built before the command starts and an approver answers about one action at the moment it is
+  attempted, so the sandbox cannot ask. Denying is the safer of two surprising answers; it remains
+  an open question rather than a settled one.
+- >
+  **The Linux mount fix reaches the verification gate too, and that is a real behaviour change
+  beyond this release's own scope.** The gate uses the same `LinuxSandbox`. A gate command that
+  wrote outside its working directory on Linux succeeded before this release and fails after it.
+  That is the boundary the module always claimed arriving late rather than a new restriction, and it
+  is in the changelog under Changed and in `docs/guide/sandbox.md` rather than left to be discovered.
+- >
+  **`shell_start` / `shell_poll` / `shell_kill` handles are not contained**, and a contained `shell`
+  stage is contained slightly less than an `exec` command: it gets the wrapper, the filesystem
+  confinement, the egress denial and the CPU and open-file rlimits, but not the memory monitor, and
+  a stage killed by a cap is not attributed to a `Cap`. Both are stated at the field and in
+  `docs/CONTRACT.md`.
+- >
+  **Two criteria, N7 and N8, were added during the completion phase** by `US-IO-HARNESS-0.40.0-I01`
+  on owner request, after every functional criterion had passed. They are documentation only — every
+  io-cli link removed with the product marked "Not built", and the README brought up to what the
+  crate does at 0.40.0. `src/lib.rs` is edited, so `fmt`, `clippy`, the nightly docs command, the
+  doctests and both suite polarities were re-run afterwards and are the figures reported above.
+  `CHANGELOG.md` and `.ultraship/views/` still name io-cli and are deliberately untouched, because
+  they record what past releases said at the time.
+supersedes: null
+next_recommended_version: null
+immutable: true
