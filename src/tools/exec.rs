@@ -24,7 +24,7 @@
 //! ## What this does not bound, unless it is asked to
 //!
 //! By default a command runs in the workspace root **with the embedding
-//! program's privileges**, not inside the [`Sandbox`](crate::Sandbox). That is
+//! program's privileges**, not inside the [`Sandbox`]. That is
 //! the owner's decision of 2026-07-29, recorded in `US-IO-HARNESS-0.17.0-I02`,
 //! and it is taken with its cost stated: the sandbox denies network egress by
 //! default and discards its working directory, which is right for a verification
