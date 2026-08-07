@@ -7084,6 +7084,37 @@ fn parse_todo_items(args: &serde_json::Value) -> std::result::Result<Vec<TodoIte
 #[allow(clippy::too_many_arguments)]
 // `pending_media` is `()` without the feature, and nothing reads it there.
 #[cfg_attr(not(feature = "media"), allow(unused_variables))]
+/// Record one sandbox lifecycle row for a contained tool call, and tell the
+/// observer.
+///
+/// 0.40.0. The same two writes `src/verify.rs` has made since 0.6.0, reached from
+/// the tool layer so that a contained `exec` or `shell` is auditable the way a
+/// contained verification gate already is. Through one helper rather than copied
+/// into each tool arm: the two arms would otherwise drift, and a missing row is
+/// invisible until somebody needs it.
+///
+/// The backend recorded is the one that **actually applied**. A run whose host
+/// refused the native primitive took `PortableFloor` and confined nothing, and
+/// the whole value of this row is telling that apart afterwards from a run that
+/// was contained as asked.
+fn record_sandbox_step(
+    store: &Store,
+    watch: &Watch<'_>,
+    depth: u32,
+    event: &crate::state::SandboxEvent,
+) {
+    let _ = store.record_sandbox_event(event);
+    watch.emit(RunEvent::at_depth(
+        event.run_id,
+        event.step,
+        depth,
+        EventKind::Sandbox {
+            kind: event.kind.clone(),
+            backend: event.backend.clone(),
+        },
+    ));
+}
+
 async fn dispatch(
     ws: &Workspace,
     call: &ToolCall,
@@ -7955,6 +7986,18 @@ async fn dispatch(
                 ShellCheck::Stop(d) => return Ok(d),
             };
 
+            if let Some(config) = exec_sandbox {
+                let backend = {
+                    use crate::sandbox::Sandbox as _;
+                    crate::sandbox::select(config).backend()
+                };
+                for event in [
+                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
             let outcome = Shell::new(exec_timeout, cap)
                 .contained(
                     exec_sandbox.map(|config| crate::tools::shell::ShellSandbox {
@@ -7965,6 +8008,14 @@ async fn dispatch(
                 )
                 .run(&parsed, &plan)
                 .await?;
+            if exec_sandbox.is_some() {
+                record_sandbox_step(
+                    store,
+                    watch,
+                    depth,
+                    &crate::state::SandboxEvent::destroy(run_id, step),
+                );
+            }
             let (decision, obs) = match &outcome {
                 ShellOutcome::Unavailable { reason } => (
                     "shell command unavailable".to_string(),
@@ -8448,10 +8499,38 @@ async fn dispatch(
                 allow_network: ws.policy().permits_any_egress(),
                 ..config.clone()
             });
+            if let Some(config) = &contained {
+                let backend = {
+                    use crate::sandbox::Sandbox as _;
+                    crate::sandbox::select(config).backend()
+                };
+                for event in [
+                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), &joined),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
             let outcome = Exec::new(ws.root(), exec_timeout, cap)
                 .contained(contained.as_ref())
                 .run(&argv)
                 .await?;
+            if contained.is_some() {
+                if let ExecOutcome::Capped { cap: hit, .. } = &outcome {
+                    record_sandbox_step(
+                        store,
+                        watch,
+                        depth,
+                        &crate::state::SandboxEvent::cap_hit(run_id, step, hit.as_str()),
+                    );
+                }
+                record_sandbox_step(
+                    store,
+                    watch,
+                    depth,
+                    &crate::state::SandboxEvent::destroy(run_id, step),
+                );
+            }
             let (decision, obs) = match &outcome {
                 ExecOutcome::Unavailable { reason } => (
                     format!("{program} unavailable"),

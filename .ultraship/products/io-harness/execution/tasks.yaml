@@ -295,7 +295,7 @@ tasks:
     is otherwise indistinguishable from one that was contained as asked. The rows already exist and
     the verification gate already writes them; a contained command that does not is a boundary claim
     with no audit behind it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.40.0-T01
   - US-IO-HARNESS-0.40.0-T04
@@ -312,7 +312,24 @@ tasks:
   - src/run.rs
   - src/tools/exec.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - A contained `exec` or `shell` now writes the same `SandboxEvent` lifecycle rows the verification
+    gate has written since 0.6.0 — `create`, `exec`, `destroy`, plus `cap_hit` when a cap fired — through
+    one crate-internal helper, `record_sandbox_step`, that both tool arms call. Copied into each arm
+    they would drift, and a missing row is invisible until somebody needs it.
+  - 'No new table, column, index or `EventKind`: the rows go where `record_sandbox_event` has always
+    put them and the observer receives the existing `EventKind::Sandbox`.'
+  - 'The backend recorded is the one that **actually applied**, taken from `select(config).backend()`.
+    That is the entire value of the row: a host that refused its native primitive took `PortableFloor`,
+    which confines nothing, and without this the trace is identical to a run contained exactly as asked.'
+  - F7, `cargo test --test exec_contained` — **12 passed, 0 failed in 0.17s**. The positive test asserts
+    a `create` row whose backend equals what `select` reports on this host, plus `exec` and `destroy`
+    rows closing the lifecycle.
+  - 'The control asserts an **absence**: with the field unset, `Store::sandbox_events` is empty. An
+    audit that reported containment for an uncontained command would be worse than no audit, and asserting
+    the absence is what stops the rows being written unconditionally.'
+  - Sabotage **S8** — record `Backend::PortableFloor` regardless of what applied. `a_contained_command_records_the_backend_that_actually_applied`
+    FAILED and the other eleven passed. Reverted.
 - id: US-IO-HARNESS-0.40.0-T07
   summary: Documentation, the per-platform table, the public-API surface and the release bookkeeping.
   why_required: 'The release''s honesty is the deliverable. `src/tools/exec.rs`''s ''What this does

@@ -609,3 +609,83 @@ async fn linux_confines_a_contained_commands_writes_to_the_workspace() {
         steps[1].decision
     );
 }
+
+// ---------------------------------------------------------------------------
+// F7 — the audit says which backend actually ran
+// ---------------------------------------------------------------------------
+
+/// A run contained less than the caller asked for must be legible afterwards.
+///
+/// Without these rows, a host that refused its native primitive and fell back to
+/// `PortableFloor` — which confines nothing — produces a trace identical to a run
+/// that was contained exactly as requested. The rows are the same ones the
+/// verification gate has written since 0.6.0; what is new is the tool layer
+/// reaching them.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_contained_command_records_the_backend_that_actually_applied() {
+    use io_harness::sandbox::{select, Sandbox};
+
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&["touch", "audited.txt"])]]);
+
+    let result = run_with(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let events = store.sandbox_events(result.run_id).unwrap();
+    assert!(
+        !events.is_empty(),
+        "a contained command wrote no sandbox lifecycle rows at all"
+    );
+
+    let expected = select(&SandboxConfig::new()).backend();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == "create" && e.backend.as_deref() == Some(expected.as_str())),
+        "the recorded backend must be the one that applied ({}): {events:?}",
+        expected.as_str()
+    );
+    assert!(
+        events.iter().any(|e| e.kind == "exec"),
+        "the command itself is recorded: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e.kind == "destroy"),
+        "and the sandbox's teardown closes the lifecycle: {events:?}"
+    );
+}
+
+/// The control. With the field absent there is no sandbox, so there must be no
+/// row claiming one — an audit that reported containment for an uncontained
+/// command would be worse than no audit.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_uncontained_command_records_no_sandbox_at_all() {
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&["touch", "unaudited.txt"])]]);
+
+    let result = run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        store.sandbox_events(result.run_id).unwrap().is_empty(),
+        "an uncontained command must not leave rows claiming it was contained"
+    );
+}
