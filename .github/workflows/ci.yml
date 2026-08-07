@@ -237,6 +237,28 @@ jobs:
       - name: permit unprivileged user namespaces so the Linux backend is real
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      # TEMPORARY diagnostic, 0.40.0. The backend still reports PortableFloor
+      # after the sysctl above, which means the namespace is now permitted and
+      # the mount setup itself is failing. The probe deliberately swallows
+      # stderr, so this step runs the same script with stderr shown to find out
+      # why. Remove once the cause is known.
+      - name: diagnose the mount setup
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          set -x
+          unshare --user --map-root-user --mount --pid --fork --net -- sh -c '
+            set -e
+            mount --make-rprivate / || echo "STEP1 make-rprivate FAILED rc=$?"
+            mount --bind / / || echo "STEP2 bind / FAILED rc=$?"
+            mount -o remount,bind,ro / || echo "STEP3 remount ro FAILED rc=$?"
+            echo "STEP4 reached"
+          ' ; echo "wrapper rc=$?"
+          echo "--- variant: no ro remount of /, bind the workdir only ---"
+          unshare --user --map-root-user --mount --pid --fork --net -- sh -c '
+            mount --make-rprivate / && echo "v2 rprivate ok"
+            mount --bind /tmp /tmp && echo "v2 bind /tmp ok"
+          ' ; echo "variant rc=$?"
       - run: cargo nextest run ${{ matrix.flags }} --lib --tests
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.
