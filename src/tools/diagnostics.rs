@@ -217,6 +217,17 @@ async fn run(
                 after.as_secs()
             ));
         }
+        // Unreachable today: diagnostics build their own uncontained `Exec`, so no
+        // backend is selected and no cap can be reported. Handled rather than
+        // `unreachable!()` so that pointing this path at a sandbox later is a
+        // compile-time decision instead of a panic in someone's run.
+        Ok(ExecOutcome::Capped { cap, .. }) => {
+            return Outcome::Failed(format!(
+                "`{}` was killed by the {} cap, so this edit is unchecked",
+                argv.join(" "),
+                cap.as_str()
+            ));
+        }
         Ok(ExecOutcome::Unavailable { reason }) => {
             return Outcome::Failed(format!(
                 "this edit is unchecked: {reason}, so `{}` could not run",

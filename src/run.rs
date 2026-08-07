@@ -4363,6 +4363,7 @@ async fn run_workspace_from<P: Provider>(
                 pending_media,
                 &contract.commit_identity,
                 contract.exec_timeout,
+                contract.exec_sandbox.as_ref(),
                 toolchain.as_ref(),
                 handles,
                 PlanPhase {
@@ -5784,6 +5785,7 @@ fn run_agent<'f, P: Provider>(
                     pending_media,
                     &contract.commit_identity,
                     contract.exec_timeout,
+                    contract.exec_sandbox.as_ref(),
                     toolchain.as_ref(),
                     handles,
                     PlanPhase {
@@ -7077,6 +7079,37 @@ fn parse_todo_items(args: &serde_json::Value) -> std::result::Result<Vec<TodoIte
     Ok(out)
 }
 
+/// Record one sandbox lifecycle row for a contained tool call, and tell the
+/// observer.
+///
+/// 0.40.0. The same two writes `src/verify.rs` has made since 0.6.0, reached from
+/// the tool layer so that a contained `exec` or `shell` is auditable the way a
+/// contained verification gate already is. Through one helper rather than copied
+/// into each tool arm: the two arms would otherwise drift, and a missing row is
+/// invisible until somebody needs it.
+///
+/// The backend recorded is the one that **actually applied**. A run whose host
+/// refused the native primitive took `PortableFloor` and confined nothing, and
+/// the whole value of this row is telling that apart afterwards from a run that
+/// was contained as asked.
+fn record_sandbox_step(
+    store: &Store,
+    watch: &Watch<'_>,
+    depth: u32,
+    event: &crate::state::SandboxEvent,
+) {
+    let _ = store.record_sandbox_event(event);
+    watch.emit(RunEvent::at_depth(
+        event.run_id,
+        event.step,
+        depth,
+        EventKind::Sandbox {
+            kind: event.kind.clone(),
+            backend: event.backend.clone(),
+        },
+    ));
+}
+
 /// observations the agent can recover from rather than failing the run — only
 /// the model can decide what to do about them.
 #[allow(clippy::too_many_arguments)]
@@ -7102,6 +7135,11 @@ async fn dispatch(
     pending_media: &mut PendingMedia,
     identity: &crate::tools::git::Identity,
     exec_timeout: Duration,
+    // 0.40.0 — the containment this contract asked for, or `None` for the 0.17.0
+    // default. Carried beside `exec_timeout` because they bound the same tool and
+    // arrive from the same place; resolved to a backend inside the tool rather
+    // than here, so a run that never calls `exec` never probes the host.
+    exec_sandbox: Option<&crate::sandbox::SandboxConfig>,
     // The project's ecosystem, detected once by the loop rather than per edit:
     // `toolchain::detect` reads the directory, and an edit is a hot path.
     toolchain: Option<&crate::toolchain::Toolchain>,
@@ -7948,7 +7986,36 @@ async fn dispatch(
                 ShellCheck::Stop(d) => return Ok(d),
             };
 
-            let outcome = Shell::new(exec_timeout, cap).run(&parsed, &plan).await?;
+            if let Some(config) = exec_sandbox {
+                let backend = {
+                    use crate::sandbox::Sandbox as _;
+                    crate::sandbox::select(config).backend()
+                };
+                for event in [
+                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
+            let outcome = Shell::new(exec_timeout, cap)
+                .contained(
+                    exec_sandbox.map(|config| crate::tools::shell::ShellSandbox {
+                        allow_network: ws.policy().permits_any_egress(),
+                        config: config.clone(),
+                        workdir: ws.root().to_path_buf(),
+                    }),
+                )
+                .run(&parsed, &plan)
+                .await?;
+            if exec_sandbox.is_some() {
+                record_sandbox_step(
+                    store,
+                    watch,
+                    depth,
+                    &crate::state::SandboxEvent::destroy(run_id, step),
+                );
+            }
             let (decision, obs) = match &outcome {
                 ShellOutcome::Unavailable { reason } => (
                     "shell command unavailable".to_string(),
@@ -8423,7 +8490,47 @@ async fn dispatch(
                 }
             }
 
-            let outcome = Exec::new(ws.root(), exec_timeout, cap).run(&argv).await?;
+            // Egress on a contained command follows this run's policy, not the
+            // config's flag: the config is shared with the verification gate,
+            // which has no policy to consult, while a run has one and it is the
+            // run's own statement about reaching the network. One authority per
+            // path, rather than two that can disagree.
+            let contained = exec_sandbox.map(|config| crate::sandbox::SandboxConfig {
+                allow_network: ws.policy().permits_any_egress(),
+                ..config.clone()
+            });
+            if let Some(config) = &contained {
+                let backend = {
+                    use crate::sandbox::Sandbox as _;
+                    crate::sandbox::select(config).backend()
+                };
+                for event in [
+                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), &joined),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
+            let outcome = Exec::new(ws.root(), exec_timeout, cap)
+                .contained(contained.as_ref())
+                .run(&argv)
+                .await?;
+            if contained.is_some() {
+                if let ExecOutcome::Capped { cap: hit, .. } = &outcome {
+                    record_sandbox_step(
+                        store,
+                        watch,
+                        depth,
+                        &crate::state::SandboxEvent::cap_hit(run_id, step, hit.as_str()),
+                    );
+                }
+                record_sandbox_step(
+                    store,
+                    watch,
+                    depth,
+                    &crate::state::SandboxEvent::destroy(run_id, step),
+                );
+            }
             let (decision, obs) = match &outcome {
                 ExecOutcome::Unavailable { reason } => (
                     format!("{program} unavailable"),
@@ -8441,6 +8548,33 @@ async fn dispatch(
                         after.as_secs()
                     ),
                 ),
+                // 0.40.0 — the sandbox's own ceiling, named. The model is told
+                // which resource ran out, because "run something narrower" and
+                // "this needs more memory than it was given" are different next
+                // moves, and an exit status alone distinguishes neither.
+                ExecOutcome::Capped {
+                    cap,
+                    stdout,
+                    stderr,
+                    ..
+                } => {
+                    let body = crate::verify::joined_streams(stdout, stderr);
+                    (
+                        format!("exec {program} hit the {} cap", cap.as_str()),
+                        format!(
+                            "\n[exec `{joined}` killed by the {} cap] The sandbox stopped it \
+                             because it crossed the {} limit this run set, not because the \
+                             command failed. Anything it printed first is below.\n{}\n",
+                            cap.as_str(),
+                            cap.as_str(),
+                            if body.trim().is_empty() {
+                                "(no output)"
+                            } else {
+                                body.trim_end()
+                            }
+                        ),
+                    )
+                }
                 ExecOutcome::Ran {
                     code,
                     stdout,

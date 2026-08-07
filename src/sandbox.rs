@@ -598,6 +598,79 @@ impl Sandbox for FloorSandbox {
 /// only ever names a cap that really fired, and a run whose backend has no
 /// CPU/memory mechanism warns once rather than letting a caller believe the
 /// limits it configured are in force.
+/// Apply the unix resource caps a sandboxed spawn gets, to a command the caller
+/// owns and will spawn itself.
+///
+/// Extracted in 0.40.0 because there are now two spawn paths that must cap a
+/// child identically: this module's own runner, and the `shell` tool, which
+/// pipes stages into one another and therefore cannot hand its argv to
+/// [`Sandbox::run`] at all. Two copies of a `pre_exec` block is two places for a
+/// cap to lapse, and the lapse would be silent — an uncapped child runs fine.
+///
+/// A no-op on Windows, where the Job Object bounds the whole job rather than
+/// each process.
+#[allow(unused_variables)]
+pub(crate) fn apply_rlimits(cmd: &mut tokio::process::Command, limits: &SandboxLimits) {
+    #[cfg(unix)]
+    {
+        let cpu = limits.max_cpu_secs;
+        let nofile = limits.max_open_files;
+        // Note: max_processes is deliberately NOT mapped to RLIMIT_NPROC here —
+        // that limit is per-real-uid, so it would throttle the whole login
+        // session, not the sandbox. The native backends scope it per-sandbox.
+        unsafe {
+            cmd.pre_exec(move || {
+                // The cast is load-bearing on macOS, where the RLIMIT_* constants
+                // are c_int, and a no-op on Linux, where they are already u32 —
+                // so clippy's unnecessary_cast fires on Linux only. Keep the cast
+                // and silence it rather than cfg-splitting two lines.
+                // A cap that could not be applied fails the spawn: running the
+                // payload uncapped is worse than not running it.
+                #[allow(clippy::unnecessary_cast)]
+                {
+                    set_rlimit(libc::RLIMIT_CPU as u32, cpu)?;
+                    set_rlimit(libc::RLIMIT_NOFILE as u32, nofile)?;
+                }
+                Ok(())
+            });
+        }
+    }
+}
+
+/// The argv this host's backend would run, and the backend it chose.
+///
+/// The native backends confine a command by *wrapping its argv* — macOS prepends
+/// `sandbox-exec -p <profile>`, Linux prepends `unshare` — which is what makes
+/// containment available to a caller that cannot use [`Sandbox::run`] because it
+/// needs the child itself. The `shell` tool is that caller: its stages are piped
+/// into one another, so it owns every `Child` and cannot delegate the spawn.
+///
+/// The returned [`Backend`] is what actually applied, not what was asked for. A
+/// host whose primitive failed its probe returns [`Backend::PortableFloor`] and
+/// an unwrapped argv — the caller must record that rather than the isolation it
+/// wanted, or a run contained less than it claimed becomes indistinguishable
+/// from one that was contained.
+pub(crate) fn wrap_argv(
+    config: &SandboxConfig,
+    workdir: &Path,
+    allow_network: bool,
+    argv: &[String],
+) -> (Backend, Vec<String>) {
+    let backend = select(config).backend();
+    #[cfg(target_os = "macos")]
+    if backend == Backend::MacosSandboxExec {
+        let profile = macos::profile_for(workdir, allow_network);
+        let mut wrapped = vec!["sandbox-exec".to_string(), "-p".to_string(), profile];
+        wrapped.extend(argv.iter().cloned());
+        return (backend, wrapped);
+    }
+    #[cfg(target_os = "linux")]
+    if backend == Backend::LinuxNamespaces {
+        return (backend, linux::unshare_argv(argv, workdir, allow_network));
+    }
+    (backend, argv.to_vec())
+}
+
 async fn run_capped(
     backend: Backend,
     spec: RunSpec<'_>,
@@ -659,30 +732,7 @@ async fn run_capped_hooked(
     }
 
     // Unix: apply rlimits in the child before exec. CPU is the reliable kill.
-    #[cfg(unix)]
-    {
-        let cpu = spec.limits.max_cpu_secs;
-        let nofile = spec.limits.max_open_files;
-        // Note: max_processes is deliberately NOT mapped to RLIMIT_NPROC here —
-        // that limit is per-real-uid, so it would throttle the whole login
-        // session, not the sandbox. The native backends scope it per-sandbox.
-        unsafe {
-            cmd.pre_exec(move || {
-                // The cast is load-bearing on macOS, where the RLIMIT_* constants
-                // are c_int, and a no-op on Linux, where they are already u32 —
-                // so clippy's unnecessary_cast fires on Linux only. Keep the cast
-                // and silence it rather than cfg-splitting two lines.
-                // A cap that could not be applied fails the spawn: running the
-                // payload uncapped is worse than not running it.
-                #[allow(clippy::unnecessary_cast)]
-                {
-                    set_rlimit(libc::RLIMIT_CPU as u32, cpu)?;
-                    set_rlimit(libc::RLIMIT_NOFILE as u32, nofile)?;
-                }
-                Ok(())
-            });
-        }
-    }
+    apply_rlimits(&mut cmd, spec.limits);
 
     configure(&mut cmd);
 

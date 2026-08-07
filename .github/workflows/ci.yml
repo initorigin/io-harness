@@ -214,6 +214,29 @@ jobs:
       # nothing, so the number of tests executed per leg is compared with the
       # number `cargo test` executed for that leg on run 30834723995: 967 in
       # the default polarity and 1044 with every feature on.
+      # 0.40.0: let the Linux legs actually exercise the namespaces backend.
+      #
+      # Ubuntu 24.04 ships `kernel.apparmor_restrict_unprivileged_userns=1`, so
+      # an unprivileged `unshare --user` fails, `LinuxSandbox` degrades to the
+      # portable floor and reports it, and every containment assertion on this
+      # runner would be testing the floor. That is honest behaviour and it is
+      # also no evidence at all for the claim that Linux confines writes — a
+      # test that passes by taking the fallback is 0.32.0's fact 17 wearing a
+      # kernel setting.
+      #
+      # This does not weaken what is being tested. It restores the setting that
+      # is the default on most distributions, so the leg exercises the backend a
+      # user without Ubuntu's hardening gets. The degraded path keeps its own
+      # coverage: the escape tests branch on the backend that actually applied,
+      # so if this step is ever removed or stops working they assert the floor
+      # rather than silently proving nothing.
+      #
+      # `|| true` because the failure mode that matters is the sysctl being
+      # absent, not the tests being unable to run: on a runner without it the
+      # backend reports the floor and the tests assert the floor.
+      - name: permit unprivileged user namespaces so the Linux backend is real
+        if: runner.os == 'Linux'
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo nextest run ${{ matrix.flags }} --lib --tests
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.

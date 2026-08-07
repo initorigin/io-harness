@@ -335,6 +335,51 @@ If none of that is acceptable for your workload, the answer today is not to allo
 `exec` at all: leave the tier default at `Deny`, or deny the programs by rule.
 Sandboxed execution as an opt-in is later work.
 
+## Running them contained (0.40.0)
+
+By default a command runs in the workspace root at the privileges of whatever
+program embedded this crate. That is a decision rather than an oversight — the
+sandbox denies egress and, as the verification gate uses it, throws its working
+directory away, which is right for a gate and useless for `npm install`.
+
+One field changes it for a run that does not need what containment takes away:
+
+```rust
+use io_harness::sandbox::SandboxConfig;
+use io_harness::TaskContract;
+
+let contract = TaskContract::workspace("run the test suite", "/repo")
+    .with_contained_exec(SandboxConfig::new());
+```
+
+Every command `exec` and `shell` start is then wrapped by the backend this host
+offers. The working directory stays the **workspace root**, which is the part
+that makes it usable: nothing is copied to a temporary directory and nothing is
+discarded, so `target/`, `node_modules/` and an incremental build survive from one
+command to the next.
+
+What a contained command gives up:
+
+| | Contained | Not contained |
+| --- | --- | --- |
+| working directory | the workspace root | the workspace root |
+| writes outside the workspace | refused on macOS and Linux | allowed |
+| outbound network | only if the policy permits `Act::Net`, and then to every host | whatever the host allows |
+| resource caps | the config's, and a kill names the cap | none |
+| audit | `sandbox_events` records the backend that applied | nothing |
+
+Three things are worth knowing before you turn it on. Egress is a single boolean,
+so a policy naming one host opens all of them *at the sandbox wall* — the crate's
+own tools are still checked per host. A toolchain that writes to a user-level
+cache (`~/.cargo/registry`, `~/.npm`) **fails** under containment, because those
+are outside the workspace; point the cache inside the workspace or leave the field
+unset. And the `shell_start` handles are not contained at all, because a handle
+outlives the call that made it.
+
+[The contract](../CONTRACT.md) states the per-platform table: Windows gets the
+resource caps and neither a filesystem nor a network boundary, because a Job
+Object has neither.
+
 ## Where it shows up afterwards
 
 | Question | Where |

@@ -152,6 +152,14 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: release-default
+      # 0.40.0, and it is here because a guard written for ci.yml does not cover
+      # this file — trap 87, paid for in 0.36.1 when release.yml's all-features
+      # job inherited an ordering nothing declared. Ubuntu 24.04 restricts
+      # unprivileged user namespaces, which makes LinuxSandbox degrade to the
+      # portable floor and report it; without this the release gate would test
+      # the floor and pass, which is worse than failing.
+      - name: permit unprivileged user namespaces so the Linux backend is real
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo test
 
   # The other polarity. 155s on run 30834005895, run after the 222s above it
@@ -182,6 +190,10 @@ jobs:
       # release gate and not the wall-clock target, and a list here would be a
       # second list to keep in step with `tests/ci_workflow.rs`'s.
       - run: cargo build --all-features --examples
+      # The same reason as the sibling job above. Both release-gate legs run on
+      # ubuntu-latest, so both need it or the gate is half-blind.
+      - name: permit unprivileged user namespaces so the Linux backend is real
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo test --all-features --lib --tests
 
   # Catches a file the manifest forgot, and produces the attached artifact.

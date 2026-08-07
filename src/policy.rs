@@ -594,6 +594,35 @@ impl Policy {
     /// Evaluate `act` against `target`. This *is* [`Policy::explain`] — the
     /// enforcement path and the explanation path are one function, so they
     /// cannot drift apart.
+    /// Would this policy permit an outbound connection to anything at all?
+    ///
+    /// 0.40.0, and the one place in the crate where the per-host egress model is
+    /// flattened to a single boolean. A sandbox backend takes one flag — a new
+    /// network namespace either exists or it does not, an SBPL profile either says
+    /// `(allow network*)` or it does not — so a contained command that is given
+    /// egress is given it to **every** host, not to the ones a rule named. That is
+    /// stated on [`TaskContract::exec_sandbox`](crate::TaskContract::exec_sandbox)
+    /// and in `docs/CONTRACT.md` rather than left for someone to discover.
+    ///
+    /// [`Effect::Ask`] counts as **not** permitted, and the reason is that there is
+    /// nobody to ask. An approver answers a question about one action at the moment
+    /// it is attempted; a namespace is built before the command starts and cannot
+    /// be renegotiated once it is running. Treating `Ask` as permission would hand
+    /// a blanket route out on the strength of a rule that asked for a human, which
+    /// is the one direction this crate's boundaries never move.
+    ///
+    /// This governs the sandbox wall only. Every outbound call the crate's *own*
+    /// tools make is still checked per host by [`Policy::check`], unchanged.
+    pub(crate) fn permits_any_egress(&self) -> bool {
+        if self.defaults.net == Effect::Allow {
+            return true;
+        }
+        self.layers
+            .iter()
+            .flat_map(|layer| &layer.rules)
+            .any(|rule| rule.act == Act::Net && rule.effect == Effect::Allow)
+    }
+
     pub fn check(&self, act: Act, target: &str) -> Verdict {
         self.explain(act, target)
     }
