@@ -643,6 +643,18 @@ evidence:
     a runner policy. It was not. The three-OS matrix is the only reason this is a fixed defect
     rather than a shipped one, which is the strongest argument for O1 this project has produced.
   - >
+    **F6 is now executed rather than reasoned about, and this was read out of the log rather than
+    inferred from a green tick.** On the run for commit `e867423`, job `test (ubuntu-latest,
+    default)`: `linux_confines_a_contained_commands_writes_to_the_workspace` **PASS** — a test
+    written to *fail* on CI if the backend reports `PortableFloor`, so its passing is the positive
+    statement that `LinuxNamespaces` applied. Beside it
+    `a_contained_command_cannot_write_outside_the_workspace` **PASS** and
+    `a_contained_shell_line_contains_its_later_stages_too` **PASS**, both on the native branch, and
+    `a_policy_that_denies_the_network_denies_it_to_a_contained_command` **PASS** with **zero**
+    occurrences of the `skipped: this host` message anywhere in the job — so F3's Linux arm ran for
+    the first time in this release's history instead of returning early. Both ubuntu legs green,
+    all three OSes green.
+  - >
     **Both halves of the original CI problem were fixed too.** `.github/workflows/ci.yml` and **both** ubuntu legs of
     `.github/workflows/release.yml` now set
     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` before the suite, restoring the
@@ -676,11 +688,13 @@ known_limitations:
   Byte-identical is the stronger zero-break claim, not a weaker one. 0.39.0 recorded the same trap
   and the criterion was still written this way — plan such a criterion as "unchanged".
 - >
-  **F6 is the one criterion this host cannot verify, by construction.** The Linux confinement
-  assertion runs on `ubuntu-latest`; a macOS developer machine can only run the macOS arm. The
-  release is therefore sealed on macOS evidence plus the matrix, and O1 is the criterion that closes
-  it. If the runner's kernel refuses the remounts the backend reports `PortableFloor` and the test
-  asserts *that* rather than asserting confinement that was never applied.
+  **F6 cannot be verified on the machine this release was built on, and that nearly shipped a
+  boundary that existed nowhere.** The Linux assertion runs on `ubuntu-latest`; a macOS developer
+  host can only run the macOS arm, and every local gate passed throughout while Linux confined
+  nothing. It is verified now — asserted on the runner, on the native backend, read out of the job
+  log — but the standing limitation is the shape of the risk, not this instance of it: a
+  platform-specific boundary is only ever as true as the platform that runs its test, and this
+  project has exactly one such platform in CI and none on the developer's desk.
 - >
   **Linux confinement is verified on a host whose apparmor restriction has been lifted, and that is
   not the Ubuntu 24.04 default.** CI now sets
