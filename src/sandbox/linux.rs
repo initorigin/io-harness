@@ -120,6 +120,18 @@ fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
 /// without it most toolchains fail on their first temporary file. Both are
 /// stated in `docs/CONTRACT.md`.
 ///
+/// **`/` is remounted read-only directly, and is deliberately not bound to
+/// itself first.** The first version of this script did `mount --bind / /`
+/// before the remount, on the assumption that a bind was needed to own the
+/// mount. On a GitHub `ubuntu-latest` runner that bind fails with
+/// `wrong fs type, bad option, bad superblock on /` and takes the whole setup
+/// with it, so the probe reported failure and every contained run on Linux
+/// silently took the portable floor — the confinement this module documents was
+/// applied nowhere, and the matrix is what caught it. Measured on the runner:
+/// with the bind removed, the remount alone leaves the tree genuinely
+/// read-only — asserted by *attempting a write and having it refused*, not by
+/// the mount's exit status — and the workdir rebinds writable over it.
+///
 /// **`sh` here is not a shell for the payload.** The command arrives as
 /// positional parameters and leaves through `exec "$@"`, so nothing re-parses
 /// it and a metacharacter in an argument stays an ordinary byte — the property
@@ -134,7 +146,6 @@ const MOUNT_SETUP: &str = "\
 set -e
 fail() { echo \"unshare: sandbox mount setup failed: $1\" >&2; exit 125; }
 mount --make-rprivate / 2>/dev/null || fail 'could not make / private'
-mount --bind / / 2>/dev/null || fail 'could not bind /'
 mount -o remount,bind,ro / 2>/dev/null || fail 'could not remount / read-only'
 for d in \"$1\" \"${TMPDIR:-/tmp}\"; do
   [ -d \"$d\" ] || continue

@@ -619,7 +619,31 @@ evidence:
     failed loudly and the egress tests passed vacuously — the same defect wearing two faces, and
     exactly the "skip that reads as a pass" F6 was written to forbid.
   - >
-    **Both halves were fixed.** `.github/workflows/ci.yml` and **both** ubuntu legs of
+    **The matrix then caught the real defect, which the first diagnosis had missed.** With the
+    apparmor sysctl applied, `kernel.apparmor_restrict_unprivileged_userns = 0` confirmed in the log,
+    the backend *still* reported `PortableFloor` — and the F6 test now said so as a failure instead
+    of a skip. So the namespace was permitted and the **mount setup itself** was failing. The probe
+    swallows stderr by design, so a temporary CI step ran the same script with stderr shown:
+    `mount --make-rprivate /` succeeded and `mount --bind / /` failed **rc=32**, `wrong fs type, bad
+    option, bad superblock on /`, while binding a subdirectory worked. That failure hit `fail`,
+    exited 125, and took the whole setup down.
+  - >
+    **The fix is the deletion of one line, and it was measured rather than reasoned about.** A second
+    probe asked the only question that decides it — not whether `mount` returns 0, but whether a
+    write is actually refused. Dropping the bind and remounting `/` read-only directly returned
+    `V3 VERDICT: READ-ONLY — the write was refused`, and with the workdir rebound rw,
+    `V4 write INSIDE workdir ok` beside `V4 escape refused`. `mount --bind / /` was never needed;
+    it was the assumption that a bind was required to own the mount, and it was the only thing
+    breaking Linux. Both temporary diagnostic steps were removed once the cause was known.
+  - >
+    **What this means about every earlier claim in this release, stated plainly.** Until this fix
+    the Linux confinement was applied on **no machine anywhere** — the probe failed, the backend
+    took the floor, and the escape tests either failed loudly or (for egress) skipped silently. The
+    release spent two matrix runs believing the Linux work was sound because the failure looked like
+    a runner policy. It was not. The three-OS matrix is the only reason this is a fixed defect
+    rather than a shipped one, which is the strongest argument for O1 this project has produced.
+  - >
+    **Both halves of the original CI problem were fixed too.** `.github/workflows/ci.yml` and **both** ubuntu legs of
     `.github/workflows/release.yml` now set
     `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` before the suite, restoring the
     setting that is the default on most distributions so the leg exercises the real backend.

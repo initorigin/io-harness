@@ -237,39 +237,6 @@ jobs:
       - name: permit unprivileged user namespaces so the Linux backend is real
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      # TEMPORARY diagnostic, 0.40.0. The backend still reports PortableFloor
-      # after the sysctl above, which means the namespace is now permitted and
-      # the mount setup itself is failing. The probe deliberately swallows
-      # stderr, so this step runs the same script with stderr shown to find out
-      # why. Remove once the cause is known.
-      - name: diagnose the mount setup
-        if: runner.os == 'Linux'
-        continue-on-error: true
-        run: |
-          OUT="$RUNNER_TEMP/probe-target"; mkdir -p "$OUT"
-          echo "=== V3: drop the bind of /, remount / ro directly, then TRY TO WRITE ==="
-          unshare --user --map-root-user --mount --pid --fork --net -- sh -c '
-            mount --make-rprivate / || { echo "V3 rprivate failed"; exit 9; }
-            mount -o remount,bind,ro / || { echo "V3 remount ro failed rc=$?"; exit 9; }
-            if touch "$1/escaped" 2>/dev/null; then
-              echo "V3 VERDICT: NOT READ-ONLY — the write landed"
-            else
-              echo "V3 VERDICT: READ-ONLY — the write was refused"
-            fi
-          ' sh "$OUT" ; echo "V3 rc=$?"
-          ls -l "$OUT" || true
-          rm -f "$OUT/escaped"
-          echo "=== V4: same, plus binding the workdir back rw ==="
-          WD="$RUNNER_TEMP/probe-wd"; mkdir -p "$WD"
-          unshare --user --map-root-user --mount --pid --fork --net -- sh -c '
-            mount --make-rprivate / || exit 9
-            mount -o remount,bind,ro / || exit 9
-            mount --bind "$2" "$2" 2>/dev/null && mount -o remount,bind,rw "$2" 2>/dev/null \
-              && echo "V4 workdir rebound rw" || echo "V4 could not rebind the workdir"
-            touch "$2/inside" 2>/dev/null && echo "V4 write INSIDE workdir ok" || echo "V4 write inside workdir REFUSED"
-            touch "$1/escaped" 2>/dev/null && echo "V4 escape LANDED" || echo "V4 escape refused"
-          ' sh "$OUT" "$WD" ; echo "V4 rc=$?"
-          ls -l "$OUT" "$WD" || true
       - run: cargo nextest run ${{ matrix.flags }} --lib --tests
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.
