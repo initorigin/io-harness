@@ -374,22 +374,14 @@ pub struct ReviewRequest {
 /// ```
 /// use io_harness::FileChange;
 ///
-/// let edited = FileChange {
-///     path: "src/parse.rs".into(),
-///     before: Some("/// Parses one line.\npub fn parse() {}\n".into()),
-///     after: "pub fn parse() {}\n".into(),
-///     unkept: None,
-/// };
+/// let edited = FileChange::new("src/parse.rs", "pub fn parse() {}\n")
+///     .with_before("/// Parses one line.\npub fn parse() {}\n");
 /// // What a "what the run wrote" view cannot show: the line that is gone.
 /// assert!(edited.before.as_deref().unwrap().contains("Parses one line"));
 /// assert!(!edited.after.contains("Parses one line"));
 ///
-/// let created = FileChange {
-///     path: "src/new.rs".into(),
-///     before: None,
-///     after: "pub fn new() {}\n".into(),
-///     unkept: None,
-/// };
+/// // A file the run created carries no before at all.
+/// let created = FileChange::new("src/new.rs", "pub fn new() {}\n");
 /// assert!(created.before.is_none());
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -420,16 +412,12 @@ pub struct FileChange {
 /// ```
 /// use io_harness::{ChangeReview, FileChange};
 ///
-/// let review = ChangeReview {
-///     goal: "tidy the parser".into(),
-///     rubric: "no public item lost its doc comment".into(),
-///     changes: vec![FileChange {
-///         path: "src/parse.rs".into(),
-///         before: Some("/// Parses one line.\npub fn parse() {}\n".into()),
-///         after: "pub fn parse() {}\n".into(),
-///         unkept: None,
-///     }],
-/// };
+/// let review = ChangeReview::new(
+///     "tidy the parser",
+///     "no public item lost its doc comment",
+///     vec![FileChange::new("src/parse.rs", "pub fn parse() {}\n")
+///         .with_before("/// Parses one line.\npub fn parse() {}\n")],
+/// );
 ///
 /// // The same request, seen the way a reviewer written before 0.42.0 sees it.
 /// let outcome = review.into_outcome_request();
@@ -448,7 +436,47 @@ pub struct ChangeReview {
     pub changes: Vec<FileChange>,
 }
 
+impl FileChange {
+    /// A file the run created, holding `after`.
+    ///
+    /// The before is added with [`Self::with_before`] when the file existed, and
+    /// [`Self::not_kept`] when it existed and its contents were not kept.
+    pub fn new(path: impl Into<PathBuf>, after: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            before: None,
+            after: after.into(),
+            unkept: None,
+        }
+    }
+
+    /// What the file held before the run first wrote it.
+    pub fn with_before(mut self, before: impl Into<String>) -> Self {
+        self.before = Some(before.into());
+        self
+    }
+
+    /// Why there is no before for a file that did exist.
+    pub fn not_kept(mut self, why: impl Into<String>) -> Self {
+        self.unkept = Some(why.into());
+        self
+    }
+}
+
 impl ChangeReview {
+    /// A review of `changes`, against `rubric`, for a run pursuing `goal`.
+    pub fn new(
+        goal: impl Into<String>,
+        rubric: impl Into<String>,
+        changes: Vec<FileChange>,
+    ) -> Self {
+        Self {
+            goal: goal.into(),
+            rubric: rubric.into(),
+            changes,
+        }
+    }
+
     /// The same review as a [`ReviewRequest`] — the files as they stand.
     ///
     /// What the default [`Reviewer::review_change`] forwards, so a reviewer
@@ -607,6 +635,10 @@ pub trait Reviewer: Send + Sync + std::fmt::Debug {
     ///                 Review::passed()
     ///             })
     ///         })
+    ///     }
+    ///
+    ///     fn model(&self) -> Option<&str> {
+    ///         None
     ///     }
     /// }
     /// ```
@@ -778,8 +810,8 @@ fn json_object_from(text: &str, from: usize) -> Option<(usize, usize)> {
         let mut depth = 0usize;
         let mut in_string = false;
         let mut escaped = false;
-        for end in start..bytes.len() {
-            let c = bytes[end] as char;
+        for (end, byte) in bytes.iter().enumerate().skip(start) {
+            let c = *byte as char;
             if in_string {
                 match c {
                     _ if escaped => escaped = false,
