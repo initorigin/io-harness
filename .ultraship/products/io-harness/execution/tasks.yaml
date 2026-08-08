@@ -47,7 +47,7 @@ tasks:
   why_required: 'This is the release''s headline: the thing that lets an unattended run answer the grey
     tier at all. It is also where F1 and F2 become provable, because a fixture provider can record the
     prompt it was handed and return each of the three answers.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.42.0-T01
   acceptance_criteria:
@@ -72,7 +72,28 @@ tasks:
   - src/approve.rs
   - src/lib.rs
   - tests/model_approver.rs
-  evidence: []
+  evidence:
+  - '`ModelApprover<P>` landed in `src/approve.rs` with `new`, `allow_self_approval` and `self_approval_allowed`,
+    re-exported from `src/lib.rs`. It overrides both `decide` and `decide_in_context`, so it works with
+    or without the context and prompts with whatever it was given.'
+  - 'The three answers plus a fourth case: `approve` and `deny` map to their `Decision`s, `defer` and
+    **anything unreadable** map to `Decision::Defer` — including a provider error, because a decision
+    nobody gave must park the question rather than answer it. `modified` is always `None` and `remember`
+    is always empty, so a model can neither rewrite the action nor widen the run''s boundary.'
+  - 'One scanner, not two. `parse_verdict`''s balanced-object walk moved to `verify::first_json_object`
+    / `json_object_from` and both readers use it; `parse_verdict` still tries each candidate in turn,
+    so a model writing `{"note": …} {"passed": true}` is still read as before.'
+  - F1 — `the_approving_model_is_told_which_rule_and_which_layer_asked` passes. The approving provider
+    keeps every prompt; the assertion is against the `Verdict` the policy itself produced (`ops-baseline`,
+    `out.*`), plus the run's goal and the target. A decision alone could not show the model was told anything,
+    which is why the prompt is what is asserted.
+  - 'F2 — `approve_deny_and_defer_each_leave_their_own_trace` passes. Approve: one `Edit` row, the bytes
+    on disk. Deny: no `Edit` row, no file, and the model''s own observation carries the verdict''s reason.
+    Defer, run twice — once for `{"decision": "defer"}` and once for a verdict with no JSON in it at all:
+    `RunOutcome::AwaitingApproval`, an unresolved `pending` row, and `resume_with_decision` then lands
+    exactly the persisted write.'
+  - '`cargo test --test model_approver` exit 0, 4 passed; `--test review` 11 passed, which is the regression
+    on the scanner the two now share.'
 - id: US-IO-HARNESS-0.42.0-T03
   summary: Refuse a `ModelApprover` whose model is the model under it, in `preflight_review_and_routing`,
     before the first request is built.

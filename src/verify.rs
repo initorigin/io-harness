@@ -565,16 +565,31 @@ impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Reviewer for 
     }
 }
 
-/// Read a verdict out of a model's answer.
+/// The first balanced JSON object in a model's answer, braces included.
 ///
-/// Scans for the first balanced JSON object rather than requiring the whole
-/// response to be one: a model that says "Looks good to me. {...}" has answered,
-/// and refusing it would turn a judgement into a transport error. A response with
-/// no object at all, or one that does not carry `passed`, is an error — a verdict
-/// nobody can read is a review that did not happen.
-fn parse_verdict(text: &str) -> Result<Review> {
+/// One scanner, used by both things in this crate that read a verdict out of
+/// prose — the review gate here and [`ModelApprover`](crate::ModelApprover) — so
+/// "a model that wraps its object in a fenced block has still answered" is one
+/// rule rather than two that can drift. Strings are tracked so a brace inside one
+/// does not close the object, which is exactly what a denial reason containing
+/// `}` would otherwise do.
+///
+/// `None` means there was no balanced object at all. What that *means* is the
+/// caller's to decide, and the two callers decide differently: an unreadable
+/// review is an error, an unreadable approval is a defer.
+pub(crate) fn first_json_object(text: &str) -> Option<&str> {
+    json_object_from(text, 0).map(|(start, end)| &text[start..=end])
+}
+
+/// The first balanced object at or after `from`, as a byte range.
+///
+/// Separate from [`first_json_object`] because [`parse_verdict`] must try each
+/// candidate in turn — a model that writes `{ "note": "…" } {"passed": true}` has
+/// answered in its second object, and stopping at the first would refuse a
+/// verdict that is right there.
+fn json_object_from(text: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
-    for (start, _) in text.char_indices().filter(|&(_, c)| c == '{') {
+    for (start, _) in text.char_indices().filter(|&(i, c)| i >= from && c == '{') {
         let mut depth = 0usize;
         let mut in_string = false;
         let mut escaped = false;
@@ -595,15 +610,30 @@ fn parse_verdict(text: &str) -> Result<Review> {
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        if let Ok(review) = serde_json::from_str::<Review>(&text[start..=end]) {
-                            return Ok(review);
-                        }
-                        break;
+                        return Some((start, end));
                     }
                 }
                 _ => {}
             }
         }
+    }
+    None
+}
+
+/// Read a verdict out of a model's answer.
+///
+/// Scans for the first balanced JSON object rather than requiring the whole
+/// response to be one: a model that says "Looks good to me. {...}" has answered,
+/// and refusing it would turn a judgement into a transport error. A response with
+/// no object at all, or one that does not carry `passed`, is an error — a verdict
+/// nobody can read is a review that did not happen.
+fn parse_verdict(text: &str) -> Result<Review> {
+    let mut at = 0;
+    while let Some((start, end)) = json_object_from(text, at) {
+        if let Ok(review) = serde_json::from_str::<Review>(&text[start..=end]) {
+            return Ok(review);
+        }
+        at = start + 1;
     }
     Err(Error::provider(
         crate::error::ProviderErrorKind::Malformed,

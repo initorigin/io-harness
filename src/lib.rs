@@ -393,8 +393,8 @@ pub mod web;
 
 pub use approve::{
     AcceptPlan, AnswerFuture, ApprovalContext, ApproveAll, Approver, Decision, DenyAll,
-    FixedResponder, Plan, PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict, Question,
-    Request, Responder, ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
+    FixedResponder, ModelApprover, Plan, PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict,
+    Question, Request, Responder, ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
 };
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
