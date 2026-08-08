@@ -102,9 +102,11 @@ struct AgentDef src/agent.rs
 struct AgentEvent src/state.rs
 struct Agents src/agent.rs
 struct Anthropic src/provider/anthropic.rs
+struct ApprovalContext src/approve.rs
 struct ApproveAll src/approve.rs
 struct Attach src/attach.rs
 struct Broadcast src/observe.rs
+struct ChangeReview src/verify.rs
 struct CheckpointEvent src/state.rs
 struct Citation src/web.rs
 struct Compatible src/provider/compatible.rs
@@ -119,6 +121,7 @@ struct DenyAll src/approve.rs
 struct Dropped src/plugin.rs
 struct Edit src/state.rs
 struct ExecGuard src/verify.rs
+struct FileChange src/verify.rs
 struct FirstTry src/state.rs
 struct FixedResponder src/approve.rs
 struct FleetTally src/containment.rs
@@ -134,6 +137,7 @@ struct Media src/provider/mod.rs (feature = "media")
 struct MemoryEntry src/state.rs
 struct MemoryRecall src/state.rs
 struct MemoryWrite src/state.rs
+struct ModelApprover src/approve.rs
 struct ModelInfo src/provider/mod.rs
 struct ModelReviewer src/verify.rs
 struct OpenAi src/provider/openai.rs

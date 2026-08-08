@@ -144,6 +144,45 @@ default for an unattended run that must never take a sensitive action;
 `StdinApprover` prompts on the terminal and treats anything other than `y` as a
 denial.
 
+### A model in the approver's chair (0.42.0)
+
+`ApproveAll` opens the whole grey tier, `DenyAll` closes it, and `StdinApprover`
+needs somebody at a terminal. For an unattended run that is a choice between too
+much and nothing. `ModelApprover` is the fourth answer:
+
+```rust
+use io_harness::{ModelApprover, Policy, run_with};
+
+// Its own provider and its own model — never the one making the calls.
+let approver = ModelApprover::new(reviewing_provider, "a-different-model");
+
+let policy = Policy::default()
+    .layer("ops-baseline")
+    .allow_read("*")
+    .allow_write("src/*")
+    .deny_write("src/main.rs")   // never reaches the model at all
+    .ask_exec("cargo *");        // this is what it decides
+
+let result = run_with(&contract, &provider, &store, &policy, &approver).await?;
+```
+
+It is told the act, the target, the bytes a write would land, **the rule and the
+layer that flagged the call**, and the run's goal — then approves, denies with a
+reason the agent reads and adapts to, or defers, which persists the action and
+stops the run for a person to answer later with `resume_with_decision`. An answer
+it cannot read is a defer: a machine standing in for an absent human parks what it
+does not understand rather than waving it through.
+
+Two bounds are worth knowing before you install one. The policy's denies never
+reach it, so it is a filter over the grey tier and not a wall; and it may not
+answer for its own model — a `ModelApprover` whose model is the model making the
+call is refused at run start, before either provider is billed, unless you wrote
+`allow_self_approval(true)` and meant it.
+
+An approver of your own can have the same context: `Approver::decide_in_context`
+receives an `ApprovalContext { goal, rule, layer }` and defaults to forwarding to
+`decide`, so implementing it is optional and ignoring it costs nothing.
+
 ## Deferring past the end of the process
 
 ```rust

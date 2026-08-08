@@ -140,6 +140,40 @@ versions, and not a proof. It does not replace an execution gate — run the sui
 *and* have the change read. The full bounds, including why the reviewer never sees
 the run's conversation, are in [the public contract](../CONTRACT.md).
 
+### The reviewer reads the change (0.42.0)
+
+A rubric like *"no public item lost its doc comment"* cannot be answered from the
+files as they stand, because what was deleted is not in the text that remains.
+`ModelReviewer` is therefore shown each written file **before and after**: the
+state before the run first touched it, from the restore point the store already
+keeps, and the state now. A file the run created carries no before; a file it
+never wrote is not shown at all.
+
+Your own reviewer opts in by overriding one method:
+
+```rust
+use io_harness::{ChangeReview, Review, Reviewer, ReviewRequest, Reviewing};
+
+impl Reviewer for NothingWasDeleted {
+    fn review<'a>(&'a self, _: ReviewRequest) -> Reviewing<'a> {
+        Box::pin(async { Ok(Review::failed(["this rubric needs the change"])) })
+    }
+
+    fn review_change<'a>(&'a self, request: ChangeReview) -> Reviewing<'a> {
+        let shrank = request.changes.iter().any(|c| {
+            c.before.as_ref().is_some_and(|b| b.len() > c.after.len())
+        });
+        Box::pin(async move {
+            Ok(if shrank { Review::failed(["a file lost content"]) } else { Review::passed() })
+        })
+    }
+}
+```
+
+`review_change` defaults to forwarding the `ReviewRequest` a reviewer has always
+received, so nothing written before 0.42.0 needs an edit — and, stated plainly: a
+reviewer that does not override it keeps judging the outcome, not the change.
+
 ## Retrying one gate, without re-running the run (0.34.0)
 
 A review is the first criterion that can fail for a reason that is not about the

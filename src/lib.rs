@@ -392,9 +392,9 @@ mod verify;
 pub mod web;
 
 pub use approve::{
-    AcceptPlan, AnswerFuture, ApproveAll, Approver, Decision, DenyAll, FixedResponder, Plan,
-    PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict, Question, Request, Responder,
-    ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
+    AcceptPlan, AnswerFuture, ApprovalContext, ApproveAll, Approver, Decision, DenyAll,
+    FixedResponder, ModelApprover, Plan, PlanGate, PlanGateNone, PlanReview, PlanStep, PlanVerdict,
+    Question, Request, Responder, ResponderNone, StdinApprover, StdinPlanGate, StdinResponder,
 };
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
@@ -463,6 +463,7 @@ pub use tools::{
     PROPOSE_PLAN_TOOL, TODO_WRITE_TOOL,
 };
 pub use verify::{
-    ExecGuard, ModelReviewer, Review, ReviewRequest, Reviewer, Reviewing, Verification, TEST_BINARY,
+    ChangeReview, ExecGuard, FileChange, ModelReviewer, Review, ReviewRequest, Reviewer, Reviewing,
+    Verification, TEST_BINARY,
 };
 pub use web::{Citation, ServerToolCall, WebAccess};
