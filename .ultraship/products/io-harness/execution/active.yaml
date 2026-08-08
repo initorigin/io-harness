@@ -1,0 +1,27 @@
+product: io-harness
+version: 0.42.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+  - 'Three capabilities, but each is additive and each has an in-tree template: `ModelReviewer` for the
+    model approver, the 0.28.0 event hook for the lifecycle hook, and the 0.28.0 restore points for the
+    change.'
+  - No schema change, no new dependency and no public break, so the release carries none of the costs
+    that made 0.36.1 and 0.40.0 expensive.
+  - The one shared file is `run.rs`, and 0.41.0 left a single serial policy phase (`prepare_read`) that
+    all three dispatch sites already go through, so the gate has one insertion point rather than four.
+  - No constraints have been recorded for this release, so this assessment is grounded in the repository's
+    own condition rather than in a stated limit.
+  major_cost_drivers:
+  - Three capabilities each needing their own discriminating evidence, two of which need a fixture provider
+    that records the prompt it was handed.
+  - Placing the gate in `prepare_read` without disturbing 0.41.0's pause collapse, pending-approval row
+    or call-order fold.
+  - A hook argv that runs identically on macOS, Ubuntu and Windows, and capturing its stdout without reintroducing
+    a pipe deadlock.
+  - 'The approving model''s prompt is a security surface: the write content it renders is attacker-controlled
+    in a repository the agent did not author.'
+  recommended_scope_change: null
