@@ -26,6 +26,48 @@ notes are produced from it.
 
 ### Security
 
+## [0.41.0] - 2026-08-08
+
+### Added
+
+- **A read-heavy step no longer costs one round trip per file.** When a completion
+  carries several read-only tool calls, they now run at the same time instead of
+  one after another. A model that spent a completion asking for eight files pays
+  for the slowest read rather than the sum of all eight. Three built-ins are
+  read-only — `grep`, `find` and `read_file` — and everything else runs exactly as
+  it did, one at a time, in the order the model asked.
+- `TaskContract::max_parallel_reads`, with `TaskContract::with_max_parallel_reads`,
+  caps how many read-only calls from one completion may be in flight. It defaults
+  to **10** and clamps to a floor of 1; `0` means serial rather than an error. It
+  caps calls in flight, not calls attempted, so a completion carrying four reads
+  runs four whatever the cap says.
+- `ToolEffect`, and a defaulted `Tool::effect` returning it. A registered tool that
+  returns `ToolEffect::ReadOnly` joins the concurrent group; the default is
+  `ToolEffect::Mutating`, so **every `Tool` implementation written before this
+  release compiles unchanged and keeps being called one at a time**. The
+  declaration is a promise the tool makes about itself — the harness cannot check
+  it, which is why concurrency is opted into rather than given.
+
+### Changed
+
+- The step loop partitions each completion's tool calls by whether they can change
+  anything and dispatches each run of read-only ones together, bounded by a
+  `tokio::task::JoinSet`. **This changes timing, not results.** Observations,
+  decisions, recorded steps, `Edit` rows, budget draws and the events an `Observer`
+  receives are folded back in the order the model asked for the calls, never in the
+  order they finished, and a run's trace, ledger and replay are identical to the
+  serial run of the same recorded case. If you want to rule the concurrency out
+  while debugging something else, `with_max_parallel_reads(1)` puts the run back on
+  0.40.0's execution path exactly — the batch is not entered at all.
+- A batch collapses to serial at the first call whose policy decision is not an
+  outright allow. A read-only call an approver defers stops the step as it always
+  has, and the calls after it in that completion are not started — not merely not
+  recorded.
+
+There is no migration note for this release: nothing is removed, renamed or
+altered, no table, column or index is added, `CHECKPOINT_FORMAT` is unmoved, and a
+0.40.0 store and a 0.41.0 store are the same store.
+
 ## [0.40.0] - 2026-08-07
 
 ### Added

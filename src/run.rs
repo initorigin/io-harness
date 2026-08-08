@@ -56,9 +56,9 @@ const GIT_DIR: &str = ".git";
 #[cfg(feature = "media")]
 use crate::tools::VIEW_IMAGE_TOOL;
 use crate::tools::{
-    Entry, FsTool, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL, FIND_TOOL,
-    GREP_TOOL, LIST_DIR_TOOL, PROPOSE_PLAN_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL, REMEMBER_TOOL,
-    SHELL_KILL_TOOL, SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL,
+    Entry, FsTool, ToolEffect, Toolbox, Workspace, ASK_QUESTION_TOOL, EDIT_FILE_TOOL, EXEC_TOOL,
+    FIND_TOOL, GREP_TOOL, LIST_DIR_TOOL, PROPOSE_PLAN_TOOL, READ_FILE_TOOL, READ_SKILL_TOOL,
+    REMEMBER_TOOL, SHELL_KILL_TOOL, SHELL_POLL_TOOL, SHELL_START_TOOL, SHELL_TOOL, TODO_WRITE_TOOL,
     WRITE_FILE_TOOL,
 };
 #[cfg(feature = "docx")]
@@ -4343,37 +4343,86 @@ async fn run_workspace_from<P: Provider>(
         let mut plan_cancelled = false;
         let mut plan_approved = false;
         let mut new_rules: Vec<Rule> = Vec::new();
-        for call in &response.tool_calls {
-            calls_json.push(format!("{}:{}", call.name, call.arguments));
-            match dispatch(
-                &ws,
-                call,
-                approver,
-                responder_of(contract),
-                store,
-                run_id,
-                step,
-                mcp,
-                &contract.tools,
-                skills,
-                entry_cap,
-                &mem_key,
-                watch,
-                0,
-                pending_media,
-                &contract.commit_identity,
-                contract.exec_timeout,
-                contract.exec_sandbox.as_ref(),
-                toolchain.as_ref(),
-                handles,
-                PlanPhase {
-                    gate: contract.plan_gate.as_deref(),
-                    agents: &contract.agents,
-                    active: planning,
-                },
-            )
-            .await?
+        // 0.41.0 — the completion's calls are partitioned by whether they can
+        // change anything, and each maximal run of read-only ones is dispatched
+        // together. Everything below this line then folds a `Dispatched` exactly
+        // as it always has, in the order the model asked, whether that result
+        // came back from a batch or from a lone call: concurrency is where the
+        // work happened, not what the run recorded.
+        //
+        // A cap of 1 never enters the batch path at all, which is what makes the
+        // change bisectable — `with_max_parallel_reads(1)` is 0.40.0's loop.
+        let effects: Vec<ToolEffect> = response
+            .tool_calls
+            .iter()
+            .map(|c| tool_effect(&c.name, &contract.tools))
+            .collect();
+        let mut batched: std::collections::VecDeque<Dispatched> = std::collections::VecDeque::new();
+        let mut at = 0usize;
+        while at < response.tool_calls.len() {
+            if batched.is_empty()
+                && contract.max_parallel_reads > 1
+                && effects[at] == ToolEffect::ReadOnly
             {
+                let end = at
+                    + effects[at..]
+                        .iter()
+                        .take_while(|e| **e == ToolEffect::ReadOnly)
+                        .count();
+                if end - at > 1 {
+                    batched = read_batch(
+                        &ws,
+                        &response.tool_calls[at..end],
+                        approver,
+                        store,
+                        run_id,
+                        step,
+                        &contract.tools,
+                        entry_cap,
+                        watch,
+                        0,
+                        contract.max_parallel_reads,
+                    )
+                    .await?;
+                }
+            }
+            let call = &response.tool_calls[at];
+            at += 1;
+            calls_json.push(format!("{}:{}", call.name, call.arguments));
+            let dispatched = match batched.pop_front() {
+                Some(done) => done,
+                None => {
+                    dispatch(
+                        &ws,
+                        call,
+                        approver,
+                        responder_of(contract),
+                        store,
+                        run_id,
+                        step,
+                        mcp,
+                        &contract.tools,
+                        skills,
+                        entry_cap,
+                        &mem_key,
+                        watch,
+                        0,
+                        pending_media,
+                        &contract.commit_identity,
+                        contract.exec_timeout,
+                        contract.exec_sandbox.as_ref(),
+                        toolchain.as_ref(),
+                        handles,
+                        PlanPhase {
+                            gate: contract.plan_gate.as_deref(),
+                            agents: &contract.agents,
+                            active: planning,
+                        },
+                    )
+                    .await?
+                }
+            };
+            match dispatched {
                 Dispatched::Continue {
                     decision,
                     obs,
@@ -6989,6 +7038,357 @@ impl Dispatched {
     }
 }
 
+/// Whether a call in this completion can change anything (0.41.0).
+///
+/// Three built-ins observe and change nothing: `grep`, `find` and `read_file`.
+/// **Everything else built in is [`ToolEffect::Mutating`]**, including tools that
+/// only read the world but reach it through a process — the git readers, `exec`,
+/// `shell` — because a spawn under a sandbox backend is not something this
+/// release makes concurrent, and including `list_dir` and `view_image`, which
+/// read the workspace but are outside the set the contract named. Widening the
+/// set is a later release's decision, taken with its own evidence.
+///
+/// A registered tool answers for itself through [`Tool::effect`](crate::Tool),
+/// which is defaulted to `Mutating`, so a toolbox assembled before 0.41.0 keeps
+/// running exactly as it did. An MCP tool is `Mutating`: honouring a server's
+/// `readOnlyHint` means overlapping requests on one [`McpSession`], which is a
+/// question about the client rather than about this loop.
+fn tool_effect(name: &str, custom: &Toolbox) -> ToolEffect {
+    match name {
+        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => ToolEffect::ReadOnly,
+        _ => custom
+            .get(name)
+            .map_or(ToolEffect::Mutating, |tool| tool.effect()),
+    }
+}
+
+/// The part of a read-only call that can run at the same time as another one.
+///
+/// Everything a call needs from the run has already been decided by the time one
+/// of these exists: the policy has been consulted, an approver has answered, and
+/// the target is whatever the approver left it as. What remains is the read
+/// itself, which touches the workspace and the registered tool and nothing else —
+/// no `Store` (`rusqlite::Connection` is `Send` and not `Sync`, so it could not
+/// cross into a task even if this wanted it to), no `Watch`, no run-scoped
+/// mutable state.
+enum ReadWork {
+    Grep {
+        pattern: String,
+        path_glob: Option<String>,
+    },
+    Find {
+        glob: String,
+    },
+    Read {
+        target: String,
+        remember: Vec<Rule>,
+    },
+    Custom {
+        name: String,
+        tool: std::sync::Arc<dyn crate::tools::Tool>,
+        arguments: serde_json::Value,
+        remember: Vec<Rule>,
+    },
+}
+
+impl ReadWork {
+    /// Perform it. The same code the serial path runs, so the two cannot drift:
+    /// a batched read and a lone read are the same function called from two
+    /// places.
+    async fn run(self, ws: &Workspace, cap: usize, run_id: i64, step: u32) -> Dispatched {
+        match self {
+            ReadWork::Grep { pattern, path_glob } => {
+                match ws.grep(&pattern, path_glob.as_deref()) {
+                    Ok(hits) => {
+                        let shown: Vec<String> = hits
+                            .iter()
+                            .take(OBS_GREP_CAP)
+                            .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
+                            .collect();
+                        Dispatched::seen(
+                            format!("grep {pattern:?} ({} hits)", hits.len()),
+                            bound(
+                                &format!("\n[grep {pattern:?}]\n{}\n", shown.join("\n")),
+                                cap,
+                                ObsKind::Grep,
+                            ),
+                            ObsKind::Grep,
+                            Some(pattern),
+                        )
+                    }
+                    Err(e) => Dispatched::go("grep error", format!("\n[grep error] {e}\n")),
+                }
+            }
+            ReadWork::Find { glob } => match ws.find(&glob) {
+                Ok(paths) => Dispatched::seen(
+                    format!("find {glob:?} ({} paths)", paths.len()),
+                    bound(
+                        &format!("\n[find {glob:?}]\n{}\n", paths.join("\n")),
+                        cap,
+                        ObsKind::Find,
+                    ),
+                    ObsKind::Find,
+                    Some(glob),
+                ),
+                Err(e) => Dispatched::go("find error", format!("\n[find error] {e}\n")),
+            },
+            ReadWork::Read { target, remember } => match ws.read_file(&target) {
+                Ok(c) => Dispatched::Continue {
+                    decision: format!("read {target}"),
+                    obs: format!("\n[read {target}]\n{}\n", bound(&c, cap, ObsKind::Read)),
+                    kind: ObsKind::Read,
+                    target: Some(target),
+                    changed: false,
+                    remember,
+                },
+                Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
+            },
+            ReadWork::Custom {
+                name,
+                tool,
+                arguments,
+                remember,
+            } => match tool.invoke(&arguments).await {
+                Ok(out) => {
+                    let (out, truncated) = crate::tools::cap_result(out, cap);
+                    info!(run_id, step, tool = name, truncated, "registered tool call");
+                    Dispatched::Continue {
+                        decision: format!("called {name}"),
+                        obs: format!("\n[{name}]\n{out}\n"),
+                        kind: ObsKind::Tool,
+                        target: Some(name),
+                        changed: false,
+                        remember,
+                    }
+                }
+                // A tool's own failure is the model's problem to route around,
+                // not the run's to die on — the same treatment a bad regex gets
+                // from grep.
+                Err(e) => {
+                    info!(run_id, step, tool = name, error = %e, "registered tool failed");
+                    Dispatched::Continue {
+                        decision: format!("{name} failed"),
+                        obs: format!("\n[{name} error] {e}\n"),
+                        kind: ObsKind::Error,
+                        target: None,
+                        changed: false,
+                        remember,
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// What consulting the policy about a read-only call left behind.
+enum Prepared {
+    /// Cleared to run, on its own or beside others.
+    Work(ReadWork),
+    /// Already answered — a refusal, or a call with nothing to do. Nothing runs.
+    Done(Dispatched),
+    /// An approver deferred. This result stands and the batch ends here: no call
+    /// after it in the completion is prepared, let alone started.
+    Stop(Dispatched),
+}
+
+/// Consult the policy for one read-only call, on the caller's own thread.
+///
+/// Split out from the concurrent half deliberately. Every durable write a
+/// decision makes — the policy event, the pending approval row — lands here, in
+/// call order, before anything overlaps; the batch is only ever concurrent in the
+/// part that touches the workspace. That is what makes a pause honest: the run
+/// stops holding an approval for the third call in a completion having recorded
+/// nothing for the fourth and fifth.
+#[allow(clippy::too_many_arguments)]
+async fn prepare_read(
+    ws: &Workspace,
+    call: &ToolCall,
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    custom: &Toolbox,
+    watch: &Watch<'_>,
+    depth: u32,
+) -> Result<Prepared> {
+    let a = &call.arguments;
+    let s = |k: &str| a.get(k).and_then(|v| v.as_str());
+    Ok(match call.name.as_str() {
+        // Neither search is gated, and that is 0.3.0's decision rather than this
+        // release's: a pattern names no path until it has matched one, and the
+        // hits are drawn from a workspace the policy already bounds.
+        GREP_TOOL => Prepared::Work(ReadWork::Grep {
+            pattern: s("pattern").unwrap_or_default().to_string(),
+            path_glob: s("path_glob").map(str::to_string),
+        }),
+        FIND_TOOL => Prepared::Work(ReadWork::Find {
+            glob: s("name_glob")
+                .or_else(|| s("glob"))
+                .unwrap_or_default()
+                .to_string(),
+        }),
+        READ_FILE_TOOL => {
+            let path = s("path").unwrap_or_default();
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Read,
+                path,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Prepared::Done(Dispatched::go(decision, obs)),
+                Gated::Paused { request_id } => Prepared::Stop(Dispatched::Pause { request_id }),
+                Gated::Go {
+                    target, remember, ..
+                } => Prepared::Work(ReadWork::Read { target, remember }),
+            }
+        }
+        name => {
+            match gate(
+                ws,
+                approver,
+                store,
+                run_id,
+                step,
+                Act::Exec,
+                name,
+                None,
+                watch,
+                depth,
+            )
+            .await?
+            {
+                Gated::Refused { decision, obs } => Prepared::Done(Dispatched::go(decision, obs)),
+                Gated::Paused { request_id } => Prepared::Stop(Dispatched::Pause { request_id }),
+                Gated::Go { remember, .. } => {
+                    // `validate` ran at run start, so the lookup cannot miss.
+                    let tool = custom.get(name).expect("owns() and get() agree");
+                    Prepared::Work(ReadWork::Custom {
+                        name: name.to_string(),
+                        tool: std::sync::Arc::clone(tool),
+                        arguments: call.arguments.clone(),
+                        remember,
+                    })
+                }
+            }
+        }
+    })
+}
+
+/// Dispatch a run of read-only calls from one completion, overlapping them.
+///
+/// Returns one [`Dispatched`] per call the batch reached, **in the order the
+/// model asked for them** — never in the order they finished. The caller folds
+/// them exactly as it folds a serial result, which is the whole guarantee: a
+/// run's trace, its ledger and its replay cannot tell that this happened.
+///
+/// The bound is a [`JoinSet`](tokio::task::JoinSet) with at most `max_parallel`
+/// tasks alive, refilled as each finishes. It is a `JoinSet` rather than loose
+/// tasks because it aborts its children when it is dropped: a run that ends
+/// mid-batch leaves nothing running behind it.
+#[allow(clippy::too_many_arguments)]
+async fn read_batch(
+    ws: &Workspace,
+    calls: &[ToolCall],
+    approver: &dyn Approver,
+    store: &Store,
+    run_id: i64,
+    step: u32,
+    custom: &Toolbox,
+    cap: usize,
+    watch: &Watch<'_>,
+    depth: u32,
+    max_parallel: usize,
+) -> Result<std::collections::VecDeque<Dispatched>> {
+    let mut out: Vec<Option<Dispatched>> = Vec::with_capacity(calls.len());
+    let mut queued: std::collections::VecDeque<(usize, ReadWork)> =
+        std::collections::VecDeque::new();
+    for call in calls {
+        // Announced here rather than in the concurrent half, so a watcher sees
+        // the calls in the order the model made them however they then run.
+        announce(watch, run_id, step, depth, call);
+        match prepare_read(
+            ws, call, approver, store, run_id, step, custom, watch, depth,
+        )
+        .await?
+        {
+            Prepared::Work(work) => {
+                queued.push_back((out.len(), work));
+                out.push(None);
+            }
+            Prepared::Done(done) => out.push(Some(done)),
+            Prepared::Stop(stop) => {
+                out.push(Some(stop));
+                break;
+            }
+        }
+    }
+
+    let owned = ws.clone();
+    let mut set: tokio::task::JoinSet<(usize, Dispatched)> = tokio::task::JoinSet::new();
+    let fill = |set: &mut tokio::task::JoinSet<(usize, Dispatched)>,
+                queued: &mut std::collections::VecDeque<(usize, ReadWork)>| {
+        while set.len() < max_parallel {
+            let Some((at, work)) = queued.pop_front() else {
+                break;
+            };
+            let ws = owned.clone();
+            set.spawn(async move { (at, work.run(&ws, cap, run_id, step).await) });
+        }
+    };
+    fill(&mut set, &mut queued);
+    while let Some(joined) = set.join_next().await {
+        let (at, done) = match joined {
+            Ok(pair) => pair,
+            // A tool that panics panicked before this release too, and the run
+            // died with it. Carrying the unwind on rather than turning it into an
+            // observation keeps that true.
+            Err(e) if e.is_panic() => std::panic::resume_unwind(e.into_panic()),
+            Err(e) => {
+                return Err(Error::Config(format!(
+                    "a read-only tool call was cancelled: {e}"
+                )))
+            }
+        };
+        out[at] = Some(done);
+        fill(&mut set, &mut queued);
+    }
+
+    Ok(out
+        .into_iter()
+        .map(|d| d.expect("every prepared call was either finished or joined"))
+        .collect())
+}
+
+/// Tell a watcher what the run is about to do.
+///
+/// The subject is whichever of the conventional argument names this tool uses; a
+/// tool that names none of them is its own subject, which is what an MCP or
+/// registered tool call is.
+fn announce(watch: &Watch<'_>, run_id: i64, step: u32, depth: u32, call: &ToolCall) {
+    let s = |k: &str| call.arguments.get(k).and_then(|v| v.as_str());
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::ToolCall {
+            name: call.name.clone(),
+            target: ["path", "pattern", "name_glob", "glob", "key", "name"]
+                .into_iter()
+                .find_map(s)
+                .unwrap_or(&call.name)
+                .to_string(),
+        },
+    ));
+}
+
 /// Execute one tool call against the workspace, enforcing the policy and
 /// consulting `approver` for anything it marks [`Effect::Ask`].
 ///
@@ -7154,61 +7554,21 @@ async fn dispatch(
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
     // Announced before the call is made, so a watcher sees what the run is about
-    // to do rather than only what it did. The subject is whichever of the
-    // conventional argument names this tool uses; a tool that names none of them
-    // is its own subject, which is what an MCP or registered tool call is.
-    watch.emit(RunEvent::at_depth(
-        run_id,
-        step,
-        depth,
-        EventKind::ToolCall {
-            name: call.name.clone(),
-            target: ["path", "pattern", "name_glob", "glob", "key", "name"]
-                .into_iter()
-                .find_map(s)
-                .unwrap_or(&call.name)
-                .to_string(),
-        },
-    ));
+    // to do rather than only what it did.
+    announce(watch, run_id, step, depth, call);
     let name = call.name.as_str();
     Ok(match name {
-        GREP_TOOL => {
-            let pattern = s("pattern").unwrap_or_default();
-            match ws.grep(pattern, s("path_glob")) {
-                Ok(hits) => {
-                    let shown: Vec<String> = hits
-                        .iter()
-                        .take(OBS_GREP_CAP)
-                        .map(|m| format!("{}:{}: {}", m.path, m.line, m.text))
-                        .collect();
-                    Dispatched::seen(
-                        format!("grep {pattern:?} ({} hits)", hits.len()),
-                        bound(
-                            &format!("\n[grep {pattern:?}]\n{}\n", shown.join("\n")),
-                            cap,
-                            ObsKind::Grep,
-                        ),
-                        ObsKind::Grep,
-                        Some(pattern.to_string()),
-                    )
-                }
-                Err(e) => Dispatched::go("grep error", format!("\n[grep error] {e}\n")),
-            }
-        }
-        FIND_TOOL => {
-            let glob = s("name_glob").or_else(|| s("glob")).unwrap_or_default();
-            match ws.find(glob) {
-                Ok(paths) => Dispatched::seen(
-                    format!("find {glob:?} ({} paths)", paths.len()),
-                    bound(
-                        &format!("\n[find {glob:?}]\n{}\n", paths.join("\n")),
-                        cap,
-                        ObsKind::Find,
-                    ),
-                    ObsKind::Find,
-                    Some(glob.to_string()),
-                ),
-                Err(e) => Dispatched::go("find error", format!("\n[find error] {e}\n")),
+        // 0.41.0 — the three read-only built-ins go through the same two halves a
+        // batched read does: the policy on this thread, then the read itself. One
+        // of them run alone is the batch of size one.
+        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => {
+            match prepare_read(
+                ws, call, approver, store, run_id, step, custom, watch, depth,
+            )
+            .await?
+            {
+                Prepared::Work(work) => work.run(ws, cap, run_id, step).await,
+                Prepared::Done(done) | Prepared::Stop(done) => done,
             }
         }
         REMEMBER_TOOL => {
@@ -7643,39 +8003,6 @@ async fn dispatch(
                         }
                     }
                     Err(e) => Dispatched::go("list_dir error", format!("\n[list_dir error] {e}\n")),
-                },
-            }
-        }
-        READ_FILE_TOOL => {
-            let path = s("path").unwrap_or_default();
-            match gate(
-                ws,
-                approver,
-                store,
-                run_id,
-                step,
-                Act::Read,
-                path,
-                None,
-                watch,
-                depth,
-            )
-            .await?
-            {
-                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
-                Gated::Paused { request_id } => Dispatched::Pause { request_id },
-                Gated::Go {
-                    target, remember, ..
-                } => match ws.read_file(&target) {
-                    Ok(c) => Dispatched::Continue {
-                        decision: format!("read {target}"),
-                        obs: format!("\n[read {target}]\n{}\n", bound(&c, cap, ObsKind::Read)),
-                        kind: ObsKind::Read,
-                        target: Some(target.clone()),
-                        changed: false,
-                        remember,
-                    },
-                    Err(e) => Dispatched::go("read error", format!("\n[read error] {e}\n")),
                 },
             }
         }
@@ -9174,55 +9501,18 @@ async fn dispatch(
                 }
             }
         }
+        // A registered tool. Gated as an exec check on its name, then invoked —
+        // the same two halves as a built-in read, and through the same code, so a
+        // tool that declares itself read-only behaves identically whether it ran
+        // beside another call or on its own.
         name if custom.owns(name) => {
-            match gate(
-                ws,
-                approver,
-                store,
-                run_id,
-                step,
-                Act::Exec,
-                name,
-                None,
-                watch,
-                depth,
+            match prepare_read(
+                ws, call, approver, store, run_id, step, custom, watch, depth,
             )
             .await?
             {
-                Gated::Refused { decision, obs } => Dispatched::go(decision, obs),
-                Gated::Paused { request_id } => Dispatched::Pause { request_id },
-                Gated::Go { remember, .. } => {
-                    // `validate` ran at run start, so the lookup cannot miss.
-                    let tool = custom.get(name).expect("owns() and get() agree");
-                    match tool.invoke(&call.arguments).await {
-                        Ok(out) => {
-                            let (out, truncated) = crate::tools::cap_result(out, cap);
-                            info!(run_id, step, tool = name, truncated, "registered tool call");
-                            Dispatched::Continue {
-                                decision: format!("called {name}"),
-                                obs: format!("\n[{name}]\n{out}\n"),
-                                kind: ObsKind::Tool,
-                                target: Some(name.to_string()),
-                                changed: false,
-                                remember,
-                            }
-                        }
-                        // A tool's own failure is the model's problem to route
-                        // around, not the run's to die on — the same treatment a
-                        // bad regex gets from grep.
-                        Err(e) => {
-                            info!(run_id, step, tool = name, error = %e, "registered tool failed");
-                            Dispatched::Continue {
-                                decision: format!("{name} failed"),
-                                obs: format!("\n[{name} error] {e}\n"),
-                                kind: ObsKind::Error,
-                                target: None,
-                                changed: false,
-                                remember,
-                            }
-                        }
-                    }
-                }
+                Prepared::Work(work) => work.run(ws, cap, run_id, step).await,
+                Prepared::Done(done) | Prepared::Stop(done) => done,
             }
         }
         // An MCP tool. Invoking it is an exec check on its namespaced name, so a
