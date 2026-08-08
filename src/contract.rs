@@ -283,6 +283,24 @@ pub struct TaskContract {
     /// on its [`AgentDef`](crate::AgentDef), which is where a role's own model is
     /// said.
     pub routing: Option<crate::contract::Routing>,
+    /// How many read-only tool calls from one completion may be in flight at once
+    /// (0.41.0).
+    ///
+    /// Defaults to 10. It caps calls *in flight*, not
+    /// calls attempted, so the number that actually run together is
+    /// `min(this, read-only calls in that completion)` — a completion carrying
+    /// four reads runs four whatever this says.
+    ///
+    /// `1` is every release before 0.41.0, exactly: one call at a time, in the
+    /// order the model asked. That is the point of the floor being 1 rather than
+    /// 2 — an embedder who suspects the concurrency while debugging something
+    /// else sets it and is back on 0.40.0's execution path without changing
+    /// anything else. Set it with [`TaskContract::with_max_parallel_reads`].
+    ///
+    /// It bounds tool calls inside one step of one agent, and nothing else.
+    /// [`Containment::max_concurrent_agents`](crate::Containment) bounds a tree's
+    /// children; the two are independent by design.
+    pub max_parallel_reads: usize,
 }
 
 impl TaskContract {
@@ -318,6 +336,7 @@ impl TaskContract {
             agents: crate::agent::Agents::new(),
             responder: None,
             web: None,
+            max_parallel_reads: 10,
         }
     }
 
@@ -377,6 +396,7 @@ impl TaskContract {
             agents: crate::agent::Agents::new(),
             responder: None,
             web: None,
+            max_parallel_reads: 10,
         }
     }
 
@@ -773,6 +793,42 @@ impl TaskContract {
     #[must_use]
     pub fn with_exec_timeout(mut self, exec_timeout: Duration) -> Self {
         self.exec_timeout = exec_timeout;
+        self
+    }
+
+    /// Set how many read-only tool calls from one completion may run at once
+    /// (0.41.0).
+    ///
+    /// `0` is clamped to `1` rather than rejected: a caller who computed this
+    /// from a configuration file should get the safe reading — serial, which is
+    /// what every release before 0.41.0 did — and not a failed run.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// // A model that reads eight files before it edits one gets them in the
+    /// // time of the slowest read rather than the sum of all of them.
+    /// let wide = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_max_parallel_reads(16);
+    /// assert_eq!(wide.max_parallel_reads, 16);
+    ///
+    /// // And the way back to 0.40.0's execution shape, for anyone ruling the
+    /// // concurrency out while debugging something else.
+    /// let serial = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_max_parallel_reads(1);
+    /// assert_eq!(serial.max_parallel_reads, 1);
+    ///
+    /// // Zero means serial too, not an error.
+    /// let zero = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_max_parallel_reads(0);
+    /// assert_eq!(zero.max_parallel_reads, 1);
+    ///
+    /// // The default, which no caller has to say.
+    /// assert_eq!(TaskContract::workspace("port the parser", "/repo").max_parallel_reads, 10);
+    /// ```
+    #[must_use]
+    pub fn with_max_parallel_reads(mut self, max_parallel_reads: usize) -> Self {
+        self.max_parallel_reads = max_parallel_reads.max(1);
         self
     }
 

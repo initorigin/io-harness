@@ -9,7 +9,7 @@ tasks:
     partition there is nothing concurrent to bound, nothing to fold in call order, and nothing for a cap
     to limit. The negative control lands here too, because the same code path that makes reads concurrent
     is the one `with_max_parallel_reads(1)` must return to 0.40.0's execution shape.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F1 — read-only calls in one completion run concurrently, and with the cap at 1 they do not.** Three
@@ -45,7 +45,44 @@ tasks:
   - src/contract.rs
   - src/run.rs
   - tests/parallel_reads.rs
-  evidence: []
+  evidence:
+  - '`ToolEffect { ReadOnly, Mutating }` and the defaulted `Tool::effect` landed in `src/tools/custom.rs`,
+    re-exported from `src/tools/mod.rs` and `src/lib.rs`. The default is `Mutating`, so every `Tool` implementation
+    written before 0.41.0 compiles and is still called one at a time — asserted by `a_tool_that_says_nothing_is_mutating`
+    as well as by the doctest.'
+  - '`TaskContract::max_parallel_reads` and `with_max_parallel_reads` landed in `src/contract.rs`, defaulting
+    to 10 in both constructors and clamping 0 to 1 rather than rejecting it. `TaskContract` has been `#[non_exhaustive]`
+    since 0.35.0, so the field costs no caller anything.'
+  - The step loop partitions each completion by `tool_effect(name, &contract.tools)` and dispatches each
+    maximal run of read-only calls through the new `read_batch`. Everything below the partition folds
+    a `Dispatched` exactly as it did in 0.40.0, in the model call order, whether that result came from
+    a batch or from a lone `dispatch`. A cap of 1 never enters the batch path at all.
+  - 'The concurrency is split in two so the store never crosses a task boundary: `prepare_read` consults
+    the policy on the loop own thread, in call order, and `ReadWork::run` performs the read against a
+    cloned `Workspace` and the tool own `Arc`. `rusqlite::Connection` is `Send` and not `Sync`, so this
+    is the only shape available, and it is also what makes a pause honest.'
+  - The three built-in read arms and the registered-tool arm in `dispatch` were rewritten to call the
+    same `prepare_read` + `ReadWork::run` pair the batch uses, so a batched read and a lone read are the
+    same code reached from two places and cannot drift.
+  - F1 — `three_read_only_tools_rendezvous_and_at_cap_one_they_cannot` passes. Three registered `ReadOnly`
+    tools each wait on a `tokio::sync::Barrier` of three; under the default cap the step completes within
+    the 60s bound, and on the same contract, policy, store and completion with `with_max_parallel_reads(1)`
+    the run does not finish inside 5s. No clock is asserted, only whether a rendezvous can be met.
+  - 'F6 — `the_cap_bounds_calls_in_flight_and_all_of_them_still_land_in_order` passes. Twenty read-only
+    calls under a cap of 3: the peak in-flight count is 3 (asserted <= 3, and >= 2 so the bound cannot
+    pass by being serial), all twenty complete, and the twenty observation targets equal the call order
+    exactly.'
+  - N5 — `dropping_a_run_mid_batch_leaves_nothing_running` passes. Three read-only calls that sleep 400ms
+    and then park; the run is dropped at 100ms, and 900ms later none has reached its own completion and
+    the store step count is unchanged.
+  - N1 — `cargo tree` reads 402 lines, the same figure as 0.40.0. The bound is `tokio::task::JoinSet`,
+    from a dependency the crate has had since 0.1.0.
+  - 'Three sabotages, one per arm, each failing a NAMED test and none silent. S1 — `tool_effect` returns
+    `Mutating` for everything: F1 first half fails (Elapsed) and F6 peak drops to 1. S2 — the `JoinSet`
+    bound removed (`set.len() < usize::MAX`): F6 fails with a peak of 20 and F1 still passes, so it isolates
+    the bound. S3 — each task detached through `tokio::spawn` instead of being a `JoinSet` child: N5 fails
+    with 3 completions after the drop, which is exactly why the contract names `JoinSet` rather than loose
+    tasks.'
 - id: US-IO-HARNESS-0.41.0-T02
   summary: 'Prove the trace is identical whether or not a batch ran concurrently: one recorded case replayed
     at cap 10 and cap 1 into two stores, compared row for row, and repeated twenty times in one job.'
