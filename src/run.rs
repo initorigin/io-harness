@@ -2843,9 +2843,53 @@ pub async fn retry_gate_observed(
     }
 }
 
-/// Everything 0.34.0 refuses before the first request is billed.
+/// Refuse a model that would be approving for its own model (0.42.0).
 ///
-/// Three checks, all of them things a run can be certain of up front:
+/// The approval mirror of the review refusal below it, and the same argument: a
+/// model answering for a call it just made reports what the run already believes,
+/// so it is a refusal rather than a warning. Taken before the first request is
+/// built, which is what makes it observable as **zero** calls to either provider.
+///
+/// A helper rather than another arm of the preflight because there are two loops:
+/// the flat one preflights, the tree entry does not, and an unattended tree is
+/// exactly where a self-approving model would do the most damage.
+fn refuse_self_approval<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    approver: &dyn Approver,
+) -> Result<()> {
+    let Some(approving) = approver.model() else {
+        // Not a model. Nothing to compare, and nothing to refuse.
+        return Ok(());
+    };
+    if approver.self_approval_allowed() {
+        return Ok(());
+    }
+    // The run's own model, as this contract asks for it, and as the provider says
+    // it would ask. `None` on both means the provider's own default, which this
+    // crate cannot name — so it cannot compare it either, and says so in
+    // `docs/CONTRACT.md` rather than guessing.
+    let routed = contract.routing.as_ref().and_then(|r| {
+        r.escalate_after
+            .as_ref()
+            .map(|(_, m)| m.as_str())
+            .or(r.downshift_under.as_ref().map(|(_, m)| m.as_str()))
+    });
+    for writing in [routed, provider.model_hint()].into_iter().flatten() {
+        if writing == approving {
+            return Err(Error::Config(format!(
+                "the approving model and the model making the call are both {approving}; a model \
+                 answering for its own call reports what the run already believes. Use a different \
+                 model, or build the approver with allow_self_approval(true) to say you meant it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Everything refused before the first request is billed.
+///
+/// Four checks, all of them things a run can be certain of up front:
 ///
 /// 1. A [`Verification::Review`] criterion with no reviewer registered. A gate
 ///    that cannot run is found at run start rather than after the work.
@@ -2857,10 +2901,15 @@ pub async fn retry_gate_observed(
 /// 3. [`Routing::require_primary`](crate::Routing) against
 ///    [`Provider::reachable`]. An unattended job that starts on a fallback nobody
 ///    chose is the failure this exists to prevent.
+/// 4. A model approving for its own model (0.42.0), through
+///    [`refuse_self_approval`] — which the tree entry calls too, because a tree
+///    does not come through here.
 async fn preflight_review_and_routing<P: Provider>(
     contract: &TaskContract,
     provider: &P,
+    approver: &dyn Approver,
 ) -> Result<()> {
+    refuse_self_approval(contract, provider, approver)?;
     if let Verification::Review {
         allow_self_review, ..
     } = &contract.verify
@@ -3989,7 +4038,7 @@ async fn run_workspace_from<P: Provider>(
     // checked before the first completion is billed. A contract that cannot be
     // honoured should cost nothing to find out about, which is why this is here
     // and not at the gate: a review gate fires at the END of a run.
-    preflight_review_and_routing(contract, provider).await?;
+    preflight_review_and_routing(contract, provider, approver).await?;
 
     // The effective policy grows as approvers remember rules; it is rebuilt as a
     // merge so a remembered allow can still never defeat a deny beneath it.
@@ -5141,6 +5190,11 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
+    // 0.42.0 — a tree does not come through `preflight_review_and_routing`, and an
+    // unattended tree is where a model answering for its own call would do the
+    // most damage. Same helper, same refusal, before anything is billed.
+    refuse_self_approval(contract, provider, approver)?;
+
     let policy = &match authorize_provider(
         provider,
         policy,

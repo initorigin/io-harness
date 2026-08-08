@@ -99,7 +99,7 @@ tasks:
     before the first request is built.
   why_required: A model approving its own call reports what the run already believes. The contract states
     the refusal costs zero completions, and only a check in the preflight can be that.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.42.0-T02
   acceptance_criteria:
@@ -113,7 +113,23 @@ tasks:
   files:
   - src/run.rs
   - tests/model_approver.rs
-  evidence: []
+  evidence:
+  - '`refuse_self_approval(contract, provider, approver)` landed in `src/run.rs`, comparing `Approver::model()`
+    against the contract''s `Routing` models and `Provider::model_hint()` — the same two answers 0.34.0''s
+    review refusal compares — and returning `Error::Config` naming the model and how to say you meant
+    it.'
+  - 'Called from BOTH loops, which is why it is a helper rather than a fourth arm of the preflight: `preflight_review_and_routing`
+    covers the flat and session loops, and `run_tree_with_extras` calls it directly because a tree entry
+    never preflights. An unattended tree is where a self-approving model would do the most damage.'
+  - '`Approver::self_approval_allowed` was added as a third defaulted method (`false`), read only when
+    `model()` names one, so the knob stays on the approver the caller built rather than on the contract.'
+  - 'F4 — `a_model_cannot_approve_its_own_call` passes both arms. Refused: the error names `one-model`,
+    the approving provider recorded **zero** completions and the run''s own provider recorded **zero**
+    as well, and nothing was written. Control, same models with `allow_self_approval(true)`: the run proceeds,
+    the approver is asked exactly once, the file lands. The zero-count is the discriminating assertion
+    — a refusal implemented after the response arrives would produce the same message and one call each.'
+  - '`cargo test --test model_approver` exit 0, 7 passed; `--test agents` 5 passed, the regression on
+    the tree entry the refusal was added to.'
 - id: US-IO-HARNESS-0.42.0-T04
   summary: Add `at` and `tools` to the `[[hook]]` table with exactly-one-of `at`/`on` validation and a
     named value list, add `OnFailure::Refuse`, and keep the project-scope refusal covering the new keys

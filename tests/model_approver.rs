@@ -31,6 +31,7 @@ struct MockScript {
     steps: Vec<Vec<ToolCall>>,
     at: AtomicUsize,
     seen: Mutex<Vec<CompletionRequest>>,
+    model: Option<String>,
 }
 
 impl MockScript {
@@ -39,7 +40,19 @@ impl MockScript {
             steps,
             at: AtomicUsize::new(0),
             seen: Mutex::new(Vec::new()),
+            model: None,
         }
+    }
+
+    /// The same script, but the provider names the model it would ask — which is
+    /// what the self-approval refusal compares against.
+    fn naming_model(mut self, model: &str) -> Self {
+        self.model = Some(model.to_string());
+        self
+    }
+
+    fn calls(&self) -> usize {
+        self.seen.lock().unwrap().len()
     }
 }
 
@@ -57,6 +70,10 @@ impl Provider for MockScript {
             }),
             ..Default::default()
         })
+    }
+
+    fn model_hint(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 }
 
@@ -390,6 +407,60 @@ async fn approve_deny_and_defer_each_leave_their_own_trace() {
             "written\n",
             "the persisted write is what lands, byte for byte"
         );
+    }
+}
+
+// ------------------------------------------------------------------------- F4
+
+/// F4 — a model may not answer for a call its own model made, and finding that
+/// out costs nothing.
+///
+/// The discriminating assertion is a call count of **zero** on both providers,
+/// not the text of the error: a refusal implemented after the response arrives
+/// would produce the same message and one call each. `allow_self_approval(true)`
+/// is the control — same models, same everything, and the run proceeds — which is
+/// what shows the refusal was the model comparison rather than the fixture.
+#[tokio::test]
+async fn a_model_cannot_approve_its_own_call() {
+    for (allow, refused) in [(false, true), (true, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::memory().unwrap();
+        let provider = MockScript::new(write_script()).naming_model("one-model");
+        let judge = Judge::saying(r#"{"decision": "approve"}"#, "one-model");
+        let asked = judge.counter();
+        let approver = ModelApprover::new(judge, "one-model").allow_self_approval(allow);
+
+        let result = run_with(
+            &TaskContract::workspace("write out.txt", dir.path()),
+            &provider,
+            &store,
+            &asking_policy(),
+            &approver,
+        )
+        .await;
+
+        if refused {
+            let err = result.expect_err("a self-approving model is refused");
+            assert!(
+                err.to_string().contains("one-model"),
+                "the error names the model it refused: {err}"
+            );
+            assert_eq!(
+                asked.load(Ordering::SeqCst),
+                0,
+                "nothing was asked of the approving model"
+            );
+            assert_eq!(
+                provider.calls(),
+                0,
+                "and nothing was billed on the run's own provider either"
+            );
+            assert!(!dir.path().join("out.txt").exists());
+        } else {
+            result.expect("allow_self_approval(true) says you meant it");
+            assert_eq!(asked.load(Ordering::SeqCst), 1);
+            assert!(dir.path().join("out.txt").exists());
+        }
     }
 }
 

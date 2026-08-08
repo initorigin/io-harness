@@ -348,6 +348,15 @@ pub trait Approver: Send + Sync {
     fn model(&self) -> Option<&str> {
         None
     }
+
+    /// Whether this approver may answer for its own model (0.42.0).
+    ///
+    /// `false` — the default — is what makes the refusal the default. It is read
+    /// only when [`Self::model`] names one, so an approver that is not a model is
+    /// unaffected either way.
+    fn self_approval_allowed(&self) -> bool {
+        false
+    }
 }
 
 /// Approves everything. For tests and for callers who want the policy's denies
@@ -474,6 +483,7 @@ impl<P> ModelApprover<P> {
     /// ```
     /// # use io_harness::ModelApprover;
     /// # fn demo<P: io_harness::Provider + std::fmt::Debug + Send + Sync>(provider: P) {
+    /// use io_harness::Approver;
     /// let approver = ModelApprover::new(provider, "one-model").allow_self_approval(true);
     /// assert!(approver.self_approval_allowed());
     /// # }
@@ -481,11 +491,6 @@ impl<P> ModelApprover<P> {
     pub fn allow_self_approval(mut self, allow: bool) -> Self {
         self.allow_self = allow;
         self
-    }
-
-    /// Whether this approver may answer for its own model.
-    pub fn self_approval_allowed(&self) -> bool {
-        self.allow_self
     }
 }
 
@@ -604,6 +609,10 @@ impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Approver for 
 
     fn model(&self) -> Option<&str> {
         Some(&self.model)
+    }
+
+    fn self_approval_allowed(&self) -> bool {
+        self.allow_self
     }
 }
 
