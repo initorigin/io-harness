@@ -368,7 +368,7 @@ tasks:
     of every two-armed claim.'
   why_required: A criterion nobody tried to break is a criterion nobody has tested. The sabotage pass
     and the platform matrix are what turn the contract's claims into evidence the record can cite.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.42.0-T07
   acceptance_criteria:
@@ -396,4 +396,32 @@ tasks:
   - tests/model_approver.rs
   - tests/tool_hooks.rs
   - tests/review_change.rs
-  evidence: []
+  evidence:
+  - TEN sabotages, each failing a NAMED test, none silent. S1 the context is built empty → F1. S2 an unreadable
+    verdict approves → F2. S3 the defaulted `decide_in_context` does not forward → F3. S4 the self-approval
+    check is not taken → F4. S5 the gate's refusal is ignored → F5. S6 a lifecycle hook defaults to continue
+    → F7. S7 the `tools` filter is ignored → N4's spawn count. S8 a gated batch is run one call at a time
+    → N4's rendezvous. S9 `before` is read from the file as it stands → F8. S10 the defaulted `review_change`
+    does not forward → F9. Every sabotage was reverted by `git checkout` and the tree re-verified afterwards.
+  - 'The four load-bearing sabotages were checked for HOW they failed: S1, S5, S8 and S9 each produce
+    `panicked at` in the named test with no compile error, so the criterion caught the defect rather than
+    the compiler catching the edit.'
+  - 'O1/the suites, in separate invocations under a redirected `XDG_CONFIG_HOME`: `cargo test` exit 0,
+    70 binaries, **1423 passed / 0 failed**; `cargo test --all-features` exit 0, 70 binaries, **1502 passed
+    / 0 failed**. Doctests are inside both figures and all of them pass.'
+  - 'Per-suite counts read with each suite run ALONE (trap 118): `model_approver` 5, `tool_hooks` 6, `review_change`
+    2.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` exit 0 — after fixing one `needless_range_loop`
+    the extracted scanner tripped. `cargo fmt --check` clean.'
+  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` exit 0, zero
+    warnings — the gate stable `cargo doc` cannot see, run before the release PR.'
+  - 'N2 — `cargo +1.95 check --all-features --lib` exit 0: MSRV unmoved.'
+  - N1 — `cargo tree` **402** lines, the same figure as 0.41.0 and every release since 0.23.0. The approver
+    uses the crate's own `Provider` trait and the hook uses `std::process`, which 0.28.0 already spawns
+    through.
+  - 'O2 — no store migration. `git diff main -- src/state.rs` is **empty**: not one line of the schema
+    file changed. `CHECKPOINT_FORMAT` unmoved at **7**. The cross-version gate: `cargo build --manifest-path
+    tests/fixtures/gen-0.29.0/Cargo.toml` exit 0, then `cargo test --test cross_version_0_29_0 -- --ignored`
+    exit 0, 1 passed — a 0.29.0 binary reading a store this tree wrote.'
+  - '`cargo clean && cargo package --locked` exit 0, producing `io-harness-0.42.0.crate` at **1,424,538
+    bytes**. Disk checked before and after: 61 GiB free.'
