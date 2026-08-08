@@ -257,7 +257,7 @@ tasks:
   why_required: The review criterion answers from post-change contents today, which cannot show a deletion.
     Without this the release's third capability does not exist, and the criterion keeps being answered
     from the wrong evidence.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F8 — the reviewer is handed the change, and the change contains what was deleted.** A recorded
@@ -281,7 +281,30 @@ tasks:
   - src/run.rs
   - src/lib.rs
   - tests/review_change.rs
-  evidence: []
+  evidence:
+  - '`FileChange { path, before, after, unkept }` and `ChangeReview { goal, rubric, changes }` landed
+    in `src/verify.rs`, both `#[non_exhaustive]`, re-exported from `src/lib.rs`. `ChangeReview::into_outcome_request`
+    is the one place the old shape is now built.'
+  - '`Reviewer::review_change` is defaulted to `self.review(request.into_outcome_request())`, so `ReviewRequest`
+    was not touched at all — no field, no `#[non_exhaustive]`, no break. `ModelReviewer` overrides it
+    and prompts with a before/after section per file; both paths now go through one `ModelReviewer::judge`,
+    so the system prompt and the verdict parse cannot drift between them.'
+  - 'The change comes from the store''s existing rows: `written_changes` reads `Store::snapshot(run_id,
+    path)` — the restore point 0.28.0 has written at each file''s FIRST edit, which is exactly "before
+    this run touched it". `Kept::Text`, `Kept::Absent` and `Kept::Unkept` map onto `before: Some`, `before:
+    None` and `unkept: Some(why)`. **No table, column or index was added**, and the stored hunks stay
+    0.51.0''s.'
+  - 'A store with no row for a path reports `unkept: "no restore point was recorded"` rather than `Absent`:
+    claiming the run created a file it only rewrote is the one wrong answer a reviewer could not detect.'
+  - F8 — `the_reviewing_model_is_shown_what_the_run_removed` passes. The reviewing prompt contains a line
+    the run **deleted**, asserted alongside the proof that the file itself no longer holds it; it contains
+    the added line; a file the run created appears with no before; a file the run never touched does not
+    appear at all.
+  - F9 — `a_reviewer_that_overrides_nothing_still_reads_the_outcome` passes. A reviewer implementing only
+    `review` receives the files the run wrote with their contents as they stand, exactly as on 0.41.0,
+    and its verdict decides the gate. It passed BEFORE the implementation landed and still passes after,
+    which is the point of it.
+  - '`cargo test --test review_change --test review` exit 0: 2 and 11 passed.'
 - id: US-IO-HARNESS-0.42.0-T07
   summary: 'Bump to 0.42.0 and bring the checked-in doc surfaces with it: `docs/CONTRACT.md`, the tool
     and approval guide pages, `CHANGELOG.md` and `docs/public-api.txt`, each new public item carrying

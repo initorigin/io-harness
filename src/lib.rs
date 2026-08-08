@@ -463,6 +463,7 @@ pub use tools::{
     PROPOSE_PLAN_TOOL, TODO_WRITE_TOOL,
 };
 pub use verify::{
-    ExecGuard, ModelReviewer, Review, ReviewRequest, Reviewer, Reviewing, Verification, TEST_BINARY,
+    ChangeReview, ExecGuard, FileChange, ModelReviewer, Review, ReviewRequest, Reviewer, Reviewing,
+    Verification, TEST_BINARY,
 };
 pub use web::{Citation, ServerToolCall, WebAccess};

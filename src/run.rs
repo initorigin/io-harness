@@ -3005,12 +3005,12 @@ async fn evaluate_gate(
                 )?;
                 return Err(e);
             };
-            let request = crate::verify::ReviewRequest {
+            let request = crate::verify::ChangeReview {
                 goal: contract.goal.clone(),
                 rubric: rubric.clone(),
-                files: written_files(store, run_id, root),
+                changes: written_changes(store, run_id, root),
             };
-            match reviewer.review(request).await {
+            match reviewer.review_change(request).await {
                 Ok(review) => {
                     watch.emit(RunEvent::at_depth(
                         run_id,
@@ -3094,19 +3094,43 @@ fn gate_phase(verify: &Verification) -> &'static str {
 /// walking the tree, so a reviewer is handed the run's change and not the
 /// repository. A path that has since been deleted is skipped: a reviewer reading
 /// an empty file it was told exists would be judging an artefact of the read.
-fn written_files(store: &Store, run_id: i64, root: &Path) -> Vec<(PathBuf, String)> {
+fn written_changes(store: &Store, run_id: i64, root: &Path) -> Vec<crate::verify::FileChange> {
     let mut seen: Vec<String> = Vec::new();
-    let mut files = Vec::new();
+    let mut changes = Vec::new();
     for edit in store.edits(run_id).unwrap_or_default() {
         if seen.contains(&edit.path) {
             continue;
         }
         seen.push(edit.path.clone());
-        if let Ok(contents) = std::fs::read_to_string(root.join(&edit.path)) {
-            files.push((PathBuf::from(&edit.path), contents));
-        }
+        // The file as it stands. A path the run wrote and something then removed
+        // is skipped rather than reported as empty, which is what `written_files`
+        // has always done and is the honest reading: there is nothing to review.
+        let Ok(after) = std::fs::read_to_string(root.join(&edit.path)) else {
+            continue;
+        };
+        // The way it was, from the restore point the store has kept since 0.28.0.
+        // One row per file per run, written at the *first* edit, which is exactly
+        // "before this run touched it" — the boundary a reviewer of a change
+        // wants, and not the one before the last edit.
+        let (before, unkept) = match store.snapshot(run_id, &edit.path).ok().flatten() {
+            Some(snap) => match snap.kept {
+                crate::state::Kept::Text(text) => (Some(text), None),
+                crate::state::Kept::Absent => (None, None),
+                crate::state::Kept::Unkept(why) => (None, Some(why)),
+            },
+            // No row at all: a store written before restore points, or one this
+            // version does not understand. Absent is the wrong answer — it would
+            // claim the run created the file — so it is reported as not kept.
+            None => (None, Some("no restore point was recorded".to_string())),
+        };
+        changes.push(crate::verify::FileChange {
+            path: PathBuf::from(&edit.path),
+            before,
+            after,
+            unkept,
+        });
     }
-    files
+    changes
 }
 
 /// How many gate attempts in a row, most recent first, ended without passing
@@ -3131,7 +3155,6 @@ fn consecutive_gate_failures(store: &Store, run_id: i64) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-/// Bytes the run has written, as they stand on disk (0.34.0).
 ///
 /// What [`Routing::downshift_under`](crate::Routing) measures. On disk rather
 /// than summed from the edits, because an edit that replaced a file twice is one
