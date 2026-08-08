@@ -90,7 +90,7 @@ tasks:
     one. An ordering slip that survives a single comparison is exactly the once-in-twenty defect that
     would surface later as an unreproducible trace, so the repeat count is part of the criterion rather
     than a nicety.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.41.0-T01
   acceptance_criteria:
@@ -109,14 +109,35 @@ tasks:
     '
   files:
   - tests/parallel_reads.rs
-  evidence: []
+  evidence:
+  - 'F2 and N4 — `a_batched_run_and_a_serial_run_leave_identical_traces_every_time` passes. One case recorded
+    through `provider::Record` over a completion of eight `read_file` calls split by two `write_file`
+    calls, then replayed twice per round through `provider::Replay` — cap 10 and cap 1 — into two fresh
+    in-memory stores. The comparison is a tuple of the whole `RunOutcome`, `store.steps`, `store.observations`,
+    `store.edits` and `store.spent_tokens`, compared with `assert_eq!`: equality of what the store holds,
+    not a normalisation.'
+  - 'The workspace is re-seeded before every run, so all three runs make byte-identical requests. That
+    is load-bearing rather than tidiness: `Replay` keys on the request content, so a run whose prompt
+    differed at all would fail to be answered rather than diverge quietly.'
+  - N4 — the comparison runs twenty times in one test. Each round also asserts that the case really wrote
+    (2 `Edit` rows) and really read (8 `ObsKind::Read` observations), so an empty comparison cannot pass
+    for a clean one.
+  - 'Sabotage S4 — fold results in completion order rather than call order (assign each joined result
+    to the earliest free slot): fails `the_cap_bounds_calls_in_flight_and_all_of_them_still_land_in_order`
+    with the twenty targets scrambled inside each wave.'
+  - 'FINDING, recorded rather than propped up: S4 fails NOTHING against F2 on its own. Eight built-in
+    `read_file` calls are synchronous, so they complete in the order they were spawned and call order
+    and completion order are the same answer. The ordering claim is therefore carried by F6, whose fixture
+    sleeps for longer the earlier a tool appears in the completion so that the two orders genuinely differ.
+    F2 remains worth having — it is what proves the two caps produce identical stored rows — but it is
+    not the discriminating test for the fold.'
 - id: US-IO-HARNESS-0.41.0-T03
   summary: Prove a mutating call is never overlapped or reordered against a read, and that a pause inside
     a batch leaves no observation, step or ledger draw behind for the calls after it.
   why_required: These are the two safety halves of the partition. Without the first, a read after a write
     could observe pre-write content and context assembly would reason from it silently; without the second,
     an operator could be shown work that was recorded before they approved it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.41.0-T01
   acceptance_criteria:
@@ -138,7 +159,24 @@ tasks:
   files:
   - tests/parallel_reads.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - 'F3 — `a_write_is_not_overlapped_and_a_read_after_it_sees_what_it_wrote` passes. One completion of
+    [read a, read b, write a, read a]: four observations in call order, the first reads `before`, the
+    fourth reads `after` and not `before`, and exactly one `Edit` row landed. Asserted from the stored
+    observations, not from timing.'
+  - 'F4 — `a_pause_in_a_batch_records_nothing_for_the_calls_after_it` passes. Five read-only calls with
+    `Effect::Ask` on the third and a deferring approver: the run stops `AwaitingApproval`, the store holds
+    two observations and no more, spent tokens are 0, and the two calls after the pause were never entered.
+    Resuming with `resume_with_decision` and an approving approver runs all three of the released calls.'
+  - 'Sabotage S5 — batch every read-only call in the completion, gathering them across the mutating ones:
+    fails F3 (the fourth call observes `before`) and fails F2 as well. This is the defect the maximal-run
+    partition exists to prevent and it is caught in two places.'
+  - 'FINDING that changed the test: the sabotage the contract names for F4 — start the whole batch before
+    checking the policy — failed NOTHING against five `read_file` calls. A file read has no side effect,
+    and the fold stops at the pause, so work started past it leaves no trace at all. F4 was rewritten
+    to use five registered read-only tools that record their own entry; the same sabotage then fails it
+    at once, with look_4 and look_5 in the entered list. An assertion about work not starting needs a
+    fixture that can observe starting.'
 - id: US-IO-HARNESS-0.41.0-T04
   summary: Prove a registered tool's `effect()` is respected in both directions, and that the public surface
     grows by exactly the three new items and nothing else.
@@ -146,7 +184,7 @@ tasks:
     is ignored in either direction is worse than not having it: a `Mutating` tool run concurrently breaks
     an embedder''s own invariants, and a `ReadOnly` one left serial delivers none of the gain it opted
     into.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.41.0-T01
   acceptance_criteria:
@@ -166,7 +204,24 @@ tasks:
   - tests/parallel_reads.rs
   - src/tools/custom.rs
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - 'F5 — `a_registered_tools_declared_effect_decides_whether_it_is_batched` passes both arms. Two registered
+    tools identical but for `effect()`, sharing a barrier of two, with a built-in `read_file` between
+    them in the completion: declaring `ReadOnly` they are one batch and the rendezvous is met inside the
+    60s bound; declaring `Mutating` — same tools, same barrier, same completion — the run cannot finish
+    inside 5s. The built-in read between them is load-bearing: were it treated as mutating it would split
+    the run and the first arm would fail too.'
+  - 'Sabotage S7 — ignore the trait method and treat every registered tool as read-only: fails F5''s second
+    arm, ''the rendezvous cannot be met — it was, which means the declaration was ignored''.'
+  - '`ToolEffect` was moved above the `Tool` trait so the trait keeps its own doc block: inserting it
+    mid-block left `trait Tool` with a doc comment carrying no fence and `every_public_item_has_a_worked_example`
+    reported it. Both public-surface gates now pass over 198 items.'
+  - 'DEVIATION on N3, the same shape as 0.39.0''s fact 114: `docs/public-api.txt` diffs by exactly ONE
+    line, `enum ToolEffect src/tools/custom.rs`, not three. The checker enumerates the names re-exported
+    from `src/lib.rs`; `Tool::effect` is a method on an already-listed trait and `TaskContract::max_parallel_reads`
+    / `with_max_parallel_reads` are members of an already-listed struct, so neither adds a line. The break
+    budget the criterion meant to bound is unchanged — three items added, none removed or altered — and
+    the file is the assertion for the part of it the file can see.'
 - id: US-IO-HARNESS-0.41.0-T05
   summary: 'Document the guarantee: `docs/CONTRACT.md`, `ToolEffect` in `docs/guide/tools-and-skills.md`,
     the changelog entry with no migration note, and the version bump.'

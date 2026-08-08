@@ -63,18 +63,27 @@ impl Tool for Rendezvous {
 
 /// A read-only tool that records how many of its kind were running when it
 /// started, so the cap can be read off the peak rather than off a clock.
+///
+/// It also finishes out of order on purpose: `settle` is longer the earlier the
+/// tool appears in the completion, so within each wave the model's first call is
+/// the last to return. Nothing asserts that it worked — a runner that ran them in
+/// order anyway would still pass — but where it does work, "in call order" and
+/// "in completion order" are two different answers and the ordering claim has
+/// something to be wrong about.
 struct Counted {
     name: String,
     live: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
+    settle: Duration,
 }
 
 impl Counted {
-    fn new(name: &str, live: &Arc<AtomicUsize>, peak: &Arc<AtomicUsize>) -> Self {
+    fn new(name: &str, live: &Arc<AtomicUsize>, peak: &Arc<AtomicUsize>, settle: Duration) -> Self {
         Self {
             name: name.into(),
             live: Arc::clone(live),
             peak: Arc::clone(peak),
+            settle,
         }
     }
 }
@@ -92,10 +101,10 @@ impl Tool for Counted {
         Box::pin(async move {
             let now = self.live.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
-            // Two yields, so every task the bound admitted has a turn to count
-            // itself in before the first one counts itself out.
-            tokio::task::yield_now().await;
-            tokio::task::yield_now().await;
+            // Long enough that every task the bound admitted has counted itself
+            // in before the first one counts itself out, and uneven so they do
+            // not come back in the order they went out.
+            tokio::time::sleep(self.settle).await;
             self.live.fetch_sub(1, Ordering::SeqCst);
             Ok(self.name.clone())
         })
@@ -293,8 +302,9 @@ async fn the_cap_bounds_calls_in_flight_and_all_of_them_still_land_in_order() {
     let peak = Arc::new(AtomicUsize::new(0));
     let names: Vec<String> = (0..20).map(|i| format!("count_{i:02}")).collect();
     let mut tools = Toolbox::new();
-    for name in &names {
-        tools = tools.with(Counted::new(name, &live, &peak));
+    for (i, name) in names.iter().enumerate() {
+        let settle = Duration::from_millis(20 - i as u64 % 20);
+        tools = tools.with(Counted::new(name, &live, &peak, settle));
     }
 
     let contract = never_passes(dir.path(), 1)
@@ -399,6 +409,420 @@ async fn dropping_a_run_mid_batch_leaves_nothing_running() {
             .map(|r| store.steps(r).unwrap().len()),
         "the store must be unchanged after the run went away"
     );
+}
+
+// ---------------------------------------------------------------- F5
+
+/// F5 — a registered tool's `effect()` is respected in both directions.
+///
+/// Two registered tools, identical but for what `effect()` returns, and a
+/// built-in `read_file` sitting between them in the completion. When they declare
+/// `ReadOnly` the three calls are one batch and the rendezvous is met; when they
+/// declare `Mutating` — same tools, same barrier, same completion — each runs on
+/// its own and the rendezvous can never be met, so the bounded timeout fires.
+///
+/// The built-in read between them is load-bearing: if it were treated as
+/// mutating it would split the run in two and the first arm would fail as well.
+#[tokio::test]
+async fn a_registered_tools_declared_effect_decides_whether_it_is_batched() {
+    for (effect, must_meet) in [(ToolEffect::ReadOnly, true), (ToolEffect::Mutating, false)] {
+        let dir = ws();
+        std::fs::write(dir.path().join("between.txt"), "in the middle\n").unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let tools = Toolbox::new()
+            .with(Rendezvous::new("pair_a", &barrier, effect))
+            .with(Rendezvous::new("pair_b", &barrier, effect));
+        let script = MockScript::new(vec![vec![
+            call("pair_a"),
+            ToolCall {
+                name: "read_file".into(),
+                arguments: json!({ "path": "between.txt" }),
+            },
+            call("pair_b"),
+        ]]);
+
+        let contract = never_passes(dir.path(), 1).with_tools(tools);
+        let store = Store::memory().unwrap();
+        let bound = if must_meet {
+            MUST_FINISH
+        } else {
+            MUST_NOT_FINISH
+        };
+        let ran = tokio::time::timeout(
+            bound,
+            run_with(&contract, &script, &store, &open_policy(), &ApproveAll),
+        )
+        .await;
+
+        if must_meet {
+            ran.expect(
+                "two tools declaring ReadOnly, with a built-in read between them, \
+                 are one batch and must meet",
+            )
+            .expect("the run itself must not error");
+        } else {
+            assert!(
+                ran.is_err(),
+                "tools declaring Mutating run one at a time, so the rendezvous \
+                 cannot be met — it was, which means the declaration was ignored"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------- F3
+
+/// F3 — a mutating call is never overlapped, and never reordered against a read.
+///
+/// One completion of `[read a, read b, write a, read a]`. The fourth call's
+/// observation contains what the third wrote, and the write does not begin until
+/// the first two have folded — asserted from the stored observations rather than
+/// from timing.
+#[tokio::test]
+async fn a_write_is_not_overlapped_and_a_read_after_it_sees_what_it_wrote() {
+    let dir = ws();
+    std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "beta\n").unwrap();
+
+    let read = |path: &str| ToolCall {
+        name: "read_file".into(),
+        arguments: json!({ "path": path }),
+    };
+    let script = MockScript::new(vec![vec![
+        read("a.txt"),
+        read("b.txt"),
+        ToolCall {
+            name: "write_file".into(),
+            arguments: json!({ "path": "a.txt", "content": "after\n" }),
+        },
+        read("a.txt"),
+    ]]);
+
+    let store = Store::memory().unwrap();
+    let result = run_with(
+        &never_passes(dir.path(), 1),
+        &script,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let seen: Vec<String> = store
+        .observations(result.run_id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .collect();
+    assert_eq!(
+        seen.len(),
+        4,
+        "one observation per call, in call order: {seen:?}"
+    );
+    assert!(
+        seen[0].contains("before") && !seen[0].contains("after"),
+        "the first read runs before the write: {:?}",
+        seen[0]
+    );
+    assert!(seen[1].contains("beta"), "the second read: {:?}", seen[1]);
+    assert!(
+        seen[2].contains("a.txt"),
+        "the write is the third artifact, between the two batches: {:?}",
+        seen[2]
+    );
+    assert!(
+        seen[3].contains("after") && !seen[3].contains("before"),
+        "the fourth call must observe what the third wrote, which it can only do \
+         if the write neither overlapped it nor was reordered past it: {:?}",
+        seen[3]
+    );
+    assert_eq!(
+        store.edits(result.run_id).unwrap().len(),
+        1,
+        "exactly one write landed"
+    );
+}
+
+// ---------------------------------------------------------------- F4
+
+/// A read-only tool that writes down the fact that it was entered at all.
+///
+/// F4 needs this rather than `read_file`, and the reason is a finding rather than
+/// a preference: a batch that starts work past a pause and then folds only up to
+/// the pause leaves *no* trace of the trailing built-in reads — a file read has no
+/// side effect to catch it out. The sabotage that removes the collapse therefore
+/// fails nothing against `read_file` and fails immediately here, where "was this
+/// call started" is a question the fixture can answer.
+struct Announcing {
+    name: String,
+    entered: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl Tool for Announcing {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            name: self.name.clone(),
+            description: "Records that it ran.".into(),
+            parameters: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    fn invoke<'a>(&'a self, _arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+        Box::pin(async move {
+            self.entered.lock().unwrap().push(self.name.clone());
+            Ok(format!("{} ran", self.name))
+        })
+    }
+
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+}
+
+/// F4 — a pause inside a batch leaves no partial work behind.
+///
+/// Five read-only calls where the policy marks the third `Ask` and the approver
+/// defers. The run stops `AwaitingApproval`; the store holds observations for the
+/// two calls before it and none for the two after it, neither of which was even
+/// entered; and resuming on approval proceeds from the deferred call.
+#[tokio::test]
+async fn a_pause_in_a_batch_records_nothing_for_the_calls_after_it() {
+    use io_harness::approve::{Approver, Decision, DecisionFuture, Request};
+    use io_harness::{Act, Effect};
+
+    struct Defer;
+    impl Approver for Defer {
+        fn decide<'a>(&'a self, _r: &'a Request) -> DecisionFuture<'a> {
+            Box::pin(async { Decision::Defer })
+        }
+    }
+
+    let dir = ws();
+    let names: Vec<String> = (1..=5).map(|i| format!("look_{i}")).collect();
+    let entered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut tools = Toolbox::new();
+    for name in &names {
+        tools = tools.with(Announcing {
+            name: name.clone(),
+            entered: Arc::clone(&entered),
+        });
+    }
+    // `Ask` outranks `Allow`, so the third call is the one that stops.
+    let asking = open_policy().rule(Act::Exec, Effect::Ask, "look_3");
+    let script = || MockScript::new(vec![names.iter().map(|n| call(n)).collect()]);
+
+    let path = dir.path().join("runs.db");
+    let store = Store::open(&path).unwrap();
+    let contract = never_passes(dir.path(), 2).with_tools(tools);
+    let paused = run_with(&contract, &script(), &store, &asking, &Defer)
+        .await
+        .unwrap();
+    let request_id = match paused.outcome {
+        io_harness::RunOutcome::AwaitingApproval { request_id, .. } => request_id,
+        other => panic!("expected AwaitingApproval, got {other:?}"),
+    };
+
+    let seen: Vec<String> = store
+        .observations(paused.run_id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .collect();
+    assert_eq!(
+        seen.len(),
+        2,
+        "only the two calls before the deferred one may have been recorded: {seen:?}"
+    );
+    for early in &names[..2] {
+        assert!(
+            seen.iter().any(|t| t.contains(early.as_str())),
+            "{early} ran before the pause and must be in the ledger: {seen:?}"
+        );
+    }
+    for late in &names[2..] {
+        assert!(
+            !seen.iter().any(|t| t.contains(late.as_str())),
+            "{late} is at or after the pause and must have left nothing behind: {seen:?}"
+        );
+    }
+    assert_eq!(
+        *entered.lock().unwrap(),
+        names[..2].to_vec(),
+        "a call at or after the pause must not have been started, let alone \
+         recorded — the batch collapses from the first decision that is not an \
+         outright allow"
+    );
+    assert_eq!(
+        store.spent_tokens(paused.run_id).unwrap(),
+        0,
+        "the fixture provider reports no usage, so any draw here would be one the \
+         trailing calls made"
+    );
+
+    // The human approves, and the run picks up from the call it stopped on.
+    let resumed = io_harness::resume_with_decision(
+        &contract,
+        &script(),
+        &store,
+        paused.run_id,
+        request_id,
+        Decision::approve(),
+        &asking,
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    let after: Vec<String> = store
+        .observations(resumed.run_id)
+        .unwrap()
+        .into_iter()
+        .map(|o| o.text)
+        .collect();
+    for released in &names[2..] {
+        assert!(
+            after.iter().any(|t| t.contains(released.as_str())),
+            "{released} is at or after the approval and must run once it is \
+             given: {after:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------- F2 and N4
+
+/// The eight files the recorded case reads.
+const READS: &[&str] = &["a", "b", "c", "d", "e", "f", "g", "h"];
+
+/// Put the workspace back exactly as it was, so every run of the recorded case
+/// starts from the same tree and the requests it makes are identical — which is
+/// what lets one recording answer all of them.
+fn seed(root: &std::path::Path) {
+    for name in READS {
+        std::fs::write(
+            root.join(format!("{name}.txt")),
+            format!("contents of {name}\n"),
+        )
+        .unwrap();
+    }
+    for out in ["out_1.txt", "out_2.txt"] {
+        let _ = std::fs::remove_file(root.join(out));
+    }
+}
+
+/// Eight reads mixed with two writes, in one completion. The two writes split the
+/// reads into two batches of four, so the case exercises the partition rather
+/// than one long run of reads.
+fn mixed_completion() -> Vec<ToolCall> {
+    let read = |name: &str| ToolCall {
+        name: "read_file".into(),
+        arguments: json!({ "path": format!("{name}.txt") }),
+    };
+    let write = |path: &str, content: &str| ToolCall {
+        name: "write_file".into(),
+        arguments: json!({ "path": path, "content": content }),
+    };
+    let mut calls: Vec<ToolCall> = READS[..4].iter().map(|n| read(n)).collect();
+    calls.push(write("out_1.txt", "first\n"));
+    calls.extend(READS[4..].iter().map(|n| read(n)));
+    calls.push(write("out_2.txt", "second\nthird\n"));
+    calls
+}
+
+/// Everything the store holds about one run of the case, in one comparable value.
+type Trace = (
+    io_harness::RunOutcome,
+    Vec<io_harness::StepRecord>,
+    Vec<io_harness::context::Observation>,
+    Vec<io_harness::Edit>,
+    u64,
+);
+
+async fn drive(root: &std::path::Path, provider: &impl Provider, cap: usize) -> Trace {
+    seed(root);
+    let contract = never_passes(root, 1).with_max_parallel_reads(cap);
+    let store = Store::memory().unwrap();
+    let result = run_with(&contract, provider, &store, &open_policy(), &ApproveAll)
+        .await
+        .expect("the recorded case must replay");
+    let id = result.run_id;
+    (
+        result.outcome,
+        store.steps(id).unwrap(),
+        store.observations(id).unwrap(),
+        store.edits(id).unwrap(),
+        store.spent_tokens(id).unwrap(),
+    )
+}
+
+/// F2 — the trace is identical whether or not it ran concurrently, and N4 — it is
+/// identical every time.
+///
+/// One recorded case, replayed into two stores: once at cap 10, once at cap 1.
+/// The stored steps, the observations in the ledger, the decision strings, the
+/// `Edit` rows, the ledger draw and the final `RunOutcome` compare equal row for
+/// row. Not "equivalent" and not a normalisation — equality of what the store
+/// holds.
+///
+/// Repeated twenty times, because concurrency that is deterministic nineteen
+/// times out of twenty is a defect this release must not ship and one run cannot
+/// see it.
+#[tokio::test]
+async fn a_batched_run_and_a_serial_run_leave_identical_traces_every_time() {
+    let dir = ws();
+    let path = dir.path().join("recording.json");
+
+    // Record the case once, against a counter-keyed mock, then answer every
+    // later run from the recording — which keys on the request's content, so a
+    // run whose prompt differed at all would fail to be answered rather than
+    // quietly diverge.
+    seed(dir.path());
+    let recorder = io_harness::provider::Record::new(MockScript::new(vec![mixed_completion()]));
+    run_with(
+        &never_passes(dir.path(), 1),
+        &recorder,
+        &Store::memory().unwrap(),
+        &open_policy(),
+        &ApproveAll,
+    )
+    .await
+    .expect("the recording run must succeed");
+    recorder.save(&path).unwrap();
+
+    for round in 0..20 {
+        let batched = drive(
+            dir.path(),
+            &io_harness::provider::Replay::load(&path).unwrap(),
+            10,
+        )
+        .await;
+        let serial = drive(
+            dir.path(),
+            &io_harness::provider::Replay::load(&path).unwrap(),
+            1,
+        )
+        .await;
+        assert_eq!(
+            batched, serial,
+            "round {round}: a run that batched its reads must leave exactly the \
+             trace the serial run left — outcome, steps, observations, edits and \
+             ledger draw"
+        );
+        assert_eq!(
+            batched.3.len(),
+            2,
+            "round {round}: the case must actually have written, or the edit \
+             comparison proves nothing"
+        );
+        assert_eq!(
+            batched
+                .2
+                .iter()
+                .filter(|o| o.kind == io_harness::context::ObsKind::Read)
+                .count(),
+            8,
+            "round {round}: all eight reads must be in the ledger"
+        );
+    }
 }
 
 /// A registered tool is `Mutating` unless it says otherwise, so a toolbox

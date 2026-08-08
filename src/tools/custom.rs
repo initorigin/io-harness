@@ -88,40 +88,6 @@ use crate::provider::ToolSpec;
 /// [`Provider`]: crate::Provider
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
-/// An action the embedding program lets the agent take.
-///
-/// Implement it for anything the model should be able to do that the built-in
-/// filesystem tools cannot: query your database, call your internal API, render
-/// your template, ask your UI. The result is text, as an MCP tool result already
-/// is — the model reads it, so it has to be readable.
-///
-/// ```
-/// use io_harness::tools::{Tool, ToolFuture};
-/// use io_harness::ToolSpec;
-/// use serde_json::json;
-///
-/// struct Uppercase;
-///
-/// impl Tool for Uppercase {
-///     fn spec(&self) -> ToolSpec {
-///         ToolSpec {
-///             name: "uppercase".into(),
-///             description: "Upper-case the `text` argument.".into(),
-///             parameters: json!({
-///                 "type": "object",
-///                 "properties": { "text": { "type": "string" } },
-///                 "required": ["text"]
-///             }),
-///         }
-///     }
-///
-///     fn invoke<'a>(&'a self, arguments: &'a serde_json::Value) -> ToolFuture<'a> {
-///         let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
-///         Box::pin(async move { Ok(text) })
-///     }
-/// }
-/// ```
-///
 /// Whether calling a tool can change anything (0.41.0).
 ///
 /// The step loop dispatches the read-only calls in one completion concurrently
@@ -180,6 +146,40 @@ pub enum ToolEffect {
     Mutating,
 }
 
+/// An action the embedding program lets the agent take.
+///
+/// Implement it for anything the model should be able to do that the built-in
+/// filesystem tools cannot: query your database, call your internal API, render
+/// your template, ask your UI. The result is text, as an MCP tool result already
+/// is — the model reads it, so it has to be readable.
+///
+/// ```
+/// use io_harness::tools::{Tool, ToolFuture};
+/// use io_harness::ToolSpec;
+/// use serde_json::json;
+///
+/// struct Uppercase;
+///
+/// impl Tool for Uppercase {
+///     fn spec(&self) -> ToolSpec {
+///         ToolSpec {
+///             name: "uppercase".into(),
+///             description: "Upper-case the `text` argument.".into(),
+///             parameters: json!({
+///                 "type": "object",
+///                 "properties": { "text": { "type": "string" } },
+///                 "required": ["text"]
+///             }),
+///         }
+///     }
+///
+///     fn invoke<'a>(&'a self, arguments: &'a serde_json::Value) -> ToolFuture<'a> {
+///         let text = arguments.get("text").and_then(|v| v.as_str()).unwrap_or("").to_uppercase();
+///         Box::pin(async move { Ok(text) })
+///     }
+/// }
+/// ```
+///
 /// Returning `Err` is not a run failure. The error text becomes an observation
 /// the agent can adapt to, the same treatment `grep` gives a malformed regex —
 /// only the model can decide whether a failed lookup means "try another id" or
