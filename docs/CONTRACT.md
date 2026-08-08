@@ -962,6 +962,66 @@ is the contract's bound on a wedged command and is raised with
 raised in the config. A command stopped by the second is reported as a cap kill
 naming the resource, and one stopped by the first is reported as a timeout.
 
+## What running read-only tool calls together guarantees, and what it does not (0.41.0)
+
+Since 0.41.0 the loop may run several of one completion's tool calls at the same
+time. This is the guarantee that goes with it, because the change is only worth
+having if nothing an embedder can observe moved.
+
+**Order is the model's call order, always.** Observations, decisions, recorded
+steps, `Edit` rows, budget draws and the events an `Observer` receives are folded
+back in the order the model asked for the calls, never in the order they
+finished. A run's trace, its context assembly, its ledger and its replay are the
+same as the serial run of the same recorded case — identical rows, not equivalent
+ones. Concurrency here is an execution detail and the release treats any drift in
+that as the defect it would be.
+
+**Only read-only calls overlap.** Three built-ins are read-only: `grep`, `find`
+and `read_file`. Everything else built in runs one at a time, in order, exactly as
+it did before — `write_file`, `edit_file`, `exec`, the four shell tools, the git
+built-ins, `list_dir`, `view_image`, spawn, `remember`, `todo_write`,
+`ask_question` and `propose_plan`. That includes the git readers and `list_dir`,
+which change nothing: `list_dir` is outside the set the release measured, and the
+git readers reach the world through a process, which a later release will decide
+about with its own evidence rather than by extension.
+
+**An MCP tool is never overlapped.** A server can advertise `readOnlyHint`, and
+honouring it means issuing overlapping requests on one `McpSession`. Whether that
+session multiplexes request ids over a shared stdio transport, and what a server
+that does not expect it does, is a question about the MCP client. It is recorded
+as an open question rather than answered by assumption.
+
+**A registered tool decides for itself, and the default is the safe answer.**
+`Tool::effect` returns `ToolEffect::Mutating` unless the implementation says
+otherwise, so a toolbox assembled before 0.41.0 behaves exactly as it did.
+Returning `ToolEffect::ReadOnly` is a promise the tool makes about itself, and
+the harness cannot check it — the tool is arbitrary code the embedding program
+compiled in. A tool that declares read-only and then writes breaks its own
+invariants and nobody else's, which is the same shape as every other `Tool`
+invariant and not a new class of exposure.
+
+**The ceiling is the contract's.** `TaskContract::max_parallel_reads` defaults to
+10 and clamps to a floor of 1; `0` means serial rather than an error. It bounds
+calls *in flight*, so the number that actually run together is `min(cap, the
+read-only calls in that completion)`. **`with_max_parallel_reads(1)` reproduces
+0.40.0's execution shape exactly** — the batch path is not entered at all — which
+is the supported way to rule the concurrency out while debugging something else.
+It bounds tool calls inside one step of one agent and nothing else;
+`Containment::max_concurrent_agents` bounds a tree's children, and the two caps
+are independent.
+
+**A pause collapses the batch.** A batch runs concurrently only while every call
+in it resolves to an outright allow. The first call an approver defers ends it:
+results already folded stand, the calls after it in that completion are not
+started — not merely not recorded — and the step stops as it always has. Because
+the collapse point is decided by the policy rather than by timing, the same
+recorded case collapses at the same call every time.
+
+**Nothing new is emitted, deliberately.** The same `EventKind::ToolCall` events,
+in the same order, with the same steps and the same ledger draws. An observer
+cannot tell from the event stream whether a batch ran concurrently. That is the
+guarantee, not a gap.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

@@ -88,6 +88,64 @@ use crate::provider::ToolSpec;
 /// [`Provider`]: crate::Provider
 pub type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
 
+/// Whether calling a tool can change anything (0.41.0).
+///
+/// The step loop dispatches the read-only calls in one completion concurrently
+/// and everything else one at a time, in the order the model asked. This is what
+/// a tool says about itself so the loop can tell the two apart:
+///
+/// ```
+/// use io_harness::tools::{Tool, ToolEffect, ToolFuture};
+/// use io_harness::ToolSpec;
+/// # use serde_json::{json, Value};
+///
+/// struct Lookup;
+///
+/// impl Tool for Lookup {
+///     # fn spec(&self) -> ToolSpec {
+///     #     ToolSpec { name: "lookup".into(), description: "Read a row.".into(),
+///     #                parameters: json!({"type": "object"}) }
+///     # }
+///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+///     #     Box::pin(async { Ok(String::new()) })
+///     # }
+///     fn effect(&self) -> ToolEffect {
+///         ToolEffect::ReadOnly
+///     }
+/// }
+///
+/// assert_eq!(Lookup.effect(), ToolEffect::ReadOnly);
+/// // The default is the conservative answer, so a tool written before 0.41.0
+/// // keeps running one at a time.
+/// # struct Older;
+/// # impl Tool for Older {
+/// #     fn spec(&self) -> ToolSpec {
+/// #         ToolSpec { name: "older".into(), description: "…".into(),
+/// #                    parameters: json!({"type": "object"}) }
+/// #     }
+/// #     fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+/// #         Box::pin(async { Ok(String::new()) })
+/// #     }
+/// # }
+/// assert_eq!(Older.effect(), ToolEffect::Mutating);
+/// ```
+///
+/// The declaration is a promise the tool makes about itself. The harness cannot
+/// check it — the tool is arbitrary code the embedding program compiled in — so a
+/// tool that reports [`ToolEffect::ReadOnly`] and then writes breaks its own
+/// invariants and nobody else's. That is why the default is
+/// [`ToolEffect::Mutating`]: concurrency is something an author opts into, never
+/// something a tool is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ToolEffect {
+    /// The call observes and changes nothing, so it may run at the same time as
+    /// other read-only calls in the same completion.
+    ReadOnly,
+    /// The call may change something. It runs on its own, in the order the model
+    /// asked for it — which is what every tool did before 0.41.0.
+    Mutating,
+}
+
 /// An action the embedding program lets the agent take.
 ///
 /// Implement it for anything the model should be able to do that the built-in
@@ -145,6 +203,48 @@ pub trait Tool: Send + Sync {
     /// observation would end runs that could have recovered. Read defensively
     /// and return `Err` with a message the model can act on.
     fn invoke<'a>(&'a self, arguments: &'a Value) -> ToolFuture<'a>;
+
+    /// Whether this tool changes anything (0.41.0).
+    ///
+    /// Defaulted to [`ToolEffect::Mutating`], so a tool written against any
+    /// earlier release compiles unchanged and keeps being called one at a time.
+    /// Override it with [`ToolEffect::ReadOnly`] to let the step loop run this
+    /// tool at the same time as the other read-only calls in one completion —
+    /// bounded by
+    /// [`TaskContract::max_parallel_reads`](crate::TaskContract::max_parallel_reads).
+    ///
+    /// ```
+    /// use io_harness::tools::{Tool, ToolEffect, ToolFuture};
+    /// use io_harness::ToolSpec;
+    /// # use serde_json::{json, Value};
+    ///
+    /// struct Weather;
+    ///
+    /// impl Tool for Weather {
+    ///     # fn spec(&self) -> ToolSpec {
+    ///     #     ToolSpec { name: "weather".into(), description: "Look the forecast up.".into(),
+    ///     #                parameters: json!({"type": "object"}) }
+    ///     # }
+    ///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+    ///     #     Box::pin(async { Ok("fine".to_string()) })
+    ///     # }
+    ///     // Asking an upstream service for a forecast changes nothing here or
+    ///     // there, so two of these may be in flight at once.
+    ///     fn effect(&self) -> ToolEffect {
+    ///         ToolEffect::ReadOnly
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(Weather.effect(), ToolEffect::ReadOnly);
+    /// ```
+    ///
+    /// Read once per call while the loop partitions a completion, and it must
+    /// answer the same way every time: a tool that changed its mind between the
+    /// partition and the call would be run in a way it had just said it must not
+    /// be.
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::Mutating
+    }
 }
 
 /// The set of [`Tool`]s registered for a run.

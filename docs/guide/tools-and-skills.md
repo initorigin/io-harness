@@ -99,6 +99,41 @@ let result = run_with(&contract, &provider, &store, &policy, &ApproveAll).await?
 
 Run it live: `cargo run --example custom_tool`.
 
+### Say whether your tool changes anything (0.41.0)
+
+`Tool` has one more method and it is defaulted, so nothing above needs editing:
+
+```rust,ignore
+use io_harness::tools::ToolEffect;
+
+impl Tool for Customers {
+    // spec() and invoke() exactly as above, plus:
+    fn effect(&self) -> ToolEffect {
+        ToolEffect::ReadOnly
+    }
+}
+```
+
+When a completion carries several tool calls, the loop runs the read-only ones at
+the same time and everything else one at a time. `effect()` is how your tool joins
+the first group. It defaults to `ToolEffect::Mutating`, so a toolbox written
+before 0.41.0 keeps running exactly as it did, and a tool becomes concurrent only
+because its author said it could.
+
+Three things are worth knowing before you change it:
+
+- **The declaration is a promise the harness cannot check.** Your tool is code the
+  crate compiled in; if it says `ReadOnly` and then writes, it has broken its own
+  invariants and nobody else's. Say `ReadOnly` when a call observes and changes
+  nothing — a lookup, a fetch, a query.
+- **Order does not change.** However the calls run, the observations, decisions,
+  steps and ledger draws are recorded in the order the model asked for them. An
+  observer cannot tell the difference, and that is the point.
+- **The ceiling is on the contract.** `TaskContract::with_max_parallel_reads`
+  bounds how many are in flight; it defaults to 10, and `1` puts the run back on
+  the pre-0.41.0 path exactly, which is the way to rule the concurrency out while
+  you are debugging something else.
+
 ## Skills: instructions, not code
 
 Point the contract at a directory of markdown. Both conventions in common use

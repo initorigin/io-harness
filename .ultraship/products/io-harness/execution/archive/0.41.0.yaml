@@ -1,0 +1,67 @@
+product: io-harness
+version: 0.41.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      The workspace records no `constraints` (`ultraship state` reports none, and `ultraship
+      constraints` refuses to read them without an active release), so this assessment is grounded
+      in the contract's own recorded `resource_profile.constraints` rather than in user-estimate
+      figures — and it names no number the framework did not measure.
+    - >
+      The first recorded constraint, "no new dependency in the default build; `tokio` is already
+      there and is sufficient", holds by construction. `tokio::task::JoinSet` ships in the runtime
+      the crate has depended on since 0.1.0; `cargo tree` is the assertion and it is checkable
+      before any code is written.
+    - >
+      The third recorded constraint, "additive only", is free. `TaskContract` has been
+      `#[non_exhaustive]` since 0.35.0 (`src/contract.rs:70`) so the new field costs no caller
+      anything, and the trait method is defaulted to the conservative answer so every existing
+      `Tool` implementation compiles and behaves exactly as it does today. The diff of
+      `docs/public-api.txt` is the whole break budget and it is three lines.
+    - >
+      The capability is not being built, it is being scheduled. Every read the release overlaps is a
+      call the loop already makes through `dispatch` (`src/run.rs:7118`) and every policy decision
+      those calls take is unchanged — the release moves when `dispatch` is called and never what it
+      does, which is why fit is `probable` rather than `uncertain` against a contract recording
+      `uncertainty: medium`.
+    - >
+      No live provider is required by any criterion. The evidence is barriers, counters and stored
+      rows compared row for row, all of it deterministic against the fixture and recorded providers
+      the repository already has.
+    - >
+      The contract records a `fallback_scope` that is a genuine retreat rather than a smaller
+      version of the same risk: dropping `ToolEffect` and the trait method leaves the partition, the
+      join, the fold and the pause discipline intact over the three built-in readers. If
+      `dispatch`'s parameter set resists splitting, the release still ships its headline outcome.
+  major_cost_drivers:
+    - >
+      `dispatch`'s signature is the driver that decides how this is built. It takes twenty-odd
+      parameters including `&Store`, `&mut PendingMedia` and the live process `handles`, and
+      `rusqlite::Connection` is `Send` and **not** `Sync` (a fact this project has already paid
+      for), so `&Store` cannot cross into a concurrent task at all. The shape that follows is a
+      serial policy phase that keeps the store on the loop's own thread, then a concurrent work
+      phase that touches only the workspace and the registered tool, then an ordered fold — rather
+      than a parameter-by-parameter audit of a function this size.
+    - >
+      `tokio::task::JoinSet` requires `'static` futures, and the read path borrows `&Workspace` and
+      `&Toolbox` from the loop. `Workspace` is `Clone` and each registered tool is already behind an
+      `Arc`, so the cost is owning what a task needs rather than reaching for a scoped-join crate
+      the contract excludes.
+    - >
+      Deciding the read-only set is a judgement, not a lookup, and the contract's two lists do not
+      settle `view_image`: it is absent from the three named `ReadOnly` built-ins and absent from
+      the enumerated `Mutating` ones, while the scope prose anticipates carrying its media back
+      through the fold. The reason for whichever way it goes has to be written down here, because
+      the next release that widens the set will read it rather than re-derive it.
+    - >
+      The barrier tests are the delicate part of the work. A rendezvous meant to deadlock on the
+      serial path must deadlock *bounded* — a plain barrier with no timeout hangs CI instead of
+      failing it, and a hung Windows job costs the whole matrix.
+    - >
+      N4's twenty-run determinism check is deliberate cost on the runner and is the only criterion
+      whose price lands there rather than locally.
+  recommended_scope_change: null

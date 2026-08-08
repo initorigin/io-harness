@@ -22,7 +22,7 @@ pub(crate) mod handles;
 pub mod shell;
 pub mod workspace;
 
-pub use custom::{Tool, ToolFuture, Toolbox};
+pub use custom::{Tool, ToolEffect, ToolFuture, Toolbox};
 pub use exec::DEFAULT_EXEC_TIMEOUT;
 pub use fs::FsTool;
 pub use workspace::{Entry, EntryKind, Match, Workspace, Wrote};
