@@ -23,8 +23,8 @@ release_fit:
       `Tool` implementation compiles and behaves exactly as it does today. The diff of
       `docs/public-api.txt` is the whole break budget and it is three lines.
     - >
-      The capability is not being built, it is being scheduled. Every read the release overlaps is
-      a call the loop already makes through `dispatch` (`src/run.rs:7118`) and every policy decision
+      The capability is not being built, it is being scheduled. Every read the release overlaps is a
+      call the loop already makes through `dispatch` (`src/run.rs:7118`) and every policy decision
       those calls take is unchanged — the release moves when `dispatch` is called and never what it
       does, which is why fit is `probable` rather than `uncertain` against a contract recording
       `uncertainty: medium`.

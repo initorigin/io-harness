@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.41.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -398,3 +398,173 @@ open_questions:
 - >
   Whether `Session` should expose the cap per turn, or keep taking it from the contract each turn
   builds. Deferred until an embedder asks; the default reaches every turn either way.
+
+released_at: 2026-08-08T15:04:14Z
+mode: published
+delivered: >
+  A read-heavy step stops costing one round trip per file. When a completion carries several
+  read-only tool calls, the loop dispatches them together instead of one after another, bounded by
+  `TaskContract::max_parallel_reads` (default 10, floor 1). `grep`, `find` and `read_file` are
+  read-only by construction; a registered tool says so for itself through the defaulted
+  `Tool::effect`, returning the new `ToolEffect`. Everything else runs exactly as it did, one at a
+  time, in the order the model asked — and so does every recorded artifact: observations, decisions,
+  steps, `Edit` rows, budget draws and the events an `Observer` receives are folded back in call
+  order, never in the order the calls finished. `with_max_parallel_reads(1)` reproduces 0.40.0's
+  execution shape exactly.
+
+evidence:
+  tests:
+  - >
+    F1 — `three_read_only_tools_rendezvous_and_at_cap_one_they_cannot` passes. Three registered
+    tools declaring `ToolEffect::ReadOnly`, each waiting on a `tokio::sync::Barrier` of three, in
+    one completion: under the default cap the step completes inside a 60s bound, which can only
+    happen if all three are in flight together. The negative control — same contract, same policy,
+    same store, same completion, `with_max_parallel_reads(1)` — does not finish inside 5s. No clock
+    is asserted anywhere; the evidence is whether a rendezvous can be met.
+  - >
+    F2 and N4 — `a_batched_run_and_a_serial_run_leave_identical_traces_every_time` passes. One case
+    recorded through `provider::Record` over a completion of eight `read_file` calls split by two
+    `write_file` calls, replayed through `provider::Replay` at cap 10 and at cap 1 into two fresh
+    stores, twenty times. The comparison is `assert_eq!` over the whole `RunOutcome`, `store.steps`,
+    `store.observations`, `store.edits` and `store.spent_tokens` — equality of stored rows, not a
+    normalisation. Each round also asserts 2 `Edit` rows and 8 `ObsKind::Read` observations, so an
+    empty comparison cannot pass for a clean one.
+  - >
+    F3 — `a_write_is_not_overlapped_and_a_read_after_it_sees_what_it_wrote` passes. A completion of
+    `[read a, read b, write a, read a]` leaves four observations in call order; the first reads
+    `before`, the fourth reads `after` and not `before`, and exactly one `Edit` row landed.
+  - >
+    F4 — `a_pause_in_a_batch_records_nothing_for_the_calls_after_it` passes. Five read-only calls
+    with `Effect::Ask` on the third and a deferring approver: the run stops `AwaitingApproval`, the
+    store holds two observations and no more, spent tokens are 0, and the two calls after the pause
+    were never entered. `resume_with_decision` with an approving approver then runs all three
+    released calls.
+  - >
+    F5 — `a_registered_tools_declared_effect_decides_whether_it_is_batched` passes both arms. Two
+    registered tools identical but for `effect()`, sharing a barrier of two, with a built-in
+    `read_file` between them in the completion: declaring `ReadOnly` the rendezvous is met;
+    declaring `Mutating` the run cannot finish inside 5s. The built-in read between them is
+    load-bearing — were it treated as mutating it would split the run and the first arm would fail.
+  - >
+    F6 — `the_cap_bounds_calls_in_flight_and_all_of_them_still_land_in_order` passes. Twenty
+    read-only calls under a cap of 3: the peak in-flight count is 3 (asserted `<= 3`, and `>= 2` so
+    the bound cannot pass by being serial), all twenty complete, and the twenty observation targets
+    equal the call order exactly. The fixture settles for longer the earlier a tool appears, so
+    completion order and call order genuinely differ.
+  - >
+    N5 — `dropping_a_run_mid_batch_leaves_nothing_running` passes. Three read-only calls that sleep
+    400ms then park; the run is dropped at 100ms and 900ms later none has reached its own
+    completion and the store's step count is unchanged.
+  - >
+    Whole suite, in separate invocations from a deleted `target/` so a full volume can never be
+    mistaken for a toolchain failure, and under a redirected `XDG_CONFIG_HOME`: `cargo test` exit 0,
+    67 binaries, **1402 passed / 0 failed**; `cargo test --all-features` exit 0, 67 binaries,
+    **1481 passed / 0 failed**; `cargo test --doc --all-features` **377 passed / 0 failed**.
+  - >
+    Per-suite counts read with each suite run ALONE rather than off a combined run (trap 118):
+    `parallel_reads` 8, `cross_version` 5, `cross_version_0_29_0` 2 passed + 1 ignored, and the
+    ignored half — a 0.29.0 binary reading a store this tree wrote — 1 passed after building
+    `tests/fixtures/gen-0.29.0`.
+  builds:
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` exit 0. `cargo fmt --check` clean.
+    `cargo build --all-features --examples` clean.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` clean —
+    the gate stable `cargo doc` cannot see, run before the release PR, and the second release
+    running it has found nothing.
+  - >
+    `cargo +1.95 check --all-features --lib` exit 0: MSRV unmoved (N2).
+  - >
+    `cargo tree` **402** lines, the same figure as 0.40.0 (N1). The bound is `tokio::task::JoinSet`,
+    from a dependency the crate has had since 0.1.0.
+  - >
+    `cargo clean && cargo package --locked` exit 0, producing `io-harness-0.41.0.crate` at
+    **1,397,362 bytes**.
+  reviews:
+  - >
+    Seven sabotages, each failing a NAMED test, none silent. S1 `tool_effect` returns `Mutating` for
+    everything → F1's first half elapses and F6's peak drops to 1. S2 the `JoinSet` bound removed →
+    F6 peaks at 20 while F1 still passes, so it isolates the bound. S3 tasks detached through
+    `tokio::spawn` instead of being `JoinSet` children → N5 sees 3 completions after the drop, which
+    is exactly why the contract names `JoinSet` over loose tasks. S4 fold in completion order →
+    F6's twenty targets scramble inside each wave. S5 batch reads gathered across the mutating calls
+    → F3's fourth call observes `before`, and F2 fails as well. S6 no collapse at the pause → F4
+    sees `look_4` and `look_5` entered. S7 ignore the trait method and treat every registered tool
+    as read-only → F5's second arm meets a rendezvous it must not.
+  - >
+    TWO sabotages that failed nothing at first, both reported as findings and both of which changed
+    a test rather than being propped up. S4 against F2 alone: eight built-in `read_file` calls are
+    synchronous and complete in the order they were spawned, so "call order" and "completion order"
+    are the same answer there — the ordering claim is carried by F6, whose fixture was changed to
+    settle in reverse. S6 against F4 as originally written with five `read_file` calls: a file read
+    has no side effect and the fold stops at the pause, so work started past it leaves no trace at
+    all — F4 was rewritten to use registered tools that record their own entry, and the same
+    sabotage then fails it at once.
+  deployments:
+  - >
+    PR **#128** (`feat/0.41.0` → `develop`). CI run **31263215081** on `cdeac4e`: **18 of 18 checks
+    passing FIRST TRY, no re-run** — `test` and `doctest` on macos, ubuntu and windows in both
+    feature polarities, `lint`, `msrv`, `examples`, `links-consumer`, `cross-version-0.29.0`,
+    `docs.rs (nightly)` and both CodeQL analyses. Windows all-features is the slowest at 6m49s.
+    That green matrix is O1, and it is load-bearing rather than routine: a scheduling change is
+    exactly where a platform-specific defect hides.
+  health_checks:
+  - >
+    O2 — no store migration. `git diff main -- src/state.rs` is **empty**: no table, column or index
+    added or altered, `CHECKPOINT_FORMAT` unmoved at **7**, `ADDED_SINCE_0_22_0` unchanged. A
+    0.40.0 store and a 0.41.0 store are the same store, asserted by the cross-version jobs in both
+    directions.
+  - >
+    O3 — the checked-in doc surfaces are consistent with the code in the same commit range:
+    `changelog` 5 passed, `docs_drift` 15, `guide_pages` 7, `public_api` 9, `readme` 8.
+    `docs/CONTRACT.md` gained the 0.41.0 guarantee, `docs/guide/tools-and-skills.md` documents
+    `ToolEffect` beside the `Tool` trait, and `CHANGELOG.md` carries the entry with no
+    `*Migration:*` note because nothing breaks.
+
+known_limitations:
+- >
+  **N3 was met in a different form, and this is stated rather than glossed.** The criterion says
+  `docs/public-api.txt` diffs by exactly three lines. It diffs by exactly **one** —
+  `enum ToolEffect src/tools/custom.rs`. The checker enumerates the names re-exported from
+  `src/lib.rs`, so `Tool::effect` is a method on an already-listed trait and
+  `TaskContract::max_parallel_reads` / `with_max_parallel_reads` are members of an already-listed
+  struct, and neither adds a line. The substance of N3 holds in full: three items added, none
+  removed or altered, and a consumer who never calls the new method and never sets the new field
+  compiles unchanged. This is the same shape as 0.39.0's deviation; plan such a criterion as "the
+  lines the file can see" next time.
+- >
+  **`view_image` is `Mutating`, and the contract's two lists did not settle it.** It is absent from
+  the three named `ReadOnly` built-ins and absent from the enumerated `Mutating` ones, while the
+  scope prose anticipated carrying its media back through the fold. It was left mutating: the
+  explicit read-only set names three tools, no criterion mentions media, and the choice keeps
+  `PendingMedia` unshared, which the scope itself gives as the goal. The consequence is that a
+  completion mixing `view_image` with reads splits into two batches at the image.
+- >
+  **`list_dir` is `Mutating` too**, for the same reason — it reads the workspace and changes
+  nothing, and it is outside the set this release measured. Widening to it costs nothing
+  structurally and was not taken without evidence.
+- >
+  **The fold-order guarantee is proven by F6, not by F2.** F2 proves the two caps produce identical
+  stored rows, which is what an embedder cares about; it cannot discriminate a fold that used
+  completion order, because synchronous file reads finish in the order they were spawned. Anyone
+  strengthening this later should keep F6's uneven settle, which is what makes the two orders
+  different answers.
+- >
+  **The record was sealed before the crates.io upload**, which follows the `develop` → `main` merge
+  and the GitHub Release. `mode: published` states the authorized target; the flow makes it true.
+- >
+  **A record can never cite CI on the commit that contains it.** The run above is on `cdeac4e`; the
+  commit carrying this record has its own run, and that ordering is stated in the merge and the
+  final report rather than amended in here — the 0.29.0 and 0.38.0 precedent.
+- >
+  **MCP tools stay `Mutating` and the open question is unanswered.** Whether `McpSession` can
+  multiplex concurrent requests over one stdio transport, and whether servers in the wild tolerate
+  it, is recorded for the release that widens the read-only set rather than guessed at here.
+- >
+  **Concurrency across steps or completions is untouched**, as is `max_concurrent_agents`. The unit
+  is one completion's tool calls.
+
+supersedes: 0.40.0
+next_recommended_version: 0.42.0
+immutable: true
