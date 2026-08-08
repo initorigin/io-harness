@@ -268,7 +268,7 @@ tasks:
   why_required: A scheduling change is where a platform-specific defect hides, so a green matrix is load-bearing
     here rather than routine, and the release claims no store migration — a claim only the cross-version
     job can settle.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.41.0-T05
   acceptance_criteria:
@@ -287,4 +287,19 @@ tasks:
 
     '
   files: []
-  evidence: []
+  evidence:
+  - 'Local suite, from a deleted target each time and in separate invocations so a full volume cannot
+    be mistaken for a toolchain failure: default features 67 binaries / 1402 passed / 0 failed, exit 0;
+    all features 67 binaries / 1481 passed / 0 failed, exit 0. cargo test --doc --all-features 377 passed.
+    cargo clippy --all-features --all-targets clean, cargo fmt --check clean, cargo build --all-features
+    --examples clean.'
+  - 'O2 — no store migration. git diff main -- src/state.rs is EMPTY: no table, column or index is added
+    or altered and CHECKPOINT_FORMAT is unmoved at 7, so ADDED_SINCE_0_22_0 has nothing new to be fed.
+    The cross-version suites pass on their own rather than only inside the whole run (trap 118): cross_version
+    5 passed, cross_version_0_29_0 2 passed with 1 ignored, both reading the checked-in fixture stores
+    in both directions.'
+  - N2 — MSRV unmoved. cargo +1.95 check --all-features --lib finishes clean. Nothing here reaches for
+    a newer std API; JoinSet has been in tokio far longer than the MSRV.
+  - 'N1 re-checked at the end of the release: cargo tree still reads 402 lines.'
+  - O1 — the three-platform matrix is the one criterion that cannot be settled locally. Recorded from
+    the CI run on the release commit rather than assumed.
