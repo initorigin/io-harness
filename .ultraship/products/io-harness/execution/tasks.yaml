@@ -228,7 +228,7 @@ tasks:
   why_required: An embedder cannot rely on ordering they were never told about, and a tool author cannot
     know that `effect()` is a promise their tool makes about itself unless it is written down. The checked-in
     doc surfaces are gated in CI, so a release that skips them does not merge.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.41.0-T04
   acceptance_criteria:
@@ -243,7 +243,25 @@ tasks:
   - CHANGELOG.md
   - Cargo.toml
   - Cargo.lock
-  evidence: []
+  evidence:
+  - 'docs/CONTRACT.md gains "What running read-only tool calls together guarantees, and what it does not
+    (0.41.0)": order is the model call order always; only grep, find and read_file overlap and every other
+    built-in is named as not overlapping; MCP tools are never overlapped with the reason written down;
+    a registered tool declaration is a promise the harness cannot check; the cap is the contract and with_max_parallel_reads(1)
+    is 0.40.0 exactly; a pause collapses the batch; nothing new is emitted.'
+  - docs/guide/tools-and-skills.md gains "Say whether your tool changes anything (0.41.0)" beside the
+    Tool trait it hangs off, with the snippet and the three things an author needs before changing the
+    default.
+  - 'CHANGELOG.md gains the 0.41.0 section with Added and Changed and NO migration note, plus an explicit
+    sentence saying why one is not owed. tests/changelog.rs passes: no entry is marked breaking, so none
+    needs a note.'
+  - Cargo.toml 0.40.0 to 0.41.0, and README.md io-harness = "0.41" — the install-snippet checker added
+    in 0.36.1 compares major.minor against Cargo.toml and would have failed on the stale line.
+  - 'The documentation gates all pass: changelog 5, docs_drift 15, guide_pages 7, public_api 9, readme
+    8. The nightly gate — RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps
+    — is clean, which is the second release running it has found nothing. cargo test --doc --all-features
+    is 377 passed, 0 failed, run under a redirected XDG_CONFIG_HOME so the machine own io.toml does not
+    fail src/config.rs doctests.'
 - id: US-IO-HARNESS-0.41.0-T06
   summary: Run the full suite on all three platforms, confirm a 0.40.0 store opens and resumes unchanged,
     and confirm the MSRV toolchain gate still builds.
