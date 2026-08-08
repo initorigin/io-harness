@@ -1,0 +1,570 @@
+product: io-harness
+version: 0.42.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    Leave a run unattended and have the decisions it meets answered, checked and — when nobody
+    should answer them — parked for a human, without writing a line of Rust for any of it.
+
+    Three things a run stops needing a present human for, and one thing a reviewer stops being
+    lied to about.
+
+    **A model can be installed as the `Approver`.** Today the three built-in approvers are
+    `ApproveAll`, `DenyAll` and `StdinApprover` (`src/approve.rs:261`, `:293`, `:328`): wave
+    everything through, refuse everything, or block on a terminal that is not there. An unattended
+    job therefore either runs with its grey tier fully open or dies at the first `Effect::Ask`.
+    0.42.0 adds `ModelApprover`, the mirror of 0.34.0's `ModelReviewer`: it reads the pending act,
+    what it targets, the bytes a write would land, **the rule and the layer that flagged it**, and
+    the run's goal — then approves, denies with a reason the model under it will read, or defers.
+    Deferring is the escalation, and it already means the right thing: the pending action is
+    persisted, the run stops with `RunOutcome::AwaitingApproval`, the process may exit, and the
+    human who reads the trace tomorrow answers it with `resume_with_decision`. No new `Decision`
+    variant is invented for something the crate already does.
+
+    The rule and the layer are the reason this is worth having rather than a novelty. An approver
+    that sees only `Act::Write` on `src/main.rs` is guessing; one that sees "the `ops-baseline`
+    layer's `deny_write src/main.rs` did not fire, the app layer's `*.rs` Ask tier did" is
+    answering the question an operator actually asked. `Policy::explain` has carried
+    `Verdict { effect, rule, layer }` since 0.13.0 (`src/policy.rs:274`) and the approver has never
+    been shown it.
+
+    **A model must never approve its own call.** `Verification::Review` already refuses a reviewing
+    model that is the model under review, before a request is built
+    (`preflight_review_and_routing`, `src/run.rs:2843`). The same refusal now covers approval, from
+    the same place and with the same escape hatch stated in the caller's own code: a `ModelApprover`
+    whose model is the run's model is an `Error::Config` at run start — zero calls to either
+    provider — unless the caller wrote `allow_self_approval(true)` and meant it.
+
+    **An operator attaches a check to a named point in the tool lifecycle from `io.toml`.** A
+    `[[hook]]` today is an `Observer` (0.28.0): it names events by their wire tags, and the strongest
+    thing it can do is `on_failure = "cancel"`, which is honoured at the **next step boundary** —
+    after the tool it objected to has already run. So "no `exec` of `terraform` in this repository,
+    ever, whatever the agent decides" is not expressible as a table entry; it is a Rust
+    `Approver` impl an operator has to compile in. 0.42.0 gives a hook table the key `at`, whose one
+    value in this release is `before_tool`, and an optional `tools` filter. Such a hook is spawned
+    with the pending call on its stdin **before the call executes**, in the serial policy phase all
+    three dispatch sites already share (`prepare_read`, `src/run.rs:7203`). A non-zero exit refuses
+    that one call: nothing runs, the hook's own first line of stdout becomes the reason the model
+    reads, and the run adapts rather than dying — the same shape as a policy deny. An operator who
+    wants the wall instead writes `on_failure = "cancel"`.
+
+    That check obeys the trust rule without exception. `[[hook]]` is refused in a project-scoped
+    `io.toml` because a hook runs an argv a clone delivered, and a hook that can stop a tool is
+    strictly more dangerous than one that appends a log line, so `at` inherits the refusal rather
+    than reopening the question.
+
+    **And the review criterion reads the change instead of the outcome.** `Verification::Review`
+    hands the reviewer `written_files` (`src/run.rs:3031`): every file the run wrote, with its
+    contents **as they stand now**. That is the outcome, and a reviewer of a code change reads the
+    change. A rubric like "no public item lost its doc comment" cannot be answered from a file that
+    no longer contains the comment — the deletion is invisible, because what was deleted is not in
+    the text. The store has held the answer since 0.28.0: `snapshots` keeps each file's contents
+    from before the run first wrote it, for the rewind. 0.42.0 spends nothing new to reach it. A
+    `ModelReviewer` is now handed a `ChangeReview` carrying, per file, what was there before and
+    what is there now; a file the run created carries no before, a file it never touched is not in
+    the list at all, and a file whose previous contents the snapshot cap did not keep says so rather
+    than pretending it was empty.
+
+  business_value: >
+    Every one of the three closes a gap that only the library can close, which is the same test the
+    last six releases were chosen by.
+
+    An `Approver` is consulted from inside the run loop through a `&dyn Approver` the caller
+    installs; an application can write its own, and every application that wants a model to answer
+    the grey tier writes the same one — the prompt, the verdict parse, the self-approval refusal and
+    the plumbing of the policy's `rule` and `layer` down to it. The last of those it **cannot**
+    write: `Verdict`'s rule and layer are known at the approval site inside `run.rs` and are not on
+    `Request`, so an out-of-crate approver is structurally blind to why it is being asked. That is a
+    library gap, not an application one.
+
+    The lifecycle hook is the difference between an operator and a programmer. `[[hook]]` (0.28.0),
+    `[[mcp]]`, `[[plugin]]` (0.35.0) and `[instructions]` exist because the person who decides what a
+    machine may do in a repository is often not the person who compiles the binary that does it.
+    Every rule that must stop a tool is today outside that reach, and "install a Rust trait impl" is
+    not an answer for the operator holding the repository.
+
+    The review change is the smallest of the three and the one most likely to be silently wrong
+    without it. A gate that answers "does the work satisfy the rubric" from post-change contents is
+    a gate that cannot see a deletion, cannot see a weakening, and cannot see the difference between
+    a file the run rewrote and a file that was already like that. Every rubric about what a change
+    did — rather than about what a file now says — is being answered from the wrong evidence, and
+    nothing in the trace shows it.
+
+    The price is one defaulted trait method on each of two traits, one new field on
+    `#[non_exhaustive]` `TaskContract`, one new key in a `pub(crate)` config struct, and four new
+    public types. Nothing is removed, nothing changes shape, and an embedder who upgrades and edits
+    nothing gets identical behaviour on all three paths.
+
+  evidence_of_value: >
+    Executed in the technique the last eleven releases used: a discriminating assertion per claim, a
+    negative control that must not move, one sabotage per arm of every two-armed claim, and a
+    sabotage that fails nothing reported as a finding rather than propped up.
+
+    The approver claims are proven from what the approving provider was **handed** and from what the
+    store holds afterwards, never from a description: a fixture provider that records the request it
+    received proves the rule and the layer reached the model, and the three decisions are proven by
+    an `Edit` row that exists, an `Edit` row that does not with a reason in the observation, and an
+    `AwaitingApproval` outcome with an unresolved pending row that a second call resumes. The
+    self-approval refusal is proven by a **counting provider that must record zero completions** —
+    the same shape 0.34.0 used, and the only way to prove a refusal happened before a request was
+    built rather than after.
+
+    The hook claims are proven by what did not happen. A `before_tool` hook that exits non-zero
+    leaves the file on disk byte-identical and no `Edit` row behind, which no ordering of an
+    after-the-fact observer can produce; the sabotage that runs the hook after the tool changes the
+    file and fails it. The project-scope refusal is proven against the existing error, inside a
+    `[profile]` too, because that is where the trust rule has been widened by accident before.
+
+    The review claim rests on one assertion that only the change can satisfy: the prompt the
+    reviewing model receives **contains a line the run deleted**. A file's current contents cannot
+    contain the text that was removed from it, so a `changes` list built from post-change contents
+    fails that assertion and passes every weaker one. That is the release's discriminating test for
+    this capability, and the sabotage — build `before` from the same read as `after` — fails exactly
+    it.
+
+    And the standing invariant of the previous release is asserted rather than assumed: with a
+    `before_tool` hook matching `read_file`, three read-only tools still rendezvous. A gate that
+    quietly serialised 0.41.0's batch would be a regression this release could ship without
+    noticing, so it is a criterion.
+
+scope:
+  included:
+  - >
+    **`ApprovalContext`, and a defaulted `Approver::decide_in_context`.**
+    `#[non_exhaustive] pub struct ApprovalContext { goal: String, rule: Option<String>, layer:
+    Option<String> }` — the run's goal and the `Verdict`'s own `rule`/`layer`
+    (`src/policy.rs:274`), which is all the approval site knows and the approver does not.
+    `Approver` gains `fn decide_in_context<'a>(&'a self, request: &'a Request, context:
+    &'a ApprovalContext) -> DecisionFuture<'a>`, defaulted to `self.decide(request)`. Both approval
+    sites in the run loop (`src/run.rs:6767`, the pre-run net authorization, and `src/run.rs:9915`,
+    the tool path) call the context form, through **one crate-internal helper both call**, because
+    there are two loops and a rule added to one of them must be a helper both go through.
+    Defaulted, so `ApproveAll`, `DenyAll`, `StdinApprover`, io-studio's channel approver and every
+    approver an embedder wrote against 0.41.0 compile and behave unchanged.
+  - >
+    **`Approver::model`, defaulted to `None`.** The mirror of `Reviewer::model`
+    (`src/verify.rs:479`) and used for one thing: the self-approval refusal. An approver that is not
+    a model returns `None` and is never refused, which is why the default is the honest one.
+  - >
+    **`ModelApprover<P>`**, in `src/approve.rs`, built as `ModelApprover::new(provider, model)` with
+    `allow_self_approval(bool)`. It renders the request, the context and the goal into a prompt,
+    asks for a JSON verdict, and parses it into a `Decision` — the shape `ModelReviewer`
+    (`src/verify.rs:498`) already established, including its parse tolerance for a verdict wrapped
+    in prose. An unparseable verdict is `Decision::Defer`, never an approval: the failure mode of a
+    machine standing in for an absent human must be to park the question, not to answer it.
+    `remember` is always empty on a model's approval — a model may answer the call in front of it
+    and may not install a run-scoped rule that stops later calls being asked about.
+  - >
+    **The self-approval refusal, in `preflight_review_and_routing` (`src/run.rs:2843`).** A fourth
+    check beside the three 0.34.0 put there, sharing their guarantee: refused before the first
+    request is built, so the evidence is zero completions rather than a wasted call. It compares
+    `approver.model()` against the same two answers the review check uses — the contract's
+    `Routing` models and `Provider::model_hint()` — and says which model it is refusing and how to
+    say you meant it.
+  - >
+    **`at = "before_tool"` and `tools = [..]` on a `[[hook]]` table.** `Hook` is `pub(crate)`
+    (`src/hooks.rs:96`) so both keys are additive with no public surface. `at` and `on` are
+    exactly-one-of, enforced in `Hook::check` where the error names the table's index, exactly as
+    the existing `append`/`run` pair is: an event hook and a lifecycle hook are different things and
+    a table claiming both is a mistake worth naming. An unknown `at` value is refused with the list
+    of the ones this crate knows, for the reason `EVENT_NAMES` exists — a misspelling that loads,
+    installs and never fires is the failure this module can least afford. `tools` filters by tool
+    name; empty means every call.
+  - >
+    **`OnFailure::Refuse`, and a per-kind default.** The `pub(crate)` enum
+    (`src/hooks.rs:75`) gains a third answer: the call does not execute, and the run continues.
+    A `before_tool` hook that omits `on_failure` defaults to `Refuse` — a check attached to a point
+    that exists to stop something is not a notification — while an event hook's default stays
+    `Continue`, unchanged. `Cancel` keeps its meaning on both: `Flow::Cancel` at the next step
+    boundary.
+  - >
+    **The refusal reason comes from the hook.** For a `before_tool` hook only, the child's stdout is
+    captured rather than discarded, bounded at 4 KiB, and its first line becomes the reason the
+    model reads. A hook that prints nothing gets a reason naming its argv[0] and its exit status.
+    Event hooks keep `Stdio::null()` on both streams and the guide's limits block keeps saying so:
+    a library must not write to a caller's terminal, and capturing into a `String` is not writing to
+    one.
+  - >
+    **`Hooks` doubles as the tool gate, and `TaskContract::with_tool_hooks(Hooks)` installs it.**
+    One public type, built once by `Config::hooks()`, installed at two points by the caller: as an
+    `Observer` it ignores `at` tables, as a tool gate it ignores `on` tables. `TaskContract` is
+    `#[non_exhaustive]` (`src/contract.rs:70`) so the field and the builder method are free. Nothing
+    is implicit: an `io.toml` describing a `before_tool` hook does nothing at all until the
+    application installs it, which is the rule every projection in that file already obeys and is
+    stated in the guide beside this one.
+  - >
+    **The gate runs in `prepare_read` (`src/run.rs:7203`).** The serial policy phase all three
+    dispatch call sites share (`src/run.rs:7317`, `:7565`, `:9509`) — so one insertion covers the
+    flat loop, the tree loop, the serial path and 0.41.0's concurrent batch, and covers them in the
+    model's call order. Nothing about the batch changes: the hook is spawned serially, on the loop's
+    own thread, and the read work it approves still runs concurrently.
+  - >
+    **`FileChange`, `ChangeReview`, and a defaulted `Reviewer::review_change`.**
+    `#[non_exhaustive] pub struct FileChange { path: PathBuf, before: Option<String>, after: String,
+    unkept: Option<String> }` and `#[non_exhaustive] pub struct ChangeReview { goal: String, rubric:
+    String, changes: Vec<FileChange> }`. `Reviewer` gains `fn review_change<'a>(&'a self, request:
+    ChangeReview) -> Reviewing<'a>`, defaulted to `self.review(request.into_outcome_request())`, so
+    a reviewer written against 0.41.0 keeps receiving exactly the `ReviewRequest` it receives today
+    and needs no edit. `ModelReviewer` overrides it and prompts with the change. `ReviewRequest` is
+    untouched — no field, no `#[non_exhaustive]`, no break.
+  - >
+    **The change is read from the 0.28.0 restore points.** `Store::snapshot(run_id, path)`
+    (`src/state.rs:4156`) already holds, per run and per path, the file's contents from before the
+    run's first write, as `Kept::Text`, `Kept::Absent` (the run created it) or `Kept::Unkept` (over
+    `MAX_SNAPSHOT_BYTES`, or not UTF-8). Those three cases map onto `before: Some(_)`,
+    `before: None` and `unkept: Some(why)`. **No table, column or index is added**, and the stored
+    hunks that would let a trace emit a patch stay 0.51.0's, where the patch tool needs them.
+  - >
+    **Documentation as part of the release.** `docs/CONTRACT.md` gains three guarantees in the terms
+    an embedder needs them: what a model approver may and may not decide and that the policy's deny
+    tier never reaches it; that a `before_tool` hook is refused at project scope and runs before the
+    call with the run's own working directory; and that a reviewer overriding nothing sees the
+    outcome, not the change. `docs/guide/tools-and-skills.md` documents the lifecycle hook beside
+    the event hook; the approval guide page documents `ModelApprover` beside `StdinApprover`.
+    `CHANGELOG.md` gains the entry with **no** `*Migration:*` note, because nothing breaks.
+    **No new guide page**, so no `GUIDES` / `CAPABILITIES.md` bookkeeping — the precedent from
+    0.31.0 and every release since. `docs/public-api.txt` updated by hand; every new public item
+    carries a worked doctest for the `every_public_item_has_a_worked_example` gate.
+  excluded:
+  - >
+    **An `after_tool` lifecycle point.** It needs a tool-result shape to put on the hook's stdin,
+    and that shape is the `ToolResult` event withdrawn from 0.41.0 and the stored hunks 0.51.0
+    owns. `at` is a key with one value in this release, and the validator names the one value rather
+    than pretending to a set.
+  - >
+    **A hook that rewrites the call.** `Decision::Approve { modified }` lets a Rust approver
+    substitute a different action; a hook cannot. Its answers are run, refuse and cancel. Letting an
+    argv from a config file rewrite a tool call is a wider trust grant than this release is willing
+    to make in the same version that first lets one stop a call.
+  - >
+    **Any new `Decision` variant.** Escalation is `Decision::Defer`, which already persists the
+    pending action, stops the run and survives the process exiting. A fourth variant would be a
+    second name for it.
+  - >
+    **Widening what an approver is asked about.** A denied act never reaches an approver and still
+    does not; a model answers the `Effect::Ask` tier and nothing else. The policy's boundary is
+    exactly where it was.
+  - >
+    **Storing the change.** `changes` is built at review time from rows the store already has. No
+    hunk, no diff and no before-text is written by this release.
+  - >
+    **A new `EventKind` variant.** A hook refusal is reported through the existing
+    `EventKind::Refused`, with the hook named where a rule would be and the declaring scope where a
+    layer would be. A refusal that did not come from the policy is still a refusal, and an observer
+    routing on `Refused` should see it.
+  - >
+    **Any new dependency, table, column, index, or public break.**
+  fallback_scope:
+  - >
+    **`ModelApprover`, `ApprovalContext`, `Approver::decide_in_context`, `Approver::model` and the
+    self-approval refusal — the approval half alone.** It is the roadmap's headline sentence and a
+    coherent release on its own: an unattended run stops dying on a decision nobody is present to
+    make. The lifecycle hook and the review change each move to their own version with their own
+    evidence rather than being half-built here. What is given up is stated in the record rather than
+    discovered: an operator still cannot stop a tool from `io.toml`, and a reviewer still reads the
+    outcome. Both are additive when they land, so nothing about this fallback makes them harder.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a model approver is handed the rule and the layer that flagged the call.** A policy whose
+    Ask tier comes from a **named** layer with a named glob; a fixture provider standing in for the
+    approving model that records the request it was given and returns an approving verdict. The
+    recorded prompt contains the layer's name and the rule's pattern, and the run's goal. Asserted
+    against the same `Verdict` the policy produced, not against a literal. Sabotage: build the
+    context with `rule: None, layer: None`, under which the assertion fails while every other
+    approval test still passes.
+  - >
+    **F2 — the three answers, each with its own stored consequence.** The same completion — one
+    `write_file` the policy marks `Ask` — run three times against a `ModelApprover` whose fixture
+    provider returns approve, deny and defer. Approve: one `Edit` row and the file on disk holds the
+    new bytes. Deny: **no** `Edit` row, the file is byte-identical to before, and the model's next
+    observation carries the reason the verdict gave. Defer: `RunOutcome::AwaitingApproval`, an
+    unresolved row in `pending`, and `resume_with_decision` with an approving decision then lands
+    exactly the persisted write. Sabotage: map an unparseable verdict to approve instead of defer,
+    under which the malformed-verdict arm lands a write it must not.
+  - >
+    **F3 — an approver that overrides nothing is unaffected.** `ApproveAll`, `DenyAll` and a
+    hand-written approver implementing only `decide` are each run through the tool path and the
+    pre-run net authorization, and each decides exactly as it does on 0.41.0 — same outcome, same
+    stored rows. Sabotage: make `decide_in_context` return `Decision::Defer` instead of forwarding
+    to `decide`, under which all three arms stop at an approval nobody asked for.
+  - >
+    **F4 — a model cannot approve its own call, and the refusal costs nothing.** A `ModelApprover`
+    whose model equals the run's model, over a counting provider: the run fails at start with
+    `Error::Config`, and the counter shows **zero** completions on both providers. With
+    `allow_self_approval(true)` and nothing else changed, the same run proceeds and the approval is
+    answered. Sabotage: move the check after the first completion, under which the counter is
+    non-zero and this fails.
+  - >
+    **F5 — a `before_tool` hook refuses a call, from a config file, with no Rust written.** An
+    `io.local.toml` carrying `at = "before_tool"`, `tools = ["write_file"]` and a `run` argv that
+    exits non-zero, installed with `TaskContract::with_tool_hooks(config.hooks())`. The completion's
+    `write_file` leaves the target byte-identical on disk and **no** `Edit` row; the model's
+    observation carries the hook's own first line of stdout as the reason; the run continues to its
+    next step rather than ending. Sabotage: consult the hook after the tool has run, under which the
+    file has changed and this fails.
+  - >
+    **F6 — the trust rule is extended, never weakened.** The same table in a project-scoped
+    `io.toml` fails to load with the existing "may not declare hooks" error — and so does the same
+    table nested inside a `[profile]`, which is where the boundary has been widened by accident
+    before. The identical file at user or local scope loads. Sabotage: accept `at` tables at project
+    scope on the grounds that they only *stop* things, under which both refusal arms fail.
+  - >
+    **F7 — `on_failure` decides the consequence, and a `before_tool` hook defaults to refusing.**
+    Four tables identical but for `on_failure`: absent and `"refuse"` both leave no `Edit` row and
+    the run continuing; `"cancel"` ends the run `RunOutcome::Cancelled` at the step boundary with
+    the earlier calls' rows intact; `"continue"` lets the call execute despite the non-zero exit and
+    the `Edit` row appears. Sabotage: default a `before_tool` hook to `Continue`, under which the
+    first arm's write lands.
+  - >
+    **F8 — the reviewer is handed the change, and the change contains what was deleted.** A recorded
+    case whose run deletes a distinctive line from an existing file and adds another, with a fixture
+    reviewing provider that records its prompt. The prompt contains **the deleted line**, which the
+    file's current contents provably do not; it contains the added line; a file the run created
+    appears with no before; and a file the run never touched does not appear at all. Sabotage: build
+    `before` from a second read of the current contents, under which the deleted line is absent and
+    only this criterion fails.
+  - >
+    **F9 — a reviewer that overrides nothing still receives the outcome.** A `Reviewer` impl
+    byte-identical to one written against 0.41.0 — `review` only — is called for a
+    `Verification::Review` criterion and receives a `ReviewRequest` whose `files` are the written
+    files with their current contents, exactly as today, and its verdict decides the gate. Sabotage:
+    make the default `review_change` return a failing verdict instead of forwarding, under which
+    this fails while F8 passes.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` for the default feature set has the same number of
+    crates as 0.41.0. The approver needs a `Provider`, which is the crate's own trait; the hook
+    needs `std::process`, which 0.28.0 already spawns through.
+  - >
+    **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
+  - >
+    **N3 — no public break.** Every item is added; none is removed or altered. `ReviewRequest`,
+    `Request` and `Decision` are untouched, both new trait methods are defaulted, and the new
+    `TaskContract` field sits on a `#[non_exhaustive]` struct. A consumer that upgrades and changes
+    nothing compiles and behaves identically. `docs/public-api.txt` gains the lines **its checker
+    can see** — the crate-root re-exports `ApprovalContext`, `ModelApprover`, `ChangeReview` and
+    `FileChange` — and not the trait methods or the struct field, which are members of already-listed
+    items. Stated this way at plan time because the same criterion has been met "in a different
+    form" three releases running.
+  - >
+    **N4 — 0.41.0's batch survives the gate.** With a `before_tool` hook whose `tools` filter names
+    `read_file`, three read-only tools sharing a barrier still rendezvous inside the bound — the
+    hook is spawned in the serial policy phase and the read work still runs concurrently. And with a
+    hook filtered to `write_file`, a completion of twenty reads spawns the hook **zero** times,
+    counted by the hook itself. Sabotage: run the gate inside the concurrent phase, or ignore the
+    `tools` filter, and one arm each fails.
+  - >
+    **N5 — a hook cannot hang a run.** A `before_tool` hook whose argv sleeps past its `timeout_ms`
+    is killed at the deadline and takes its `on_failure` path, exactly as an event hook does. The
+    test asserts the run finishes inside a bound comfortably under the sleep. The existing
+    `wait_bounded` poll is what makes this true; it is asserted rather than assumed because a hook
+    on the tool path is spawned far more often than one on an event.
+  operational:
+  - >
+    **O1 — the full suite passes on all three platforms**, which is what the standing CI matrix
+    already runs. Load-bearing rather than routine here: the hook spawns a child per matching call,
+    and the fixture hook must be an argv that exists on macOS, Ubuntu **and** Windows — the same
+    portability problem 0.28.0's hook tests solved, solved the same way rather than with a shell
+    script that silently skips.
+  - >
+    **O2 — no store migration.** `CHECKPOINT_FORMAT` unmoved, no table, column or index added or
+    altered, `git diff main -- src/state.rs` confined to whatever making `Store::snapshot` reachable
+    from the review path requires and containing no DDL. A 0.41.0 store opens and resumes under
+    0.42.0 unchanged, asserted by the cross-version tests that already read the 0.22.0 and 0.29.0
+    fixture stores.
+  - >
+    **O3 — the documentation gates pass**: the nightly rustdoc gate, the intra-doc link rules, and
+    the checked-in doc surfaces (`docs/public-api.txt`, `CAPABILITIES.md`, the guide index,
+    `CHANGELOG.md`) consistent with the code in the same commit range.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.42.0, GitHub at initorigin/io-harness with the tag `v0.42.0` and a
+    Release titled `io-harness 0.42.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.42.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head checked against the tree the gates ran on immediately
+    before the release PR is opened. Release PR `develop` into `main`, merged the same way. The
+    GitHub Release is cut by `release.yml` —
+    `gh workflow run release.yml --ref main -f version=0.42.0` — which takes its notes verbatim from
+    the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and
+    the Release exist, with the registry token sourced from the repo-local `.env` in the same shell
+    invocation. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    None. No table is created or altered, no index is added, no column is added, `CHECKPOINT_FORMAT`
+    is unmoved, and a 0.41.0 store and a 0.42.0 store are the same store.
+  - >
+    No public break. Two trait methods are added, both defaulted; four types are added; one field
+    and one builder method are added to a `#[non_exhaustive]` struct. Nothing is removed or altered,
+    and `ReviewRequest` in particular keeps its exact shape so an existing `Reviewer` needs no edit.
+  - >
+    One config-file consequence a reader must not misread: `at` and `tools` are new keys under
+    `deny_unknown_fields`, so an `io.toml` written for 0.42.0 is **refused** by a 0.41.0 binary
+    rather than silently ignored. That is the intended direction — a lifecycle check that loads and
+    never fires is the failure mode this crate refuses to ship — and the changelog says so beside
+    the addition.
+  observability:
+  - >
+    A hook refusal is reported through the existing `EventKind::Refused`, with the hook's argv[0]
+    where a rule's pattern would be and the declaring scope where a layer would be. No new variant:
+    an observer already routing on refusals sees this one without being rebuilt.
+  - >
+    An approval answered by a model emits exactly the events an approval answered by a human emits —
+    `ApprovalRequested` then `ApprovalDecided` — and the decision string is the same
+    `"approve"`/`"deny"`/`"defer"`. Who answered is visible in the trace through the policy event's
+    source, not through a new event shape.
+  - >
+    The reviewing prompt is not emitted. `EventKind::Reviewed` still carries the verdict and its
+    reasons and nothing about what the reviewer was shown, which is the same boundary 0.34.0 drew.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.42.1 and `cargo yank --version
+    0.42.0` is the escape hatch, leaving 0.41.0 as what `cargo install` resolves. Reverting is
+    cheap and, unusually, partial: all three capabilities are opt-in from the caller's side. An
+    embedder who does not install a `ModelApprover`, does not call `with_tool_hooks` and whose
+    reviewer does not override `review_change` is on 0.41.0's behaviour on every path, so a
+    suspected defect is bisected by removing one installation rather than by downgrading.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    No live provider is required. The approving and reviewing models are fixture and recorded
+    providers throughout; the evidence is recorded prompts, stored rows and counters, none of which
+    needs a vendor.
+  - >
+    The three-platform matrix is load-bearing: the lifecycle hook spawns a child process per
+    matching call, and process spawning is where a Windows-only defect lives.
+  human_approvals:
+  - >
+    The owner decided on 2026-08-08 that all three capabilities stay in 0.42.0, with the approval
+    half as the fallback scope.
+  - >
+    The owner decided on 2026-08-08 that the reviewer reads the change through a **defaulted
+    `Reviewer::review_change`** rather than through a new field on `ReviewRequest` — zero breaks,
+    with the consequence accepted and stated: a reviewer that overrides nothing sees the outcome and
+    not the change.
+  - >
+    The owner decided on 2026-08-08 that a failing `before_tool` hook **refuses that tool call** by
+    default, the model reads the reason and the run adapts, with `on_failure = "cancel"` still
+    available for an operator who wants the run to end.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **Three capabilities in one release, touching three different files and one shared loop.** The
+    largest single cost is that each needs its own discriminating evidence, and two of them
+    (`F1`'s recorded prompt, `F8`'s deleted line) need a fixture provider that captures what it was
+    handed. Build that capture once and use it for both rather than twice.
+  - >
+    **The gate's position in `prepare_read` is the delicate part.** It must sit after the policy
+    verdict and before the tool runs, on the loop's own thread, without moving anything 0.41.0 put
+    there — the pause collapse, the pending-approval row and the call-order fold all live in that
+    function. Budget for reading it whole before editing it, and for N4 catching the mistake if the
+    gate lands one line too late.
+  - >
+    **A portable hook argv for the tests.** Three platforms, no shell, an exit status and a line of
+    stdout. 0.28.0 solved this for its own hook tests; find what it did and do the same rather than
+    inventing a second answer, and never a `.sh` that Windows skips into a false pass.
+  - >
+    **Capturing stdout without reintroducing a deadlock.** The existing `fire` writes the payload to
+    the child's stdin and drops it; reading stdout as well means a child that fills the pipe while
+    nobody reads must not hang the poll. Bound the read and keep `wait_bounded` the thing that
+    decides the deadline.
+  - >
+    **The prompt for `ModelApprover` is a security surface, not a formatting task.** The write
+    content it renders is attacker-controlled in any repository the agent did not author. Budget
+    time for the framing and for saying plainly in `docs/CONTRACT.md` what the model is and is not
+    the wall against.
+  preferred_tools:
+  - >
+    `ModelReviewer` (`src/verify.rs:498`) as the template for `ModelApprover`, including its verdict
+    parse and its tolerance for a verdict wrapped in prose. Two near-identical parsers is the cost
+    of two different verdict shapes; a shared one is worth trying and not worth forcing.
+  - >
+    `preflight_review_and_routing` (`src/run.rs:2843`) for the self-approval refusal — the same
+    function, so the two refusals cannot drift and a reader finds both in one place.
+  - >
+    `Store::snapshot` (`src/state.rs:4156`) for the before-text. It is `pub(crate)`, already
+    per-run, already three-cased, and already the answer to "the way it was".
+  - >
+    The existing fixture-provider and recorded-provider machinery for every criterion. No new test
+    infrastructure beyond the prompt-capturing fixture.
+  constraints:
+  - >
+    No new dependency in the default build.
+  - >
+    MSRV stays 1.95.
+  - >
+    Additive only. Both new trait methods are defaulted; every new struct is `#[non_exhaustive]`;
+    `ReviewRequest`, `Request` and `Decision` are not touched.
+  - >
+    The trust rule may be extended and never weakened: `at` is refused at project scope for the same
+    reason `[[hook]]` is, inside a `[profile]` too.
+  - >
+    A model's approval may not install a remembered rule. `Decision::Approve { remember }` is always
+    empty from a `ModelApprover`.
+  - >
+    Nothing on the tool path may serialise 0.41.0's batch or move a recorded artifact out of the
+    model's call order.
+
+risks:
+- >
+  **This release lets a model answer a permission question, and the repository it is reading may be
+  hostile.** A write's content reaches the approving model's prompt, and a file in the workspace can
+  therefore address that model directly. Mitigation is that the policy is untouched and remains the
+  wall: a denied act never reaches any approver, so the worst a successful injection buys is an
+  approval of something the operator had already marked as a grey-tier question. It cannot widen the
+  boundary, cannot remember a rule, and cannot rewrite the act. This is stated in
+  `docs/CONTRACT.md` in exactly those terms rather than left for an embedder to work out, and
+  `DenyAll` remains the honest posture for a job that must never take a sensitive action.
+- >
+  **A `before_tool` hook is a process spawn on the hottest path in the loop.** An unfiltered hook in
+  a read-heavy step spawns once per call. Mitigation is the `tools` filter, N4's zero-spawn arm, and
+  documentation that leads with the filter rather than mentioning it. The residual risk is an
+  operator who writes an unfiltered hook and blames the harness for the slowdown; the guide names
+  the cost in the same paragraph as the feature.
+- >
+  **A defaulted trait method means a silent no-op.** A `Reviewer` that overrides nothing keeps
+  reading the outcome and no error says so — which is the price of zero breaks and was chosen
+  deliberately. Mitigation: `ModelReviewer`, the reviewer almost everyone uses, overrides it; the
+  criterion that proves the default forwards (F9) exists precisely so the no-op is a documented
+  behaviour rather than an accident; and `docs/CONTRACT.md` states which reviewers see the change.
+- >
+  **Windows.** A child process per tool call, on the slowest runner in the matrix, is where a
+  platform-specific defect and a flaky timeout both live. Mitigation: the fixture argv is portable
+  by construction, timeouts are sized against the slowest runner, and every assertion is structural
+  — a stored row, a counter or an absent `Edit` — rather than timed.
+- >
+  **Fallback pressure.** If the gate cannot be placed in `prepare_read` without disturbing 0.41.0's
+  pause collapse or call-order fold, the honest retreat is the fallback scope — the approval half
+  alone — rather than a second dispatch path that would drift from the first.
+
+open_questions:
+- >
+  Whether `at` should later gain `after_tool`. It needs a tool-result shape, which is the
+  `ToolResult` event withdrawn from 0.41.0 and the stored hunks 0.51.0 owns, so the question is
+  recorded for the release that has the shape rather than guessed at here.
+- >
+  Whether `ApprovalContext` should carry recent observations so the approving model can see what the
+  run has been doing. Deferred, and deliberately: `ReviewRequest`'s type-level docs already argue
+  that a judge reading the author's own reasoning is a judge being led, and the same argument
+  applies to an approver. Revisit only with a case that a rule, a layer and a goal cannot answer.
+- >
+  Whether a `before_tool` hook should be able to answer for the whole run rather than for one call —
+  the hook equivalent of `Decision::Approve { remember }`. Not in this release, for the same reason a
+  model's approval may not remember: a config-file argv installing a run-scoped rule is a wider
+  grant than stopping one call.

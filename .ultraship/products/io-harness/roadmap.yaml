@@ -1040,7 +1040,7 @@ versions:
       what the run produced, while what a reviewer of a code change actually reads is the change —
       so a rubric can be answered against the edits the run made, which is the form the criterion
       was always reaching for.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.43.0
     outcome: >
