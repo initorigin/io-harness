@@ -1,0 +1,400 @@
+product: io-harness
+version: 0.41.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    Get the reads a completion asked for in the time of the slowest one rather than the sum of all
+    of them.
+
+    A model that has decided to understand a module before changing it emits one completion carrying
+    eight `read_file` calls, a `grep` and a `find`. The loop then walks them one at a time:
+    `src/run.rs:4346` is `for call in &response.tool_calls`, and each iteration awaits `dispatch`
+    (`src/run.rs:7118`) to completion before the next begins. Ten independent reads of ten different
+    files, none of which can affect another, are ten sequential filesystem round trips inside one
+    step. Nothing in the crate is contended, nothing is waiting on the provider — the loop is simply
+    written serially, and has been since 0.1.0 when a step carried one call.
+
+    0.41.0 partitions each completion's calls by whether they can change anything, and dispatches the
+    read-only ones concurrently. `read_file`, `grep` and `find` are read-only by construction; an
+    in-process `Tool` an embedder registered says which it is through a new defaulted trait method,
+    so every existing implementation keeps the safe answer without being edited. Everything else —
+    `write_file`, `edit_file`, `exec`, `shell`, the git built-ins, the spawn tool, the plan and
+    question tools — runs exactly as it does today, one at a time, in the order the model asked.
+
+    The concurrency has a ceiling the contract owns: `max_parallel_reads`, defaulting to 10, floor 1.
+    It caps calls in flight, not calls attempted, so the real number is
+    `min(cap, read-only calls in that completion)` and a completion carrying four reads runs four. A
+    floor of 1 reproduces today's behaviour exactly, which is what makes the change bisectable by an
+    embedder who suspects it.
+
+    What does not change is what anyone can observe afterwards. Observations, decisions, recorded
+    steps, budget draws and the media a read attached are folded back **in the order the model asked
+    for them**, never in the order they finished. A run's trace, its context assembly, its ledger and
+    its replay are byte-identical to the serial run of the same recorded case. Concurrency here is an
+    execution detail, not a semantic one, and the release is only worth having if that stays true.
+
+    One case collapses back: a read-only call the policy sends to an approver. `Dispatched::Pause`
+    stops the step (`src/run.rs:4392`), and a pause that arrives while three other tools are already
+    running would have to either discard their work or record work the operator has not yet
+    approved. So a batch degrades to serial from the first call whose policy decision is not an
+    outright allow, and the step behaves precisely as it does today from that point on.
+
+  business_value: >
+    This is the crate's largest unforced cost and the one an embedder cannot fix. `dispatch` is
+    private, the loop that calls it is inside `run.rs`, and the tools it dispatches are `pub(crate)`
+    — an application built on the harness cannot batch its own reads, cannot reorder them, and cannot
+    even observe that they ran serially except by timing them. As with 0.37.0's greeting list,
+    0.38.0's cache marker, 0.39.0's spawn tool and 0.40.0's contained `exec`, the gap is in the
+    library and only the library can close it.
+
+    It is also the cost that grows with exactly the usage the crate is designed for. A session over
+    one workspace re-reads as it goes; context assembly invalidates an observation a later write
+    touched and the model re-reads it (`src/context.rs`); a fan-out turn has sixteen children each
+    exploring before editing. Every one of those multiplies the serial read, and the fix is one
+    partition and a bounded join.
+
+    The price is a single defaulted trait method and one optional field, both additive on types that
+    are already `#[non_exhaustive]`. An embedder who upgrades and changes nothing gets faster reads
+    and an identical trace; an embedder who distrusts it writes `1` and is back to 0.40.0's
+    behaviour.
+
+  evidence_of_value: >
+    Executed in the technique the last ten releases used: a discriminating pair, a negative control
+    that must not move, one sabotage per arm of every two-armed claim, and a sabotage that fails
+    nothing reported as a finding rather than propped up.
+
+    The concurrency claim is proven where concurrency is either present or absent, and without a
+    clock: three read-only tools whose implementations rendezvous with each other complete only if
+    they are in flight together, and deadlock — caught by a bounded timeout that fails the test —
+    if they are run one after another. On the same contract with `max_parallel_reads(1)`, the same
+    three tools must fail to rendezvous. That pair is the release in one assertion and it does not
+    measure anything, which matters because a wall-clock assertion on a CI runner is a flake waiting
+    to be written and this project has paid for that lesson four times.
+
+    The ordering claim is proven against the serial path directly: a recorded case replayed with the
+    cap at 10 and at 1 produces byte-identical stored steps, observations, decisions, ledger rows and
+    outcome. Not "equivalent" — identical, by comparison of the stored rows.
+
+    The safety claim is proven by what does *not* run at once: a completion mixing reads and a write
+    records the write's effect after every read that preceded it, and two mutating calls never
+    overlap. And the pause claim is proven by a read-only call the policy marks `Ask` inside a batch
+    of five: the run stops with `AwaitingApproval`, and the tools after it in that completion have
+    left no observation, no step and no ledger draw behind.
+
+scope:
+  included:
+  - >
+    **One defaulted trait method and one enum, on the public surface.**
+    `pub enum ToolEffect { ReadOnly, Mutating }` and, on `custom::Tool` (`src/tools/custom.rs:129`),
+    `fn effect(&self) -> ToolEffect { ToolEffect::Mutating }`. Defaulted, so every existing
+    implementation compiles unchanged and keeps the conservative answer; a tool that wants
+    concurrency opts in by one line. The trait is already `Send + Sync`, so a concurrent call needs
+    no new bound.
+  - >
+    **One optional field on `TaskContract`, and one builder method.**
+    `max_parallel_reads: usize` with `TaskContract::with_max_parallel_reads(usize)`, default 10,
+    clamped to a floor of 1 rather than rejected — `0` means serial, not an error, because a caller
+    who computed it from a config should get the safe reading and not a failed run. `TaskContract`
+    has been `#[non_exhaustive]` since 0.35.0 (`src/contract.rs:70`), so this is free of breaks.
+  - >
+    **Partition and bounded join in the step loop.** `src/run.rs:4346`'s single `for` becomes: walk
+    the completion's calls, take maximal runs of `ReadOnly` calls, dispatch each run under a
+    `JoinSet` bounded by the cap, and dispatch everything else exactly as today. `tokio` is already a
+    dependency and is the only thing this needs; no `futures`, no `rayon`, no new crate.
+  - >
+    **Order-preserving fold.** Each parallel task returns its `Dispatched` into a pre-sized
+    `Vec<Option<_>>` indexed by the call's position in the completion. After the join the results are
+    folded in index order: observations pushed to the ledger, decisions recorded, `step_changed`
+    OR-ed, remembered rules extended, and — the one piece of shared mutable state on this path —
+    the media a read attached (`src/run.rs:7735` pushes into `pending_media`) returned by value from
+    each task and pushed during the fold, so `PendingMedia` is never shared across tasks and needs no
+    lock.
+  - >
+    **Serial collapse on any non-allow decision.** A batch is executed concurrently only while every
+    call in it resolves to `Dispatched::Continue`. The first `Pause`, `Ask` or `Plan` ends the batch:
+    results already folded stand, calls after it in the completion are not started, and the step
+    stops as it does today. Because the collapse point is decided by the policy and not by timing,
+    the same recorded case collapses at the same call every time.
+  - >
+    **Built-in classification.** `read_file`, `grep` and `find` are `ReadOnly`. Everything else built
+    in — `write_file`, `edit_file`, `exec`, `shell`, `shell_start` / `shell_poll` / `shell_kill`, the
+    git built-ins, spawn, the plan and question tools, skill loading — is `Mutating`, including tools
+    that only read the world but reach it through a process, because a spawn under a sandbox backend
+    is not a thing this release makes concurrent.
+  - >
+    **Documentation as part of the release.** `docs/CONTRACT.md` gains the guarantee in the terms an
+    embedder needs it: read-only calls in one completion may run concurrently, order of every
+    recorded artifact is the model's call order regardless, and a tool that lies about `effect()`
+    breaks its own invariants and nobody else's. `docs/guide/tools-and-skills.md` documents
+    `ToolEffect` beside the `Tool` trait it hangs off. `CHANGELOG.md` gains the entry with **no**
+    `*Migration:*` note, because nothing breaks. **No new guide page**, and therefore no `GUIDES` /
+    `CAPABILITIES.md` bookkeeping — the 0.31.0, 0.36.0, 0.37.0, 0.38.0, 0.39.0 and 0.40.0 precedent.
+    `docs/public-api.txt` updated by hand; all three new items carry a worked doctest for the
+    `every_public_item_has_a_worked_example` gate.
+  excluded:
+  - >
+    **Concurrent MCP tool calls.** An MCP tool can advertise `readOnlyHint`, and honouring it means
+    issuing overlapping requests on one `McpSession` (`src/mcp.rs`). Whether the session multiplexes
+    request ids across a shared stdio transport, and what a server that does not expect it does, is a
+    question about the MCP client rather than about the step loop. MCP tools stay `Mutating` in
+    0.41.0 and the reason is written down rather than left as an oversight.
+  - >
+    **Concurrent verification, gates or sub-agent spawns.** A tree already runs children concurrently
+    under its own cap (0.39.0); this release does not touch that machinery, and the two caps are
+    independent by design — `max_concurrent_agents` bounds children, `max_parallel_reads` bounds
+    tool calls inside one step of one agent.
+  - >
+    **Concurrency across steps or across completions.** The unit is one completion's tool calls.
+    Nothing is carried across a provider round trip; that is 0.54.0's question.
+  - >
+    **Any change to `dispatch`'s decisions.** Every policy check, approval, refusal, observation
+    shape, error mapping and store write is what it is today. This release changes when `dispatch` is
+    called, never what it does.
+  - >
+    **A wall-clock or throughput criterion.** Nothing in this release asserts a duration. The gain is
+    structural and the evidence is structural; a runner-timed assertion would be a flake and this
+    project does not write them.
+  - >
+    **Any new dependency, table, column, index or `EventKind` variant.**
+  fallback_scope:
+  - >
+    The partition, the bounded join, the order-preserving fold and the serial collapse — with
+    **`ToolEffect` and the `Tool` trait method dropped**, so the classification is internal and
+    covers the three built-in readers only. An embedder's registered tools stay serial and the public
+    surface is one field and one builder method instead of three items. The headline outcome holds in
+    full for the case that motivates it — a completion full of `read_file` calls — the whole ordering
+    and pause discipline is unchanged, and what drops is the extension point, which can be added
+    later as the same defaulted method with no break. The limitation is stated in `docs/CONTRACT.md`
+    and in the record rather than discovered by an embedder who expected their tool to be batched.
+
+acceptance:
+  functional:
+  - >
+    **F1 — read-only calls in one completion run concurrently, and with the cap at 1 they do not.**
+    Three registered `Tool` implementations returning `ToolEffect::ReadOnly`, each of which waits on
+    a shared barrier of three and then returns. A fixture provider emits one completion calling all
+    three. With the default cap the step completes; the barrier can only be crossed if all three are
+    in flight. **The negative control, on the same contract, same policy, same store, same
+    completion, with `with_max_parallel_reads(1)`:** the step does not complete and the bounded
+    timeout that guards the test fires, proving the serial path is genuinely serial. This pair is the
+    release in one assertion, and it contains no clock. Sabotage: make the partition treat
+    `ReadOnly` as `Mutating`, under which the first half must fail.
+  - >
+    **F2 — the trace is identical whether or not it ran concurrently.** One recorded case
+    (`src/provider/record.rs` / `replay.rs`) exercising a completion of eight reads mixed with two
+    writes, replayed twice into two stores: once at cap 10, once at cap 1. The stored steps,
+    observations in the ledger, decision strings, `Edit` rows, ledger draws and the final
+    `RunOutcome` compare equal row for row. Not a subset and not a normalisation — equality of what
+    the store holds. Sabotage: fold results in completion order instead of call order, under which
+    this must fail while F1 still passes.
+  - >
+    **F3 — a mutating call is never overlapped, and never reordered against a read.** A completion of
+    `[read a, read b, write a, read a]`: the fourth call's observation contains what the third call
+    wrote, and the third does not begin until the first two have folded. Asserted from the stored
+    observations, not from timing. Sabotage: include `Mutating` calls in a batch, under which the
+    fourth read may see the pre-write content and this fails.
+  - >
+    **F4 — a pause inside a batch leaves no partial work behind.** A completion of five read-only
+    calls where the policy marks the third `Ask` and the approver defers. The run stops with
+    `AwaitingApproval`; the store holds observations for the two calls before it and **none** for the
+    two after it; the ledger shows no draw for them; and resuming on approval proceeds from the
+    deferred call. Asserted on stored rows. Sabotage: start the whole batch before checking policy,
+    under which observations for the trailing calls appear and this fails.
+  - >
+    **F5 — a registered tool's effect is respected in both directions.** Two registered tools,
+    identical but for `effect()`. The `ReadOnly` one is batched with a built-in read; the `Mutating`
+    one is not — proven by F1's barrier technique in the first case and by a rendezvous that must
+    *fail* in the second. Sabotage: ignore the trait method and treat every custom tool as read-only,
+    under which the second arm fails.
+  - >
+    **F6 — the cap bounds calls in flight.** A completion carrying twenty read-only calls under a cap
+    of 3: a counter incremented on entry and decremented on exit never observes more than 3
+    concurrently, and all twenty complete with twenty observations in call order. Sabotage: drop the
+    `JoinSet` bound, under which the counter exceeds 3.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` for the default feature set has the same number of
+    crates as 0.40.0. The join is `tokio`'s, which is already there.
+  - >
+    **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs. Nothing
+    here reaches for a newer std API.
+  - >
+    **N3 — no public break.** Three items added, none removed or altered. `docs/public-api.txt`
+    diffs by exactly those three lines. A consumer who never calls the new method and never sets the
+    new field compiles unchanged.
+  - >
+    **N4 — determinism under the crate's own replay.** The F2 comparison is run twenty times in one
+    CI job and is equal every time. Concurrency that is deterministic nineteen times out of twenty is
+    a defect this release must not ship, and one run cannot see it.
+  - >
+    **N5 — no leaked task.** A run that ends while a batch is in flight — cancelled, budget-exhausted
+    or errored — leaves no detached task writing to the store afterwards. Asserted by dropping the
+    run and confirming the store is unchanged after a bounded wait. The `JoinSet` is what makes this
+    true rather than hopeful, and it is the reason for choosing it over spawning loose tasks.
+  operational:
+  - >
+    **O1 — the full suite passes on all three platforms**, which is what the standing CI matrix
+    already runs. Concurrency changes the plausible failure set on Windows specifically, so a green
+    matrix is load-bearing here rather than routine.
+  - >
+    **O2 — no store migration.** `CHECKPOINT_FORMAT` unmoved, no table, column or index added, and a
+    0.40.0 store opens and resumes under 0.41.0 unchanged, asserted by the cross-version tests that
+    already read the 0.22.0 and 0.29.0 fixture stores.
+  - >
+    **O3 — the documentation gates pass**: the nightly rustdoc gate, the intra-doc link rules, and
+    the checked-in doc surfaces (`docs/public-api.txt`, `CAPABILITIES.md`, the guide index,
+    `CHANGELOG.md`) consistent with the code in the same commit range.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.41.0, GitHub at initorigin/io-harness with the tag `v0.41.0` and a
+    Release titled `io-harness 0.41.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.41.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head checked against the tree the gates ran on immediately
+    before the release PR is opened. Release PR `develop` into `main`, merged the same way. The
+    GitHub Release is cut by `release.yml` —
+    `gh workflow run release.yml --ref main -f version=0.41.0` — which takes its notes verbatim from
+    the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and
+    the Release exist, with the registry token sourced from the repo-local `.env` in the same shell
+    invocation. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    None. No table is created or altered, no index is added, no column is added, `CHECKPOINT_FORMAT`
+    is unmoved, and a 0.40.0 store and a 0.41.0 store are the same store.
+  - >
+    No public break. Three items are added and none is removed or altered. A `Tool` implementation
+    written against 0.40.0 compiles and behaves identically, because the new method is defaulted to
+    the conservative answer.
+  - >
+    One thing a reader must not misread: the default changes *timing*, not results. The changelog
+    says so beside the addition, and names `with_max_parallel_reads(1)` as the way back to 0.40.0's
+    execution shape for anyone who wants to rule it out while debugging something else.
+  observability:
+  - >
+    Nothing new is emitted, deliberately. The same `EventKind::ToolCall` events, in the same order,
+    with the same steps and the same ledger draws — an observer cannot tell from the event stream
+    whether a batch ran concurrently, which is the guarantee F2 asserts rather than a gap.
+  - >
+    The resolved cap is part of the boundary the run took, so it is available to an observer through
+    the contract it already holds; no new accessor is added for it.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.41.1 and `cargo yank --version
+    0.41.0` is the escape hatch, leaving 0.40.0 as what `cargo install` resolves. Reverting is
+    unusually cheap: no schema change, no public API removal, and the entire behaviour change is a
+    scheduling decision behind a field whose floor value reproduces the previous release exactly. An
+    embedder who suspects the concurrency writes `with_max_parallel_reads(1)` and is on 0.40.0's
+    execution path without changing anything else — which is the whole reason the floor is 1 and not
+    2.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    No live provider is required. Every criterion here is deterministic against fixture and recorded
+    providers — the evidence is stored rows, barriers and counters, none of which needs a vendor.
+  - >
+    The GitHub Actions three-platform matrix is load-bearing rather than incidental: a scheduling
+    change is where a Windows-only or slow-runner-only defect would surface, and N4's twenty-run
+    determinism check is the one criterion whose cost lands on the runner.
+  human_approvals:
+  - >
+    The owner decided on 2026-08-07 that the previously drafted 0.41.0 — a `ToolResult` event and
+    stored edit hunks — is withdrawn, and that the hunk half returns inside 0.51.0 where the patch
+    tool needs it.
+  - >
+    The owner decided on 2026-08-07 that the concurrency ceiling is a contract field defaulting to
+    **10** with a floor of 1, rather than an unbounded join or a fixed internal constant.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: medium
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **`dispatch`'s signature is the whole problem.** It takes twenty-odd parameters
+    (`src/run.rs:7118`) including `&mut PendingMedia`, the live process `handles`, and several
+    borrows of run-scoped state. Concurrency means the read-only path must take only what is `Sync`
+    and return by value what it would have mutated. The media push (`src/run.rs:7735`) is the known
+    one; budget for one or two more found by the borrow checker rather than by reading, and for the
+    honest answer being a narrower `dispatch_read_only` beside the existing function rather than a
+    parameter-by-parameter audit of a function this size.
+  - >
+    **Deciding the read-only set is a judgement, not a lookup.** `git status` reads and changes
+    nothing, and is still excluded here because it spawns a process under a sandbox backend. Every
+    such call needs the reason written down, because the next release that widens the set will read
+    these reasons rather than re-derive them.
+  - >
+    **The barrier tests are the delicate part of the work.** A rendezvous test that is meant to
+    deadlock on the serial path must deadlock *bounded* — a plain barrier with no timeout hangs CI
+    instead of failing it. Budget for getting the timeout and the failure message right, because a
+    hung Windows job costs the whole matrix.
+  - >
+    **N4's twenty-run determinism check** is deliberate cost on the runner, and it is the criterion
+    most likely to be argued down. It is the only thing standing between this release and a
+    once-in-twenty ordering defect that would surface as an unreproducible trace in someone else's
+    audit.
+  preferred_tools:
+  - >
+    `tokio::task::JoinSet` for the bound, since it cancels its children on drop, which is what N5
+    asserts. Not `futures::join_all`, which would be a new dependency and would not give the bound.
+  - >
+    The existing recorded-provider machinery for F2 and N4; the existing fixture-provider pattern for
+    F1, F3, F4, F5 and F6. No new test infrastructure.
+  constraints:
+  - >
+    No new dependency in the default build; `tokio` is already there and is sufficient.
+  - >
+    MSRV stays 1.95.
+  - >
+    Additive only. `TaskContract` and the relevant enums are `#[non_exhaustive]`; the trait gains a
+    defaulted method and nothing else.
+  - >
+    Ordering of every stored artifact is the model's call order. This is the release's own invariant
+    and no optimisation may trade it.
+
+risks:
+- >
+  **A defect here is a wrong trace, not a crash, and a wrong trace is the one thing this crate sells
+  against.** An ordering slip that survives F2 would put an observation before the write that
+  invalidated it, and context assembly (`src/context.rs`) would then reason from stale content
+  silently. Mitigation is N4's repeat count and F3's read-after-write assertion; the residual risk is
+  a shape neither covers, which is why the fold is written as a positional `Vec` rather than as
+  anything that could be reordered by an optimisation later.
+- >
+  **A registered tool that declares `ReadOnly` and then writes.** The crate cannot enforce the
+  declaration — the tool is arbitrary code the embedder compiled in. Mitigation is that the default
+  is `Mutating`, so a tool is only concurrent if its author said so, and `docs/CONTRACT.md` states
+  plainly that the declaration is a promise the tool makes about itself. This is the same shape as
+  every other `Tool` invariant and is not a new class of exposure.
+- >
+  **Windows.** A scheduling change is exactly where a platform-specific defect hides, and the Windows
+  runner is the slowest in the matrix, which makes a bounded-timeout test the likeliest thing to
+  become flaky there. Mitigation: timeouts sized against the slowest runner and asserted structurally
+  wherever a structural assertion exists.
+- >
+  **Fallback pressure.** If `dispatch`'s parameter set resists splitting, the honest retreat is the
+  fallback scope — three built-in readers, no public trait method — rather than a lock around shared
+  mutable state that would serialise the very calls this release exists to overlap.
+
+open_questions:
+- >
+  Whether `McpSession` can multiplex concurrent requests over one stdio transport, and whether
+  servers in the wild tolerate it. Not answered here; MCP tools stay `Mutating` and the question is
+  recorded for the release that widens the read-only set.
+- >
+  Whether the read-only set should later include the git built-ins that only read (`status`, `diff`,
+  `log`). They are excluded now because they spawn a process under a sandbox backend, and the
+  interaction between concurrent spawns and 0.46.0–0.48.0's containment work is a question those
+  releases should answer rather than this one.
+- >
+  Whether `Session` should expose the cap per turn, or keep taking it from the contract each turn
+  builds. Deferred until an embedder asks; the default reaches every turn either way.
