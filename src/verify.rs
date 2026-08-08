@@ -362,6 +362,138 @@ pub struct ReviewRequest {
     pub files: Vec<(PathBuf, String)>,
 }
 
+/// What one file looked like before the run first wrote it, and what it holds now
+/// (0.42.0).
+///
+/// The three cases are the three the store already keeps, and they are kept apart
+/// because they read differently: a file that existed has a `before`, a file the
+/// run *created* has none, and a file whose previous contents were too large or
+/// not text says so in `unkept` rather than pretending to have been empty. A
+/// reviewer told a rewritten file was empty would read every line as an addition.
+///
+/// ```
+/// use io_harness::FileChange;
+///
+/// let edited = FileChange::new("src/parse.rs", "pub fn parse() {}\n")
+///     .with_before("/// Parses one line.\npub fn parse() {}\n");
+/// // What a "what the run wrote" view cannot show: the line that is gone.
+/// assert!(edited.before.as_deref().unwrap().contains("Parses one line"));
+/// assert!(!edited.after.contains("Parses one line"));
+///
+/// // A file the run created carries no before at all.
+/// let created = FileChange::new("src/new.rs", "pub fn new() {}\n");
+/// assert!(created.before.is_none());
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FileChange {
+    /// The path, relative to the workspace root.
+    pub path: PathBuf,
+    /// What the file held before the run first wrote it, or `None` when the run
+    /// created it.
+    pub before: Option<String>,
+    /// What it holds now.
+    pub after: String,
+    /// Why `before` is absent for a file that did exist — over the store's
+    /// snapshot cap, or not text. `None` when `before` is the whole answer.
+    pub unkept: Option<String>,
+}
+
+/// What a [`Reviewer`] is handed when it wants the change rather than the outcome
+/// (0.42.0).
+///
+/// The same goal and the same rubric a [`ReviewRequest`] carries, and in place of
+/// "every file the run wrote, as it stands" the before and after of each one. A
+/// rubric about what a change *did* — nothing lost its doc comment, no public
+/// item was removed, the new code has a test — is answerable from this and is not
+/// answerable from the outcome, because what was deleted is not in the text that
+/// remains.
+///
+/// ```
+/// use io_harness::{ChangeReview, FileChange};
+///
+/// let review = ChangeReview::new(
+///     "tidy the parser",
+///     "no public item lost its doc comment",
+///     vec![FileChange::new("src/parse.rs", "pub fn parse() {}\n")
+///         .with_before("/// Parses one line.\npub fn parse() {}\n")],
+/// );
+///
+/// // The same request, seen the way a reviewer written before 0.42.0 sees it.
+/// let outcome = review.into_outcome_request();
+/// assert_eq!(outcome.files.len(), 1);
+/// assert_eq!(outcome.files[0].1, "pub fn parse() {}\n");
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ChangeReview {
+    /// The contract's goal, so the reviewer knows what was asked for.
+    pub goal: String,
+    /// The criterion's rubric, verbatim.
+    pub rubric: String,
+    /// Every file the run wrote, before and after, in the order it first touched
+    /// them.
+    pub changes: Vec<FileChange>,
+}
+
+impl FileChange {
+    /// A file the run created, holding `after`.
+    ///
+    /// The before is added with [`Self::with_before`] when the file existed, and
+    /// [`Self::not_kept`] when it existed and its contents were not kept.
+    pub fn new(path: impl Into<PathBuf>, after: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            before: None,
+            after: after.into(),
+            unkept: None,
+        }
+    }
+
+    /// What the file held before the run first wrote it.
+    pub fn with_before(mut self, before: impl Into<String>) -> Self {
+        self.before = Some(before.into());
+        self
+    }
+
+    /// Why there is no before for a file that did exist.
+    pub fn not_kept(mut self, why: impl Into<String>) -> Self {
+        self.unkept = Some(why.into());
+        self
+    }
+}
+
+impl ChangeReview {
+    /// A review of `changes`, against `rubric`, for a run pursuing `goal`.
+    pub fn new(
+        goal: impl Into<String>,
+        rubric: impl Into<String>,
+        changes: Vec<FileChange>,
+    ) -> Self {
+        Self {
+            goal: goal.into(),
+            rubric: rubric.into(),
+            changes,
+        }
+    }
+
+    /// The same review as a [`ReviewRequest`] — the files as they stand.
+    ///
+    /// What the default [`Reviewer::review_change`] forwards, so a reviewer
+    /// written before 0.42.0 receives exactly what it received then.
+    pub fn into_outcome_request(self) -> ReviewRequest {
+        ReviewRequest {
+            goal: self.goal,
+            rubric: self.rubric,
+            files: self
+                .changes
+                .into_iter()
+                .map(|c| (c.path, c.after))
+                .collect(),
+        }
+    }
+}
+
 /// One reviewer's verdict, with the reasons it gave for it.
 ///
 /// `reasons` is not decoration: a refusal a human cannot argue with is a gate
@@ -472,6 +604,48 @@ pub trait Reviewer: Send + Sync + std::fmt::Debug {
     /// because nothing about the work has changed.
     fn review<'a>(&'a self, request: ReviewRequest) -> Reviewing<'a>;
 
+    /// Judge the change rather than what it left behind (0.42.0).
+    ///
+    /// This is what the run loop calls. The default hands [`Self::review`] the
+    /// same [`ReviewRequest`] it has always received, so a reviewer written
+    /// before 0.42.0 needs no edit — and, stated plainly because it is the price
+    /// of that: such a reviewer sees the outcome and not the change. Overriding
+    /// this is how a reviewer sees what was removed.
+    ///
+    /// ```
+    /// use io_harness::{ChangeReview, Review, Reviewer, ReviewRequest, Reviewing};
+    ///
+    /// #[derive(Debug)]
+    /// struct NothingWasDeleted;
+    ///
+    /// impl Reviewer for NothingWasDeleted {
+    ///     fn review<'a>(&'a self, _: ReviewRequest) -> Reviewing<'a> {
+    ///         // Unanswerable from the outcome alone, so it says so.
+    ///         Box::pin(async { Ok(Review::failed(["this rubric needs the change"])) })
+    ///     }
+    ///
+    ///     fn review_change<'a>(&'a self, request: ChangeReview) -> Reviewing<'a> {
+    ///         let shrank = request.changes.iter().any(|c| {
+    ///             c.before.as_ref().is_some_and(|b| b.len() > c.after.len())
+    ///         });
+    ///         Box::pin(async move {
+    ///             Ok(if shrank {
+    ///                 Review::failed(["a file lost content"])
+    ///             } else {
+    ///                 Review::passed()
+    ///             })
+    ///         })
+    ///     }
+    ///
+    ///     fn model(&self) -> Option<&str> {
+    ///         None
+    ///     }
+    /// }
+    /// ```
+    fn review_change<'a>(&'a self, request: ChangeReview) -> Reviewing<'a> {
+        self.review(request.into_outcome_request())
+    }
+
     /// The model this reviewer will ask, when it is a model at all.
     ///
     /// `None` means the question does not apply — a human, a stub, a second
@@ -531,6 +705,22 @@ object and nothing else:
 Give a reason for every refusal. Judge the work in front of you against the \
 rubric, not against what you would have written.";
 
+impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> ModelReviewer<P> {
+    /// Ask, and read the verdict out of the answer.
+    async fn judge(&self, user: String) -> Result<Review> {
+        let response = self
+            .provider
+            .complete(crate::provider::CompletionRequest {
+                system: REVIEW_SYSTEM.to_string(),
+                user,
+                model: Some(self.model.clone()),
+                ..Default::default()
+            })
+            .await?;
+        parse_verdict(response.text.as_deref().unwrap_or_default())
+    }
+}
+
 impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Reviewer for ModelReviewer<P> {
     fn review<'a>(&'a self, request: ReviewRequest) -> Reviewing<'a> {
         Box::pin(async move {
@@ -547,16 +737,43 @@ impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Reviewer for 
                     path.to_string_lossy()
                 ));
             }
-            let response = self
-                .provider
-                .complete(crate::provider::CompletionRequest {
-                    system: REVIEW_SYSTEM.to_string(),
-                    user,
-                    model: Some(self.model.clone()),
-                    ..Default::default()
-                })
-                .await?;
-            parse_verdict(response.text.as_deref().unwrap_or_default())
+            self.judge(user).await
+        })
+    }
+
+    /// The change, rendered before-and-after per file.
+    ///
+    /// Not a unified diff: computing one is 0.51.0's work, where the hunks are
+    /// stored and a patch tool needs them. What a model needs to answer "did this
+    /// change lose something" is both texts, and both texts is what the store
+    /// already holds.
+    fn review_change<'a>(&'a self, request: ChangeReview) -> Reviewing<'a> {
+        Box::pin(async move {
+            let mut user = format!(
+                "# Goal\n{}\n\n# Rubric\n{}\n\n# What the run changed\n",
+                request.goal, request.rubric
+            );
+            if request.changes.is_empty() {
+                user.push_str("(nothing was changed)\n");
+            }
+            for change in &request.changes {
+                let path = change.path.to_string_lossy();
+                match (&change.before, &change.unkept) {
+                    (Some(before), _) => user.push_str(&format!(
+                        "\n## {path}\n\n### before\n```\n{before}\n```\n\n### after\n```\n{}\n```\n",
+                        change.after
+                    )),
+                    (None, Some(why)) => user.push_str(&format!(
+                        "\n## {path}\n\n### before\n(not kept: {why})\n\n### after\n```\n{}\n```\n",
+                        change.after
+                    )),
+                    (None, None) => user.push_str(&format!(
+                        "\n## {path}\n\n### before\n(this file did not exist)\n\n### after\n```\n{}\n```\n",
+                        change.after
+                    )),
+                }
+            }
+            self.judge(user).await
         })
     }
 
@@ -565,21 +782,36 @@ impl<P: crate::provider::Provider + std::fmt::Debug + Send + Sync> Reviewer for 
     }
 }
 
-/// Read a verdict out of a model's answer.
+/// The first balanced JSON object in a model's answer, braces included.
 ///
-/// Scans for the first balanced JSON object rather than requiring the whole
-/// response to be one: a model that says "Looks good to me. {...}" has answered,
-/// and refusing it would turn a judgement into a transport error. A response with
-/// no object at all, or one that does not carry `passed`, is an error — a verdict
-/// nobody can read is a review that did not happen.
-fn parse_verdict(text: &str) -> Result<Review> {
+/// One scanner, used by both things in this crate that read a verdict out of
+/// prose — the review gate here and [`ModelApprover`](crate::ModelApprover) — so
+/// "a model that wraps its object in a fenced block has still answered" is one
+/// rule rather than two that can drift. Strings are tracked so a brace inside one
+/// does not close the object, which is exactly what a denial reason containing
+/// `}` would otherwise do.
+///
+/// `None` means there was no balanced object at all. What that *means* is the
+/// caller's to decide, and the two callers decide differently: an unreadable
+/// review is an error, an unreadable approval is a defer.
+pub(crate) fn first_json_object(text: &str) -> Option<&str> {
+    json_object_from(text, 0).map(|(start, end)| &text[start..=end])
+}
+
+/// The first balanced object at or after `from`, as a byte range.
+///
+/// Separate from [`first_json_object`] because [`parse_verdict`] must try each
+/// candidate in turn — a model that writes `{ "note": "…" } {"passed": true}` has
+/// answered in its second object, and stopping at the first would refuse a
+/// verdict that is right there.
+fn json_object_from(text: &str, from: usize) -> Option<(usize, usize)> {
     let bytes = text.as_bytes();
-    for (start, _) in text.char_indices().filter(|&(_, c)| c == '{') {
+    for (start, _) in text.char_indices().filter(|&(i, c)| i >= from && c == '{') {
         let mut depth = 0usize;
         let mut in_string = false;
         let mut escaped = false;
-        for end in start..bytes.len() {
-            let c = bytes[end] as char;
+        for (end, byte) in bytes.iter().enumerate().skip(start) {
+            let c = *byte as char;
             if in_string {
                 match c {
                     _ if escaped => escaped = false,
@@ -595,15 +827,30 @@ fn parse_verdict(text: &str) -> Result<Review> {
                 '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        if let Ok(review) = serde_json::from_str::<Review>(&text[start..=end]) {
-                            return Ok(review);
-                        }
-                        break;
+                        return Some((start, end));
                     }
                 }
                 _ => {}
             }
         }
+    }
+    None
+}
+
+/// Read a verdict out of a model's answer.
+///
+/// Scans for the first balanced JSON object rather than requiring the whole
+/// response to be one: a model that says "Looks good to me. {...}" has answered,
+/// and refusing it would turn a judgement into a transport error. A response with
+/// no object at all, or one that does not carry `passed`, is an error — a verdict
+/// nobody can read is a review that did not happen.
+fn parse_verdict(text: &str) -> Result<Review> {
+    let mut at = 0;
+    while let Some((start, end)) = json_object_from(text, at) {
+        if let Ok(review) = serde_json::from_str::<Review>(&text[start..=end]) {
+            return Ok(review);
+        }
+        at = start + 1;
     }
     Err(Error::provider(
         crate::error::ProviderErrorKind::Malformed,

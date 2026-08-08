@@ -26,6 +26,78 @@ notes are produced from it.
 
 ### Security
 
+## [0.42.0] - 2026-08-08
+
+### Added
+
+- **An unattended run no longer dies on a decision nobody is there to make.**
+  `ModelApprover` installs a model as the `Approver`: it reads the pending act,
+  what it targets, the bytes a write would land, **the rule and the policy layer
+  that flagged it** and the run's goal, then approves, denies with a reason the
+  agent reads and adapts to, or defers — persisting the action so the person who
+  reads the trace tomorrow answers it with `resume_with_decision`. A verdict it
+  cannot read is a defer, never an approval.
+- What a model approver may decide is bounded by what reaches it, and that bound
+  is unchanged: an action the `Policy` **denies** never reaches any approver. A
+  `ModelApprover` also never rewrites the action and never remembers a rule, so it
+  answers the call in front of it and cannot widen the run's boundary.
+- A model is refused before the first request is billed when it would be answering
+  for its own model — the approval mirror of the review refusal 0.34.0 added, with
+  `ModelApprover::allow_self_approval(true)` as the visible way to say you meant
+  it. The refusal costs zero calls to either provider, and it covers a tree as
+  well as a flat run.
+- `ApprovalContext`, carrying the goal, the rule and the layer, with the defaulted
+  `Approver::decide_in_context` that receives it. The default forwards to
+  `decide`, so **every approver written before this release compiles and behaves
+  identically**. `Approver::model` and `Approver::self_approval_allowed` are
+  defaulted too.
+- **An operator can stop a tool call from `io.toml` instead of from Rust.** A
+  `[[hook]]` table gains `at = "before_tool"` and an optional `tools` filter. The
+  hook is spawned with the pending call on its stdin *before the call runs*; a
+  non-zero exit refuses that one call, its first line of stdout becomes the reason
+  the model reads, and the run adapts. `on_failure` gains `refuse`, which is a
+  lifecycle hook's default — a check attached to a point that exists to stop
+  something is not a notification — while `cancel` still ends the run and
+  `continue` lets the call through.
+- A lifecycle hook is refused in a project-scoped `io.toml` exactly as an event
+  hook is, inside a `[profile]` too: a hook that can stop a tool is strictly more
+  dangerous than one that appends a log line. A table this crate cannot honour —
+  an unknown `at`, `on` and `at` together, `tools` without `at`, or a lifecycle
+  hook whose only action is `append` — is refused when the file is read, because a
+  check that loads and never fires looks exactly like one that approved
+  everything.
+- `TaskContract::with_tool_hooks` installs them. It takes the same `Hooks` value an
+  application already installs as an `Observer`: as an observer it ignores the `at`
+  tables, as a gate it ignores the `on` ones. Nothing is implicit — a configuration
+  describing a `before_tool` hook does nothing until an application installs it.
+- **A review criterion can read the change rather than the outcome.**
+  `ChangeReview` and `FileChange` carry each written file as it was before the run
+  first touched it and as it stands now, so a rubric about what a change *did* —
+  nothing lost its doc comment, no public item was removed — is answerable at all.
+  It is built from the restore points the store has kept since 0.28.0: no table,
+  column or index is added.
+- `Reviewer::review_change` is defaulted to forwarding the `ReviewRequest` a
+  reviewer has always received, so **no existing `Reviewer` needs an edit**. The
+  consequence is stated rather than hidden: a reviewer that does not override it
+  sees the outcome and not the change. `ModelReviewer` overrides it.
+
+### Changed
+
+- A refusal from a `before_tool` hook is reported through the existing
+  `EventKind::Refused`, with the hook's program where a rule's pattern would be and
+  `io.toml hook` where a layer would be. No new event kind: a refusal that did not
+  come from the policy is still a refusal, and an observer already routing on them
+  sees it.
+- A `[[hook]]` table written for 0.42.0 is **refused** by an older binary rather
+  than silently ignored, because `at` and `tools` are new keys under
+  `deny_unknown_fields`. That is the intended direction — a lifecycle check that
+  loads and never fires is the failure mode this crate refuses to ship.
+
+There is no migration note for this release: nothing is removed, renamed or
+altered, both new trait methods are defaulted, `ReviewRequest` and `Request` keep
+their exact shape, no table, column or index is added, `CHECKPOINT_FORMAT` is
+unmoved, and a 0.41.0 store and a 0.42.0 store are the same store.
+
 ## [0.41.0] - 2026-08-08
 
 ### Added

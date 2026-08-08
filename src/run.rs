@@ -17,7 +17,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::agent::{AgentDef, Agents};
-use crate::approve::{ApproveAll, Approver, Decision, Request};
+use crate::approve::{ApprovalContext, ApproveAll, Approver, Decision, Request};
 use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
@@ -1050,7 +1050,16 @@ pub(crate) async fn run_with_extras<P: Provider>(
     // permissive caller into a policy-bearing one and push it off the
     // single-file path.
     let caller_enforces = !policy.is_permissive();
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    let policy = &match authorize_provider(
+        provider,
+        policy,
+        store,
+        run_id,
+        approver,
+        watch,
+        &contract.goal,
+    )
+    .await?
     {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
@@ -2004,8 +2013,16 @@ pub async fn resume_with_observed<P: Provider>(
             // run, for the reason [`resume_tree_observed`] gives: the policy
             // handed to the resume is the one that governs it, and a host allowed
             // before a crash may not be allowed after.
-            let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch)
-                .await?
+            let policy = &match authorize_provider(
+                provider,
+                policy,
+                store,
+                run_id,
+                approver,
+                watch,
+                &contract.goal,
+            )
+            .await?
             {
                 ProviderAccess::Granted(p) => p,
                 ProviderAccess::Pending(request_id) => {
@@ -2826,9 +2843,53 @@ pub async fn retry_gate_observed(
     }
 }
 
-/// Everything 0.34.0 refuses before the first request is billed.
+/// Refuse a model that would be approving for its own model (0.42.0).
 ///
-/// Three checks, all of them things a run can be certain of up front:
+/// The approval mirror of the review refusal below it, and the same argument: a
+/// model answering for a call it just made reports what the run already believes,
+/// so it is a refusal rather than a warning. Taken before the first request is
+/// built, which is what makes it observable as **zero** calls to either provider.
+///
+/// A helper rather than another arm of the preflight because there are two loops:
+/// the flat one preflights, the tree entry does not, and an unattended tree is
+/// exactly where a self-approving model would do the most damage.
+fn refuse_self_approval<P: Provider>(
+    contract: &TaskContract,
+    provider: &P,
+    approver: &dyn Approver,
+) -> Result<()> {
+    let Some(approving) = approver.model() else {
+        // Not a model. Nothing to compare, and nothing to refuse.
+        return Ok(());
+    };
+    if approver.self_approval_allowed() {
+        return Ok(());
+    }
+    // The run's own model, as this contract asks for it, and as the provider says
+    // it would ask. `None` on both means the provider's own default, which this
+    // crate cannot name — so it cannot compare it either, and says so in
+    // `docs/CONTRACT.md` rather than guessing.
+    let routed = contract.routing.as_ref().and_then(|r| {
+        r.escalate_after
+            .as_ref()
+            .map(|(_, m)| m.as_str())
+            .or(r.downshift_under.as_ref().map(|(_, m)| m.as_str()))
+    });
+    for writing in [routed, provider.model_hint()].into_iter().flatten() {
+        if writing == approving {
+            return Err(Error::Config(format!(
+                "the approving model and the model making the call are both {approving}; a model \
+                 answering for its own call reports what the run already believes. Use a different \
+                 model, or build the approver with allow_self_approval(true) to say you meant it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Everything refused before the first request is billed.
+///
+/// Four checks, all of them things a run can be certain of up front:
 ///
 /// 1. A [`Verification::Review`] criterion with no reviewer registered. A gate
 ///    that cannot run is found at run start rather than after the work.
@@ -2840,10 +2901,15 @@ pub async fn retry_gate_observed(
 /// 3. [`Routing::require_primary`](crate::Routing) against
 ///    [`Provider::reachable`]. An unattended job that starts on a fallback nobody
 ///    chose is the failure this exists to prevent.
+/// 4. A model approving for its own model (0.42.0), through
+///    [`refuse_self_approval`] — which the tree entry calls too, because a tree
+///    does not come through here.
 async fn preflight_review_and_routing<P: Provider>(
     contract: &TaskContract,
     provider: &P,
+    approver: &dyn Approver,
 ) -> Result<()> {
+    refuse_self_approval(contract, provider, approver)?;
     if let Verification::Review {
         allow_self_review, ..
     } = &contract.verify
@@ -2939,12 +3005,12 @@ async fn evaluate_gate(
                 )?;
                 return Err(e);
             };
-            let request = crate::verify::ReviewRequest {
+            let request = crate::verify::ChangeReview {
                 goal: contract.goal.clone(),
                 rubric: rubric.clone(),
-                files: written_files(store, run_id, root),
+                changes: written_changes(store, run_id, root),
             };
-            match reviewer.review(request).await {
+            match reviewer.review_change(request).await {
                 Ok(review) => {
                     watch.emit(RunEvent::at_depth(
                         run_id,
@@ -3028,19 +3094,43 @@ fn gate_phase(verify: &Verification) -> &'static str {
 /// walking the tree, so a reviewer is handed the run's change and not the
 /// repository. A path that has since been deleted is skipped: a reviewer reading
 /// an empty file it was told exists would be judging an artefact of the read.
-fn written_files(store: &Store, run_id: i64, root: &Path) -> Vec<(PathBuf, String)> {
+fn written_changes(store: &Store, run_id: i64, root: &Path) -> Vec<crate::verify::FileChange> {
     let mut seen: Vec<String> = Vec::new();
-    let mut files = Vec::new();
+    let mut changes = Vec::new();
     for edit in store.edits(run_id).unwrap_or_default() {
         if seen.contains(&edit.path) {
             continue;
         }
         seen.push(edit.path.clone());
-        if let Ok(contents) = std::fs::read_to_string(root.join(&edit.path)) {
-            files.push((PathBuf::from(&edit.path), contents));
-        }
+        // The file as it stands. A path the run wrote and something then removed
+        // is skipped rather than reported as empty, which is what `written_files`
+        // has always done and is the honest reading: there is nothing to review.
+        let Ok(after) = std::fs::read_to_string(root.join(&edit.path)) else {
+            continue;
+        };
+        // The way it was, from the restore point the store has kept since 0.28.0.
+        // One row per file per run, written at the *first* edit, which is exactly
+        // "before this run touched it" — the boundary a reviewer of a change
+        // wants, and not the one before the last edit.
+        let (before, unkept) = match store.snapshot(run_id, &edit.path).ok().flatten() {
+            Some(snap) => match snap.kept {
+                crate::state::Kept::Text(text) => (Some(text), None),
+                crate::state::Kept::Absent => (None, None),
+                crate::state::Kept::Unkept(why) => (None, Some(why)),
+            },
+            // No row at all: a store written before restore points, or one this
+            // version does not understand. Absent is the wrong answer — it would
+            // claim the run created the file — so it is reported as not kept.
+            None => (None, Some("no restore point was recorded".to_string())),
+        };
+        changes.push(crate::verify::FileChange {
+            path: PathBuf::from(&edit.path),
+            before,
+            after,
+            unkept,
+        });
     }
-    files
+    changes
 }
 
 /// How many gate attempts in a row, most recent first, ended without passing
@@ -3065,7 +3155,6 @@ fn consecutive_gate_failures(store: &Store, run_id: i64) -> u32 {
         .unwrap_or(u32::MAX)
 }
 
-/// Bytes the run has written, as they stand on disk (0.34.0).
 ///
 /// What [`Routing::downshift_under`](crate::Routing) measures. On disk rather
 /// than summed from the edits, because an edit that replaced a file twice is one
@@ -3406,6 +3495,16 @@ impl<'a> Watch<'a> {
         if self.observer.event(&event).is_cancel() {
             self.cancelled.set(true);
         }
+    }
+
+    /// Ask for the run to stop, without an event to hang it off (0.42.0).
+    ///
+    /// What `on_failure = "cancel"` on a `before_tool` hook reaches. An event hook
+    /// gets here through `emit`, because it is answering an event; a lifecycle
+    /// hook is answering a call, and the refusal it produces is reported as a
+    /// refusal rather than as a second event kind.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.set(true);
     }
 
     /// Whether stopping has been asked for. Read at a step boundary only.
@@ -3972,7 +4071,7 @@ async fn run_workspace_from<P: Provider>(
     // checked before the first completion is billed. A contract that cannot be
     // honoured should cost nothing to find out about, which is why this is here
     // and not at the gate: a review gate fires at the END of a run.
-    preflight_review_and_routing(contract, provider).await?;
+    preflight_review_and_routing(contract, provider, approver).await?;
 
     // The effective policy grows as approvers remember rules; it is rebuilt as a
     // merge so a remembered allow can still never defeat a deny beneath it.
@@ -4382,6 +4481,8 @@ async fn run_workspace_from<P: Provider>(
                         watch,
                         0,
                         contract.max_parallel_reads,
+                        &contract.goal,
+                        contract.tool_hooks.as_deref(),
                     )
                     .await?;
                 }
@@ -4418,6 +4519,8 @@ async fn run_workspace_from<P: Provider>(
                             agents: &contract.agents,
                             active: planning,
                         },
+                        &contract.goal,
+                        contract.tool_hooks.as_deref(),
                     )
                     .await?
                 }
@@ -5122,7 +5225,21 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    // 0.42.0 — a tree does not come through `preflight_review_and_routing`, and an
+    // unattended tree is where a model answering for its own call would do the
+    // most damage. Same helper, same refusal, before anything is billed.
+    refuse_self_approval(contract, provider, approver)?;
+
+    let policy = &match authorize_provider(
+        provider,
+        policy,
+        store,
+        run_id,
+        approver,
+        watch,
+        &contract.goal,
+    )
+    .await?
     {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
@@ -5321,7 +5438,16 @@ pub async fn resume_tree_observed<P: Provider>(
     // Re-authorized on resume rather than trusted from the crashed run: the
     // policy handed to the resume is the one that governs it, and a host allowed
     // before a crash may not be allowed after.
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    let policy = &match authorize_provider(
+        provider,
+        policy,
+        store,
+        run_id,
+        approver,
+        watch,
+        &contract.goal,
+    )
+    .await?
     {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
@@ -5842,6 +5968,8 @@ fn run_agent<'f, P: Provider>(
                         agents: &contract.agents,
                         active: planning,
                     },
+                    &contract.goal,
+                    contract.tool_hooks.as_deref(),
                 )
                 .await?
                 {
@@ -6708,6 +6836,7 @@ async fn authorize_provider<P: Provider>(
     run_id: i64,
     approver: &dyn Approver,
     watch: &Watch<'_>,
+    goal: &str,
 ) -> Result<ProviderAccess> {
     // A provider that opens no connection (the mock providers tests drive the
     // loop with) has no endpoint to authorize.
@@ -6722,7 +6851,7 @@ async fn authorize_provider<P: Provider>(
     }
 
     let mut effective = policy.clone();
-    let mut ask: Option<String> = None;
+    let mut ask: Option<(String, crate::policy::Verdict)> = None;
     for url in urls {
         let Some(target) = net::target(url) else {
             return Err(crate::error::Error::Refused {
@@ -6740,12 +6869,14 @@ async fn authorize_provider<P: Provider>(
             .check_target(&target)?;
         if verdict.effect == Effect::Ask {
             // One human decision covers the run; the first host that needs asking
-            // is the one asked about.
-            ask = Some(target.clone());
+            // is the one asked about. The verdict rides along because the approver
+            // is told which rule and which layer asked (0.42.0), and only the
+            // asking host's verdict is the answer to that.
+            ask = Some((target.clone(), verdict));
         }
     }
 
-    let Some(target) = ask else {
+    let Some((target, verdict)) = ask else {
         return Ok(ProviderAccess::Granted(effective));
     };
 
@@ -6764,7 +6895,8 @@ async fn authorize_provider<P: Provider>(
     // `gate_path` for the same ordering and the same reason.
     let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
     let request = Request::new(Act::Net, &target);
-    let raced = race_gate(approver.decide(&request), store, |s| {
+    let context = approval_context(goal, &verdict);
+    let raced = race_gate(approver.decide_in_context(&request, &context), store, |s| {
         Ok(s.pending(request_id)?.is_some_and(|p| p.resolved.is_some()))
     })
     .await?;
@@ -7210,6 +7342,7 @@ async fn prepare_read(
     custom: &Toolbox,
     watch: &Watch<'_>,
     depth: u32,
+    goal: &str,
 ) -> Result<Prepared> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -7240,6 +7373,7 @@ async fn prepare_read(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -7262,6 +7396,7 @@ async fn prepare_read(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -7306,6 +7441,8 @@ async fn read_batch(
     watch: &Watch<'_>,
     depth: u32,
     max_parallel: usize,
+    goal: &str,
+    hooks: Option<&crate::hooks::Hooks>,
 ) -> Result<std::collections::VecDeque<Dispatched>> {
     let mut out: Vec<Option<Dispatched>> = Vec::with_capacity(calls.len());
     let mut queued: std::collections::VecDeque<(usize, ReadWork)> =
@@ -7314,8 +7451,12 @@ async fn read_batch(
         // Announced here rather than in the concurrent half, so a watcher sees
         // the calls in the order the model made them however they then run.
         announce(watch, run_id, step, depth, call);
+        if let Some(refused) = tool_gate(hooks, call, watch, run_id, step, depth) {
+            out.push(Some(refused));
+            continue;
+        }
         match prepare_read(
-            ws, call, approver, store, run_id, step, custom, watch, depth,
+            ws, call, approver, store, run_id, step, custom, watch, depth, goal,
         )
         .await?
         {
@@ -7387,6 +7528,71 @@ fn announce(watch: &Watch<'_>, run_id: i64, step: u32, depth: u32, call: &ToolCa
                 .to_string(),
         },
     ));
+}
+
+/// Ask the operator's `before_tool` hooks whether this call may happen (0.42.0).
+///
+/// One definition, two call sites: the head of [`dispatch`], which every
+/// non-batched call passes through, and [`read_batch`]'s per-call loop, which is
+/// where 0.41.0's concurrent reads are prepared. Both are serial and on the
+/// loop's own thread, so a hook runs in the model's call order and the read work
+/// it approves still runs concurrently. `None` means nothing objected.
+///
+/// A refusal is reported through [`EventKind::Refused`] with the hook's program
+/// where a rule's pattern would be: a refusal that did not come from the policy
+/// is still a refusal, and an observer already routing on them should see it.
+fn tool_gate(
+    hooks: Option<&crate::hooks::Hooks>,
+    call: &ToolCall,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
+) -> Option<Dispatched> {
+    let hooks = hooks?;
+    if !hooks.gates_tools() {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "at": "before_tool",
+        "run_id": run_id,
+        "step": step,
+        "depth": depth,
+        "tool": call.name,
+        "arguments": call.arguments,
+    })
+    .to_string();
+
+    let (argv0, why, cancel) = match hooks.before_tool(&call.name, &payload) {
+        crate::hooks::ToolGate::Go => return None,
+        crate::hooks::ToolGate::Refused { argv0, why } => (argv0, why, false),
+        crate::hooks::ToolGate::Cancel { argv0 } => (
+            argv0,
+            "a local check stopped the run rather than this call".to_string(),
+            true,
+        ),
+    };
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::Refused {
+            act: "tool".into(),
+            target: call.name.clone(),
+            rule: Some(argv0.clone()),
+            layer: Some("io.toml hook".into()),
+        },
+    ));
+    if cancel {
+        watch.cancel();
+    }
+    Some(Dispatched::go(
+        format!("{} refused by hook {argv0}", call.name),
+        format!(
+            "\n[{} refused] a local check (`{argv0}`) stopped this call: {why}\n",
+            call.name
+        ),
+    ))
 }
 
 /// Execute one tool call against the workspace, enforcing the policy and
@@ -7550,12 +7756,23 @@ async fn dispatch(
     // 0.31.0 — the plan gate, in one parameter rather than three. `active` was read
     // from the store at this loop's entry, never carried from a previous process.
     plan: PlanPhase<'_>,
+    // 0.42.0 — what the run is for. The approval site tells an approver why it is
+    // being asked, and the goal is the half of that a `Verdict` cannot carry.
+    goal: &str,
+    // 0.42.0 — the operator's own `before_tool` checks, or `None`.
+    hooks: Option<&crate::hooks::Hooks>,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
     // Announced before the call is made, so a watcher sees what the run is about
     // to do rather than only what it did.
     announce(watch, run_id, step, depth, call);
+    // 0.42.0 — the operator's own check, before anything happens. Every call that
+    // is not part of a read batch arrives here, and a batched one is checked in
+    // `read_batch` instead, so each call is asked about exactly once.
+    if let Some(refused) = tool_gate(hooks, call, watch, run_id, step, depth) {
+        return Ok(refused);
+    }
     let name = call.name.as_str();
     Ok(match name {
         // 0.41.0 — the three read-only built-ins go through the same two halves a
@@ -7563,7 +7780,7 @@ async fn dispatch(
         // of them run alone is the batch of size one.
         GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => {
             match prepare_read(
-                ws, call, approver, store, run_id, step, custom, watch, depth,
+                ws, call, approver, store, run_id, step, custom, watch, depth, goal,
             )
             .await?
             {
@@ -7955,6 +8172,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8035,6 +8253,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8095,6 +8314,7 @@ async fn dispatch(
                 Some(content),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8190,6 +8410,7 @@ async fn dispatch(
                 Some(replacement),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8305,7 +8526,7 @@ async fn dispatch(
             // checked-then-ran each stage in turn would be wrong however careful
             // it looked.
             let remembered = match check_shell_line(
-                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan, goal,
             )
             .await?
             {
@@ -8450,7 +8671,7 @@ async fn dispatch(
                 }
             };
             let remembered = match check_shell_line(
-                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan, goal,
             )
             .await?
             {
@@ -8808,6 +9029,7 @@ async fn dispatch(
                     None,
                     watch,
                     depth,
+                    goal,
                 )
                 .await?
                 {
@@ -8982,6 +9204,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9038,6 +9261,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9114,6 +9338,7 @@ async fn dispatch(
                 Some(&preview),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9174,6 +9399,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9221,6 +9447,7 @@ async fn dispatch(
                 Some(&preview),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9313,7 +9540,7 @@ async fn dispatch(
             let mut refused: Option<Dispatched> = None;
             for (act, target) in targets {
                 match gate(
-                    ws, approver, store, run_id, step, act, &target, None, watch, depth,
+                    ws, approver, store, run_id, step, act, &target, None, watch, depth, goal,
                 )
                 .await?
                 {
@@ -9507,7 +9734,7 @@ async fn dispatch(
         // beside another call or on its own.
         name if custom.owns(name) => {
             match prepare_read(
-                ws, call, approver, store, run_id, step, custom, watch, depth,
+                ws, call, approver, store, run_id, step, custom, watch, depth, goal,
             )
             .await?
             {
@@ -9651,6 +9878,7 @@ async fn check_shell_line(
     depth: u32,
     parsed: &crate::tools::shell::Line,
     plan: &[crate::tools::shell::Planned],
+    goal: &str,
 ) -> Result<ShellCheck> {
     let mut remembered: Vec<Rule> = Vec::new();
     for (cmd, planned) in parsed.commands().zip(plan.iter()) {
@@ -9670,6 +9898,7 @@ async fn check_shell_line(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9707,6 +9936,7 @@ async fn check_shell_line(
                     None,
                     watch,
                     depth,
+                    goal,
                 )
                 .await?
                 {
@@ -9735,7 +9965,7 @@ async fn check_shell_line(
             };
             let rel = relative_to(ws.root(), path);
             match gate(
-                ws, approver, store, run_id, step, act, &rel, None, watch, depth,
+                ws, approver, store, run_id, step, act, &rel, None, watch, depth, goal,
             )
             .await?
             {
@@ -9834,6 +10064,19 @@ fn relative_to(root: &std::path::Path, path: &std::path::Path) -> String {
 /// form re-evaluated here, so it can narrow or redirect within the policy but
 /// cannot move an action across a deny.
 #[allow(clippy::too_many_arguments)]
+/// What the approver is told about the question, beyond the action itself
+/// (0.42.0).
+///
+/// One definition, called by both approval sites — the tool path in [`gate`] and
+/// the provider authorization in [`authorize_provider`]. The two are in different
+/// loops and would otherwise each grow their own copy of "which parts of the
+/// verdict an approver gets", which is exactly the drift `NO_TOOL_CALL`'s doc
+/// comment and `tests/session_fanout.rs` exist to prevent.
+fn approval_context(goal: &str, verdict: &crate::policy::Verdict) -> ApprovalContext {
+    ApprovalContext::new(goal).flagged_by(verdict.rule.clone(), verdict.layer.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn gate(
     ws: &Workspace,
     approver: &dyn Approver,
@@ -9845,6 +10088,7 @@ async fn gate(
     content: Option<&str>,
     watch: &Watch<'_>,
     depth: u32,
+    goal: &str,
 ) -> Result<Gated> {
     let kind = format!("{act:?}").to_lowercase();
     // Read and write targets are workspace paths, and are resolved so a symlink
@@ -9912,7 +10156,8 @@ async fn gate(
             // while the run is still holding the question, which is exactly the
             // gap this release closes.
             let request_id = store.put_pending(run_id, step, &kind, target, content)?;
-            let raced = race_gate(approver.decide(&request), store, |s| {
+            let context = approval_context(goal, &verdict);
+            let raced = race_gate(approver.decide_in_context(&request, &context), store, |s| {
                 Ok(s.pending(request_id)?.is_some_and(|p| p.resolved.is_some()))
             })
             .await?;

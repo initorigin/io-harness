@@ -274,6 +274,18 @@ pub struct TaskContract {
     /// Behind an `Arc` for the same reason [`Self::responder`] and
     /// [`Self::plan_gate`] are — one reviewer for a whole tree.
     pub reviewer: Option<std::sync::Arc<dyn crate::verify::Reviewer>>,
+    /// The operator's own `before_tool` checks, from `io.toml` (0.42.0).
+    ///
+    /// `None` — the default — is no lifecycle gate at all. The same
+    /// [`Hooks`](crate::Hooks) value that an application installs as an
+    /// [`Observer`](crate::Observer) is what goes here: as an observer it ignores
+    /// the `at` tables, as a gate it ignores the `on` ones, so an operator writes
+    /// one file and the application makes one decision about whether to honour it.
+    ///
+    /// Nothing is implicit. A configuration describing a `before_tool` hook does
+    /// nothing until an application installs it, which is the rule every other
+    /// projection of that file already obeys.
+    pub tool_hooks: Option<std::sync::Arc<crate::hooks::Hooks>>,
     /// Rules that change which model the run asks, while it is running (0.34.0).
     ///
     /// `None` — the default — is every release before 0.34.0: whichever model the
@@ -316,6 +328,7 @@ impl TaskContract {
             plan_gate: None,
             effort: None,
             reviewer: None,
+            tool_hooks: None,
             routing: None,
             max_steps: 8,
             max_duration: None,
@@ -375,6 +388,7 @@ impl TaskContract {
             verify: Verification::None,
             plan_gate: None,
             reviewer: None,
+            tool_hooks: None,
             routing: None,
             effort: None,
             max_steps: 12,
@@ -665,6 +679,33 @@ impl TaskContract {
     /// ```
     pub fn with_reviewer(mut self, reviewer: std::sync::Arc<dyn crate::verify::Reviewer>) -> Self {
         self.reviewer = Some(reviewer);
+        self
+    }
+
+    /// Honour the `before_tool` hooks a configuration declared (0.42.0).
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use io_harness::{Config, TaskContract};
+    ///
+    /// # fn demo() -> io_harness::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// // A check an operator writes instead of compiling: nothing is published
+    /// // from this repository by an agent, whatever it decides.
+    /// std::fs::write(
+    ///     dir.path().join("io.local.toml"),
+    ///     "[[hook]]\nat = \"before_tool\"\ntools = [\"exec\"]\nrun = [\"./no-publish\"]\n",
+    /// )?;
+    ///
+    /// let hooks = Config::discover(dir.path())?.hooks();
+    /// let contract = TaskContract::workspace("cut the release", dir.path())
+    ///     .with_tool_hooks(Arc::new(hooks));
+    /// assert!(contract.tool_hooks.is_some());
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn with_tool_hooks(mut self, hooks: std::sync::Arc<crate::hooks::Hooks>) -> Self {
+        self.tool_hooks = Some(hooks);
         self
     }
 
