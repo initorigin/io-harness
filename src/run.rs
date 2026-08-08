@@ -17,7 +17,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::agent::{AgentDef, Agents};
-use crate::approve::{ApproveAll, Approver, Decision, Request};
+use crate::approve::{ApprovalContext, ApproveAll, Approver, Decision, Request};
 use crate::approve::{Plan, PlanGate, PlanStep, PlanVerdict};
 use crate::approve::{Question, Responder, ResponderNone};
 use crate::containment::{Containment, Draw, Ledger};
@@ -1050,7 +1050,16 @@ pub(crate) async fn run_with_extras<P: Provider>(
     // permissive caller into a policy-bearing one and push it off the
     // single-file path.
     let caller_enforces = !policy.is_permissive();
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    let policy = &match authorize_provider(
+        provider,
+        policy,
+        store,
+        run_id,
+        approver,
+        watch,
+        &contract.goal,
+    )
+    .await?
     {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
@@ -2004,8 +2013,16 @@ pub async fn resume_with_observed<P: Provider>(
             // run, for the reason [`resume_tree_observed`] gives: the policy
             // handed to the resume is the one that governs it, and a host allowed
             // before a crash may not be allowed after.
-            let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch)
-                .await?
+            let policy = &match authorize_provider(
+                provider,
+                policy,
+                store,
+                run_id,
+                approver,
+                watch,
+                &contract.goal,
+            )
+            .await?
             {
                 ProviderAccess::Granted(p) => p,
                 ProviderAccess::Pending(request_id) => {
@@ -4382,6 +4399,7 @@ async fn run_workspace_from<P: Provider>(
                         watch,
                         0,
                         contract.max_parallel_reads,
+                        &contract.goal,
                     )
                     .await?;
                 }
@@ -4418,6 +4436,7 @@ async fn run_workspace_from<P: Provider>(
                             agents: &contract.agents,
                             active: planning,
                         },
+                        &contract.goal,
                     )
                     .await?
                 }
@@ -5122,7 +5141,16 @@ pub(crate) async fn run_tree_with_extras<P: Provider>(
     // Authorized once at the root. Children inherit the root's policy through
     // `Policy::contain`, so the provider layer flows down the tree and no child
     // needs (or gets) its own chance to widen network access.
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    let policy = &match authorize_provider(
+        provider,
+        policy,
+        store,
+        run_id,
+        approver,
+        watch,
+        &contract.goal,
+    )
+    .await?
     {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
@@ -5321,7 +5349,16 @@ pub async fn resume_tree_observed<P: Provider>(
     // Re-authorized on resume rather than trusted from the crashed run: the
     // policy handed to the resume is the one that governs it, and a host allowed
     // before a crash may not be allowed after.
-    let policy = &match authorize_provider(provider, policy, store, run_id, approver, watch).await?
+    let policy = &match authorize_provider(
+        provider,
+        policy,
+        store,
+        run_id,
+        approver,
+        watch,
+        &contract.goal,
+    )
+    .await?
     {
         ProviderAccess::Granted(p) => p,
         ProviderAccess::Pending(request_id) => {
@@ -5842,6 +5879,7 @@ fn run_agent<'f, P: Provider>(
                         agents: &contract.agents,
                         active: planning,
                     },
+                    &contract.goal,
                 )
                 .await?
                 {
@@ -6708,6 +6746,7 @@ async fn authorize_provider<P: Provider>(
     run_id: i64,
     approver: &dyn Approver,
     watch: &Watch<'_>,
+    goal: &str,
 ) -> Result<ProviderAccess> {
     // A provider that opens no connection (the mock providers tests drive the
     // loop with) has no endpoint to authorize.
@@ -6722,7 +6761,7 @@ async fn authorize_provider<P: Provider>(
     }
 
     let mut effective = policy.clone();
-    let mut ask: Option<String> = None;
+    let mut ask: Option<(String, crate::policy::Verdict)> = None;
     for url in urls {
         let Some(target) = net::target(url) else {
             return Err(crate::error::Error::Refused {
@@ -6740,12 +6779,14 @@ async fn authorize_provider<P: Provider>(
             .check_target(&target)?;
         if verdict.effect == Effect::Ask {
             // One human decision covers the run; the first host that needs asking
-            // is the one asked about.
-            ask = Some(target.clone());
+            // is the one asked about. The verdict rides along because the approver
+            // is told which rule and which layer asked (0.42.0), and only the
+            // asking host's verdict is the answer to that.
+            ask = Some((target.clone(), verdict));
         }
     }
 
-    let Some(target) = ask else {
+    let Some((target, verdict)) = ask else {
         return Ok(ProviderAccess::Granted(effective));
     };
 
@@ -6764,7 +6805,8 @@ async fn authorize_provider<P: Provider>(
     // `gate_path` for the same ordering and the same reason.
     let request_id = store.put_pending(run_id, 0, "net", &target, None)?;
     let request = Request::new(Act::Net, &target);
-    let raced = race_gate(approver.decide(&request), store, |s| {
+    let context = approval_context(goal, &verdict);
+    let raced = race_gate(approver.decide_in_context(&request, &context), store, |s| {
         Ok(s.pending(request_id)?.is_some_and(|p| p.resolved.is_some()))
     })
     .await?;
@@ -7210,6 +7252,7 @@ async fn prepare_read(
     custom: &Toolbox,
     watch: &Watch<'_>,
     depth: u32,
+    goal: &str,
 ) -> Result<Prepared> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -7240,6 +7283,7 @@ async fn prepare_read(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -7262,6 +7306,7 @@ async fn prepare_read(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -7306,6 +7351,7 @@ async fn read_batch(
     watch: &Watch<'_>,
     depth: u32,
     max_parallel: usize,
+    goal: &str,
 ) -> Result<std::collections::VecDeque<Dispatched>> {
     let mut out: Vec<Option<Dispatched>> = Vec::with_capacity(calls.len());
     let mut queued: std::collections::VecDeque<(usize, ReadWork)> =
@@ -7315,7 +7361,7 @@ async fn read_batch(
         // the calls in the order the model made them however they then run.
         announce(watch, run_id, step, depth, call);
         match prepare_read(
-            ws, call, approver, store, run_id, step, custom, watch, depth,
+            ws, call, approver, store, run_id, step, custom, watch, depth, goal,
         )
         .await?
         {
@@ -7550,6 +7596,9 @@ async fn dispatch(
     // 0.31.0 — the plan gate, in one parameter rather than three. `active` was read
     // from the store at this loop's entry, never carried from a previous process.
     plan: PlanPhase<'_>,
+    // 0.42.0 — what the run is for. The approval site tells an approver why it is
+    // being asked, and the goal is the half of that a `Verdict` cannot carry.
+    goal: &str,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
@@ -7563,7 +7612,7 @@ async fn dispatch(
         // of them run alone is the batch of size one.
         GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => {
             match prepare_read(
-                ws, call, approver, store, run_id, step, custom, watch, depth,
+                ws, call, approver, store, run_id, step, custom, watch, depth, goal,
             )
             .await?
             {
@@ -7955,6 +8004,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8035,6 +8085,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8095,6 +8146,7 @@ async fn dispatch(
                 Some(content),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8190,6 +8242,7 @@ async fn dispatch(
                 Some(replacement),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -8305,7 +8358,7 @@ async fn dispatch(
             // checked-then-ran each stage in turn would be wrong however careful
             // it looked.
             let remembered = match check_shell_line(
-                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan, goal,
             )
             .await?
             {
@@ -8450,7 +8503,7 @@ async fn dispatch(
                 }
             };
             let remembered = match check_shell_line(
-                ws, approver, store, run_id, step, watch, depth, &parsed, &plan,
+                ws, approver, store, run_id, step, watch, depth, &parsed, &plan, goal,
             )
             .await?
             {
@@ -8808,6 +8861,7 @@ async fn dispatch(
                     None,
                     watch,
                     depth,
+                    goal,
                 )
                 .await?
                 {
@@ -8982,6 +9036,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9038,6 +9093,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9114,6 +9170,7 @@ async fn dispatch(
                 Some(&preview),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9174,6 +9231,7 @@ async fn dispatch(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9221,6 +9279,7 @@ async fn dispatch(
                 Some(&preview),
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9313,7 +9372,7 @@ async fn dispatch(
             let mut refused: Option<Dispatched> = None;
             for (act, target) in targets {
                 match gate(
-                    ws, approver, store, run_id, step, act, &target, None, watch, depth,
+                    ws, approver, store, run_id, step, act, &target, None, watch, depth, goal,
                 )
                 .await?
                 {
@@ -9507,7 +9566,7 @@ async fn dispatch(
         // beside another call or on its own.
         name if custom.owns(name) => {
             match prepare_read(
-                ws, call, approver, store, run_id, step, custom, watch, depth,
+                ws, call, approver, store, run_id, step, custom, watch, depth, goal,
             )
             .await?
             {
@@ -9651,6 +9710,7 @@ async fn check_shell_line(
     depth: u32,
     parsed: &crate::tools::shell::Line,
     plan: &[crate::tools::shell::Planned],
+    goal: &str,
 ) -> Result<ShellCheck> {
     let mut remembered: Vec<Rule> = Vec::new();
     for (cmd, planned) in parsed.commands().zip(plan.iter()) {
@@ -9670,6 +9730,7 @@ async fn check_shell_line(
                 None,
                 watch,
                 depth,
+                goal,
             )
             .await?
             {
@@ -9707,6 +9768,7 @@ async fn check_shell_line(
                     None,
                     watch,
                     depth,
+                    goal,
                 )
                 .await?
                 {
@@ -9735,7 +9797,7 @@ async fn check_shell_line(
             };
             let rel = relative_to(ws.root(), path);
             match gate(
-                ws, approver, store, run_id, step, act, &rel, None, watch, depth,
+                ws, approver, store, run_id, step, act, &rel, None, watch, depth, goal,
             )
             .await?
             {
@@ -9834,6 +9896,19 @@ fn relative_to(root: &std::path::Path, path: &std::path::Path) -> String {
 /// form re-evaluated here, so it can narrow or redirect within the policy but
 /// cannot move an action across a deny.
 #[allow(clippy::too_many_arguments)]
+/// What the approver is told about the question, beyond the action itself
+/// (0.42.0).
+///
+/// One definition, called by both approval sites — the tool path in [`gate`] and
+/// the provider authorization in [`authorize_provider`]. The two are in different
+/// loops and would otherwise each grow their own copy of "which parts of the
+/// verdict an approver gets", which is exactly the drift `NO_TOOL_CALL`'s doc
+/// comment and `tests/session_fanout.rs` exist to prevent.
+fn approval_context(goal: &str, verdict: &crate::policy::Verdict) -> ApprovalContext {
+    ApprovalContext::new(goal).flagged_by(verdict.rule.clone(), verdict.layer.clone())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn gate(
     ws: &Workspace,
     approver: &dyn Approver,
@@ -9845,6 +9920,7 @@ async fn gate(
     content: Option<&str>,
     watch: &Watch<'_>,
     depth: u32,
+    goal: &str,
 ) -> Result<Gated> {
     let kind = format!("{act:?}").to_lowercase();
     // Read and write targets are workspace paths, and are resolved so a symlink
@@ -9912,7 +9988,8 @@ async fn gate(
             // while the run is still holding the question, which is exactly the
             // gap this release closes.
             let request_id = store.put_pending(run_id, step, &kind, target, content)?;
-            let raced = race_gate(approver.decide(&request), store, |s| {
+            let context = approval_context(goal, &verdict);
+            let raced = race_gate(approver.decide_in_context(&request, &context), store, |s| {
                 Ok(s.pending(request_id)?.is_some_and(|p| p.resolved.is_some()))
             })
             .await?;

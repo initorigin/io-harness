@@ -183,6 +183,66 @@ impl Decision {
 /// backed by a UI channel while io-cli uses [`StdinApprover`].
 pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>>;
 
+/// Why this action is being asked about, and what the run is for (0.42.0).
+///
+/// A [`Request`] says *what* would happen. This says why the question exists: the
+/// glob that put the action in the grey tier, the policy layer that glob came
+/// from, and the goal the run is pursuing. All three are known at the approval
+/// site — [`Policy::explain`](crate::Policy::explain) returns them as
+/// [`Verdict`](crate::Verdict) — and none of them could reach an approver before,
+/// which left every out-of-crate approver deciding from the target alone.
+///
+/// The difference is the difference between a prompt and an answer:
+///
+/// ```
+/// use io_harness::{Act, ApprovalContext, Request};
+///
+/// let request = Request::new(Act::Write, "src/main.rs");
+/// let context = ApprovalContext::new("tidy the parser")
+///     .flagged_by(Some("src/*.rs".into()), Some("app".into()));
+///
+/// // Without the context: "may I write src/main.rs?" — unanswerable unattended.
+/// // With it: the app layer's own `*.rs` rule asked, so no stricter layer denied
+/// // it, and the run doing the writing was asked to tidy the parser.
+/// assert_eq!(context.rule.as_deref(), Some("src/*.rs"));
+/// assert_eq!(context.layer.as_deref(), Some("app"));
+/// assert_eq!(context.goal, "tidy the parser");
+/// # let _ = request;
+/// ```
+///
+/// `rule` and `layer` are both `None` when the tier default decided — nothing
+/// named the action, the policy's own default for that act did. An approver that
+/// treats "no rule" as "no reason" would be reading that backwards: an unnamed
+/// action in the grey tier is the *least* vouched-for kind.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ApprovalContext {
+    /// The run's goal, in the words the caller wrote it in.
+    pub goal: String,
+    /// The glob that decided, or `None` when the tier default did.
+    pub rule: Option<String>,
+    /// The layer the deciding rule came from, or `None` for the tier default.
+    pub layer: Option<String>,
+}
+
+impl ApprovalContext {
+    /// The context for a run pursuing `goal`, with nothing named yet.
+    pub fn new(goal: impl Into<String>) -> Self {
+        Self {
+            goal: goal.into(),
+            rule: None,
+            layer: None,
+        }
+    }
+
+    /// Attach the rule and the layer that put this action in the grey tier.
+    pub fn flagged_by(mut self, rule: Option<String>, layer: Option<String>) -> Self {
+        self.rule = rule;
+        self.layer = layer;
+        self
+    }
+}
+
 /// Decides whether a sensitive action may proceed.
 ///
 /// Implementations may take as long as they like; the run stays paused until
@@ -230,6 +290,64 @@ pub type DecisionFuture<'a> = Pin<Box<dyn Future<Output = Decision> + Send + 'a>
 pub trait Approver: Send + Sync {
     /// Decide on one request.
     fn decide<'a>(&'a self, request: &'a Request) -> DecisionFuture<'a>;
+
+    /// Decide on one request, knowing why it is being asked about (0.42.0).
+    ///
+    /// This is what the run loop calls. The default forwards to [`Self::decide`]
+    /// and ignores the context, so every approver written before 0.42.0 keeps
+    /// deciding exactly as it did — and an approver that wants the rule, the
+    /// layer and the goal overrides this instead:
+    ///
+    /// ```
+    /// use io_harness::approve::DecisionFuture;
+    /// use io_harness::{ApprovalContext, Approver, Decision, Request};
+    ///
+    /// /// Unattended, and not blanket-anything: an action a *named* rule put in
+    /// /// the grey tier was vouched for by whoever wrote that layer, and an
+    /// /// unnamed one — the tier default — was vouched for by nobody.
+    /// struct NamedRulesOnly;
+    ///
+    /// impl Approver for NamedRulesOnly {
+    ///     fn decide<'a>(&'a self, _request: &'a Request) -> DecisionFuture<'a> {
+    ///         Box::pin(async { Decision::Defer })
+    ///     }
+    ///
+    ///     fn decide_in_context<'a>(
+    ///         &'a self,
+    ///         request: &'a Request,
+    ///         context: &'a ApprovalContext,
+    ///     ) -> DecisionFuture<'a> {
+    ///         Box::pin(async move {
+    ///             match (&context.rule, &context.layer) {
+    ///                 (Some(_named), Some(_layer)) => Decision::Approve {
+    ///                     modified: None,
+    ///                     remember: Vec::new(),
+    ///                 },
+    ///                 // Nothing named it. Park the question rather than answer it.
+    ///                 _ => self.decide(request).await,
+    ///             }
+    ///         })
+    ///     }
+    /// }
+    /// ```
+    fn decide_in_context<'a>(
+        &'a self,
+        request: &'a Request,
+        context: &'a ApprovalContext,
+    ) -> DecisionFuture<'a> {
+        let _ = context;
+        self.decide(request)
+    }
+
+    /// The model this approver asks, when it asks one (0.42.0).
+    ///
+    /// `None` — the default, and every approver that is not a model — is never
+    /// refused. A [`ModelApprover`] returns the model it was built with, which is
+    /// what the self-approval refusal compares against: a model answering for a
+    /// call it made itself reports what the run already believes.
+    fn model(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Approves everything. For tests and for callers who want the policy's denies

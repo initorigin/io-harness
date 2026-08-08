@@ -8,7 +8,7 @@ tasks:
   why_required: Every approval claim in the release rests on the approver being handed the rule and the
     layer that flagged the call, and neither is on `Request` today. Without this the model approver is
     as blind as an out-of-crate one, and the two loops would each grow their own copy of the context.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F3 — an approver that overrides nothing is unaffected.** `ApproveAll`, `DenyAll` and a hand-written
@@ -23,7 +23,24 @@ tasks:
   - src/lib.rs
   - src/run.rs
   - tests/model_approver.rs
-  evidence: []
+  evidence:
+  - '`ApprovalContext { goal, rule, layer }` landed in `src/approve.rs` as a `#[non_exhaustive]` struct
+    with `new` and `flagged_by`, re-exported from `src/lib.rs`. `Approver` gained two defaulted methods:
+    `decide_in_context`, which forwards to `decide` and ignores the context, and `model`, which returns
+    `None`.'
+  - Both approval sites go through one helper. `fn approval_context(goal, verdict)` in `src/run.rs` is
+    called by `gate` (the tool path) and by `authorize_provider` (the pre-run provider authorization);
+    the latter now keeps the asking host's `Verdict` beside its target rather than the target alone, because
+    only that verdict is the answer to "which rule asked".
+  - The goal reaches the tool path by parameter, threaded through `dispatch`, `prepare_read`, `read_batch`,
+    `check_shell_line` and all eleven `gate` call sites, from `contract.goal` at both loops' entry.
+  - '`cargo test --test model_approver` exit 0, 2 passed: F3''s three arms (`ApproveAll` writes, `DenyAll`
+    does not, and an approver implementing only `decide` is asked exactly once and its reason reaches
+    the model''s observations), and the structural test — one definition of `approval_context`, at least
+    two call sites, zero `.decide(&request)` call sites left in the loop and exactly two `decide_in_context(`
+    ones.'
+  - 'Regression, same invocation: `net` 9 passed, `policy` 24 passed, `shell` 11 passed. The net suite
+    is the one that exercises the second approval site end to end.'
 - id: US-IO-HARNESS-0.42.0-T02
   summary: Add `ModelApprover<P>` with `new`, `allow_self_approval`, the verdict prompt and parse, defer
     on an unparseable verdict, and an always-empty `remember`.
