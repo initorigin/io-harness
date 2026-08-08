@@ -195,11 +195,15 @@ scope:
     application installs it, which is the rule every projection in that file already obeys and is
     stated in the guide beside this one.
   - >
-    **The gate runs in `prepare_read` (`src/run.rs:7203`).** The serial policy phase all three
-    dispatch call sites share (`src/run.rs:7317`, `:7565`, `:9509`) — so one insertion covers the
-    flat loop, the tree loop, the serial path and 0.41.0's concurrent batch, and covers them in the
-    model's call order. Nothing about the batch changes: the hook is spawned serially, on the loop's
-    own thread, and the read work it approves still runs concurrently.
+    **The gate is one helper, called from the two places a tool call can begin** (corrected by
+    `US-IO-HARNESS-0.42.0-I01`): the head of `dispatch`, which every non-batched call passes through,
+    and `read_batch`'s per-call loop (`src/run.rs:7317`), where 0.41.0's concurrent reads are
+    prepared. Not `prepare_read`, which the contract first named and which only the read paths reach
+    — a gate there would be silent for `write_file`, `edit_file`, `exec`, `shell` and the git
+    built-ins. One definition and two call sites, asserted by shape exactly as `approval_context` is,
+    and no call consulted twice: a read dispatched on its own is checked at the head, a read inside a
+    batch is checked in the batch. Both sites are serial and on the loop's own thread, so the hook
+    runs in the model's call order and the read work it approves still runs concurrently.
   - >
     **`FileChange`, `ChangeReview`, and a defaulted `Reviewer::review_change`.**
     `#[non_exhaustive] pub struct FileChange { path: PathBuf, before: Option<String>, after: String,
@@ -470,11 +474,11 @@ resource_profile:
     (`F1`'s recorded prompt, `F8`'s deleted line) need a fixture provider that captures what it was
     handed. Build that capture once and use it for both rather than twice.
   - >
-    **The gate's position in `prepare_read` is the delicate part.** It must sit after the policy
-    verdict and before the tool runs, on the loop's own thread, without moving anything 0.41.0 put
-    there — the pause collapse, the pending-approval row and the call-order fold all live in that
-    function. Budget for reading it whole before editing it, and for N4 catching the mistake if the
-    gate lands one line too late.
+    **The gate's position is the delicate part, and reading the loop is how it gets decided.** It must
+    sit before the tool runs, on the loop's own thread, and cover every arm rather than the one the
+    first reading suggested — which cost `US-IO-HARNESS-0.42.0-I01`. Budget for confirming, by call
+    site rather than by assumption, that both insertions together see every tool call exactly once,
+    and for N4 catching the mistake if either lands inside the concurrent phase.
   - >
     **A portable hook argv for the tests.** Three platforms, no shell, an exit status and a line of
     stdout. 0.28.0 solved this for its own hook tests; find what it did and do the same rather than
@@ -549,9 +553,9 @@ risks:
   by construction, timeouts are sized against the slowest runner, and every assertion is structural
   — a stored row, a counter or an absent `Edit` — rather than timed.
 - >
-  **Fallback pressure.** If the gate cannot be placed in `prepare_read` without disturbing 0.41.0's
-  pause collapse or call-order fold, the honest retreat is the fallback scope — the approval half
-  alone — rather than a second dispatch path that would drift from the first.
+  **Fallback pressure.** If the gate cannot be placed without disturbing 0.41.0's pause collapse or
+  call-order fold, the honest retreat is the fallback scope — the approval half alone — rather than a
+  third dispatch path that would drift from the two the release already has.
 
 open_questions:
 - >
