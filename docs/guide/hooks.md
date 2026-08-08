@@ -26,10 +26,20 @@ own.
 | Key | What it takes | Default |
 | --- | --- | --- |
 | `on` | the event names this hook wants | absent means **every** event |
+| `at` | the lifecycle point this hook attaches to — `"before_tool"` (0.42.0) | absent means an event hook |
+| `tools` | the tool names an `at` hook wants | absent means **every** call |
 | `append` | a path to append one JSON line per matching event to | — |
 | `run` | an **argv array** to spawn with the event JSON on its stdin | — |
-| `on_failure` | `"continue"` or `"cancel"` | `"continue"` |
+| `on_failure` | `"continue"`, `"cancel"`, or `"refuse"` (0.42.0) | `"continue"`, or `"refuse"` for an `at` hook |
 | `timeout_ms` | the wall-clock ceiling on `run` | `5000` |
+
+**Exactly one of `on` and `at`.** An event hook watches what happened; a lifecycle
+hook decides whether something happens. A table claiming both is an error naming
+its index, as is `tools` on a table with no `at`, an `at` value this crate does not
+have, and a lifecycle hook whose only action is `append` — appending a line cannot
+stop a call, so that table would be a check that always passes. Every one of them
+is refused when the file is read, because a check that loads and never fires looks
+exactly like a check that approved everything.
 
 **Exactly one of `append` and `run`.** A table with neither and a table with both
 are each an error naming the table by index — `key hook[2]` — because "the second
@@ -139,6 +149,70 @@ refuses a `tool_call` does not un-call the tool. It ends the run that called it.
 `on_failure` governs any failure of the hook, including an `append` that cannot
 open its file — a hook whose audit log stopped being writable is a hook that is no
 longer auditing.
+
+### A rule that stops a call before it runs (0.42.0)
+
+An event hook is told what happened. `on_failure = "cancel"` is the strongest
+answer it has, and it lands at the next step boundary — after the call it objected
+to has already run. A hook that must stop a call attaches to the lifecycle
+instead:
+
+```toml
+# Nothing publishes from this repository, whatever the agent decides.
+[[hook]]
+at = "before_tool"
+tools = ["exec", "shell"]
+run = ["./checks/no-publish"]
+timeout_ms = 2000
+```
+
+The child is spawned before the call executes, in the discovery root, with the
+pending call on its stdin:
+
+```json
+{"at":"before_tool","run_id":41,"step":3,"depth":0,"tool":"exec",
+ "arguments":{"argv":["cargo","publish"]}}
+```
+
+Exit 0 and the call proceeds. Exit non-zero and — by default — **that call does
+not happen**: the run continues and the model is told why, in the hook's own
+words, so it retargets rather than retrying the same refused call to the step cap.
+The reason is the child's first non-empty line of stdout, bounded at 4096
+characters; a hook that prints nothing gets a reason naming its program and its
+exit status. This is the one place a hook's stdout is read at all — an event hook's
+is discarded, as it has been since 0.28.0.
+
+```sh
+#!/bin/sh
+# ./checks/no-publish — refuse, and say why in one line.
+if grep -q '"cargo".*"publish"' -; then
+  echo "releases are cut by a person in this repository"
+  exit 1
+fi
+```
+
+`on_failure = "cancel"` ends the whole run instead, at the next step boundary, and
+`on_failure = "continue"` makes the hook advisory — it runs, its failure is logged,
+and the call proceeds.
+
+A refusal appears in the trace as a `refused` event with the hook's program where
+a rule's pattern would be and `io.toml hook` where a layer would be, so an
+observer already watching refusals sees it without being rebuilt.
+
+**A lifecycle hook is a process spawn per matching call**, so `tools` is not
+decoration: filtered to `exec`, a completion full of `read_file` calls costs
+nothing at all, and unfiltered it costs one spawn per read. The gate is serial and
+runs on the loop's own thread; the read work it approves still runs concurrently.
+
+**It is installed like everything else in this file, and it is not implicit.**
+`Config::hooks()` builds the same `Hooks` you install as an observer;
+`TaskContract::with_tool_hooks(Arc::new(hooks))` is what makes the `at` tables
+decide anything. As an observer it ignores the `at` tables; as a gate it ignores
+the `on` ones.
+
+There is no `after_tool`. It needs a result shape this crate does not have yet,
+and naming a point that cannot fire is the mistake the validator above exists to
+prevent.
 
 ## Which events you may name
 

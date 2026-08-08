@@ -312,7 +312,7 @@ tasks:
   why_required: The documentation is part of the release rather than an afterthought, and three of the
     release's guarantees — what a model approver may decide, where a lifecycle hook is refused, and which
     reviewers see the change — exist for an embedder only if they are written down.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.42.0-T03
   - US-IO-HARNESS-0.42.0-T05
@@ -340,7 +340,28 @@ tasks:
   - docs/CONTRACT.md
   - docs/public-api.txt
   - docs/guide/tools-and-skills.md
-  evidence: []
+  evidence:
+  - '`Cargo.toml` and `Cargo.lock` at **0.42.0**; `README.md`''s dependency snippet moved to `"0.42"`,
+    which `docs_drift` refuses to let go stale.'
+  - 'N3 — `docs/public-api.txt` gained **exactly four lines**, the crate-root re-exports the checker can
+    see: `ApprovalContext`, `ModelApprover`, `ChangeReview`, `FileChange`. The three new trait methods
+    and the new `TaskContract` field add no line, because they are members of already-listed items — which
+    is what the criterion predicted at plan time rather than discovering afterwards. `cargo test --test
+    public_api` exit 0, 9 passed, including the worked-example gate on every new item.'
+  - '`docs/CONTRACT.md` gained three sections: what a model approving an action can and cannot decide
+    (including that a hostile repository can address the approving model, and that `DenyAll` remains the
+    honest posture for a run that must never act), what a `before_tool` hook stops and where it may be
+    written, and what a reviewer is shown of a change.'
+  - '`docs/guide/hooks.md` documents `at`/`tools`/`refuse` in the keys table and a worked lifecycle hook
+    with its stdin payload, its refusal script and its per-call spawn cost. `docs/guide/permissions.md`
+    documents `ModelApprover` beside the three built-in approvers. `docs/guide/verification.md` documents
+    `review_change` and states the default''s consequence.'
+  - '`CHANGELOG.md` carries the 0.42.0 entry with **no** `*Migration:*` note, because nothing breaks —
+    and with the one config-file consequence stated: a table written for 0.42.0 is refused by an older
+    binary rather than silently ignored.'
+  - No new guide page, so no `GUIDES` / `CAPABILITIES.md` bookkeeping — the precedent since 0.31.0.
+  - 'O3 — the checked-in doc surfaces are consistent with the code: `changelog` 5 passed, `docs_drift`
+    15, `guide_pages` 7, `public_api` 9, `readme` 8.'
 - id: US-IO-HARNESS-0.42.0-T08
   summary: 'Run the release''s own gates: the full suite in both feature polarities, clippy, fmt, the
     nightly rustdoc gate, MSRV 1.95, `cargo tree`, the cross-version stores, and one sabotage per arm

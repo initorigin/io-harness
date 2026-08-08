@@ -1022,6 +1022,99 @@ in the same order, with the same steps and the same ledger draws. An observer
 cannot tell from the event stream whether a batch ran concurrently. That is the
 guarantee, not a gap.
 
+## What a model approving an action can and cannot decide (0.42.0)
+
+`ModelApprover` installs a model where a human would stand. This is the boundary
+around it, and the boundary is the reason it is safe to offer at all.
+
+**It only ever answers the grey tier.** An action the `Policy` denies never
+reaches any approver, this one included, so the wall is exactly where it was: the
+worst a model can do here is approve something the operator had already marked as
+a question. It cannot widen the boundary, because a `ModelApprover`'s approval
+never carries a `modified` request and never carries a remembered rule. Both are
+things a Rust `Approver` may do and this one may not.
+
+**The repository it is reading may be hostile.** A write's content reaches the
+approving model's prompt, so a file in the workspace can address that model
+directly, and the system prompt says in as many words that content is material
+being acted on rather than an instruction. That is mitigation, not proof: treat a
+model approver as a filter over the grey tier and not as a defence against a
+workspace you do not trust. For a run that must never take a sensitive action,
+`DenyAll` remains the honest posture and nothing about this release changes it.
+
+**A verdict it cannot read is a defer.** A malformed answer, an answer with no
+JSON object in it, and a provider that failed all park the question — the action
+is persisted, the run stops, and a person answers it later. A machine standing in
+for an absent human must never wave through what it did not understand.
+
+**It may not answer for its own model.** A `ModelApprover` whose model is the
+model making the call is refused before the first request is billed, in a flat
+run and in a tree, and the evidence is zero calls to either provider.
+`allow_self_approval(true)` is the way to say you meant it, and it is a knob on
+the approver rather than a setting in a file so the exception is visible in the
+caller's own code. Neither model can always be named: when the contract states no
+routing model and the provider reports no `model_hint`, the run's model is the
+provider's own default, which this crate cannot name and therefore cannot
+compare.
+
+**Nothing about the trace changes.** An approval answered by a model emits the
+same `ApprovalRequested` and `ApprovalDecided` events, with the same decision
+strings, that an approval answered by a human emits.
+
+## What a `before_tool` hook stops, and where it may be written (0.42.0)
+
+**It runs before the call, on the loop's own thread.** A `[[hook]]` with
+`at = "before_tool"` is spawned with `{at, run_id, step, depth, tool, arguments}`
+on its stdin, in the discovery root, before the tool executes — which is the whole
+difference from an event hook, whose `on_failure = "cancel"` lands at the next
+step boundary and therefore after the call it objected to. A non-zero exit refuses
+that one call: nothing runs, the hook's first line of stdout (up to 4096
+characters) becomes the reason the model reads, and the run adapts. `on_failure`
+chooses otherwise — `cancel` ends the run at the next step boundary, `continue`
+lets the call through — and `refuse` is the default for a lifecycle hook.
+
+**It is refused in a project-scoped `io.toml`, exactly as any hook is**, inside a
+`[profile]` too. A hook runs an argv on this machine and `io.toml` is the file a
+`git clone` delivers; one that can stop a tool is strictly more dangerous than one
+that appends a log line. Write it in `io.local.toml` or the user-scope file.
+
+**It costs a process spawn per matching call.** The `tools` filter is how an
+operator pays for the check they wanted rather than for one per read, and an
+unfiltered `before_tool` hook over a read-heavy completion spawns once per call.
+The gate is serial, so a slow hook slows the step it is in; the read work it
+approves still runs concurrently, and 0.41.0's guarantees above are untouched.
+
+**Nothing happens until an application installs it.**
+`TaskContract::with_tool_hooks` takes the same `Hooks` a caller installs as an
+`Observer`; a configuration file alone changes nothing, which is the rule every
+projection of `io.toml` obeys.
+
+**A refusal is a `Refused` event**, with the hook's program where a rule's
+pattern would be and `io.toml hook` where a layer would be. There is no new event
+kind, and there is no `after_tool`: that needs a tool-result shape this crate does
+not have yet.
+
+## What a reviewer is shown of a change (0.42.0)
+
+**`ModelReviewer` is shown the change; a reviewer that overrides nothing is shown
+the outcome.** `Reviewer::review_change` is defaulted to forwarding the same
+`ReviewRequest` a reviewer has always received, so no existing implementation
+needs an edit — and the price of that is stated rather than hidden: such a
+reviewer keeps judging the files as they stand, which cannot show a deletion.
+Overriding `review_change` is how a reviewer sees what was removed.
+
+**The "before" is the state before the run first touched the file**, read from the
+restore point the store has kept since 0.28.0 — not the state before the last
+edit. A file the run created carries no before at all. A file whose previous
+contents were over the store's snapshot cap or were not text says so in `unkept`
+rather than appearing as empty, because a reviewer told a rewritten file was empty
+would read every line as an addition. A file the run never wrote is not in the
+list.
+
+**It is not a diff, and nothing new is stored.** Both texts are what the store
+already holds; computing and keeping hunks is a later release's work. A file the
+run wrote and something then removed is omitted rather than reported as empty.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none
