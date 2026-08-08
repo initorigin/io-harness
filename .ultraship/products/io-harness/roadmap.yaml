@@ -1041,7 +1041,7 @@ versions:
       so a rubric can be answered against the edits the run made, which is the form the criterion
       was always reaching for.
     detail: specified
-    status: planned
+    status: released
   - version: 0.43.0
     outcome: >
       A long conversation stops forgetting its own beginning, and a context overflow stops ending

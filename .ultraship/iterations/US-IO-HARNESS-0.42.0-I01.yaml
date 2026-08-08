@@ -45,6 +45,10 @@ change:
   - The `scope.included` bullet placing the gate in `prepare_read`.
   - The `resource_profile.likely_cost_drivers` bullet about editing `prepare_read`.
   - The fallback-pressure risk, which named the same function.
+  - >
+    The same claim where it also appeared in `outcome.user_can`, found while sealing the record and
+    corrected before the pin — the prose and the scope carried one error between them, and fixing
+    only the scope would have left the outcome saying something the code does not do.
 impact:
   products:
   - io-harness
