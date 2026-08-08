@@ -277,16 +277,30 @@ impl Hook {
             return Ok(());
         }
 
+        self.spawn_and_wait(dir, line, false).map(|_| ())
+    }
+
+    /// Spawn the hook's argv with `line` on its stdin and wait, bounded.
+    ///
+    /// One spawn for both kinds of hook, so an event hook and a lifecycle hook
+    /// cannot drift apart on the argv, the working directory, the payload or the
+    /// deadline. `capture` is the single difference and it is the lifecycle
+    /// hook's: its stdout becomes the reason the model reads, so it is read
+    /// rather than discarded, while an event hook keeps 0.28.0's `null` on both
+    /// streams — a library must not write to a caller's terminal, and reading
+    /// into a `String` is not writing to one.
+    fn spawn_and_wait(&self, dir: &Path, line: &str, capture: bool) -> Result<Option<String>> {
         let argv = self.run.as_ref().expect("check() proved one action exists");
         let limit = Duration::from_millis(self.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
         let mut child = Command::new(&argv[0])
             .args(&argv[1..])
             .current_dir(dir)
             .stdin(Stdio::piped())
-            // Discarded rather than inherited: a library must not write to a
-            // caller's terminal, and a hook that has something to say says it by
-            // exiting non-zero. Stated in the guide's limits block.
-            .stdout(Stdio::null())
+            .stdout(if capture {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::null())
             .spawn()
             .map_err(|e| Error::Config(format!("hook could not run `{}`: {e}", argv[0])))?;
@@ -298,12 +312,30 @@ impl Hook {
             let _ = writeln!(stdin, "{line}");
         }
 
-        match wait_bounded(&mut child, limit) {
-            Some(status) if status.success() => Ok(()),
-            Some(status) => Err(Error::Config(format!(
-                "hook `{}` exited with {status}",
-                argv[0]
-            ))),
+        // Drained on its own thread, and only then waited on. Reading after the
+        // wait would deadlock the other way round: a child that fills the pipe
+        // blocks writing, never exits, and is killed at the deadline — turning a
+        // chatty hook into a timeout instead of an answer.
+        let drain = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut text = String::new();
+                use std::io::Read;
+                let _ = out.read_to_string(&mut text);
+                text
+            })
+        });
+        let status = wait_bounded(&mut child, limit);
+        let said = drain
+            .and_then(|h| h.join().ok())
+            .map(|text| first_line(&text))
+            .filter(|s| !s.is_empty());
+
+        match status {
+            Some(status) if status.success() => Ok(said),
+            Some(status) => Err(Error::Config(match &said {
+                Some(why) => format!("hook `{}` exited with {status}: {why}", argv[0]),
+                None => format!("hook `{}` exited with {status}", argv[0]),
+            })),
             None => Err(Error::Config(format!(
                 "hook `{}` did not finish within {}ms and was killed",
                 argv[0],
@@ -312,6 +344,25 @@ impl Hook {
         }
     }
 }
+
+/// The first non-empty line of a hook's output, bounded.
+///
+/// Bounded because a hook is an operator's own program and a refusal reason
+/// belongs in a model's context: a hook that prints a 4 MB diff would otherwise
+/// put it there. The cap is on what is *used*, never on what is read — the whole
+/// stream is drained either way, or the child would block on a full pipe.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or_default()
+        .chars()
+        .take(MAX_REASON_CHARS)
+        .collect()
+}
+
+/// How much of a hook's answer reaches the model.
+const MAX_REASON_CHARS: usize = 4096;
 
 /// Wait for `child` up to `limit`, killing it past the deadline.
 ///
@@ -436,6 +487,68 @@ impl Hooks {
         }
         Ok(())
     }
+
+    /// Ask every `before_tool` hook that wants this call whether it may happen
+    /// (0.42.0).
+    ///
+    /// Called on the loop's own thread, before the call runs. The first hook to
+    /// object decides — there is nothing for a second opinion to add once a call
+    /// has been stopped, and spawning the rest would be work whose answer cannot
+    /// change the outcome.
+    pub(crate) fn before_tool(&self, tool: &str, payload: &str) -> ToolGate {
+        for (i, hook) in self.hooks.iter().enumerate() {
+            if !hook.wants_tool(tool) {
+                continue;
+            }
+            let Err(why) = hook.spawn_and_wait(&self.dir, payload, true) else {
+                continue;
+            };
+            // The reason, and the hook's index, never the payload: a call's
+            // arguments carry a path and a file's bytes, and a warning is not the
+            // place for either.
+            tracing::warn!("hook[{i}] on `{tool}` refused: {why}");
+            let argv0 = hook
+                .run
+                .as_ref()
+                .and_then(|a| a.first())
+                .cloned()
+                .unwrap_or_else(|| "hook".to_string());
+            return match hook.on_failure() {
+                OnFailure::Continue => continue,
+                OnFailure::Cancel => ToolGate::Cancel { argv0 },
+                OnFailure::Refuse => ToolGate::Refused {
+                    argv0,
+                    why: why.to_string(),
+                },
+            };
+        }
+        ToolGate::Go
+    }
+
+    /// Whether any table wants to decide about tool calls at all, so a loop with
+    /// no lifecycle hook does not serialize a payload nobody reads.
+    pub(crate) fn gates_tools(&self) -> bool {
+        self.hooks.iter().any(|h| h.at.is_some())
+    }
+}
+
+/// What the `before_tool` hooks decided about one call (0.42.0).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolGate {
+    /// Nothing objected. The call runs.
+    Go,
+    /// The call does not run, and the model is told why.
+    Refused {
+        /// The program that refused, named in the trace where a rule would be.
+        argv0: String,
+        /// What it said, or why it failed.
+        why: String,
+    },
+    /// The call does not run and the run stops at the next step boundary.
+    Cancel {
+        /// The program that stopped it.
+        argv0: String,
+    },
 }
 
 impl Observer for Hooks {

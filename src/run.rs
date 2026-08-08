@@ -3474,6 +3474,16 @@ impl<'a> Watch<'a> {
         }
     }
 
+    /// Ask for the run to stop, without an event to hang it off (0.42.0).
+    ///
+    /// What `on_failure = "cancel"` on a `before_tool` hook reaches. An event hook
+    /// gets here through `emit`, because it is answering an event; a lifecycle
+    /// hook is answering a call, and the refusal it produces is reported as a
+    /// refusal rather than as a second event kind.
+    pub(crate) fn cancel(&self) {
+        self.cancelled.set(true);
+    }
+
     /// Whether stopping has been asked for. Read at a step boundary only.
     fn cancelled(&self) -> bool {
         self.cancelled.get()
@@ -4449,6 +4459,7 @@ async fn run_workspace_from<P: Provider>(
                         0,
                         contract.max_parallel_reads,
                         &contract.goal,
+                        contract.tool_hooks.as_deref(),
                     )
                     .await?;
                 }
@@ -4486,6 +4497,7 @@ async fn run_workspace_from<P: Provider>(
                             active: planning,
                         },
                         &contract.goal,
+                        contract.tool_hooks.as_deref(),
                     )
                     .await?
                 }
@@ -5934,6 +5946,7 @@ fn run_agent<'f, P: Provider>(
                         active: planning,
                     },
                     &contract.goal,
+                    contract.tool_hooks.as_deref(),
                 )
                 .await?
                 {
@@ -7406,6 +7419,7 @@ async fn read_batch(
     depth: u32,
     max_parallel: usize,
     goal: &str,
+    hooks: Option<&crate::hooks::Hooks>,
 ) -> Result<std::collections::VecDeque<Dispatched>> {
     let mut out: Vec<Option<Dispatched>> = Vec::with_capacity(calls.len());
     let mut queued: std::collections::VecDeque<(usize, ReadWork)> =
@@ -7414,6 +7428,10 @@ async fn read_batch(
         // Announced here rather than in the concurrent half, so a watcher sees
         // the calls in the order the model made them however they then run.
         announce(watch, run_id, step, depth, call);
+        if let Some(refused) = tool_gate(hooks, call, watch, run_id, step, depth) {
+            out.push(Some(refused));
+            continue;
+        }
         match prepare_read(
             ws, call, approver, store, run_id, step, custom, watch, depth, goal,
         )
@@ -7487,6 +7505,71 @@ fn announce(watch: &Watch<'_>, run_id: i64, step: u32, depth: u32, call: &ToolCa
                 .to_string(),
         },
     ));
+}
+
+/// Ask the operator's `before_tool` hooks whether this call may happen (0.42.0).
+///
+/// One definition, two call sites: the head of [`dispatch`], which every
+/// non-batched call passes through, and [`read_batch`]'s per-call loop, which is
+/// where 0.41.0's concurrent reads are prepared. Both are serial and on the
+/// loop's own thread, so a hook runs in the model's call order and the read work
+/// it approves still runs concurrently. `None` means nothing objected.
+///
+/// A refusal is reported through [`EventKind::Refused`] with the hook's program
+/// where a rule's pattern would be: a refusal that did not come from the policy
+/// is still a refusal, and an observer already routing on them should see it.
+fn tool_gate(
+    hooks: Option<&crate::hooks::Hooks>,
+    call: &ToolCall,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
+) -> Option<Dispatched> {
+    let hooks = hooks?;
+    if !hooks.gates_tools() {
+        return None;
+    }
+    let payload = serde_json::json!({
+        "at": "before_tool",
+        "run_id": run_id,
+        "step": step,
+        "depth": depth,
+        "tool": call.name,
+        "arguments": call.arguments,
+    })
+    .to_string();
+
+    let (argv0, why, cancel) = match hooks.before_tool(&call.name, &payload) {
+        crate::hooks::ToolGate::Go => return None,
+        crate::hooks::ToolGate::Refused { argv0, why } => (argv0, why, false),
+        crate::hooks::ToolGate::Cancel { argv0 } => (
+            argv0,
+            "a local check stopped the run rather than this call".to_string(),
+            true,
+        ),
+    };
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        step,
+        depth,
+        EventKind::Refused {
+            act: "tool".into(),
+            target: call.name.clone(),
+            rule: Some(argv0.clone()),
+            layer: Some("io.toml hook".into()),
+        },
+    ));
+    if cancel {
+        watch.cancel();
+    }
+    Some(Dispatched::go(
+        format!("{} refused by hook {argv0}", call.name),
+        format!(
+            "\n[{} refused] a local check (`{argv0}`) stopped this call: {why}\n",
+            call.name
+        ),
+    ))
 }
 
 /// Execute one tool call against the workspace, enforcing the policy and
@@ -7653,12 +7736,20 @@ async fn dispatch(
     // 0.42.0 — what the run is for. The approval site tells an approver why it is
     // being asked, and the goal is the half of that a `Verdict` cannot carry.
     goal: &str,
+    // 0.42.0 — the operator's own `before_tool` checks, or `None`.
+    hooks: Option<&crate::hooks::Hooks>,
 ) -> Result<Dispatched> {
     let a = &call.arguments;
     let s = |k: &str| a.get(k).and_then(|v| v.as_str());
     // Announced before the call is made, so a watcher sees what the run is about
     // to do rather than only what it did.
     announce(watch, run_id, step, depth, call);
+    // 0.42.0 — the operator's own check, before anything happens. Every call that
+    // is not part of a read batch arrives here, and a batched one is checked in
+    // `read_batch` instead, so each call is asked about exactly once.
+    if let Some(refused) = tool_gate(hooks, call, watch, run_id, step, depth) {
+        return Ok(refused);
+    }
     let name = call.name.as_str();
     Ok(match name {
         // 0.41.0 — the three read-only built-ins go through the same two halves a

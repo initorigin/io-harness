@@ -177,7 +177,7 @@ tasks:
   why_required: 'This is the capability itself: without the consult in the shared serial policy phase,
     an operator''s table is a file nothing reads. It is also where the release''s interaction with 0.41.0''s
     batch is settled.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.42.0-T04
   acceptance_criteria:
@@ -218,7 +218,38 @@ tasks:
   - src/run.rs
   - src/lib.rs
   - tests/tool_hooks.rs
-  evidence: []
+  evidence:
+  - '`Hooks::before_tool(tool, payload) -> ToolGate` landed in `src/hooks.rs`: it spawns every table whose
+    `at` is `before_tool` and whose `tools` filter wants this call, with `{at, run_id, step, depth, tool,
+    arguments}` on the child''s stdin, and the first hook to object decides — a second opinion cannot
+    change the outcome of a call already stopped.'
+  - One spawn implementation for both kinds of hook. `fire` and the gate both call `spawn_and_wait(dir,
+    line, capture)`, so the argv, the working directory, the payload and the deadline cannot drift; `capture`
+    is the lifecycle hook's single difference. Stdout is drained on its own thread and only then waited
+    on — reading after the wait would turn a chatty hook into a timeout — and `first_line` bounds what
+    reaches the model at 4096 characters.
+  - 'The gate is one helper called from two places, as `US-IO-HARNESS-0.42.0-I01` recorded: `tool_gate`
+    at the head of `dispatch` (every non-batched call) and in `read_batch`''s per-call loop (0.41.0''s
+    concurrent reads). Each call is asked about exactly once.'
+  - A refusal is reported through the existing `EventKind::Refused` with the hook's program where a rule's
+    pattern would be and `io.toml hook` where a layer would be. No new `EventKind` variant. `Watch::cancel`
+    is what `on_failure = "cancel"` reaches, honoured at the next step boundary like every other cancellation.
+  - '`TaskContract::with_tool_hooks(Arc<Hooks>)` installs the same `Hooks` value an application installs
+    as an `Observer`: as an observer it ignores the `at` tables (`Hook::wants` answers false for them),
+    as a gate it ignores the `on` ones.'
+  - 'F5 — `a_before_tool_hook_refuses_the_call_and_the_model_reads_why` passes: no file on disk, no `Edit`
+    row, the hook''s own first line of stdout in the model''s observations, and the run not `Cancelled`.'
+  - 'F7 — `on_failure_decides_what_a_failing_hook_costs` passes all four arms: absent and `refuse` leave
+    no write and the run continuing, `cancel` ends it `RunOutcome::Cancelled`, `continue` lets the call
+    through.'
+  - 'N4 — `the_gate_is_serial_but_the_batch_is_not_and_a_filter_costs_nothing` passes both arms: three
+    registered read-only tools sharing a barrier of three still rendezvous under a hook matching all three,
+    and a hook filtered to `write_file` is spawned **zero** times across a completion of twenty reads,
+    counted by the hook itself on disk.'
+  - 'N5 — `a_hook_that_never_returns_is_killed_and_the_call_is_refused` passes: a hook sleeping 30s under
+    `timeout_ms = 200` is killed at the deadline, the call is refused and the run finishes.'
+  - '`cargo test --test tool_hooks` exit 0, 6 passed. Regression: `parallel_reads` 15 passed and `hooks`
+    5 passed — 0.41.0''s batch and 0.28.0''s event hooks, the two things this could have broken.'
 - id: US-IO-HARNESS-0.42.0-T06
   summary: Add `FileChange`, `ChangeReview` and the defaulted `Reviewer::review_change`, build the change
     from the 0.28.0 restore points, and override it in `ModelReviewer` so the reviewing prompt carries
