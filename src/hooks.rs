@@ -53,6 +53,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::observe::{Flow, Observer, RunEvent, EVENT_NAMES};
 
+/// The one lifecycle point a `[[hook]]` may attach to (0.42.0).
+///
+/// Named rather than free-form for the reason [`EVENT_NAMES`] is: a misspelling
+/// that loads, installs and never fires is a check that silently approves
+/// everything, and that is the worst thing this module can ship.
+const AT_BEFORE_TOOL: &str = "before_tool";
+
+/// Every lifecycle point, for the error that lists them.
+const AT_NAMES: &[&str] = &[AT_BEFORE_TOOL];
+
 /// How long an executing hook may take before it is killed, when the table says
 /// nothing.
 ///
@@ -81,6 +91,14 @@ pub(crate) enum OnFailure {
     /// local policy check": the mechanism already existed and this is the key that
     /// reaches it.
     Cancel,
+    /// The tool call does not happen, and the run continues (0.42.0). The hook's
+    /// reason reaches the model, which adapts — the same shape as a policy deny.
+    ///
+    /// Only a lifecycle hook can take this answer, because only a lifecycle hook
+    /// runs while there is still a call to stop. It is also the **default** for
+    /// one: a check attached to a point that exists to stop something is not a
+    /// notification.
+    Refuse,
 }
 
 /// One `[[hook]]` table.
@@ -98,6 +116,21 @@ pub(crate) struct Hook {
     /// to. Empty means every event.
     #[serde(default)]
     on: Vec<String>,
+    /// The point in the tool lifecycle this hook attaches to (0.42.0), or `None`
+    /// for an event hook. Exactly one of `on` and `at`.
+    ///
+    /// One value, `before_tool`, and the validator names it rather than pretending
+    /// to a set: an `after_tool` needs a result shape to put on the child's stdin,
+    /// and this crate does not have one yet.
+    #[serde(default)]
+    at: Option<String>,
+    /// The tool names a lifecycle hook wants, or empty for every call (0.42.0).
+    ///
+    /// Not decoration: a lifecycle hook is a process spawn on the hottest path in
+    /// the loop, and a filter is how an operator pays for the check they wanted
+    /// rather than for one per read.
+    #[serde(default)]
+    tools: Vec<String>,
     /// A file to append one JSON line per matching event to, relative to the
     /// discovery root the configuration was loaded for — so a user-scope hook
     /// writes its log beside the project it is watching rather than beside itself.
@@ -107,9 +140,11 @@ pub(crate) struct Hook {
     /// Never a string, so there is nothing for a shell to interpret.
     #[serde(default)]
     run: Option<Vec<String>>,
-    /// What a failure of this hook does to the run.
+    /// What a failure of this hook does to the run, or `None` for its kind's own
+    /// default — [`OnFailure::Continue`] for an event hook, [`OnFailure::Refuse`]
+    /// for a lifecycle one. Read through [`Hook::on_failure`], never directly.
     #[serde(default)]
-    on_failure: OnFailure,
+    on_failure: Option<OnFailure>,
     /// The wall-clock ceiling on `run`, in milliseconds.
     #[serde(default)]
     timeout_ms: Option<u64>,
@@ -124,6 +159,44 @@ impl Hook {
     /// failure mode this module can least afford.
     fn check(&self, index: usize, path: &Path) -> Result<()> {
         let at = format!("{}: key `hook[{index}]`", path.display());
+        // 0.42.0 — an event hook and a lifecycle hook are different things, and a
+        // table claiming both is a mistake worth naming rather than resolving by
+        // precedence.
+        if self.at.is_some() && !self.on.is_empty() {
+            return Err(Error::Config(format!(
+                "{at}: a hook attaches to events or to a lifecycle point — set `on` or `at`, \
+                 not both"
+            )));
+        }
+        match &self.at {
+            Some(point) if !AT_NAMES.contains(&point.as_str()) => {
+                return Err(Error::Config(format!(
+                    "{at}: `{point}` is not a lifecycle point this crate has. It has: {}",
+                    AT_NAMES.join(", ")
+                )))
+            }
+            // Appending a line cannot stop a call, so a lifecycle hook that only
+            // appends is a check that always passes — which is the silence this
+            // module can least afford.
+            Some(_) if self.run.is_none() => {
+                return Err(Error::Config(format!(
+                    "{at}: a lifecycle hook decides whether a call happens, so it needs `run` \
+                     — an `append` cannot stop anything"
+                )))
+            }
+            None if !self.tools.is_empty() => {
+                return Err(Error::Config(format!(
+                    "{at}: `tools` filters a lifecycle hook, and this one has no `at`"
+                )))
+            }
+            None if self.on_failure == Some(OnFailure::Refuse) => {
+                return Err(Error::Config(format!(
+                    "{at}: `on_failure = \"refuse\"` needs a call to refuse, and an event hook \
+                     runs after one"
+                )))
+            }
+            _ => {}
+        }
         match (&self.append, &self.run) {
             (None, None) => {
                 return Err(Error::Config(format!(
@@ -152,9 +225,30 @@ impl Hook {
     }
 
     /// Whether this hook wants an event carrying `tag`. An empty `on` wants all of
-    /// them, which is the reading that makes an audit log one line.
+    /// them, which is the reading that makes an audit log one line — and a
+    /// lifecycle hook wants none of them, whatever the tag.
     fn wants(&self, tag: &str) -> bool {
-        self.on.is_empty() || self.on.iter().any(|n| n == tag)
+        self.at.is_none() && (self.on.is_empty() || self.on.iter().any(|n| n == tag))
+    }
+
+    /// Whether this hook wants to decide about a call to `tool` (0.42.0). An empty
+    /// `tools` wants every call, the same reading `on` has.
+    fn wants_tool(&self, tool: &str) -> bool {
+        self.at.as_deref() == Some(AT_BEFORE_TOOL)
+            && (self.tools.is_empty() || self.tools.iter().any(|n| n == tool))
+    }
+
+    /// What a failure of this hook does, with its kind's default applied.
+    ///
+    /// A lifecycle hook that says nothing refuses the call: it was attached to a
+    /// point that exists to stop something. An event hook that says nothing lets
+    /// the run continue, as it has since 0.28.0.
+    fn on_failure(&self) -> OnFailure {
+        self.on_failure.unwrap_or(if self.at.is_some() {
+            OnFailure::Refuse
+        } else {
+            OnFailure::Continue
+        })
     }
 
     /// Do the hook's one thing, and say why if it did not happen.
@@ -366,7 +460,7 @@ impl Observer for Hooks {
                 // `ToolCall` carries a target, and a warning is not the place for
                 // either.
                 tracing::warn!("hook[{i}] on `{tag}` failed: {why}");
-                if hook.on_failure == OnFailure::Cancel {
+                if hook.on_failure() == OnFailure::Cancel {
                     flow = Flow::Cancel;
                 }
             }

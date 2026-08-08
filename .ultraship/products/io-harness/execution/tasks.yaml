@@ -136,7 +136,7 @@ tasks:
     inside a `[profile]` too.
   why_required: A lifecycle hook has to be expressible and validated before anything can consult it, and
     the trust rule has to be extended in the same change that creates the thing it must cover.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F6 — the trust rule is extended, never weakened.** The same table in a project-scoped `io.toml`
@@ -150,7 +150,26 @@ tasks:
   - src/hooks.rs
   - src/config.rs
   - tests/tool_hooks.rs
-  evidence: []
+  evidence:
+  - '`Hook` gained `at: Option<String>` and `tools: Vec<String>`, both `pub(crate)` like the struct, so
+    the table grows with no public surface. `AT_BEFORE_TOOL`/`AT_NAMES` name the one lifecycle point for
+    the same reason `EVENT_NAMES` exists: a misspelling that loads, installs and never fires is a check
+    that silently approves everything.'
+  - '`OnFailure` gained `Refuse`, and `on_failure` became `Option<OnFailure>` read through `Hook::on_failure()`,
+    which applies the kind''s own default — `Refuse` for a lifecycle hook, `Continue` for an event hook,
+    unchanged since 0.28.0.'
+  - '`Hook::check` refuses four shapes at load, each naming what is wrong: an `at` value this crate does
+    not have, `on` and `at` together, `tools` on an event hook, and a lifecycle hook whose only action
+    is `append` — appending a line cannot stop a call, so that table is a check that always passes.'
+  - '`Hook::wants` now answers `false` for a lifecycle hook whatever the event tag, so a `[[hook]]` with
+    `at` is never fired as an observer.'
+  - 'F6 — `a_lifecycle_hook_is_refused_in_a_project_scoped_file` passes: the table is refused in `io.toml`
+    with the existing "may not declare hooks" error, refused again nested in `[profile.ci]`, and the identical
+    file at local scope loads. The project-scope refusal covers the whole `hook` key, so `at` inherits
+    it rather than reopening the question.'
+  - '`a_lifecycle_table_that_cannot_fire_is_refused_at_load` passes all four shapes.'
+  - '`cargo test --test tool_hooks --test hooks --test config` exit 0: 2, 5 and 48 passed. The hooks and
+    config suites are the 0.28.0 regression on a struct this changed the shape of.'
 - id: US-IO-HARNESS-0.42.0-T05
   summary: Consult a matching `before_tool` hook in `prepare_read` before the call executes, capture its
     first line of stdout as the refusal reason, report the refusal through `EventKind::Refused`, and install
