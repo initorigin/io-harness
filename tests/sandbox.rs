@@ -101,11 +101,21 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
         }
     }
 
-    // Windows: since 0.24.0 the Job Object is implemented, so it *is* the
-    // strongest available backend and reporting the floor would now be the lie.
-    // Before 0.24.0 this asserted `PortableFloor`, and that was correct then.
+    // Windows: 0.24.0 made the Job Object the strongest available backend and
+    // this asserted it exactly; 0.47.0 selects the AppContainer alongside it, so
+    // a host that can build a container correctly reports the stronger of the
+    // two. Both are legitimate answers and which one a host gives is the
+    // container probe's business — what must never happen is the floor, which on
+    // Windows would mean the Job Object was not created either.
     #[cfg(target_os = "windows")]
-    assert_eq!(native.backend(), Backend::WindowsJobObject);
+    assert!(
+        matches!(
+            native.backend(),
+            Backend::WindowsAppContainer | Backend::WindowsJobObject
+        ),
+        "a Windows host must report a native backend, got {:?}",
+        native.backend()
+    );
 
     // ...and forcing the floor selects the portable backend, recorded so the
     // selection ladder is observable.
