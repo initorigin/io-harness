@@ -151,11 +151,14 @@ scope:
     one `provider_calls` row and is billed and rate-limited with everything else.
   - >
     **A `summaries` table, and `Store::summaries` / `Summary`.**
-    `summaries (id, run_id, through_step, kept_from, text, est_tokens, created_at)` with an index on
-    `(run_id, through_step)`. Written before the ledger is edited, so a process that dies between
-    the summarising call and the next request has already paid for and kept the summary. Read back
-    on resume, branch and replay by the same helper, keyed on the step it covers — which is what
-    makes a resumed run reproduce the fold rather than buy it again. Additive: `summaries` and its
+    `summaries (id, run_id, through_step, folded, text, est_tokens, at)` with an index on
+    `(run_id, folded)`. Written before the ledger is edited, so a process that dies between
+    the summarising call and the next request has already paid for and kept the summary. Keyed on
+    `folded` — how many entries from the front of the ledger the paragraph stands in for — and
+    **not** on the step, which a resume does not restart on; and `restore_ledger` replays the stored
+    folds after restoring the observations, which is what actually makes a resumed, branched or
+    replayed run reproduce the fold rather than buy it again. Both corrections are
+    `US-IO-HARNESS-0.43.0-I01`. Additive: `summaries` and its
     index go into `ADDED_SINCE_0_22_0` (`tests/cross_version.rs:149`), `CHECKPOINT_FORMAT`
     (`src/state.rs:107`) is **unmoved** at 7, and no existing table, column or index is altered.
   - >

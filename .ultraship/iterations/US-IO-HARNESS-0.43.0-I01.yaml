@@ -1,0 +1,89 @@
+id: US-IO-HARNESS-0.43.0-I01
+timestamp: 2026-08-09T00:00:00Z
+category:
+- implementation-level
+trigger: >
+  The contract states that the summary row is "keyed on the step it covers — which is what makes a
+  resumed run reproduce the fold rather than buy it again". Building F3 showed the step is not a key
+  a resume can find a row by, and — the larger half — that a resume would have discarded the fold
+  entirely however it was keyed, because it rebuilds the working ledger from `ledger_observations`
+  and a summary is not one of those rows.
+evidence:
+- >
+  `resume` restarts at the step *after* the last committed one (`start_step`, `src/run.rs`), so a run
+  that folded on step 5 and died before step 5 committed re-enters at step 5 — but a run that folded
+  on step 5 and was stopped cleanly re-enters at step 6. A step key therefore misses by one in the
+  common case, and `summary_at(run_id, step)` returned `None` on every resume that reached the same
+  point in its own history.
+- >
+  `restore_ledger` (`src/run.rs:3346`) rebuilt the ledger from `Store::observations` alone. Every
+  observation the run had already paid to summarise came back whole, so the resumed run both lost the
+  paragraph it owned and re-crossed the threshold and bought a second one. Asserted directly: F3's
+  first version recorded two summarising completions across the two passes and two `summaries` rows.
+- >
+  A third fact settled the key. The fold is applied to a ledger that may already contain a summary at
+  the front, so the count that reproduces a fold is a count of entries *from the front of the ledger
+  as it then stood* — which nests correctly across folds — and not the ledger's pre-fold length,
+  which was what the column first held. The column said 5 while the fold had replaced 3.
+- >
+  Separately and not a plan change: N4 failed on its first run — 96 tokens billed against 120 in
+  `provider_calls` — because `Store::spent_tokens` sums `steps.tokens` and the fold's completion was
+  landing only a `provider_calls` row. The criterion caught exactly the invisible spend it was
+  written for; the fold's tokens now join the step's total.
+before:
+  scope:
+  - Summarising compaction, stored so a resumed run does not pay twice.
+  - A context overflow classified and answered by compacting and re-asking once.
+  - A session transcript export.
+  - Images on a conversational turn.
+  implementation: >
+    A `summaries` row carrying `through_step` and `kept_from`, looked up by `through_step`, with
+    `restore_ledger` unchanged.
+  assumptions:
+  - The step a fold happened on identifies that fold across a resume.
+  - A resumed run reaching the same boundary will look the row up and find it.
+change:
+  summary: >
+    One column with one meaning, and the replay that makes it worth having. `kept_from` becomes
+    `folded`: how many entries from the front of the ledger the paragraph stands in for — the lookup
+    key, and exactly what replaying the fold needs. `through_step` is kept for a trace reader and is
+    explicitly not the key. `restore_ledger` now applies each stored fold in order after restoring
+    the observations, so a resumed, branched or replayed run reconstructs the ledger the run had
+    rather than the ledger it would have had without compaction.
+  added:
+  - >
+    `restore_ledger` replays the stored folds. A row whose prefix no longer exists is skipped rather
+    than panicking: a fold is a compression of history, and refusing to resume over an odd row would
+    be refusing over something advisory.
+  removed: []
+  deferred: []
+  replaced:
+  - The `scope.included` sentence keying the stored summary on the step it covers.
+  - The `outcome.user_can` sentence calling the row "bound to the step it covers", which carried the
+    same claim in the prose — the 0.42.0 lesson that a corrected claim must be grepped for across
+    the whole contract, applied at implementation time rather than at sealing time.
+impact:
+  products:
+  - io-harness
+  versions:
+  - 0.43.0
+  tasks:
+  - US-IO-HARNESS-0.43.0-T01
+  - US-IO-HARNESS-0.43.0-T03
+  dependencies: []
+  resource_effect: >
+    Neutral to positive. The replay is fifteen lines in a function that already existed, and it
+    removes the need for any same-step re-entry to be the mechanism — the fold survives every
+    interruption rather than only the one that happens to land on the same step number.
+versioning:
+  previous_target: 0.43.0
+  new_target: 0.43.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Under the standing authorisation to make engineering decisions inside the release's scope without
+    routing them back as approval gates. The scope, the acceptance criteria and the fallback are
+    unchanged; what changed is the mechanism one included bullet named.
+canonical_updates:
+- products/io-harness/releases/0.43.0.yaml

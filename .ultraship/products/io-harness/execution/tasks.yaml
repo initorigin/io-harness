@@ -89,7 +89,7 @@ tasks:
   why_required: This is the release's headline capability. It is also the shape most at risk of landing
     in one loop and not the other, or inside assembly, which is why it is one definition with two asserted
     call sites.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.43.0-T02
   acceptance_criteria:
@@ -127,7 +127,44 @@ tasks:
   - src/context.rs
   - src/run.rs
   - tests/compaction.rs
-  evidence: []
+  evidence:
+  - '`compact_ledger` in `src/run.rs` is the one definition, called from both loops immediately before
+    `assemble` — the flat workspace loop and the tree loop — and never from inside `assemble`, which
+    still makes no provider call. It compares the ledger''s estimated tokens against `at_share ×
+    effective_tokens`, folds all but `keep_recent` from the front, and returns the tokens it spent.'
+  - 'The summarising call goes through `complete_with_retry`, the single choke point every completion
+    uses, with `SUMMARY_SYSTEM` and no tools — so it lands one ordinary `provider_calls` row and is
+    retried, traced and billed like everything else. Never streamed.'
+  - 'A fold may only replace observations the store already holds: `count = (len - keep).min(written)`,
+    where `written` is the durable watermark. Found by the tests, not by reasoning — the first version
+    panicked in `persist_ledger` with "range start index 5 out of range for slice of length 4", because
+    folding shrank the vector the watermark indexes into. The watermark moves with the fold.'
+  - '`US-IO-HARNESS-0.43.0-I01`: the row is keyed on `folded` rather than on the step, and
+    `restore_ledger` replays the stored folds. Both corrections came from F3 failing three different
+    ways; see the iteration record.'
+  - 'N4 caught the invisible spend it was written for. `Store::spent_tokens` sums `steps.tokens`, so a
+    fold billed only in `provider_calls` was money the run''s own token budget never saw — 96 against
+    120. The fold''s tokens now join the step''s total in both loops.'
+  - 'An empty summary is not a fold: a summariser that returns no text leaves the ledger alone rather
+    than replacing the notes with nothing. The call still happened and is still billed.'
+  - '`cargo test --test compaction` exit 0, 11 passed. F1 is the discriminating pair — the summarising
+    request contains the folded observation, and a later working request contains the summary''s own
+    sentence and no longer contains a marker that appeared only in the folded text. F3 parks a
+    completion forever, drops the run mid-step (the only interruption that leaves a run resumable —
+    every clean stop, cancellation included, is terminal to `resume` by design) and resumes: the
+    summarising model is called once in total and the paragraph is still in the request. N4 asserts one
+    extra `provider_calls` row per fold, filed under the step it happened in, and `spent_tokens` equal
+    to the sum over those rows.'
+  - 'N5: the whole corpus is the control, because compaction is on by default and every suite now runs
+    with it. `cargo test --tests --no-fail-fast` — 68 suites green, including `parallel_reads`
+    (0.41.0''s batch) and `tool_hooks` (0.42.0''s gate). One existing test needed a line:
+    `tests/context.rs`''s prompt-stabilisation test drives a positional script under a 1,000-token
+    budget, where the fold now fires and inserts a completion the script cannot see coming — it sets
+    `at_share: 1.0` and says why, because it is 0.13.0''s elision claim and the fold''s own
+    stabilisation is asserted in `tests/compaction.rs`.'
+  - '`cargo test --doc` exit 0, 388 passed; `cargo test --lib` exit 0, 388 passed;
+    `cargo test --test public_api` exit 0 after `docs/public-api.txt` gained `Compaction` and
+    `Summary` by hand.'
 - id: US-IO-HARNESS-0.43.0-T04
   summary: Add `ProviderErrorKind::ContextOverflow` and `#[non_exhaustive]` to the enum, add `from_response`,
     and route the three built-in providers through it.
