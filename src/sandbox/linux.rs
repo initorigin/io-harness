@@ -220,7 +220,14 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
         // `landlock_restrict_self`, both async-signal-safe. `fd` is owned by
         // `ruleset`, which outlives the spawn below.
         unsafe {
-            cmd.pre_exec(move || unsafe { super::landlock::restrict_self(fd) });
+            cmd.pre_exec(move || unsafe {
+                // Order is not arbitrary: `restrict_self` sets
+                // `PR_SET_NO_NEW_PRIVS`, which installing a seccomp filter also
+                // requires, so the rule set goes on first and the deny-list
+                // second. Neither allocates.
+                super::landlock::restrict_self(fd)?;
+                super::seccomp::install()
+            });
         }
     })
     .await;

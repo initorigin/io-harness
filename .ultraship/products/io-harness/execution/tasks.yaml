@@ -185,7 +185,7 @@ tasks:
   why_required: The roadmap entry names a namespace-free filesystem AND syscall restriction. Without it
     the rung leaves a payload able to undo its own confinement, and the crate's standing confession that
     it installs no filter would still be true.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.47.0-T02
   acceptance_criteria:
@@ -203,7 +203,30 @@ tasks:
   - src/sandbox/seccomp.rs
   - src/sandbox/landlock.rs
   - tests/sandbox.rs
-  evidence: []
+  evidence:
+  - '`src/sandbox/seccomp.rs` — a BPF program installed in the same `pre_exec` as the Landlock rule set
+    and after it, because `landlock::restrict_self` sets the `PR_SET_NO_NEW_PRIVS` that installing a filter
+    also requires.'
+  - '**The syscall numbers are `libc`''s own per-architecture `SYS_*` constants and are never written
+    out as numbers.** A hand-copied table is the one mistake in this module that would be invisible —
+    a wrong number denies some other syscall, on one architecture, and the symptom is a build failing
+    for no stated reason. Naming them makes a missing constant a compile error.'
+  - 'F11''s host-free half: `every_comparison_jumps_to_the_refusal` checks the jump arithmetic instruction
+    by instruction, which is the part of an assembled BPF program that is silently rather than loudly
+    wrong — a bad offset produces a filter the kernel accepts and that refuses the wrong call. It also
+    asserts the refusal is `SECCOMP_RET_ERRNO(EPERM)` and not a kill. `the_denied_set_is_the_documented_one`
+    asserts the list''s size and that `openat` and `execve` are absent.'
+  - '**Type-checked for BOTH Linux architectures without a matrix round, and aarch64 was worth checking.**
+    The standalone `rustc --target ... --emit=metadata --test` technique was run for `x86_64-unknown-linux-gnu`
+    (exit 0) and for `aarch64-unknown-linux-gnu` (exit 0, after `rustup target add` and building `libc`
+    alone for it). **CI has no ARM Linux leg**, so a `SYS_*` constant missing on aarch64 would have compiled
+    nowhere in the matrix and shipped. All 13 resolve on both.'
+  - 'Stated limitation, in the module doc rather than discovered: the filter is written in the host architecture''s
+    numbers, so a process under a foreign personality is allowed through rather than denied by coincidence.
+    The architecture guard jumps to `allow`, asserted by the jump test. This layer hardens; the Landlock
+    rule set beside it is the boundary.'
+  - '**Not yet proven**: that a denied syscall actually returns `EPERM` on a live kernel. Pending the
+    matrix.'
 - id: US-IO-HARNESS-0.47.0-T05
   summary: Add the bubblewrap rung beneath Landlock, probed by spawning the wrapper it builds.
   why_required: A setuid bwrap works on hosts whose kernel refuses an unprivileged user namespace, which

@@ -1552,6 +1552,13 @@ pub mod windows;
 // in the plan, and the plan is the half that does not need a matrix round.
 pub(crate) mod landlock;
 
+// The seccomp deny-list installed beside the Landlock rule set. Unlike the rung
+// itself this module has no portable half worth compiling elsewhere — it is a
+// BPF program in one architecture's syscall numbers — so the whole file is
+// `cfg(target_os = "linux")` and is proven on the Linux legs or nowhere.
+#[cfg(target_os = "linux")]
+pub(crate) mod seccomp;
+
 // The AppContainer half is the exception to the paragraph above: it has no
 // portable logic to unit-test on the build host, because unlike a Job Object's
 // limit mapping there is no pure-data layer between the configuration and the
