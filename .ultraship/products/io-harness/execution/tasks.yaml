@@ -2,20 +2,13 @@ product: io-harness
 version: 0.44.0
 tasks:
 - id: US-IO-HARNESS-0.44.0-T01
-  summary: Add `CompletionRequest::cache_boundary` and `#[non_exhaustive]`, skipped when `None`.
-  why_required: 'Nothing else in the release can be built until the request can carry the offset. The
-    serde attribute is the half that is easy to get wrong and expensive to discover: `Replay` keys on
-    the whole request JSON, so a naked field stops every recorded cassette in the repository from matching.'
-  status: in-progress
+  summary: Add `CompletionRequest::cache_boundary`, skipped when `None`.
+  why_required: Nothing else in the release can be built until the request can carry the offset. The serde
+    attribute matches the three optional fields before it, and the criterion that guards it is the only
+    thing in the suite that can see it change.
+  status: done
   depends_on: []
   acceptance_criteria:
-  - '**F2 — `None` is 0.43.0''s body, byte for byte.** The same builders with `cache_boundary: None`,
-    asserted against the serialised body 0.43.0 produced for the same request — the whole body, not the
-    user field. Separately, an offset past `user.len()`, an offset landing inside a multi-byte character,
-    and `Some(0)` each produce that same body and no error. Sabotage: treat an out-of-range offset as
-    a clamp to the end, under which one block becomes two and this fails while F1 still passes.
-
-    '
   - '**F9 — an unmarked request keys as it always has, and a marked one is a different question.** An
     unmarked request''s serialised form carries no `cache_boundary` key at all; a marked one carries it;
     and a recording made by the unmarked request refuses to answer the marked one. The second half is
@@ -30,19 +23,18 @@ tasks:
   - src/provider/mod.rs
   - tests/replay.rs
   evidence:
-  - '`CompletionRequest::cache_boundary: Option<usize>` added at `src/provider/mod.rs`, `#[serde(default,
-    skip_serializing_if = "Option::is_none")]` like `model`, `web` and `effort` before it. `cargo fmt
+  - '`CompletionRequest::cache_boundary: Option<usize>` added at `src/provider/mod.rs` with `#[serde(default,
+    skip_serializing_if = "Option::is_none")]`, like `model`, `web` and `effort` before it. `cargo fmt
     --check` clean, `cargo clippy --all-targets -- -D warnings` clean, and the field''s own worked doctest
-    passes.'
-  - '`a_boundary_is_absent_from_an_unmarked_key_and_present_in_a_marked_one` (`tests/replay.rs`) passes;
-    the whole replay suite is 9 passed / 0 failed. Sabotage — drop `skip_serializing_if` — fails that
-    named test and NOTHING else in the suite, which is the finding that justifies the test existing: a
-    recording made and replayed by one build serialises both sides the same way, so every other test stays
-    self-consistent.'
-  - BLOCKED on the `#[non_exhaustive]` half. Applying it fails `E0639` at `tests/replay.rs:136`, `:392`
-    and `:428` — the attribute forbids every struct expression outside the defining crate INCLUDING functional
-    update, so `..Default::default()` stops compiling. Reported for `/ultraship:iterate`; the attribute
-    is not in the tree.
+    passes (2 passed / 0 failed).'
+  - '`a_boundary_is_absent_from_an_unmarked_key_and_present_in_a_marked_one` (`tests/replay.rs`): the
+    replay suite is 9 passed / 0 failed.'
+  - 'Sabotage — drop `skip_serializing_if` — gives 8 passed / 1 failed, failing that named test and NOTHING
+    else. Reported as a finding: one build serialises both sides of a recording the same way, so no pre-existing
+    test can see it. This is what disproved the contract''s cassette claim (`US-IO-HARNESS-0.44.0-I01`).'
+  - '`#[non_exhaustive]` was applied, measured and reverted: E0639 at `tests/replay.rs:136`, `:392`, `:428`,
+    the first being `..Default::default()`. Removed from scope by `US-IO-HARNESS-0.44.0-I01`; the reason
+    is recorded in a comment at the type.'
 - id: US-IO-HARNESS-0.44.0-T02
   summary: Anthropic splits the user turn at the boundary and refuses it when images are present.
   why_required: Anthropic is the vendor the second breakpoint is designed against, and the one where image
@@ -58,6 +50,13 @@ tasks:
     and the second carries none; and **the two texts concatenated are byte-identical to `request.user`**.
     The third is the discriminating one. Sabotage: split with `trim()` on either half, under which the
     first two assertions pass and only the concatenation fails.
+
+    '
+  - '**F2 — `None` is 0.43.0''s body, byte for byte.** The same builders with `cache_boundary: None`,
+    asserted against the serialised body 0.43.0 produced for the same request — the whole body, not the
+    user field. Separately, an offset past `user.len()`, an offset landing inside a multi-byte character,
+    and `Some(0)` each produce that same body and no error. Sabotage: treat an out-of-range offset as
+    a clamp to the end, under which one block becomes two and this fails while F1 still passes.
 
     '
   - '**F6 — media decides the boundary per wire, and the two wires differ.** One request carrying an image
@@ -87,6 +86,13 @@ tasks:
     and the second carries none; and **the two texts concatenated are byte-identical to `request.user`**.
     The third is the discriminating one. Sabotage: split with `trim()` on either half, under which the
     first two assertions pass and only the concatenation fails.
+
+    '
+  - '**F2 — `None` is 0.43.0''s body, byte for byte.** The same builders with `cache_boundary: None`,
+    asserted against the serialised body 0.43.0 produced for the same request — the whole body, not the
+    user field. Separately, an offset past `user.len()`, an offset landing inside a multi-byte character,
+    and `Some(0)` each produce that same body and no error. Sabotage: treat an out-of-range offset as
+    a clamp to the end, under which one block becomes two and this fails while F1 still passes.
 
     '
   - '**F5 — `WebFlavor::OpenAi` never sends a boundary.** The shared body builder at that flavour, with
