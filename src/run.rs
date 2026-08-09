@@ -3941,6 +3941,15 @@ async fn run_from<P: Provider>(
         family: provider.prompt_family(),
         ending: "",
     });
+    report_prompt(
+        watch,
+        run_id,
+        0,
+        &system,
+        contract,
+        provider.prompt_family(),
+        false,
+    );
     let tool = write_file_tool();
     // Durable budget: spend and elapsed time are restored from the store, so a
     // resume continues one continuous budget instead of restarting it at zero.
@@ -4193,6 +4202,15 @@ async fn run_workspace_from<P: Provider>(
         }),
         false => base_system.clone(),
     };
+    report_prompt(
+        watch,
+        run_id,
+        0,
+        &system,
+        contract,
+        provider.prompt_family(),
+        after_planning.is_some(),
+    );
     // 0.37.0 — the prompt the first completion of a conversational turn is made
     // with, and only the first. Today's prompt tells the agent it is executing a
     // task, which is why a diligent model reaches for a tool to answer a question
@@ -5865,6 +5883,15 @@ fn run_agent<'f, P: Provider>(
             ),
             false => base_system.clone(),
         };
+        report_prompt(
+            tree.watch,
+            run_id,
+            depth,
+            &system,
+            contract,
+            tree.provider.prompt_family(),
+            after_planning.is_some(),
+        );
         // 0.39.0 — the opening a contained turn's first completion is made with,
         // and only the first, exactly as the flat loop builds it. `None` for every
         // agent that is not a classifying turn's root, which is every child and
@@ -11306,6 +11333,44 @@ fn compose(spec: PromptSpec<'_>) -> String {
     }
     out.push_str(spec.ending);
     out
+}
+
+/// Which [`SystemPrompt`] produced the description, for the trace.
+fn prompt_source(prompt: &SystemPrompt) -> &'static str {
+    match prompt {
+        SystemPrompt::Builtin => "builtin",
+        SystemPrompt::Append(_) => "appended",
+        SystemPrompt::Replace(_) => "replaced",
+    }
+}
+
+/// Report what was composed, once (0.45.0).
+///
+/// Not the text: it can carry a repository's whole `AGENTS.md`. What an operator
+/// needs is which family answered, how large the block is, and whether the two
+/// optional sections were there — "this run told its agent nothing about its
+/// boundary" has an answer here and nowhere else.
+fn report_prompt(
+    watch: &Watch<'_>,
+    run_id: i64,
+    depth: u32,
+    composed: &str,
+    contract: &TaskContract,
+    family: PromptFamily,
+    boundary: bool,
+) {
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        0,
+        depth,
+        EventKind::PromptComposed {
+            family: family.as_str().to_string(),
+            bytes: composed.len() as u64,
+            source: prompt_source(&contract.prompt).to_string(),
+            boundary,
+            instructions: !contract.instructions.is_empty(),
+        },
+    ));
 }
 
 /// Delimit one section the way this family's own guidance asks for (0.45.0).

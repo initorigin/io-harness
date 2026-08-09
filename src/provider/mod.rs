@@ -963,6 +963,23 @@ pub enum PromptFamily {
 }
 
 impl PromptFamily {
+    /// A stable label for the trace, as [`Backend`](crate::sandbox::Backend) and
+    /// [`Cap`](crate::sandbox::Cap) each have one.
+    ///
+    /// ```
+    /// use io_harness::provider::PromptFamily;
+    ///
+    /// assert_eq!(PromptFamily::Anthropic.as_str(), "anthropic");
+    /// ```
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+            Self::Generic => "generic",
+        }
+    }
+
     /// Classify a model slug.
     ///
     /// Deliberately a short table: every entry is a claim that has to stay true,

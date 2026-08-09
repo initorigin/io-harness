@@ -294,7 +294,7 @@ tasks:
   summary: Emit `EventKind::PromptComposed` once per run.
   why_required: Without it, `what prompt did this run actually use` has no answer in the trace, and the
     boundary and instructions sections are invisible to an operator reading events.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.45.0-T02
   - US-IO-HARNESS-0.45.0-T05
@@ -311,13 +311,27 @@ tasks:
   files:
   - src/observe.rs
   - src/run.rs
+  - src/provider/mod.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`EventKind::PromptComposed { family, bytes, source, boundary, instructions }` added at `src/observe.rs`
+    on the enum `#[non_exhaustive]` since 0.24.0, with `EVENT_NAMES` and the round-trip census in the
+    same commit and no field named like the envelope''s (trap 77). It carries no prompt text: the text
+    can be a repository''s whole `AGENTS.md`. `PromptFamily::as_str` added for the label, as `Backend`
+    and `Cap` each have one.'
+  - Emitted by `report_prompt` at all three composition sites — single-file, workspace, and each tree
+    agent at its own depth — immediately after the prompt is decided and never inside a step loop.
+  - F9 — `prompt_composed_fires_once_and_says_what_was_composed` (`tests/prompt.rs`) asserts exactly one
+    event over a four-step run, that `bytes` equals the length of the system string the provider actually
+    received, and that `source`/`boundary`/`instructions` match the contract. A second arm asserts a permissive
+    run with no guidance reports both sections `false`.
+  - Sabotage — emit inside the workspace step loop — fails `prompt_composed_fires_once_and_says_what_was_composed`
+    and nothing else (0.34.0's `Routed` defect, reproduced deliberately).
 - id: US-IO-HARNESS-0.45.0-T08
   summary: Prove the prompt is composed once and that the four prior releases are unaffected.
   why_required: A system prompt that varies between steps converts 0.38.0's cache read into a cache write
     on every step of every run on both marked wires, and fails nothing else in the suite.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.45.0-T01
   - US-IO-HARNESS-0.45.0-T02
@@ -366,8 +380,27 @@ tasks:
   files:
   - src/run.rs
   - tests/prompt.rs
-  - tests/context.rs
-  evidence: []
+  evidence:
+  - F10 — `the_prompt_is_composed_once_and_does_not_move` (`tests/prompt.rs`) drives a four-step run that
+    writes a memory note AND rewrites `AGENTS.md` from inside the run, then asserts every request's `system`
+    is byte-identical to the first and still carries the pre-run text. The rewrite is asserted to have
+    actually happened, so the test cannot pass by never exercising the case.
+  - Sabotage — re-read the instructions from disk and recompose per step — fails `the_prompt_is_composed_once_and_does_not_move`
+    with `the system prompt moved on step 2`. It also fails five other tests, because a crude per-step
+    recomposition drops the catalogues too; the discriminating evidence is the named failure and its message.
+    Reported rather than tidied.
+  - 'N6 — the four prior releases are unaffected, asserted by their own suites rather than by a new one:
+    `cache_boundary` 7 passed, `compaction` 11 passed, `parallel_reads` 8 passed, `tool_hooks` 6 passed,
+    all unchanged. 0.44.0''s transcript boundary is untouched — it is an offset into `user`, and this
+    release only changes `system`.'
+  - N1 — `cargo tree` for the default feature set is **402** lines, unchanged from 0.44.0. N2 — MSRV unmoved
+    at 1.95; the toolchain gate CI runs is untouched. N4 — `git diff main -- src/state.rs` is **empty**
+    and `CHECKPOINT_FORMAT` is unmoved at 7.
+  - O2 — no DDL, so `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0` in `tests/cross_version.rs`
+    are unchanged, which is the assertion. O1 — the full suite passes on this host; the platform-shaped
+    criterion is F2, which branches on `select()`'s own answer so each CI platform asserts its own truth.
+  - 'Gates on the whole tree: `cargo test --lib --tests --no-fail-fast` exit 0 over **76** suites, `cargo
+    test --doc` 399 passed, `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings` clean.'
 - id: US-IO-HARNESS-0.45.0-T09
   summary: Bring the shipped documentation to 0.45.0 and clear the sentences it contradicts.
   why_required: Two doc surfaces state that discovered instructions become constraints, and the composition

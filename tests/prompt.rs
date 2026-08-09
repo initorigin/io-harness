@@ -11,8 +11,9 @@ use std::sync::{Arc, Mutex};
 use io_harness::provider::{CompletionRequest, CompletionResponse, PromptFamily, ToolCall};
 use io_harness::sandbox::{select, Backend, Sandbox, SandboxConfig};
 use io_harness::{
-    run_tree, run_with, Act, ApproveAll, Containment, Effect, Policy, Provider, Session, Store,
-    SystemPrompt, TaskContract, Verification,
+    run_tree, run_with, run_with_observed, Act, ApproveAll, Containment, ContextBudget, Effect,
+    EventKind, Flow, Observer, Policy, Provider, RunEvent, Session, Store, SystemPrompt,
+    TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -766,4 +767,159 @@ async fn a_family_changes_the_delimiters_and_nothing_else() {
         assert!(prompt.contains("Your boundary."));
         assert!(prompt.contains("ZZ-GUIDANCE-ZZ"));
     }
+}
+
+// ------------------------------------------------------------------------- F9
+
+/// Every `PromptComposed` the run emitted.
+/// One `PromptComposed`, as the observer read it.
+#[derive(Clone)]
+struct Report {
+    family: String,
+    bytes: u64,
+    source: String,
+    boundary: bool,
+    instructions: bool,
+}
+
+#[derive(Default)]
+struct Composed(Arc<Mutex<Vec<Report>>>);
+
+impl Observer for Composed {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if let EventKind::PromptComposed {
+            family,
+            bytes,
+            source,
+            boundary,
+            instructions,
+        } = &event.kind
+        {
+            self.0.lock().unwrap().push(Report {
+                family: family.clone(),
+                bytes: *bytes,
+                source: source.clone(),
+                boundary: *boundary,
+                instructions: *instructions,
+            });
+        }
+        Flow::Continue
+    }
+}
+
+/// F9 — `PromptComposed` fires once per run and reports what was composed.
+///
+/// Once, not once per step: a run of four steps that reported four times would be
+/// 0.34.0's `Routed` defect and 0.44.0's `CacheMarked` lesson, reproduced.
+#[tokio::test]
+async fn prompt_composed_fires_once_and_says_what_was_composed() {
+    let dir = workspace();
+    let seen = Composed::default();
+    let store = Store::memory().unwrap();
+    let shaped = contract(dir.path())
+        .with_max_steps(4)
+        .with_instruction("ZZ-GUIDANCE-ZZ prefer small diffs.")
+        .with_system_prompt(SystemPrompt::Append("ACME.".into()));
+    let provider = Rec::new(vec![write_call(), write_call(), write_call(), write_call()]);
+
+    let _ = run_with_observed(&shaped, &provider, &store, &layered(), &ApproveAll, &seen).await;
+
+    let events = seen.0.lock().unwrap().clone();
+    assert_eq!(events.len(), 1, "one composition, one event");
+    let report = events[0].clone();
+    assert_eq!(report.family, "generic");
+    assert_eq!(report.source, "appended");
+    assert!(report.boundary);
+    assert!(report.instructions);
+    assert_eq!(
+        report.bytes as usize,
+        provider.system().len(),
+        "the reported size is not the prompt that was sent"
+    );
+
+    // A run with nothing optional in it reports both sections absent.
+    let plain = Composed::default();
+    let provider = Rec::new(vec![write_call()]);
+    let _ = run_with_observed(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &Policy::permissive(),
+        &ApproveAll,
+        &plain,
+    )
+    .await;
+    let events = plain.0.lock().unwrap().clone();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].source, "builtin");
+    assert!(!events[0].boundary, "a permissive run reported a boundary");
+    assert!(!events[0].instructions);
+}
+
+// ------------------------------------------------------------------------ F10
+
+/// F10 — the prompt is composed once and never varies between steps.
+///
+/// This is the most expensive defect the release could ship and it fails nothing
+/// else in the suite: 0.38.0's cache breakpoint sits at the end of the system block,
+/// so a prompt that moved between steps would be billed as a cache **write** every
+/// step on both wires that honour it, turning a saving into a cost.
+///
+/// The instructions file is rewritten mid-run, which is the case a per-step re-read
+/// would follow and a composed-once prompt cannot.
+#[tokio::test]
+async fn the_prompt_is_composed_once_and_does_not_move() {
+    let dir = workspace();
+    std::fs::write(
+        dir.path().join("AGENTS.md"),
+        "ZZ-FIRST-ZZ prefer small diffs.",
+    )
+    .unwrap();
+
+    let contract = contract(dir.path())
+        .with_max_steps(4)
+        .with_instruction("ZZ-FIRST-ZZ prefer small diffs.")
+        // 0.43.0's fold on, so a run that compacts is covered by the same assertion.
+        .with_context_budget(ContextBudget {
+            max_tokens: 2_000,
+            share: 0.5,
+        });
+    let provider = Rec::new(vec![
+        vec![ToolCall {
+            name: "remember".into(),
+            arguments: json!({ "key": "k", "value": "a note that moves the prompt if anything does" }),
+        }],
+        // The instructions file is rewritten by the run itself, mid-run: a prompt
+        // that re-read it per step would follow this and fail below.
+        vec![ToolCall {
+            name: "write_file".into(),
+            arguments: json!({ "path": "AGENTS.md", "content": "ZZ-SECOND-ZZ rewritten mid-run." }),
+        }],
+        write_call(),
+        write_call(),
+    ]);
+    let store = Store::memory().unwrap();
+    let _ = run_with(&contract, &provider, &store, &layered(), &ApproveAll).await;
+
+    assert!(
+        std::fs::read_to_string(dir.path().join("AGENTS.md"))
+            .unwrap()
+            .contains("ZZ-SECOND-ZZ"),
+        "the run never rewrote the instructions file, so nothing was under test"
+    );
+
+    let seen = provider.seen.lock().unwrap();
+    assert!(seen.len() >= 4, "only {} requests", seen.len());
+    let first = &seen[0].system;
+    for (i, request) in seen.iter().enumerate() {
+        assert_eq!(
+            &request.system, first,
+            "the system prompt moved on step {i}, which bills a cache write per step"
+        );
+    }
+    assert!(first.contains("ZZ-FIRST-ZZ"));
+    assert!(
+        !first.contains("ZZ-SECOND-ZZ"),
+        "the prompt followed a file the run rewrote under it"
+    );
 }
