@@ -1136,7 +1136,7 @@ versions:
       syscall restriction first, a mount-namespacing helper where the host has one, the existing
       backend after that, the floor last — and finishes Windows access confinement so a Windows run
       enforces files and network rather than resource caps alone.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.48.0
     outcome: >

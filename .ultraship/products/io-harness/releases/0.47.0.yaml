@@ -1,0 +1,659 @@
+product: io-harness
+version: 0.47.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    Embed this crate on any of the three platforms it claims and get the containment the API
+    promises — or be told, in the trace and in the agent's own prompt, exactly which weaker thing
+    was applied instead.
+
+    **0.46.0 made containment the default and shipped with two hosts where the default enforces
+    nothing.** `docs/CONTRACT.md:983` states it as a table: Linux confines writes and denies egress,
+    Windows does neither. The Linux row carries its own footnote — the backend needs an unprivileged
+    user namespace, a stock Ubuntu 24.04 ships
+    `kernel.apparmor_restrict_unprivileged_userns=1`, `ubuntu-latest` is one, and every contained
+    run there takes `Backend::PortableFloor`: resource caps, an ephemeral working directory, and a
+    proxy-environment strip a payload that does not read those variables ignores completely. The
+    Windows row is not a footnote at all. A Job Object is a kernel container for *resources*
+    (`src/sandbox/windows.rs:1`); it has no filesystem facility and no network facility, so a
+    Windows run reporting `WindowsJobObject` is resource-contained and not confined, and nothing
+    about `ExecMode::WorkspaceWrite` is true there. Both are reported rather than hidden, which is
+    the one thing 0.40.0 and 0.46.0 got right and is also the whole of what they got. This release
+    is the other half.
+
+    **On Linux the backend becomes a chain, and the first rung needs no namespace at all.**
+    Landlock is an unprivileged LSM: a process builds a filesystem ruleset, calls
+    `landlock_restrict_self`, and the restriction applies to it and every descendant, with no user
+    namespace, no mount namespace and no setuid helper anywhere in the path. It is exactly the
+    primitive the current backend's failure mode is missing — Ubuntu restricts the namespace and
+    ships Landlock enabled — and it is applied in the child between fork and exec, so the rung is a
+    `pre_exec` closure through the shared runner rather than a wrapper process. That removes two
+    classes of defect this crate has already paid for: there is no wrapper whose own failure has to
+    be told apart from the payload's (`wrapper_failure`, `src/sandbox/linux.rs:111`), and there is
+    no wrapper that `cd`s on the run's behalf, which is what silently beat `Command::current_dir`
+    for every `shell` stage in 0.46.0. Where the host's kernel has Landlock's network rules
+    (ABI 4 and later) an egress-denying run gets a refused `connect`, which is a kernel boundary
+    and not an environment strip. Below the rungs it cannot serve, the chain falls through: a
+    mount-namespacing helper (`bwrap`) where the host has one and it works, the existing `unshare`
+    backend after that, and the portable floor last — each probed by *attempting the thing*, never
+    by reading a sysctl or a capability list, because 0.40.0's Linux breakage survived three matrix
+    runs behind exactly that mistake.
+
+    **On Windows the access half stops being a module nothing selects.** `sandbox::appcontainer`
+    has existed since 0.26.0 — it creates a low-box profile, grants named paths to its container SID
+    with explicit ACEs, and spawns into it through `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`,
+    proven on the Windows runner against negative controls for both a refused read and a refused
+    socket (`src/lib.rs:307`). It is not what `select` returns, and the stated reason is honest:
+    an AppContainer is default-deny for reads, and naming everything an arbitrary toolchain needs
+    was a discovery problem 0.26.0 did not close. **0.46.0 closed most of it without meaning to.**
+    A run now resolves its own writable roots — the workspace, the system temporary directory and
+    the detected toolchain's cache directories, filtered to those that exist
+    (`src/sandbox.rs:939`) — so the grant list is derived from facts the run already has rather than
+    guessed at. This release grants those, adds the small fixed read-execute set a process needs to
+    start at all, spawns into the container, and *also* assigns that process to the Job Object in
+    the same suspended-assign-resume ordering `windows.rs` already argues for. A Windows run then
+    has access confinement and resource containment together, and reports
+    `Backend::WindowsAppContainer`. A grant that fails, or a mode of `FullAccess`, degrades to the
+    Job Object and says so — the same shape Linux has had since 0.9.1.
+
+  business_value: >
+    **A boundary that is absent on the commonest CI image is worth less than no boundary, because
+    it is believed.** 0.46.0 made every run contained by default. An embedder reading
+    `TaskContract::workspace(goal, root)` now reasonably believes the agent's commands cannot write
+    outside the workspace — and on `ubuntu-latest`, which is where most of this crate's users run
+    their agents, they can. The interfaces all say contained: the contract type says it, the
+    prompt's boundary section says it, `EventKind::Contained` fires. Only `backend` says otherwise,
+    and it says so in a field a caller has to know to read. Every release since 0.40.0 has widened
+    the gap between what the default claims and what the commonest host delivers; this is the
+    release that closes it rather than documenting it again.
+
+    **Windows is a supported platform in the table and has never had a filesystem boundary.**
+    `docs/CONTRACT.md:132` says "Supported, full suite in CI" and "**Native resource containment
+    only**" in the same row, and 0.26.0 built the mechanism that would fix it and left it unwired.
+    Shipping a security module that nothing selects is a cost already paid with no value taken.
+    The discovery problem that stopped it is smaller now than it was, and the honest answer to
+    what remains of it is the one this crate uses everywhere else: derive what you can, degrade
+    when you cannot, and report which happened.
+
+    **The chain is worth more than any one rung, and that is the design argument.** No single Linux
+    primitive is available everywhere: user namespaces are restricted on Ubuntu, Landlock is absent
+    before 5.13 and has no network rules before 6.7, `bwrap` is installed on some hosts and not
+    others. A backend that picks one and degrades to nothing when it is missing is what the crate
+    has today. A backend that tries them in strength order, and takes the strongest rung that can
+    enforce *what this run asked for*, degrades one step at a time instead of all the way to the
+    floor. The rule that makes that honest rather than optimistic is that the network question
+    decides: a run that denies egress may not take a rung that cannot deny egress.
+
+    **Zero compile breaks, and that is a deliberate consequence of 0.46.0.** `Backend` is
+    `#[non_exhaustive]` (`src/sandbox.rs:78`), so three new variants are additive; `RunSpec` took
+    `#[non_exhaustive]` plus a constructor last release specifically so this one and 0.48.0 could
+    add to it for free. Nothing here changes a signature, a field type or a schema. The whole
+    release is new enforcement behind existing types, which is also what makes it safe to ship into
+    programs that upgraded to 0.46.0 a week ago.
+
+  evidence_of_value: >
+    Executed in the technique the last sixteen releases used: a discriminating assertion per claim,
+    negative controls that must not move, one sabotage per arm of every two-armed claim, and a
+    sabotage that fails nothing reported as a finding rather than propped up.
+
+    **The Linux half is proven on a host with the restriction ON, and that is the criterion the
+    release exists for.** Both `ci.yml` and `release.yml` currently run
+    `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` on every Linux leg (trap 87)
+    precisely so the existing namespace backend is exercised rather than the fallback. This release
+    adds a leg that does **not** run it — Ubuntu's own default, the state a user's machine is
+    actually in — and asserts there that the reported backend is `linux-landlock`, that a write
+    outside the granted roots is refused, and that a write inside them lands. On today's build that
+    same leg reports `portable-floor` and the write succeeds. The difference between those two runs
+    is the release.
+
+    **Every rung is proven to enforce, not merely to be selected.** The reported backend is a
+    report and never a promise (`src/sandbox.rs:61`), so a criterion asserting `select().backend()`
+    alone would pass for a rung that confines nothing — which is exactly the failure 0.40.0 shipped
+    for three matrix runs. Each rung is asserted by a command that attempts a write outside its
+    granted set and is refused, and by a command that writes inside and succeeds, with the rung
+    pinned for the test rather than left to the host's own answer.
+
+    **The chain's ORDER is proven by a pure function, separately from any host.** Which rung a host
+    takes is a decision over four probe answers, the run's mode and its egress requirement, and it
+    is testable as a table without spawning anything — the shape `unshare_argv`'s existing tests use
+    (`src/sandbox/linux.rs:225`). The table includes the case the honesty rule exists for: a host
+    with Landlock at an ABI below its network rules, on a run that denies egress, must not take the
+    Landlock rung.
+
+    **The Windows half is proven against the negative controls 0.26.0 already wrote and passed.**
+    A refused read of a path outside the grant set and a refused socket are already asserted for
+    the AppContainer module on the Windows runner; this release asserts them for a run driven
+    through `TaskContract` with no direct use of the module, which is the difference between a
+    mechanism that works and a mechanism that is wired. The Job Object's own caps are asserted to
+    still fire on the same run, because a backend that traded resource containment for access
+    containment would be a regression wearing a new name.
+
+    **And the degradation paths are proven to degrade rather than to fail.** A Windows host where
+    a grant cannot be applied, and a Linux host with no rung above the floor, each complete their
+    run and report the weaker backend. That is asserted rather than assumed because the alternative
+    — a hard failure on a host the caller did not choose — is the outcome that would make embedders
+    turn the default off, which is the failure mode 0.46.0's own specification named.
+
+scope:
+  included:
+  - >
+    **Three additive `Backend` variants and their stable labels.** `Backend::LinuxLandlock`
+    (`"linux-landlock"`), `Backend::LinuxBubblewrap` (`"linux-bubblewrap"`) and
+    `Backend::WindowsAppContainer` (`"windows-appcontainer"`), each with the doc paragraph the
+    existing four carry saying precisely what it enforces and what it does not. `Backend` is
+    `#[non_exhaustive]` since before this release, so the addition costs no caller a compile.
+    `EventKind::Contained` and the `SandboxEvent` rows carry them through the existing fields, so
+    there is no new event and no new column.
+  - >
+    **The Linux Landlock rung — filesystem, applied between fork and exec.** A ruleset built from
+    the run's own `RunSpec`: read and execute over `/`, read-write over the writable roots the run
+    resolved, plus the workdir when the `ExecMode` grants it and never under `ReadOnly`, exactly the
+    list `MOUNT_SETUP` binds today. Applied by `landlock_create_ruleset` / `landlock_add_rule` /
+    `landlock_restrict_self` through `libc::syscall` — `libc` is already a `cfg(unix)` dependency
+    — after `prctl(PR_SET_NO_NEW_PRIVS, 1)`, which Landlock requires and which is itself the
+    release's first syscall-level restriction. Delivered as a `pre_exec` closure passed to the
+    shared `run_capped` (`src/sandbox.rs:796`), so there is no wrapper process: no
+    `wrapper_failure` classification, no re-implemented output collection, and `current_dir` means
+    what it says, which it did not under the `unshare` rung until 0.46.0 separated the two facts.
+  - >
+    **The Landlock rung's network rules, where the kernel has them.** ABI 4 and later carry
+    `LANDLOCK_ACCESS_NET_CONNECT_TCP` and `LANDLOCK_ACCESS_NET_BIND_TCP`. When the run denies
+    egress and the negotiated ABI is 4 or later, both are restricted with no port permitted, which
+    makes a refused `connect` a kernel decision rather than a proxy-environment strip. The ABI is
+    negotiated by asking the kernel (`landlock_create_ruleset(NULL, 0,
+    LANDLOCK_CREATE_RULESET_VERSION)`) and every access flag the negotiated version does not know
+    is dropped from the request, which is the documented forward-compatible shape and the reason
+    this does not need a kernel-version table.
+  - >
+    **A seccomp deny-list on the Landlock rung, small and each entry justified.** A hand-assembled
+    `sock_filter` program installed in the same `pre_exec`, returning `SECCOMP_RET_ERRNO(EPERM)`
+    for the syscalls that would let a payload undo its own confinement or reach outside the
+    process model the crate reasons about — `mount`, `umount2`, `pivot_root`, `ptrace`,
+    `process_vm_readv`, `process_vm_writev`, `init_module`, `finit_module`, `delete_module`,
+    `kexec_load`, `kexec_file_load`, `bpf`, `perf_event_open`. A deny-list and stated as one: it
+    is not a jail and the doc paragraph says so. Syscall numbers are per architecture; `x86_64`
+    and `aarch64` carry tables, and any other Linux architecture takes the Landlock rung **without**
+    the seccomp layer and reports that it did rather than claiming a filter it did not install.
+  - >
+    **The Linux bubblewrap rung.** When Landlock cannot serve the run, `bwrap` is used if it is on
+    `PATH` and a probe spawn of the exact wrapper this rung builds succeeds: `--ro-bind / /`,
+    `--bind` per writable root, `--proc /proc`, `--dev /dev`, `--unshare-net` when egress is denied,
+    `--chdir` the run's workdir, `--` and the payload as trailing arguments. It earns its place
+    because a setuid `bwrap` works on hosts whose kernel refuses an unprivileged user namespace —
+    the same hosts the existing rung fails on — and because it is a mount namespace, which is a
+    strictly stronger filesystem statement than Landlock's path rules.
+  - >
+    **The chain itself, as one pure decision function.** `fn rung(probes, mode, deny_egress) ->
+    Backend` over the four probe answers, returning the strongest rung that can enforce what this
+    run asked for, in the order Landlock, bubblewrap, namespaces, floor. The honesty rule lives
+    here and nowhere else: **a run that denies egress may not be given a rung that cannot deny
+    egress**, which excludes Landlock below ABI 4. Every probe is one spawn per process behind a
+    `OnceLock`, and every probe *attempts the restriction* rather than reading a sysctl, a
+    `/sys/kernel/security/lsm` line or a package's presence — 0.40.0's finding, applied to four
+    rungs instead of one.
+  - >
+    **Windows access confinement, selected.** `WindowsSandbox::run` attempts the AppContainer path
+    whenever the mode is not `FullAccess`: create or adopt the profile, grant the derived set, spawn
+    into the container `CREATE_SUSPENDED`, assign the process to the Job Object carrying the run's
+    caps, resume it. Both halves in one backend, reported as `WindowsAppContainer`. Any failure in
+    the container path — a profile that cannot be created, a grant that cannot be applied — falls
+    back to the Job Object alone and reports `WindowsJobObject`, which is today's behaviour and
+    therefore a degradation and not a break.
+  - >
+    **The Windows grant set, derived rather than guessed.** `Access::Full` on the workspace root
+    (withheld under `ReadOnly`), the system temporary directory and each existing writable root the
+    run already resolved. `Access::ReadExecute` on the workspace root under `ReadOnly`, on the
+    directory of the resolved program, on `%SystemRoot%` and on the detected toolchain's install
+    directories. Only paths that exist are granted, for the reason 0.46.0 recorded: an absent path
+    in a grant list is not tidiness, it is a failure that unwinds the isolation it was added to
+    preserve.
+  - >
+    **The Windows egress answer, which the empty capability array already gives.** A container with
+    no capabilities has no route off the machine, so an egress-denying run requests none — the
+    denial is the token's own. A run whose policy permits egress requests exactly
+    `internetClient`, so a network-allowing run still works. This makes Windows the third platform
+    where the run's network answer is enforced by the kernel rather than approximated by stripping
+    proxy variables.
+  - >
+    **The reporting surfaces, updated to describe what now happens.** The two platform tables in
+    `docs/CONTRACT.md` (`:128` and `:983`), the platform prose in `src/lib.rs` (`:295`–`:313`),
+    the README's product table, and `CHANGELOG.md`. 0.45.0's boundary section names the backend
+    that `sandbox::select` actually returned, so it renders the new labels with no change of its
+    own; the criterion asserts that rather than assuming it.
+  - >
+    **A CI leg with the Ubuntu default restriction left in place.** A Linux job in `ci.yml` that
+    does not run the `kernel.apparmor_restrict_unprivileged_userns=0` line, asserting the rung
+    taken there and the confinement it delivers. `release.yml` keeps its existing sysctl on its
+    existing legs and gains the same guarded leg, because trap 87 is that a guard written for one
+    workflow file does not cover its sibling.
+  excluded:
+  - >
+    **Any change to `RunSpec`, `SandboxConfig`, `ExecMode`, `TaskContract` or `Policy`.** The run's
+    mode, its writable roots and its egress answer are already resolved and already reach the
+    backend (`ExecContainment`, `src/sandbox.rs:865`). This release consumes them; it does not add
+    a knob. A caller cannot pin a rung, and deliberately: a rung the host cannot deliver is not a
+    setting, and `SandboxConfig::floor_only()` is the one override that already exists.
+  - >
+    **A seccomp allow-list, or any claim that the filter is a jail.** An allow-list that a real
+    toolchain survives is a research problem with a maintenance cost per architecture and per libc,
+    and getting it wrong breaks builds rather than weakening a boundary. The deny-list is named as
+    a deny-list in the doc, the contract and the changelog.
+  - >
+    **Landlock's later ABIs beyond the network rules.** `LANDLOCK_ACCESS_FS_TRUNCATE` (ABI 3),
+    `LANDLOCK_ACCESS_FS_IOCTL_DEV` (ABI 5) and the ABI 6 scopes are dropped from the request when
+    the kernel does not know them and are otherwise requested as part of the write set; nothing
+    here builds a per-ABI feature matrix or exposes one.
+  - >
+    **The `shell_start` background handles, per-tool modes, and the egress proxy.** All three are
+    0.48.0's, which is already specified in the roadmap as the release that closes them. A
+    backgrounded handle still runs uncontained after this release and the limitation stays stated.
+  - >
+    **A macOS change of any kind.** `sandbox-exec` already confines writes and denies egress; the
+    macOS rung is one and stays one. Its profile builder is untouched.
+  - >
+    **Any store, schema or event change.** No table, column, index or `EventKind` variant, and
+    `CHECKPOINT_FORMAT` stays at 7.
+  fallback_scope:
+  - >
+    **The Landlock rung, its network rules, and the chain that orders it.** Landlock first,
+    the existing `unshare` backend after it, the floor last, with the egress honesty rule intact.
+    This alone turns `ubuntu-latest` — and every stock Ubuntu 24.04 — from a host that enforces
+    nothing into a host that confines writes and refuses `connect`, which is the larger of the two
+    holes and the one an embedder is most likely to be standing in.
+  - >
+    **Windows AppContainer selection with the derived grant set**, degrading to the Job Object and
+    reporting it. The second hole, and it needs no new mechanism — the module is built, tested and
+    shipped; what it needs is to be chosen.
+  - >
+    Dropped under pressure, in this order: the seccomp deny-list first (it is a hardening layer on
+    a rung that already confines the filesystem, and the crate's honest position today is that it
+    installs no filter), then the bubblewrap rung (it serves hosts where Landlock is absent and a
+    setuid `bwrap` is present, which is a narrowing intersection on modern kernels). Both stay in
+    the roadmap as named work rather than being quietly forgotten.
+
+acceptance:
+  functional:
+  - >
+    **F1 — on a host with the Ubuntu default restriction in place, a contained run confines its
+    writes.** Driven end to end from `TaskContract::workspace(goal, root)` with no builder call:
+    a command writing to an absolute path outside the granted roots is refused and the file does not
+    exist afterwards; a command writing inside the workspace root succeeds; and
+    `select(&config).backend()` reports `linux-landlock`. Run on a CI leg that does **not** set
+    `kernel.apparmor_restrict_unprivileged_userns=0`. On today's build the same test reports
+    `portable-floor` and the outside write lands. Sabotage: return the floor from the chain when the
+    namespace probe fails, which is today's behaviour, under which both arms fail and only this
+    fails.
+  - >
+    **F2 — the Landlock rung refuses `connect` when the run denies egress and the kernel has the
+    network rules.** A contained command dialling a listener the test itself started on loopback is
+    refused with a connection error, while the same command under a run whose policy permits egress
+    connects. On a kernel whose negotiated ABI is below 4 the test asserts instead that the rung was
+    **not** taken for the egress-denying run — the honesty rule, asserted rather than skipped, which
+    is 0.40.0's lesson about a test that steps over a fallback. Sabotage: request the network access
+    flags unconditionally rather than dropping them below ABI 4, under which the ruleset creation
+    fails on an older kernel and the rung wrongly reports success; and separately, allow the rung
+    for an egress-denying run below ABI 4, under which the loopback dial succeeds and only this
+    fails.
+  - >
+    **F3 — the chain's order is a table, decided without a host.** A pure test over the decision
+    function for every combination of the four probe answers, the three modes and both egress
+    answers: the strongest serviceable rung is returned; `PortableFloor` only when nothing above it
+    can serve; and the ABI-3 Landlock host on an egress-denying run returns the next rung down
+    rather than Landlock. Sabotage: order bubblewrap ahead of Landlock, under which the
+    Landlock-available rows return the wrong rung and only this fails.
+  - >
+    **F4 — every rung is proven to enforce, with the rung pinned.** For each of Landlock,
+    bubblewrap and the existing namespace rung, on a host that has it: a write outside the granted
+    roots is refused, a write inside lands, and the run's own outcome carries the failure to the
+    model rather than erroring the run. Pinned for the test rather than left to the host's answer,
+    so a host that would have chosen a different rung still asserts the one under test, and skipped
+    with a stated reason — never silently — where the primitive is absent. Sabotage: build each
+    rung's rule set from an empty root list, under which the inside write is refused too and each
+    arm fails on its own.
+  - >
+    **F5 — `ReadOnly` withholds the workspace on every new rung.** A command writing into the
+    workspace root fails and a command reading the same file succeeds, under Landlock and under
+    bubblewrap, with the system temporary directory still writable in both. This is the mode whose
+    entire difference is one directory, so it is asserted per rung rather than once. Sabotage:
+    include the workdir in the writable set unconditionally, under which the write lands and only
+    this fails.
+  - >
+    **F6 — the Landlock rung installs no wrapper, and that is asserted rather than described.**
+    The argv the backend spawns is byte-identical to the argv the caller asked for — no `unshare`,
+    no `sh`, no `bwrap` — and `SandboxOutcome::argv` records exactly that. A payload that does not
+    exist on `PATH` therefore fails as a missing program rather than as the wrapper's non-zero
+    exit, and a `shell` stage whose own `cd` is expressed through `Command::current_dir` runs in
+    the directory it named. The second half is 0.46.0's defect asserted at its root cause on the
+    rung where it cannot recur. Sabotage: wrap the payload in `sh -c` on this rung, under which the
+    argv assertion and the missing-program assertion both fail and only this fails.
+  - >
+    **F7 — a Windows run is access-confined and resource-contained at the same time.** Driven from
+    `TaskContract::workspace`: a read of a path outside the grant set is refused, a socket to the
+    outside is refused, a write inside the workspace lands, `select(&config).backend()` reports
+    `windows-appcontainer`, and the Job Object's own `max_processes` cap still fires on the same
+    run. The last clause is the control: a backend that traded resource containment for access
+    containment would pass the first four. Sabotage: spawn into the container without assigning the
+    process to the job, under which the cap arm fails and only this fails.
+  - >
+    **F8 — the Windows grant set is derived from the run's resolved facts.** A pure test over the
+    grant-list builder: the workspace root, the temp directory and each existing writable root
+    appear as `Full`; under `ReadOnly` the workspace appears as `ReadExecute` instead; the program's
+    directory and `%SystemRoot%` appear as `ReadExecute`; and a writable root that does not exist
+    appears not at all. Sabotage: grant the workspace `Full` under `ReadOnly`, under which that arm
+    fails and only this fails.
+  - >
+    **F9 — a Windows run whose network is permitted still reaches the network.** The same run with
+    a policy permitting egress requests `internetClient` and connects to the test's own listener;
+    with egress denied it requests nothing and is refused. Both arms in one test so the second is a
+    control rather than a separate claim — an empty capability array that broke every
+    network-permitting run would be a regression this release could otherwise ship green. Sabotage:
+    request the capability unconditionally, under which the denied arm connects and only this fails.
+  - >
+    **F10 — every degradation completes the run and reports the weaker backend.** A Windows host
+    where the container path is made to fail runs to completion and reports `windows-job-object`;
+    a Linux host with no rung above the floor runs to completion and reports `portable-floor`;
+    `EventKind::Contained` carries the backend that was applied in both cases, and `FullAccess`
+    still reports `full-access` with no container and no ruleset. Sabotage: return an error from
+    the backend instead of degrading, under which the run fails and only this fails.
+  - >
+    **F11 — the seccomp deny-list refuses a named syscall and refuses it with `EPERM`.** On the
+    Landlock rung, a contained command invoking one of the denied syscalls directly fails with
+    `EPERM` and the process is **not** killed — the distinction matters, because a filter that
+    killed would be indistinguishable from a crash in the payload and would tell the model nothing.
+    A command invoking a syscall that is not on the list, and every command the crate's own gates
+    run, completes normally. On an architecture with no syscall table the test asserts that the
+    rung was taken **without** the filter and that this is what the backend reports, rather than
+    skipping. Sabotage: return `SECCOMP_RET_KILL_PROCESS` instead of the errno, under which the
+    first arm sees a signal rather than a failed call and only this fails.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402**
+    crates on macOS and Linux. Landlock and seccomp are `libc::syscall` with hand-written constants
+    against the existing `cfg(unix)` `libc`; the AppContainer path uses the `windows-sys` features
+    already listed in `Cargo.toml` (`Win32_Security_Isolation`, `Win32_Security_Authorization`).
+    No `landlock`, no `seccompiler`, no `libseccomp`, no `nix`.
+  - >
+    **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
+  - >
+    **N3 — zero compile breaks, and `docs/public-api.txt` is byte-identical.** The only public
+    additions are three `Backend` variants and their `as_str` arms, and the checker
+    (`tests/docs_drift.rs`) enumerates items rather than variants — `enum Backend src/sandbox.rs` is
+    one line at `docs/public-api.txt:69` whether the enum has four variants or seven. **The number
+    is stated at plan time as "unchanged"** because a criterion promising a line count has been met
+    in a different form in four of the last nine releases, and because byte-identical is the
+    stronger claim.
+  - >
+    **N4 — no durable state moves.** `git diff main -- src/state.rs` is **empty**: no table, column,
+    index or reader, and `CHECKPOINT_FORMAT` unmoved at 7. No `EventKind` variant is added; the new
+    backends travel through `Contained`'s existing `backend` field and the existing `SandboxEvent`
+    rows.
+  - >
+    **N5 — each rung's per-command overhead is measured, not asserted to be small.** The same fixed
+    command is timed under `FullAccess`, under the Landlock rung and under the existing namespace
+    rung on a Linux host, and under the Job Object and the AppContainer on a Windows runner, over
+    the same 30-iteration shape 0.46.0 used to record ~6.25 ms for `sandbox-exec`. Every figure goes
+    into the release record. The Landlock rung's claim is that it avoids a wrapper spawn entirely,
+    which is a claim about a number and is therefore measured rather than argued.
+  - >
+    **N6 — 0.41.0's batch, 0.42.0's gate, 0.43.0's fold, 0.44.0's boundary, 0.45.0's prompt and
+    0.46.0's default are unaffected.** Their suites pass unchanged. Specifically: the composed
+    system prompt is still byte-identical across the steps of a run, and still composed once — the
+    boundary section names the selected backend, and a rung re-probed inside the step loop would
+    convert 0.38.0's cache read into a cache write on every step of every run and fail no other
+    test.
+  operational:
+  - >
+    **O1 — the full suite passes on all three platforms**, which the standing CI matrix already
+    runs, plus the new Linux leg with `kernel.apparmor_restrict_unprivileged_userns` at Ubuntu's
+    default. The existing Linux legs keep the sysctl line in **both** `ci.yml` and `release.yml`
+    (trap 87), so the namespace rung is still exercised somewhere and F4's namespace arm is not
+    silently skipped everywhere.
+  - >
+    **O2 — cross-version is unaffected and proven so.** No DDL, so a 0.46.0 store and a 0.47.0
+    store are the same store in both directions, asserted by the existing cross-version suites.
+  - >
+    **O3 — `tests/ci_workflow.rs` covers the new leg in both workflow files.** The guard asserts
+    that a Linux leg without the sysctl exists in `ci.yml` and in `release.yml`, and that the legs
+    which do carry it still do. Trap 87 is that a guard reads one file; this criterion names both.
+  - >
+    **O4 — the documentation surfaces agree with the code, in the same release.** Both
+    `docs/CONTRACT.md` platform tables, the `src/lib.rs` platform prose, the README's table and
+    `CHANGELOG.md` describe the chain, the Windows backend and what each rung does and does not
+    enforce. `tests/docs_drift.rs` and `tests/changelog.rs` pass. No surface still says Windows
+    confines nothing.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.47.0, GitHub at initorigin/io-harness with the tag `v0.47.0` and a
+    Release titled `io-harness 0.47.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.47.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head and tree checked against the tree the gates ran on
+    immediately before the release PR is opened. Release PR `develop` into `main`, merged the same
+    way. The GitHub Release is cut by `release.yml` —
+    `gh workflow run release.yml --ref main -f version=0.47.0` — which takes its notes verbatim from
+    the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and
+    the Release exist, with the registry token sourced from the repo-local `.env` in the same shell
+    invocation. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **No store migration at all.** No table, column or index is created or altered,
+    `CHECKPOINT_FORMAT` is unmoved at 7, and a 0.46.0 store and a 0.47.0 store are the same store in
+    both directions.
+  - >
+    **No compile break.** Three additive variants on an enum that is already `#[non_exhaustive]`,
+    which is the attribute's whole purpose: a caller matching on `Backend` already carries a
+    wildcard arm and keeps compiling. No signature, field type or trait method changes.
+  - >
+    **A behaviour change with no compile consequence, and it is the release.** On a Linux host with
+    Landlock — every kernel 5.13 and later, which includes every currently supported Ubuntu, Debian
+    and Fedora — a contained command's writes are now confined where before they were not, and on a
+    kernel 6.7 or later an egress-denying run's outbound TCP is now refused. On Windows a contained
+    command's reads are now default-deny outside the granted set, and an egress-denying run has no
+    socket. A program that was relying on a command writing or reading outside the workspace on
+    those hosts — and getting away with it because the boundary was absent, not because it was
+    permitted — sees those operations refused. The remedy is the one 0.46.0 named:
+    `TaskContract::with_full_access()`, or a `SandboxConfig` whose mode says what the run actually
+    needs. The changelog carries this as a migration note rather than a line item.
+  - >
+    **The Windows change is the larger surprise of the two and the changelog says so first.**
+    0.46.0's default was a no-op on Windows; a program written against 0.46.0 on Windows has never
+    had a filesystem boundary and may be reading configuration, credentials or a sibling checkout
+    from outside the workspace without anything having refused it. Those reads now fail. The
+    grant set is stated in `docs/CONTRACT.md` so the failure is diagnosable from the documentation
+    rather than from a Win32 error code.
+  observability:
+  - >
+    `EventKind::Contained { mode, backend, roots }` is unchanged and now carries the new labels —
+    `"linux-landlock"`, `"linux-bubblewrap"`, `"windows-appcontainer"` — so an existing observer
+    reads the new backends with no code change and a trace written by 0.46.0 stays readable.
+  - >
+    The `SandboxEvent` create/exec/destroy rows keep naming the backend per command, so a run that
+    degrades mid-flight is visible at command scope and not only at run scope.
+  - >
+    0.45.0's boundary section renders the backend `sandbox::select` actually returned, so the agent
+    is told which rung it is under in the same vocabulary the operator's trace uses. On a host that
+    took the floor it still says the floor.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.47.1 and `cargo yank --version
+    0.47.0` is the escape hatch, leaving 0.46.0 as what `cargo install` resolves. Reverting the
+    behaviour does not require a downgrade, and there are two granularities of it:
+    `TaskContract::with_full_access()` restores an uncontained run at the construction site, and
+    `SandboxConfig::floor_only()` keeps containment while taking the portable floor — which is
+    exactly 0.46.0's behaviour on the affected hosts. That second lever is the reason `floor_only`
+    is not being removed or repurposed by this release.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim here is about what a process may read, write
+    or dial and what the crate reports about it; each is proven from a real command under a real
+    rung, from a loopback listener the test itself starts, or from a pure decision or grant-list
+    function.
+  - >
+    **The Linux and Windows CI runners are load-bearing for this release in a way they have not
+    been before.** F1, F2, F4, F7 and F9 cannot be evaluated on the macOS development host at all:
+    Landlock, bubblewrap and AppContainer do not exist there. This release is therefore
+    CI-discovered by construction, which is the same position 0.40.0 and 0.46.0 were in — and in
+    both, the defect that mattered was found by the matrix and not locally. Budget for that
+    rather than being surprised by it.
+  human_approvals:
+  - >
+    **The chain's order is Landlock, bubblewrap, namespaces, floor** — namespace-free first, as the
+    roadmap entry states. Decided at specification time, 2026-08-09.
+  - >
+    **A run that denies egress may not take a rung that cannot deny egress.** This is what makes the
+    chain honest rather than merely ordered, and it is the one rule that can send a host to a weaker
+    rung than its strongest available primitive. Decided at specification time, 2026-08-09.
+  - >
+    **The seccomp layer is a deny-list, not an allow-list, and is named as one everywhere it is
+    described.** An allow-list a real toolchain survives is a per-architecture, per-libc maintenance
+    problem whose failure mode is broken builds. Decided at specification time, 2026-08-09.
+  - >
+    **No caller-facing knob to pin a rung.** The host's answer is the host's answer;
+    `SandboxConfig::floor_only()` remains the single override. Decided at specification time,
+    2026-08-09.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: large
+  uncertainty: high
+  likely_cost_drivers:
+  - >
+    **Two new kernel interfaces written against raw syscalls, in `unsafe`.** Landlock's three
+    syscalls and its versioned struct layouts, and a hand-assembled seccomp BPF program with a
+    per-architecture syscall table. Neither has a crate to lean on under the no-new-dependency
+    constraint, both are `unsafe`, and both fail in ways that look like the payload failing. The
+    mitigation is the one this crate already uses: probe by attempting the restriction, and assert
+    enforcement by a refused write rather than by a successful setup call.
+  - >
+    **Nothing on the Linux or Windows halves can be tested on the development host.** Every
+    iteration of F1, F2, F4, F7 and F9 costs a CI round. Expect the debugging loop to be measured
+    in matrix runs, and prefer pure decision and argv/grant-list tests wherever a claim can be
+    split into a host-free half — F3, F6 and F8 exist partly for that reason.
+  - >
+    **The AppContainer path owns its own spawn, and joining it to the Job Object is where the
+    ordering argument has to hold twice.** `windows.rs` spawns `CREATE_SUSPENDED` and assigns
+    before resuming precisely so no instruction executes outside the job; the container path must
+    do the same, in its own `CreateProcessW`, with the attribute list carrying the security
+    capabilities. A process that runs briefly outside the job leaves a hole that nothing reports.
+  - >
+    **The Windows default-deny read set is the risk 0.26.0 named and did not close.** The grant
+    list is derived, but "derived" is not "complete": a toolchain reading a machine-wide
+    configuration file, a certificate store or an environment-directed cache outside the derived
+    set will now be refused. Expect the first Windows CI run to surface at least one such path and
+    to require a decision about whether it belongs in the fixed read-execute set or whether the
+    degradation is the correct answer for that run.
+  - >
+    **The existing suite runs commands everywhere, and the enforcement is new on two platforms.**
+    0.46.0 flipped the default and had to read failures that were the release working correctly.
+    This release does it again for Windows reads and for Linux writes on hosts that never enforced
+    them. Each failure is a decision, not a sweep: a test relying on a read outside the workspace
+    either says so or should not have been doing it.
+  preferred_tools:
+  - >
+    `cargo nextest` for the suite, `cargo test --doc` for the doctests, the standing CI matrix for
+    everything platform-shaped, and a scratch Linux VM or container only if a matrix round proves
+    too slow a loop — noting that a container's own seccomp and userns policy is not the runner's,
+    so a green container is not evidence about `ubuntu-latest`.
+  - >
+    `strace` / `Process Monitor` when a refusal has to be attributed to a specific rule rather than
+    guessed at. A refused operation whose cause is inferred is how 0.40.0's defect survived.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402. Platform code goes behind the existing
+    `cfg(unix)` `libc` and `cfg(windows)` `windows-sys` entries.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** This release has no break; it is a minor bump for new
+    functionality.
+  - >
+    **The reported backend is a report, never a promise.** Nothing added here may name an isolation
+    it did not apply. Every new rung reports itself only after its restriction has been installed,
+    and a failure to install it is a fall to the next rung and not a silent claim.
+  - >
+    **`docs/CONTRACT.md` is a checked-in surface**, and so are the README table, the changelog and
+    the crate-root prose. They change in this release, not in the next one.
+
+risks:
+- >
+  **A rung that is selected but does not enforce.** This is the failure this crate has already
+  shipped once: 0.40.0's Linux backend applied its confinement on no machine anywhere for three
+  matrix runs while every local gate passed, because the probe read a `mount` exit status instead
+  of attempting a write. Four rungs multiplies the surface. Mitigations: every probe attempts the
+  restriction it is probing; F4 asserts enforcement per rung with the rung pinned rather than
+  asserting the reported label; and the new CI leg runs with the restriction Ubuntu actually
+  ships, so the rung under test is the rung a user gets.
+- >
+  **The seccomp filter breaks a real toolchain.** A denied syscall a compiler, linker or package
+  manager legitimately uses turns a working build into an inexplicable `EPERM`. Mitigations: the
+  list is short and every entry is a syscall that undoes containment or reaches into another
+  process, none of which a build performs; the filter returns `EPERM` rather than killing the
+  process, so the failure is diagnosable; and it is the first thing the fallback scope drops.
+- >
+  **The Windows grant set is incomplete and refuses a read a toolchain needs.** This is the
+  discovery problem 0.26.0 declined to close, and deriving from the run's resolved roots reduces it
+  without eliminating it. Mitigations: the fixed read-execute set covers the program's own
+  directory and the system root; failures degrade to the Job Object rather than to a failed run
+  when the container cannot be built at all; `with_full_access()` is a one-call escape; and the
+  grant set is documented in `docs/CONTRACT.md` so a refusal is diagnosable. **This is the risk
+  most likely to produce an iteration record**, and the honest form of that record is a named path
+  added to the fixed set with the reason.
+- >
+  **Landlock's forward-compatible ABI handling is got wrong and the rung fails on older kernels.**
+  Requesting an access flag the kernel does not know fails the whole ruleset creation. Mitigation:
+  the ABI is negotiated by asking the kernel and the request is masked down to it, asserted by
+  F2's below-ABI-4 arm, which is a real branch and not a skip.
+- >
+  **The chain hides a regression on a host that used to take the namespace rung.** A Linux host
+  with both Landlock and working namespaces now takes Landlock, which is a weaker filesystem
+  statement than a mount namespace in at least one respect: Landlock governs path access, not the
+  mount table. Mitigation is stated rather than mitigated away — the order is the roadmap's and the
+  owner's, the reason is that it is the rung available on the hosts where the others are not, and
+  `docs/CONTRACT.md` states what each rung does and does not do so a reader choosing between them
+  is choosing rather than guessing.
+- >
+  **CI-only discoverability makes the loop slow enough to encourage shortcuts.** The temptation is
+  a blanket skip or a test that asserts the label instead of the behaviour. Mitigation: F3, F6 and
+  F8 are deliberately host-free so the decision logic, the argv and the grant list are settled
+  locally, leaving the matrix to answer only what only it can.
+
+open_questions:
+- >
+  Whether the Landlock rung should be preferred over the namespace rung on a host that has both,
+  or only used where the namespace rung fails. The roadmap says namespace-free first and this
+  release follows it, on the argument that one code path exercised everywhere beats two paths each
+  exercised somewhere. If measurement or a matrix finding shows the mount namespace enforcing
+  something Landlock does not for a case that matters, the order is a one-line change in the
+  decision function and F3's table is where it would be re-decided.
+- >
+  Whether the seccomp deny-list should eventually cover the `*at` and `*2` variants of everything
+  it names, and whether that is worth a generated table. Not attempted here; the list is written
+  out per architecture and the doc says it is a deny-list.
+- >
+  Whether a caller should be able to require a minimum rung — "refuse to run rather than degrade
+  to the floor". Deliberately excluded: today the crate always runs and always reports, and an
+  application that wants to refuse can read `select(&config).backend()` before it starts, which
+  the type's own doc example shows. If an embedder asks for it, it is additive on `SandboxConfig`.
+- >
+  Whether the Windows fixed read-execute set should include the user's profile directory. It does
+  not: that is where credentials live, and a default-deny boundary whose first act is to grant the
+  home directory is not one. The consequence is that a toolchain reading a per-user configuration
+  file from outside the derived cache roots is refused, and the answer for now is the escape hatch
+  rather than a wider default.
+- >
+  Whether `shell_start`'s backgrounded handles should have been contained here rather than in
+  0.48.0. They are the one execution path still running at full privilege after this release, and
+  a reader could reasonably expect "containment holds on every platform" to include them. The
+  roadmap places them in 0.48.0 with the per-tool modes they need, and the limitation stays
+  stated in `docs/CONTRACT.md` until then.

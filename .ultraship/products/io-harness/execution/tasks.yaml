@@ -1,495 +1,374 @@
 product: io-harness
-version: 0.46.0
+version: 0.47.0
 tasks:
-- id: US-IO-HARNESS-0.46.0-T01
-  summary: Name the three modes and make the contract carry one, not an Option.
-  why_required: Every other task routes a mode somewhere. Until `ExecMode` exists and `TaskContract::exec_sandbox`
-    is a `SandboxConfig` whose default is `WorkspaceWrite`, there is no default to flip and no escape
-    hatch to spell.
-  status: done
+- id: US-IO-HARNESS-0.47.0-T01
+  summary: Name the three new backends and decide the chain in one pure function.
+  why_required: Every rung below reports one of these labels and is reached through this decision. Until
+    the variants exist and the chain is a testable function, no rung can be selected, reported or ordered.
+  status: todo
   depends_on: []
   acceptance_criteria:
-  - '**F2 — `with_full_access()` is the only way back, and it is complete.** The same tree, the same command,
-    one method call added: the write lands, `select` is never consulted, no `SandboxEvent` create/exec
-    rows are written for the call, and `EventKind::Contained` reports `mode: "full-access"`. Sabotage:
-    have `with_full_access` set the mode but still wrap the command, under which the write is refused
+  - '**F3 — the chain''s order is a table, decided without a host.** A pure test over the decision function
+    for every combination of the four probe answers, the three modes and both egress answers: the strongest
+    serviceable rung is returned; `PortableFloor` only when nothing above it can serve; and the ABI-3
+    Landlock host on an egress-denying run returns the next rung down rather than Landlock. Sabotage:
+    order bubblewrap ahead of Landlock, under which the Landlock-available rows return the wrong rung
     and only this fails.
 
     '
-  - '**N3 — exactly two compile breaks, and `docs/public-api.txt` gains exactly one line.** The breaks
-    are `TaskContract::exec_sandbox` changing type from `Option<SandboxConfig>` to `SandboxConfig`, and
-    `RunSpec` becoming `#[non_exhaustive]` (which is also what makes its two new fields a single break
-    rather than a second one). The added line is `enum ExecMode src/sandbox.rs`: `ExecMode` is a crate-root
-    re-export and the checker (`tests/docs_drift.rs`) enumerates exactly those, while `RunSpec` and `Toolchain`
-    are not re-exported at the root and `SandboxConfig::mode`, `SandboxLimits::none`, `Toolchain::cache_dirs`,
-    `TaskContract::with_full_access`, `with_exec_mode` and `EventKind::Contained` are members of already-listed
-    items. **The number is stated at plan time** because "met in a different form" has cost a `known_limitations`
-    line in four of the last eight releases.
+  - '**N3 — zero compile breaks, and `docs/public-api.txt` is byte-identical.** The only public additions
+    are three `Backend` variants and their `as_str` arms, and the checker (`tests/docs_drift.rs`) enumerates
+    items rather than variants — `enum Backend src/sandbox.rs` is one line at `docs/public-api.txt:69`
+    whether the enum has four variants or seven. **The number is stated at plan time as "unchanged"**
+    because a criterion promising a line count has been met in a different form in four of the last nine
+    releases, and because byte-identical is the stronger claim.
 
     '
   files:
   - src/sandbox.rs
-  - src/contract.rs
-  - src/lib.rs
-  - docs/public-api.txt
-  - tests/exec_contained.rs
-  evidence:
-  - '`ExecMode` (`ReadOnly` / `WorkspaceWrite` / `FullAccess`, `#[non_exhaustive]`, serde kebab-case,
-    `Default` = `WorkspaceWrite`, `as_str`, `is_contained`) added at `src/sandbox.rs` and re-exported
-    from `src/lib.rs`. `docs/public-api.txt` gains exactly one line, `enum ExecMode src/sandbox.rs` —
-    the number stated at plan time (N3), and `git diff main -- docs/public-api.txt` shows one addition
-    and no removal.'
-  - '`SandboxConfig::mode` + `with_mode`, and `SandboxLimits::none()`. The attribute was deliberately
-    NOT put on `SandboxConfig`: it is built by literal with `..SandboxConfig::new()` at six sites under
-    `tests/` and `examples/` and in the crate''s own doc examples, and `#[non_exhaustive]` forbids functional-update
-    syntax too (`US-IO-HARNESS-0.44.0-I01`).'
-  - '`TaskContract::exec_sandbox` is a `SandboxConfig`, defaulting to `WorkspaceWrite` with `SandboxLimits::none()`
-    at both construction sites — the owner''s specification-time decision that the default flip is a boundary
-    and not a ceiling. `with_full_access()` and `with_exec_mode()` added beside the unchanged `with_contained_exec`.'
-  - 'F2 — `the_escape_hatch_is_one_call_and_it_is_complete` (`tests/exec_contained.rs`) passes: the same
-    tree and the same command, one method call apart, and the write lands again; no `sandbox_events` row
-    claims containment; and the run still reports `mode: full-access`, `backend: none`. Sabotage S2 —
-    return a containment for every mode, so `with_full_access` sets the mode but the command is still
-    wrapped — fails that test and only it.'
-- id: US-IO-HARNESS-0.46.0-T02
-  summary: Carry the mode and its writable roots to the backends through RunSpec.
-  why_required: The backends are where a mode becomes an enforcement, and `RunSpec` is the only OS-neutral
-    thing that reaches them. The `#[non_exhaustive]` + constructor break is paid here once so 0.47.0 and
-    0.48.0 add fields to this type for free.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.46.0-T01
-  acceptance_criteria:
-  - '**N3 — exactly two compile breaks, and `docs/public-api.txt` gains exactly one line.** The breaks
-    are `TaskContract::exec_sandbox` changing type from `Option<SandboxConfig>` to `SandboxConfig`, and
-    `RunSpec` becoming `#[non_exhaustive]` (which is also what makes its two new fields a single break
-    rather than a second one). The added line is `enum ExecMode src/sandbox.rs`: `ExecMode` is a crate-root
-    re-export and the checker (`tests/docs_drift.rs`) enumerates exactly those, while `RunSpec` and `Toolchain`
-    are not re-exported at the root and `SandboxConfig::mode`, `SandboxLimits::none`, `Toolchain::cache_dirs`,
-    `TaskContract::with_full_access`, `with_exec_mode` and `EventKind::Contained` are members of already-listed
-    items. **The number is stated at plan time** because "met in a different form" has cost a `known_limitations`
-    line in four of the last eight releases.
-
-    '
-  files:
-  - src/sandbox.rs
-  - src/verify.rs
-  - src/tools/exec.rs
-  - src/sandbox/linux.rs
-  - src/sandbox/macos.rs
   - tests/sandbox.rs
-  - tests/sandbox_job_object.rs
-  - examples/sandbox_run.rs
-  evidence:
-  - '`RunSpec` gains `mode` and `writable_roots`, plus `#[non_exhaustive]` and `RunSpec::new(argv, workdir,
-    limits)` with `with_network` / `with_mode` / `with_writable_roots`. Every construction site moved
-    in the same commit: `src/verify.rs`, `src/tools/exec.rs`, `src/sandbox/{linux,macos}.rs`, the crate''s
-    own `Sandbox` doc example, `tests/sandbox.rs` (2), `tests/sandbox_job_object.rs` and `examples/sandbox_run.rs`
-    (2).'
-  - The doc example on `Sandbox` failed `cargo test --doc` with `E0639` until it moved to the builder
-    — the standing rule that `#[non_exhaustive]` breaks your own doctests, met again and fixed rather
-    than worked around.
-  - 'N3 — the two fields are one break, not two, because the attribute is what makes 0.47.0''s and 0.48.0''s
-    additions to this type free. `docs/public-api.txt` is unaffected: `RunSpec` is not a crate-root re-export.'
-- id: US-IO-HARNESS-0.46.0-T03
-  summary: Derive the detected toolchain's own cache directories.
-  why_required: A default-contained run that cannot populate a registry cache teaches every embedder to
-    reach for `with_full_access()` on its first failure, which would make the default flip worse than
-    no flip.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - '**F5 — `cache_dirs` reads the ecosystem''s own environment, and reads it per ecosystem.** A pure
-    table test over `Toolchain` values for cargo, node (npm and pnpm), python (pip, poetry, uv), go, java
-    (maven, gradle) and dotnet: with the ecosystem''s variable set the returned path is the one it names;
-    with it unset the conventional path under a redirected `HOME` is returned; and a variable belonging
-    to another ecosystem set at the same time changes nothing. Environment is manipulated within a single
-    serialised test rather than across parallel ones — trap 102''s family. Sabotage: read `XDG_CACHE_HOME`
-    for cargo, which does not use it, under which the unset-variable arm returns the wrong path and only
-    this fails.
-
-    '
-  - '**N1 — no new dependency.** `cargo tree` for the default feature set has the same number of crates
-    as 0.45.0 (**402**). The home directory is read from `HOME` / `USERPROFILE` through `std::env::var_os`,
-    and every cache path is `PathBuf::from` plus `join` — no `dirs`, no `home`, no `directories`.
-
-    '
-  files:
-  - src/toolchain.rs
-  evidence:
-  - '`Toolchain::cache_dirs()` added at `src/toolchain.rs`, keyed on `ecosystem` and `manager` over the
-    strings `toolchain::detect` actually emits — verified against the table rather than assumed: the ecosystems
-    are `cargo`, `deno`, `node`, `python`, `go`, `maven`, `gradle`, `elixir`, `ruby`, `php`, `swift`,
-    `dotnet`, `cmake`, `make` (an earlier draft keyed on a `java` ecosystem that does not exist).'
-  - 'Each ecosystem''s own environment variable wins over the conventional path: `CARGO_HOME`, `npm_config_cache`,
-    `PNPM_HOME`, `PIP_CACHE_DIR`, `POETRY_CACHE_DIR`, `UV_CACHE_DIR`, `DENO_DIR`, `GOMODCACHE`/`GOPATH`/`GOCACHE`,
-    `GRADLE_USER_HOME`, `NUGET_PACKAGES`, `GEM_HOME`/`BUNDLE_PATH`, `COMPOSER_HOME`, `MIX_HOME`/`HEX_HOME`.
-    `XDG_CACHE_HOME` is honoured only where the ecosystem documents it — not for cargo or go, where it
-    would name a path the toolchain never writes to.'
-  - N1 — no new dependency. The home directory is read from `HOME` / `USERPROFILE` through `std::env::var_os`;
-    `cargo tree` is **402** lines, unchanged since 0.34.0.
-  - '`make` and `cmake` return an empty list, stated in a comment as the honest answer rather than left
-    as a gap: those ecosystems drive whatever the project configured.'
-- id: US-IO-HARNESS-0.46.0-T04
-  summary: Render one writable-root list as a macOS profile and a Linux bind loop.
-  why_required: Two backends express the same grant in two languages. Asserted from the pure builders,
-    a root dropped from one rendering is caught without spawning anything.
-  status: done
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T02
+  summary: 'Build the Landlock rung: a filesystem ruleset applied between fork and exec, with no wrapper
+    process.'
+  why_required: This is the rung that turns a stock Ubuntu host from enforcing nothing into confining
+    writes. Without it the chain has nothing above the existing namespace backend and the release delivers
+    nothing on the hosts it exists for.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.46.0-T02
+  - US-IO-HARNESS-0.47.0-T01
   acceptance_criteria:
-  - '**F7 — one list, two renderings.** For a fixed set of writable roots: the macOS profile string carries
-    exactly one `(allow file-write* (subpath "<root>"))` per root and still carries `(deny file-write*
-    (subpath "/"))` ahead of them; the Linux `unshare` argv''s setup script binds exactly those roots
-    read-write after remounting `/` read-only. Both asserted from the pure argv/profile builders without
-    spawning anything, the way `unshare_argv`''s existing tests do (`src/sandbox/linux.rs:194`). Sabotage:
-    render the roots on macOS and drop them from the Linux loop, under which the Linux half fails and
-    only this fails — which is why the criterion asserts both renderings rather than "the roots are plumbed".
+  - '**F1 — on a host with the Ubuntu default restriction in place, a contained run confines its writes.**
+    Driven end to end from `TaskContract::workspace(goal, root)` with no builder call: a command writing
+    to an absolute path outside the granted roots is refused and the file does not exist afterwards; a
+    command writing inside the workspace root succeeds; and `select(&config).backend()` reports `linux-landlock`.
+    Run on a CI leg that does **not** set `kernel.apparmor_restrict_unprivileged_userns=0`. On today''s
+    build the same test reports `portable-floor` and the outside write lands. Sabotage: return the floor
+    from the chain when the namespace probe fails, which is today''s behaviour, under which both arms
+    fail and only this fails.
+
+    '
+  - '**F4 — every rung is proven to enforce, with the rung pinned.** For each of Landlock, bubblewrap
+    and the existing namespace rung, on a host that has it: a write outside the granted roots is refused,
+    a write inside lands, and the run''s own outcome carries the failure to the model rather than erroring
+    the run. Pinned for the test rather than left to the host''s answer, so a host that would have chosen
+    a different rung still asserts the one under test, and skipped with a stated reason — never silently
+    — where the primitive is absent. Sabotage: build each rung''s rule set from an empty root list, under
+    which the inside write is refused too and each arm fails on its own.
+
+    '
+  - '**F5 — `ReadOnly` withholds the workspace on every new rung.** A command writing into the workspace
+    root fails and a command reading the same file succeeds, under Landlock and under bubblewrap, with
+    the system temporary directory still writable in both. This is the mode whose entire difference is
+    one directory, so it is asserted per rung rather than once. Sabotage: include the workdir in the writable
+    set unconditionally, under which the write lands and only this fails.
+
+    '
+  - '**F6 — the Landlock rung installs no wrapper, and that is asserted rather than described.** The argv
+    the backend spawns is byte-identical to the argv the caller asked for — no `unshare`, no `sh`, no
+    `bwrap` — and `SandboxOutcome::argv` records exactly that. A payload that does not exist on `PATH`
+    therefore fails as a missing program rather than as the wrapper''s non-zero exit, and a `shell` stage
+    whose own `cd` is expressed through `Command::current_dir` runs in the directory it named. The second
+    half is 0.46.0''s defect asserted at its root cause on the rung where it cannot recur. Sabotage: wrap
+    the payload in `sh -c` on this rung, under which the argv assertion and the missing-program assertion
+    both fail and only this fails.
 
     '
   files:
-  - src/sandbox/macos.rs
   - src/sandbox/linux.rs
-  evidence:
-  - macOS renders one `(allow file-write* (subpath …))` line per root after the standing `(deny file-write*
-    (subpath "/"))`; Linux renders them as entries in the mount setup's bind loop. The Linux script's
-    calling convention changed from a fixed pair to `sh <workdir> <n> <root>… <argv…>` — a counted list,
-    so the payload is still findable after a variable number of roots.
-  - F7 — `every_writable_root_gets_exactly_one_allow_line` (`src/sandbox/macos.rs`) and `the_writable_roots_are_a_counted_list_before_the_payload`
-    (`src/sandbox/linux.rs`), both asserted from the pure builders without spawning anything, the way
-    `unshare_argv`'s existing tests are. Sabotage S7 — render the roots on macOS and drop them from the
-    Linux loop — fails the Linux half alone, which is why the criterion asserts both renderings rather
-    than 'the roots are plumbed'.
-  - F3's platform halves — `read_only_does_not_grant_the_workdir` (macOS) and `read_only_does_not_put_the_workdir_in_the_writable_list`
-    (Linux). Under `ReadOnly` the process still `cd`s into the workspace and the workspace is not in the
-    writable set, which is what makes the mode a mode rather than a label. Sabotage S3 — grant the workdir
-    under `ReadOnly` — fails both, and F3's end-to-end test with them.
-- id: US-IO-HARNESS-0.46.0-T05
-  summary: 'Contain the run by default: compute the roots, filter to what exists, wire exec, shell and
-    the gate.'
-  why_required: This is the release. Everything before it is surface; this is where a contract built with
-    no builder call confines a write, and where the exists-filter stops a granted path from degrading
-    the Linux backend to the floor.
-  status: done
+  - src/sandbox/landlock.rs
+  - src/sandbox.rs
+  - tests/sandbox.rs
+  - tests/exec_contained.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T03
+  summary: Restrict outbound TCP on the Landlock rung where the kernel has the network rules, and enforce
+    the egress honesty rule.
+  why_required: A run that denies egress must not be handed a rung that cannot deny egress. Without the
+    network access flags and the ABI negotiation that masks them down, the chain would either claim a
+    denial it never applied or fail ruleset creation on an older kernel.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.46.0-T01
-  - US-IO-HARNESS-0.46.0-T02
-  - US-IO-HARNESS-0.46.0-T03
-  - US-IO-HARNESS-0.46.0-T04
+  - US-IO-HARNESS-0.47.0-T02
   acceptance_criteria:
-  - '**F1 — the default confines a write, with no builder call at all.** A contract built as `TaskContract::workspace(goal,
-    root)` and driven through a command that writes to an absolute path outside the root: the file does
-    not exist afterwards, and the command''s own outcome reports the failure to the model rather than
-    the run erroring. Branching on `select(&config).backend()` — a backend with no filesystem facility
-    (`WindowsJobObject`, `PortableFloor`) asserts instead that the mode was routed and reported, which
-    is 0.40.0''s rule about tests that step over a fallback. Sabotage: default `exec_sandbox` to `FullAccess`,
-    under which the write lands and only this fails.
-
-    '
-  - '**F3 — `ReadOnly` refuses a write into the workspace root itself and still permits the read.** A
-    command writing to a file inside the root fails; a command reading the same file succeeds; the temp
-    directory is still writable, because a toolchain that cannot open a temporary file cannot run at all.
-    Same backend branch as F1. Sabotage: grant the workspace root under `ReadOnly`, under which the write
-    lands and only this fails.
-
-    '
-  - '**F6 — a granted root that does not exist never reaches a backend, and the backend stays native.**
-    A `WorkspaceWrite` run whose computed cache roots include a directory that is not there: the run succeeds,
-    the write inside the workspace still lands, and `select(&config).backend()` still reports this host''s
-    native backend rather than `PortableFloor`. This is 0.40.0''s defect reproduced deliberately — a wrapper
-    that `fail`s degrades the confinement while the feature appears to work. Sabotage: pass the roots
-    through unfiltered, under which the Linux arm''s wrapper exits 125 and the run reports the floor;
-    on a platform whose backend tolerates a missing path the assertion is the filtered list itself, and
-    that difference is stated in the test rather than hidden.
-
-    '
-  - '**F8 — the gate is contained under the same roots as the run.** The verification gate''s `RunSpec`
-    (`src/verify.rs:1086`) carries the run''s mode and the same writable roots, asserted over a gate command
-    that writes into its ephemeral workdir (permitted), into a cache root (permitted) and outside both
-    (refused). Sabotage: leave the gate on `RunSpec::new` without the roots, under which the cache-root
-    write is refused and only this fails.
+  - '**F2 — the Landlock rung refuses `connect` when the run denies egress and the kernel has the network
+    rules.** A contained command dialling a listener the test itself started on loopback is refused with
+    a connection error, while the same command under a run whose policy permits egress connects. On a
+    kernel whose negotiated ABI is below 4 the test asserts instead that the rung was **not** taken for
+    the egress-denying run — the honesty rule, asserted rather than skipped, which is 0.40.0''s lesson
+    about a test that steps over a fallback. Sabotage: request the network access flags unconditionally
+    rather than dropping them below ABI 4, under which the ruleset creation fails on an older kernel and
+    the rung wrongly reports success; and separately, allow the rung for an egress-denying run below ABI
+    4, under which the loopback dial succeeds and only this fails.
 
     '
   files:
-  - src/run.rs
-  - src/tools/exec.rs
-  - src/tools/shell.rs
-  - src/verify.rs
-  - tests/exec_contained.rs
-  evidence:
-  - '`ExecContainment { config, roots }` resolved once per run by `exec_containment`, called from **both**
-    loops beside their `toolchain::detect` — the standing rule that a rule added to one loop must be a
-    helper both call. `dispatch` takes `Option<&Arc<ExecContainment>>`, where `None` is `FullAccess`.'
-  - Egress stays resolved per call through `ExecContainment::with_egress`, because a plan gate narrows
-    the effective policy mid-run and the run's `Policy` remains the single authority on the network. The
-    mode and the roots do not move, which is why they are resolved once and this is not.
-  - 'F1 — `the_default_contract_confines_a_write_with_no_builder_call`: a contract that is `TaskContract::workspace(goal,
-    root)` and nothing else refuses a write outside the root. Branches on `select().backend()`, so a host
-    that took the floor asserts the floor''s truth rather than skipping — 0.40.0''s lesson. Sabotage S1
-    — default the mode back to `FullAccess` — fails it alone.'
-  - 'F3 — `read_only_refuses_a_write_into_the_workspace_and_permits_the_read`. **The fixture is not a
-    `tempfile::tempdir()`**, and that is the module header''s own trap read a second time: the macOS profile
-    blanket-allows `/private/var/folders`, so a read-only workspace placed there is writable no matter
-    what this release does. The workspace moved under `target/`, where the deny reaches it.'
-  - 'F6 — `a_writable_root_that_does_not_exist_does_not_degrade_the_backend`: a run whose computed cache
-    root is absent still succeeds, still reports this host''s native backend, and grants **0** roots.
-    This is 0.40.0''s defect reproduced on purpose — a wrapper that `fail`s degrades the confinement while
-    the feature appears to work. Sabotage S5 — drop the exists-filter — fails it alone.'
-  - 'F8 — `the_verification_gate_gets_the_same_writable_roots`: a gate command writing into the toolchain''s
-    cache succeeds. Sabotage S8 — leave the gate on an empty root list — fails it alone.'
-  - '**A defect the flip would have shipped, found by an existing test and fixed at the root.** `a_program_this_machine_does_not_have_is_an_observation_not_a_failed_run`
-    (`tests/exec_tool.rs`) failed: a contained spawn is of the *wrapper* (`sandbox-exec`, `unshare`),
-    which exists, so a missing payload came back as the wrapper''s own non-zero exit instead of `[exec
-    unavailable]`. With containment defaulted on, every ''no such program on PATH'' would have become
-    ''your command failed''. Fixed by resolving the program against `PATH` before a contained spawn —
-    one guard, so the answer is the same contained or not.'
-- id: US-IO-HARNESS-0.46.0-T06
-  summary: Report the containment that was applied, once per run.
-  why_required: An audit has to answer whether a run was contained and by which backend. A `FullAccess`
-    run emits the event too, because an absent event is not a statement.
-  status: done
+  - src/sandbox/landlock.rs
+  - src/sandbox.rs
+  - tests/net.rs
+  - tests/sandbox.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T04
+  summary: Install the seccomp deny-list on the Landlock rung, per architecture, returning EPERM.
+  why_required: The roadmap entry names a namespace-free filesystem AND syscall restriction. Without it
+    the rung leaves a payload able to undo its own confinement, and the crate's standing confession that
+    it installs no filter would still be true.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.46.0-T05
+  - US-IO-HARNESS-0.47.0-T02
   acceptance_criteria:
-  - '**F9 — `Contained` fires once per run and reports what was applied, not what was asked for.** Over
-    a recorded multi-step run: exactly one event; `backend` equal to `select(&config).backend().as_str()`
-    and therefore `"portable-floor"` on a host that degraded; `mode` equal to the contract''s; `roots`
-    equal to the number of roots actually granted after the exists-filter. A `FullAccess` run emits the
-    event with `mode: "full-access"` and `roots: 0`. Sabotage: report the requested backend rather than
-    the selected one, under which a `floor_only` run claims an isolation the host never applied and only
-    this fails — 0.40.0''s lesson, and 0.45.0''s F2 in a second place.
+  - '**F11 — the seccomp deny-list refuses a named syscall and refuses it with `EPERM`.** On the Landlock
+    rung, a contained command invoking one of the denied syscalls directly fails with `EPERM` and the
+    process is **not** killed — the distinction matters, because a filter that killed would be indistinguishable
+    from a crash in the payload and would tell the model nothing. A command invoking a syscall that is
+    not on the list, and every command the crate''s own gates run, completes normally. On an architecture
+    with no syscall table the test asserts that the rung was taken **without** the filter and that this
+    is what the backend reports, rather than skipping. Sabotage: return `SECCOMP_RET_KILL_PROCESS` instead
+    of the errno, under which the first arm sees a signal rather than a failed call and only this fails.
+
+    '
+  files:
+  - src/sandbox/seccomp.rs
+  - src/sandbox/landlock.rs
+  - tests/sandbox.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T05
+  summary: Add the bubblewrap rung beneath Landlock, probed by spawning the wrapper it builds.
+  why_required: A setuid bwrap works on hosts whose kernel refuses an unprivileged user namespace, which
+    is exactly where the existing rung fails and where Landlock may be absent. Without it the chain skips
+    from Landlock to a backend the host has already refused.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.47.0-T01
+  acceptance_criteria:
+  - '**F4 — every rung is proven to enforce, with the rung pinned.** For each of Landlock, bubblewrap
+    and the existing namespace rung, on a host that has it: a write outside the granted roots is refused,
+    a write inside lands, and the run''s own outcome carries the failure to the model rather than erroring
+    the run. Pinned for the test rather than left to the host''s answer, so a host that would have chosen
+    a different rung still asserts the one under test, and skipped with a stated reason — never silently
+    — where the primitive is absent. Sabotage: build each rung''s rule set from an empty root list, under
+    which the inside write is refused too and each arm fails on its own.
+
+    '
+  - '**F5 — `ReadOnly` withholds the workspace on every new rung.** A command writing into the workspace
+    root fails and a command reading the same file succeeds, under Landlock and under bubblewrap, with
+    the system temporary directory still writable in both. This is the mode whose entire difference is
+    one directory, so it is asserted per rung rather than once. Sabotage: include the workdir in the writable
+    set unconditionally, under which the write lands and only this fails.
+
+    '
+  files:
+  - src/sandbox/linux.rs
+  - src/sandbox.rs
+  - tests/sandbox.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T06
+  summary: 'Select the AppContainer on Windows: derive the grant set, spawn into the container, assign
+    to the Job Object.'
+  why_required: Windows has never had a filesystem boundary and the mechanism has been built and unselected
+    since 0.26.0. This is the whole of the Windows half; without it the platform table's Windows row does
+    not change.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.47.0-T01
+  acceptance_criteria:
+  - '**F7 — a Windows run is access-confined and resource-contained at the same time.** Driven from `TaskContract::workspace`:
+    a read of a path outside the grant set is refused, a socket to the outside is refused, a write inside
+    the workspace lands, `select(&config).backend()` reports `windows-appcontainer`, and the Job Object''s
+    own `max_processes` cap still fires on the same run. The last clause is the control: a backend that
+    traded resource containment for access containment would pass the first four. Sabotage: spawn into
+    the container without assigning the process to the job, under which the cap arm fails and only this
+    fails.
+
+    '
+  - '**F8 — the Windows grant set is derived from the run''s resolved facts.** A pure test over the grant-list
+    builder: the workspace root, the temp directory and each existing writable root appear as `Full`;
+    under `ReadOnly` the workspace appears as `ReadExecute` instead; the program''s directory and `%SystemRoot%`
+    appear as `ReadExecute`; and a writable root that does not exist appears not at all. Sabotage: grant
+    the workspace `Full` under `ReadOnly`, under which that arm fails and only this fails.
+
+    '
+  - '**F10 — every degradation completes the run and reports the weaker backend.** A Windows host where
+    the container path is made to fail runs to completion and reports `windows-job-object`; a Linux host
+    with no rung above the floor runs to completion and reports `portable-floor`; `EventKind::Contained`
+    carries the backend that was applied in both cases, and `FullAccess` still reports `full-access` with
+    no container and no ruleset. Sabotage: return an error from the backend instead of degrading, under
+    which the run fails and only this fails.
+
+    '
+  files:
+  - src/sandbox/windows.rs
+  - src/sandbox/appcontainer.rs
+  - src/sandbox.rs
+  - tests/sandbox_job_object.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T07
+  summary: Map the run's egress answer onto the container's capability array.
+  why_required: An empty capability array denies the network, which is the release's Windows egress boundary,
+    but it also breaks every run whose policy permits egress. Without the mapping the backend would be
+    selected and immediately have to be turned off.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.47.0-T06
+  acceptance_criteria:
+  - '**F9 — a Windows run whose network is permitted still reaches the network.** The same run with a
+    policy permitting egress requests `internetClient` and connects to the test''s own listener; with
+    egress denied it requests nothing and is refused. Both arms in one test so the second is a control
+    rather than a separate claim — an empty capability array that broke every network-permitting run would
+    be a regression this release could otherwise ship green. Sabotage: request the capability unconditionally,
+    under which the denied arm connects and only this fails.
+
+    '
+  files:
+  - src/sandbox/appcontainer.rs
+  - src/sandbox/windows.rs
+  - tests/net.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T08
+  summary: Make every degradation complete the run and report the backend that was actually applied.
+  why_required: A rung that names an isolation it did not apply is the defect this crate shipped in 0.40.0
+    for three matrix runs. Without this the chain multiplies that surface by four and a caller reading
+    the trace is misled rather than informed.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.47.0-T02
+  - US-IO-HARNESS-0.47.0-T05
+  - US-IO-HARNESS-0.47.0-T06
+  acceptance_criteria:
+  - '**F10 — every degradation completes the run and reports the weaker backend.** A Windows host where
+    the container path is made to fail runs to completion and reports `windows-job-object`; a Linux host
+    with no rung above the floor runs to completion and reports `portable-floor`; `EventKind::Contained`
+    carries the backend that was applied in both cases, and `FullAccess` still reports `full-access` with
+    no container and no ruleset. Sabotage: return an error from the backend instead of degrading, under
+    which the run fails and only this fails.
 
     '
   - '**N4 — no durable state moves.** `git diff main -- src/state.rs` is **empty**: no table, column,
-    index or reader, and `CHECKPOINT_FORMAT` unmoved at 7. `EventKind::Contained` is serialized into the
-    `run_events` row that already exists.
+    index or reader, and `CHECKPOINT_FORMAT` unmoved at 7. No `EventKind` variant is added; the new backends
+    travel through `Contained`''s existing `backend` field and the existing `SandboxEvent` rows.
 
     '
   files:
-  - src/observe.rs
+  - src/sandbox.rs
+  - src/sandbox/linux.rs
+  - src/sandbox/windows.rs
   - src/run.rs
-  - tests/exec_contained.rs
-  evidence:
-  - '`EventKind::Contained { mode, backend, roots }` added on the enum `#[non_exhaustive]` since 0.24.0,
-    emitted once per run at run start from both workspace loops. `EVENT_NAMES` gained `"contained"` and
-    the round-trip census was updated in the same commit — both of the observe tests failed first and
-    are what caught the omission.'
-  - 'It carries the count of writable roots, not their paths: a path is host-identifying and of unbounded
-    length. A `FullAccess` run emits it with `backend: "none"`, because an absent event is not a statement.'
-  - 'F9 — `the_containment_report_names_what_actually_applied` and the full-access arm of `the_escape_hatch_is_one_call_and_it_is_complete`:
-    exactly one event per run, `backend` equal to `select(&SandboxConfig::new()).backend().as_str()`.
-    Sabotage S6 — report the requested backend rather than the selected one — fails it alone.'
-  - N4 — no DDL. `git diff main -- src/state.rs` is **empty** and `CHECKPOINT_FORMAT` is unmoved at 7;
-    the variant is serialized into the `run_events` row that already exists.
-- id: US-IO-HARNESS-0.46.0-T07
-  summary: Tell the agent which mode it is under, without moving the prompt between steps.
-  why_required: 0.45.0's boundary section exists so a boundary is known rather than discovered by refusal,
-    and this release adds a boundary. The byte-identity half protects 0.38.0's cache breakpoint, which
-    sits at the end of the block the line lives in.
-  status: done
+  - tests/observe.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T09
+  summary: Add the Linux CI leg that leaves the Ubuntu userns restriction in place, in both workflow files,
+    and guard it.
+  why_required: Every existing Linux leg unsets the restriction, so the rung a real user gets is exercised
+    nowhere. Without this leg F1 is asserted only on a host configured to avoid the problem the release
+    exists to fix.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.46.0-T05
+  - US-IO-HARNESS-0.47.0-T02
   acceptance_criteria:
-  - '**F10 — 0.45.0''s boundary section names the mode, and the prompt is still composed once.** The composed
-    system prompt under each of the three modes names that mode in the containment line; under `FullAccess`
-    it states that commands run at the host''s privileges; and every request''s `system` string over a
-    run of at least four steps is byte-identical to the first. The second half is not decoration: 0.38.0''s
-    cache breakpoint sits at the end of the system block, the boundary line is inside it, and a mode rendered
-    from a per-step probe would bill a cache write on every step of every run on both marked wires. Sabotage:
-    re-probe `select` inside the step loop, under which the byte-identity arm fails and only this fails.
+  - '**O1 — the full suite passes on all three platforms**, which the standing CI matrix already runs,
+    plus the new Linux leg with `kernel.apparmor_restrict_unprivileged_userns` at Ubuntu''s default. The
+    existing Linux legs keep the sysctl line in **both** `ci.yml` and `release.yml` (trap 87), so the
+    namespace rung is still exercised somewhere and F4''s namespace arm is not silently skipped everywhere.
+
+    '
+  - '**O3 — `tests/ci_workflow.rs` covers the new leg in both workflow files.** The guard asserts that
+    a Linux leg without the sysctl exists in `ci.yml` and in `release.yml`, and that the legs which do
+    carry it still do. Trap 87 is that a guard reads one file; this criterion names both.
 
     '
   files:
-  - src/run.rs
-  - tests/prompt.rs
-  evidence:
-  - '`containment_line` (`src/run.rs`) leads with the mode, and `boundary_section` now renders for any
-    run that is contained rather than only for one that opted in. A `FullAccess` run gets the line too,
-    stating that commands run at this program''s own privileges — since 0.46.0 that is a decision the
-    caller made.'
-  - 'F10 — the byte-identity half is 0.45.0''s own `the_prompt_is_composed_once_and_does_not_move` (`tests/prompt.rs`),
-    unchanged and still passing: `select` is called once per run, so the containment line cannot move
-    between steps and 0.38.0''s cache breakpoint is not converted into a per-step cache write.'
-  - '**Three of 0.45.0''s prompt tests changed, each with the reason in its own comment, and the change
-    is the behaviour deliberately changing rather than a test propped up.** `a_run_with_no_boundary_is_told_about_none`
-    now asks for `with_full_access()` — a contained run *has* a boundary, and what the test asserts is
-    that a run enforcing and confining nothing is still told nothing; `containment_names_the_backend_the_host_actually_gave`
-    asserts the mode beside the backend and that a full-access run is told it is not contained; `prompt_composed_fires_once_and_says_what_was_composed`''s
-    nothing-optional arm likewise, since a contained run reporting `boundary: false` would be the event
-    lying.'
-  - 'One further existing test''s expected event sequence changed, for the second release running and
-    for the same reason: `a_one_shot_run_emits_no_deltas_and_a_session_turn_does` (`tests/session_streaming.rs`)
-    sees `Contained` beside 0.45.0''s `PromptComposed` before the first step. An additive variant on an
-    enum `#[non_exhaustive]` since 0.24.0 is what this crate has told observers to expect; the claim that
-    test is really making — that streaming adds no `Token` events to a one-shot run — is asserted separately
-    and is untouched.'
-- id: US-IO-HARNESS-0.46.0-T08
-  summary: Prove a real package manager completes under the default, and fails without the roots.
-  why_required: 'The cache-root table is the part most likely to be quietly wrong, because a wrong path
-    is invisible: the run works and the toolchain re-downloads forever. Only a real invocation with a
-    control arm says so.'
-  status: done
+  - .github/workflows/ci.yml
+  - .github/workflows/release.yml
+  - tests/ci_workflow.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T10
+  summary: Bring every documentation surface to what the code now does.
+  why_required: Two platform tables, the crate-root prose and the README all currently state that Windows
+    confines nothing and that Linux depends on a namespace. Leaving them is shipping a release whose own
+    documentation contradicts it.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.46.0-T05
+  - US-IO-HARNESS-0.47.0-T03
+  - US-IO-HARNESS-0.47.0-T04
+  - US-IO-HARNESS-0.47.0-T05
+  - US-IO-HARNESS-0.47.0-T07
+  - US-IO-HARNESS-0.47.0-T08
   acceptance_criteria:
-  - '**F4 — a real package manager completes under the default.** A contained `cargo` invocation that
-    must populate its registry cache — run against a scratch `CARGO_HOME` inside the test''s own temporary
-    directory, so the assertion is about the grant and not about the developer''s machine — succeeds under
-    `WorkspaceWrite`, and the same invocation with the cache roots removed from the granted list fails.
-    Both arms in one test so the second is a control rather than a separate claim. Marked `#[ignore]`
-    and run explicitly if it needs the network; the cache-population half is what is being asserted, not
-    the download. Sabotage: return an empty `cache_dirs()` for the cargo ecosystem, under which the first
-    arm fails and only this fails.
+  - '**O4 — the documentation surfaces agree with the code, in the same release.** Both `docs/CONTRACT.md`
+    platform tables, the `src/lib.rs` platform prose, the README''s table and `CHANGELOG.md` describe
+    the chain, the Windows backend and what each rung does and does not enforce. `tests/docs_drift.rs`
+    and `tests/changelog.rs` pass. No surface still says Windows confines nothing.
 
     '
-  files:
-  - tests/exec_contained.rs
-  evidence:
-  - 'F4 — `a_real_package_manager_completes_under_the_default`. `cargo generate-lockfile --offline` is
-    the smallest real invocation that **must** write outside the project it builds: measured on this host
-    it creates `$CARGO_HOME/.package-cache` and `.global-cache` and touches the network for nothing. Under
-    the default it completes and the cache is written.'
-  - '**The control differs in exactly one thing**: whether the workspace root carries the marker `toolchain::detect`
-    reads. The second arm runs the same command against a manifest in a subdirectory, so there is no detection,
-    so there are no cache roots — and the cache is **not** written. Sabotage S4 — return no cache directories
-    for the cargo ecosystem — fails the first arm alone.'
-  - The three tests that redirect `CARGO_HOME` are serialised behind a `tokio::sync::Mutex`, because the
-    environment is process-global and `cargo test` runs a binary's tests in parallel — trap 102's family.
-    A `std` mutex was refused by `clippy::await_holding_lock` and the async one is the guard that may
-    be held across the run's awaits.
-- id: US-IO-HARNESS-0.46.0-T09
-  summary: State the default, both breaks and the hosts that cannot enforce it, in the shipped documentation.
-  why_required: A behaviour change with no compile error reaches an embedder as a mystery unless the changelog
-    names the remedy, and at least three sentences in the crate currently say an uncontained run is the
-    default.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.46.0-T05
-  - US-IO-HARNESS-0.46.0-T06
-  - US-IO-HARNESS-0.46.0-T07
-  acceptance_criteria:
-  - '**O3 — the documentation gates pass**: the nightly rustdoc gate, the two intra-doc link rules, and
-    the checked-in doc surfaces (`docs/public-api.txt`, `CAPABILITIES.md`, the guide index, `CHANGELOG.md`
-    including both migration notes) consistent with the code in the same commit range. Specifically included:
-    **no surviving sentence anywhere in the crate or the docs says that an uncontained run is the default**,
-    asserted by grep over `src/` and `docs/`, because at least three such sentences exist today — `src/contract.rs:240`,
-    `src/tools/exec.rs:37` and `src/tools/exec.rs:164`''s "the 0.17.0 default".
-
-    '
-  - '**N3 — exactly two compile breaks, and `docs/public-api.txt` gains exactly one line.** The breaks
-    are `TaskContract::exec_sandbox` changing type from `Option<SandboxConfig>` to `SandboxConfig`, and
-    `RunSpec` becoming `#[non_exhaustive]` (which is also what makes its two new fields a single break
-    rather than a second one). The added line is `enum ExecMode src/sandbox.rs`: `ExecMode` is a crate-root
-    re-export and the checker (`tests/docs_drift.rs`) enumerates exactly those, while `RunSpec` and `Toolchain`
-    are not re-exported at the root and `SandboxConfig::mode`, `SandboxLimits::none`, `Toolchain::cache_dirs`,
-    `TaskContract::with_full_access`, `with_exec_mode` and `EventKind::Contained` are members of already-listed
-    items. **The number is stated at plan time** because "met in a different form" has cost a `known_limitations`
-    line in four of the last eight releases.
+  - '**N3 — zero compile breaks, and `docs/public-api.txt` is byte-identical.** The only public additions
+    are three `Backend` variants and their `as_str` arms, and the checker (`tests/docs_drift.rs`) enumerates
+    items rather than variants — `enum Backend src/sandbox.rs` is one line at `docs/public-api.txt:69`
+    whether the enum has four variants or seven. **The number is stated at plan time as "unchanged"**
+    because a criterion promising a line count has been met in a different form in four of the last nine
+    releases, and because byte-identical is the stronger claim.
 
     '
   files:
   - docs/CONTRACT.md
-  - CHANGELOG.md
+  - src/lib.rs
   - README.md
+  - CHANGELOG.md
   - docs/public-api.txt
-  - src/contract.rs
-  - src/tools/exec.rs
-  - src/sandbox.rs
-  evidence:
-  - '`docs/CONTRACT.md` — the three modes as a table, the boundary-not-a-ceiling reason the default carries
-    no cap, the writable roots and the exists-only rule with the degrade-to-floor consequence spelled
-    out, the gate taking the same roots, `EventKind::Contained`, the `io.toml` key under the trust rule,
-    and the plain statement that on a Windows Job Object and the portable floor the mode is routed, reported
-    and not enforced.'
-  - '`CHANGELOG.md` — the behaviour change as a migration note naming `with_full_access()`, both compile
-    breaks with their exact replacement text, and the no-cap decision stated so nobody looks for a ceiling
-    that is not there.'
-  - 'O3 — the grep the criterion names: **no surviving sentence in `src/` or `docs/` says an uncontained
-    run is the default.** Three said so and were rewritten: `src/tools/exec.rs`''s module doc, `README.md`''s
-    containment paragraph, and `docs/guide/command-execution.md`''s ''The boundary, stated plainly'' section
-    — whose comparison table is now keyed on the default rather than on the opt-in, and whose closing
-    ''Sandboxed execution as an opt-in is later work'' is gone.'
-  - '`io.toml` gains `[sandbox] mode`, added to `PROJECT_WIDENING` so `full-access` is refused at project
-    scope beside `force_floor = false` and `allow_network = true` — the standing trust rule extended rather
-    than weakened. Asserted by a doctest on `Config::from_toml`.'
-  - Every new public item carries a worked doctest; `cargo test --doc` is **410 passed**, up from 0.45.0's
-    401. `Cargo.toml` and the README install snippet bumped to 0.46.0, which `tests/docs_drift.rs`'s fourth
-    checker verifies.
-- id: US-IO-HARNESS-0.46.0-T10
-  summary: Run every release gate and record what the default costs in wall time.
-  why_required: Flipping a default every run now takes is where a regression to the four preceding releases
-    would hide, and wrapping every command is not free.
-  status: done
+  - tests/docs_drift.rs
+  - tests/changelog.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T11
+  summary: Measure each rung's per-command overhead and record the figures.
+  why_required: The Landlock rung's claim is that it avoids a wrapper spawn, which is a claim about a
+    number. An unmeasured regression in a default every run now pays would be discovered by an embedder
+    rather than by this release.
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.46.0-T08
-  - US-IO-HARNESS-0.46.0-T09
+  - US-IO-HARNESS-0.47.0-T02
+  - US-IO-HARNESS-0.47.0-T05
   acceptance_criteria:
-  - '**N1 — no new dependency.** `cargo tree` for the default feature set has the same number of crates
-    as 0.45.0 (**402**). The home directory is read from `HOME` / `USERPROFILE` through `std::env::var_os`,
-    and every cache path is `PathBuf::from` plus `join` — no `dirs`, no `home`, no `directories`.
+  - '**N5 — each rung''s per-command overhead is measured, not asserted to be small.** The same fixed
+    command is timed under `FullAccess`, under the Landlock rung and under the existing namespace rung
+    on a Linux host, and under the Job Object and the AppContainer on a Windows runner, over the same
+    30-iteration shape 0.46.0 used to record ~6.25 ms for `sandbox-exec`. Every figure goes into the release
+    record. The Landlock rung''s claim is that it avoids a wrapper spawn entirely, which is a claim about
+    a number and is therefore measured rather than argued.
+
+    '
+  files:
+  - tests/sandbox.rs
+  evidence: []
+- id: US-IO-HARNESS-0.47.0-T12
+  summary: 'Run the standing gates: no new dependency, MSRV, cross-version, and the five prior releases
+    unaffected.'
+  why_required: The release adds enforcement to paths every existing test drives. Without the regression
+    gate a green suite would prove only that the new code compiles.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.47.0-T10
+  acceptance_criteria:
+  - '**N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402** crates
+    on macOS and Linux. Landlock and seccomp are `libc::syscall` with hand-written constants against the
+    existing `cfg(unix)` `libc`; the AppContainer path uses the `windows-sys` features already listed
+    in `Cargo.toml` (`Win32_Security_Isolation`, `Win32_Security_Authorization`). No `landlock`, no `seccompiler`,
+    no `libseccomp`, no `nix`.
 
     '
   - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
 
     '
-  - '**N5 — the default''s cost in wall time is measured, not asserted to be small.** The same fixed command
-    is timed under `FullAccess` and under `WorkspaceWrite` on the development host, and both figures go
-    into the release record. Wrapping every command in `sandbox-exec` or `unshare` is not free, the default
-    now pays it on every run, and an unmeasured regression here would be discovered by an embedder rather
-    than by this release.
+  - '**N6 — 0.41.0''s batch, 0.42.0''s gate, 0.43.0''s fold, 0.44.0''s boundary, 0.45.0''s prompt and
+    0.46.0''s default are unaffected.** Their suites pass unchanged. Specifically: the composed system
+    prompt is still byte-identical across the steps of a run, and still composed once — the boundary section
+    names the selected backend, and a rung re-probed inside the step loop would convert 0.38.0''s cache
+    read into a cache write on every step of every run and fail no other test.
 
     '
-  - '**N6 — 0.41.0''s batch, 0.42.0''s gate, 0.43.0''s fold, 0.44.0''s boundary and 0.45.0''s prompt are
-    unaffected.** Their own suites pass unchanged; specifically the read batch still rendezvouses inside
-    its bound, a `before_tool` hook is still consulted exactly once per call, and the composed prompt
-    still varies only by the containment line this release changes. Asserted rather than assumed, because
-    flipping a default that every run now takes is exactly where a regression to any of them would hide.
-
-    '
-  - '**O1 — the full suite passes on all three platforms**, which the standing CI matrix already runs.
-    F1, F3, F6 and F8 are the platform-shaped criteria and each branches on `select().backend()`, so a
-    macOS `sandbox-exec`, a Linux namespace, a Windows Job Object and the portable floor each assert their
-    own truth. The Linux legs keep the `kernel.apparmor_restrict_unprivileged_userns=0` line in **both**
-    `ci.yml` and `release.yml` (trap 87), without which the Linux arms assert the floor''s behaviour and
-    report success.
-
-    '
-  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.45.0 store and a 0.46.0 store
-    are the same store; `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0` (`tests/cross_version.rs`)
-    are **unchanged**, which is itself the assertion.
+  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.46.0 store and a 0.47.0 store
+    are the same store in both directions, asserted by the existing cross-version suites.
 
     '
   files:
   - Cargo.toml
-  - CHANGELOG.md
-  evidence:
-  - '`cargo test` (default features) — exit 0, **77 test binaries, 1,517 passed, 0 failed**, with `XDG_CONFIG_HOME`
-    redirected to a scratch directory (this machine''s standing environment fix for `tests/plugin.rs`,
-    unrelated to the release).'
-  - '`cargo test --all-features` — exit 0, **77 binaries, 1,603 passed, 0 failed**, as a separate invocation.
-    `cargo test --doc` — **410 passed, 0 failed**.'
-  - '`cargo fmt --check` exit 0. `cargo clippy --all-targets --all-features -- -D warnings` exit 0, **after
-    it refused a `std::sync::MutexGuard` held across an await** in the new env-serialising tests.'
-  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0, **after
-    it caught one error stable `cargo doc` did not report**: a redundant explicit link target on `[`select`](crate::sandbox::select)`
-    in a file that has the type in scope. The sixth of the last eight releases this gate has found something.'
-  - N1 — `cargo tree` is **402** lines, unchanged since 0.34.0. N2 — MSRV unmoved at 1.95. N3 — `docs/public-api.txt`
-    gains **exactly one line** (`enum ExecMode`) and loses none, the number stated at plan time. N4 —
-    `git diff main -- src/state.rs` is **empty** and `CHECKPOINT_FORMAT` is unmoved at 7.
-  - 'N5 — **measured, not asserted to be small.** On this macOS host under `macos-sandbox-exec`, 30 iterations
-    of the same trivial command: full-access **5.48 ms** per command, workspace-write **11.73 ms** per
-    command, so wrapping costs **~6.25 ms per command**. Noise against a build that takes seconds; real
-    for a run issuing hundreds of tiny commands, and now a figure rather than a hope.'
-  - 'N6 — the four preceding releases'' own suites pass unchanged in the full run: `cache_boundary`, `compaction`,
-    `parallel_reads`, `tool_hooks`. O2 — cross-version both directions: the forward halves in the ordinary
-    suite, and the backward half run as CI runs it (`cargo build` in `tests/fixtures/gen-0.29.0`, then
-    `cargo test --test cross_version_0_29_0 -- --ignored`) — **1 passed**. `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0`
-    unchanged, which is itself the assertion.'
-  - '**Nine sabotages, each failing a NAMED test, none silent.** S1 the default flipped back → F1; S2
-    full-access still wrapped → F2; S3 read-only grants the workdir → F3 plus both platform unit tests;
-    S4 no cargo cache directories → F4; S5 no exists-filter → F6; S6 the requested backend reported →
-    F9; S7 the Linux loop drops the roots → F7''s Linux half; S8 the gate keeps an empty root list → F8.'
-  - '**A process finding worth keeping: a sabotage that appears to survive must first be checked for having
-    applied.** One run reported S2 as surviving; the patch had been written against pre-`cargo fmt` source
-    and matched nothing, so nothing was sabotaged. Re-applied against the formatted text it fails F2 immediately.
-    A sabotage harness must assert its own patch landed, or it manufactures findings.'
+  - Cargo.lock
+  evidence: []
