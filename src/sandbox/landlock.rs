@@ -221,7 +221,7 @@ pub(crate) fn plan(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use imp::{abi, Ruleset};
+pub(crate) use imp::{abi, restrict_self, Ruleset};
 
 #[cfg(target_os = "linux")]
 mod imp {
