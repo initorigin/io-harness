@@ -230,7 +230,7 @@ tasks:
   why_required: The marker is conditional, so an operator whose run gets no cache reads cannot otherwise
     tell whether it was never offered, withheld by the guard, or ignored by the vendor. It is the release's
     only new public surface after the break.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.44.0-T04
   acceptance_criteria:
@@ -245,7 +245,25 @@ tasks:
   - src/observe.rs
   - src/run.rs
   - tests/cache_boundary.rs
-  evidence: []
+  evidence:
+  - '`EventKind::CacheMarked { through_step, prefix_bytes }` added to an enum `#[non_exhaustive]` since
+    0.24.0, so it is additive. `EVENT_NAMES` gained `cache_marked` and the `every_kind` census gained
+    the variant plus its arm in the exhaustiveness guard — the bookkeeping trap 45 records. `through_step`
+    rather than `step`, matching `Compacted` beside it; `run_id` would have been trap 77''s duplicate
+    key.'
+  - Emitted on the TRANSITION into marking, via `PrefixGuard { last, marking }`. The one extra bit is
+    what tells a first mark from a repeat; every change of marked prefix passes through an unmarked step,
+    so 'newly marking' and 'the marked prefix changed' are the same event and no previous offset need
+    be kept.
+  - '`cache_marked_fires_on_change_and_not_once_per_step`: marked steps strictly outnumber events, exactly
+    2 events across the F4 run (the first prefix and the one the note moved it to), each `prefix_bytes`
+    equal to an offset actually sent, and the two differing from each other.'
+  - '`a_run_that_never_folds_emits_no_cache_marked`: the negative control. The absence of the event is
+    the documented signal that nothing was marked.'
+  - '`cargo test --lib observe::` 7 passed / 0 failed; `--test cache_boundary` 6 passed / 0 failed. fmt
+    clean, clippy --all-targets -D warnings clean.'
+  - 'Sabotage: emit on every marked step — 0.34.0''s `Routed` defect reproduced — fails `cache_marked_fires_on_change_and_not_once_per_step`
+    and nothing else.'
 - id: US-IO-HARNESS-0.44.0-T06
   summary: Measure the saving once against a real vendor, with the no-marker control.
   why_required: The entire benefit of this release is vendor-side. Every other criterion proves the crate

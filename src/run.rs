@@ -4201,7 +4201,7 @@ async fn run_workspace_from<P: Provider>(
     // built request could never see that. `None` while there is no fold, after a fold
     // whose summary assembly stubbed, and on a resume — a resumed run has sent this
     // prefix zero times from where it now stands, so it earns the marker again.
-    let mut marked_prefix: Option<String> = None;
+    let mut marked_prefix = PrefixGuard::default();
     // The run's live process handles, created before the first turn and killed
     // when the run ends however it ends. `Arc` because the reaping task for each
     // handle outlives the dispatch that started it and has to be able to record
@@ -4344,7 +4344,8 @@ async fn run_workspace_from<P: Provider>(
             let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
             // 0.44.0 — the second cache breakpoint, at the end of what compaction
             // froze, and only once that prefix has already gone out once.
-            let cache_boundary = cache_boundary_for(&user, &ledger, &mut marked_prefix);
+            let cache_boundary =
+                cache_boundary_for(&user, &ledger, &mut marked_prefix, watch, run_id, step, 0);
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 // 0.37.0 — the conversational prompt is this turn's opening only. Every
@@ -5807,7 +5808,7 @@ fn run_agent<'f, P: Provider>(
         // 0.44.0 — per agent, not per tree. Each agent in a tree assembles its own
         // prompt from its own ledger, so one agent's frozen prefix says nothing about
         // another's, and a shared one would mark a prefix this agent has never sent.
-        let mut marked_prefix: Option<String> = None;
+        let mut marked_prefix = PrefixGuard::default();
         // Same ledger and same per-turn assembly as the workspace loop: a tree of
         // 100 children each re-sending its own unbounded log is the multiplied
         // version of the problem 0.10.0 exists to fix — and, since 0.13.0, the
@@ -5914,7 +5915,15 @@ fn run_agent<'f, P: Provider>(
                 // 0.44.0 — the same rule as the flat loop, through the same helper.
                 // A boundary computed in one loop and not the other would make a
                 // contained run and a flat one cache differently while nothing failed.
-                let cache_boundary = cache_boundary_for(&user, &ledger, &mut marked_prefix);
+                let cache_boundary = cache_boundary_for(
+                    &user,
+                    &ledger,
+                    &mut marked_prefix,
+                    tree.watch,
+                    run_id,
+                    step,
+                    depth,
+                );
                 #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
                 let request = CompletionRequest {
                     // 0.39.0 — a contained turn's opening is its first completion
@@ -10487,23 +10496,71 @@ fn frozen_prefix<'a>(user: &'a str, ledger: &ContextLedger) -> Option<&'a str> {
 /// `routed_model` is: a rule applied to a freshly-built request cannot detect its own
 /// transition, and a comparison recomputed from scratch each step would answer the same
 /// way every time.
+#[derive(Default)]
+struct PrefixGuard {
+    /// The previous step's candidate prefix.
+    last: Option<String>,
+    /// Whether the previous step actually sent a marker. The one bit that tells a
+    /// first mark from a repeat, and therefore what makes `CacheMarked` fire on the
+    /// transition rather than on every step.
+    marking: bool,
+}
+
+impl PrefixGuard {
+    /// The boundary for this step's request, and whether it is a prefix not already
+    /// being marked.
+    ///
+    /// The second half of the pair is exactly when [`EventKind::CacheMarked`] should
+    /// fire. Every change of marked prefix passes through an unmarked step — to mark a
+    /// new candidate the guard must first have seen it once, and on that step the old
+    /// one was no longer being marked — so "newly marking" and "the marked prefix
+    /// changed" are the same event, and neither needs the previous offset kept.
+    fn boundary(&mut self, user: &str, ledger: &ContextLedger) -> Option<(usize, bool)> {
+        let Some(candidate) = frozen_prefix(user, ledger) else {
+            // No fold, or the summary was stubbed. Forget what was seen: the next
+            // frozen prefix has to earn the marker again from scratch.
+            self.last = None;
+            self.marking = false;
+            return None;
+        };
+        if self.last.as_deref() != Some(candidate) {
+            self.last = Some(candidate.to_string());
+            self.marking = false;
+            return None;
+        }
+        let first = !self.marking;
+        self.marking = true;
+        Some((candidate.len(), first))
+    }
+}
+
+/// This step's boundary, emitting [`EventKind::CacheMarked`] when the marked prefix
+/// changes.
+///
+/// One definition, called by the flat workspace loop and the tree loop, so a contained
+/// run and a flat one cannot cache differently while every test still passes.
 fn cache_boundary_for(
     user: &str,
     ledger: &ContextLedger,
-    last: &mut Option<String>,
+    guard: &mut PrefixGuard,
+    watch: &Watch<'_>,
+    run_id: i64,
+    step: u32,
+    depth: u32,
 ) -> Option<usize> {
-    let Some(candidate) = frozen_prefix(user, ledger) else {
-        // No fold, or the summary was stubbed. Forget what was marked: the next
-        // frozen prefix has to earn the marker again from scratch.
-        *last = None;
-        return None;
-    };
-    let repeated = last.as_deref() == Some(candidate);
-    if !repeated {
-        *last = Some(candidate.to_string());
-        return None;
+    let (at, newly) = guard.boundary(user, ledger)?;
+    if newly {
+        watch.emit(RunEvent::at_depth(
+            run_id,
+            step,
+            depth,
+            EventKind::CacheMarked {
+                through_step: step,
+                prefix_bytes: at as u64,
+            },
+        ));
     }
-    Some(candidate.len())
+    Some(at)
 }
 
 /// One definition, and every loop calls it — the flat workspace loop and the tree

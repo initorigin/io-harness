@@ -22,10 +22,30 @@ use std::sync::{Arc, Mutex};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
 use io_harness::{
-    run_with, ApproveAll, Compaction, ContextBudget, Policy, Provider, Store, TaskContract,
-    Verification,
+    run_with, ApproveAll, Compaction, ContextBudget, EventKind, Flow, Observer, Policy, Provider,
+    RunEvent, Store, TaskContract, Verification,
 };
 use serde_json::json;
+
+/// Every `CacheMarked` the run emitted, as `(through_step, prefix_bytes)`.
+///
+/// Read off the event stream rather than out of the store, so the count and the
+/// requests the provider recorded are two independent halves of the claim.
+#[derive(Default)]
+struct Marks(Arc<Mutex<Vec<(u32, u64)>>>);
+
+impl Observer for Marks {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if let EventKind::CacheMarked {
+            through_step,
+            prefix_bytes,
+        } = &event.kind
+        {
+            self.0.lock().unwrap().push((*through_step, *prefix_bytes));
+        }
+        Flow::Continue
+    }
+}
 
 /// The one sentence the summarising model writes.
 const SUMMARY_SENTENCE: &str = "ZZ-SUMMARY-ZZ read alpha.txt and kept the token enum.";
@@ -339,10 +359,111 @@ fn the_boundary_is_one_helper_that_both_loops_call() {
     // once. Two declarations, no more: a third would be a third loop nobody told
     // this test about, and zero in one of them is the drift above.
     assert_eq!(
-        src.matches("let mut marked_prefix: Option<String> = None;")
+        src.matches("let mut marked_prefix = PrefixGuard::default();")
             .count(),
         2,
-        "one run-scoped prefix per loop"
+        "one run-scoped guard per loop"
+    );
+}
+
+// ------------------------------------------------------------------------ F8
+
+/// F8 — `CacheMarked` fires when the marked prefix changes, and not once per step.
+///
+/// This is 0.34.0's `Routed` defect reproduced deliberately: a rule applied to each
+/// freshly built request reports a transition every step and stops meaning anything.
+/// The count is what discriminates — a run marking one prefix for many steps emits
+/// once, and the withdrawal-and-return of F4 emits a second time and no more.
+#[tokio::test]
+async fn cache_marked_fires_on_change_and_not_once_per_step() {
+    let dir = workspace();
+    let mut script: Vec<Vec<ToolCall>> = NAMES.iter().map(|n| vec![read(n)]).collect();
+    script.push(vec![remember("layout", "the parser lives in src/parse.rs")]);
+    script.push(vec![read("alpha.txt")]);
+    script.push(vec![read("beta.txt")]);
+    let steps = script.len() as u32;
+
+    let provider = Recorder::new(script);
+    let store = Store::memory().unwrap();
+    let marks = Marks::default();
+    let seen = Arc::clone(&marks.0);
+
+    io_harness::run_with_observed(
+        &contract(dir.path(), steps),
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &marks,
+    )
+    .await
+    .unwrap();
+
+    let events = seen.lock().unwrap().clone();
+    let marked_steps: Vec<usize> = provider
+        .working()
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.cache_boundary.is_some())
+        .map(|(i, _)| i)
+        .collect();
+
+    assert!(
+        marked_steps.len() > events.len(),
+        "the event must be rarer than the marking: {} marked steps, {} events",
+        marked_steps.len(),
+        events.len()
+    );
+    assert_eq!(
+        events.len(),
+        2,
+        "one for the first prefix and one for the prefix the note moved it to, got {events:?}"
+    );
+
+    // Each event's `prefix_bytes` is the offset that was actually sent on that step,
+    // and its `through_step` is the envelope's step.
+    let working = provider.working();
+    for (through_step, prefix_bytes) in &events {
+        let sent = working
+            .iter()
+            .find(|r| r.cache_boundary == Some(*prefix_bytes as usize))
+            .unwrap_or_else(|| panic!("no request carried {prefix_bytes} bytes"));
+        assert_eq!(sent.cache_boundary, Some(*prefix_bytes as usize));
+        assert!(*through_step > 0, "a marker is never sent before step 1");
+    }
+
+    // The two prefixes really are different, which is what "on change" means.
+    assert_ne!(events[0].1, events[1].1, "{events:?}");
+}
+
+/// The negative control: a run that cannot fold emits none.
+#[tokio::test]
+async fn a_run_that_never_folds_emits_no_cache_marked() {
+    let dir = workspace();
+    let provider = Recorder::new(NAMES.iter().map(|n| vec![read(n)]).collect());
+    let store = Store::memory().unwrap();
+    let marks = Marks::default();
+    let seen = Arc::clone(&marks.0);
+
+    let never = contract(dir.path(), NAMES.len() as u32).with_compaction(Compaction {
+        at_share: 1.0,
+        ..Compaction::default()
+    });
+
+    io_harness::run_with_observed(
+        &never,
+        &provider,
+        &store,
+        &open_policy(),
+        &ApproveAll,
+        &marks,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "the absence of the event is the signal that nothing was marked"
     );
 }
 
