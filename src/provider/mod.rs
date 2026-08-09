@@ -574,6 +574,35 @@ pub struct CompletionRequest {
     pub media: Vec<Media>,
 }
 
+/// Split `user` at [`CompletionRequest::cache_boundary`], or `None` when there is no
+/// boundary or the one there is cannot be honoured.
+///
+/// One helper rather than one rule per wire, for the reason [`web_key`], `effort_key`
+/// and `cached_system` are each one function: two vendors differ in the *shape* they
+/// carry a marker in, never in what makes an offset valid, and a validity rule written
+/// twice is a validity rule that drifts once.
+///
+/// [`None`] is returned — the request is sent exactly as it was before 0.44.0 — when:
+///
+/// - there is no boundary;
+/// - the offset is `0`, which would mark an empty prefix;
+/// - the offset is at or past the end, which would leave an empty remainder that a
+///   vendor rejects as an empty content block;
+/// - the offset is not on a UTF-8 character boundary, where slicing would panic.
+///
+/// None of these is an error. A boundary is an optimisation, and an optimisation that
+/// turns a working run into an `Err` — or into a panic — costs more than it can save.
+/// The same reasoning `TaskContract::max_parallel_reads` uses when it clamps `0`.
+///
+/// [`web_key`]: crate::provider::openai_wire::web_key
+pub(crate) fn split_at_boundary(request: &CompletionRequest) -> Option<(&str, &str)> {
+    let at = request.cache_boundary?;
+    if at == 0 || at >= request.user.len() || !request.user.is_char_boundary(at) {
+        return None;
+    }
+    Some(request.user.split_at(at))
+}
+
 /// Refuse a request carrying media that `provider` does not accept.
 ///
 /// Called by the run loop before every completion, so the boundary covers an

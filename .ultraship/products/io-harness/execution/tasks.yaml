@@ -40,7 +40,7 @@ tasks:
   why_required: Anthropic is the vendor the second breakpoint is designed against, and the one where image
     ordering means the boundary cannot always be honoured. Without this the field is inert on the wire
     it matters most on.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.44.0-T01
   acceptance_criteria:
@@ -69,7 +69,27 @@ tasks:
     '
   files:
   - src/provider/anthropic.rs
-  evidence: []
+  evidence:
+  - '`Anthropic::text_content` splits `user` at the boundary into two text blocks, `cache_control: ephemeral`
+    on the first only; `user_content` returns it whenever `media` is empty. The validity rule is `provider::split_at_boundary`,
+    one helper both wires call, so `0`, an offset at or past the end, and a non-character-boundary offset
+    are ignored rather than sliced.'
+  - '`body_splits_the_user_turn_at_the_boundary_and_marks_only_the_first_half` asserts two text blocks,
+    the marker on the first and absent from the second, the two texts concatenating byte-identically to
+    `request.user`, and exactly TWO `cache_control` occurrences in the whole body — 0.38.0''s system breakpoint
+    plus this one.'
+  - '`an_unusable_boundary_sends_the_body_that_has_always_been_sent` asserts the whole body is byte-identical
+    to the unmarked one for `None`, `Some(0)`, `Some(len+1)`, `Some(usize::MAX)` and an offset inside
+    a two-byte `é`.'
+  - '`an_image_suppresses_the_boundary_because_the_images_come_first` (media feature) asserts one image
+    block, one WHOLE unmarked text block, one `cache_control` in the body, and byte-identity with the
+    same request carrying no boundary at all.'
+  - '`cargo test --lib --features media provider::anthropic`: 24 passed / 0 failed.'
+  - 'Sabotages, one per arm. `rest.trim_start()` and `prefix.trim_end()` each fail the F1 test and nothing
+    else. Suppression removed (`user_content` always splitting) fails TWO named media tests. FINDING:
+    the first `trim_start` run failed NOTHING — the fixture''s remainder began with a letter, so the sabotage
+    was a no-op. The fixture now carries whitespace on both sides of the split and both arms bite; the
+    test was only half discriminating until that was found.'
 - id: US-IO-HARNESS-0.44.0-T03
   summary: Split the same way on the OpenRouter flavour, send nothing on the OpenAI flavour, and keep
     image blocks after the text.
