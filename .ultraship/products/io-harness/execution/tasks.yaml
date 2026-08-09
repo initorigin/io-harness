@@ -1,451 +1,432 @@
 product: io-harness
-version: 0.43.0
+version: 0.44.0
 tasks:
-- id: US-IO-HARNESS-0.43.0-T01
-  summary: Add the `summaries` table, its `(run_id, through_step)` index, `Summary`, `Store::put_summary`
-    and `Store::summaries`, and extend the cross-version lists.
-  why_required: 'Every compaction claim rests on the summary being durable: a resumed run must re-read
-    it rather than pay for it again, and the transcript renders it. The row must exist before anything
-    writes one, and the additive-migration criterion is asserted against this DDL and no other.'
+- id: US-IO-HARNESS-0.44.0-T01
+  summary: Add `CompletionRequest::cache_boundary`, skipped when `None`.
+  why_required: Nothing else in the release can be built until the request can carry the offset. The serde
+    attribute matches the three optional fields before it, and the criterion that guards it is the only
+    thing in the suite that can see it change.
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**O2 — the store migration is additive and proven so.** One new table and one new index, `CHECKPOINT_FORMAT`
-    unmoved at 7, no existing table, column or index created or altered, `git diff main -- src/state.rs`
-    containing exactly that DDL and its reader. A 0.42.0 store opens, resumes and rewinds under 0.43.0,
-    and a 0.43.0 store opens under a 0.42.0 binary, asserted by the cross-version tests that already read
-    the 0.22.0 and 0.29.0 fixture stores. `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0` (`tests/cross_version.rs:149`,
-    `:233`) updated in the same commit as the DDL.
+  - '**F9 — an unmarked request keys as it always has, and a marked one is a different question.** An
+    unmarked request''s serialised form carries no `cache_boundary` key at all; a marked one carries it;
+    and a recording made by the unmarked request refuses to answer the marked one. The second half is
+    the load-bearing one — the key is the exact request content, and the two are not the same request.
+    Sabotage: drop `skip_serializing_if`, under which `"cache_boundary":null` enters every key and this
+    test fails while **every other test in the replay suite still passes**, which is the finding that
+    justifies the criterion: one build records and replays through the same serialiser, so nothing else
+    here can see it.
 
     '
   files:
-  - src/state.rs
-  - src/lib.rs
-  - tests/cross_version.rs
-  - tests/summaries.rs
-  evidence:
-  - '`summaries (id, run_id, through_step, kept_from, text, est_tokens, at)` and `CREATE INDEX summaries_run
-    ON summaries (run_id, through_step)` added in `Store::open`''s DDL batch, immediately before the
-    `CHECKPOINT_FORMAT` stamp. `text` is deliberately in no index — the control column, the same shape
-    `gate_attempts.detail` and `runs.finish_reason` use.'
-  - '`Summary` is `#[non_exhaustive]` in `src/state.rs`, re-exported from `src/lib.rs`, with `Store::put_summary`,
-    `Store::summary_at` (newest row at a boundary wins) and `Store::summaries` (per run, oldest first).'
-  - '`ADDED_SINCE_0_22_0` (`tests/cross_version.rs`) gains `summaries` and `summaries_run`. `COLUMNS_ADDED_SINCE_0_22_0`
-    is unchanged: no table is altered.'
-  - '`cargo test --test summaries` exit 0, 6 passed: round trip, a neighbouring step is not the boundary,
-    a corrected fold reads back as the correction while both rows survive, per-run isolation and ordering,
-    an unfolded run is empty, and `CHECKPOINT_FORMAT == 7`.'
-  - '`cargo test --test cross_version` exit 0, 5 passed — including `the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it`
-    and `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing`, which are O2''s
-    migration half and pass over the new DDL.'
-- id: US-IO-HARNESS-0.43.0-T02
-  summary: Add `Compaction`, `TaskContract::compaction` and `with_compaction`, and `EventKind::Compacted`,
-    with the event census and `EVENT_NAMES` updated in the same commit.
-  why_required: The knob decides when a fold happens and is the one-line return to 0.42.0's behaviour
-    the changelog promises; the event is how an operator sees a fold at all. Both are needed before the
-    helper that reads them exists.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.43.0-T01
-  acceptance_criteria:
-  - '**F2 — under the threshold, nothing happens and nothing is spent.** The same run with `at_share:
-    1.0`, and separately with a ledger that never crosses the share: zero `summaries` rows, zero `Compacted`
-    events, and the counting provider records exactly the completions the steps required. Byte-for-byte,
-    the requests are 0.42.0''s. Sabotage: fold every turn, under which the completion count is wrong and
-    this fails while F1 still passes.
-
-    '
-  files:
-  - src/context.rs
-  - src/contract.rs
-  - src/observe.rs
-  - src/lib.rs
-  - tests/compaction.rs
-  evidence:
-  - '`Compaction { at_share, keep_recent }` landed in `src/context.rs` beside `ContextBudget`, with
-    `Default` (0.8 / 8), `enabled()`, `threshold_tokens(effective_tokens)` and `keep()`. Re-exported
-    from `src/lib.rs`.'
-  - 'Deliberately NOT `#[non_exhaustive]`, and the reason is recorded at the type: it is `ContextBudget`''s
-    sibling and every caller and doctest writes `Compaction { .. ..default() }`, which `#[non_exhaustive]`
-    refuses outside the crate with `E0639`. Found by the tests, not by reasoning — `tests/compaction.rs`
-    failed to compile three times against the first version.'
-  - '`TaskContract::compaction` + `with_compaction` added to the `#[non_exhaustive]` struct; both
-    constructors default it, so an existing caller is unchanged in source and folds by default in
-    behaviour.'
-  - '`EventKind::Compacted { through_step, before_tokens, after_tokens }` added before `Finished`, with
-    `EVENT_NAMES` gaining `"compacted"`, the `every_kind()` sample vector gaining an instance and the
-    compile-time census arm naming it — the three-file bookkeeping a new variant owes.'
-  - '`cargo test --test compaction` exit 0, 6 passed: the default folds and reaches a contract built the
-    ordinary way; `at_share: 1.0` is 0.42.0 exactly and its threshold is unreachable; NaN, infinity,
-    negative and zero all read as never rather than always; the threshold is derived from the same
-    `effective_tokens` the assembler uses; `keep_recent: 0` floors at 1; and the config-file round trip
-    refuses a misspelled key. This is F2''s threshold half — the run-level half is T03.'
-  - '`cargo test --lib` exit 0, 388 passed, including `event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
-    and `every_variant_round_trips`, which are what prove the new variant''s bookkeeping complete rather
-    than merely written.'
-- id: US-IO-HARNESS-0.43.0-T03
-  summary: Add the fold helper — threshold, summarising prompt, ledger edit and stored-row re-read — and
-    call it from both loops immediately before `assemble`.
-  why_required: This is the release's headline capability. It is also the shape most at risk of landing
-    in one loop and not the other, or inside assembly, which is why it is one definition with two asserted
-    call sites.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.43.0-T02
-  acceptance_criteria:
-  - '**F1 — a fold replaces the oldest observations with a written summary, and the next request carries
-    it.** A run driven past the threshold with a fixture provider that records every request it receives.
-    Two assertions, and the pair is what discriminates: the summarising request contains the text of an
-    observation being folded, and the **next step''s** request contains a distinctive sentence from the
-    summary while **not** containing a distinctive string that appeared only in a folded observation.
-    Sabotage: fold by stubbing instead of summarising (today''s behaviour), under which the second assertion
-    fails and every weaker one passes.
-
-    '
-  - '**F3 — the summary is stored once and re-read.** A run that compacts, is interrupted, and is resumed
-    under the same run id: the counting provider shows the summarising model was called **once in total**,
-    one `summaries` row exists with the `through_step` it covers, and the resumed run''s next request
-    carries the same summary text. Sabotage: read the row but write a fresh summary anyway, under which
-    the counter is two and only this fails.
-
-    '
-  - '**N4 — a fold costs one provider call and is visible where spend already is.** The summarising completion
-    lands exactly one `provider_calls` row for the step it happened in, attributed to the run, and its
-    tokens are inside `Store::spent_tokens` and inside the run''s token budget. Asserted by row count
-    and by a budget tight enough that the summarising call is what exhausts it — a fold that spent money
-    invisibly would be the one defect this release could ship without noticing.
-
-    '
-  - '**N5 — 0.41.0''s batch and 0.42.0''s gate are unaffected.** With compaction on, three read-only tools
-    still rendezvous inside the bound and are still folded back in the model''s call order, and a `before_tool`
-    hook is still consulted exactly once per call. The fold is in the serial phase before assembly and
-    touches neither. Asserted rather than assumed, because a helper inserted into both loops is exactly
-    where a regression to either would hide.
-
-    '
-  files:
-  - src/context.rs
-  - src/run.rs
-  - tests/compaction.rs
-  evidence:
-  - '`compact_ledger` in `src/run.rs` is the one definition, called from both loops immediately before
-    `assemble` — the flat workspace loop and the tree loop — and never from inside `assemble`, which
-    still makes no provider call. It compares the ledger''s estimated tokens against `at_share ×
-    effective_tokens`, folds all but `keep_recent` from the front, and returns the tokens it spent.'
-  - 'The summarising call goes through `complete_with_retry`, the single choke point every completion
-    uses, with `SUMMARY_SYSTEM` and no tools — so it lands one ordinary `provider_calls` row and is
-    retried, traced and billed like everything else. Never streamed.'
-  - 'A fold may only replace observations the store already holds: `count = (len - keep).min(written)`,
-    where `written` is the durable watermark. Found by the tests, not by reasoning — the first version
-    panicked in `persist_ledger` with "range start index 5 out of range for slice of length 4", because
-    folding shrank the vector the watermark indexes into. The watermark moves with the fold.'
-  - '`US-IO-HARNESS-0.43.0-I01`: the row is keyed on `folded` rather than on the step, and
-    `restore_ledger` replays the stored folds. Both corrections came from F3 failing three different
-    ways; see the iteration record.'
-  - 'N4 caught the invisible spend it was written for. `Store::spent_tokens` sums `steps.tokens`, so a
-    fold billed only in `provider_calls` was money the run''s own token budget never saw — 96 against
-    120. The fold''s tokens now join the step''s total in both loops.'
-  - 'An empty summary is not a fold: a summariser that returns no text leaves the ledger alone rather
-    than replacing the notes with nothing. The call still happened and is still billed.'
-  - '`cargo test --test compaction` exit 0, 11 passed. F1 is the discriminating pair — the summarising
-    request contains the folded observation, and a later working request contains the summary''s own
-    sentence and no longer contains a marker that appeared only in the folded text. F3 parks a
-    completion forever, drops the run mid-step (the only interruption that leaves a run resumable —
-    every clean stop, cancellation included, is terminal to `resume` by design) and resumes: the
-    summarising model is called once in total and the paragraph is still in the request. N4 asserts one
-    extra `provider_calls` row per fold, filed under the step it happened in, and `spent_tokens` equal
-    to the sum over those rows.'
-  - 'N5: the whole corpus is the control, because compaction is on by default and every suite now runs
-    with it. `cargo test --tests --no-fail-fast` — 68 suites green, including `parallel_reads`
-    (0.41.0''s batch) and `tool_hooks` (0.42.0''s gate). One existing test needed a line:
-    `tests/context.rs`''s prompt-stabilisation test drives a positional script under a 1,000-token
-    budget, where the fold now fires and inserts a completion the script cannot see coming — it sets
-    `at_share: 1.0` and says why, because it is 0.13.0''s elision claim and the fold''s own
-    stabilisation is asserted in `tests/compaction.rs`.'
-  - '`cargo test --doc` exit 0, 388 passed; `cargo test --lib` exit 0, 388 passed;
-    `cargo test --test public_api` exit 0 after `docs/public-api.txt` gained `Compaction` and
-    `Summary` by hand.'
-- id: US-IO-HARNESS-0.43.0-T04
-  summary: Add `ProviderErrorKind::ContextOverflow` and `#[non_exhaustive]` to the enum, add `from_response`,
-    and route the three built-in providers through it.
-  why_required: An overflow is indistinguishable from any other 4xx today, so the recovery has nothing
-    to branch on. This is the release's one public break and it is paid here, once, with the conservative
-    classifier and its negative control.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - '**F6 — classification is conservative and does not swallow a real 400.** A 400 with a message carrying
-    none of the signatures stays `Request`, terminal, with no fold and no second attempt — the negative
-    control that must not move. A 401 stays `Auth`, a 429 stays `RateLimited`, a 500 stays `Server`; `from_status`
-    is asserted byte-identical in behaviour to 0.42.0''s over the whole status range it maps. Sabotage:
-    classify any 400 as an overflow, under which the control run compacts and re-asks a request the server
-    had already read and refused.
-
-    '
-  files:
-  - src/error.rs
   - src/provider/mod.rs
-  - src/provider/openai_wire.rs
-  - src/provider/anthropic.rs
-  - tests/overflow.rs
+  - tests/replay.rs
   evidence:
-  - '`ProviderErrorKind::ContextOverflow` added, and `#[non_exhaustive]` on the enum in the same
-    release — one break, paid once, the move four previous releases each made on a different type.
-    `is_retryable()` returns false for it, and the doc says why that is the right answer rather than a
-    compromise: re-sending bytes a server called too many cannot work, and the recovery is a different
-    request.'
-  - '`ProviderErrorKind::from_response(status, message)` added beside `from_status`, which keeps its
-    exact signature and behaviour. Only a 400 or a 413 is eligible; the seven vendor signatures are a
-    short list matched case-insensitively, documented as conservative on purpose.'
-  - 'No per-vendor edit was needed. Every built-in provider builds its status failures through
-    `Error::provider_status`, which is the single funnel — so OpenRouter, OpenAI and Anthropic cannot
-    drift apart on what an over-window rejection is, and `src/provider/` is untouched by this task.'
-  - '`cargo test --test overflow` exit 0, 6 passed. F6''s negative control is
-    `an_ordinary_400_is_left_exactly_where_it_was` (four ordinary 400s, including an empty message,
-    stay `Request`); `a_status_that_means_something_else_is_not_reclassified_by_its_wording` proves a
-    429 carrying a signature verbatim is still a rate limit; and `from_status_behaves_exactly_as_it_did_on_0_42_0`
-    asserts the old mapping over the whole 400..600 range rather than at a few points.'
-- id: US-IO-HARNESS-0.43.0-T05
-  summary: Answer a `ContextOverflow` by folding unconditionally and re-asking once, bounded at one recovery
-    per step, in the same helper both loops call.
-  why_required: Classification without recovery leaves the run dying exactly as it does today. The bound
-    is what stops a pathological request looping, and it is the second caller the fold helper was built
-    for.
+  - '`CompletionRequest::cache_boundary: Option<usize>` added at `src/provider/mod.rs` with `#[serde(default,
+    skip_serializing_if = "Option::is_none")]`, like `model`, `web` and `effort` before it. `cargo fmt
+    --check` clean, `cargo clippy --all-targets -- -D warnings` clean, and the field''s own worked doctest
+    passes (2 passed / 0 failed).'
+  - '`a_boundary_is_absent_from_an_unmarked_key_and_present_in_a_marked_one` (`tests/replay.rs`): the
+    replay suite is 9 passed / 0 failed.'
+  - 'Sabotage — drop `skip_serializing_if` — gives 8 passed / 1 failed, failing that named test and NOTHING
+    else. Reported as a finding: one build serialises both sides of a recording the same way, so no pre-existing
+    test can see it. This is what disproved the contract''s cassette claim (`US-IO-HARNESS-0.44.0-I01`).'
+  - '`#[non_exhaustive]` was applied, measured and reverted: E0639 at `tests/replay.rs:136`, `:392`, `:428`,
+    the first being `..Default::default()`. Removed from scope by `US-IO-HARNESS-0.44.0-I01`; the reason
+    is recorded in a comment at the type.'
+- id: US-IO-HARNESS-0.44.0-T02
+  summary: Anthropic splits the user turn at the boundary and refuses it when images are present.
+  why_required: Anthropic is the vendor the second breakpoint is designed against, and the one where image
+    ordering means the boundary cannot always be honoured. Without this the field is inert on the wire
+    it matters most on.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.43.0-T03
-  - US-IO-HARNESS-0.43.0-T04
+  - US-IO-HARNESS-0.44.0-T01
   acceptance_criteria:
-  - '**F4 — a context overflow is classified, and the run survives it.** A fixture provider that refuses
-    any request over a byte threshold with the vendor wording, and serves one under it. The run finishes;
-    the trace holds exactly one `Compacted` event and the failing attempt; and the request that succeeded
-    is provably shorter than the one that failed. `ProviderErrorKind` on the failing attempt''s recorded
-    error is `ContextOverflow` and not `Request`. Sabotage: re-ask without compacting, under which the
-    second attempt hits the same refusal and the run escalates.
+  - '**F1 — a marked request is two text blocks that reassemble exactly.** Anthropic''s and OpenRouter''s
+    body builders, called directly with a `CompletionRequest` whose `cache_boundary` is `Some(n)`. Three
+    assertions: `content` is an array of two `text` blocks; the first carries `cache_control: {"type":"ephemeral"}`
+    and the second carries none; and **the two texts concatenated are byte-identical to `request.user`**.
+    The third is the discriminating one. Sabotage: split with `trim()` on either half, under which the
+    first two assertions pass and only the concatenation fails.
 
     '
-  - '**F5 — the recovery happens once.** A provider that refuses **every** request whatever its size:
-    the run escalates with `RunOutcome::Escalated { retryable: false, .. }` after exactly two completion
-    attempts for that step and one fold, not a loop. The step row names both. Sabotage: remove the once-per-step
-    bound, under which the attempt count grows past two.
+  - '**F2 — `None` is 0.43.0''s body, byte for byte.** The same builders with `cache_boundary: None`,
+    asserted against the serialised body 0.43.0 produced for the same request — the whole body, not the
+    user field. Separately, an offset past `user.len()`, an offset landing inside a multi-byte character,
+    and `Some(0)` each produce that same body and no error. Sabotage: treat an out-of-range offset as
+    a clamp to the end, under which one block becomes two and this fails while F1 still passes.
+
+    '
+  - '**F6 — media decides the boundary per wire, and the two wires differ.** One request carrying an image
+    and `cache_boundary: Some(n)`: Anthropic''s body has images first and **one** text block with no `cache_control`;
+    OpenRouter''s has **two** marked-then-unmarked text blocks followed by the image blocks. Both assertions
+    in one test, because the point is the difference. Sabotage: honour the boundary on Anthropic with
+    media present, under which the marked block is not a prefix of the message and the cache entry can
+    never be hit.
+
+    '
+  files:
+  - src/provider/anthropic.rs
+  evidence:
+  - '`Anthropic::text_content` splits `user` at the boundary into two text blocks, `cache_control: ephemeral`
+    on the first only; `user_content` returns it whenever `media` is empty. The validity rule is `provider::split_at_boundary`,
+    one helper both wires call, so `0`, an offset at or past the end, and a non-character-boundary offset
+    are ignored rather than sliced.'
+  - '`body_splits_the_user_turn_at_the_boundary_and_marks_only_the_first_half` asserts two text blocks,
+    the marker on the first and absent from the second, the two texts concatenating byte-identically to
+    `request.user`, and exactly TWO `cache_control` occurrences in the whole body — 0.38.0''s system breakpoint
+    plus this one.'
+  - '`an_unusable_boundary_sends_the_body_that_has_always_been_sent` asserts the whole body is byte-identical
+    to the unmarked one for `None`, `Some(0)`, `Some(len+1)`, `Some(usize::MAX)` and an offset inside
+    a two-byte `é`.'
+  - '`an_image_suppresses_the_boundary_because_the_images_come_first` (media feature) asserts one image
+    block, one WHOLE unmarked text block, one `cache_control` in the body, and byte-identity with the
+    same request carrying no boundary at all.'
+  - '`cargo test --lib --features media provider::anthropic`: 24 passed / 0 failed.'
+  - 'Sabotages, one per arm. `rest.trim_start()` and `prefix.trim_end()` each fail the F1 test and nothing
+    else. Suppression removed (`user_content` always splitting) fails TWO named media tests. FINDING:
+    the first `trim_start` run failed NOTHING — the fixture''s remainder began with a letter, so the sabotage
+    was a no-op. The fixture now carries whitespace on both sides of the split and both arms bite; the
+    test was only half discriminating until that was found.'
+- id: US-IO-HARNESS-0.44.0-T03
+  summary: Split the same way on the OpenRouter flavour, send nothing on the OpenAI flavour, and keep
+    image blocks after the text.
+  why_required: OpenRouter is the wire the live measurement is taken on, and `WebFlavor::OpenAi` fronts
+    21 `Compatible` endpoints whose bodies must not change at all. Both halves are one change to one shared
+    body builder.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.44.0-T01
+  acceptance_criteria:
+  - '**F1 — a marked request is two text blocks that reassemble exactly.** Anthropic''s and OpenRouter''s
+    body builders, called directly with a `CompletionRequest` whose `cache_boundary` is `Some(n)`. Three
+    assertions: `content` is an array of two `text` blocks; the first carries `cache_control: {"type":"ephemeral"}`
+    and the second carries none; and **the two texts concatenated are byte-identical to `request.user`**.
+    The third is the discriminating one. Sabotage: split with `trim()` on either half, under which the
+    first two assertions pass and only the concatenation fails.
+
+    '
+  - '**F2 — `None` is 0.43.0''s body, byte for byte.** The same builders with `cache_boundary: None`,
+    asserted against the serialised body 0.43.0 produced for the same request — the whole body, not the
+    user field. Separately, an offset past `user.len()`, an offset landing inside a multi-byte character,
+    and `Some(0)` each produce that same body and no error. Sabotage: treat an out-of-range offset as
+    a clamp to the end, under which one block becomes two and this fails while F1 still passes.
+
+    '
+  - '**F5 — `WebFlavor::OpenAi` never sends a boundary.** The shared body builder at that flavour, with
+    `cache_boundary: Some(n)`, media present and absent, fold and no fold: the user message content is
+    the bare string in every case and the whole body is byte-identical to 0.43.0''s. The negative control
+    that must not move, and the one that covers 21 endpoints this crate does not control. Sabotage: honour
+    the boundary for every flavour, under which a `Compatible` endpoint receives a content shape nobody
+    asked it for.
+
+    '
+  - '**F6 — media decides the boundary per wire, and the two wires differ.** One request carrying an image
+    and `cache_boundary: Some(n)`: Anthropic''s body has images first and **one** text block with no `cache_control`;
+    OpenRouter''s has **two** marked-then-unmarked text blocks followed by the image blocks. Both assertions
+    in one test, because the point is the difference. Sabotage: honour the boundary on Anthropic with
+    media present, under which the marked block is not a prefix of the message and the cache entry can
+    never be hit.
+
+    '
+  files:
+  - src/provider/openai_wire.rs
+  evidence:
+  - '`cached_user(flavor, request)` added beside `cached_system`, the fourth per-vendor difference resolved
+    in the shared body builder after `web_key` (0.22.0), `effort_key` (0.31.0) and `cached_system` (0.38.0).
+    `WebFlavor::OpenAi` returns `None`; `WebFlavor::OpenRouter` splits through the shared `provider::split_at_boundary`.
+    The image part builder was factored out as `image_part` so the marked and unmarked paths cannot render
+    an image two ways.'
+  - '`the_openrouter_body_splits_the_user_turn_at_the_boundary`: two text blocks, marker on the first
+    only, byte-exact reassembly, exactly two `cache_control` in the body.'
+  - '`the_openai_body_ignores_a_boundary_entirely`: for `Some(len)`, `Some(0)` and `Some(usize::MAX)`
+    the user turn stays a bare string, the body holds zero `cache_control`, and the whole body is byte-identical
+    to the unmarked one. This is the control covering OpenAI plus all 21 `Compatible` endpoints.'
+  - '`an_unusable_boundary_leaves_the_openrouter_user_turn_alone`: `Some(0)`, `Some(len)`, `Some(len+1)`,
+    `Some(usize::MAX)` and an offset inside a two-byte `é` all produce the unmarked body.'
+  - '`an_image_still_leaves_a_markable_prefix_because_the_text_comes_first`: three parts — marked prefix,
+    remainder, image — because this wire puts text first. The same request is UNMARKED on Anthropic (T02),
+    and the pair is the criterion: one request, two vendors, two correct answers.'
+  - '`cargo test --lib --features media provider::`: 104 passed / 0 failed. fmt clean, clippy --all-targets
+    --features media -D warnings clean.'
+  - Sabotages. Honouring the boundary on the OpenAi flavour fails `the_openai_body_ignores_a_boundary_entirely`
+    and nothing else. Dropping the images from the marked path fails the media test and nothing else —
+    which matters because a silently discarded image is a request the model answers without seeing what
+    it was asked about.
+- id: US-IO-HARNESS-0.44.0-T04
+  summary: Compute the frozen prefix in one helper called from both assembly sites, and mark only when
+    the candidate repeated byte-identically.
+  why_required: This is the release. The wire can carry a boundary and nothing produces one until the
+    loop locates the summary in the assembled prompt and the guard decides it has been sent once already.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.44.0-T02
+  - US-IO-HARNESS-0.44.0-T03
+  acceptance_criteria:
+  - '**F3 — the boundary is offered only after a fold, and only once the prefix has repeated.** A run
+    driven past the compaction threshold over a fixture provider that records every request. The request
+    on the step the fold happens carries `cache_boundary: None`; the next carries `Some(n)`; and `user[..n]`
+    **ends with the summary''s own text** and contains the memory block and the prompt header ahead of
+    it. Sabotage: mark whenever the ledger holds a fold, under which the fold step is marked and only
+    this fails.
+
+    '
+  - '**F4 — a moved prefix withdraws the marker for exactly one step.** The same run, with a memory note
+    written on a step after the marker started being offered: that step''s request carries `None`, the
+    step after it carries `Some(m)`, and `m != n` — the prefix that came back is a different one. Four
+    steps, four different answers. Sabotage: compare the summary text instead of the whole candidate prefix,
+    under which the note never withdraws the marker and the crate asks a vendor to cache bytes it has
+    not sent.
+
+    '
+  - '**N5 — a run that never folds is 0.43.0 exactly.** With compaction off (`at_share: 1.0`) and over
+    a run too short to fold, every request the fixture provider receives carries `cache_boundary: None`
+    and the assembled prompts are byte-identical to 0.43.0''s for the same script. The cost of this release
+    to a short run is zero, asserted rather than reasoned.
+
+    '
+  - '**N6 — 0.41.0''s batch, 0.42.0''s gate and 0.43.0''s fold are unaffected.** With the boundary on,
+    three read-only tools still rendezvous inside the bound and are folded back in the model''s call order,
+    a `before_tool` hook is still consulted exactly once per call, and the fold still fires at `at_share`
+    and writes exactly one `summaries` row. The boundary is computed after assembly and changes no decision
+    any of the three makes. Asserted rather than assumed, because a helper inserted into both loops is
+    exactly where a regression to any of them would hide.
 
     '
   files:
   - src/run.rs
-  - tests/overflow.rs
+  - tests/cache_boundary.rs
   evidence:
-  - 'Both loops now make at most two attempts at a step''s completion: the fold, the assembly, the
-    request and the call are inside a `loop`, and a `ContextOverflow` on the first attempt sets
-    `recovered` and continues. The recovery fold is unconditional — the threshold was guessing at what
-    the vendor has now stated — and bounded at one per step.'
-  - '`complete_with_retry` gained a `may_compact` parameter. Without it the recovery was unreachable:
-    on a non-retryable failure the function records the escalation *and calls `finish`*, so the run was
-    already marked escalated before the loop saw the error. With `may_compact`, an overflow the caller
-    can answer is recorded as a step row and handed back without finishing the run; every other
-    failure, and a second overflow, escalate exactly as on 0.42.0.'
-  - 'The loop''s recovery arm and `may_compact` are guarded by the same condition, `!recovered &&
-    contract.compaction.enabled()`. The first version guarded only the loop, so a caller with folding
-    off got a second attempt on a run `complete_with_retry` had already finished — caught by
-    `with_folding_off_an_overflow_is_terminal_at_once`, which counted two refusals where 0.42.0 makes
-    one.'
-  - 'The summarising call passes `may_compact: false`: a fold cannot be answered by folding. The
-    single-file loop passes `false` too — it has no ledger, so an over-window request there is terminal
-    exactly as it was.'
-  - '`record_memory_recall` moved below the loop in both, so a recovered step writes one recall row
-    rather than two.'
-  - '`cargo test --test overflow` exit 0, 10 passed. F4 uses a provider that refuses any user block
-    over a byte ceiling and serves anything under it, so the request that succeeded is provably smaller
-    than the one refused — a recovery, not a re-send that got lucky — with a negative-control run under
-    the ceiling that never folds. F5''s provider refuses every request whatever its size: exactly two
-    refusals for the step, one fold, then an escalated run.'
-  - '`cargo test --tests --no-fail-fast` — 72 suites green. Four `fleet` failures and one `plan_gate`
-    failure on the way were a stale `target/debug/examples/` binary carrying the pre-rename `summaries`
-    DDL under `CREATE TABLE IF NOT EXISTS`; `cargo build --examples` fixed them, which is the standing
-    trap that `--tests` does not rebuild examples.'
-  - '`cargo clippy --all-features --all-targets` clean. `tests/provider_failures.rs` needed the
-    wildcard arm the `#[non_exhaustive]` break now requires — the same one-line migration a consumer
-    writes — and it panics rather than defaulting, so a kind added later still cannot slip in without a
-    decision about retrying it.'
-- id: US-IO-HARNESS-0.43.0-T06
-  summary: Add `Session::transcript`, `Transcript`, `TranscriptTurn` and `Transcript::to_markdown`, built
-    from the whole session tree.
-  why_required: A summary that replaces fifty observations is only honest if the fifty stay reachable,
-    and today reading a conversation back means writing the SQL yourself. The whole tree rather than the
-    head path is the half that cannot be recovered any other way.
+  - '`frozen_prefix(user, ledger)` locates the fold''s summary — the ledger''s first entry, `ObsKind::Message`
+    targeted `summary` — inside the assembled prompt by its own text, and returns everything through it.
+    A summary assembly STUBBED rather than carried is not found, and not being found is exactly the no-frozen-prefix
+    case, so the search is its own correctness check. No field was added to `Assembled`, which is not
+    `#[non_exhaustive]` and would have been a second public break.'
+  - '`cache_boundary_for(user, ledger, &mut last)` is the guard: it marks only when this step''s candidate
+    is byte-identical to the previous step''s, and clears the state when there is no candidate. Run-scoped
+    `marked_prefix` in BOTH loops — per agent in the tree loop, since each agent assembles from its own
+    ledger.'
+  - '`the_boundary_appears_only_after_a_fold_and_only_once_the_prefix_repeats`: no request before the
+    fold is marked, the fold''s OWN step is not marked, the next step is, the marked span ends with the
+    summary sentence and is a real prefix of `user`.'
+  - '`a_note_written_mid_run_withdraws_the_marker_for_one_step`: a `remember` call mid-run withdraws the
+    marker for exactly one step; the prefix that returns differs from the earlier one and contains the
+    note. This is the criterion that exists because the memory block renders AHEAD of the summary and
+    is re-read every turn.'
+  - '`the_boundary_is_one_helper_that_both_loops_call`: one definition each of `cache_boundary_for` and
+    `frozen_prefix`, >=2 call sites, and exactly two `marked_prefix` declarations — one per loop.'
+  - '`a_run_that_never_folds_marks_nothing` (N5): with `at_share: 1.0` no request carries a boundary and
+    none carries a summary.'
+  - 'N6 neighbours re-run and unaffected: compaction 11 passed, parallel_reads 8 passed, tool_hooks 6
+    passed.'
+  - Sabotages, one per arm. Dropping the guard (mark whenever a fold exists) fails BOTH F3 and F4. Comparing
+    only the summary instead of the whole candidate prefix fails both as well — that is the shape that
+    would ask a vendor to cache bytes never sent. Removing the tree loop's call site fails the shape test
+    and nothing else, which is the drift the test exists for.
+- id: US-IO-HARNESS-0.44.0-T05
+  summary: Add `EventKind::CacheMarked`, emitted when the marked prefix changes and not per step.
+  why_required: The marker is conditional, so an operator whose run gets no cache reads cannot otherwise
+    tell whether it was never offered, withheld by the guard, or ignored by the vendor. It is the release's
+    only new public surface after the break.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.43.0-T01
+  - US-IO-HARNESS-0.44.0-T04
   acceptance_criteria:
-  - '**F7 — a transcript renders the whole tree, including what the model can no longer see.** A session
-    of three turns, branched from the first, then one more turn. `Session::history` returns three; `Session::transcript`
-    returns **four**, in id order, with the branched-away turn present and `on_path: false`. The markdown
-    contains both turns'' prompts, and marks where a summary stands in for folded steps. Sabotage: build
-    the export from `history()`, under which the fourth turn is missing and only this criterion fails.
-
-    '
-  - '**F8 — a transcript is a read.** The same export run against a counting provider that must record
-    **zero** completions, on a session whose runs have already finished. Sabotage: summarise anything
-    at export time, under which the counter is non-zero.
+  - '**F8 — `CacheMarked` fires on change and not per step.** Over the F3/F4 run: exactly two `CacheMarked`
+    events for four marked steps across two distinct prefixes, each carrying the `through_step` it was
+    marked at and `prefix_bytes` equal to the offset that was sent, and a run that never folds emits none.
+    Sabotage: emit on every marked step, under which the count is four and only this fails — 0.34.0''s
+    `Routed` defect, reproduced deliberately.
 
     '
   files:
-  - src/session.rs
-  - src/lib.rs
-  - tests/transcript.rs
+  - src/observe.rs
+  - src/run.rs
+  - tests/cache_boundary.rs
   evidence:
-  - '`Session::transcript(&Store) -> Result<Transcript>` added, built from `Store::session_turns` —
-    the whole tree — with `on_path` computed from `Session::history`''s ids. `Transcript`,
-    `TranscriptTurn` and `Transcript::to_markdown` are `#[non_exhaustive]` and re-exported; each turn
-    carries its run''s `Summary` rows.'
-  - 'The markdown marks a branched-away turn as such and renders each fold as a line saying what it
-    stands in for — "At step 9, 21 earlier observations were summarised as: …" — which is the half that
-    makes compaction honest rather than lossy. One `String`, one method: a library does not choose the
-    caller''s file.'
-  - '`cargo test --test transcript` exit 0, 4 passed. F7 branches a three-turn session and asserts
-    `history` returns 2 while `transcript` returns 3, with exactly the branched-away turn marked
-    `on_path: false` and both branches present in the markdown — the assertion an export built from
-    `history()` fails and every weaker one passes. F8 exports three times against a counting provider
-    and asserts zero extra completions, zero extra `provider_calls` rows and no summary written.'
-  - '`docs/public-api.txt` gained `Transcript` and `TranscriptTurn` by hand, and both needed a worked
-    doctest before `every_public_item_has_a_worked_example` would pass — the three-file cost of a new
-    public item, paid here as it is every release.'
-- id: US-IO-HARNESS-0.43.0-T07
-  summary: 'Add `Session::attach` under the `media` feature: stage images for the next turn, append them
-    in `drive`, and clear the staging whatever the outcome.'
-  why_required: The one path an operator would hand a screenshot to is the only one that cannot take it.
-    One staging method covers all six turn shapes without a signature change or a seventh entry point.
+  - '`EventKind::CacheMarked { through_step, prefix_bytes }` added to an enum `#[non_exhaustive]` since
+    0.24.0, so it is additive. `EVENT_NAMES` gained `cache_marked` and the `every_kind` census gained
+    the variant plus its arm in the exhaustiveness guard — the bookkeeping trap 45 records. `through_step`
+    rather than `step`, matching `Compacted` beside it; `run_id` would have been trap 77''s duplicate
+    key.'
+  - Emitted on the TRANSITION into marking, via `PrefixGuard { last, marking }`. The one extra bit is
+    what tells a first mark from a repeat; every change of marked prefix passes through an unmarked step,
+    so 'newly marking' and 'the marked prefix changed' are the same event and no previous offset need
+    be kept.
+  - '`cache_marked_fires_on_change_and_not_once_per_step`: marked steps strictly outnumber events, exactly
+    2 events across the F4 run (the first prefix and the one the note moved it to), each `prefix_bytes`
+    equal to an offset actually sent, and the two differing from each other.'
+  - '`a_run_that_never_folds_emits_no_cache_marked`: the negative control. The absence of the event is
+    the documented signal that nothing was marked.'
+  - '`cargo test --lib observe::` 7 passed / 0 failed; `--test cache_boundary` 6 passed / 0 failed. fmt
+    clean, clippy --all-targets -D warnings clean.'
+  - 'Sabotage: emit on every marked step — 0.34.0''s `Routed` defect reproduced — fails `cache_marked_fires_on_change_and_not_once_per_step`
+    and nothing else.'
+- id: US-IO-HARNESS-0.44.0-T06
+  summary: Measure the saving once against a real vendor, with the no-marker control.
+  why_required: The entire benefit of this release is vendor-side. Every other criterion proves the crate
+    asks correctly; only this one proves anything was cached.
   status: done
-  depends_on: []
+  depends_on:
+  - US-IO-HARNESS-0.44.0-T04
   acceptance_criteria:
-  - '**F9 — an image reaches the wire through a conversational turn.** `Session::attach` then `Session::turn`,
-    over a fixture provider that records the `CompletionRequest` it received: the media is on the request.
-    The same through `turn_observed`. The **next** turn, with no second `attach`, carries none — the staging
-    is cleared. A `turn_bounded` whose contract already carries an image of its own carries both. Sabotage:
-    keep the staging across turns, under which the second turn''s request carries an image nobody attached.
-
-    '
-  - '**F10 — a provider that does not accept images still refuses, and before anything is sent.** A turn
-    with staged images over a provider whose `accepts_images` is false fails with the existing error from
-    `ensure_media_accepted` (`src/run.rs:10286`), and the counting provider records zero completions.
-    The refusal is 0.42.0''s, reached through a new door. Sabotage: attach after the media check, under
-    which a request is sent that must not be.
+  - '**F7 — a real vendor honours it, measured once and controlled.** Two consecutive requests over an
+    identical frozen prefix through OpenRouter against a pinned Anthropic model: the second reports non-zero
+    `cache_read_tokens` covering materially more than the `system` block alone. The control — the same
+    endpoint and model through `Compatible`, which sends no marker — reports zero on both calls. `CompletionResponse::model`
+    is recorded on every call and is the Anthropic model that was pinned. If the vendor is unreachable
+    at development time this becomes a `known_limitations` line naming what was not observed, never a
+    silent pass.
 
     '
   files:
-  - src/session.rs
-  - tests/session_media.rs
+  - examples/cache_live.rs
   evidence:
-  - '`Session::attach<I: IntoIterator<Item = Media>>(&mut self) -> &mut Self` added under
-    `#[cfg(feature = "media")]`, staging into a `staged` field on `Session` that carries the same
-    gate. `drive` clones the contract, extends its `images` with `std::mem::take(&mut self.staged)`
-    and runs that — so the staging is cleared however the turn ends, and a `turn_bounded` caller''s own
-    `with_images` are kept beside the staged one rather than replaced.'
-  - 'One method covers all six turn shapes. Staging is orthogonal to how a turn is driven, and an
-    images-carrying variant of each would owe a seventh the next time a turn shape is added.'
-  - '`cargo check` on the default feature set is clean: the field, the append and the clear all carry
-    the same `cfg`, so a build without `media` is byte-identical to 0.42.0''s.'
-  - '`cargo test --features media --test session_media` exit 0, 4 passed. Every assertion is against
-    the `CompletionRequest` the provider received, not the contract that was built: the image reaches
-    the wire through `turn` and through `turn_observed`, the *next* turn carries none without a second
-    `attach`, a bounded turn whose contract has its own image sends two, and a provider whose
-    `accepts_images` is false refuses with zero completions recorded — the refusal is 0.42.0''s,
-    reached through a new door.'
-- id: US-IO-HARNESS-0.43.0-T08
-  summary: 'Documentation: the four `docs/CONTRACT.md` guarantees, the guide pages, the `CHANGELOG.md`
-    entry with its `*Migration:*` note, `docs/public-api.txt` by hand, and a worked doctest on every new
-    public item.'
-  why_required: The release notes are taken verbatim from the changelog, the migration note is the only
-    warning a consumer matching `ProviderErrorKind` exhaustively gets, and the checked-in doc surfaces
-    are gates that fail the build when they drift.
+  - MEASURED LIVE 2026-08-09, OpenRouter, `anthropic/claude-haiku-4.5` pinned and read back from `CompletionResponse::model`
+    on every call. System block ~8.5k tokens, frozen transcript prefix 21,817 chars (~5.4k tokens).
+  - 'THE NUMBER. System breakpoint alone (0.43.0''s request, `cache_boundary: None`): prompt=13113, cache_read=7408.
+    Both breakpoints, second call: prompt=13113, cache_read=13093. The transcript breakpoint is worth
+    5,685 tokens per step beyond what the system block already saved, and 13,093 of a 13,113-token prompt
+    — 99.8% — is served from cache. Priced through the shipped table that is the cache-read rate rather
+    than the input rate on all of it.'
+  - '0.38.0''s control still holds on the same run: marked call 2 cache_read=7408, and the SAME endpoint
+    and model through `Compatible` — which sends no marker — reads 0 on both of its calls. One key different,
+    not one vendor different.'
+  - '`cache_write` is 0 on every call, as trap 108 records: OpenRouter reports no cache-write counter,
+    so the writing call''s cost is UNREPORTED rather than measured. The example prints that in as many
+    words so nobody infers it from the prompt length.'
+  - 'FINDING, and the second release to pay for it: the first attempt failed HTTP 402 — ''You requested
+    up to 64000 tokens, but can only afford 43047''. The OpenAI wire sends no `max_tokens`, so the vendor
+    applied `claude-sonnet-4.5`''s own 64k default. Not a caching failure and it reads exactly like one.
+    `DEFAULT_MODEL` in the example is now haiku with the reason written at the constant, so the next run
+    does not rediscover it.'
+  - 'Harness: 0.38.0''s `examples/cache_live.rs` extended rather than a second live example added, so
+    the two breakpoints are measured by one thing that cannot drift. The 0.44.0 half needs its own baseline
+    rather than the unmarked control, because OpenRouter now always sends the system marker and ''did
+    anything cache'' cannot tell the two breakpoints apart.'
+- id: US-IO-HARNESS-0.44.0-T07
+  summary: Document the second breakpoint, correct the two shipped sentences that deny it, and write the
+    changelog entry with its migration note.
+  why_required: Two places in the shipped crate currently state that the transcript deliberately carries
+    no breakpoint, one of them a doc comment on a function this release edits. Shipping the code without
+    them is shipping documentation that contradicts it.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.43.0-T05
-  - US-IO-HARNESS-0.43.0-T06
-  - US-IO-HARNESS-0.43.0-T07
+  - US-IO-HARNESS-0.44.0-T05
   acceptance_criteria:
-  - '**N3 — exactly one public break, and it is the one named.** `ProviderErrorKind` gains `ContextOverflow`
-    and `#[non_exhaustive]` together. Everything else is additive: `Compaction`, `Summary`, `Transcript`,
-    `TranscriptTurn` are new; `EventKind::Compacted` sits on an already-`#[non_exhaustive]` enum; the
-    `TaskContract` field and builder sit on a `#[non_exhaustive]` struct; `Session::attach`, `Session::transcript`,
-    `Store::summaries`, `Transcript::to_markdown` and `ProviderErrorKind::from_response` are added and
-    nothing is removed or altered. `docs/public-api.txt` gains the lines **its checker can see** — the
-    crate-root re-exports `Compaction`, `Summary`, `Transcript` and `TranscriptTurn` — and not the methods,
-    the enum variant or the struct field, which are members of already-listed items. Stated this way at
-    plan time because the same criterion has been met "in a different form" four releases running (traps
-    114 and the 0.41.0 N3 note).
+  - '**N3 — exactly one public break, and `docs/public-api.txt` is byte-identical.** `CompletionRequest`
+    gains `cache_boundary` and **no** `#[non_exhaustive]`, so the break is what a new field on this type
+    has always been — an exhaustive literal outside the crate — and `..Default::default()` still compiles,
+    asserted by every out-of-crate construction site building unchanged. `EventKind::CacheMarked` sits
+    on an enum `#[non_exhaustive]` since 0.24.0. Neither adds a line the checker can see: it enumerates
+    crate-root re-exports (`tests/docs_drift.rs`), and both `CompletionRequest` and `EventKind` are already
+    listed — a field and a variant are members of already-listed items. **Byte-identical is the claim,
+    stated at plan time**, because "met in a different form" has cost a `known_limitations` line in four
+    of the last six releases (traps 114, the 0.41.0 N3 note, and 0.39.0''s).
 
     '
   - '**O3 — the documentation gates pass**: the nightly rustdoc gate, the two intra-doc link rules, and
     the checked-in doc surfaces (`docs/public-api.txt`, `CAPABILITIES.md`, the guide index, `CHANGELOG.md`
-    including its `*Migration:*` note) consistent with the code in the same commit range.
+    including its `*Migration:*` note) consistent with the code in the same commit range. Specifically
+    included: **no surviving sentence anywhere in the crate or the docs says the transcript carries no
+    breakpoint.** Asserted by grep over `src/` and `docs/`, because two such sentences exist today and
+    one of them is a doc comment on the function being changed.
 
     '
   files:
   - docs/CONTRACT.md
-  - docs/public-api.txt
-  - docs/guide
+  - docs/guide/providers.md
+  - README.md
   - CHANGELOG.md
-  - src/context.rs
-  - src/error.rs
-  - src/session.rs
-  - src/state.rs
+  - src/provider/openai_wire.rs
+  - Cargo.toml
+  - tests/cache_boundary.rs
   evidence:
-  - '`CHANGELOG.md` gains the 0.43.0 section with **a `*Migration:*` note** — the one this release owes
-    — saying a `match` on `ProviderErrorKind` now needs a wildcard arm, and recommending one that
-    fails loudly over one that guesses. A second Changed entry states the behaviour change nobody
-    would otherwise see: a long run now makes a summarising call it did not make on 0.42.0, with the
-    one-line way back.'
-  - '`docs/CONTRACT.md` gains four guarantees — what compaction folds, costs and never loses (with the
-    prompt-injection answer stated: the summariser has no tools and the policy is untouched); what a
-    context overflow does now, including that the classifier is deliberately not exhaustive; that a
-    transcript is a read of the whole tree; and how long `Session::attach` attaches for.'
-  - 'Guide pages: `context-and-memory.md` documents the fold beside the context budget,
-    `resilience.md` documents the overflow beside the other failures you can branch on, and
-    `sessions.md` documents the transcript and `attach`. No new page, so no `GUIDES` or
-    `CAPABILITIES.md` bookkeeping — the precedent since 0.31.0.'
-  - '`Cargo.toml` 0.42.0 -> 0.43.0 and the README install snippet `"0.42"` -> `"0.43"`, which
-    `tests/docs_drift.rs` checks.'
-  - 'The nightly rustdoc gate earned its keep again — three errors stable `cargo doc` did not report:
-    a link to `Summary::kept_from` left behind by the rename, a bare `[`Summary`]` in `session.rs`
-    where the type is not `use`d, and a *redundant* explicit target on `Provider::accepts_images`
-    where it is. The two intra-doc rules partition on scope exactly as recorded.'
-  - '`cargo test --doc` exit 0, **392** passed (up 4). `cargo test --tests --no-fail-fast` — 74 suites
-    green. `cargo clippy --all-features --all-targets` clean. `cargo fmt` applied and `--check` clean.
-    `RUSTDOCFLAGS=... cargo +nightly doc --all-features --no-deps` clean.'
-- id: US-IO-HARNESS-0.43.0-T09
-  summary: 'Run the release gates: dependency count, MSRV, the full suite in both feature polarities,
-    and the three-platform matrix.'
-  why_required: These are the criteria that fail late and cheaply-avoidably. A dependency added without
-    noticing or an MSRV drift is found here or on a release run, and the second is far more expensive.
+  - '`docs/CONTRACT.md`: the caching section is now ''(0.38.0, 0.44.0)'', describes BOTH breakpoints,
+    and its table names what each wire sends for each. Three new paragraphs — the transcript is cached
+    only from a compaction boundary, the crate never asks for a prefix it has not sent, and `CacheMarked`''s
+    absence is the signal — plus the image/ordering difference between the two wires.'
+  - THE STALE SENTENCES, all found and corrected. `docs/CONTRACT.md` said 'The transcript is not cached,
+    and that is a design decision'. `docs/guide/providers.md` said 'Only the instructions are marked,
+    never the transcript'. `README.md` said 'Nothing is marked in the transcript, deliberately'. And `src/provider/openai_wire.rs`'s
+    `cached_system` doc comment — on a function this release edits, the easiest to leave behind — said
+    'The transcript deliberately carries no breakpoint'. All four now state what ships, with the 0.38.0
+    reasoning kept in the past tense so the argument is not lost.
+  - '`CHANGELOG.md` deliberately NOT corrected: its 0.38.0 entry says the transcript is unmarked and that
+    is a true statement about what 0.38.0 shipped. A changelog is immutable history, not a claim about
+    today — the rule 0.40.0 recorded.'
+  - '`nothing_shipped_still_denies_the_second_breakpoint` greps the five prose and source files for the
+    four stale phrases and fails on any survivor. `validate` cannot see this and neither can a compiler.'
+  - '0.44.0 changelog entry written with the `*Migration:*` note: construct with `..Default::default()`;
+    only an exhaustive literal outside the crate breaks; and the note says WHY the type is not `#[non_exhaustive]`
+    — the attribute would forbid the very construction the note prescribes.'
+  - Version bumped to 0.44.0 in `Cargo.toml` and the README install snippet to "0.44" (the checker 0.36.1
+    added catches that one).
+  - 'GATES: `docs/public-api.txt` is BYTE-IDENTICAL — `git diff` empty — which is N3''s claim made at
+    plan time rather than discovered at seal. docs_drift 15 passed, readme 7, changelog 9, guide_pages
+    8, public_api 5. The nightly rustdoc gate exits 0 and caught NOTHING this release, which is worth
+    a sentence: it found something in five of the last six.'
+- id: US-IO-HARNESS-0.44.0-T08
+  summary: Run the release gates and record their output as evidence.
+  why_required: The additive-nothing claims — no dependency, no store change, byte-identical public surface
+    — are only true once measured, and each has been met in a different form in a past release when it
+    was assumed instead.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.43.0-T08
+  - US-IO-HARNESS-0.44.0-T07
   acceptance_criteria:
   - '**N1 — no new dependency.** `cargo tree` for the default feature set has the same number of crates
-    as 0.42.0 (**402**). Summarising needs a `Provider`, which is the crate''s own trait; the transcript
-    needs `std::fmt`; the table needs `rusqlite`, already there.
+    as 0.43.0 (**402**). Splitting a string needs `std`; the marker is `serde_json`, already there.
 
     '
   - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
 
     '
+  - '**N4 — no durable state moves.** `git diff main -- src/state.rs` is **empty**: no table, column,
+    index or reader, and `CHECKPOINT_FORMAT` unmoved at 7. The cache columns this release''s value is
+    measured in have existed since 0.18.0 (`src/state.rs:2991`) and are read, not written to.
+
+    '
   - '**O1 — the full suite passes on all three platforms**, which the standing CI matrix already runs.
-    Nothing here is process-spawning or path-shaped, so this is the routine bar rather than a load-bearing
-    one; the `media` arm of the matrix is what covers `Session::attach`.
+    Nothing here is process-spawning or path-shaped, so this is the routine bar; the `media` arm of the
+    matrix is what covers F6.
+
+    '
+  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.43.0 store and a 0.44.0 store
+    are the same store; `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0` (`tests/cross_version.rs`)
+    are **unchanged**, which is itself the assertion.
 
     '
   files:
   - Cargo.toml
-  - Cargo.lock
   evidence:
-  - 'N1 — `cargo tree` on the default feature set is **402** crates, the same number as 0.41.0 and
-    0.42.0. Nothing was added: the summariser needs a `Provider`, which is the crate''s own trait; the
-    transcript needs `std::fmt`; the table needs `rusqlite`, already there.'
-  - 'N2 — `rust-version = "1.95"` in `Cargo.toml` is unmoved, and both feature polarities build and
-    test on it.'
-  - 'O1 — both polarities green locally. All-features: **1,152** passed across 74 suites, plus 395
-    doctests. Default: **1,071** passed across 74 suites, plus 392 doctests. `cargo build
-    --all-features --examples` clean.'
-  - 'The three-platform matrix is CI''s, and is the gate the release PR runs; nothing in this release
-    is process-spawning or path-shaped, so the `media` arm covering `Session::attach` is the only part
-    that is more than routine.'
+  - Gates run locally with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` and `XDG_CONFIG_HOME`
+    redirected to a scratch dir — `tests/plugin.rs` otherwise reads this machine's real `~/.config/io/io.toml`,
+    whose `api_key` key the schema rejects, and 11 tests fail for reasons that have nothing to do with
+    the release.
+  - '`cargo fmt --check` exit 0. `cargo clippy --all-targets --all-features -- -D warnings` exit 0.'
+  - '`cargo test` (default features): exit 0, 76 binaries, **1478 passed / 0 failed**.'
+  - '`cargo test --all-features`: exit 0, 76 binaries, **1564 passed / 0 failed**.'
+  - 'N1 — `cargo tree` is **402** lines, unmoved since 0.23.0. No dependency added: splitting a string
+    is `std` and the marker is `serde_json`, already present.'
+  - N4 — `git diff main -- src/state.rs` is **EMPTY**. No table, column, index or reader, and `CHECKPOINT_FORMAT`
+    untouched. The cache columns this release is measured in have existed since 0.18.0 and are read, never
+    written.
+  - 'O2 — cross-version, both baselines. `tests/cross_version.rs` (0.22.0): 5 passed, and note that NONE
+    of its tests is `#[ignore]`, so `-- --ignored` filters all five out — they run in the ordinary suite
+    and did. `tests/cross_version_0_29_0.rs`: 2 in the ordinary run plus the `#[ignore]` one, which was
+    run with `-- --ignored` against a freshly built `tests/fixtures/gen-0.29.0` and passed. `ADDED_SINCE_0_22_0`
+    and `COLUMNS_ADDED_SINCE_0_22_0` are UNCHANGED, which is itself the assertion.'
+  - O3 — the nightly rustdoc gate (`RUSTDOCFLAGS='--cfg docsrs -D warnings -D rustdoc::broken_intra_doc_links
+    -D rustdoc::redundant_explicit_links' cargo +nightly doc --all-features --no-deps`) exits 0 and caught
+    NOTHING. Worth a sentence because it caught something in five of the last six releases; a gate going
+    quiet is a fact, not a non-event.
+  - N3 — `docs/public-api.txt` byte-identical, `git diff` empty. Claimed at plan time, not discovered
+    at seal.
+  - '`cargo package --locked` exit 0; packaged crate **1,478,864 bytes** (0.43.0 was 1,458,100). The verify
+    step compiled the packaged crate cleanly.'
+  - O1 — the three-platform matrix is CI's, not this machine's. Nothing in this release is process-spawning
+    or path-shaped, so the local run is the routine bar and the matrix is the gate; the `media` arm is
+    what covers F6's two-wire assertion.

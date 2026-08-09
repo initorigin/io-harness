@@ -220,18 +220,28 @@ impl Anthropic {
         tools
     }
 
-    /// The user turn's `content`: a bare string when there is no image, and
-    /// Anthropic's content-block array when there is.
+    /// The user turn's `content`: a bare string when there is no image and no cache
+    /// boundary, and Anthropic's content-block array when there is either.
     ///
-    /// Text-only requests keep exactly the body 0.14.0 sent, so upgrading
-    /// changes nothing on the wire for a caller who sends no image.
+    /// Text-only, boundary-less requests keep exactly the body 0.14.0 sent, so
+    /// upgrading changes nothing on the wire for a caller who sends neither.
     #[cfg(feature = "media")]
     fn user_content(request: &CompletionRequest) -> serde_json::Value {
         if request.media.is_empty() {
-            return json!(request.user);
+            return Self::text_content(request);
         }
         // Images before text: what Anthropic's own guidance recommends for
         // prompts that ask a question about an image.
+        //
+        // 0.44.0 — and that ordering is exactly why a request carrying an image gets
+        // no transcript breakpoint here. A `cache_control` marks the prefix *ending*
+        // at the block it sits on, so with images ahead of the text the marked span
+        // would begin with them: an image staged for one turn (`Session::attach`)
+        // would be written into the cache entry and the next turn, which does not
+        // carry it, could never hit that entry. The boundary is ignored rather than
+        // moved, and the caller is not told, because there is nothing they got wrong
+        // — this is a property of the wire. The OpenAI wire puts text first and
+        // therefore honours it; see `openai_wire::user_content`.
         let mut parts: Vec<serde_json::Value> = request
             .media
             .iter()
@@ -252,7 +262,29 @@ impl Anthropic {
 
     #[cfg(not(feature = "media"))]
     fn user_content(request: &CompletionRequest) -> serde_json::Value {
-        json!(request.user)
+        Self::text_content(request)
+    }
+
+    /// The text half of the user turn: two blocks split at the cache boundary, or the
+    /// bare string when there is no usable one.
+    ///
+    /// 0.44.0's second breakpoint. The first, on `system`, covers what a run re-sends
+    /// identically on every step; this one covers what 0.43.0's compaction froze — the
+    /// prompt header, the memory block and the summary that stands in for the folded
+    /// observations. The run loop only ever names a prefix it has already sent once,
+    /// so the marker is never a cache *write* on a prefix that then moves.
+    fn text_content(request: &CompletionRequest) -> serde_json::Value {
+        match super::split_at_boundary(request) {
+            Some((prefix, rest)) => json!([
+                {
+                    "type": "text",
+                    "text": prefix,
+                    "cache_control": { "type": "ephemeral" },
+                },
+                { "type": "text", "text": rest },
+            ]),
+            None => json!(request.user),
+        }
     }
 }
 
@@ -781,6 +813,120 @@ mod tests {
         );
     }
 
+    /// The request 0.44.0's boundary tests are built from: a system block, a user
+    /// turn with an obvious split point, and no tools.
+    ///
+    /// Whitespace sits on **both** sides of the split on purpose — the prefix ends
+    /// with a newline and the remainder begins with spaces — so that trimming either
+    /// half is caught. A first version of this fixture had a remainder starting with a
+    /// letter, and the `trim_start` sabotage passed every assertion: the test was only
+    /// discriminating against half the mistake it exists to catch.
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn boundary_req(cache_boundary: Option<usize>) -> CompletionRequest {
+        CompletionRequest {
+            system: "you are a careful agent".into(),
+            user: "FROZEN PREFIX\n---\n  volatile tail".into(),
+            tools: Vec::new(),
+            cache_boundary,
+            ..Default::default()
+        }
+    }
+
+    /// F1 — a marked request is two text blocks that reassemble exactly.
+    ///
+    /// The concatenation assertion is the discriminating one. An implementation that
+    /// split at the wrong byte, dropped the separator or trimmed either half passes
+    /// every "is there a marker" assertion and fails that one — and a marked block
+    /// that is not a byte-exact prefix of the message buys a cache entry the vendor
+    /// can never hit, which costs the write premium instead of saving anything.
+    #[test]
+    fn body_splits_the_user_turn_at_the_boundary_and_marks_only_the_first_half() {
+        let a = Anthropic::new("k", "claude-x");
+        let req = boundary_req(Some("FROZEN PREFIX\n---\n".len()));
+        let b = a.body(&req);
+
+        let content = b["messages"][0]["content"]
+            .as_array()
+            .expect("a marked user turn is a content-block array");
+        assert_eq!(content.len(), 2, "prefix and remainder: {b}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "text");
+
+        // The marker is on the prefix and nowhere else in the user turn.
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            content[1].get("cache_control").is_none(),
+            "the remainder must not be marked: {}",
+            content[1]
+        );
+
+        // Byte-exact reassembly. This is the assertion the release rests on.
+        let rejoined = format!(
+            "{}{}",
+            content[0]["text"].as_str().expect("prefix text"),
+            content[1]["text"].as_str().expect("remainder text"),
+        );
+        assert_eq!(rejoined, req.user, "the split must lose nothing: {b}");
+        assert_eq!(content[0]["text"], "FROZEN PREFIX\n---\n");
+
+        // Two in the whole body: 0.38.0's system breakpoint and this one. Anthropic
+        // permits four; a third would be a prefix this crate cannot show is stable.
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            2,
+            "exactly two breakpoints in the body, got {b}"
+        );
+    }
+
+    /// F2 — `None`, and every offset that cannot be honoured, send 0.43.0's body.
+    ///
+    /// A boundary is an optimisation, so an offset the crate cannot use is ignored
+    /// rather than refused: past the end, inside a multi-byte character, and zero —
+    /// which would mark an empty prefix — all send the single bare string, and the
+    /// body is asserted byte-identical to the unmarked one rather than merely
+    /// "still valid".
+    #[test]
+    fn an_unusable_boundary_sends_the_body_that_has_always_been_sent() {
+        let a = Anthropic::new("k", "claude-x");
+        let unmarked = a.body(&boundary_req(None));
+        assert!(
+            unmarked["messages"][0]["content"].is_string(),
+            "an unmarked user turn is the bare string it has always been: {unmarked}"
+        );
+        assert_eq!(
+            unmarked.to_string().matches("cache_control").count(),
+            1,
+            "only 0.38.0's system breakpoint: {unmarked}"
+        );
+
+        let user_len = boundary_req(None).user.len();
+        for bad in [Some(0), Some(user_len + 1), Some(usize::MAX)] {
+            assert_eq!(
+                a.body(&boundary_req(bad)),
+                unmarked,
+                "an unusable boundary {bad:?} must change nothing"
+            );
+        }
+
+        // A multi-byte character the offset lands inside of. `é` is two bytes, so an
+        // offset of 1 into it is not a character boundary and slicing there panics —
+        // which is the failure this arm exists to make impossible.
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let accented = CompletionRequest {
+            system: "s".into(),
+            user: "é".into(),
+            tools: Vec::new(),
+            cache_boundary: Some(1),
+            ..Default::default()
+        };
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let plain = CompletionRequest {
+            cache_boundary: None,
+            ..accented.clone()
+        };
+        assert_eq!(a.body(&accented), a.body(&plain));
+    }
+
     #[test]
     fn accumulates_tool_use_from_input_json_deltas_and_usage() {
         let mut acc = Accumulator::default();
@@ -1235,6 +1381,56 @@ mod media_wire {
         // when the question is about the picture.
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "what is this");
+    }
+
+    /// F6 (the Anthropic half) — a request carrying an image gets no transcript
+    /// breakpoint, because on this wire the images come first.
+    ///
+    /// `cache_control` marks the prefix *ending* at the block it sits on, so with the
+    /// images ahead of the text there is no text prefix to mark: a marker on the text
+    /// block would write the images into the cache entry, and the next turn — which
+    /// carries no image, because `Session::attach` stages for one turn only — could
+    /// never hit it. Ignoring the boundary costs a run nothing it had; honouring it
+    /// would cost the write premium on every attached turn.
+    ///
+    /// The OpenRouter half of this criterion asserts the opposite outcome from the
+    /// same input, and that difference is the point: it is a property of the two
+    /// wires, not a policy this crate chose.
+    #[test]
+    fn an_image_suppresses_the_boundary_because_the_images_come_first() {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let with_boundary = CompletionRequest {
+            cache_boundary: Some("what is ".len()),
+            ..req_with_image()
+        };
+        let b = Anthropic::new("k", "claude-x").body(&with_boundary);
+        let content = b["messages"][0]["content"]
+            .as_array()
+            .expect("an image request is a content-block array");
+
+        assert_eq!(content.len(), 2, "one image and one text block: {b}");
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(
+            content[1]["text"], "what is this",
+            "the text is whole, not split: {b}"
+        );
+        assert!(
+            content[1].get("cache_control").is_none(),
+            "the text block must not be marked when images precede it: {b}"
+        );
+
+        // 0.38.0's system breakpoint is untouched — the suppression is of the second
+        // breakpoint only, not of caching altogether.
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            1,
+            "only the system breakpoint survives an attached image: {b}"
+        );
+
+        // And the body is byte-identical to the one the same request sends with no
+        // boundary at all, which is the strong form of "ignored".
+        assert_eq!(b, Anthropic::new("k", "claude-x").body(&req_with_image()));
     }
 
     #[test]

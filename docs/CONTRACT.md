@@ -764,21 +764,30 @@ matches `hi` and not `namaste`, and answers `hi, the login page is broken`
 correctly only by accident. If the classification needed a lookup table to work,
 it would not work.
 
-## What prompt caching asks for, and what it cannot promise (0.38.0)
+## What prompt caching asks for, and what it cannot promise (0.38.0, 0.44.0)
 
-The crate marks one cache breakpoint per request, at the end of the system block.
-On the Anthropic wire that block is preceded by the tool schemas, so the single
-marker covers the tool definitions and the instructions together — the part of a
-request that is identical on every step of a run and every turn of a session.
+The crate marks up to **two** cache breakpoints per request.
+
+The **first** sits at the end of the system block. On the Anthropic wire that block
+is preceded by the tool schemas, so the single marker covers the tool definitions
+and the instructions together — the part of a request that is identical on every
+step of a run and every turn of a session.
+
+The **second** sits at the end of the frozen transcript prefix, and only a run that
+has compacted has one. When 0.43.0's fold replaces the older observations with a
+written summary, everything from the top of the prompt through that summary stops
+changing, and that is what this marker covers. 0.38.0 deliberately left the
+transcript unmarked because assembly rewrote earlier observations every turn;
+compaction is what removed the objection.
 
 | provider | what is sent | why |
 | --- | --- | --- |
-| `Anthropic` | `system` as a content-block array whose one block carries `cache_control: {"type":"ephemeral"}` | that vendor's caching is request-side |
-| `OpenRouter` | the system message's `content` as a one-part array carrying the same object | it translates the marker for the vendors that take one |
+| `Anthropic` | `system` as a content-block array whose one block carries `cache_control: {"type":"ephemeral"}`; the user turn split into two text blocks with the same object on the first | that vendor's caching is request-side |
+| `OpenRouter` | the same two markers, in the parts shape that wire spells them in | it translates the marker for the vendors that take one |
 | `OpenAi` | **nothing** | OpenAI caches a repeated prefix by itself; there is no request-side control to use |
 | `Compatible` | **nothing** | 21 endpoints this crate does not control, where an unknown body key is a 400 nobody asked for |
 
-Six things follow that a caller should hear plainly rather than find on an
+Nine things follow that a caller should hear plainly rather than find on an
 invoice.
 
 **This crate declares a cache; it does not operate one.** Whether anything is
@@ -810,16 +819,42 @@ calls, including the one that must have written the entry the next call read. Th
 crate does **not** infer the write from the prompt length — that would put a
 number in the trace the invoice does not contain.
 
-**The transcript is not cached, and that is a design decision.** A cache
-breakpoint needs a byte-identical prefix. `context::assemble` re-derives what the
-model sees on every turn: a later observation supersedes an earlier one of the
-same kind and target, a write invalidates an earlier read of that path, an
-invalidated read is re-read and its text replaced, and what does not fit the
-ceiling becomes a stub. Earlier bytes therefore change between turns by design, so
-a breakpoint inside the observation log would miss on nearly every turn and be
-billed as a write each time — it would cost money rather than save it. The
-assembler and prefix caching want opposite things; reconciling them is a change to
-the assembler, not an addition here.
+**The transcript is cached only from a compaction boundary, and only once the
+prefix has repeated.** A cache breakpoint needs a byte-identical prefix, and
+`context::assemble` re-derives what the model sees on every turn: a later
+observation supersedes an earlier one of the same kind and target, a write
+invalidates an earlier read of that path, an invalidated read is re-read and its
+text replaced, and what does not fit the ceiling becomes a stub. That is still true
+of everything *after* the fold, which is why the marker goes at the summary and not
+past it. A run that has not compacted marks nothing in its transcript at all.
+
+**The crate never asks a vendor to cache a prefix it has not already sent.** Even
+after a fold the prefix is not immutable by construction: the memory block renders
+*ahead* of the summary and is re-read from the store on every turn, so a note the
+run writes about its own work moves the prefix without touching the summary. The
+run loop therefore holds the previous step's candidate and marks only when this
+step's is byte-identical to it. Two consequences, both deliberate: the step a fold
+happens on is **never** marked, so the marker is always one turn behind the
+boundary; and a note written mid-run withdraws it for exactly one step. What this
+buys is that the marker cannot be billed as a cache write on a prefix that then
+changes — the failure mode is lost saving, never lost money.
+
+**`EventKind::CacheMarked` says when the crate started asking, and its absence says
+it never did.** It is emitted when the marked prefix *changes* — the step it is
+first offered, and again whenever a later fold moves it — and not once per step. So
+a run with no `CacheMarked` marked nothing, a run with three marked three different
+prefixes, and one of these beside a zero `cache_read_tokens` on the same step means
+the vendor declined a marker that was sent. Without it, "why is this run getting no
+cache reads" has three indistinguishable answers.
+
+**A request carrying an image is marked on one wire and not the other.** The
+Anthropic wire puts image blocks *before* the text, so there is no text prefix to
+mark: a marker there would write a one-turn attachment into the cache entry, and the
+next turn — which carries no image, because `Session::attach` stages for one turn
+only — could never hit it. The OpenAI-shaped wire puts text first, so the two text
+blocks lead, the images follow, and the boundary is honoured. Same request, two
+vendors, two different answers, and the difference is a property of the orderings
+rather than a policy this crate chose.
 
 ## What a contained session turn gives you, and what it does not (0.39.0)
 

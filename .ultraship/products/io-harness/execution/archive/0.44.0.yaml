@@ -1,0 +1,52 @@
+product: io-harness
+version: 0.44.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: high
+  reasons:
+    - The narrowest release since 0.38.0, and it is deliberately the same shape as 0.38.0. One
+      request field, two body builders that already carry a marker of exactly this kind, one loop
+      helper and one event. There is no new capability to design — the boundary this release marks
+      is one 0.43.0 already creates.
+    - Every piece has an in-tree template written for the same purpose. `cached_system`
+      (`src/provider/openai_wire.rs:84`) is the per-vendor difference resolved in the shared body
+      builder; the existing body tests (`src/provider/anthropic.rs:763`,
+      `src/provider/openai_wire.rs:705`) assert 0.38.0's marker at exactly the altitude F1, F2, F5
+      and F6 need; `compact_ledger` (`src/run.rs:10436`) is the one-definition-two-call-sites shape
+      T04 copies; and `routed_model` (0.34.0) is the run-scoped transition state the guard is.
+    - Nothing durable moves. No table, column, index or `CHECKPOINT_FORMAT` change, so the whole
+      cross-version surface is asserted by being unchanged rather than extended — the cheapest
+      migration shape this repository has, and the first release since 0.38.0 with no DDL at all.
+    - The accounting half of the roadmap outcome is already built. `Usage::cache_read_tokens`
+      (0.18.0), both wires' parsers, the `provider_calls` columns and
+      `spend_by_run`/`spend_by_model` /`spend_by_day` all exist, so that clause is read back as
+      evidence rather than implemented. This was confirmed by reading the code during planning, not
+      assumed.
+    - No constraints have been recorded for this release, so this assessment is grounded in the
+      repository's own condition rather than in a stated limit.
+  major_cost_drivers:
+    - The guard's transitions are the feature, and the implementation follows the test rather than
+      the other way round. Unmarked on the fold step, marked on the next, withdrawn when a memory
+      note moves the prefix, re-marked with different bytes — four steps and four different answers
+      (F3, F4). Written last, the guard becomes "marks when a fold exists" wearing a comparison.
+    - Locating the summary inside the assembled prompt rests on two things being true that must be
+      confirmed by reading the code, not by trusting the contract - that `assemble` emits a carried
+      entry's text verbatim (`src/context.rs:685`) and that the fold's observation is the ledger's
+      first entry. The collapse branch (`src/context.rs:722`) emits a count that changes every step,
+      so a run in that state must be seen to withhold the marker rather than be worked around.
+    - Two body builders order images differently on purpose - Anthropic before the text, OpenAI's
+      wire after it - so the boundary is honoured on one wire and refused on the other for the same
+      request. Both `user_content` functions get read; pattern-matching one produces a marked block
+      that is not a prefix, which costs money instead of saving it.
+    - "`Replay` keys on the whole request JSON (`src/provider/replay.rs:68`), so the serde attribute
+      on the new field is load-bearing rather than tidy. Getting it wrong breaks every recorded
+      cassette in the repository, in tests nothing else in this release touches."
+    - The live measurement carries three traps that have each bitten before - pin an Anthropic model
+      and read back what actually answered, expect no cache-write counter from OpenRouter, and keep
+      the request small enough that a credit-limited account does not answer 402.
+    - Two sentences in the shipped crate say the transcript deliberately carries no breakpoint, one
+      of them a doc comment on a function this release edits. O3 greps for them because the one on
+      the edited function is the easiest to leave behind.
+  recommended_scope_change: null

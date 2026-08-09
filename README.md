@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.43"
+io-harness = "0.44"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -195,13 +195,15 @@ raise.
 
 **The stable prefix is cached, where the vendor sells it.** One cache breakpoint
 sits at the end of the system block, which on the Anthropic wire covers the tool
-schemas and the instructions together, and OpenRouter carries the same marker.
-The reads land in the accounting rows beside every other token, so a long
-conversation over one workspace stops paying full price for the part of the
-request that never changes. Nothing is marked in the transcript, deliberately:
-context assembly supersedes, invalidates and re-reads earlier observations every
-turn, so a breakpoint there would be billed as a cache *write* almost every turn
-and cost money rather than save it.
+schemas and the instructions together, and OpenRouter carries the same marker. A
+second sits at the end of the frozen transcript prefix once the run has compacted —
+everything from the top of the prompt through the written summary stops changing,
+so it can be cached, while the observations after it are still rewritten every turn
+and are still never marked. The reads land in the accounting rows beside every other
+token, so a long conversation over one workspace stops paying full price for the
+part of the request that never changes. The crate never asks a vendor to cache a
+prefix it has not already sent once, so a marker it places cannot be billed as a
+cache write on a prefix that then moves.
 
 **One failed gate is retried on its own.** Every gate evaluation is recorded as
 `Passed`, `Failed` or `Errored` — the last being a criterion that could not run at
