@@ -199,6 +199,12 @@ const ADDED_SINCE_0_22_0: &[&str] = &[
     // carrying it and never names it, which `tests/cross_version_0_29_0.rs`
     // executes rather than asserts on paper.
     "provider_calls_run",
+    // 0.43.0 — what a fold wrote, so a resumed run does not pay a model to write
+    // the same paragraph again. One table and its index, added and nothing
+    // altered: a 0.29.0 binary opens a store carrying both and never names either,
+    // which `tests/cross_version_0_29_0.rs` executes rather than asserts on paper.
+    "summaries",
+    "summaries_run",
 ];
 
 /// Whether a `CREATE` statement is one of [`ADDED_SINCE_0_22_0`].

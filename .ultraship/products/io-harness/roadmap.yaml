@@ -1063,8 +1063,8 @@ versions:
       and nothing else — so the one path an operator would hand a screenshot to is the only one that
       cannot take it. A turn accepts images beside its text, through the attachment path a one-shot
       contract already uses.
-    detail: outline
-    status: planned
+    detail: specified
+    status: released
   - version: 0.44.0
     outcome: >
       A long session stops paying full price for the part of the request that never changes. 0.38.0

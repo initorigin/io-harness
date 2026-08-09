@@ -110,12 +110,19 @@ fn every_kind_states_whether_a_retry_is_worth_it() {
         Auth,
         Request,
         Malformed,
+        ContextOverflow,
     ] {
-        // Exhaustive on purpose: a kind added later cannot slip in without a
-        // deliberate decision about retrying it — this stops compiling.
+        // The wildcard is 0.43.0's, and it is exactly the one-line migration a
+        // consumer matching this enum exhaustively now writes: the enum became
+        // `#[non_exhaustive]` in the release that added `ContextOverflow`, so this
+        // match no longer compiles without one. What the arm must never become is
+        // a default answer — it panics, so a kind added later still cannot slip in
+        // without a deliberate decision about retrying it, which is the property
+        // the old exhaustive match was written for.
         let expected = match kind {
             Transport | Timeout | RateLimited | Server | Malformed => true,
-            Auth | Request => false,
+            Auth | Request | ContextOverflow => false,
+            other => panic!("{other:?} has no recorded answer about retrying"),
         };
         assert_eq!(kind.is_retryable(), expected, "{kind:?}");
     }

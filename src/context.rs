@@ -166,6 +166,43 @@ impl Ledger {
         &self.entries
     }
 
+    /// Replace all but the newest `keep` observations with one summary (0.43.0).
+    ///
+    /// The single exception to "append-only", and it is narrower than it looks:
+    /// what is replaced is the *working* view the assembler reads, not history.
+    /// Every folded observation is still in `ledger_observations`, still returned
+    /// by [`Store::observations`](crate::Store::observations), and still rendered
+    /// by a session transcript — so nothing an operator can audit is lost, and
+    /// what changes is only what the next request carries.
+    ///
+    /// `pub(crate)`: the run loop is the only thing that may fold, because a fold
+    /// is only honest when the durable half was written first, and only the loop
+    /// knows that it was. Returns how many observations the summary stands in for.
+    ///
+    /// `count` is a count from the *front*, not a count to keep, because the run
+    /// loop's durable ledger is tracked by a watermark index into this vector: it
+    /// may only fold observations the store already holds, and it is the loop —
+    /// not this type — that knows how many those are.
+    pub(crate) fn fold_first(&mut self, count: usize, summary: Observation) -> usize {
+        if count == 0 || count > self.entries.len() {
+            return 0;
+        }
+        let recent = self.entries.split_off(count);
+        self.entries.clear();
+        self.entries.push(summary);
+        self.entries.extend(recent);
+        count
+    }
+
+    /// Estimated tokens for everything the assembler would read (0.43.0).
+    ///
+    /// The figure compaction's threshold is compared against, taken through
+    /// [`estimate_tokens`] so the fold and the budget it is a share of are
+    /// measured by one estimator rather than two.
+    pub fn est_tokens(&self) -> u64 {
+        estimate_tokens(&self.full_text())
+    }
+
     /// The whole log, unelided — what an operator reconstructing a run wants, so
     /// bounding what the model sees never bounds what can be audited.
     pub fn full_text(&self) -> String {
@@ -290,6 +327,114 @@ impl ContextBudget {
                 self.max_tokens.min(share.max(BUDGET_FLOOR))
             }
         }
+    }
+}
+
+/// When the run's history is folded into a written summary, and how much of it is
+/// kept whole beside one (0.43.0).
+///
+/// The gap this closes is [`ContextBudget`]'s fourth rule. Assembly carries the
+/// newest observations whole and replaces the rest with one-line stubs — a stub
+/// says a read happened and how big it was, and says nothing about what the run
+/// *learned* from it. So a long run is working from its last few observations and
+/// a list of sizes, and nothing in the crate had ever written a sentence about the
+/// rest.
+///
+/// Compaction replaces that truncation with a paragraph: when the ledger crosses
+/// `at_share` of the turn's own effective budget, everything but the newest
+/// `keep_recent` observations becomes one model-written summary of what was
+/// attempted, which files were touched, what was decided and what is still open.
+/// The summary is written by the run's own provider and model, costs one ordinary
+/// [`provider_calls`](crate::ProviderCall) row, and is stored
+/// ([`Store::summaries`](crate::Store::summaries)) so a resumed, branched or
+/// replayed run re-reads it rather than paying for it again.
+///
+/// **On by default**, because the failure it replaces is silent — a run whose
+/// oldest work became a list of byte counts reports nothing, and an embedder
+/// cannot opt into fixing a defect whose symptom is a prompt they never see:
+///
+/// ```
+/// use io_harness::Compaction;
+///
+/// let folding = Compaction::default();
+/// assert_eq!(folding.at_share, 0.8);
+/// assert_eq!(folding.keep_recent, 8);
+/// assert!(folding.enabled(), "a fold happens below the whole budget");
+/// ```
+///
+/// A caller who wants 0.42.0's behaviour exactly says so in one line, and it is a
+/// setting rather than an absence:
+///
+/// ```
+/// use io_harness::{Compaction, TaskContract};
+///
+/// let contract = TaskContract::workspace("port the parser", "/repo")
+///     .with_compaction(Compaction { at_share: 1.0, ..Compaction::default() });
+/// assert!(!contract.compaction.enabled(), "never folds: the ledger cannot exceed the whole budget");
+/// ```
+///
+/// `Serialize`/`Deserialize` with both fields `#[serde(default)]`, like
+/// [`ContextBudget`], so an operator can set it in a config file and an omitted
+/// key keeps its default.
+// Deliberately NOT `#[non_exhaustive]`, unlike most structs this crate adds.
+// `Compaction` is `ContextBudget`'s sibling: same module, same two-knob shape,
+// same `#[serde(default)]` config-file story, and the same ergonomic — a literal
+// with `..default()`, which is what every caller and every doctest here writes.
+// `#[non_exhaustive]` would refuse that literal outside the crate (`E0639`) and
+// force a builder for a type whose whole surface is two numbers. The cost is
+// stated rather than hidden: a third field would be a break, and this type is not
+// expected to grow one.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Compaction {
+    /// The share of the turn's effective budget above which the ledger is folded.
+    ///
+    /// `1.0` or more never folds: the assembler bounds the section at the budget,
+    /// so a ledger cannot exceed the whole of it and the threshold is unreachable
+    /// by construction rather than by a flag this type would also have to carry.
+    pub at_share: f32,
+    /// How many of the newest observations are kept whole beside the summary.
+    ///
+    /// A count rather than a share because it is the one a reader can reason about
+    /// without knowing the budget. Floored at 1: a fold that kept nothing recent
+    /// would hand the model a paragraph about work it can no longer see.
+    pub keep_recent: usize,
+}
+
+impl Default for Compaction {
+    fn default() -> Self {
+        Self {
+            at_share: 0.8,
+            keep_recent: 8,
+        }
+    }
+}
+
+impl Compaction {
+    /// Whether a fold can ever happen under this setting.
+    ///
+    /// False for `at_share >= 1.0` and for a non-finite or negative share, which
+    /// are the two ways a config file can say "never" — one deliberately and one
+    /// by accident. A `NaN` threshold compares false against everything, so
+    /// answering "no fold" here is what stops it reading as "fold always".
+    pub fn enabled(&self) -> bool {
+        self.at_share.is_finite() && self.at_share > 0.0 && self.at_share < 1.0
+    }
+
+    /// The ledger's estimated tokens at or above which this turn folds.
+    ///
+    /// Derived from the same `effective_tokens` the assembler is about to bound
+    /// the section by, so the threshold and the budget cannot drift apart.
+    pub fn threshold_tokens(&self, effective_tokens: u64) -> u64 {
+        if !self.enabled() {
+            return u64::MAX;
+        }
+        ((effective_tokens as f64) * (self.at_share as f64)) as u64
+    }
+
+    /// How many observations to keep whole, never fewer than one.
+    pub fn keep(&self) -> usize {
+        self.keep_recent.max(1)
     }
 }
 

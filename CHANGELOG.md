@@ -26,6 +26,75 @@ notes are produced from it.
 
 ### Security
 
+## [0.43.0] - 2026-08-09
+
+### Added
+
+- **A long run no longer forgets its own beginning.** When the observation ledger
+  crosses a share of the turn's context budget, everything but the newest few
+  observations becomes one model-written paragraph — what was being attempted,
+  which files were read or changed, what was decided, and what is still open — and
+  the run continues from that. Before this the assembler could only *truncate*:
+  the oldest observations became one-line stubs saying that a read happened and
+  how big it was, and nothing in the crate had ever written a sentence about what
+  the run learned from them.
+- `Compaction { at_share, keep_recent }` and `TaskContract::with_compaction`
+  decide when that happens. **It is on by default** (`at_share: 0.8`,
+  `keep_recent: 8`), because the failure it replaces is silent: a run whose oldest
+  work became a list of byte counts reports nothing.
+- The paragraph is written by the run's **own** provider and model — no second
+  provider to configure — and costs one ordinary `provider_calls` row for the step
+  it happened in. Its tokens are inside `Store::spent_tokens` and inside the run's
+  token budget, so a fold is spend you can see where you already look.
+- `Summary`, `Store::summaries` and `Store::summary_for` make each fold durable, in
+  a new `summaries` table. A resumed, branched or replayed run **replays** its
+  stored folds rather than paying a model to write the same paragraph again.
+- `EventKind::Compacted { through_step, before_tokens, after_tokens }` reports a
+  fold as it happens, with what it cost and what it bought.
+- **A context overflow no longer ends the run.** `ProviderErrorKind::ContextOverflow`
+  tells an over-window rejection apart from any other 4xx, using the vendor's own
+  wording via the new `ProviderErrorKind::from_response`. The loop answers it by
+  compacting and asking once more with a smaller request; a second overflow
+  escalates exactly as before. The classification is deliberately conservative — a
+  wording it does not know costs exactly what it costs today, while a false
+  positive would re-send a request the server had already refused.
+- **A session's whole conversation can be exported.** `Session::transcript` returns
+  a `Transcript` of `TranscriptTurn`s and `Transcript::to_markdown` renders it: every
+  turn in order, what was asked, what was answered, where a summary stands in for
+  the steps behind it, and which turns a branch left off the model's path. It is a
+  read — no provider is called and no row is written.
+- **A conversational turn can carry an image.** `Session::attach` stages images for
+  the next turn, through the same path `TaskContract::with_images` has used since
+  the `media` feature shipped. One method covers all six turn entry points, and the
+  staging is cleared once the turn has been driven. `media` feature only.
+
+### Changed
+
+- `ProviderErrorKind` is now `#[non_exhaustive]`, and gained `ContextOverflow`.
+  `is_retryable()` returns `false` for it, which is the correct answer rather than a
+  compromise: re-sending bytes a server has said were too many cannot work. The
+  recovery is a *different* request, and it belongs to the run loop.
+
+  *Migration:* a `match` on `ProviderErrorKind` that was exhaustive now needs a
+  wildcard arm. Prefer one that fails loudly over one that guesses — this crate's
+  own test panics in that arm, so a kind added later still cannot slip past a
+  decision about retrying it. Nothing else about the enum moved:
+  `ProviderErrorKind::from_status` behaves exactly as it did on 0.42.0 over every
+  status it maps.
+- A run long enough to cross `Compaction::at_share` now makes a summarising
+  provider call it did not make on 0.42.0 — billed, traced, and inside the token
+  budget. A caller who wants 0.42.0's behaviour exactly writes
+  `.with_compaction(Compaction { at_share: 1.0, ..Compaction::default() })`, which
+  also leaves an over-window request terminal as it was.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.42.0] - 2026-08-08
 
 ### Added
