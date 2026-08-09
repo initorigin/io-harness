@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
+use io_harness::sandbox::{select, Backend, Sandbox, SandboxConfig};
 use io_harness::{
-    run_tree, run_with, ApproveAll, Containment, Policy, Provider, Session, Store, SystemPrompt,
-    TaskContract, Verification,
+    run_tree, run_with, Act, ApproveAll, Containment, Effect, Policy, Provider, Session, Store,
+    SystemPrompt, TaskContract, Verification,
 };
 use serde_json::json;
 
@@ -102,6 +103,14 @@ async fn workspace_system(contract: &TaskContract) -> String {
         &ApproveAll,
     )
     .await;
+    provider.system()
+}
+
+/// The workspace prompt of a run under a policy that enforces something.
+async fn policy_system(contract: &TaskContract, policy: &Policy) -> String {
+    let provider = Rec::new(vec![write_call()]);
+    let store = Store::memory().unwrap();
+    let _ = run_with(contract, &provider, &store, policy, &ApproveAll).await;
     provider.system()
 }
 
@@ -303,6 +312,23 @@ async fn no_caller_prompt_can_get_past_the_ending() {
         "Replace did not replace the crate's description"
     );
 
+    // The boundary section, when one applies, is the last thing before the ending —
+    // so neither a caller's text nor a repository's can be read after the rules.
+    let bounded = policy_system(
+        &contract(dir.path()).with_system_prompt(SystemPrompt::Append(HOUSE.into())),
+        &layered(),
+    )
+    .await;
+    let body = bounded
+        .strip_suffix(CALL_TOOLS_ENDING)
+        .expect("the ending is the suffix");
+    let last_section = body.rsplit("\n\n").next().unwrap();
+    assert!(
+        last_section.starts_with("Your boundary."),
+        "something was emitted between the boundary and the ending: {last_section}"
+    );
+    assert!(bounded.find(HOUSE).unwrap() < bounded.find("Your boundary.").unwrap());
+
     // Replace(""): nothing of the caller's, and still every rule of the crate's.
     let empty = conversational_system(
         &contract(dir.path()).with_system_prompt(SystemPrompt::Replace(String::new())),
@@ -313,4 +339,236 @@ async fn no_caller_prompt_can_get_past_the_ending() {
         empty.ends_with(CONVERSATIONAL_ENDING),
         "an empty replacement swallowed the crate's ending"
     );
+}
+
+// ------------------------------------------------------------------------- F1
+
+/// A policy with something to say in all four tiers.
+fn layered() -> Policy {
+    Policy::default()
+        .layer("app")
+        // Deliberately conflicting: the app allows what the baseline beneath it
+        // denies, so a renderer printing each rule's own effect groups this under
+        // "Allowed" while `explain` says "Refused". That is the arm F1 is for.
+        .allow_read("infra/*")
+        .allow_write("out/*")
+        .allow_exec("cargo")
+        .allow_net("docs.rs")
+        .layer("ops-baseline")
+        .deny_read("infra/*")
+        .deny_write("infra/*")
+}
+
+/// Every pattern the section names, as `(act, pattern)`, read back off the rendered
+/// line rather than out of the policy — so the assertion is about what the agent was
+/// told, not about what the renderer was given.
+fn named_patterns(section: &str) -> Vec<(Act, String)> {
+    let mut out = Vec::new();
+    for line in section.lines() {
+        let act = match line {
+            l if l.starts_with("- Reading files:") => Act::Read,
+            l if l.starts_with("- Writing files:") => Act::Write,
+            l if l.starts_with("- Running a command:") => Act::Exec,
+            l if l.starts_with("- Reaching the network:") => Act::Net,
+            _ => continue,
+        };
+        for group in line.split(". ").skip(1) {
+            let Some((_, items)) = group.split_once(": ") else {
+                continue;
+            };
+            for item in items.trim_end_matches('.').split(", ") {
+                // A deny carries its layer in parentheses; the pattern is the rest.
+                let pattern = item.split(" (").next().unwrap().trim();
+                if !pattern.is_empty() {
+                    out.push((act, pattern.to_string()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// F1 — the boundary section agrees with the policy that enforces it.
+///
+/// The discriminating assertion is the last one: every pattern the prompt names is
+/// grouped under the effect `Policy::explain` actually returns for it. A renderer
+/// that read the layers and forgot that deny is absolute across them, or that
+/// printed a rule's own effect rather than the stack's answer, fails here while
+/// every "is there a section" assertion still passes.
+#[tokio::test]
+async fn the_boundary_section_says_what_the_policy_does() {
+    let dir = workspace();
+    let policy = layered();
+    let composed = policy_system(&contract(dir.path()), &policy).await;
+
+    let section = composed
+        .split("Your boundary.")
+        .nth(1)
+        .expect("the section is present");
+
+    // One line per act, each naming its own tier default.
+    assert!(section.contains("- Reading files: allowed by default."));
+    assert!(section.contains(
+        "- Writing files: allowed only once a human or an approver says yes by default."
+    ));
+    assert!(section.contains(
+        "- Running a command: allowed only once a human or an approver says yes by default."
+    ));
+    assert!(section.contains("- Reaching the network: refused by default."));
+
+    // The five secret patterns `Policy::default()` denies, which no caller wrote and
+    // no agent is told about today.
+    for pattern in [".env", "*.pem", "id_rsa", "id_ed25519", "*.key"] {
+        assert!(
+            section.contains(pattern),
+            "the section never mentions {pattern}"
+        );
+    }
+    // A deny carries the layer that produced it, which is what a refusal carries.
+    assert!(section.contains("infra/* (ops-baseline)"));
+
+    // The discriminating one.
+    let named = named_patterns(section);
+    assert!(named.len() >= 12, "only {} patterns named", named.len());
+    for (act, pattern) in named {
+        let verdict = policy.explain(act, &pattern);
+        let group = match verdict.effect {
+            Effect::Allow => "Allowed",
+            Effect::Ask => "Needs approval",
+            Effect::Deny => "Refused",
+        };
+        let line = section
+            .lines()
+            .find(|l| l.contains(&format!(" {pattern}")) || l.contains(&format!(": {pattern}")))
+            .unwrap_or_else(|| panic!("no line names {pattern}"));
+        let at_group = line.find(group).unwrap_or_else(|| {
+            panic!(
+                "{pattern} is not under {group}, and the policy says {:?}",
+                verdict.effect
+            )
+        });
+        let at_pattern = line.find(&pattern).unwrap();
+        assert!(
+            at_group < at_pattern,
+            "{pattern} is named before its own group heading"
+        );
+    }
+}
+
+/// F1's other half: a permissive run gets no section at all, and single-file mode
+/// never gets one because it enforces no policy.
+#[tokio::test]
+async fn a_run_with_no_boundary_is_told_about_none() {
+    let dir = workspace();
+    let composed = workspace_system(&contract(dir.path())).await;
+    assert!(!composed.contains("Your boundary."));
+}
+
+// ------------------------------------------------------------------------- N5
+
+/// N5 — the section's cost is measured rather than asserted to be small, and the
+/// truncation rule is real.
+///
+/// The figures go into the release record. The truncation arm is the one with a
+/// property to assert: a section that grew with an operator's rule file would
+/// eventually cost more per request than the refusals it prevents, and a list that
+/// silently stopped would be one the agent plans against as if it were complete.
+#[tokio::test]
+async fn the_boundary_section_is_bounded_and_says_when_it_stops() {
+    let dir = workspace();
+
+    let permissive = workspace_system(&contract(dir.path())).await.len();
+    let defaulted = policy_system(&contract(dir.path()), &Policy::default())
+        .await
+        .len();
+    let contained = policy_system(
+        &contract(dir.path()).with_contained_exec(SandboxConfig::new()),
+        &Policy::default(),
+    )
+    .await
+    .len();
+
+    // Forty rules on one act, which is past the cap.
+    let mut many = Policy::default().layer("bulk");
+    for i in 0..40 {
+        many = many.deny_read(format!("vendor{i}/*"));
+    }
+    let big = policy_system(&contract(dir.path()), &many).await;
+
+    println!(
+        "N5 prompt bytes: permissive {permissive}, Policy::default() {defaulted}, \
+         plus containment {contained}, forty rules {}",
+        big.len()
+    );
+
+    let section = big.split("Your boundary.").nth(1).unwrap();
+    let read_line = section
+        .lines()
+        .find(|l| l.starts_with("- Reading files:"))
+        .unwrap();
+    let named = read_line.matches("vendor").count();
+    assert!(
+        named <= 24,
+        "the read line named {named} bulk patterns, past the cap"
+    );
+    assert!(
+        read_line.contains("further rule(s) are not listed here and are enforced just the same"),
+        "the line stopped naming patterns without saying so: {read_line}"
+    );
+    // And the section a caller actually pays for stays a few hundred bytes, not a
+    // few thousand, on the policy most runs carry.
+    assert!(
+        defaulted - permissive < 1_200,
+        "Policy::default() costs {} bytes of prompt",
+        defaulted - permissive
+    );
+}
+
+// ------------------------------------------------------------------------- F2
+
+/// F2 — containment names the backend that was actually selected, and says when it
+/// is degraded.
+///
+/// Both arms branch on what `select` returns rather than asserting a platform's
+/// answer: on a stock Ubuntu 24.04 the namespace backend is refused and the floor
+/// applies, and a test that asserted confinement unconditionally would step over
+/// exactly that case (0.40.0).
+#[tokio::test]
+async fn containment_names_the_backend_the_host_actually_gave() {
+    let dir = workspace();
+
+    for config in [SandboxConfig::new(), SandboxConfig::new().floor_only()] {
+        let backend = select(&config).backend();
+        let composed = policy_system(
+            &contract(dir.path()).with_contained_exec(config.clone()),
+            &Policy::default(),
+        )
+        .await;
+        let line = composed
+            .lines()
+            .find(|l| l.starts_with("- Commands you run"))
+            .unwrap_or_else(|| panic!("no containment line for {}", backend.as_str()));
+
+        assert!(
+            line.contains(backend.as_str()),
+            "the line names a backend the host did not give: {line}"
+        );
+        match backend {
+            // A resource-only backend is stated as one. This is the degraded case
+            // and the whole reason the line reports the selection rather than the
+            // request.
+            Backend::PortableFloor | Backend::WindowsJobObject => {
+                assert!(line.contains("resource limits only"), "{line}");
+                assert!(line.contains("no filesystem confinement"), "{line}");
+            }
+            _ => {
+                assert!(line.contains("are contained"), "{line}");
+                assert!(line.contains("confined to the workspace"), "{line}");
+            }
+        }
+    }
+
+    // And a run that did not ask for containment is told nothing about it.
+    let plain = policy_system(&contract(dir.path()), &Policy::default()).await;
+    assert!(!plain.contains("- Commands you run"));
 }

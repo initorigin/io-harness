@@ -32,6 +32,7 @@ use crate::observe::{EventKind, Ignore, Observer, RunEvent};
 use crate::policy::{Act, Effect, Policy, Rule};
 use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
 use crate::resilience::{Progress, Progressing};
+use crate::sandbox::{Backend, Sandbox, SandboxConfig};
 use crate::skills::Skills;
 use crate::state::PolicyEvent;
 use crate::state::{
@@ -4155,6 +4156,12 @@ async fn run_workspace_from<P: Provider>(
     // 0.45.0 — composed once, here, and reused on every step. A system prompt that
     // varied between steps would move 0.38.0's cache breakpoint every turn and bill
     // a cache write per step on both wires that honour it.
+    // 0.45.0 — the boundary the agent is told about is the one that will refuse it.
+    // Two of them, because the plan gate narrows the policy while the phase is on and
+    // the prompt the loop falls back to when it ends is a different string already.
+    // An approver's remembered rule is not reflected: it widens the boundary mid-run,
+    // and a prompt composed once cannot follow it (`docs/CONTRACT.md`).
+    let after_planning = boundary_section(policy, contract.exec_sandbox.as_ref());
     let base_system = compose(PromptSpec {
         base: WORKSPACE_PROMPT,
         prompt: &contract.prompt,
@@ -4162,7 +4169,7 @@ async fn run_workspace_from<P: Provider>(
         skills,
         directive: None,
         instructions: &contract.instructions,
-        boundary: None,
+        boundary: after_planning.as_deref(),
         ending: CALL_TOOLS_ENDING,
     });
     let mut system = match planning {
@@ -4173,7 +4180,7 @@ async fn run_workspace_from<P: Provider>(
             skills,
             directive: Some(planning_directive(&contract.agents)),
             instructions: &contract.instructions,
-            boundary: None,
+            boundary: boundary_section(&effective, contract.exec_sandbox.as_ref()).as_deref(),
             ending: CALL_TOOLS_ENDING,
         }),
         false => base_system.clone(),
@@ -4195,7 +4202,7 @@ async fn run_workspace_from<P: Provider>(
         &extra,
         skills,
         planning,
-        None,
+        after_planning.as_deref(),
     );
     let mut tools = workspace_tools();
     tools.extend(extra);
@@ -5803,6 +5810,13 @@ fn run_agent<'f, P: Provider>(
         // contract rather than from the tree is what makes a per-child root a
         // property of the contract the spawn built, so nothing else in this loop
         // has to know a worktree exists.
+        // 0.45.0 — computed before the policy moves into the workspace, and twice for
+        // the reason the flat loop does it twice: the plan gate narrows the boundary
+        // while the phase is on. `policy` here is this agent's own — a child's is its
+        // parent's narrowed by `Policy::contain` — so a child is told its boundary and
+        // not the root's.
+        let after_planning = boundary_section(policy, contract.exec_sandbox.as_ref());
+        let while_planning = boundary_section(&effective, contract.exec_sandbox.as_ref());
         let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
         let mut ws = Workspace::with_policy(agent_root, effective);
         // The tree shares one MCP session, so every agent in it — root or child —
@@ -5817,7 +5831,7 @@ fn run_agent<'f, P: Provider>(
         // parent, and a role that replaced it would produce an agent that did not
         // know how to be one. It sits ahead of the whole composed prompt, so the
         // crate's ending is still the last thing an agent with a role reads.
-        let with_role = |directive: Option<String>| {
+        let with_role = |directive: Option<String>, boundary: Option<&str>| {
             let body = compose(PromptSpec {
                 base: TREE_PROMPT,
                 prompt: &contract.prompt,
@@ -5825,7 +5839,7 @@ fn run_agent<'f, P: Provider>(
                 skills: tree.skills,
                 directive,
                 instructions: &contract.instructions,
-                boundary: None,
+                boundary,
                 ending: CALL_TOOLS_ENDING,
             });
             match identity.and_then(|d| d.role.as_deref()) {
@@ -5833,9 +5847,12 @@ fn run_agent<'f, P: Provider>(
                 None => body,
             }
         };
-        let base_system = with_role(None);
+        let base_system = with_role(None, after_planning.as_deref());
         let mut system = match planning {
-            true => with_role(Some(planning_directive(&contract.agents))),
+            true => with_role(
+                Some(planning_directive(&contract.agents)),
+                while_planning.as_deref(),
+            ),
             false => base_system.clone(),
         };
         // 0.39.0 — the opening a contained turn's first completion is made with,
@@ -5849,7 +5866,7 @@ fn run_agent<'f, P: Provider>(
             &extra,
             tree.skills,
             planning,
-            None,
+            after_planning.as_deref(),
         );
         let mut tools = tree_tools(tree.agents);
         tools.extend(extra);
@@ -11274,6 +11291,138 @@ fn compose(spec: PromptSpec<'_>) -> String {
     }
     out.push_str(spec.ending);
     out
+}
+
+/// How many patterns one act names before the line says it stopped naming them.
+///
+/// A section that grew with an operator's rule file would eventually cost more per
+/// request than the refusals it prevents, and a truncation the reader cannot see is
+/// a list the agent would plan against as if it were complete.
+const MAX_BOUNDARY_PATTERNS: usize = 24;
+
+/// What this run is allowed to do, as the agent needs to read it (0.45.0).
+///
+/// `None` when there is nothing true to say: a permissive policy enforces nothing,
+/// and describing it would be several hundred bytes of "everything is allowed" on
+/// every request of every run that never asked for a boundary.
+///
+/// Every pattern named is grouped by what [`Policy::explain`] actually returns for
+/// it, not by the effect of the rule that mentioned it — deny is absolute across
+/// layers, so a pattern allowed in one layer and denied beneath it belongs under
+/// denied, and asking the evaluator is both shorter and the only way the prompt and
+/// the refusal cannot disagree.
+fn boundary_section(policy: &Policy, sandbox: Option<&SandboxConfig>) -> Option<String> {
+    let permissive = policy.is_permissive();
+    if permissive && sandbox.is_none() {
+        return None;
+    }
+    let mut lines: Vec<String> = Vec::new();
+    if !permissive {
+        for (act, label, defaults) in [
+            (Act::Read, "Reading files", policy.defaults.read),
+            (Act::Write, "Writing files", policy.defaults.write),
+            (Act::Exec, "Running a command", policy.defaults.exec),
+            (Act::Net, "Reaching the network", policy.defaults.net),
+        ] {
+            lines.push(boundary_line(policy, act, label, defaults));
+        }
+    }
+    if let Some(config) = sandbox {
+        lines.push(containment_line(config));
+    }
+    Some(format!(
+        "Your boundary. These are enforced before a call runs, so a call outside them is refused \
+         rather than attempted — plan around them rather than finding them one refusal at a \
+         time.\n{}",
+        lines.join("\n")
+    ))
+}
+
+/// One act's line: what happens by default, then what the rules say.
+fn boundary_line(policy: &Policy, act: Act, label: &str, default: Effect) -> String {
+    let mut line = format!("- {label}: {} by default.", effect_phrase(default));
+    let mut named: Vec<(String, Effect, Option<String>)> = Vec::new();
+    let mut omitted = 0usize;
+    for layer in &policy.layers {
+        for rule in &layer.rules {
+            if rule.act != act || named.iter().any(|(p, _, _)| p == &rule.pattern) {
+                continue;
+            }
+            if named.len() == MAX_BOUNDARY_PATTERNS {
+                omitted += 1;
+                continue;
+            }
+            let verdict = policy.explain(act, &rule.pattern);
+            named.push((rule.pattern.clone(), verdict.effect, verdict.layer));
+        }
+    }
+    for effect in [Effect::Allow, Effect::Ask, Effect::Deny] {
+        let group: Vec<String> = named
+            .iter()
+            .filter(|(_, e, _)| *e == effect)
+            .map(|(pattern, _, layer)| match (effect, layer) {
+                // The layer that refused is carried on a deny and only there: it is
+                // what `Verdict` gives a refusal, so the prompt and the refusal name
+                // the same thing when the agent asks why.
+                (Effect::Deny, Some(name)) => format!("{pattern} ({name})"),
+                _ => pattern.clone(),
+            })
+            .collect();
+        if !group.is_empty() {
+            line.push_str(&format!(" {}: {}.", effect_label(effect), group.join(", ")));
+        }
+    }
+    if omitted > 0 {
+        line.push_str(&format!(
+            " {omitted} further rule(s) are not listed here and are enforced just the same."
+        ));
+    }
+    line
+}
+
+/// What an [`Effect`] means to the agent, in the terms it can act on.
+///
+/// `Ask` is neither of the other two and is rendered as itself: an agent told a
+/// write is allowed walks into an approval it was not warned about, and one told it
+/// is refused plans around a boundary that is not the one in force.
+fn effect_phrase(effect: Effect) -> &'static str {
+    match effect {
+        Effect::Allow => "allowed",
+        Effect::Ask => "allowed only once a human or an approver says yes",
+        Effect::Deny => "refused",
+    }
+}
+
+fn effect_label(effect: Effect) -> &'static str {
+    match effect {
+        Effect::Allow => "Allowed",
+        Effect::Ask => "Needs approval",
+        Effect::Deny => "Refused",
+    }
+}
+
+/// What containment actually gives this run, on this host (0.45.0).
+///
+/// The backend is the one [`select`](crate::sandbox::select) returned, not the one
+/// the caller asked for: on a stock Ubuntu 24.04 the namespace backend is refused
+/// and the floor applies, and an agent told it is confined when it is not is worse
+/// informed than one told nothing (0.40.0).
+fn containment_line(config: &SandboxConfig) -> String {
+    let backend = crate::sandbox::select(config).backend();
+    match backend {
+        Backend::PortableFloor | Backend::WindowsJobObject => format!(
+            "- Commands you run are given resource limits only (backend: {}). This host provides \
+             no filesystem confinement and no outbound-network confinement for them, so neither \
+             is in force.",
+            backend.as_str()
+        ),
+        _ => format!(
+            "- Commands you run are contained (backend: {}): their writes are confined to the \
+             workspace, and outbound network is permitted only where this run's policy permits \
+             it.",
+            backend.as_str()
+        ),
+    }
 }
 
 /// The repository's own guidance, delimited and framed (0.45.0).

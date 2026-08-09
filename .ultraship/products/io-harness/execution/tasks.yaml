@@ -68,7 +68,7 @@ tasks:
   summary: Render the boundary section from the run's own policy, bounded and truncation-stated.
   why_required: The release's premise is that a refusal the model could have predicted costs a step every
     time. Without this section the agent is told nothing about the policy that refuses it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.45.0-T01
   acceptance_criteria:
@@ -92,12 +92,42 @@ tasks:
   files:
   - src/run.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`boundary_section` / `boundary_line` / `effect_phrase` / `effect_label` added at `src/run.rs`, wired
+    into the workspace loop and the tree loop. Rendered twice per loop, not once: the plan gate narrows
+    the policy while the phase is on and the loop already falls back to a second prompt when it ends,
+    so the planning prompt renders `effective` (policy + plan lock) and the post-planning prompt renders
+    the caller''s `policy`. Single-file mode gets none — it enforces no policy — and a permissive policy
+    with no containment renders nothing at all.'
+  - Each pattern is grouped by what `Policy::explain` returns for it rather than by the effect of the
+    rule that named it, which is both shorter than re-implementing deny-first precedence and the only
+    way the prompt and a refusal cannot disagree. A deny carries its layer name, which is what `Verdict`
+    carries.
+  - 'F1 — `the_boundary_section_says_what_the_policy_does` (`tests/prompt.rs`) passes: one line per act
+    naming its tier default, the five `SECRET_PATTERNS` present, `infra/* (ops-baseline)` attributed,
+    and every pattern read back OFF THE RENDERED LINE re-evaluated through `policy.explain` and asserted
+    to sit under that effect''s heading. The fixture policy deliberately allows in `app` what `ops-baseline`
+    denies beneath it, so the discriminating arm has something to discriminate. `a_run_with_no_boundary_is_told_about_none`
+    covers the permissive case.'
+  - 'N5 — `the_boundary_section_is_bounded_and_says_when_it_stops` passes. Measured system-prompt bytes:
+    **permissive 432**, **`Policy::default()` 1164** (+732), **plus containment 1347** (+915 over permissive),
+    **forty rules on one act 1586**. The cap is 24 patterns per act and the line states the count it did
+    not name; the test asserts both, and that `Policy::default()` costs under 1,200 bytes.'
+  - Sabotage — render the tier defaults and skip the layers — fails `the_boundary_section_says_what_the_policy_does`
+    AND `the_boundary_section_is_bounded_and_says_when_it_stops`, and nothing else.
+  - Sabotage — print each rule's own effect and its own layer instead of the stack's answer — fails `the_boundary_section_says_what_the_policy_does`
+    alone, on the pattern the app layer allows and the baseline denies. This is the arm that says the
+    section agrees with the evaluator rather than with the rule list.
+  - 'F4''s remaining half landed here, where the renderer exists: `no_caller_prompt_can_get_past_the_ending`
+    now also asserts that the last `\n\n`-separated block before the ending is the boundary section, and
+    that an `Append` sits ahead of it.'
+  - 'Gates: `cargo test --lib --tests --no-fail-fast` exit 0 over 76 suites; `cargo fmt --check` clean;
+    `cargo clippy --all-targets -- -D warnings` clean.'
 - id: US-IO-HARNESS-0.45.0-T03
   summary: State the sandbox backend the host actually selected, including a degraded floor.
   why_required: A contained run whose host fell back to `PortableFloor` has caps and no confinement (0.40.0).
     An agent told it is confined when it is not is worse informed than one told nothing.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.45.0-T02
   acceptance_criteria:
@@ -113,7 +143,21 @@ tasks:
   files:
   - src/run.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`containment_line` at `src/run.rs` names `select(config).backend()` — the backend the host actually
+    gave, via `Backend::as_str` — and branches: `PortableFloor` and `WindowsJobObject` are stated as resource
+    limits only, with filesystem and outbound-network confinement explicitly NOT in force; a native backend
+    is stated as confining writes to the workspace with egress following the run''s policy. `select` is
+    called once per run at composition time, never per step.'
+  - F2 — `containment_names_the_backend_the_host_actually_gave` (`tests/prompt.rs`) passes on this host
+    for both `SandboxConfig::new()` and `SandboxConfig::new().floor_only()`. The test branches on `select(&config).backend()`
+    rather than asserting a platform, so each of the three CI platforms asserts its own truth and the
+    degraded case is asserted rather than stepped over (0.40.0's lesson). A run that did not ask for containment
+    is asserted to be told nothing about it.
+  - Sabotage — report the requested mode instead of the selection (`force_floor` decides the label) —
+    fails `containment_names_the_backend_the_host_actually_gave` and nothing else. On this macOS host
+    the native arm then claims `linux-namespaces`; on a stock Ubuntu 24.04 the same sabotage would claim
+    confinement the host never applied, which is the defect the criterion exists for.
 - id: US-IO-HARNESS-0.45.0-T04
   summary: Discover `AGENTS.md` with no `[instructions]` table; `files = []` is the opt-out.
   why_required: A repository carrying the file every other agent reads and no `io.toml` at all is read
