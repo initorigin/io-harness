@@ -164,12 +164,7 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         .map(|s| s.to_string())
         .collect();
     let out = sb
-        .run(RunSpec {
-            argv: &argv,
-            workdir: dir.path(),
-            limits: &SandboxLimits::default(),
-            allow_network: false,
-        })
+        .run(RunSpec::new(&argv, dir.path(), &SandboxLimits::default()).with_network(false))
         .await
         .unwrap();
 
@@ -343,12 +338,7 @@ async fn a_sandbox_that_cannot_start_returns_a_typed_failure() {
     let dir = tempfile::tempdir().unwrap();
     let argv = vec!["io-harness-no-such-binary-zzz".to_string()];
     let err = FloorSandbox
-        .run(RunSpec {
-            argv: &argv,
-            workdir: dir.path(),
-            limits: &SandboxLimits::default(),
-            allow_network: false,
-        })
+        .run(RunSpec::new(&argv, dir.path(), &SandboxLimits::default()).with_network(false))
         .await;
     assert!(
         matches!(err, Err(io_harness::Error::Sandbox { .. })),

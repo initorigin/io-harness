@@ -72,6 +72,7 @@ enum Decision src/approve.rs
 enum Draw src/containment.rs
 enum Effect src/policy.rs
 enum Effort src/provider/mod.rs
+enum ExecMode src/sandbox.rs
 enum Error src/error.rs
 enum EventKind src/observe.rs
 enum Flow src/observe.rs

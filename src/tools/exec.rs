@@ -21,38 +21,33 @@
 //! command with a metacharacter in it does not become two commands, because
 //! nothing on this path ever parses one.
 //!
-//! ## What this does not bound, unless it is asked to
+//! ## What this bounds, and what it does not
 //!
-//! By default a command runs in the workspace root **with the embedding
-//! program's privileges**, not inside the [`Sandbox`]. That is
-//! the owner's decision of 2026-07-29, recorded in `US-IO-HARNESS-0.17.0-I02`,
-//! and it is taken with its cost stated: the sandbox denies network egress by
-//! default and discards its working directory, which is right for a verification
-//! gate and makes `npm install` impossible. So the policy decides what may
-//! *start*, and not what a started process then does — the same honest bound this
-//! crate already states for a registered [`Tool`](super::Tool) and for a stdio
-//! MCP server.
+//! **A command is contained by default (0.46.0).** It runs in the workspace root
+//! inside the backend [`select`] chose, and may write to
+//! the workspace, the system temporary directory and the detected toolchain's own
+//! caches — and nowhere else. Up to 0.45.0 the default was the embedding
+//! program's own privileges (the owner's decision of 2026-07-29, recorded in
+//! `US-IO-HARNESS-0.17.0-I02`); that grant is still available and is now spelled
+//! at the call site by
+//! [`TaskContract::with_full_access`](crate::TaskContract::with_full_access).
 //!
-//! **0.40.0 makes the other choice available without changing that default.**
-//! [`TaskContract::with_contained_exec`](crate::TaskContract::with_contained_exec)
-//! puts every command this tool and `shell` start inside the selected backend.
-//! The half of the 0.17.0 objection that was about the working directory is
-//! answered rather than argued with: the discarding was never the sandbox's, it
-//! was the verification gate's choice of [`sandbox::workdir`](crate::sandbox::workdir)
-//! and [`copy_back`](crate::sandbox::copy_back). A contained command is given the
-//! **workspace root**, so nothing is copied in, nothing is copied out, and an
-//! incremental build survives from one command to the next.
+//! The 0.17.0 objection is answered rather than argued with, in both halves. The
+//! working directory was never the sandbox's doing — the discarding was the
+//! verification gate's choice of [`sandbox::workdir`](crate::sandbox::workdir)
+//! and [`copy_back`](crate::sandbox::copy_back) — so a contained command is given
+//! the **workspace root**, nothing is copied in or out, and an incremental build
+//! survives from one command to the next. And the toolchain's own cache
+//! directories are writable roots, so the cold `cargo fetch` writing
+//! `~/.cargo/registry`, or `npm install` writing `~/.npm`, that failed under
+//! 0.40.0's containment now succeeds under 0.46.0's default.
 //!
-//! What a contained command loses is everything outside that root — on macOS and
-//! Linux its writes are confined to the workspace, and its egress is denied
-//! unless this run's [`Policy`](crate::Policy) would permit
-//! [`Act::Net`](crate::Act::Net). The half of the objection that was about the
-//! network therefore stands: a build that must fetch needs a policy that allows
-//! it. And there is a real cost on macOS in particular — writes outside the
-//! workspace and the system temporary directory are refused, so a toolchain
-//! populating a user-level cache such as `~/.cargo/registry` or `~/.npm` fails
-//! under containment. `docs/CONTRACT.md` states this, and the answer is to leave
-//! the field unset or to point the cache inside the workspace.
+//! What a contained command still loses is everything outside those roots, and
+//! its egress unless this run's [`Policy`](crate::Policy) would permit
+//! [`Act::Net`](crate::Act::Net) — so a build that must fetch needs a policy that
+//! allows it. What a Windows Job Object and the portable floor enforce is the
+//! resource caps alone: there the mode is reported and not applied.
+//! `docs/CONTRACT.md` carries the per-platform table.
 //!
 //! Two ceilings apply to what a started process may do to the *run*: a wall-clock
 //! timeout, so a wedged command dies naming itself instead of consuming the
@@ -67,7 +62,7 @@ use std::time::Duration;
 use tokio::process::Command;
 
 use crate::error::{Error, Result};
-use crate::sandbox::{select, Cap, RunSpec, Sandbox, SandboxConfig};
+use crate::sandbox::{select, Cap, ExecContainment, Sandbox};
 
 /// How long a command started by the `exec` tool may run before it is killed.
 ///
@@ -161,13 +156,16 @@ pub(crate) struct Exec {
     workdir: PathBuf,
     timeout: Duration,
     cap: usize,
-    /// The containment this run asked for, or `None` for the 0.17.0 default.
+    /// The containment this run resolved, or `None` when its mode is
+    /// [`ExecMode::FullAccess`](crate::ExecMode::FullAccess).
     ///
     /// Held rather than resolved to a backend at construction because
     /// [`select`](crate::sandbox::select) probes the host, and an `Exec` is built
     /// per tool call while the probe's answer does not change under a running
-    /// process.
-    sandbox: Option<SandboxConfig>,
+    /// process. The writable roots come with it for the same reason: they are a
+    /// per-run answer, and re-deriving them per call would let two call sites
+    /// disagree about what a mode grants.
+    sandbox: Option<std::sync::Arc<ExecContainment>>,
 }
 
 impl Exec {
@@ -192,8 +190,8 @@ impl Exec {
     /// A builder rather than a fourth argument to [`Exec::new`] so the uncontained
     /// construction — every caller before 0.40.0, and every test that is not about
     /// containment — reads exactly as it did.
-    pub(crate) fn contained(mut self, sandbox: Option<&SandboxConfig>) -> Self {
-        self.sandbox = sandbox.cloned();
+    pub(crate) fn contained(mut self, sandbox: Option<std::sync::Arc<ExecContainment>>) -> Self {
+        self.sandbox = sandbox;
         self
     }
 
@@ -205,8 +203,20 @@ impl Exec {
         let Some(program) = argv.first() else {
             return Err(Error::Config("exec needs a non-empty argv".into()));
         };
-        if let Some(config) = &self.sandbox {
-            return self.run_contained(config, argv).await;
+        if let Some(containment) = &self.sandbox {
+            // A missing program must read the same way contained as uncontained.
+            // Below, `ErrorKind::NotFound` from the spawn is what says so — but a
+            // contained spawn is of the *wrapper* (`sandbox-exec`, `unshare`),
+            // which exists, and it reports the missing payload as its own failure.
+            // Without this the flip of 0.46.0's default would silently turn every
+            // "no such program" into "your command failed", which is the wrong
+            // diagnosis for the model and for whoever reads the trace.
+            if !on_path(program) {
+                return Ok(ExecOutcome::Unavailable {
+                    reason: format!("no `{program}` on PATH"),
+                });
+            }
+            return self.run_contained(containment, argv).await;
         }
         let mut cmd = command(program, &argv[1..], &self.workdir);
         match tokio::time::timeout(self.timeout, cmd.output()).await {
@@ -241,6 +251,9 @@ impl Exec {
 
     /// The same command, wrapped by whichever backend this host offers.
     ///
+    /// Reached only after [`on_path`] has answered, so a missing program is
+    /// [`ExecOutcome::Unavailable`] here exactly as it is on the direct path.
+    ///
     /// The working directory is the workspace root, not a temporary directory —
     /// that is the whole difference between this and the verification gate's use
     /// of the same machinery, and it is what makes a contained `exec` able to
@@ -253,14 +266,13 @@ impl Exec {
     /// bounded by the same rule an unsandboxed command is; the config's
     /// `max_wall_secs` is the sandbox's own, and a command it kills comes back as
     /// a cap rather than as this timeout.
-    async fn run_contained(&self, config: &SandboxConfig, argv: &[String]) -> Result<ExecOutcome> {
-        let sandbox = select(config);
-        let spec = RunSpec {
-            argv,
-            workdir: &self.workdir,
-            limits: &config.limits,
-            allow_network: config.allow_network,
-        };
+    async fn run_contained(
+        &self,
+        containment: &ExecContainment,
+        argv: &[String],
+    ) -> Result<ExecOutcome> {
+        let sandbox = select(&containment.config);
+        let spec = containment.spec(argv, &self.workdir);
         match tokio::time::timeout(self.timeout, sandbox.run(spec)).await {
             Err(_elapsed) => Ok(ExecOutcome::TimedOut {
                 after: self.timeout,
@@ -304,6 +316,50 @@ impl Exec {
 /// device, because a command that prompts must fail rather than wait forever on a
 /// terminal that will never answer, and both output streams are piped so they can
 /// be captured and bounded instead of landing on the host's console.
+/// Can this machine run `program` at all? (0.46.0)
+///
+/// The direct spawn answers this for free — the operating system returns
+/// `ErrorKind::NotFound` and the tool reports [`ExecOutcome::Unavailable`], which
+/// is 0.17.0's decision that a missing toolchain is something the agent is *told*
+/// rather than a failed run. A contained spawn cannot: it spawns the backend's
+/// wrapper, the wrapper exists, and the missing payload comes back as the
+/// wrapper's own non-zero exit. Since 0.46.0 contains by default, that difference
+/// would otherwise be visible to every caller.
+///
+/// The rule is the shell's, minus the parts that would be guesses: a program with
+/// a separator in it is a path and is checked as one; anything else is looked for
+/// in each `PATH` entry, and on Windows under each `PATHEXT` extension as well.
+/// It is not asked to decide *executability* — a file that exists and cannot be
+/// executed is a real failure with a real message, and reporting it as "not
+/// installed" would be a worse answer than the operating system's own.
+fn on_path(program: &str) -> bool {
+    let looks_like_a_path = program.contains('/') || (cfg!(windows) && program.contains('\\'));
+    if looks_like_a_path {
+        return Path::new(program).is_file();
+    }
+    let Some(path) = std::env::var_os("PATH") else {
+        // No `PATH` at all is not a claim that the program is missing.
+        return true;
+    };
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    std::env::split_paths(&path).any(|dir| {
+        if dir.join(program).is_file() {
+            return true;
+        }
+        exts.iter()
+            .any(|ext| dir.join(format!("{program}{ext}")).is_file())
+    })
+}
+
 fn command(program: &str, args: &[String], workdir: &Path) -> Command {
     let mut c = Command::new(program);
     c.args(args)

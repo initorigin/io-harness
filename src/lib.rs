@@ -436,8 +436,8 @@ pub use run::{
     RunResult, SPAWN_TOOL,
 };
 pub use sandbox::{
-    copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
-    Selected,
+    copy_back, select, Backend, Cap, ExecMode, Sandbox, SandboxConfig, SandboxLimits,
+    SandboxOutcome, Selected,
 };
 pub use session::{Session, Steer, SteerInbox, Transcript, TranscriptTurn, TurnKind, TurnResult};
 pub use skills::{Skill, Skills};

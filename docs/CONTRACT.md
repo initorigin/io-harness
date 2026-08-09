@@ -911,15 +911,64 @@ unchanged from the per-tier slot design: a parent holds a slot at its own tier a
 waits only on the tier below, which is what makes the wait graph acyclic. A
 contained turn is a tree like any other in this respect.
 
-## What contained `exec` and `shell` give you, and what they do not (0.40.0)
+## What contained `exec` and `shell` give you, and what they do not (0.40.0, 0.46.0)
 
-The project's own commands **can** run inside the sandbox, and by default they
-still do not. `TaskContract::with_contained_exec(SandboxConfig)` is the opt-in;
-with the field unset, `exec` and `shell` behave exactly as they did in 0.39.0 —
-in the workspace root, at the embedding program's privileges, with the policy
-deciding what may *start* and nothing bounding what a started process then does.
-That default is the owner's decision of 2026-07-29 (`US-IO-HARNESS-0.17.0-I02`)
-and this release leaves it standing.
+**The project's own commands run inside the sandbox by default, since 0.46.0.**
+`TaskContract::exec_sandbox` is a `SandboxConfig`, not an `Option`, and its
+`ExecMode` decides where a command may write:
+
+| `ExecMode` | A command may write to |
+| --- | --- |
+| `ReadOnly` | the system temporary directory, and nothing else |
+| `WorkspaceWrite` *(the default)* | the workspace root, the system temporary directory, and the detected toolchain's own cache directories |
+| `FullAccess` | anywhere this program's user can write |
+
+`FullAccess` is what every release up to 0.45.0 did by default, and it is still
+available — as a sentence rather than as an omission:
+`TaskContract::with_full_access()`. The method is named the way it is so the
+widest grant this crate makes is legible in a diff and findable with
+`grep -r with_full_access`. `ExecMode::ReadOnly` still grants the temporary
+directory, because a toolchain that cannot open a temporary file cannot start.
+
+**The default is a boundary and not a ceiling.** The mode-derived default carries
+`SandboxLimits::none()` — no CPU, wall, memory, process or file-descriptor cap at
+all. Defaulting containment on is a claim about where a command may write;
+defaulting the 0.6.0 ceilings on (120 wall seconds, sized for a verification gate
+compiling one crate) would be a claim about how long someone else's build may
+take, and this crate is not in a position to make it. The standing caps are one
+call away: `with_contained_exec(SandboxConfig::new())`.
+
+**The detected toolchain's cache directories are writable roots.** A default that
+no real project can build under is a default every embedder turns off on their
+first failure, so `Toolchain::cache_dirs` derives them for the ecosystem
+`toolchain::detect` already found — `CARGO_HOME`, `GOMODCACHE`/`GOPATH`,
+`npm_config_cache`, `PIP_CACHE_DIR`, `GRADLE_USER_HOME`, `NUGET_PACKAGES` and the
+rest, each ecosystem's own environment variable winning over the conventional
+path. **Only roots that exist on this host are granted**, and that filter is part
+of the confinement rather than tidiness: the Linux mount setup binds every root it
+is given, a bind of a path that is not there fails the setup, and a failed setup
+degrades the whole backend to `PortableFloor` — so a granted path that was not
+there would silently unwind the confinement it was added to preserve. A project
+whose ecosystem this crate cannot name (`make`, `cmake`) gets the workspace and
+the temporary directory alone.
+
+**The verification gate takes the same roots.** It runs the project's own build
+command in an ephemeral working directory, so it is the one place this crate runs
+a package manager on purpose, and a gate that could not populate a registry cache
+would fail for a reason that has nothing to do with the code it is judging.
+
+**A run reports its containment once, at start.**
+`EventKind::Contained { mode, backend, roots }` names the mode asked for, the
+backend `sandbox::select` **actually returned**, and how many writable roots were
+granted after the exists-filter. A `FullAccess` run emits it too, with
+`backend: "none"` — "this run was not contained" is the first fact an audit wants
+and an absent event is not a statement. The per-command `SandboxEvent` rows are
+unchanged.
+
+**An `io.toml` may name the mode**, as `[sandbox] mode = "read-only"`. It obeys
+the standing trust rule: a project-scoped file may narrow and may never widen, so
+`mode = "full-access"` is refused there exactly as `force_floor = false` and
+`allow_network = true` already are.
 
 **A contained command keeps the workspace root as its working directory.** This is
 what makes containment usable for a build at all. The sandbox never discarded a
@@ -933,12 +982,15 @@ cosmetic.**
 
 | Platform | Resource caps | Writes confined | Egress denied |
 | --- | --- | --- | --- |
-| macOS | Yes | Yes, to the workspace and the system temporary directory | Yes |
-| Linux | Yes | Yes, to the workspace and the system temporary directory (0.40.0) | Yes |
+| macOS | Yes | Yes, to what the mode grants | Yes |
+| Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes |
 | Windows | Yes | **No** | **No** |
 
 A Job Object contains resources and nothing else, so on Windows a contained
-command gets the caps and nothing more. On Linux the filesystem half is new in
+command gets the caps and nothing more. **On Windows and on the portable floor
+the `ExecMode` is therefore routed and reported and enforces nothing for the
+filesystem** — it is a statement of what the run asked for, not of what the host
+delivered, and `EventKind::Contained`'s `backend` is where the difference shows. On Linux the filesystem half is new in
 0.40.0: before it, the backend unshared a mount namespace and remounted nothing
 into it, so only the network namespace was real. A host whose kernel refuses the
 remounts degrades to `PortableFloor` and **reports the floor** rather than naming
@@ -969,14 +1021,14 @@ the sandbox wall. `Effect::Ask` counts as *not* permitted: an approver answers
 about one action at the moment it is attempted, and a namespace is built before
 the command starts and cannot be renegotiated afterwards.
 
-**A contained command on macOS may write only under the workspace and
-`/private/var/folders`.** The concrete cost is a toolchain that populates a
-user-level cache: a cold `cargo fetch` writing `~/.cargo/registry`, or
-`npm install` writing `~/.npm`, fails under containment. The answers are to leave
-the field unset for that run, or to point the toolchain's cache inside the
-workspace. Linux carries the same shape for the same reason — without the
-temporary directory bound back, most toolchains fail on their first temporary
-file.
+**A contained command may write only under what its mode grants.** Up to 0.45.0
+that was the workspace and the system temporary directory alone, and the concrete
+cost was a toolchain populating a user-level cache: a cold `cargo fetch` writing
+`~/.cargo/registry`, or `npm install` writing `~/.npm`, failed under containment.
+0.46.0 grants the detected toolchain's own cache directories, which is what
+removes that cost for a project whose ecosystem this crate can name. For one it
+cannot — or for a build that writes to a path the *caller* configured outside the
+workspace — the answer is `with_full_access()`, said once at the call site.
 
 **The `shell_start` / `shell_poll` / `shell_kill` handles are not contained.** A
 handle outlives the call that made it, and what a resumed run should do with a
@@ -1236,7 +1288,7 @@ in a fixed order:
 3. the planning directive, when the plan gate is on;
 4. the caller's own text, when `TaskContract::prompt` is `SystemPrompt::Append`;
 5. the repository's own guidance, when `[instructions]` discovered any;
-6. the boundary section, when the run enforces a policy or asked for containment;
+6. the boundary section, when the run enforces a policy or is contained — which since 0.46.0 is every run that has not asked for `ExecMode::FullAccess`;
 7. **the crate's ending sentence, last, always.**
 
 **Nothing a caller or a repository supplies is emitted after step 7.** The ending
@@ -1284,12 +1336,14 @@ event carries, so the prompt and the refusal name the same thing.
   verification layers before any call runs. Telling the agent is an optimisation
   against paying a step per refusal, and no prompt text widens anything.
 
-With `TaskContract::exec_sandbox` set, one further line names the backend
-`sandbox::select` **actually returned** on this host — not the one that was asked
-for. Where that is the portable floor or a Windows Job Object, the line says the
-resource caps apply and filesystem and outbound-network confinement do not, which
-on a stock Ubuntu 24.04 is the truth an agent would otherwise have to discover
-(0.40.0).
+One further line names the run's `ExecMode` and the backend `sandbox::select`
+**actually returned** on this host — not the one that was asked for. Where that is
+the portable floor or a Windows Job Object, the line says the resource caps apply
+and filesystem and outbound-network confinement do not, which on a stock Ubuntu
+24.04 is the truth an agent would otherwise have to discover (0.40.0). A run under
+`ExecMode::FullAccess` gets the line too, saying it is not contained: since 0.46.0
+that is a decision the caller made, and an agent that may write anywhere should
+know it rather than infer it from a write that happened to succeed.
 
 ## What a repository's own guidance is, and where it now rides (0.45.0)
 

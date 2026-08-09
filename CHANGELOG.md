@@ -26,6 +26,108 @@ notes are produced from it.
 
 ### Security
 
+## [0.46.0] - 2026-08-09
+
+### Added
+
+- **A run's own commands are contained by default.** `ExecMode` names three
+  grants and `TaskContract::exec_sandbox` carries one: `ReadOnly` (the system
+  temporary directory and nothing else), `WorkspaceWrite` — **the default** — (the
+  workspace root, the system temporary directory and the detected toolchain's own
+  cache directories), and `FullAccess` (the embedding program's own privileges,
+  which is what every release up to 0.45.0 did without being asked). Every command
+  `exec` and the foreground `shell` start now goes through the backend
+  `sandbox::select` chose, with the workspace root as its working directory, so an
+  incremental build still survives from one command to the next.
+
+- **`TaskContract::with_full_access()` — the escape hatch, spelled at the call
+  site.** A run that genuinely needs the machine still gets it; what changed is
+  that a reader of your source can see that it was chosen. `with_exec_mode` sets
+  the third mode. Both leave the resource caps alone.
+
+- **The detected toolchain's cache directories are writable roots.**
+  `Toolchain::cache_dirs` derives them for the ecosystem `toolchain::detect`
+  already found, honouring that ecosystem's own environment variable
+  (`CARGO_HOME`, `GOMODCACHE`/`GOPATH`, `npm_config_cache`, `PIP_CACHE_DIR`,
+  `POETRY_CACHE_DIR`, `UV_CACHE_DIR`, `GRADLE_USER_HOME`, `NUGET_PACKAGES`,
+  `DENO_DIR` and the rest) before falling back to the conventional path. This is
+  what removes 0.40.0's recorded limitation: a cold `cargo fetch` writing
+  `~/.cargo/registry`, or `npm install` writing `~/.npm`, now succeeds under the
+  default rather than failing. Only roots that exist on this host are granted —
+  a bind of a path that is not there fails the Linux mount setup, and a failed
+  setup would degrade the whole backend to the portable floor.
+
+- **The verification gate takes the same writable roots**, so a gate running the
+  project's own build command no longer fails for a reason that has nothing to do
+  with the code it is judging.
+
+- **`EventKind::Contained { mode, backend, roots }`, once per run.** The mode
+  asked for, the backend that **actually applied** — `portable-floor` on a host
+  that degraded — and how many writable roots were granted. A `FullAccess` run
+  emits it too, with `backend: "none"`: "this run was not contained" is the first
+  thing an audit asks and an absent event is not a statement.
+
+- **`[sandbox] mode = "read-only"` in `io.toml`.** It obeys the standing trust
+  rule: a project-scoped file may narrow and never widen, so `mode = "full-access"`
+  is refused there exactly as `force_floor = false` and `allow_network = true`
+  already are.
+
+- 0.45.0's boundary section names the mode, so an agent under `ReadOnly` is told
+  it may not write rather than finding out from a failed command — and a
+  `FullAccess` run is told it is not contained.
+
+### Changed
+
+- **BREAKING (behaviour): a run built from `TaskContract::workspace` or
+  `TaskContract::new` is now contained.** `exec`, each `shell` stage and the
+  sandboxed verification gate may write inside the workspace root, the system
+  temporary directory and the detected toolchain's cache directories, and nowhere
+  else. A program relying on a command writing elsewhere — a sibling checkout, a
+  home-directory dotfile, an absolute output path — will see those writes refused
+  by the operating system, **with no compile error to warn it**.
+  *Migration:* add `.with_full_access()` to the contract. That restores 0.45.0's
+  execution behaviour exactly, in one call, at the construction site.
+
+- **No resource cap is applied by the default.** The mode-derived default carries
+  `SandboxLimits::none()`, so nothing that completed before is newly killed by a
+  clock or a memory ceiling. Defaulting containment on is a claim about where a
+  command may write; defaulting the 0.6.0 ceilings on would be a claim about how
+  long your build may take.
+  *Migration:* none needed. `with_contained_exec(SandboxConfig::new())` still asks
+  for the standing 60s CPU / 120s wall / 2 GiB / 512 fd caps.
+
+- **BREAKING (API): `TaskContract::exec_sandbox` is a `SandboxConfig`, not an
+  `Option<SandboxConfig>`.** Three modes expressed as two variants plus a `None`
+  is a model a reader has to hold in their head rather than read off the type.
+  *Migration:* `contract.exec_sandbox.is_some()` becomes
+  `contract.exec_sandbox.mode != ExecMode::FullAccess`;
+  `contract.exec_sandbox.as_ref().unwrap().limits` becomes
+  `contract.exec_sandbox.limits`. `with_contained_exec(config)` is unchanged.
+
+- **BREAKING (API): `sandbox::RunSpec` is `#[non_exhaustive]` and is built through
+  `RunSpec::new`.** It carries the mode and the writable roots to the backends.
+  *Migration:* `RunSpec { argv, workdir, limits, allow_network }` becomes
+  `RunSpec::new(argv, workdir, limits).with_network(allow_network)`, with
+  `with_mode` and `with_writable_roots` for the rest. The attribute is why 0.47.0's
+  and 0.48.0's additions to this type will cost nothing.
+
+- **On a host whose backend cannot enforce a mode, the mode is routed, reported,
+  and enforces nothing for the filesystem.** A Windows Job Object has no
+  filesystem facility, and a Linux host that refuses an unprivileged user
+  namespace — a stock Ubuntu 24.04, which is `ubuntu-latest` — takes the portable
+  floor. This is 0.40.0's finding and it is unchanged here: `EventKind::Contained`
+  names the backend that applied, the `SandboxEvent` rows name it per command, and
+  the agent is told in its own prompt.
+
+### Fixed
+
+- **A missing program reads the same way contained and uncontained.** A contained
+  spawn is of the backend's wrapper (`sandbox-exec`, `unshare`), which exists, so
+  a missing payload came back as the wrapper's own failure rather than as
+  `[exec unavailable]`. With containment now the default that would have turned
+  every "no such program on PATH" into "your command failed" — the wrong diagnosis
+  for the model and for whoever reads the trace.
+
 ## [0.45.0] - 2026-08-09
 
 ### Added

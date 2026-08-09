@@ -170,6 +170,89 @@ impl Cap {
     }
 }
 
+/// How much of the machine a run's commands may reach.
+///
+/// The mode decides **where a command may write**. It does not decide the
+/// resource caps ([`SandboxLimits`]) and it does not decide egress, which comes
+/// from the run's own [`Policy`](crate::Policy) — one authority per question.
+///
+/// [`WorkspaceWrite`](ExecMode::WorkspaceWrite) is the default, and that is the
+/// 0.46.0 change: every release up to 0.45.0 ran commands at the embedding
+/// program's own privileges unless the caller opted into containment, so the
+/// widest grant the crate makes was spelled as a field nobody set. It is now
+/// spelled as a method call.
+///
+/// ```
+/// use io_harness::{ExecMode, TaskContract};
+///
+/// // Contained, without having asked: commands may write inside the workspace
+/// // root, the system temp directory and the detected toolchain's caches.
+/// let default = TaskContract::workspace("run the test suite", "/repo");
+/// assert_eq!(default.exec_sandbox.mode, ExecMode::WorkspaceWrite);
+///
+/// // The run that genuinely needs the machine says so where a reader sees it.
+/// let wide = TaskContract::workspace("upgrade the host toolchain", "/repo")
+///     .with_full_access();
+/// assert_eq!(wide.exec_sandbox.mode, ExecMode::FullAccess);
+///
+/// // And the label is what reaches the trace and the agent's own prompt.
+/// assert_eq!(ExecMode::ReadOnly.as_str(), "read-only");
+/// ```
+///
+/// **What a mode is worth depends on the backend the host could give.** A
+/// Windows Job Object has no filesystem facility and the
+/// [`PortableFloor`](Backend::PortableFloor) has none either, so on those hosts
+/// the mode is routed and reported and enforces nothing for the filesystem —
+/// read it off [`Sandbox::backend`] rather than assuming, exactly as with
+/// [`Backend`] itself.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ExecMode {
+    /// The workspace is readable and no command may write into it. The system
+    /// temp directory stays writable, because a toolchain that cannot open a
+    /// temporary file cannot start at all.
+    ReadOnly,
+    /// Commands may write inside the workspace root, the system temp directory
+    /// and the detected toolchain's own cache directories, and nowhere else.
+    /// **The default.**
+    #[default]
+    WorkspaceWrite,
+    /// The embedding program's own privileges — no wrapping, no confinement.
+    /// What every release up to 0.45.0 did by default, and what
+    /// [`TaskContract::with_full_access`](crate::TaskContract::with_full_access)
+    /// now asks for explicitly.
+    FullAccess,
+}
+
+impl ExecMode {
+    /// A stable label for the trace, the prompt and logs.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExecMode::ReadOnly => "read-only",
+            ExecMode::WorkspaceWrite => "workspace-write",
+            ExecMode::FullAccess => "full-access",
+        }
+    }
+
+    /// Whether a command under this mode is wrapped by a backend at all.
+    ///
+    /// [`FullAccess`](ExecMode::FullAccess) is the one mode that reaches no
+    /// backend, so this is the question every dispatch site asks rather than
+    /// matching the variant in six places.
+    ///
+    /// ```
+    /// use io_harness::ExecMode;
+    ///
+    /// assert!(ExecMode::WorkspaceWrite.is_contained());
+    /// assert!(ExecMode::ReadOnly.is_contained());
+    /// assert!(!ExecMode::FullAccess.is_contained());
+    /// ```
+    pub fn is_contained(&self) -> bool {
+        !matches!(self, ExecMode::FullAccess)
+    }
+}
+
 /// Resource caps applied to a sandboxed run. Serde-serializable like
 /// [`crate::Policy`] and [`crate::Containment`] so io-cli and io-studio load it
 /// from config rather than hand-building it.
@@ -271,6 +354,41 @@ impl Default for SandboxLimits {
     }
 }
 
+impl SandboxLimits {
+    /// Every cap unset — a boundary with no ceiling.
+    ///
+    /// This is what [`TaskContract`](crate::TaskContract) carries by default, and
+    /// the distinction it draws is the whole reason it exists. Defaulting
+    /// *containment* on is a claim about where a command may write. Defaulting
+    /// [`SandboxLimits::default`]'s ceilings on would be a claim about how long
+    /// someone else's build may take — 120 wall seconds was sized in 0.6.0 for a
+    /// verification gate compiling one crate, and a run killed at two minutes by a
+    /// limit its author never set is indistinguishable from a bug in this crate.
+    ///
+    /// ```
+    /// use io_harness::sandbox::{SandboxConfig, SandboxLimits};
+    /// use io_harness::TaskContract;
+    ///
+    /// // The default: confined, uncapped.
+    /// let default = TaskContract::workspace("build the project", "/repo");
+    /// assert_eq!(default.exec_sandbox.limits, SandboxLimits::none());
+    ///
+    /// // The standing caps are one call away, and that call is where they belong.
+    /// let capped = TaskContract::workspace("run untrusted code", "/repo")
+    ///     .with_contained_exec(SandboxConfig::new());
+    /// assert_eq!(capped.exec_sandbox.limits.max_wall_secs, Some(120));
+    /// ```
+    pub fn none() -> Self {
+        Self {
+            max_cpu_secs: None,
+            max_wall_secs: None,
+            max_memory_bytes: None,
+            max_processes: None,
+            max_open_files: None,
+        }
+    }
+}
+
 /// How the sandbox is configured for a run.
 ///
 /// The *absence* of a `SandboxConfig` on the exec path means opt out: the
@@ -318,6 +436,15 @@ pub struct SandboxConfig {
     /// used to prove the selection ladder and to run the floor everywhere.
     #[serde(default)]
     pub force_floor: bool,
+    /// Where a command may write (0.46.0). Default
+    /// [`WorkspaceWrite`](ExecMode::WorkspaceWrite).
+    ///
+    /// Sits here rather than beside the caps because it is a run-shaping knob
+    /// like the two above it, and because [`Config::sandbox`](crate::Config)
+    /// already assembles this type from an `io.toml` `[sandbox]` section — a
+    /// mode named there needs no second path.
+    #[serde(default)]
+    pub mode: ExecMode,
 }
 
 impl SandboxConfig {
@@ -331,10 +458,48 @@ impl SandboxConfig {
         self.force_floor = true;
         self
     }
+
+    /// The same config under a different [`ExecMode`].
+    ///
+    /// ```
+    /// use io_harness::sandbox::SandboxConfig;
+    /// use io_harness::ExecMode;
+    ///
+    /// let read_only = SandboxConfig::new().with_mode(ExecMode::ReadOnly);
+    /// assert_eq!(read_only.mode, ExecMode::ReadOnly);
+    /// // The caps are untouched: the mode is a boundary, not a ceiling.
+    /// assert_eq!(read_only.limits, SandboxConfig::new().limits);
+    /// ```
+    pub fn with_mode(mut self, mode: ExecMode) -> Self {
+        self.mode = mode;
+        self
+    }
 }
 
 /// One command to run in the sandbox. OS-neutral by construction — no
 /// OS-specific type appears here, so the [`Sandbox`] trait signature is portable.
+///
+/// ```
+/// use io_harness::sandbox::{RunSpec, SandboxLimits};
+/// use io_harness::ExecMode;
+///
+/// let argv = vec!["cargo".to_string(), "test".to_string()];
+/// let limits = SandboxLimits::default();
+/// let roots = vec![std::path::PathBuf::from("/home/u/.cargo")];
+///
+/// let spec = RunSpec::new(&argv, std::path::Path::new("/repo"), &limits)
+///     .with_mode(ExecMode::WorkspaceWrite)
+///     .with_writable_roots(&roots);
+///
+/// assert_eq!(spec.mode, ExecMode::WorkspaceWrite);
+/// assert!(!spec.allow_network, "egress is denied unless the caller says otherwise");
+/// ```
+///
+/// `#[non_exhaustive]` since 0.46.0, which added [`RunSpec::mode`] and
+/// [`RunSpec::writable_roots`]. It is built with [`RunSpec::new`] and narrowed
+/// with the `with_*` methods; a struct literal outside this crate is what stopped
+/// compiling, once, so that the fields 0.47.0 and 0.48.0 add cost nobody anything.
+#[non_exhaustive]
 pub struct RunSpec<'a> {
     /// The command and its arguments. `argv[0]` is the program.
     pub argv: &'a [String],
@@ -344,6 +509,59 @@ pub struct RunSpec<'a> {
     pub limits: &'a SandboxLimits,
     /// Whether outbound network is permitted (default-deny lives in the caller).
     pub allow_network: bool,
+    /// Where this command may write (0.46.0).
+    ///
+    /// [`ExecMode::FullAccess`] never reaches a backend — a command under it is
+    /// not wrapped at all — so a `RunSpec` carrying it is a caller asking a
+    /// backend to run something the run itself decided not to confine, and the
+    /// backends treat it as [`ExecMode::WorkspaceWrite`] rather than inventing a
+    /// fourth behaviour.
+    pub mode: ExecMode,
+    /// Directories this command may write to besides [`RunSpec::workdir`].
+    ///
+    /// Two rules, and both are load-bearing. **They are absolute paths that exist
+    /// on this host**: the Linux backend binds each one, a bind of a path that is
+    /// not there fails its mount setup, and a failed setup degrades the whole
+    /// backend to [`Backend::PortableFloor`] — so a root that does not exist would
+    /// silently unwind the confinement it was added to preserve. And **the workdir
+    /// is not among them**, because a backend grants that separately and a
+    /// duplicate would be a second `(allow …)` line saying what the first already
+    /// said.
+    pub writable_roots: &'a [PathBuf],
+}
+
+impl<'a> RunSpec<'a> {
+    /// A command in `workdir` under `limits`: egress denied,
+    /// [`ExecMode::WorkspaceWrite`], no extra writable roots.
+    pub fn new(argv: &'a [String], workdir: &'a Path, limits: &'a SandboxLimits) -> Self {
+        Self {
+            argv,
+            workdir,
+            limits,
+            allow_network: false,
+            mode: ExecMode::WorkspaceWrite,
+            writable_roots: &[],
+        }
+    }
+
+    /// Permit or deny outbound network for this command.
+    pub fn with_network(mut self, allow: bool) -> Self {
+        self.allow_network = allow;
+        self
+    }
+
+    /// Run under a different [`ExecMode`].
+    pub fn with_mode(mut self, mode: ExecMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Grant write access to these directories besides the workdir. They must be
+    /// absolute and must exist — see [`RunSpec::writable_roots`].
+    pub fn with_writable_roots(mut self, roots: &'a [PathBuf]) -> Self {
+        self.writable_roots = roots;
+        self
+    }
 }
 
 /// The result of a sandboxed run — enough to make a verification pass/fail
@@ -425,12 +643,11 @@ impl SandboxOutcome {
 ///
 /// let argv = vec!["rustc".to_string(), "main.rs".to_string()];
 /// let outcome = sandbox
-///     .run(RunSpec {
-///         argv: &argv,
-///         workdir: dir.path(),
-///         limits: &config.limits,
-///         allow_network: config.allow_network,
-///     })
+///     .run(
+///         RunSpec::new(&argv, dir.path(), &config.limits)
+///             .with_network(config.allow_network)
+///             .with_mode(config.mode),
+///     )
 ///     .await?;
 ///
 /// // Anything worth keeping is copied out deliberately, through
@@ -637,6 +854,101 @@ pub(crate) fn apply_rlimits(cmd: &mut tokio::process::Command, limits: &SandboxL
     }
 }
 
+/// The containment a run resolved once, at run start (0.46.0).
+///
+/// Two things travel together everywhere a command is dispatched — the config the
+/// contract asked for, and the writable roots that config's [`ExecMode`] grants on
+/// *this* host — and resolving them per call would mean re-reading the environment
+/// on a hot path and, worse, letting two call sites disagree about what a mode
+/// means. The two loops build one of these and hand it to `dispatch`; the exec
+/// tool, the shell tool and the verification gate all read it.
+pub(crate) struct ExecContainment {
+    /// What the contract asked for, with egress already resolved from the run's
+    /// own policy.
+    pub(crate) config: SandboxConfig,
+    /// Directories besides the workdir this run's commands may write to. Absolute,
+    /// existing, deduplicated — see [`RunSpec::writable_roots`] for why each of
+    /// those three matters.
+    pub(crate) roots: Vec<PathBuf>,
+}
+
+impl ExecContainment {
+    /// Resolve the roots this config's mode grants on this host.
+    ///
+    /// The system temporary directory is deliberately **not** in the list: both
+    /// native backends already grant it unconditionally (`/private/var/folders` in
+    /// the macOS profile, `${TMPDIR:-/tmp}` in the Linux mount setup), and a
+    /// second grant saying what the first already said is a line that can drift.
+    pub(crate) fn resolve(
+        config: &SandboxConfig,
+        toolchain: Option<&crate::toolchain::Toolchain>,
+    ) -> Self {
+        let roots = if config.mode == ExecMode::WorkspaceWrite {
+            writable_cache_roots(toolchain)
+        } else {
+            Vec::new()
+        };
+        Self {
+            config: config.clone(),
+            roots,
+        }
+    }
+
+    /// The same containment with egress decided by the run's own policy.
+    ///
+    /// Egress is the one part that cannot be resolved once at run start: a plan
+    /// gate narrows the effective policy mid-run, so the answer is the policy's at
+    /// the moment of the call. The roots and the mode do not move, which is why
+    /// they are resolved once and this is not.
+    pub(crate) fn with_egress(&self, allow_network: bool) -> Self {
+        Self {
+            config: SandboxConfig {
+                allow_network,
+                ..self.config.clone()
+            },
+            roots: self.roots.clone(),
+        }
+    }
+
+    /// The backend that will actually run this containment's commands.
+    pub(crate) fn backend(&self) -> Backend {
+        select(&self.config).backend()
+    }
+
+    /// A [`RunSpec`] for one command under this containment.
+    pub(crate) fn spec<'a>(&'a self, argv: &'a [String], workdir: &'a Path) -> RunSpec<'a> {
+        RunSpec::new(argv, workdir, &self.config.limits)
+            .with_network(self.config.allow_network)
+            .with_mode(self.config.mode)
+            .with_writable_roots(&self.roots)
+    }
+}
+
+/// The toolchain cache directories this host actually has, as writable roots.
+///
+/// Absolute, present, and each named once. **The exists-filter is the
+/// confinement's own guard, not tidiness**: the Linux mount setup binds every
+/// root it is given, a bind of a path that is not there `fail`s the setup, and a
+/// failed setup degrades the whole backend to [`Backend::PortableFloor`] — so a
+/// granted path that does not exist would silently unwind the confinement it was
+/// added to preserve.
+///
+/// Shared by the run's own containment and by the verification gate, which
+/// configure their sandboxes from different places and must not filter
+/// differently.
+pub(crate) fn writable_cache_roots(
+    toolchain: Option<&crate::toolchain::Toolchain>,
+) -> Vec<PathBuf> {
+    let Some(tc) = toolchain else {
+        return Vec::new();
+    };
+    let mut roots = tc.cache_dirs();
+    roots.retain(|p| p.is_absolute() && p.is_dir());
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
 /// The argv this host's backend would run, and the backend it chose.
 ///
 /// The native backends confine a command by *wrapping its argv* — macOS prepends
@@ -654,20 +966,25 @@ pub(crate) fn wrap_argv(
     config: &SandboxConfig,
     workdir: &Path,
     allow_network: bool,
+    writable_roots: &[PathBuf],
     argv: &[String],
 ) -> (Backend, Vec<String>) {
     let backend = select(config).backend();
     #[cfg(target_os = "macos")]
     if backend == Backend::MacosSandboxExec {
-        let profile = macos::profile_for(workdir, allow_network);
+        let profile = macos::profile_for(workdir, allow_network, config.mode, writable_roots);
         let mut wrapped = vec!["sandbox-exec".to_string(), "-p".to_string(), profile];
         wrapped.extend(argv.iter().cloned());
         return (backend, wrapped);
     }
     #[cfg(target_os = "linux")]
     if backend == Backend::LinuxNamespaces {
-        return (backend, linux::unshare_argv(argv, workdir, allow_network));
+        return (
+            backend,
+            linux::unshare_argv(argv, workdir, allow_network, config.mode, writable_roots),
+        );
     }
+    let _ = writable_roots;
     (backend, argv.to_vec())
 }
 
@@ -1202,12 +1519,7 @@ mod tests {
     use super::*;
 
     fn spec<'a>(argv: &'a [String], dir: &'a Path, limits: &'a SandboxLimits) -> RunSpec<'a> {
-        RunSpec {
-            argv,
-            workdir: dir,
-            limits,
-            allow_network: false,
-        }
+        RunSpec::new(argv, dir, limits)
     }
 
     #[tokio::test]

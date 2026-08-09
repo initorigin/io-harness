@@ -4176,7 +4176,7 @@ async fn run_workspace_from<P: Provider>(
     // the prompt the loop falls back to when it ends is a different string already.
     // An approver's remembered rule is not reflected: it widens the boundary mid-run,
     // and a prompt composed once cannot follow it (`docs/CONTRACT.md`).
-    let after_planning = boundary_section(policy, contract.exec_sandbox.as_ref());
+    let after_planning = boundary_section(policy, &contract.exec_sandbox);
     let base_system = compose(PromptSpec {
         base: WORKSPACE_PROMPT,
         prompt: &contract.prompt,
@@ -4196,7 +4196,7 @@ async fn run_workspace_from<P: Provider>(
             skills,
             directive: Some(planning_directive(&contract.agents)),
             instructions: &contract.instructions,
-            boundary: boundary_section(&effective, contract.exec_sandbox.as_ref()).as_deref(),
+            boundary: boundary_section(&effective, &contract.exec_sandbox).as_deref(),
             family: provider.prompt_family(),
             ending: CALL_TOOLS_ENDING,
         }),
@@ -4304,6 +4304,17 @@ async fn run_workspace_from<P: Provider>(
     // creates its own `package.json` is creating a project rather than working in
     // one.
     let toolchain = crate::toolchain::detect(root);
+    // 0.46.0 — resolved once per run, beside the detection it reads. The writable
+    // roots depend on the toolchain, and `select` probes the host, so neither
+    // belongs on a per-call path.
+    let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+    report_containment(
+        watch,
+        run_id,
+        0,
+        &contract.exec_sandbox,
+        containment.as_deref(),
+    );
     let mem_key = memory_key(root);
     // Images the agent looked at last step, carried into this one's request and
     // dropped once shown. A viewed image is a tool result, not a permanent part
@@ -4684,7 +4695,7 @@ async fn run_workspace_from<P: Provider>(
                         pending_media,
                         &contract.commit_identity,
                         contract.exec_timeout,
-                        contract.exec_sandbox.as_ref(),
+                        containment.as_ref(),
                         toolchain.as_ref(),
                         handles,
                         PlanPhase {
@@ -4942,7 +4953,8 @@ async fn run_workspace_from<P: Provider>(
             root,
             &ExecGuard::new(&effective)
                 .tracing(store, run_id, step)
-                .watching(watch, 0),
+                .watching(watch, 0)
+                .with_writable_roots(gate_roots(toolchain.as_ref())),
             store,
             run_id,
             step,
@@ -5842,8 +5854,8 @@ fn run_agent<'f, P: Provider>(
         // while the phase is on. `policy` here is this agent's own — a child's is its
         // parent's narrowed by `Policy::contain` — so a child is told its boundary and
         // not the root's.
-        let after_planning = boundary_section(policy, contract.exec_sandbox.as_ref());
-        let while_planning = boundary_section(&effective, contract.exec_sandbox.as_ref());
+        let after_planning = boundary_section(policy, &contract.exec_sandbox);
+        let while_planning = boundary_section(&effective, &contract.exec_sandbox);
         let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
         let mut ws = Workspace::with_policy(agent_root, effective);
         // The tree shares one MCP session, so every agent in it — root or child —
@@ -5949,6 +5961,15 @@ fn run_agent<'f, P: Provider>(
         let handles = &handles;
         // Children share their parent's workspace, so they share its detection too.
         let toolchain = crate::toolchain::detect(&tree.root);
+        // Children share their parent's workspace, so they share its containment.
+        let containment = exec_containment(&contract.exec_sandbox, toolchain.as_ref());
+        report_containment(
+            tree.watch,
+            run_id,
+            depth,
+            &contract.exec_sandbox,
+            containment.as_deref(),
+        );
         // Children share their parent's workspace, so they share its memory: one
         // note store per workspace, every entry attributed to the run that wrote it.
         let mem_key = memory_key(&tree.root);
@@ -6224,7 +6245,7 @@ fn run_agent<'f, P: Provider>(
                     pending_media,
                     &contract.commit_identity,
                     contract.exec_timeout,
-                    contract.exec_sandbox.as_ref(),
+                    containment.as_ref(),
                     toolchain.as_ref(),
                     handles,
                     PlanPhase {
@@ -6596,7 +6617,8 @@ fn run_agent<'f, P: Provider>(
                 &tree.root,
                 &ExecGuard::new(policy)
                     .tracing(tree.store, run_id, step)
-                    .watching(tree.watch, depth),
+                    .watching(tree.watch, depth)
+                    .with_writable_roots(gate_roots(toolchain.as_ref())),
                 tree.store,
                 run_id,
                 step,
@@ -8005,11 +8027,12 @@ async fn dispatch(
     pending_media: &mut PendingMedia,
     identity: &crate::tools::git::Identity,
     exec_timeout: Duration,
-    // 0.40.0 — the containment this contract asked for, or `None` for the 0.17.0
-    // default. Carried beside `exec_timeout` because they bound the same tool and
-    // arrive from the same place; resolved to a backend inside the tool rather
-    // than here, so a run that never calls `exec` never probes the host.
-    exec_sandbox: Option<&crate::sandbox::SandboxConfig>,
+    // 0.40.0, reshaped in 0.46.0 — the containment this run resolved, or `None`
+    // when the contract asked for `ExecMode::FullAccess`. Carried beside
+    // `exec_timeout` because they bound the same tool and arrive from the same
+    // place; resolved to a backend inside the tool rather than here, so a run that
+    // never calls `exec` never probes the host.
+    exec_sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
     // The project's ecosystem, detected once by the loop rather than per edit:
     // `toolchain::detect` reads the directory, and an edit is a hot path.
     toolchain: Option<&crate::toolchain::Toolchain>,
@@ -8798,11 +8821,10 @@ async fn dispatch(
                 ShellCheck::Stop(d) => return Ok(d),
             };
 
-            if let Some(config) = exec_sandbox {
-                let backend = {
-                    use crate::sandbox::Sandbox as _;
-                    crate::sandbox::select(config).backend()
-                };
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            if let Some(containment) = &contained {
+                let backend = containment.backend();
                 for event in [
                     crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
                     crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
@@ -8810,17 +8832,17 @@ async fn dispatch(
                     record_sandbox_step(store, watch, depth, &event);
                 }
             }
-            let outcome = Shell::new(exec_timeout, cap)
-                .contained(
-                    exec_sandbox.map(|config| crate::tools::shell::ShellSandbox {
-                        allow_network: ws.policy().permits_any_egress(),
-                        config: config.clone(),
-                        workdir: ws.root().to_path_buf(),
-                    }),
-                )
-                .run(&parsed, &plan)
-                .await?;
-            if exec_sandbox.is_some() {
+            let outcome =
+                Shell::new(exec_timeout, cap)
+                    .contained(contained.clone().map(|containment| {
+                        crate::tools::shell::ShellSandbox {
+                            containment,
+                            workdir: ws.root().to_path_buf(),
+                        }
+                    }))
+                    .run(&parsed, &plan)
+                    .await?;
+            if contained.is_some() {
                 record_sandbox_step(
                     store,
                     watch,
@@ -9308,15 +9330,10 @@ async fn dispatch(
             // which has no policy to consult, while a run has one and it is the
             // run's own statement about reaching the network. One authority per
             // path, rather than two that can disagree.
-            let contained = exec_sandbox.map(|config| crate::sandbox::SandboxConfig {
-                allow_network: ws.policy().permits_any_egress(),
-                ..config.clone()
-            });
-            if let Some(config) = &contained {
-                let backend = {
-                    use crate::sandbox::Sandbox as _;
-                    crate::sandbox::select(config).backend()
-                };
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            if let Some(containment) = &contained {
+                let backend = containment.backend();
                 for event in [
                     crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
                     crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), &joined),
@@ -9325,7 +9342,7 @@ async fn dispatch(
                 }
             }
             let outcome = Exec::new(ws.root(), exec_timeout, cap)
-                .contained(contained.as_ref())
+                .contained(contained.clone())
                 .run(&argv)
                 .await?;
             if contained.is_some() {
@@ -11406,9 +11423,67 @@ const MAX_BOUNDARY_PATTERNS: usize = 24;
 /// layers, so a pattern allowed in one layer and denied beneath it belongs under
 /// denied, and asking the evaluator is both shorter and the only way the prompt and
 /// the refusal cannot disagree.
-fn boundary_section(policy: &Policy, sandbox: Option<&SandboxConfig>) -> Option<String> {
+/// The containment a run resolves once, at start — the one definition both loops
+/// call (0.46.0).
+///
+/// `None` is [`ExecMode::FullAccess`](crate::ExecMode::FullAccess): no backend, no
+/// roots, and every command at this program's own privileges. Resolving it here
+/// rather than per call keeps `select`'s host probe and the toolchain's cache
+/// derivation off the dispatch path, and — the reason that matters — stops the
+/// flat loop and the tree loop from ever disagreeing about what a mode grants.
+fn exec_containment(
+    config: &SandboxConfig,
+    toolchain: Option<&Toolchain>,
+) -> Option<std::sync::Arc<crate::sandbox::ExecContainment>> {
+    config
+        .mode
+        .is_contained()
+        .then(|| std::sync::Arc::new(crate::sandbox::ExecContainment::resolve(config, toolchain)))
+}
+
+/// The writable roots the verification gate gets (0.46.0).
+///
+/// The gate runs in an ephemeral workdir with its own `SandboxConfig`, not the
+/// contract's, so it does not go through [`exec_containment`] — but it runs the
+/// project's own build command, and a build that cannot populate its registry
+/// cache fails for a reason that has nothing to do with the code being judged.
+/// Same derivation, same exists-filter, one call apart because the two sandboxes
+/// are configured from different places.
+fn gate_roots(toolchain: Option<&Toolchain>) -> Vec<std::path::PathBuf> {
+    crate::sandbox::writable_cache_roots(toolchain)
+}
+
+/// Report how this run's commands are contained, once (0.46.0).
+///
+/// Emitted for a `full-access` run too. An absent event is not a statement, and
+/// "was this run contained" is the first question an audit asks — so the answer
+/// is always a row, and `backend` is what [`crate::sandbox::select`] actually
+/// returned rather than what the contract asked for.
+fn report_containment(
+    watch: &Watch<'_>,
+    run_id: i64,
+    depth: u32,
+    config: &SandboxConfig,
+    containment: Option<&crate::sandbox::ExecContainment>,
+) {
+    watch.emit(RunEvent::at_depth(
+        run_id,
+        0,
+        depth,
+        EventKind::Contained {
+            mode: config.mode.as_str().to_string(),
+            backend: match containment {
+                Some(c) => c.backend().as_str().to_string(),
+                None => "none".to_string(),
+            },
+            roots: containment.map(|c| c.roots.len() as u32).unwrap_or(0),
+        },
+    ));
+}
+
+fn boundary_section(policy: &Policy, sandbox: &SandboxConfig) -> Option<String> {
     let permissive = policy.is_permissive();
-    if permissive && sandbox.is_none() {
+    if permissive && !sandbox.mode.is_contained() {
         return None;
     }
     let mut lines: Vec<String> = Vec::new();
@@ -11422,9 +11497,7 @@ fn boundary_section(policy: &Policy, sandbox: Option<&SandboxConfig>) -> Option<
             lines.push(boundary_line(policy, act, label, defaults));
         }
     }
-    if let Some(config) = sandbox {
-        lines.push(containment_line(config));
-    }
+    lines.push(containment_line(sandbox));
     Some(format!(
         "Your boundary. These are enforced before a call runs, so a call outside them is refused \
          rather than attempted — plan around them rather than finding them one refusal at a \
@@ -11503,19 +11576,36 @@ fn effect_label(effect: Effect) -> &'static str {
 /// and the floor applies, and an agent told it is confined when it is not is worse
 /// informed than one told nothing (0.40.0).
 fn containment_line(config: &SandboxConfig) -> String {
+    if !config.mode.is_contained() {
+        return "- Commands you run are not contained (mode: full-access): they run at this \
+                program's own privileges and may write anywhere this machine's user can write."
+            .to_string();
+    }
     let backend = crate::sandbox::select(config).backend();
+    let where_writes_go = match config.mode {
+        crate::sandbox::ExecMode::ReadOnly => {
+            "they may not write into the workspace at all, only into the system temporary \
+             directory"
+        }
+        _ => {
+            "their writes are confined to the workspace, the system temporary directory and this \
+             project's toolchain caches"
+        }
+    };
     match backend {
         Backend::PortableFloor | Backend::WindowsJobObject => format!(
-            "- Commands you run are given resource limits only (backend: {}). This host provides \
-             no filesystem confinement and no outbound-network confinement for them, so neither \
-             is in force.",
+            "- Commands you run are given resource limits only (mode: {}, backend: {}). This host \
+             provides no filesystem confinement and no outbound-network confinement for them, so \
+             neither is in force.",
+            config.mode.as_str(),
             backend.as_str()
         ),
         _ => format!(
-            "- Commands you run are contained (backend: {}): their writes are confined to the \
-             workspace, and outbound network is permitted only where this run's policy permits \
-             it.",
-            backend.as_str()
+            "- Commands you run are contained (mode: {}, backend: {}): {}, and outbound network \
+             is permitted only where this run's policy permits it.",
+            config.mode.as_str(),
+            backend.as_str(),
+            where_writes_go
         ),
     }
 }
