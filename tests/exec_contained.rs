@@ -749,13 +749,12 @@ use io_harness::{run_with_observed, ExecMode};
 /// `XDG_CONFIG_HOME` redirected rather than `HOME`. Held across the whole run,
 /// including its awaits, which is sound because `#[tokio::test]` is a
 /// current-thread runtime.
-static ENV: Mutex<()> = Mutex::new(());
-
-fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    // A test that panicked while holding it poisoned it; the next test still
-    // wants the lock, not a second failure blamed on the first.
-    ENV.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// A `tokio` mutex rather than a `std` one, and not as a style choice: the guard
+/// is held across the run's awaits, which `clippy::await_holding_lock` refuses
+/// for a blocking guard and permits for this one. It also cannot be poisoned, so
+/// a test that panicked while holding it does not turn into a second failure
+/// blamed on the first.
+static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A workspace that is **not** under the system temp directory.
 ///
@@ -940,7 +939,7 @@ async fn read_only_refuses_a_write_into_the_workspace_and_permits_the_read() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_writable_root_that_does_not_exist_does_not_degrade_the_backend() {
-    let _env = env_guard();
+    let _env = ENV.lock().await;
     use io_harness::sandbox::{select, Backend, Sandbox};
 
     let dir = workspace();
@@ -990,7 +989,7 @@ async fn a_writable_root_that_does_not_exist_does_not_degrade_the_backend() {
 #[cfg(unix)]
 #[tokio::test]
 async fn the_containment_report_names_what_actually_applied() {
-    let _env = env_guard();
+    let _env = ENV.lock().await;
     use io_harness::sandbox::{select, Sandbox};
 
     let dir = workspace();
@@ -1046,7 +1045,7 @@ async fn the_containment_report_names_what_actually_applied() {
 #[cfg(unix)]
 #[tokio::test]
 async fn a_real_package_manager_completes_under_the_default() {
-    let _env = env_guard();
+    let _env = ENV.lock().await;
     let ws = OutsideTemp(EscapeDir::new("cargo-granted"));
     let home = OutsideTemp(EscapeDir::new("cargo-home"));
     std::fs::create_dir_all(ws.path().join("src")).unwrap();
@@ -1138,7 +1137,7 @@ async fn a_real_package_manager_completes_under_the_default() {
 #[cfg(unix)]
 #[tokio::test]
 async fn the_verification_gate_gets_the_same_writable_roots() {
-    let _env = env_guard();
+    let _env = ENV.lock().await;
     use io_harness::Verification;
 
     let ws = OutsideTemp(EscapeDir::new("gate-granted"));

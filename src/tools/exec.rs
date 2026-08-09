@@ -24,7 +24,7 @@
 //! ## What this bounds, and what it does not
 //!
 //! **A command is contained by default (0.46.0).** It runs in the workspace root
-//! inside the backend [`select`](crate::sandbox::select) chose, and may write to
+//! inside the backend [`select`] chose, and may write to
 //! the workspace, the system temporary directory and the detected toolchain's own
 //! caches — and nowhere else. Up to 0.45.0 the default was the embedding
 //! program's own privileges (the owner's decision of 2026-07-29, recorded in
