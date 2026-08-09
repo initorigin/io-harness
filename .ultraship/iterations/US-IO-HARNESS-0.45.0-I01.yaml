@@ -1,0 +1,76 @@
+id: US-IO-HARNESS-0.45.0-I01
+timestamp: 2026-08-09T09:31:17Z
+category:
+  - task-level
+  - implementation-level
+trigger: >
+  F3 required the composed prompt to be byte-identical to 0.44.0's for a permissive, uncontained,
+  uninstructed `SystemPrompt::Builtin` run, while the release's central guarantee requires the
+  crate's turn-ending sentence to be emitted last. The two cannot both hold, because the ending
+  sentence is not last today.
+evidence:
+  - >
+    `workspace_system_prompt` (`src/run.rs:11180`) returns `WORKSPACE_PROMPT` followed by the ending
+    sentence `" Do not explain; call tools."`, and `conversational_system_prompt` (`:11208`) returns
+    `WORKSPACE_PROMPT` followed by `CONVERSATIONAL_ENDING` (`:11219`). The ending is part of the base
+    string, not appended after it.
+  - >
+    The workspace call site (`src/run.rs:4134`) then wraps that base in `with_extra_tools` (`:11233`)
+    and `with_skill_catalog` (`:11273`), each of which appends its catalogue **after** the ending
+    sentence, and the planning directive is appended after those (`:4136`). The tree site (`:5773`)
+    and the conversational opening (`conversational_opening`, `:3782`) do the same.
+  - >
+    So today's shipped prompt is `description + ending + tools + skills [+ planning directive]`.
+    Moving the ending to the end reorders four existing sentences in every prompt the crate sends,
+    which no byte-identity assertion against 0.44.0 can survive.
+before:
+  scope:
+    - The composition order is fixed, and the ending is last.
+    - >
+      F3 — a permissive, uncontained, uninstructed `Builtin` run is 0.44.0 byte for byte, for all
+      four composed prompts.
+  assumptions:
+    - >
+      The crate's ending sentence was already the last thing in the composed prompt, so relocating
+      nothing was required and byte-identity was free.
+  implementation: >
+    Compose would have appended the new sections to today's string unchanged.
+change:
+  summary: >
+    Keep the ending last — it is the guarantee the release exists to make — and correct F3 from
+    byte-identity to sentence-identity: 0.44.0's prompt with its ending sentence removed must be a
+    byte-exact prefix of the composed prompt, and the composed prompt must end with that sentence
+    byte-exact. The control still admits no added, dropped or reworded sentence; it admits exactly
+    one relocation, which is the change being made on purpose.
+  added:
+    - >
+      A stated behaviour change — the ending sentence moves after the tool and skill catalogues in
+      every prompt the crate sends — carried in `CHANGELOG.md` and `docs/CONTRACT.md`.
+  removed: []
+  deferred: []
+  replaced:
+    - F3's byte-identity assertion, replaced by the prefix-plus-suffix assertion above.
+impact:
+  products:
+    - io-harness
+  versions:
+    - 0.45.0
+  tasks:
+    - US-IO-HARNESS-0.45.0-T01
+    - US-IO-HARNESS-0.45.0-T09
+  dependencies: []
+  resource_effect: >
+    None. The same test is written; it asserts a prefix and a suffix rather than an equality, and
+    T09 gains one changelog sentence.
+versioning:
+  previous_target: 0.45.0
+  new_target: 0.45.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Asked and answered in session 2026-08-09, with the alternatives — leaving the ending in place and
+    dropping the un-overridable guarantee, or emitting the sentence twice — presented and declined.
+canonical_updates:
+  - products/io-harness/releases/0.45.0.yaml
+  - products/io-harness/execution/tasks.yaml

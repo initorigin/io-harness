@@ -1,0 +1,50 @@
+product: io-harness
+version: 0.45.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - Every surface this release touches is one the crate already owns, and none of them is new
+      capability. The prompt is four strings built in four places (`src/run.rs:3914`, `:4134`,
+      `conversational_opening` at `:3782`, `:5773`); the boundary is rendered from a `Policy` whose
+      evaluator (`src/policy.rs:626`) is the renderer's own test oracle; the backend line is one
+      call to `sandbox::select` (`src/sandbox.rs:551`) the loop already makes; and the instructions
+      half is two edits to functions that exist (`read_instructions` `src/config.rs:1681`,
+      `Config::apply_to` `:1437`).
+    - There is no compile break to absorb anywhere. `TaskContract` has been `#[non_exhaustive]`
+      since 0.35.0 so both fields are free, `Provider::prompt_family` is the fourth defaulted trait
+      method, and `EventKind` has been `#[non_exhaustive]` since 0.24.0. A release with no break has
+      no downstream fixture to update and no migration note to get wrong.
+    - Nothing durable moves. No table, column, index or `CHECKPOINT_FORMAT` change, so the whole
+      cross-version surface is asserted by being unchanged — the same shape as 0.44.0, 0.42.0 and
+      0.41.0, and the cheapest migration this repository has.
+    - No live provider call is required. Every criterion is a string the crate builds before
+      anything is sent, so unlike 0.44.0 there is no vendor, no credit limit and no account default
+      to work around.
+    - Not `high`, for one reason — the release changes **every** prompt the crate sends, so the
+      surface it can regress is larger than its diff. F3's byte-identity control over all four
+      prompts and F10's composed-once assertion are what hold that down, and both must be written
+      before the composition function rather than after it.
+    - No constraints have been recorded for this release, so this assessment is grounded in the
+      repository's own condition rather than in a stated limit.
+  major_cost_drivers:
+    - The un-overridable ending must survive `Replace`, and the natural implementation — substitute
+      the caller's string for the whole composed prompt — passes every non-empty case and produces a
+      prompt with no rules at all for `Replace("")`. F4 is written first for exactly that reason.
+    - The boundary renderer is where a plausible sentence passes a weak test. F1 asserts the section
+      against `Policy::check`'s own answers for every pattern it names; a renderer built against an
+      expected string encodes whatever the implementation happens to do, including printing a deny
+      as an allow.
+    - The `Effect::Ask` tier is the one that is easy to render wrongly, and `Policy::default()` puts
+      writes and execs there. Neither "allowed" nor "refused" is true, and both mislead the agent.
+    - A system prompt that varies between steps silently converts 0.38.0's cache read into a cache
+      write on every step of every run against Anthropic and OpenRouter. It is the most expensive
+      defect this release could ship and it fails nothing else in the suite (F10).
+    - Moving discovered instructions out of `constraints` leaves two doc surfaces stating the old
+      behaviour — `Config::instructions` (`src/config.rs:1019`) and the 0.27.0 rationale comment at
+      `apply_to` (`:1433`). 0.44.0 paid exactly this cost; O3 greps for both.
+    - Family classification is a slug table, and slug tables rot. `Generic` must be the answer for
+      everything unrecognised, and the table must stay small enough that every entry is still true.
+  recommended_scope_change: null

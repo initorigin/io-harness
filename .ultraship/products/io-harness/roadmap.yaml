@@ -1090,8 +1090,10 @@ versions:
       cannot read, extend or replace, so a program built on this crate cannot give its agent its own
       voice without forking. It becomes a choice the caller makes: keep today's minimal prompt,
       which stays the default because a library that installs opinions into someone else's product
-      is a library that fights its embedder; take an assembled preset by name; append to one; or
-      supply the whole thing. Beside it, what `[instructions]` discovers in a repository
+      is a library that fights its embedder; append to one; or supply the whole thing. A catalogue
+      of named presets was considered at specification time and refused for the same reason the
+      default is minimal — a shipped preset is an opinion about model behaviour this crate cannot
+      test and cannot withdraw. Beside it, what `[instructions]` discovers in a repository
       (`src/config.rs:678`) can land as a section of that prompt rather than only as constraints on
       the contract — a repository's own guidance reads as guidance, and a constraint is a different
       thing that the goal is checked against. And it is discovered without being asked for twice:
@@ -1110,7 +1112,7 @@ versions:
       documenting otherwise. So the crate's own turn-ending rule is emitted last and stated to be
       un-overridable, and what an embedder supplies sits before it. A composable prompt that can
       contradict its own runtime's contract is not a feature.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.46.0
     outcome: >
