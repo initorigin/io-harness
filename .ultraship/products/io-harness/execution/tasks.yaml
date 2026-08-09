@@ -232,7 +232,7 @@ tasks:
   why_required: A setuid bwrap works on hosts whose kernel refuses an unprivileged user namespace, which
     is exactly where the existing rung fails and where Landlock may be absent. Without it the chain skips
     from Landlock to a backend the host has already refused.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.47.0-T01
   acceptance_criteria:
@@ -256,7 +256,23 @@ tasks:
   - src/sandbox/linux.rs
   - src/sandbox.rs
   - tests/sandbox.rs
-  evidence: []
+  evidence:
+  - '`bwrap_argv` / `bwrap_works` / `bwrap_run` in `src/sandbox/linux.rs`. The argv binds `/` read-only,
+    binds each writable root back over it, populates `/proc` and `/dev`, adds `--unshare-net` when egress
+    is denied, `--die-with-parent`, and `--chdir` the run''s own workdir — with the payload as trailing
+    arguments after `--`, never interpolated.'
+  - 'The probe is a spawn of the exact wrapper this rung builds, not a `PATH` lookup: a `bwrap` without
+    the setuid bit on a kernel that refuses unprivileged user namespaces is present and useless, and that
+    is precisely the host this rung exists for.'
+  - '`wrapper_failure` gained the `bwrap:` prefix rather than a second copy of itself. The rule is about
+    wrappers in general and two copies is two places for it to drift.'
+  - 'Host-free arms pass on the macOS development host: `the_bwrap_argv_binds_the_tree_read_only_and_the_roots_back`
+    (including that the read-only bind precedes the writable ones, or the roots would be covered by it
+    rather than overriding it), `the_bwrap_argv_withholds_the_workdir_under_read_only`, `a_bwrap_setup_failure_is_a_wrapper_failure`.
+    37 of 37 `sandbox::` unit tests; clippy `-D warnings` clean; `cargo fmt --check` clean.'
+  - 'This rung is portable Rust with no `cfg` on it, so unlike the Landlock rung it compiles and unit-tests
+    on the development host directly. **Not yet proven**: enforcement on a host that actually has `bwrap`.
+    Pending the matrix.'
 - id: US-IO-HARNESS-0.47.0-T06
   summary: 'Select the AppContainer on Windows: derive the grant set, spawn into the container, assign
     to the Job Object.'

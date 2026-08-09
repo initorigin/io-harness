@@ -97,10 +97,14 @@ impl Sandbox for LinuxSandbox {
         // a rule set the kernel refuses, a helper that is not there — falls to
         // the next one rather than failing the run, and every one of them
         // reports the backend that was actually applied.
-        if rung(probes(), !spec.allow_network) == Backend::LinuxLandlock {
-            if let Some(outcome) = landlock_run(&spec).await {
-                return outcome;
+        match rung(probes(), !spec.allow_network) {
+            Backend::LinuxLandlock => {
+                if let Some(outcome) = landlock_run(&spec).await {
+                    return outcome;
+                }
             }
+            Backend::LinuxBubblewrap => return bwrap_run(&spec).await,
+            _ => {}
         }
         if !unshare_works() {
             // No usable namespaces on this host: take the floor rather than
@@ -154,12 +158,121 @@ impl Sandbox for LinuxSandbox {
 fn probes() -> Rungs {
     Rungs {
         landlock_abi: landlock_abi(),
-        // The bubblewrap rung is not built yet, so the chain must not be able to
-        // select it: a rung `rung` names and `run` cannot deliver would report
-        // an isolation that was never applied, which is the one thing no part of
-        // this module may do.
-        bubblewrap: false,
+        bubblewrap: bwrap_works(),
         unshare: unshare_works(),
+    }
+}
+
+/// Does the `bwrap` on this host work, running the exact wrapper this rung
+/// builds?
+///
+/// The same shape as [`unshare_works`] and for the same reason: `bwrap` being
+/// on `PATH` is not the question. A `bwrap` without the setuid bit on a kernel
+/// that refuses unprivileged user namespaces is present and useless, which is
+/// precisely the host this rung exists for, so the probe has to be a spawn.
+fn bwrap_works() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let dir = std::env::temp_dir();
+        // Probed with `--unshare-net`, the strictest form: if that works the
+        // network-allowed subset does too. Same argument as the `unshare` probe.
+        let argv = bwrap_argv(
+            &["true".to_string()],
+            &dir,
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// The `bwrap` argv this rung builds, factored out so it is unit-testable
+/// without spawning anything — the same treatment [`unshare_argv`] gets.
+///
+/// The tree is bound read-only, then each writable root is bound back over it,
+/// which is the identical statement the mount setup makes with `remount,bind,ro`
+/// and its `rw` loop. `/proc` and `/dev` are populated because a mount namespace
+/// with neither is a namespace most toolchains cannot start in.
+///
+/// **The payload is the trailing arguments after `--`**, never interpolated, so
+/// a metacharacter in an argument stays an ordinary byte — the property
+/// `src/tools/exec.rs` is built on and the one `unshare_argv` is also careful
+/// about.
+pub(crate) fn bwrap_argv(
+    inner: &[String],
+    workdir: &Path,
+    allow_network: bool,
+    mode: ExecMode,
+    writable_roots: &[PathBuf],
+) -> Vec<String> {
+    let mut v: Vec<String> = vec![
+        "bwrap".into(),
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        // A child of a run that ends must not outlive it. The shared runner
+        // kills the tree, and this is the kernel saying the same thing.
+        "--die-with-parent".into(),
+    ];
+
+    // The workdir is bound writable only when the mode grants it, which is what
+    // makes `ReadOnly` a mode rather than a label here too.
+    let mut writable: Vec<&Path> = Vec::new();
+    if mode != ExecMode::ReadOnly {
+        writable.push(workdir);
+    }
+    writable.extend(writable_roots.iter().map(|p| p.as_path()));
+    let tmp = std::env::temp_dir();
+    writable.push(&tmp);
+    for root in writable {
+        v.push("--bind".into());
+        v.push(root.display().to_string());
+        v.push(root.display().to_string());
+    }
+
+    if !allow_network {
+        v.push("--unshare-net".into());
+    }
+    // `--chdir` rather than letting the shared runner's `current_dir` decide.
+    // Both are set — the runner sets its own — and they name the same directory;
+    // stating it here is what makes the wrapper's view and the spawn's view the
+    // same one, which is exactly what 0.46.0 found they were not.
+    v.push("--chdir".into());
+    v.push(workdir.display().to_string());
+    v.push("--".into());
+    v.extend(inner.iter().cloned());
+    v
+}
+
+/// Run `spec` under `bwrap`.
+async fn bwrap_run(spec: &RunSpec<'_>) -> Result<SandboxOutcome> {
+    let wrapped = bwrap_argv(
+        spec.argv,
+        spec.workdir,
+        spec.allow_network,
+        spec.mode,
+        spec.writable_roots,
+    );
+    let wspec = RunSpec::new(&wrapped, spec.workdir, spec.limits)
+        .with_network(spec.allow_network)
+        .with_mode(spec.mode)
+        .with_writable_roots(spec.writable_roots);
+    let outcome = run_capped(Backend::LinuxBubblewrap, wspec, |_cmd| {}).await?;
+    match wrapper_failure(&outcome) {
+        Some(reason) => Err(Error::Sandbox { reason }),
+        None => Ok(outcome),
     }
 }
 
@@ -285,7 +398,12 @@ fn unshare_works() -> bool {
 /// which is exactly why the Linux breakage needed a CI log to diagnose.
 fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
     let stderr = outcome.stderr.trim();
-    (!outcome.success() && stderr.starts_with("unshare:"))
+    // Both wrapping rungs announce their own setup failures with their program
+    // name and neither reaches the payload when they do. `bwrap` was added to
+    // this list rather than given a second copy of the function: the rule is
+    // about wrappers in general, and two copies is two places for it to drift.
+    let wrapper = ["unshare:", "bwrap:"].iter().any(|p| stderr.starts_with(p));
+    (!outcome.success() && wrapper)
         .then(|| format!("the namespace wrapper failed, the command never ran: {stderr}"))
 }
 
@@ -747,6 +865,81 @@ mod tests {
                 "an egress-denying run must be refused the connection"
             );
         }
+    }
+
+    /// The bubblewrap rung's argv, asserted the way `unshare_argv`'s already is:
+    /// the tree read-only, the writable roots bound back over it, the payload
+    /// trailing and untouched.
+    #[test]
+    fn the_bwrap_argv_binds_the_tree_read_only_and_the_roots_back() {
+        let roots = vec![PathBuf::from("/home/u/.cargo")];
+        let argv = bwrap_argv(
+            &["echo".into(), "hi".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &roots,
+        );
+
+        let pos = |s: &str| argv.iter().position(|a| a == s).unwrap();
+        assert_eq!(argv[0], "bwrap");
+        assert!(argv.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
+        assert!(argv.windows(3).any(|w| w == ["--bind", "/w", "/w"]));
+        assert!(argv
+            .windows(3)
+            .any(|w| w == ["--bind", "/home/u/.cargo", "/home/u/.cargo"]));
+        assert!(argv.contains(&"--unshare-net".to_string()));
+        assert!(argv.windows(2).any(|w| w == ["--chdir", "/w"]));
+        // The read-only bind of the whole tree must come before the writable
+        // binds, or the roots are covered by it instead of overriding it.
+        assert!(pos("--ro-bind") < pos("--bind"));
+
+        // The payload is the tail, after `--`, and is never interpolated.
+        let sep = pos("--");
+        assert_eq!(&argv[sep + 1..], &["echo".to_string(), "hi".to_string()]);
+    }
+
+    /// F5's bubblewrap half, host-free: `ReadOnly` does not bind the workspace
+    /// writable, and the temporary directory is bound in every mode.
+    #[test]
+    fn the_bwrap_argv_withholds_the_workdir_under_read_only() {
+        let argv = bwrap_argv(
+            &["true".into()],
+            Path::new("/w"),
+            true,
+            ExecMode::ReadOnly,
+            &[],
+        );
+        assert!(
+            !argv.windows(3).any(|w| w == ["--bind", "/w", "/w"]),
+            "read-only must not bind the workspace writable"
+        );
+        let tmp = std::env::temp_dir().display().to_string();
+        assert!(
+            argv.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == tmp && w[2] == tmp),
+            "the temp directory is writable under every mode"
+        );
+        assert!(
+            !argv.contains(&"--unshare-net".to_string()),
+            "no network namespace when the run permits egress"
+        );
+    }
+
+    /// A `bwrap` setup failure must be classified as the wrapper failing, not as
+    /// the payload's own non-zero exit — the same distinction `unshare` gets,
+    /// and the reason both prefixes live in one function.
+    #[test]
+    fn a_bwrap_setup_failure_is_a_wrapper_failure() {
+        let fail = SandboxOutcome {
+            backend: Backend::LinuxBubblewrap,
+            argv: vec!["bwrap".into()],
+            exit_code: Some(1),
+            cap_hit: None,
+            stdout: String::new(),
+            stderr: "bwrap: Creating new namespace failed: Operation not permitted\n".into(),
+        };
+        assert!(wrapper_failure(&fail).is_some());
     }
 
     #[test]
