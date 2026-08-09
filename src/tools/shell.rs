@@ -1293,13 +1293,32 @@ impl Shell {
             // taken from `wrap_argv` rather than rebuilt here, because a line's
             // stages are piped into one another and this tool therefore owns
             // every `Child` and cannot hand an argv to `Sandbox::run`.
+            // **The wrapper is told the stage's own directory, and the workspace
+            // root is passed as a writable root instead (0.46.0).** A line is
+            // several stages and `cd` moves between them, so `planned.cwd` is
+            // where this stage must run — and the Linux wrapper *enters* the
+            // directory it is given, which on Linux made `cd src && rustc …`
+            // silently run in the workspace root once containment became the
+            // default. Handing it the workspace root and letting the stage's
+            // `current_dir` stand does not work: the wrapper's `cd` is inside the
+            // namespace and happens after the spawn. So the two facts are
+            // separated — where to run, and what may be written — and the root
+            // stays writable by being named as one.
             let argv = match &self.sandbox {
                 Some(sb) => {
+                    let mut roots = Vec::with_capacity(sb.containment.roots.len() + 1);
+                    // Only where the mode grants it. Under `ReadOnly` the
+                    // workspace is exactly what may not be written to, and naming
+                    // it here would hand it back through the side door.
+                    if sb.containment.config.mode != crate::ExecMode::ReadOnly {
+                        roots.push(sb.workdir.clone());
+                    }
+                    roots.extend(sb.containment.roots.iter().cloned());
                     crate::sandbox::wrap_argv(
                         &sb.containment.config,
-                        &sb.workdir,
+                        &planned.cwd,
                         sb.containment.config.allow_network,
-                        &sb.containment.roots,
+                        &roots,
                         &stage.argv,
                     )
                     .1
