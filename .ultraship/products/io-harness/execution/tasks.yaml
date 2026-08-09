@@ -160,7 +160,7 @@ tasks:
     the candidate repeated byte-identically.
   why_required: This is the release. The wire can carry a boundary and nothing produces one until the
     loop locates the summary in the assembled prompt and the guard decides it has been sent once already.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.44.0-T02
   - US-IO-HARNESS-0.44.0-T03
@@ -198,7 +198,33 @@ tasks:
   files:
   - src/run.rs
   - tests/cache_boundary.rs
-  evidence: []
+  evidence:
+  - '`frozen_prefix(user, ledger)` locates the fold''s summary — the ledger''s first entry, `ObsKind::Message`
+    targeted `summary` — inside the assembled prompt by its own text, and returns everything through it.
+    A summary assembly STUBBED rather than carried is not found, and not being found is exactly the no-frozen-prefix
+    case, so the search is its own correctness check. No field was added to `Assembled`, which is not
+    `#[non_exhaustive]` and would have been a second public break.'
+  - '`cache_boundary_for(user, ledger, &mut last)` is the guard: it marks only when this step''s candidate
+    is byte-identical to the previous step''s, and clears the state when there is no candidate. Run-scoped
+    `marked_prefix` in BOTH loops — per agent in the tree loop, since each agent assembles from its own
+    ledger.'
+  - '`the_boundary_appears_only_after_a_fold_and_only_once_the_prefix_repeats`: no request before the
+    fold is marked, the fold''s OWN step is not marked, the next step is, the marked span ends with the
+    summary sentence and is a real prefix of `user`.'
+  - '`a_note_written_mid_run_withdraws_the_marker_for_one_step`: a `remember` call mid-run withdraws the
+    marker for exactly one step; the prefix that returns differs from the earlier one and contains the
+    note. This is the criterion that exists because the memory block renders AHEAD of the summary and
+    is re-read every turn.'
+  - '`the_boundary_is_one_helper_that_both_loops_call`: one definition each of `cache_boundary_for` and
+    `frozen_prefix`, >=2 call sites, and exactly two `marked_prefix` declarations — one per loop.'
+  - '`a_run_that_never_folds_marks_nothing` (N5): with `at_share: 1.0` no request carries a boundary and
+    none carries a summary.'
+  - 'N6 neighbours re-run and unaffected: compaction 11 passed, parallel_reads 8 passed, tool_hooks 6
+    passed.'
+  - Sabotages, one per arm. Dropping the guard (mark whenever a fold exists) fails BOTH F3 and F4. Comparing
+    only the summary instead of the whole candidate prefix fails both as well — that is the shape that
+    would ask a vendor to cache bytes never sent. Removing the tree loop's call site fails the shape test
+    and nothing else, which is the drift the test exists for.
 - id: US-IO-HARNESS-0.44.0-T05
   summary: Add `EventKind::CacheMarked`, emitted when the marked prefix changes and not per step.
   why_required: The marker is conditional, so an operator whose run gets no cache reads cannot otherwise

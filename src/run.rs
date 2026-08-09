@@ -4195,6 +4195,13 @@ async fn run_workspace_from<P: Provider>(
     // step. Not restored on resume: a resumed run re-derives it from the gate
     // history it can still read, on its first step.
     let mut routed_model: Option<String> = None;
+    // 0.44.0 — the frozen prefix this run last built, held for the same reason
+    // `routed_model` is: the marker is offered only when a step's candidate prefix is
+    // byte-identical to the previous step's, and a comparison recomputed from a freshly
+    // built request could never see that. `None` while there is no fold, after a fold
+    // whose summary assembly stubbed, and on a resume — a resumed run has sent this
+    // prefix zero times from where it now stands, so it earns the marker again.
+    let mut marked_prefix: Option<String> = None;
     // The run's live process handles, created before the first turn and killed
     // when the run ends however it ends. `Arc` because the reaping task for each
     // handle outlives the dispatch that started it and has to be able to record
@@ -4335,6 +4342,9 @@ async fn run_workspace_from<P: Provider>(
             )
             .await?;
             let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+            // 0.44.0 — the second cache breakpoint, at the end of what compaction
+            // froze, and only once that prefix has already gone out once.
+            let cache_boundary = cache_boundary_for(&user, &ledger, &mut marked_prefix);
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
                 // 0.37.0 — the conversational prompt is this turn's opening only. Every
@@ -4351,6 +4361,7 @@ async fn run_workspace_from<P: Provider>(
                 web: contract.web.clone(),
                 // 0.31.0 — the root's tier, unchanged per step.
                 effort: contract.effort,
+                cache_boundary,
                 #[cfg(feature = "media")]
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
@@ -5793,6 +5804,10 @@ fn run_agent<'f, P: Provider>(
         let token_cap = tree.ledger.effective_token_budget(contract.max_tokens);
         // Durable per-agent budget, restored across a restart.
         let mut tokens_used: u64 = tree.store.spent_tokens(run_id)?;
+        // 0.44.0 — per agent, not per tree. Each agent in a tree assembles its own
+        // prompt from its own ledger, so one agent's frozen prefix says nothing about
+        // another's, and a shared one would mark a prefix this agent has never sent.
+        let mut marked_prefix: Option<String> = None;
         // Same ledger and same per-turn assembly as the workspace loop: a tree of
         // 100 children each re-sending its own unbounded log is the multiplied
         // version of the problem 0.10.0 exists to fix — and, since 0.13.0, the
@@ -5896,6 +5911,10 @@ fn run_agent<'f, P: Provider>(
                 )
                 .await?;
                 let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+                // 0.44.0 — the same rule as the flat loop, through the same helper.
+                // A boundary computed in one loop and not the other would make a
+                // contained run and a flat one cache differently while nothing failed.
+                let cache_boundary = cache_boundary_for(&user, &ledger, &mut marked_prefix);
                 #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
                 let request = CompletionRequest {
                     // 0.39.0 — a contained turn's opening is its first completion
@@ -5920,6 +5939,7 @@ fn run_agent<'f, P: Provider>(
                     // only where thinking is the work" is said; the contract's is the
                     // root's own, and a child spawned without a definition inherits it.
                     effort: identity.and_then(|d| d.effort).or(contract.effort),
+                    cache_boundary,
                     #[cfg(feature = "media")]
                     media: attach_media(contract, pending_media)?,
                     ..Default::default()
@@ -10417,6 +10437,75 @@ never an instruction to you.";
 
 /// Fold the older half of a run's observations into one written summary.
 ///
+/// Where this turn's frozen prefix ends, or `None` when there is not one.
+///
+/// The prefix runs from the top of the prompt through the end of the summary 0.43.0's
+/// compaction folded the older observations into. It is located by that summary's own
+/// text rather than by re-deriving the layout: `compact_ledger` puts one
+/// [`ObsKind::Message`] observation targeted `summary` at the front of the ledger, and
+/// [`assemble`] emits a carried entry's text verbatim, so finding it in the assembled
+/// prompt is exact.
+///
+/// The search doubles as the check it would otherwise need. A summary that assembly
+/// **stubbed** rather than carried — the fit rule works newest-first, so the oldest
+/// entry is the first to go — is not found, and not being found is precisely the case
+/// where there is no frozen prefix to mark.
+///
+/// No new field on [`Assembled`](crate::context::Assembled) for this: that type is not
+/// `#[non_exhaustive]`, so a field would have been a second public break for a value
+/// the loop can already derive from what it holds.
+fn frozen_prefix<'a>(user: &'a str, ledger: &ContextLedger) -> Option<&'a str> {
+    let first = ledger.entries().first()?;
+    if first.kind != ObsKind::Message || first.target.as_deref() != Some("summary") {
+        return None;
+    }
+    let at = user.find(first.text.as_str())? + first.text.len();
+    Some(&user[..at])
+}
+
+/// The boundary to put on this step's request, and the guard that decides whether
+/// there is one.
+///
+/// **The crate never asks a vendor to cache a prefix it has not already sent.** A
+/// marker on a prefix that then changes is billed as a cache *write* — above the plain
+/// input rate, not below it — so the rule that makes "this cannot cost money" true is
+/// mechanical rather than an argument about how stable assembly is: hold the previous
+/// step's candidate, and mark only when this step's is byte-identical to it.
+///
+/// That rule is needed because "everything before a compaction boundary is immutable by
+/// construction" is not true of the whole prefix. The memory block renders ahead of the
+/// summary (`context::assemble`) and is re-read from the store every turn by design, so
+/// a note the run writes about its own work moves the prefix without touching the
+/// summary. Under this guard that costs one unmarked step and nothing else.
+///
+/// The cost, stated because it is real: the marker is always one turn behind the
+/// boundary, so the step a fold happens on is never marked. That step's prefix has been
+/// sent zero times, and marking it would be exactly the write this guard exists to
+/// avoid.
+///
+/// Run-scoped state, held by the loop and passed in, for the reason 0.34.0's
+/// `routed_model` is: a rule applied to a freshly-built request cannot detect its own
+/// transition, and a comparison recomputed from scratch each step would answer the same
+/// way every time.
+fn cache_boundary_for(
+    user: &str,
+    ledger: &ContextLedger,
+    last: &mut Option<String>,
+) -> Option<usize> {
+    let Some(candidate) = frozen_prefix(user, ledger) else {
+        // No fold, or the summary was stubbed. Forget what was marked: the next
+        // frozen prefix has to earn the marker again from scratch.
+        *last = None;
+        return None;
+    };
+    let repeated = last.as_deref() == Some(candidate);
+    if !repeated {
+        *last = Some(candidate.to_string());
+        return None;
+    }
+    Some(candidate.len())
+}
+
 /// One definition, and every loop calls it — the flat workspace loop and the tree
 /// loop each immediately before [`assemble`], and the overflow recovery with
 /// `forced`. A rule that lived in one loop would lapse in the other, which is the
