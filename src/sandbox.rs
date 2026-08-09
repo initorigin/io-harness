@@ -80,10 +80,46 @@ use crate::error::Result;
 pub enum Backend {
     /// macOS `sandbox-exec` profile + rlimits + RSS monitor.
     MacosSandboxExec,
+    /// Linux Landlock: a filesystem ruleset restricting this process and every
+    /// descendant, applied between fork and exec, plus `PR_SET_NO_NEW_PRIVS`, a
+    /// seccomp deny-list, and the shared rlimits.
+    ///
+    /// **No namespace is involved**, which is the entire reason this rung
+    /// exists: a stock Ubuntu 24.04 refuses an unprivileged user namespace and
+    /// ships Landlock enabled, so this is what a contained run on the commonest
+    /// Linux CI image actually gets. It is also the only rung with no wrapper
+    /// process — the restriction is installed in the child itself — so the argv
+    /// spawned is the argv asked for.
+    ///
+    /// Egress is denied here only when the kernel's Landlock ABI carries the
+    /// network rules (4 and later). A run that denies egress on an older kernel
+    /// is given a lower rung instead of this one, so this backend never names a
+    /// network boundary it did not apply.
+    LinuxLandlock,
+    /// Linux `bwrap` (bubblewrap): a mount namespace with the tree bound
+    /// read-only and the run's writable roots bound back over it, plus a network
+    /// namespace when egress is denied, plus the shared rlimits.
+    ///
+    /// Beneath [`LinuxLandlock`](Backend::LinuxLandlock) because it needs a
+    /// helper the host may not have; above [`LinuxNamespaces`](Backend::LinuxNamespaces)
+    /// because a setuid `bwrap` works on the hosts whose kernel refuses this
+    /// crate's own `unshare` wrapper.
+    LinuxBubblewrap,
     /// Linux user/mount/pid/net namespaces + rlimits. The crate installs no
     /// seccomp filter; only the kernel's own defaults for an unprivileged user
     /// namespace apply on top.
     LinuxNamespaces,
+    /// Windows AppContainer **and** Job Object together: a low-box token that
+    /// answers *no* to every securable object it was not granted, with an
+    /// explicit ACE per granted path and a capability array that is empty unless
+    /// the run's policy permits egress — plus the Job Object's memory, CPU and
+    /// active-process limits and its kill-on-close.
+    ///
+    /// This is the only Windows backend that confines **access**. A run
+    /// reporting it is both access-confined and resource-contained; a run
+    /// reporting [`WindowsJobObject`](Backend::WindowsJobObject) is the second
+    /// only. See [`appcontainer`].
+    WindowsAppContainer,
     /// Windows Job Object: memory, CPU and active-process limits, and a
     /// tree kill on close. A **resource** boundary and nothing else — a Job
     /// Object has no filesystem facility and no network facility, so a run
@@ -98,7 +134,10 @@ impl Backend {
     pub fn as_str(&self) -> &'static str {
         match self {
             Backend::MacosSandboxExec => "macos-sandbox-exec",
+            Backend::LinuxLandlock => "linux-landlock",
+            Backend::LinuxBubblewrap => "linux-bubblewrap",
             Backend::LinuxNamespaces => "linux-namespaces",
+            Backend::WindowsAppContainer => "windows-appcontainer",
             Backend::WindowsJobObject => "windows-job-object",
             Backend::PortableFloor => "portable-floor",
         }

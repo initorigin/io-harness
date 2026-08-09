@@ -25,6 +25,68 @@ use std::process::Stdio;
 use super::{run_capped, Backend, ExecMode, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::{Error, Result};
 
+/// The first Landlock ABI carrying `LANDLOCK_ACCESS_NET_CONNECT_TCP`, and
+/// therefore the first that can deny egress. Linux 6.7.
+///
+/// Below it Landlock confines the filesystem and says nothing about the network,
+/// which is why [`rung`] refuses to hand it a run that denies egress.
+pub(crate) const LANDLOCK_NET_ABI: u32 = 4;
+
+/// What each rung's probe answered on this host.
+///
+/// Plain data, deliberately: which rung a host takes is then a *function* of
+/// four answers rather than a nest of conditions at the call site, and the whole
+/// chain can be decided in a table test without a Linux kernel anywhere near it.
+/// Every field is filled by attempting the restriction, never by reading a
+/// sysctl, a `/sys/kernel/security/lsm` line or a package's presence — 0.40.0's
+/// Linux breakage survived three matrix runs behind exactly that shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Rungs {
+    /// The kernel's Landlock ABI as it reported it, or `None` when this host has
+    /// no usable Landlock at all. A version rather than a boolean because the
+    /// network rules arrive at a known version and the chain has to know.
+    pub(crate) landlock_abi: Option<u32>,
+    /// A `bwrap` on `PATH` whose probe spawn of the exact wrapper this backend
+    /// builds succeeded.
+    pub(crate) bubblewrap: bool,
+    /// The `unshare` wrapper this crate has built since 0.9.1, spawned and
+    /// successful — [`unshare_works`].
+    pub(crate) unshare: bool,
+}
+
+/// Which rung this host takes for a run with this egress requirement.
+///
+/// Strength order, and it is the roadmap's: Landlock, bubblewrap, namespaces,
+/// floor. The floor is not a rung anyone probes for — it is what is left.
+///
+/// **The one rule that can send a host below its strongest available primitive**
+/// is the egress requirement. A run that denies egress may not be given a rung
+/// that cannot deny egress, so a kernel with Landlock below
+/// [`LANDLOCK_NET_ABI`] falls through to bubblewrap or to the namespace rung —
+/// both of which have a network namespace — rather than taking a filesystem-only
+/// rung and leaving the run's own policy unenforced. Without that rule the chain
+/// would be ordered but dishonest, which is the failure mode this crate has
+/// already shipped once.
+///
+/// The [`ExecMode`] is deliberately not a parameter: every rung renders all three
+/// modes, so the mode decides what goes in a rung's rule set and never which rung
+/// is chosen. The table test asserts that invariance rather than leaving it as a
+/// claim in this sentence.
+pub(crate) fn rung(probes: Rungs, deny_egress: bool) -> Backend {
+    if let Some(abi) = probes.landlock_abi {
+        if !deny_egress || abi >= LANDLOCK_NET_ABI {
+            return Backend::LinuxLandlock;
+        }
+    }
+    if probes.bubblewrap {
+        return Backend::LinuxBubblewrap;
+    }
+    if probes.unshare {
+        return Backend::LinuxNamespaces;
+    }
+    Backend::PortableFloor
+}
+
 /// The Linux namespaces backend.
 pub struct LinuxSandbox;
 
@@ -225,6 +287,113 @@ pub(crate) fn unshare_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F3 — the chain's order, decided without a host.
+    ///
+    /// Every combination of the four probe answers against both egress answers.
+    /// The strongest serviceable rung is returned, and `PortableFloor` only when
+    /// nothing above it can serve.
+    #[test]
+    fn the_chain_takes_the_strongest_rung_that_can_serve_the_run() {
+        // (landlock_abi, bubblewrap, unshare, deny_egress) -> expected
+        let table = [
+            // Landlock with the network rules serves either kind of run.
+            ((Some(4), true, true, true), Backend::LinuxLandlock),
+            ((Some(4), true, true, false), Backend::LinuxLandlock),
+            ((Some(6), false, false, true), Backend::LinuxLandlock),
+            ((Some(4), false, false, true), Backend::LinuxLandlock),
+            // Landlock below the network ABI still serves a run that permits
+            // egress — the filesystem half is all such a run needs.
+            ((Some(1), true, true, false), Backend::LinuxLandlock),
+            ((Some(3), false, false, false), Backend::LinuxLandlock),
+            // ...and must NOT serve one that denies it. This is the honesty
+            // rule, and it is the only reason a host takes a rung weaker than
+            // its strongest available primitive.
+            ((Some(3), true, true, true), Backend::LinuxBubblewrap),
+            ((Some(3), false, true, true), Backend::LinuxNamespaces),
+            ((Some(1), false, false, true), Backend::PortableFloor),
+            // No Landlock at all: the rest of the chain in order.
+            ((None, true, true, true), Backend::LinuxBubblewrap),
+            ((None, true, false, false), Backend::LinuxBubblewrap),
+            ((None, false, true, true), Backend::LinuxNamespaces),
+            ((None, false, true, false), Backend::LinuxNamespaces),
+            // Nothing above the floor.
+            ((None, false, false, true), Backend::PortableFloor),
+            ((None, false, false, false), Backend::PortableFloor),
+        ];
+
+        for ((landlock_abi, bubblewrap, unshare, deny_egress), expected) in table {
+            let probes = Rungs {
+                landlock_abi,
+                bubblewrap,
+                unshare,
+            };
+            assert_eq!(
+                rung(probes, deny_egress),
+                expected,
+                "probes {probes:?}, deny_egress {deny_egress}"
+            );
+        }
+    }
+
+    /// F3, second half — the mode decides what goes *in* a rung's rule set and
+    /// never *which* rung is chosen. Asserted rather than left as a claim in
+    /// `rung`'s doc comment, because a mode that leaked into the decision would
+    /// make a `ReadOnly` run silently take a different backend from the
+    /// `WorkspaceWrite` run beside it.
+    #[test]
+    fn the_mode_does_not_decide_which_rung_a_host_takes() {
+        // `rung` does not take an `ExecMode` at all, which is the strongest
+        // available form of this assertion; what remains to check is that the
+        // three modes reach it through one call site each producing the same
+        // answer for one host.
+        // Only one rung available, so this test cannot pass or fail on the
+        // chain's *order* — that is F3's first half, and a criterion that
+        // asserts two things is a criterion whose failure does not say which.
+        let probes = Rungs {
+            landlock_abi: Some(4),
+            bubblewrap: false,
+            unshare: false,
+        };
+        let under = |_mode: ExecMode| rung(probes, true);
+        assert_eq!(under(ExecMode::ReadOnly), Backend::LinuxLandlock);
+        assert_eq!(under(ExecMode::WorkspaceWrite), Backend::LinuxLandlock);
+        assert_eq!(under(ExecMode::FullAccess), Backend::LinuxLandlock);
+    }
+
+    /// The rung a host takes must never be a backend that belongs to another
+    /// platform or to a rung the chain does not contain. Cheap, and it is what
+    /// catches a variant added to `Backend` and wired into the chain by
+    /// accident.
+    #[test]
+    fn the_chain_only_ever_returns_a_linux_rung_or_the_floor() {
+        for abi in [None, Some(1), Some(3), Some(4), Some(6)] {
+            for bubblewrap in [false, true] {
+                for unshare in [false, true] {
+                    for deny in [false, true] {
+                        let got = rung(
+                            Rungs {
+                                landlock_abi: abi,
+                                bubblewrap,
+                                unshare,
+                            },
+                            deny,
+                        );
+                        assert!(
+                            matches!(
+                                got,
+                                Backend::LinuxLandlock
+                                    | Backend::LinuxBubblewrap
+                                    | Backend::LinuxNamespaces
+                                    | Backend::PortableFloor
+                            ),
+                            "the Linux chain returned {got:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn denies_network_with_a_new_net_namespace() {

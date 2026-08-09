@@ -5,7 +5,7 @@ tasks:
   summary: Name the three new backends and decide the chain in one pure function.
   why_required: Every rung below reports one of these labels and is reached through this decision. Until
     the variants exist and the chain is a testable function, no rung can be selected, reported or ordered.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F3 — the chain''s order is a table, decided without a host.** A pure test over the decision function
@@ -27,7 +27,23 @@ tasks:
   files:
   - src/sandbox.rs
   - tests/sandbox.rs
-  evidence: []
+  evidence:
+  - '`Backend::LinuxLandlock`, `Backend::LinuxBubblewrap` and `Backend::WindowsAppContainer` added with
+    the labels `linux-landlock`, `linux-bubblewrap` and `windows-appcontainer`. `Backend` was already
+    `#[non_exhaustive]`, and no internal match needed a new arm beyond `as_str` — the crate compiles and
+    clippy is clean with `--all-targets`.'
+  - 'F3 — `sandbox::linux::rung(Rungs, deny_egress) -> Backend` decides the chain as a pure function over
+    the four probe answers. Three named tests pass on the macOS development host: `the_chain_takes_the_strongest_rung_that_can_serve_the_run`
+    (15-row table), `the_mode_does_not_decide_which_rung_a_host_takes`, `the_chain_only_ever_returns_a_linux_rung_or_the_floor`.
+    29 of 29 `sandbox::` unit tests pass.'
+  - 'F3 sabotage — ordering bubblewrap ahead of Landlock in `rung` failed `the_chain_takes_the_strongest_rung_that_can_serve_the_run`
+    by assertion (`left: LinuxBubblewrap, right: LinuxLandlock` at `src/sandbox/linux.rs:331`), not by
+    compile error. Reverted by hand and re-run green.'
+  - The sabotage also failed `the_mode_does_not_decide_which_rung_a_host_takes`, which meant that test
+    was incidentally asserting the chain's order. Its probe set was narrowed to Landlock alone so each
+    criterion's failure names one cause. Reported rather than left as over-determination.
+  - N3 — `docs/public-api.txt` is byte-identical (`git diff --stat` empty) and `tests/docs_drift.rs` passes
+    15 of 15. The checker enumerates items, not variants, exactly as the contract stated at plan time.
 - id: US-IO-HARNESS-0.47.0-T02
   summary: 'Build the Landlock rung: a filesystem ruleset applied between fork and exec, with no wrapper
     process.'
