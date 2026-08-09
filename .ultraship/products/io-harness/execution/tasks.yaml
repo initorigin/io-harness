@@ -6,7 +6,7 @@ tasks:
   why_required: 'Nothing else in the release can be built until the request can carry the offset. The
     serde attribute is the half that is easy to get wrong and expensive to discover: `Replay` keys on
     the whole request JSON, so a naked field stops every recorded cassette in the repository from matching.'
-  status: todo
+  status: in-progress
   depends_on: []
   acceptance_criteria:
   - '**F2 — `None` is 0.43.0''s body, byte for byte.** The same builders with `cache_boundary: None`,
@@ -28,7 +28,20 @@ tasks:
   files:
   - src/provider/mod.rs
   - tests/replay.rs
-  evidence: []
+  evidence:
+  - '`CompletionRequest::cache_boundary: Option<usize>` added at `src/provider/mod.rs`, `#[serde(default,
+    skip_serializing_if = "Option::is_none")]` like `model`, `web` and `effort` before it. `cargo fmt
+    --check` clean, `cargo clippy --all-targets -- -D warnings` clean, and the field''s own worked doctest
+    passes.'
+  - '`a_boundary_is_absent_from_an_unmarked_key_and_present_in_a_marked_one` (`tests/replay.rs`) passes;
+    the whole replay suite is 9 passed / 0 failed. Sabotage — drop `skip_serializing_if` — fails that
+    named test and NOTHING else in the suite, which is the finding that justifies the test existing: a
+    recording made and replayed by one build serialises both sides the same way, so every other test stays
+    self-consistent.'
+  - BLOCKED on the `#[non_exhaustive]` half. Applying it fails `E0639` at `tests/replay.rs:136`, `:392`
+    and `:428` — the attribute forbids every struct expression outside the defining crate INCLUDING functional
+    update, so `..Default::default()` stops compiling. Reported for `/ultraship:iterate`; the attribute
+    is not in the tree.
 - id: US-IO-HARNESS-0.44.0-T02
   summary: Anthropic splits the user turn at the boundary and refuses it when images are present.
   why_required: Anthropic is the vendor the second breakpoint is designed against, and the one where image
