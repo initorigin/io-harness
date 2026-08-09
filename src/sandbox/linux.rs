@@ -19,10 +19,10 @@
 //! trace, so a degraded run is auditable rather than silent — and a wrapper that
 //! fails anyway is [`crate::Error::Sandbox`], never a failed verification.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
-use super::{run_capped, Backend, RunSpec, Sandbox, SandboxOutcome};
+use super::{run_capped, Backend, ExecMode, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::{Error, Result};
 
 /// The Linux namespaces backend.
@@ -38,13 +38,17 @@ impl Sandbox for LinuxSandbox {
         }
         // Wrap in `unshare`: new user (map root), mount, pid, and — when network
         // is denied — a new empty network namespace with no route out.
-        let wrapped = unshare_argv(spec.argv, spec.workdir, spec.allow_network);
-        let wspec = RunSpec {
-            argv: &wrapped,
-            workdir: spec.workdir,
-            limits: spec.limits,
-            allow_network: spec.allow_network,
-        };
+        let wrapped = unshare_argv(
+            spec.argv,
+            spec.workdir,
+            spec.allow_network,
+            spec.mode,
+            spec.writable_roots,
+        );
+        let wspec = RunSpec::new(&wrapped, spec.workdir, spec.limits)
+            .with_network(spec.allow_network)
+            .with_mode(spec.mode)
+            .with_writable_roots(spec.writable_roots);
         let outcome = run_capped(Backend::LinuxNamespaces, wspec, |_cmd| {}).await?;
         match wrapper_failure(&outcome) {
             Some(reason) => Err(Error::Sandbox { reason }),
@@ -79,7 +83,13 @@ fn unshare_works() -> bool {
         // remounts, and a probe that missed that would report `LinuxNamespaces`
         // for runs confining nothing.
         let dir = std::env::temp_dir();
-        let argv = unshare_argv(&["true".to_string()], &dir, false);
+        let argv = unshare_argv(
+            &["true".to_string()],
+            &dir,
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
         std::process::Command::new(&argv[0])
             .args(&argv[1..])
             .stdin(Stdio::null())
@@ -113,12 +123,14 @@ fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
 /// does the same through mount and network namespaces" as macOS. Only `--net`
 /// was doing real work.
 ///
-/// The script remounts the whole tree read-only and then binds back the two
-/// places a command legitimately writes: the run's own workdir, and the system
-/// temporary directory. The second is not a convenience — it is the same
-/// allowance the macOS profile already makes for `/private/var/folders`, and
-/// without it most toolchains fail on their first temporary file. Both are
-/// stated in `docs/CONTRACT.md`.
+/// The script remounts the whole tree read-only and then binds back the places a
+/// command legitimately writes: the run's own workdir (unless the
+/// [`ExecMode`](crate::ExecMode) withholds it), the writable roots the run
+/// resolved — a toolchain's own caches, since 0.46.0 — and the system temporary
+/// directory. The last is not a convenience: it is the same allowance the macOS
+/// profile already makes for `/private/var/folders`, and without it most
+/// toolchains fail on their first temporary file. All three are stated in
+/// `docs/CONTRACT.md`.
 ///
 /// **`/` is remounted read-only directly, and is deliberately not bound to
 /// itself first.** The first version of this script did `mount --bind / /`
@@ -142,24 +154,41 @@ fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
 /// [`wrapper_failure`] classifies it as the wrapper failing rather than as the
 /// payload's own non-zero exit. A wrapper failure reported as a failed command
 /// is the exact confusion that made the original Linux breakage need a CI log.
+/// **The writable set is a counted argument list, not a fixed pair (0.46.0).**
+/// `$1` is the workdir to enter, `$2` is how many writable roots follow, and the
+/// payload begins after them — so the same script serves a run with no extra
+/// grants and one whose toolchain writes to three caches, without the count ever
+/// being inferred from the argv's shape. The workdir is in that list only when
+/// the [`ExecMode`](crate::ExecMode) grants it, which is what makes `read-only`
+/// a mode here rather than a label: the process still `cd`s into the workspace
+/// and still cannot write to it.
 const MOUNT_SETUP: &str = "\
 set -e
 fail() { echo \"unshare: sandbox mount setup failed: $1\" >&2; exit 125; }
+rw() {
+  [ -d \"$1\" ] || return 0
+  mount --bind \"$1\" \"$1\" 2>/dev/null || fail \"could not bind $1\"
+  mount -o remount,bind,rw \"$1\" 2>/dev/null || fail \"could not make $1 writable\"
+}
 mount --make-rprivate / 2>/dev/null || fail 'could not make / private'
 mount -o remount,bind,ro / 2>/dev/null || fail 'could not remount / read-only'
-for d in \"$1\" \"${TMPDIR:-/tmp}\"; do
-  [ -d \"$d\" ] || continue
-  mount --bind \"$d\" \"$d\" 2>/dev/null || fail \"could not bind $d\"
-  mount -o remount,bind,rw \"$d\" 2>/dev/null || fail \"could not make $d writable\"
-done
-cd \"$1\" || fail 'could not enter the workdir'
-shift
+wd=\"$1\"; shift
+n=\"$1\"; shift
+while [ \"$n\" -gt 0 ]; do rw \"$1\"; shift; n=$((n-1)); done
+rw \"${TMPDIR:-/tmp}\"
+cd \"$wd\" || fail 'could not enter the workdir'
 exec \"$@\"
 ";
 
 /// The `unshare` argv this backend builds for a run, factored out so it is
 /// unit-testable without spawning anything.
-pub(crate) fn unshare_argv(inner: &[String], workdir: &Path, allow_network: bool) -> Vec<String> {
+pub(crate) fn unshare_argv(
+    inner: &[String],
+    workdir: &Path,
+    allow_network: bool,
+    mode: ExecMode,
+    writable_roots: &[PathBuf],
+) -> Vec<String> {
     let mut v: Vec<String> = vec![
         "unshare".into(),
         "--user".into(),
@@ -172,13 +201,23 @@ pub(crate) fn unshare_argv(inner: &[String], workdir: &Path, allow_network: bool
         v.push("--net".into());
     }
     v.push("--".into());
-    // `sh -c <script> sh <workdir> <argv...>`: `$0` is `sh`, `$1` is the workdir
-    // the script binds and enters, and `"$@"` after the shift is the payload.
+    // `sh -c <script> sh <workdir> <n> <root>... <argv...>`: `$0` is `sh`, `$1` is
+    // the workdir the script enters, `$2` is how many writable roots follow, and
+    // the payload is what remains after them.
     v.push("sh".into());
     v.push("-c".into());
     v.push(MOUNT_SETUP.into());
     v.push("sh".into());
     v.push(workdir.display().to_string());
+
+    let mut writable: Vec<String> = Vec::new();
+    if mode != ExecMode::ReadOnly {
+        writable.push(workdir.display().to_string());
+    }
+    writable.extend(writable_roots.iter().map(|p| p.display().to_string()));
+    v.push(writable.len().to_string());
+    v.extend(writable);
+
     v.extend(inner.iter().cloned());
     v
 }
@@ -189,7 +228,13 @@ mod tests {
 
     #[test]
     fn denies_network_with_a_new_net_namespace() {
-        let argv = unshare_argv(&["echo".into(), "hi".into()], Path::new("/w"), false);
+        let argv = unshare_argv(
+            &["echo".into(), "hi".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
         assert!(
             argv.contains(&"--net".into()),
             "net namespace must isolate network by default"
@@ -212,7 +257,13 @@ mod tests {
     #[test]
     fn the_payload_is_never_interpolated_into_the_setup_script() {
         let nasty = "; rm -rf /".to_string();
-        let argv = unshare_argv(&["echo".into(), nasty.clone()], Path::new("/w"), false);
+        let argv = unshare_argv(
+            &["echo".into(), nasty.clone()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
         let script = argv.iter().find(|a| a.contains("mount --bind")).unwrap();
         assert!(
             !script.contains("rm -rf"),
@@ -230,7 +281,13 @@ mod tests {
     /// making every write fail, which is not the same claim at all.
     #[test]
     fn the_setup_makes_the_tree_read_only_and_binds_the_workdir_back() {
-        let argv = unshare_argv(&["true".into()], Path::new("/w"), false);
+        let argv = unshare_argv(
+            &["true".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
         let script = argv.iter().find(|a| a.contains("mount --bind")).unwrap();
         assert!(script.contains("remount,bind,ro /"));
         assert!(script.contains("remount,bind,rw"));
@@ -240,9 +297,57 @@ mod tests {
         );
     }
 
+    /// F7 — the writable roots arrive as a counted list, ahead of the payload,
+    /// and the workdir leads it. The count is what lets the script find the
+    /// payload again, so it is asserted rather than assumed.
+    #[test]
+    fn the_writable_roots_are_a_counted_list_before_the_payload() {
+        let roots = vec![
+            PathBuf::from("/home/u/.cargo"),
+            PathBuf::from("/home/u/.npm"),
+        ];
+        let argv = unshare_argv(
+            &["echo".into(), "hi".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &roots,
+        );
+
+        // `sh -c <script> sh <workdir> <n> <root>... <payload...>`
+        let wd_at = argv.iter().position(|a| a == "/w").unwrap();
+        assert_eq!(argv[wd_at + 1], "3", "workdir plus two roots");
+        assert_eq!(argv[wd_at + 2], "/w", "the workdir leads the writable list");
+        assert_eq!(argv[wd_at + 3], "/home/u/.cargo");
+        assert_eq!(argv[wd_at + 4], "/home/u/.npm");
+        assert_eq!(&argv[wd_at + 5..], &["echo".to_string(), "hi".to_string()]);
+    }
+
+    /// F3 — under `ReadOnly` the workdir is entered and not bound writable, so
+    /// the count is the roots alone.
+    #[test]
+    fn read_only_does_not_put_the_workdir_in_the_writable_list() {
+        let argv = unshare_argv(
+            &["true".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::ReadOnly,
+            &[],
+        );
+        let wd_at = argv.iter().position(|a| a == "/w").unwrap();
+        assert_eq!(argv[wd_at + 1], "0", "nothing is writable but the temp dir");
+        assert_eq!(&argv[wd_at + 2..], &["true".to_string()]);
+    }
+
     #[test]
     fn allows_network_when_asked() {
-        let argv = unshare_argv(&["echo".into()], Path::new("/w"), true);
+        let argv = unshare_argv(
+            &["echo".into()],
+            Path::new("/w"),
+            true,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
         assert!(
             !argv.contains(&"--net".into()),
             "no net namespace when network is allowed"
@@ -272,12 +377,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let argv = vec!["sh".into(), "-c".into(), "echo hi".into()];
         let out = LinuxSandbox
-            .run(RunSpec {
-                argv: &argv,
-                workdir: dir.path(),
-                limits: &crate::sandbox::SandboxLimits::default(),
-                allow_network: false,
-            })
+            .run(RunSpec::new(
+                &argv,
+                dir.path(),
+                &crate::sandbox::SandboxLimits::default(),
+            ))
             .await
             .unwrap();
         assert!(out.success(), "a degraded run must still run, got {out:?}");

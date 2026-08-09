@@ -38,12 +38,7 @@ async fn run_bat(config: &SandboxConfig, limits: SandboxLimits, script: &str) ->
     let workdir = tempfile::tempdir().unwrap();
     let argv = vec!["cmd".to_string(), "/c".to_string(), script.to_string()];
     select(config)
-        .run(RunSpec {
-            argv: &argv,
-            workdir: workdir.path(),
-            limits: &limits,
-            allow_network: config.allow_network,
-        })
+        .run(RunSpec::new(&argv, workdir.path(), &limits).with_network(config.allow_network))
         .await
         .unwrap()
 }

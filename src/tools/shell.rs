@@ -1109,11 +1109,13 @@ pub(crate) struct Shell {
 /// several processes and the escape this release closes is a *later* stage, not
 /// the first one.
 pub(crate) struct ShellSandbox {
-    pub(crate) config: crate::sandbox::SandboxConfig,
+    /// The containment the run resolved, with this call's egress answer already
+    /// folded in — the mode, the caps and the writable roots travel together so a
+    /// stage cannot be wrapped under a different grant than the `exec` beside it.
+    pub(crate) containment: std::sync::Arc<crate::sandbox::ExecContainment>,
     /// The workspace root — the directory writes are confined to. Not the
     /// stage's `cwd`, which `cd` may have moved somewhere below it.
     pub(crate) workdir: std::path::PathBuf,
-    pub(crate) allow_network: bool,
 }
 
 /// Where a detached line's output goes, and who to tell about its processes.
@@ -1291,12 +1293,32 @@ impl Shell {
             // taken from `wrap_argv` rather than rebuilt here, because a line's
             // stages are piped into one another and this tool therefore owns
             // every `Child` and cannot hand an argv to `Sandbox::run`.
+            // **The wrapper is told the stage's own directory, and the workspace
+            // root is passed as a writable root instead (0.46.0).** A line is
+            // several stages and `cd` moves between them, so `planned.cwd` is
+            // where this stage must run — and the Linux wrapper *enters* the
+            // directory it is given, which on Linux made `cd src && rustc …`
+            // silently run in the workspace root once containment became the
+            // default. Handing it the workspace root and letting the stage's
+            // `current_dir` stand does not work: the wrapper's `cd` is inside the
+            // namespace and happens after the spawn. So the two facts are
+            // separated — where to run, and what may be written — and the root
+            // stays writable by being named as one.
             let argv = match &self.sandbox {
                 Some(sb) => {
+                    let mut roots = Vec::with_capacity(sb.containment.roots.len() + 1);
+                    // Only where the mode grants it. Under `ReadOnly` the
+                    // workspace is exactly what may not be written to, and naming
+                    // it here would hand it back through the side door.
+                    if sb.containment.config.mode != crate::ExecMode::ReadOnly {
+                        roots.push(sb.workdir.clone());
+                    }
+                    roots.extend(sb.containment.roots.iter().cloned());
                     crate::sandbox::wrap_argv(
-                        &sb.config,
-                        &sb.workdir,
-                        sb.allow_network,
+                        &sb.containment.config,
+                        &planned.cwd,
+                        sb.containment.config.allow_network,
+                        &roots,
                         &stage.argv,
                     )
                     .1
@@ -1310,7 +1332,7 @@ impl Shell {
             // The same caps the sandbox's own runner applies, through the same
             // helper rather than a second copy of the `pre_exec` block.
             if let Some(sb) = &self.sandbox {
-                crate::sandbox::apply_rlimits(&mut cmd, &sb.config.limits);
+                crate::sandbox::apply_rlimits(&mut cmd, &sb.containment.config.limits);
             }
 
             // A detached line's stages go into containment of their own, and a

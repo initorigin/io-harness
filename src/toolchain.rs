@@ -29,7 +29,7 @@
 //! that it is data, that it is shown to the model rather than executed by the
 //! harness, and that 0.19.0 makes it overridable.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -86,6 +86,124 @@ pub struct Toolchain {
 }
 
 impl Toolchain {
+    /// The directories this toolchain writes to *outside* the project (0.46.0).
+    ///
+    /// A registry cache, a module cache, a build cache. They are what makes a
+    /// default-contained run able to build a real project: 0.40.0 recorded that
+    /// under containment a toolchain writing `~/.cargo/registry` or `~/.npm`
+    /// fails, and a default nobody can build under is a default every embedder
+    /// turns off on their first failure.
+    ///
+    /// Each ecosystem's **own** environment variable wins over the conventional
+    /// path, because an operator who moved their cache has already said where it
+    /// is. Nothing here is filtered or canonicalised — the caller does that, since
+    /// only it knows whether a path that is absent should be created, skipped, or
+    /// reported.
+    ///
+    /// ```
+    /// use io_harness::toolchain;
+    ///
+    /// # fn demo() -> std::io::Result<()> {
+    /// let dir = tempfile::tempdir()?;
+    /// std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n")?;
+    /// let found = toolchain::detect(dir.path()).unwrap();
+    ///
+    /// // Every cargo build writes here, and none of it belongs to the project.
+    /// let caches = found.cache_dirs();
+    /// assert!(caches.iter().any(|p| p.ends_with(".cargo")), "{caches:?}");
+    /// # Ok(()) }
+    /// # demo().unwrap();
+    /// ```
+    pub fn cache_dirs(&self) -> Vec<PathBuf> {
+        let env = |k: &str| {
+            std::env::var_os(k)
+                .map(PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty())
+        };
+        let home = || {
+            env("HOME")
+                .or_else(|| env("USERPROFILE"))
+                .unwrap_or_else(|| PathBuf::from("/"))
+        };
+        // `XDG_CACHE_HOME` is honoured only for the ecosystems that document it.
+        // cargo and go do not, and reading it for them would return a path their
+        // toolchain never writes to — a grant that looks right and buys nothing.
+        let xdg_cache = || env("XDG_CACHE_HOME").unwrap_or_else(|| home().join(".cache"));
+
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        match self.ecosystem.as_str() {
+            "cargo" => {
+                dirs.push(env("CARGO_HOME").unwrap_or_else(|| home().join(".cargo")));
+            }
+            "node" => {
+                dirs.push(env("npm_config_cache").unwrap_or_else(|| home().join(".npm")));
+                if self.manager == "pnpm" {
+                    dirs.push(env("PNPM_HOME").unwrap_or_else(|| home().join(".local/share/pnpm")));
+                }
+                if self.manager == "yarn" {
+                    dirs.push(home().join(".yarn"));
+                }
+            }
+            "python" => {
+                dirs.push(env("PIP_CACHE_DIR").unwrap_or_else(|| xdg_cache().join("pip")));
+                match self.manager.as_str() {
+                    "poetry" => {
+                        dirs.push(
+                            env("POETRY_CACHE_DIR").unwrap_or_else(|| xdg_cache().join("pypoetry")),
+                        );
+                    }
+                    "uv" => {
+                        dirs.push(env("UV_CACHE_DIR").unwrap_or_else(|| xdg_cache().join("uv")));
+                    }
+                    _ => {}
+                }
+            }
+            "deno" => {
+                dirs.push(env("DENO_DIR").unwrap_or_else(|| xdg_cache().join("deno")));
+            }
+            "go" => {
+                // `GOMODCACHE` wins outright; otherwise it is `$GOPATH/pkg/mod`,
+                // and the build cache is a second, separate directory.
+                dirs.push(env("GOMODCACHE").unwrap_or_else(|| {
+                    env("GOPATH")
+                        .unwrap_or_else(|| home().join("go"))
+                        .join("pkg/mod")
+                }));
+                dirs.push(env("GOCACHE").unwrap_or_else(|| xdg_cache().join("go-build")));
+            }
+            "maven" => {
+                dirs.push(home().join(".m2"));
+            }
+            "gradle" => {
+                dirs.push(env("GRADLE_USER_HOME").unwrap_or_else(|| home().join(".gradle")));
+            }
+            "dotnet" => {
+                dirs.push(env("NUGET_PACKAGES").unwrap_or_else(|| home().join(".nuget/packages")));
+            }
+            "ruby" => {
+                dirs.push(env("GEM_HOME").unwrap_or_else(|| home().join(".gem")));
+                dirs.push(env("BUNDLE_PATH").unwrap_or_else(|| home().join(".bundle")));
+            }
+            "php" => {
+                dirs.push(env("COMPOSER_HOME").unwrap_or_else(|| home().join(".composer")));
+                dirs.push(xdg_cache().join("composer"));
+            }
+            "elixir" => {
+                dirs.push(env("MIX_HOME").unwrap_or_else(|| home().join(".mix")));
+                dirs.push(env("HEX_HOME").unwrap_or_else(|| home().join(".hex")));
+            }
+            "swift" => {
+                dirs.push(xdg_cache().join("org.swift.swiftpm"));
+            }
+            // `cmake` and `make` drive whatever the project configured, so there
+            // is no cache directory this crate can name for them. An empty list
+            // is the honest answer, and it is what makes the workspace-only grant
+            // the default for a project the crate cannot read the build of.
+            _ => {}
+        }
+        dirs
+    }
+
     /// The detection, as the sentence the model is shown.
     ///
     /// Prose rather than JSON: this lands in a prompt, and a model reads a

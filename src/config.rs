@@ -511,6 +511,9 @@ struct SandboxSection {
     limits: Option<LimitsSection>,
     allow_network: Option<bool>,
     force_floor: Option<bool>,
+    /// Where a command may write (0.46.0), by [`ExecMode`]'s own kebab-case
+    /// labels: `read-only`, `workspace-write`, `full-access`.
+    mode: Option<crate::sandbox::ExecMode>,
 }
 
 /// Every cap optional and merged one key at a time — unlike [`SandboxLimits`](crate::sandbox::SandboxLimits)
@@ -707,6 +710,15 @@ impl Config {
     ///
     /// // The same key set the other way is refused: this is the project scope.
     /// let err = Config::from_toml("[sandbox]\nforce_floor = false\n").unwrap_err();
+    /// assert!(err.to_string().contains("widens"), "{err}");
+    ///
+    /// // 0.46.0 — a repository may narrow what its own commands may write to,
+    /// // and may not hand whoever cloned it the host's privileges.
+    /// use io_harness::ExecMode;
+    /// let narrowed = Config::from_toml("[sandbox]\nmode = \"read-only\"\n").unwrap();
+    /// assert_eq!(narrowed.sandbox().unwrap().mode, ExecMode::ReadOnly);
+    ///
+    /// let err = Config::from_toml("[sandbox]\nmode = \"full-access\"\n").unwrap_err();
     /// assert!(err.to_string().contains("widens"), "{err}");
     /// ```
     pub fn from_toml(text: &str) -> Result<Self> {
@@ -1137,6 +1149,9 @@ impl Config {
         }
         if let Some(v) = section.force_floor {
             config.force_floor = v;
+        }
+        if let Some(v) = section.mode {
+            config.mode = v;
         }
         Some(config)
     }
@@ -1593,14 +1608,20 @@ pub(crate) fn parse(scope: Scope, text: &str, path: &Path) -> Result<toml::value
 ///
 /// `io.toml` is committed and arrives with a `git clone`. These four are the keys
 /// that turn reading a stranger's configuration into a risk: two that default an act
-/// to `allow`, one that re-opens egress inside the sandbox, and one that switches the
-/// portable floor off. The *narrowing* value of each is still legal in a project
+/// to `allow`, one that re-opens egress inside the sandbox, one that switches the
+/// portable floor off, and one that hands a cloned repository the host's own
+/// privileges. The *narrowing* value of each is still legal in a project
 /// file, because a project file denying `exec` is exactly what the scope is for.
 const PROJECT_WIDENING: &[(&[&str], &str)] = &[
     (&["policy", "defaults", "exec"], "allow"),
     (&["policy", "defaults", "net"], "allow"),
     (&["sandbox", "allow_network"], "true"),
     (&["sandbox", "force_floor"], "false"),
+    // 0.46.0 — `full-access` is the widest grant the crate makes, so a repository
+    // may not hand it to whoever clones it. The narrowing values (`read-only`,
+    // and `workspace-write` where the caller asked for less) stay legal at
+    // project scope, which is what the scope is for.
+    (&["sandbox", "mode"], "full-access"),
 ];
 
 /// Validate every `[[provider]]` entry, reporting the index of the one at fault

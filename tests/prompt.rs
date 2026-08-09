@@ -456,12 +456,18 @@ async fn the_boundary_section_says_what_the_policy_does() {
     }
 }
 
-/// F1's other half: a permissive run gets no section at all, and single-file mode
-/// never gets one because it enforces no policy.
+/// F1's other half: a run with nothing to say about a boundary gets no section
+/// at all, and single-file mode never gets one because it enforces no policy.
+///
+/// **`with_full_access()` is load-bearing here since 0.46.0** and is not a way of
+/// making the assertion pass: a run is contained by default now, and containment
+/// *is* a boundary — the section would be correct to render. What this asserts is
+/// that a run enforcing nothing and confining nothing is still told nothing, which
+/// is the claim 0.45.0 made and which this release does not weaken.
 #[tokio::test]
 async fn a_run_with_no_boundary_is_told_about_none() {
     let dir = workspace();
-    let composed = workspace_system(&contract(dir.path())).await;
+    let composed = workspace_system(&contract(dir.path()).with_full_access()).await;
     assert!(!composed.contains("Your boundary."));
 }
 
@@ -565,13 +571,24 @@ async fn containment_names_the_backend_the_host_actually_gave() {
             _ => {
                 assert!(line.contains("are contained"), "{line}");
                 assert!(line.contains("confined to the workspace"), "{line}");
+                // 0.46.0 — the mode is named beside the backend, because a mode a
+                // host cannot enforce and a mode it can read identically without
+                // it.
+                assert!(line.contains("mode: workspace-write"), "{line}");
             }
         }
     }
 
-    // And a run that did not ask for containment is told nothing about it.
-    let plain = policy_system(&contract(dir.path()), &Policy::default()).await;
-    assert!(!plain.contains("- Commands you run"));
+    // And a run that asked for the host's own privileges is told *that*, rather
+    // than told nothing: since 0.46.0 the absence of containment is a decision the
+    // caller made, so it is stated (F2).
+    let plain = policy_system(&contract(dir.path()).with_full_access(), &Policy::default()).await;
+    let line = plain
+        .lines()
+        .find(|l| l.starts_with("- Commands you run"))
+        .expect("a full-access run is told it is not contained");
+    assert!(line.contains("not contained"), "{line}");
+    assert!(line.contains("full-access"), "{line}");
 }
 
 // ---------------------------------------------------------------------- F5/F7
@@ -837,11 +854,13 @@ async fn prompt_composed_fires_once_and_says_what_was_composed() {
         "the reported size is not the prompt that was sent"
     );
 
-    // A run with nothing optional in it reports both sections absent.
+    // A run with nothing optional in it reports both sections absent. It has to
+    // ask for `with_full_access()` since 0.46.0: containment is a boundary, and a
+    // contained run reporting `boundary: false` would be the event lying.
     let plain = Composed::default();
     let provider = Rec::new(vec![write_call()]);
     let _ = run_with_observed(
-        &contract(dir.path()),
+        &contract(dir.path()).with_full_access(),
         &provider,
         &store,
         &Policy::permissive(),

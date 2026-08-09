@@ -74,12 +74,7 @@ async fn main() -> io_harness::Result<()> {
         .map(|s| s.to_string())
         .collect();
     let capped = select(&cfg)
-        .run(RunSpec {
-            argv: &busy,
-            workdir: dir.path(),
-            limits: &cfg.limits,
-            allow_network: false,
-        })
+        .run(RunSpec::new(&busy, dir.path(), &cfg.limits).with_network(false))
         .await?;
     println!(
         "\ncap demo: cap_hit = {:?} (a runaway was killed, not left hanging)",
@@ -92,12 +87,7 @@ async fn main() -> io_harness::Result<()> {
         .map(|s| s.to_string())
         .collect();
     let net = select(&SandboxConfig::new())
-        .run(RunSpec {
-            argv: &curl,
-            workdir: dir.path(),
-            limits: &SandboxLimits::default(),
-            allow_network: false,
-        })
+        .run(RunSpec::new(&curl, dir.path(), &SandboxLimits::default()).with_network(false))
         .await?;
     println!(
         "network demo: outbound allowed = {} (default-deny)",

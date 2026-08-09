@@ -954,6 +954,61 @@ pub enum EventKind {
         /// Whether a repository's own guidance was included.
         instructions: bool,
     },
+    /// How this run's own commands are contained, resolved once (0.46.0).
+    ///
+    /// Emitted once per run, at run start — including for a run that asked for
+    /// [`ExecMode::FullAccess`](crate::ExecMode::FullAccess), because "this run was
+    /// not contained" is the fact an audit most needs and an absent event is not a
+    /// statement.
+    ///
+    /// `backend` is what [`select`](crate::sandbox::select) **actually returned** on
+    /// this host, never what was asked for: a stock Ubuntu 24.04 refuses the
+    /// unprivileged user namespace the Linux backend needs, so a run there reports
+    /// `portable-floor` and enforces resource caps alone. Reading `mode` without
+    /// `backend` is reading an intention.
+    ///
+    /// It carries the *count* of writable roots rather than their paths, which are
+    /// host-identifying and of unbounded length.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// struct Containment;
+    ///
+    /// impl Observer for Containment {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::Contained { mode, backend, .. } = &event.kind {
+    ///             // The pair that matters: an application deciding how much to
+    ///             // trust a run reads both, because a mode a host cannot enforce
+    ///             // is a mode in name only.
+    ///             if backend == "portable-floor" && mode != "full-access" {
+    ///                 eprintln!("{mode} asked for, resource caps only delivered");
+    ///             }
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let contained = EventKind::Contained {
+    ///     mode: "workspace-write".into(),
+    ///     backend: "macos-sandbox-exec".into(),
+    ///     roots: 2,
+    /// };
+    /// assert!(matches!(contained, EventKind::Contained { roots: 2, .. }));
+    /// # let _ = Containment;
+    /// ```
+    Contained {
+        /// The [`ExecMode`](crate::ExecMode) this run asked for, by its stable
+        /// label: `read-only`, `workspace-write` or `full-access`.
+        mode: String,
+        /// The [`Backend`](crate::Backend) that will actually run this run's
+        /// commands, by its stable label — or `none` when the mode reaches no
+        /// backend at all.
+        backend: String,
+        /// How many writable roots were granted besides the workspace root, after
+        /// the ones that do not exist on this host were dropped.
+        roots: u32,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -1023,6 +1078,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "compacted",
     "cache_marked",
     "prompt_composed",
+    "contained",
     "finished",
 ];
 
@@ -1565,6 +1621,11 @@ mod tests {
                 boundary: true,
                 instructions: false,
             },
+            EventKind::Contained {
+                mode: "workspace-write".into(),
+                backend: "macos-sandbox-exec".into(),
+                roots: 2,
+            },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -1682,6 +1743,8 @@ mod tests {
                 | EventKind::CacheMarked { .. }
                 // 0.45.0 — the system prompt this run composed.
                 | EventKind::PromptComposed { .. }
+                // 0.46.0 — how this run's own commands are contained.
+                | EventKind::Contained { .. }
                 | EventKind::Finished { .. } => {}
             }
         }
