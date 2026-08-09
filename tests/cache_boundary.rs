@@ -366,6 +366,48 @@ fn the_boundary_is_one_helper_that_both_loops_call() {
     );
 }
 
+// ------------------------------------------------------------------------ O3
+
+/// O3 — no shipped sentence still says the transcript carries no breakpoint.
+///
+/// Two places said it before this release and one of them was a doc comment on a
+/// function this release edits, which is the easiest kind to leave behind: the code
+/// changes, the paragraph above it does not, and the crate ships documentation that
+/// contradicts itself. `validate` cannot see this and neither can a compiler; only a
+/// grep can, so here is the grep.
+///
+/// `CHANGELOG.md` is deliberately **not** searched. Its 0.38.0 entry says the
+/// transcript is unmarked and that is a true statement about what 0.38.0 shipped — a
+/// changelog is immutable history, not a claim about today.
+#[test]
+fn nothing_shipped_still_denies_the_second_breakpoint() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let stale = [
+        "transcript deliberately carries no breakpoint",
+        "Only the instructions are marked, never the transcript",
+        "The transcript is not cached",
+        "Nothing is marked in the transcript",
+    ];
+
+    for rel in [
+        "README.md",
+        "docs/CONTRACT.md",
+        "docs/guide/providers.md",
+        "src/provider/openai_wire.rs",
+        "src/provider/anthropic.rs",
+    ] {
+        let text = std::fs::read_to_string(root.join(rel))
+            .unwrap_or_else(|e| panic!("{rel}: {e}"))
+            .replace("\r\n", "\n");
+        for phrase in stale {
+            assert!(
+                !text.contains(phrase),
+                "{rel} still says {phrase:?}, which 0.44.0 made false"
+            );
+        }
+    }
+}
+
 // ------------------------------------------------------------------------ F8
 
 /// F8 — `CacheMarked` fires when the marked prefix changes, and not once per step.

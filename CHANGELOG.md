@@ -26,6 +26,80 @@ notes are produced from it.
 
 ### Security
 
+## [0.44.0] - 2026-08-09
+
+### Added
+
+- **A long run stops paying full price for the part of the request that never
+  changes.** 0.38.0 marked one cache breakpoint, at the end of the system block,
+  and deliberately left the transcript unmarked: context assembly supersedes,
+  invalidates, re-reads and re-fits earlier observations on every turn, so it was
+  not the byte-identical prefix a cache needs and a marker there would have been
+  billed as a cache *write* almost every turn. 0.43.0's summarising compaction
+  removed that objection for the part of the prompt ahead of the fold, and this
+  release marks it. Measured live against `anthropic/claude-haiku-4.5` through
+  OpenRouter: the system breakpoint alone served 7,408 tokens of a 13,113-token
+  prompt from cache; with the transcript breakpoint the same request served
+  **13,093** — 5,685 tokens a step that were being paid for fresh.
+
+- **`CompletionRequest::cache_boundary`.** A byte offset into `user`: the end of
+  the prefix the caller states is byte-stable across requests. `None` — the
+  default, and every caller before this release — sends the body 0.43.0 sent, byte
+  for byte. A `Provider` that ignores it keeps working and is honestly
+  non-caching, exactly as with `model`, `web` and `effort`. An offset past the end
+  of `user`, one that is not on a UTF-8 character boundary, and `Some(0)` are all
+  ignored rather than refused: a boundary is an optimisation, and one that turns a
+  working run into an error costs more than it can save.
+
+- **`EventKind::CacheMarked { through_step, prefix_bytes }`.** Emitted when the
+  marked prefix *changes* — the step it is first offered, and again whenever a
+  later fold moves it — and never once per step. The absence of it across a run is
+  the signal that nothing was ever marked, which is what makes "why is this run
+  getting no cache reads" answerable without a wire trace. Additive: `EventKind`
+  has been `#[non_exhaustive]` since 0.24.0.
+
+### Changed
+
+- **The crate never asks a vendor to cache a prefix it has not already sent.**
+  "Everything before a compaction boundary is immutable" is not true of the whole
+  prefix: the memory block renders *ahead* of the summary and is re-read from the
+  store every turn, so a note a run writes about its own work moves the prefix
+  without touching the summary. The run loop therefore holds the previous step's
+  candidate prefix and marks only on a byte-identical repeat. Two visible
+  consequences, both deliberate — the step a fold happens on is never marked, so
+  the marker is always one turn behind the boundary, and a note written mid-run
+  withdraws it for exactly one step. The failure mode is lost saving, never lost
+  money.
+
+- **A marked request sends the user turn as two content blocks instead of one**, on
+  the Anthropic and OpenRouter wires, with byte-identical content. Bodies for
+  `OpenAi` and every `Compatible` endpoint are unchanged under all inputs, and so
+  is any request that names no boundary.
+
+- **A request carrying an image is marked on OpenRouter and not on Anthropic.**
+  Anthropic puts image blocks before the text, so a marked text block would write a
+  one-turn attachment into the cache entry and the next turn could never hit it;
+  the OpenAI-shaped wire puts text first, so the marked span is still a real
+  prefix. A property of the two orderings rather than a policy this crate chose.
+
+- **`CompletionRequest` gains a field.** *Migration:* construct it with
+  `..Default::default()`, which the type's own worked example has advised since
+  0.15.0 and which every caller already using it needs no change for. Only an
+  exhaustive struct literal outside this crate stops compiling — the same break
+  `media` (0.15.0), `model` (0.21.0), `web` (0.22.0) and `effort` (0.31.0) each
+  were. The type is deliberately **not** `#[non_exhaustive]`: that attribute
+  forbids every struct expression outside the defining crate, functional update
+  included, so marking it would forbid the very `..Default::default()` this note
+  tells you to write.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
 ## [0.43.0] - 2026-08-09
 
 ### Added

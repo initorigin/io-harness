@@ -80,13 +80,17 @@ pub(crate) fn body(
 /// The system message's `content` for a wire that takes a request-side cache
 /// breakpoint, or `None` for one that does not and keeps the bare string.
 ///
-/// The breakpoint sits at the end of the instructions and nowhere else. That block
-/// — the system prompt, the skill catalogue folded into it, and the tool schemas
-/// the vendor orders ahead of it — is what this crate re-sends identically on every
-/// step of a run and every turn of a session. The transcript deliberately carries
-/// no breakpoint: [`crate::context::assemble`] supersedes, invalidates, re-reads
-/// and re-fits earlier observations on each turn, so it is not a byte-stable prefix
-/// and marking it would be billed as a cache *write* on nearly every turn.
+/// The first of the request's two breakpoints, at the end of the instructions. That
+/// block — the system prompt, the skill catalogue folded into it, and the tool
+/// schemas the vendor orders ahead of it — is what this crate re-sends identically on
+/// every step of a run and every turn of a session.
+///
+/// Through 0.43.0 it was the only one, because [`crate::context::assemble`]
+/// supersedes, invalidates, re-reads and re-fits earlier observations on each turn:
+/// the transcript was not a byte-stable prefix and marking it would have been billed
+/// as a cache *write* on nearly every turn. 0.43.0's compaction froze the part ahead
+/// of the folded summary, and 0.44.0 marks that part in [`cached_user`] — still never
+/// past it, because everything after the summary is rewritten exactly as before.
 fn cached_system(flavor: WebFlavor, system: &str) -> Option<serde_json::Value> {
     match flavor {
         // OpenAI caches a repeated prefix by itself with no request-side control,

@@ -312,7 +312,7 @@ tasks:
   why_required: Two places in the shipped crate currently state that the transcript deliberately carries
     no breakpoint, one of them a doc comment on a function this release edits. Shipping the code without
     them is shipping documentation that contradicts it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.44.0-T05
   acceptance_criteria:
@@ -337,11 +337,37 @@ tasks:
     '
   files:
   - docs/CONTRACT.md
-  - docs/guide/accounting.md
   - docs/guide/providers.md
+  - README.md
   - CHANGELOG.md
   - src/provider/openai_wire.rs
-  evidence: []
+  - Cargo.toml
+  - tests/cache_boundary.rs
+  evidence:
+  - '`docs/CONTRACT.md`: the caching section is now ''(0.38.0, 0.44.0)'', describes BOTH breakpoints,
+    and its table names what each wire sends for each. Three new paragraphs — the transcript is cached
+    only from a compaction boundary, the crate never asks for a prefix it has not sent, and `CacheMarked`''s
+    absence is the signal — plus the image/ordering difference between the two wires.'
+  - THE STALE SENTENCES, all found and corrected. `docs/CONTRACT.md` said 'The transcript is not cached,
+    and that is a design decision'. `docs/guide/providers.md` said 'Only the instructions are marked,
+    never the transcript'. `README.md` said 'Nothing is marked in the transcript, deliberately'. And `src/provider/openai_wire.rs`'s
+    `cached_system` doc comment — on a function this release edits, the easiest to leave behind — said
+    'The transcript deliberately carries no breakpoint'. All four now state what ships, with the 0.38.0
+    reasoning kept in the past tense so the argument is not lost.
+  - '`CHANGELOG.md` deliberately NOT corrected: its 0.38.0 entry says the transcript is unmarked and that
+    is a true statement about what 0.38.0 shipped. A changelog is immutable history, not a claim about
+    today — the rule 0.40.0 recorded.'
+  - '`nothing_shipped_still_denies_the_second_breakpoint` greps the five prose and source files for the
+    four stale phrases and fails on any survivor. `validate` cannot see this and neither can a compiler.'
+  - '0.44.0 changelog entry written with the `*Migration:*` note: construct with `..Default::default()`;
+    only an exhaustive literal outside the crate breaks; and the note says WHY the type is not `#[non_exhaustive]`
+    — the attribute would forbid the very construction the note prescribes.'
+  - Version bumped to 0.44.0 in `Cargo.toml` and the README install snippet to "0.44" (the checker 0.36.1
+    added catches that one).
+  - 'GATES: `docs/public-api.txt` is BYTE-IDENTICAL — `git diff` empty — which is N3''s claim made at
+    plan time rather than discovered at seal. docs_drift 15 passed, readme 7, changelog 9, guide_pages
+    8, public_api 5. The nightly rustdoc gate exits 0 and caught NOTHING this release, which is worth
+    a sentence: it found something in five of the last six.'
 - id: US-IO-HARNESS-0.44.0-T08
   summary: Run the release gates and record their output as evidence.
   why_required: The additive-nothing claims — no dependency, no store change, byte-identical public surface
