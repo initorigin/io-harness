@@ -96,7 +96,7 @@ tasks:
   why_required: OpenRouter is the wire the live measurement is taken on, and `WebFlavor::OpenAi` fronts
     21 `Compatible` endpoints whose bodies must not change at all. Both halves are one change to one shared
     body builder.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.44.0-T01
   acceptance_criteria:
@@ -133,7 +133,28 @@ tasks:
     '
   files:
   - src/provider/openai_wire.rs
-  evidence: []
+  evidence:
+  - '`cached_user(flavor, request)` added beside `cached_system`, the fourth per-vendor difference resolved
+    in the shared body builder after `web_key` (0.22.0), `effort_key` (0.31.0) and `cached_system` (0.38.0).
+    `WebFlavor::OpenAi` returns `None`; `WebFlavor::OpenRouter` splits through the shared `provider::split_at_boundary`.
+    The image part builder was factored out as `image_part` so the marked and unmarked paths cannot render
+    an image two ways.'
+  - '`the_openrouter_body_splits_the_user_turn_at_the_boundary`: two text blocks, marker on the first
+    only, byte-exact reassembly, exactly two `cache_control` in the body.'
+  - '`the_openai_body_ignores_a_boundary_entirely`: for `Some(len)`, `Some(0)` and `Some(usize::MAX)`
+    the user turn stays a bare string, the body holds zero `cache_control`, and the whole body is byte-identical
+    to the unmarked one. This is the control covering OpenAI plus all 21 `Compatible` endpoints.'
+  - '`an_unusable_boundary_leaves_the_openrouter_user_turn_alone`: `Some(0)`, `Some(len)`, `Some(len+1)`,
+    `Some(usize::MAX)` and an offset inside a two-byte `é` all produce the unmarked body.'
+  - '`an_image_still_leaves_a_markable_prefix_because_the_text_comes_first`: three parts — marked prefix,
+    remainder, image — because this wire puts text first. The same request is UNMARKED on Anthropic (T02),
+    and the pair is the criterion: one request, two vendors, two correct answers.'
+  - '`cargo test --lib --features media provider::`: 104 passed / 0 failed. fmt clean, clippy --all-targets
+    --features media -D warnings clean.'
+  - Sabotages. Honouring the boundary on the OpenAi flavour fails `the_openai_body_ignores_a_boundary_entirely`
+    and nothing else. Dropping the images from the marked path fails the media test and nothing else —
+    which matters because a silently discarded image is a request the model answers without seeing what
+    it was asked about.
 - id: US-IO-HARNESS-0.44.0-T04
   summary: Compute the frozen prefix in one helper called from both assembly sites, and mark only when
     the candidate repeated byte-identically.
