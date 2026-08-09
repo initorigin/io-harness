@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.46.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -639,3 +639,191 @@ open_questions:
   verification and no write-permitting policy. Not attempted here: it would make the default depend
   on two other fields, and a default a reader cannot predict from the call site is the problem this
   release is fixing.
+
+released_at: 2026-08-09T14:00:02Z
+mode: published
+delivered: >
+  A run's own commands are confined to the workspace without the caller having asked, and the run
+  that genuinely needs the machine says so in a sentence a reader can find.
+
+  `ExecMode` names three grants — `ReadOnly`, `WorkspaceWrite` and `FullAccess` —
+  `TaskContract::exec_sandbox` carries one instead of an `Option`, and the default is
+  `WorkspaceWrite` with **no resource cap at all**: containment is a claim about where a command
+  may write, and the 0.6.0 ceilings would have been a claim about how long someone else's build
+  may take. `with_full_access()` restores 0.45.0's behaviour exactly, in one call, at the
+  construction site.
+
+  The detected toolchain's own cache directories are writable roots, which is what makes a
+  default-contained `cargo` or `npm` run at all — 0.40.0's recorded limitation, removed. Only
+  roots that exist on this host are granted, because the Linux mount setup fails on a bind it
+  cannot perform and a failed setup degrades the whole backend to the floor. The verification gate
+  takes the same roots. `RunSpec` carries the mode and the roots to whichever backend `select`
+  returned, and the macOS profile and the Linux bind loop are two renderings of one list.
+
+  `EventKind::Contained { mode, backend, roots }` reports once per run — including for a
+  full-access run — and names the backend that actually applied rather than the one requested.
+  0.45.0's boundary section names the mode, so an agent under `ReadOnly` is told it may not write
+  rather than discovering it from a refused command.
+
+  Two compile breaks, both stated with their replacement text: the contract field's type, and
+  `RunSpec` becoming `#[non_exhaustive]` with a constructor — the second bought forward so
+  0.47.0's and 0.48.0's additions to that type cost nothing.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — exit 0, **77 test binaries, 1,517 passed, 0 failed**. Run
+    with `XDG_CONFIG_HOME` redirected to a scratch directory, which is this machine's standing
+    environment fix for `tests/plugin.rs` and unrelated to the release.
+  - >
+    `cargo test --all-features` — exit 0, **77 test binaries, 1,603 passed, 0 failed**, as a
+    separate invocation.
+  - >
+    `cargo test --doc` — **410 passed, 0 failed**, up from 0.45.0's 401, including the worked
+    examples on `ExecMode`, `ExecMode::is_contained`, `SandboxLimits::none`,
+    `SandboxConfig::with_mode`, `RunSpec`, `Toolchain::cache_dirs`,
+    `TaskContract::with_full_access`, `TaskContract::with_exec_mode` and the `[sandbox] mode`
+    trust-rule example on `Config::from_toml`.
+  - >
+    F1 — `the_default_contract_confines_a_write_with_no_builder_call`: a contract that is
+    `TaskContract::workspace(goal, root)` and nothing else refuses a write outside the root, with
+    the arm branching on `select(&config).backend()` so a degraded host asserts the floor's truth
+    rather than skipping. Sabotage: default the mode back to `FullAccess` (fails F1 alone).
+  - >
+    F2 — `the_escape_hatch_is_one_call_and_it_is_complete`: the same tree and command one method
+    call apart; the write lands, no `sandbox_events` row claims containment, and the run still
+    reports `mode: full-access`, `backend: none`. Sabotage: resolve a containment for every mode,
+    so `with_full_access` sets the mode and the command is still wrapped (fails F2 alone).
+  - >
+    F3 — `read_only_refuses_a_write_into_the_workspace_and_permits_the_read`, plus
+    `read_only_does_not_grant_the_workdir` (macOS) and
+    `read_only_does_not_put_the_workdir_in_the_writable_list` (Linux). Sabotage: grant the workdir
+    under `ReadOnly` (fails all three).
+  - >
+    F4 — `a_real_package_manager_completes_under_the_default`: `cargo generate-lockfile --offline`
+    against a scratch `CARGO_HOME`, which must write `$CARGO_HOME/.package-cache` and
+    `.global-cache` and reaches no network. The control arm is the same command against a manifest
+    in a subdirectory, so the workspace root carries no marker, so there is no detection and no
+    cache root — and the cache is not written. Sabotage: return no cache directories for the cargo
+    ecosystem (fails the granted arm alone).
+  - >
+    F6 — `a_writable_root_that_does_not_exist_does_not_degrade_the_backend`: a run whose computed
+    cache root is absent succeeds, still reports this host's native backend, and grants **0**
+    roots. 0.40.0's defect reproduced on purpose. Sabotage: drop the exists-filter (fails F6
+    alone).
+  - >
+    F7 — `every_writable_root_gets_exactly_one_allow_line` (`src/sandbox/macos.rs`) and
+    `the_writable_roots_are_a_counted_list_before_the_payload` (`src/sandbox/linux.rs`), both from
+    the pure builders without spawning anything. Sabotage: render the roots on macOS and drop them
+    from the Linux loop (fails the Linux half alone — which is why the criterion asserts both
+    renderings rather than "the roots are plumbed").
+  - >
+    F8 — `the_verification_gate_gets_the_same_writable_roots`: a gate command writing into the
+    toolchain's cache succeeds. Sabotage: leave the gate on an empty root list (fails F8 alone).
+  - >
+    F9 — `the_containment_report_names_what_actually_applied`: exactly one event per run, with
+    `backend` equal to `select(&SandboxConfig::new()).backend().as_str()` and `roots` equal to the
+    count granted after the exists-filter. Sabotage: report the requested backend rather than the
+    selected one (fails F9 alone).
+  - >
+    F10 — 0.45.0's `the_prompt_is_composed_once_and_does_not_move` unchanged and still passing:
+    `select` is called once per run, so the containment line cannot move between steps and
+    0.38.0's cache breakpoint is not converted into a per-step cache write.
+  - >
+    N5 — **measured**. On this macOS host under `macos-sandbox-exec`, 30 iterations of one trivial
+    command: full-access **5.48 ms** per command, workspace-write **11.73 ms** per command, so
+    wrapping costs **~6.25 ms per command**. Noise against a build that takes seconds; real for a
+    run issuing hundreds of tiny commands, and now a figure rather than a hope.
+  - >
+    N6 — the four preceding releases asserted by their own suites, unchanged: `cache_boundary`,
+    `compaction`, `parallel_reads`, `tool_hooks` all pass in the full run.
+  - >
+    O2 — cross-version, both directions. Forward halves in the ordinary suite; the backward half
+    run as CI runs it (`cargo build` in `tests/fixtures/gen-0.29.0`, then
+    `cargo test --test cross_version_0_29_0 -- --ignored`) — **1 passed**. `ADDED_SINCE_0_22_0`
+    and `COLUMNS_ADDED_SINCE_0_22_0` unchanged, which is itself the assertion.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — exit 0, **after it refused a
+    `std::sync::MutexGuard` held across an await** in the tests that serialise `CARGO_HOME`. A
+    `tokio::sync::Mutex` is the guard that may be held there, and it cannot be poisoned by a test
+    that panicked while holding it.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0,
+    **after it caught one error stable `cargo doc` did not report**: a redundant explicit link
+    target on `[`select`](crate::sandbox::select)` in a file that has the type in scope. The sixth
+    of the last eight releases this gate has found something.
+  - >
+    `cargo package --locked` — exit 0, **1,521,150 bytes**.
+  - >
+    N1 — `cargo tree` is **402** lines, unchanged since 0.34.0. N2 — MSRV unmoved at 1.95.
+  - >
+    N3 — exactly two compile breaks and `docs/public-api.txt` gains **exactly one line**
+    (`enum ExecMode`) and loses none, which is the number stated at plan time. N4 —
+    `git diff main -- src/state.rs` is **empty** and `CHECKPOINT_FORMAT` is unmoved at 7.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record was sealed before the crates.io upload.** `mode: published` states the authorized
+  target; the upload follows the feat→develop and develop→main merges and the GitHub Release, and
+  is the last step of the flow.
+- >
+  **On a host whose backend cannot enforce a mode, the default enforces nothing for the
+  filesystem.** A Windows Job Object has no filesystem facility, and a Linux host that refuses an
+  unprivileged user namespace — a stock Ubuntu 24.04, which is `ubuntu-latest` — takes the
+  portable floor. This is 0.40.0's finding and **0.47.0 is the release that closes it**; the
+  honest cost of shipping the default first is one release in which "contained by default" is true
+  of the API and not of every host. It is reported three ways: `EventKind::Contained`'s `backend`,
+  the per-command `SandboxEvent` rows, and the agent's own prompt.
+- >
+  **A defect the default flip would have shipped, found by an existing test rather than a new
+  one.** A contained spawn is of the backend's *wrapper* (`sandbox-exec`, `unshare`), which
+  exists, so a missing payload came back as the wrapper's own non-zero exit instead of
+  `[exec unavailable]` — and with containment defaulted on, every "no such program on PATH" would
+  have become "your command failed". Fixed at the root by resolving the program against `PATH`
+  before a contained spawn, so the answer is the same contained or not. It deliberately does not
+  decide *executability*: a file that exists and cannot be executed is a real failure with a real
+  message, and reporting it as "not installed" would be worse than the operating system's own
+  answer.
+- >
+  **Four existing tests changed, each with its reason in its own comment.** Three of 0.45.0's
+  prompt tests now ask for `with_full_access()` where they assert the *absence* of a boundary —
+  a contained run has one, and what they assert is that a run enforcing and confining nothing is
+  still told nothing. The fourth, `a_one_shot_run_emits_no_deltas_and_a_session_turn_does`, sees
+  `Contained` beside 0.45.0's `PromptComposed`; an additive variant on an enum
+  `#[non_exhaustive]` since 0.24.0 is what this crate has told observers to expect, and the claim
+  that test is really making is asserted separately and untouched. Changing a test because the
+  behaviour deliberately changed is legitimate; doing it without the sentence is not.
+- >
+  **The read-only fixture cannot be a `tempfile::tempdir()`, and this is the second release to pay
+  for that.** The macOS profile blanket-allows `/private/var/folders`, so a read-only workspace
+  placed there is writable no matter what this release does and the test would have passed on the
+  development host while asserting nothing. 0.40.0 moved the *escape* targets under `target/` for
+  the same reason; F3's workspace moved for it too.
+- >
+  **A sabotage that appears to survive must first be checked for having applied.** One run of the
+  sabotage pass reported the full-access arm as surviving; the patch had been written against
+  pre-`cargo fmt` source, matched nothing, and sabotaged nothing. Re-applied against the formatted
+  text it fails F2 immediately. A harness that does not assert its own patch landed manufactures
+  findings — recorded here because the false finding is cheaper to prevent than to investigate.
+- >
+  **A caller cannot supply a writable root, deliberately.** The roots are derived from the mode,
+  the workspace and the detected toolchain; a program whose agent writes to a configured output
+  directory outside the workspace has only `with_full_access()` today, which is wider than it
+  needs. Adding the knob later is additive; removing a badly-shaped one is not.
+- >
+  **`ReadOnly` does not imply denying egress**, and the toolchain cache roots are not granted
+  under it. The policy remains the one authority on the network, and a read-only run has nothing
+  to build. Both are open questions against 0.48.0, where sandboxed egress becomes per-host.
+- >
+  **The `shell_start` / `shell_poll` / `shell_kill` handles are still not contained**, and per-tool
+  modes are still not a thing. Both are named in 0.48.0 and neither was borrowed forward.
+- >
+  **N5 was measured on one host and one backend.** The ~6.25 ms per command is
+  `macos-sandbox-exec` on the development machine; a Linux namespace and a Windows Job Object have
+  their own costs and this release does not claim them.
+supersedes: 0.45.0
+next_recommended_version: 0.47.0
+immutable: true

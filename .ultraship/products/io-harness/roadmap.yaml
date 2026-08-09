@@ -1125,7 +1125,7 @@ versions:
       own cache directories become writable roots, which is what makes a default-contained build
       survive contact with a real package manager.
     detail: specified
-    status: planned
+    status: released
   - version: 0.47.0
     outcome: >
       Containment holds on every platform the crate claims, including the hosts that refuse the
