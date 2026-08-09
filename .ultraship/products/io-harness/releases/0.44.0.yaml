@@ -75,14 +75,22 @@ outcome:
     where cost grew with length — and the two together mean a run's marginal step gets cheaper rather
     than more expensive as it goes.
 
-    The price: one break, taken deliberately and paid once. `CompletionRequest` gains a field and
-    `#[non_exhaustive]` in the same release — the move `Verification` (0.34.0), `TaskContract`
-    (0.35.0), `AgentDef` (0.36.0), `TurnResult` (0.37.0) and `ProviderErrorKind` (0.43.0) each made.
-    It is worth naming why this type has escaped it for forty-three releases: its own worked example
-    says "never an exhaustive literal — `media` appeared in 0.15.0 and the next field will appear the
-    same way, in a minor" (`src/provider/mod.rs:440`), and every in-tree caller obeys it — but an
-    exhaustive struct literal outside the crate compiles today, so the field is a break whatever the
-    doc advises, and `#[non_exhaustive]` is what makes the *next* request field free.
+    The price: one break, of exactly the kind this type has taken four times before.
+    `CompletionRequest` gains a field, so an exhaustive struct literal outside the crate stops
+    compiling — which is what `media` (0.15.0), `model` (0.21.0), `web` (0.22.0) and `effort`
+    (0.31.0) each cost, and which the type's own worked example has warned about since 0.15.0:
+    "never an exhaustive literal … the next field will appear the same way, in a minor"
+    (`src/provider/mod.rs:440`). `..Default::default()` keeps working, which is the whole point.
+
+    **`#[non_exhaustive]` is deliberately NOT taken, and this was decided against implementation
+    evidence rather than at plan time** — see `US-IO-HARNESS-0.44.0-I01`. The attribute forbids every
+    struct expression outside the defining crate *including the functional-update form*, so marking
+    this type would stop `..Default::default()` compiling for every downstream caller, for all five
+    construction sites in `tests/` and `examples/`, and for the type's own doc example, which is
+    compiled as an external crate. It would not make the next field free; it would make the type
+    unconstructible without a builder this crate does not have. That is 0.43.0's `Compaction`
+    decision applied to a second type: decide by call shape, not by reflex.
+
     Everything else is additive: one variant on an enum that has been `#[non_exhaustive]` since
     0.24.0. No table, no column, no index, no dependency, and `docs/public-api.txt` byte-identical.
 
@@ -132,13 +140,15 @@ outcome:
 scope:
   included:
   - >
-    **`CompletionRequest::cache_boundary: Option<usize>`, and `#[non_exhaustive]` on
-    `CompletionRequest`.** One break, paid once, in the release that needs the field. A byte offset
+    **`CompletionRequest::cache_boundary: Option<usize>`, and no `#[non_exhaustive]`.** The
+    release's one break, and the same one adding a field to this type has always been. A byte offset
     into `user`: the end of the prefix the caller states is byte-stable across requests. `None` — the
     default, and every caller before 0.44.0 — sends the body 0.43.0 sent, byte for byte. It is a
     *request*, not a fact, in exactly the sense `model` (0.21.0), `web` (0.22.0) and `effort`
     (0.31.0) are: a `Provider` outside this crate that ignores it keeps working and is honestly
-    non-caching, which is why it is a field on the request rather than a method on the trait.
+    non-caching, which is why it is a field on the request rather than a method on the trait. The
+    reason the attribute is not taken is recorded at the type in a comment rather than left for a
+    later release to rediscover, which is how 0.43.0 handled the same decision on `Compaction`.
   - >
     **An out-of-range or mid-character offset is ignored, not an error.** Past `user.len()`, or not
     on a UTF-8 character boundary, or zero-length, and the provider sends the single block it sends
@@ -147,16 +157,18 @@ scope:
     is being silently discarded — a boundary is an optimisation, and an optimisation that turns a
     working run into an `Err` is worse than the optimisation is worth.
   - >
-    **The field is `#[serde(default, skip_serializing_if = "Option::is_none")]`, and that is
-    load-bearing rather than tidy.** `CompletionRequest` is `Serialize`/`Deserialize`
-    (`src/provider/mod.rs:450`) and `Replay` keys every lookup on
-    `serde_json::to_string(request)` — the whole request as JSON, deliberately not a hash so a
-    mismatch can be read (`src/provider/replay.rs:68`). A field that serialised as
-    `"cache_boundary": null` would change the key of every request that does not use it and silently
-    stop **every recorded cassette in the repository** from matching. Skipped-when-`None` keeps an
-    unmarked request's key byte-identical to 0.43.0's; a marked request keys differently from an
-    unmarked one for the same prompt, which is correct — the key is the exact request content, and
-    the two requests are not the same request.
+    **The field is `#[serde(default, skip_serializing_if = "Option::is_none")]`, like the three
+    optional fields before it.** `CompletionRequest` is `Serialize`/`Deserialize`
+    (`src/provider/mod.rs:450`) and `Replay` keys every lookup on `serde_json::to_string(request)` —
+    the whole request as JSON, deliberately not a hash so a mismatch can be read
+    (`src/provider/replay.rs:68`), so an unmarked request's key is the string it has always been.
+    **This is a convention, not a compatibility guarantee, and the contract said otherwise until
+    `US-IO-HARNESS-0.44.0-I01`**: a recording made by an earlier release is already refused on load,
+    because `Replay::load` rejects anything from another `major.minor` series
+    (`src/provider/record.rs:99`) for precisely this reason — a request shape a minor may change. No
+    recordings are checked in. What the attribute genuinely buys is that a marked request keys
+    differently from an unmarked one for the same prompt, which is correct: the key is the exact
+    request content, and the two are not the same request.
   - >
     **The boundary is computed by the run loop, as one crate-internal helper called from both
     assembly sites.** The flat workspace loop (`src/run.rs:4337`) and the tree loop
@@ -342,13 +354,14 @@ acceptance:
     that never folds emits none. Sabotage: emit on every marked step, under which the count is four
     and only this fails — 0.34.0's `Routed` defect, reproduced deliberately.
   - >
-    **F9 — an unmarked request keys exactly as it did on 0.43.0, and every recorded cassette still
-    replays.** `replay::key` over a `cache_boundary: None` request is byte-identical to the string
-    0.43.0 produced for it, and the repository's existing recorded exchanges are served by `Replay`
-    unchanged. A marked request keys differently from the same prompt unmarked, and that difference
-    is asserted rather than merely tolerated. Sabotage: drop `skip_serializing_if`, under which
-    `"cache_boundary":null` enters every key and the existing cassettes stop matching — a failure
-    that reaches tests nothing else in this release touches.
+    **F9 — an unmarked request keys as it always has, and a marked one is a different question.**
+    An unmarked request's serialised form carries no `cache_boundary` key at all; a marked one
+    carries it; and a recording made by the unmarked request refuses to answer the marked one. The
+    second half is the load-bearing one — the key is the exact request content, and the two are not
+    the same request. Sabotage: drop `skip_serializing_if`, under which `"cache_boundary":null`
+    enters every key and this test fails while **every other test in the replay suite still passes**,
+    which is the finding that justifies the criterion: one build records and replays through the same
+    serialiser, so nothing else here can see it.
   non_functional:
   - >
     **N1 — no new dependency.** `cargo tree` for the default feature set has the same number of
@@ -358,8 +371,10 @@ acceptance:
     **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
   - >
     **N3 — exactly one public break, and `docs/public-api.txt` is byte-identical.**
-    `CompletionRequest` gains `cache_boundary` **and** `#[non_exhaustive]` together;
-    `EventKind::CacheMarked` sits on an enum `#[non_exhaustive]` since 0.24.0. Neither adds a line
+    `CompletionRequest` gains `cache_boundary` and **no** `#[non_exhaustive]`, so the break is what a
+    new field on this type has always been — an exhaustive literal outside the crate — and
+    `..Default::default()` still compiles, asserted by every out-of-crate construction site building
+    unchanged. `EventKind::CacheMarked` sits on an enum `#[non_exhaustive]` since 0.24.0. Neither adds a line
     the checker can see: it enumerates crate-root re-exports (`tests/docs_drift.rs`), and both
     `CompletionRequest` and `EventKind` are already listed — a field and a variant are members of
     already-listed items. **Byte-identical is the claim, stated at plan time**, because "met in a
@@ -419,12 +434,14 @@ delivery:
     `CHECKPOINT_FORMAT` is unmoved at 7, and a 0.43.0 store and a 0.44.0 store are the same store in
     both directions.
   - >
-    One public break: `CompletionRequest` gains `cache_boundary: Option<usize>` **and**
-    `#[non_exhaustive]`. A consumer constructing it with an exhaustive struct literal adds
-    `..Default::default()`, which the type's own documentation has advised since 0.2.0; a consumer
-    already doing so changes nothing. The changelog carries the `*Migration:*` note saying exactly
-    that, and says why the two are paid in the same release — the type becoming `#[non_exhaustive]`
-    is what makes the next request field free.
+    One public break: `CompletionRequest` gains `cache_boundary: Option<usize>`. A consumer
+    constructing it with an exhaustive struct literal adds `..Default::default()`, which the type's
+    own worked example has advised since 0.15.0; a consumer already doing so — which is every caller
+    in this repository and what the documentation has always told a downstream one to be — changes
+    nothing. The changelog carries the `*Migration:*` note saying exactly that. It is the same break
+    `media` (0.15.0), `model` (0.21.0), `web` (0.22.0) and `effort` (0.31.0) each were, and it is
+    **not** accompanied by `#[non_exhaustive]`: marking the type would forbid the very
+    `..Default::default()` this note tells a consumer to write. See `US-IO-HARNESS-0.44.0-I01`.
   - >
     One behaviour change with no compile consequence: a run that folds now sends a different request
     *shape* to Anthropic and OpenRouter — two content blocks where there was one — with byte-identical
@@ -474,8 +491,10 @@ dependencies:
     getting no cache reads" is answerable without a wire trace. Chosen over relying on the
     accounting rows alone, which show the effect and never the cause.
   - >
-    `CompletionRequest` takes the field **and** `#[non_exhaustive]` in the same release — one break,
-    paid once, the move five previous releases made on five other types.
+    `CompletionRequest` takes the field and **not** `#[non_exhaustive]`, decided during
+    implementation on evidence rather than at plan time (`US-IO-HARNESS-0.44.0-I01`). The attribute
+    would forbid `..Default::default()` outside the crate — this type's documented ergonomic since
+    0.15.0 — so the break stays the one a new field on this type has always been.
   - >
     The PR, both merges, the Release and the publish are pre-authorised for this version under the
     standing flow.
@@ -531,9 +550,11 @@ resource_profile:
   - >
     No new dependency in the default build. MSRV stays 1.95.
   - >
-    Exactly one public break, and it is `CompletionRequest`. `Assembled` (`src/context.rs:517`) is
-    not `#[non_exhaustive]` and `Compaction` is deliberately not (`src/context.rs:379`); neither
-    gains a field, which is what keeps the break count at one.
+    Exactly one public break, and it is `CompletionRequest` gaining a field. `Assembled`
+    (`src/context.rs:517`) is not `#[non_exhaustive]` and `Compaction` is deliberately not
+    (`src/context.rs:379`); neither gains a field, which is what keeps the break count at one. No
+    type in this release becomes `#[non_exhaustive]` — the three named here are all constructed by
+    struct expression outside the crate, and the attribute forbids that.
   - >
     `git diff main -- src/state.rs` is empty. No table, column, index or `CHECKPOINT_FORMAT` change.
   - >

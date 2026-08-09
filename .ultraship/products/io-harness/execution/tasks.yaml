@@ -16,13 +16,14 @@ tasks:
     a clamp to the end, under which one block becomes two and this fails while F1 still passes.
 
     '
-  - '**F9 — an unmarked request keys exactly as it did on 0.43.0, and every recorded cassette still replays.**
-    `replay::key` over a `cache_boundary: None` request is byte-identical to the string 0.43.0 produced
-    for it, and the repository''s existing recorded exchanges are served by `Replay` unchanged. A marked
-    request keys differently from the same prompt unmarked, and that difference is asserted rather than
-    merely tolerated. Sabotage: drop `skip_serializing_if`, under which `"cache_boundary":null` enters
-    every key and the existing cassettes stop matching — a failure that reaches tests nothing else in
-    this release touches.
+  - '**F9 — an unmarked request keys as it always has, and a marked one is a different question.** An
+    unmarked request''s serialised form carries no `cache_boundary` key at all; a marked one carries it;
+    and a recording made by the unmarked request refuses to answer the marked one. The second half is
+    the load-bearing one — the key is the exact request content, and the two are not the same request.
+    Sabotage: drop `skip_serializing_if`, under which `"cache_boundary":null` enters every key and this
+    test fails while **every other test in the replay suite still passes**, which is the finding that
+    justifies the criterion: one build records and replays through the same serialiser, so nothing else
+    here can see it.
 
     '
   files:
@@ -203,12 +204,14 @@ tasks:
   - US-IO-HARNESS-0.44.0-T05
   acceptance_criteria:
   - '**N3 — exactly one public break, and `docs/public-api.txt` is byte-identical.** `CompletionRequest`
-    gains `cache_boundary` **and** `#[non_exhaustive]` together; `EventKind::CacheMarked` sits on an enum
-    `#[non_exhaustive]` since 0.24.0. Neither adds a line the checker can see: it enumerates crate-root
-    re-exports (`tests/docs_drift.rs`), and both `CompletionRequest` and `EventKind` are already listed
-    — a field and a variant are members of already-listed items. **Byte-identical is the claim, stated
-    at plan time**, because "met in a different form" has cost a `known_limitations` line in four of the
-    last six releases (traps 114, the 0.41.0 N3 note, and 0.39.0''s).
+    gains `cache_boundary` and **no** `#[non_exhaustive]`, so the break is what a new field on this type
+    has always been — an exhaustive literal outside the crate — and `..Default::default()` still compiles,
+    asserted by every out-of-crate construction site building unchanged. `EventKind::CacheMarked` sits
+    on an enum `#[non_exhaustive]` since 0.24.0. Neither adds a line the checker can see: it enumerates
+    crate-root re-exports (`tests/docs_drift.rs`), and both `CompletionRequest` and `EventKind` are already
+    listed — a field and a variant are members of already-listed items. **Byte-identical is the claim,
+    stated at plan time**, because "met in a different form" has cost a `known_limitations` line in four
+    of the last six releases (traps 114, the 0.41.0 N3 note, and 0.39.0''s).
 
     '
   - '**O3 — the documentation gates pass**: the nightly rustdoc gate, the two intra-doc link rules, and
