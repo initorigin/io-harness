@@ -211,7 +211,7 @@ tasks:
   why_required: Classification without recovery leaves the run dying exactly as it does today. The bound
     is what stops a pathological request looping, and it is the second caller the fold helper was built
     for.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.43.0-T03
   - US-IO-HARNESS-0.43.0-T04
@@ -233,7 +233,39 @@ tasks:
   files:
   - src/run.rs
   - tests/overflow.rs
-  evidence: []
+  evidence:
+  - 'Both loops now make at most two attempts at a step''s completion: the fold, the assembly, the
+    request and the call are inside a `loop`, and a `ContextOverflow` on the first attempt sets
+    `recovered` and continues. The recovery fold is unconditional — the threshold was guessing at what
+    the vendor has now stated — and bounded at one per step.'
+  - '`complete_with_retry` gained a `may_compact` parameter. Without it the recovery was unreachable:
+    on a non-retryable failure the function records the escalation *and calls `finish`*, so the run was
+    already marked escalated before the loop saw the error. With `may_compact`, an overflow the caller
+    can answer is recorded as a step row and handed back without finishing the run; every other
+    failure, and a second overflow, escalate exactly as on 0.42.0.'
+  - 'The loop''s recovery arm and `may_compact` are guarded by the same condition, `!recovered &&
+    contract.compaction.enabled()`. The first version guarded only the loop, so a caller with folding
+    off got a second attempt on a run `complete_with_retry` had already finished — caught by
+    `with_folding_off_an_overflow_is_terminal_at_once`, which counted two refusals where 0.42.0 makes
+    one.'
+  - 'The summarising call passes `may_compact: false`: a fold cannot be answered by folding. The
+    single-file loop passes `false` too — it has no ledger, so an over-window request there is terminal
+    exactly as it was.'
+  - '`record_memory_recall` moved below the loop in both, so a recovered step writes one recall row
+    rather than two.'
+  - '`cargo test --test overflow` exit 0, 10 passed. F4 uses a provider that refuses any user block
+    over a byte ceiling and serves anything under it, so the request that succeeded is provably smaller
+    than the one refused — a recovery, not a re-send that got lucky — with a negative-control run under
+    the ceiling that never folds. F5''s provider refuses every request whatever its size: exactly two
+    refusals for the step, one fold, then an escalated run.'
+  - '`cargo test --tests --no-fail-fast` — 72 suites green. Four `fleet` failures and one `plan_gate`
+    failure on the way were a stale `target/debug/examples/` binary carrying the pre-rename `summaries`
+    DDL under `CREATE TABLE IF NOT EXISTS`; `cargo build --examples` fixed them, which is the standing
+    trap that `--tests` does not rebuild examples.'
+  - '`cargo clippy --all-features --all-targets` clean. `tests/provider_failures.rs` needed the
+    wildcard arm the `#[non_exhaustive]` break now requires — the same one-line migration a consumer
+    writes — and it panics rather than defaulting, so a kind added later still cannot slip in without a
+    decision about retrying it.'
 - id: US-IO-HARNESS-0.43.0-T06
   summary: Add `Session::transcript`, `Transcript`, `TranscriptTurn` and `Transcript::to_markdown`, built
     from the whole session tree.
