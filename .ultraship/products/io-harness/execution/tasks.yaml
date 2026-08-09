@@ -417,7 +417,7 @@ tasks:
     and the three-platform matrix.'
   why_required: These are the criteria that fail late and cheaply-avoidably. A dependency added without
     noticing or an MSRV drift is found here or on a release run, and the second is far more expensive.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.43.0-T08
   acceptance_criteria:
@@ -437,4 +437,15 @@ tasks:
   files:
   - Cargo.toml
   - Cargo.lock
-  evidence: []
+  evidence:
+  - 'N1 — `cargo tree` on the default feature set is **402** crates, the same number as 0.41.0 and
+    0.42.0. Nothing was added: the summariser needs a `Provider`, which is the crate''s own trait; the
+    transcript needs `std::fmt`; the table needs `rusqlite`, already there.'
+  - 'N2 — `rust-version = "1.95"` in `Cargo.toml` is unmoved, and both feature polarities build and
+    test on it.'
+  - 'O1 — both polarities green locally. All-features: **1,152** passed across 74 suites, plus 395
+    doctests. Default: **1,071** passed across 74 suites, plus 392 doctests. `cargo build
+    --all-features --examples` clean.'
+  - 'The three-platform matrix is CI''s, and is the gate the release PR runs; nothing in this release
+    is process-spawning or path-shaped, so the `media` arm covering `Session::attach` is the only part
+    that is more than routine.'
