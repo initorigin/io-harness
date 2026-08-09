@@ -1,0 +1,63 @@
+product: io-harness
+version: 0.47.0
+timestamp: 2026-08-09T16:47:26Z
+reason: capacity
+repository_state: passing
+completed_acceptance:
+  - >
+    F3 — the chain's order, decided as a pure function over the four probe answers and asserted by a
+    15-row table plus a mode-invariance arm and a returns-only-a-Linux-rung arm. Sabotaged
+    (bubblewrap ahead of Landlock) and the sabotage failed a named test by assertion.
+  - >
+    F8 — the Windows AppContainer grant set, derived from the run's already-resolved writable roots
+    rather than guessed, asserted by four named tests including one that keeps the user's profile
+    directory out of the default.
+  - >
+    N3 — zero compile breaks and `docs/public-api.txt` byte-identical. Confirmed the moment the three
+    `Backend` variants landed: the checker enumerates items, not variants, exactly as stated at plan
+    time.
+  - >
+    N4 — no durable state moves. No table, column, index or `EventKind` variant has been added and
+    none is planned; the new backends travel through `Contained`'s existing `backend` field.
+remaining_acceptance:
+  - >
+    F1 — a contained run confines its writes on a host with the Ubuntu default userns restriction in
+    place. The rung and its assertions are written; the assertion needs a Linux host and the CI leg
+    of T09, which does not exist yet.
+  - >
+    F2 — the Landlock rung refuses `connect`. Written as
+    `egress_is_denied_only_where_the_kernel_can_enforce_it`; needs a Linux host with ABI 4 or later.
+  - >
+    F4, F5, F6, F11 — per-rung enforcement, the `ReadOnly` arms, the no-wrapper argv identity and the
+    seccomp `EPERM`. All written; all need a Linux host.
+  - >
+    F7, F9, F10 — the Windows halves. **The Win32 wiring is not written.** See `next_task`.
+  - >
+    N1, N2, N5, N6, O1, O2, O3, O4 — the standing gates, the per-rung overhead measurement, the CI
+    legs and every documentation surface. Not started.
+active_hypotheses:
+  - >
+    That the standalone `rustc --target <triple> --emit=metadata --test` technique will also
+    type-check the Windows half against `x86_64-pc-windows-msvc`, since `windows-sys` is pure Rust
+    bindings and needs no cross C toolchain. It has already worked for both Linux architectures and
+    is the only local evidence available for a `cfg`-gated body.
+next_task: US-IO-HARNESS-0.47.0-T06
+required_context:
+  - >
+    `src/sandbox/appcontainer.rs` — four things have to change and they are all in this file.
+    `Profile::create` hardcodes `CapabilityCount: 0` (line ~406) and needs the `internetClient`
+    capability when the run's policy permits egress, which is T07. `Spawned::start` spawns running
+    and must spawn `CREATE_SUSPENDED` so the process can be assigned to the Job Object before it
+    executes an instruction — the ordering argument `src/sandbox/windows.rs` already makes for the
+    Job Object path, which has to hold twice here. `Spawned` must expose its process handle for
+    `AssignProcessToJobObject`. It already keeps `pi.hThread`, so the resume needs no ToolHelp
+    snapshot — that detour exists only on the `std::Command` path.
+  - >
+    `src/sandbox/windows.rs` — `WindowsSandbox::run` still goes straight to `job::run`. It must try
+    the container path whenever the mode is not `FullAccess` and fall back to the Job Object alone,
+    reporting `WindowsJobObject`, on any failure in it.
+  - >
+    `src/sandbox/windows.rs::grants` — done, tested, and is the input the wiring consumes.
+  - >
+    `.github/workflows/ci.yml` and `release.yml` — the new Linux leg must go in **both**, and
+    `tests/ci_workflow.rs` must assert it in both. A guard only covers the file it reads.
