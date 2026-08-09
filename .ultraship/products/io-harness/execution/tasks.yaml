@@ -373,7 +373,7 @@ tasks:
   why_required: The additive-nothing claims — no dependency, no store change, byte-identical public surface
     — are only true once measured, and each has been met in a different form in a past release when it
     was assumed instead.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.44.0-T07
   acceptance_criteria:
@@ -401,4 +401,32 @@ tasks:
     '
   files:
   - Cargo.toml
-  evidence: []
+  evidence:
+  - Gates run locally with `CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0` and `XDG_CONFIG_HOME`
+    redirected to a scratch dir — `tests/plugin.rs` otherwise reads this machine's real `~/.config/io/io.toml`,
+    whose `api_key` key the schema rejects, and 11 tests fail for reasons that have nothing to do with
+    the release.
+  - '`cargo fmt --check` exit 0. `cargo clippy --all-targets --all-features -- -D warnings` exit 0.'
+  - '`cargo test` (default features): exit 0, 76 binaries, **1478 passed / 0 failed**.'
+  - '`cargo test --all-features`: exit 0, 76 binaries, **1564 passed / 0 failed**.'
+  - 'N1 — `cargo tree` is **402** lines, unmoved since 0.23.0. No dependency added: splitting a string
+    is `std` and the marker is `serde_json`, already present.'
+  - N4 — `git diff main -- src/state.rs` is **EMPTY**. No table, column, index or reader, and `CHECKPOINT_FORMAT`
+    untouched. The cache columns this release is measured in have existed since 0.18.0 and are read, never
+    written.
+  - 'O2 — cross-version, both baselines. `tests/cross_version.rs` (0.22.0): 5 passed, and note that NONE
+    of its tests is `#[ignore]`, so `-- --ignored` filters all five out — they run in the ordinary suite
+    and did. `tests/cross_version_0_29_0.rs`: 2 in the ordinary run plus the `#[ignore]` one, which was
+    run with `-- --ignored` against a freshly built `tests/fixtures/gen-0.29.0` and passed. `ADDED_SINCE_0_22_0`
+    and `COLUMNS_ADDED_SINCE_0_22_0` are UNCHANGED, which is itself the assertion.'
+  - O3 — the nightly rustdoc gate (`RUSTDOCFLAGS='--cfg docsrs -D warnings -D rustdoc::broken_intra_doc_links
+    -D rustdoc::redundant_explicit_links' cargo +nightly doc --all-features --no-deps`) exits 0 and caught
+    NOTHING. Worth a sentence because it caught something in five of the last six releases; a gate going
+    quiet is a fact, not a non-event.
+  - N3 — `docs/public-api.txt` byte-identical, `git diff` empty. Claimed at plan time, not discovered
+    at seal.
+  - '`cargo package --locked` exit 0; packaged crate **1,478,864 bytes** (0.43.0 was 1,458,100). The verify
+    step compiled the packaged crate cleanly.'
+  - O1 — the three-platform matrix is CI's, not this machine's. Nothing in this release is process-spawning
+    or path-shaped, so the local run is the routine bar and the matrix is the gate; the `media` arm is
+    what covers F6's two-wire assertion.
