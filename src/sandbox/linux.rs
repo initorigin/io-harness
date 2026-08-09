@@ -775,7 +775,7 @@ mod tests {
                 &dir,
                 ExecMode::WorkspaceWrite,
                 true,
-                &[cache.clone()],
+                std::slice::from_ref(&cache),
             )
             .await;
             let Some(out) = out else { return };
@@ -1112,16 +1112,34 @@ mod tests {
         );
     }
 
+    /// Never name an isolation that was not applied.
+    ///
+    /// Up to 0.46.0 there were two possible answers and this pinned them against
+    /// `unshare_works()` directly. 0.47.0 made it a chain, so the assertion is
+    /// now the *property* rather than the enumeration: whatever rung is reported,
+    /// this host must actually be able to deliver it. `backend()` answers for a
+    /// run that denies egress, which is why the Landlock arm requires the
+    /// network ABI and not merely the presence of Landlock.
     #[test]
     fn the_reported_backend_is_the_one_the_host_can_actually_run() {
-        // Never name an isolation that was not applied: `LinuxNamespaces` only
-        // when the wrapper works, the floor otherwise.
-        let expected = if unshare_works() {
-            Backend::LinuxNamespaces
-        } else {
-            Backend::PortableFloor
-        };
-        assert_eq!(LinuxSandbox.backend(), expected);
+        let p = probes();
+        match LinuxSandbox.backend() {
+            Backend::LinuxLandlock => assert!(
+                p.landlock_abi.is_some_and(|abi| abi >= LANDLOCK_NET_ABI),
+                "reported Landlock for an egress-denying run on a host that \
+                 cannot deny egress with it: {p:?}"
+            ),
+            Backend::LinuxBubblewrap => assert!(p.bubblewrap, "reported a bwrap this host lacks"),
+            Backend::LinuxNamespaces => assert!(
+                p.unshare && !p.bubblewrap,
+                "reported namespaces where a stronger rung was available or none works: {p:?}"
+            ),
+            Backend::PortableFloor => assert!(
+                !p.unshare && !p.bubblewrap,
+                "reported the floor while a rung above it works: {p:?}"
+            ),
+            other => panic!("the Linux chain reported {other:?}"),
+        }
     }
 
     // The degrade path itself, which runs on any host without a working
