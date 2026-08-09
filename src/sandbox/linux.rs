@@ -333,7 +333,7 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
         // `landlock_restrict_self`, both async-signal-safe. `fd` is owned by
         // `ruleset`, which outlives the spawn below.
         unsafe {
-            cmd.pre_exec(move || unsafe {
+            cmd.pre_exec(move || {
                 // Order is not arbitrary: `restrict_self` sets
                 // `PR_SET_NO_NEW_PRIVS`, which installing a seccomp filter also
                 // requires, so the rule set goes on first and the deny-list
@@ -644,6 +644,51 @@ mod tests {
         use super::*;
         use crate::sandbox::SandboxLimits;
 
+        /// A scratch directory that is **not** under the system temporary
+        /// directory, plus its cleanup.
+        ///
+        /// This exists because of a defect the matrix found and the development
+        /// host could not. Every rung grants the system temporary directory
+        /// writable — the mount setup binds `${TMPDIR:-/tmp}`, the macOS profile
+        /// allows `/private/var/folders`, and this rung grants it too — and
+        /// `tempfile::tempdir()` creates its directories *inside* it. So a test
+        /// whose workspace and whose "outside" target were both `tempdir()`s was
+        /// asserting about two paths that had **both** been granted, and it
+        /// failed on the one arm that mattered: a write outside the roots landed,
+        /// because the roots included the whole of `/tmp`.
+        ///
+        /// The consequence is not confined to tests, and it is stated in
+        /// `docs/CONTRACT.md` rather than left here: **a workspace located inside
+        /// the system temporary directory is not confined on any unix backend**,
+        /// because the temporary directory is writable by design. That is the
+        /// price of a default under which a toolchain can open a temporary file
+        /// at all.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Self {
+                // Under the crate's own `target/`, which is inside the checkout
+                // and therefore outside `/tmp` on every host the matrix runs.
+                let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("landlock-scratch")
+                    .join(format!("{}-{}", tag, std::process::id()));
+                std::fs::create_dir_all(&root).expect("create the scratch root");
+                Scratch(root)
+            }
+            fn dir(&self, name: &str) -> PathBuf {
+                let p = self.0.join(name);
+                std::fs::create_dir_all(&p).expect("create a scratch directory");
+                p
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
         /// Run `argv` under the Landlock rung specifically, or `None` when this
         /// host has no Landlock to pin.
         async fn pinned(
@@ -680,13 +725,17 @@ mod tests {
         /// would pass the second alone.
         #[tokio::test]
         async fn the_rung_confines_writes_to_what_it_granted() {
-            let dir = tempfile::tempdir().unwrap();
-            let outside = tempfile::tempdir().unwrap();
-            let target = outside.path().join("escaped");
+            let scratch = Scratch::new("confines");
+            let dir = scratch.dir("ws");
+            // Deliberately NOT a `tempfile::tempdir()`: that would sit inside the
+            // system temporary directory, which every rung grants, and the
+            // assertion below would be about a path that had been granted.
+            let outside = scratch.dir("outside");
+            let target = outside.join("escaped");
 
             let inside = pinned(
                 &sh("echo in > ./inside"),
-                dir.path(),
+                &dir,
                 ExecMode::WorkspaceWrite,
                 true,
                 &[],
@@ -694,11 +743,11 @@ mod tests {
             .await;
             let Some(inside) = inside else { return };
             assert!(inside.success(), "a granted write must land: {inside:?}");
-            assert!(dir.path().join("inside").exists());
+            assert!(dir.join("inside").exists());
 
             let out = pinned(
                 &sh(&format!("echo out > {}", target.display())),
-                dir.path(),
+                &dir,
                 ExecMode::WorkspaceWrite,
                 true,
                 &[],
@@ -716,16 +765,17 @@ mod tests {
         /// makes a real toolchain able to run at all under this rung.
         #[tokio::test]
         async fn a_resolved_writable_root_is_granted() {
-            let dir = tempfile::tempdir().unwrap();
-            let cache = tempfile::tempdir().unwrap();
-            let target = cache.path().join("artifact");
+            let scratch = Scratch::new("root");
+            let dir = scratch.dir("ws");
+            let cache = scratch.dir("cache");
+            let target = cache.join("artifact");
 
             let out = pinned(
                 &sh(&format!("echo x > {}", target.display())),
-                dir.path(),
+                &dir,
                 ExecMode::WorkspaceWrite,
                 true,
-                &[cache.path().to_path_buf()],
+                &[cache.clone()],
             )
             .await;
             let Some(out) = out else { return };
@@ -741,26 +791,23 @@ mod tests {
         /// so both halves are asserted against the same file.
         #[tokio::test]
         async fn read_only_refuses_the_workspace_and_still_reads_it() {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("seed"), "hello").unwrap();
+            // Outside the system temporary directory, or the workspace would be
+            // writable through the temp grant whatever the mode says.
+            let scratch = Scratch::new("readonly");
+            let dir = scratch.dir("ws");
+            std::fs::write(dir.join("seed"), "hello").unwrap();
 
-            let read = pinned(&sh("cat ./seed"), dir.path(), ExecMode::ReadOnly, true, &[]).await;
+            let read = pinned(&sh("cat ./seed"), &dir, ExecMode::ReadOnly, true, &[]).await;
             let Some(read) = read else { return };
             assert!(read.success(), "a read-only run must still read: {read:?}");
             assert!(read.stdout.contains("hello"));
 
-            let write = pinned(
-                &sh("echo no > ./seed"),
-                dir.path(),
-                ExecMode::ReadOnly,
-                true,
-                &[],
-            )
-            .await
-            .unwrap();
+            let write = pinned(&sh("echo no > ./seed"), &dir, ExecMode::ReadOnly, true, &[])
+                .await
+                .unwrap();
             assert!(!write.success(), "read-only must refuse the workspace");
             assert_eq!(
-                std::fs::read_to_string(dir.path().join("seed")).unwrap(),
+                std::fs::read_to_string(dir.join("seed")).unwrap(),
                 "hello",
                 "and must not have changed it"
             );
@@ -769,7 +816,7 @@ mod tests {
             // that cannot open a temporary file cannot run at all.
             let tmp = pinned(
                 &sh("echo t > \"${TMPDIR:-/tmp}/io-harness-ro-probe\""),
-                dir.path(),
+                &dir,
                 ExecMode::ReadOnly,
                 true,
                 &[],
@@ -786,18 +833,12 @@ mod tests {
         /// the argv asked for, and `current_dir` means what it says.
         #[tokio::test]
         async fn the_rung_spawns_the_callers_own_argv_and_honours_the_workdir() {
-            let dir = tempfile::tempdir().unwrap();
-            std::fs::create_dir(dir.path().join("sub")).unwrap();
+            let scratch = Scratch::new("argv");
+            let dir = scratch.dir("ws");
+            let sub = scratch.dir("ws/sub");
 
             let argv = sh("pwd");
-            let out = pinned(
-                &argv,
-                &dir.path().join("sub"),
-                ExecMode::WorkspaceWrite,
-                true,
-                &[dir.path().to_path_buf()],
-            )
-            .await;
+            let out = pinned(&argv, &sub, ExecMode::WorkspaceWrite, true, &[dir.clone()]).await;
             let Some(out) = out else { return };
             assert_eq!(
                 out.argv, argv,
@@ -831,7 +872,8 @@ mod tests {
             };
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
-            let dir = tempfile::tempdir().unwrap();
+            let scratch = Scratch::new("egress");
+            let dir = scratch.dir("ws");
             // `/dev/tcp` is a bash builtin; the probe uses it because it needs no
             // network tool to be installed on the runner.
             let dial = vec![
@@ -849,7 +891,7 @@ mod tests {
                 return;
             }
 
-            let allowed = pinned(&dial, dir.path(), ExecMode::WorkspaceWrite, true, &[])
+            let allowed = pinned(&dial, &dir, ExecMode::WorkspaceWrite, true, &[])
                 .await
                 .unwrap();
             assert!(
@@ -857,7 +899,7 @@ mod tests {
                 "a run permitting egress must still connect: {allowed:?}"
             );
 
-            let denied = pinned(&dial, dir.path(), ExecMode::WorkspaceWrite, false, &[])
+            let denied = pinned(&dial, &dir, ExecMode::WorkspaceWrite, false, &[])
                 .await
                 .unwrap();
             assert!(

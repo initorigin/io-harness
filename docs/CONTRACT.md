@@ -142,6 +142,19 @@ for:
 | `linux-namespaces` | unprivileged user namespaces | Yes | Yes |
 | `portable-floor` | nothing | No | No |
 
+**A workspace inside the system temporary directory is not confined**, on any
+unix backend and now on Windows too. Every one of them grants the system
+temporary directory writable — the mount setup binds `${TMPDIR:-/tmp}`, the macOS
+profile allows `/private/var/folders`, the Landlock rung grants it and the
+AppContainer is granted it — because a toolchain that cannot open a temporary
+file cannot run at all. A workspace *located* under that directory therefore sits
+inside a writable grant, and `ExecMode::ReadOnly` does not make it read-only.
+This was found by the CI matrix in 0.47.0, on a test whose own workspace and
+whose "outside" target were both `tempfile::tempdir()`s and so had both been
+granted. It is a property of the design, not a defect in one rung: put a
+workspace somewhere other than the temporary directory if the mode is meant to
+bind.
+
 **A run that denies egress is never given a rung that cannot deny egress.** That
 is the one rule that can send a host below its strongest available primitive: a
 kernel whose Landlock predates the network rules falls through to a rung with a

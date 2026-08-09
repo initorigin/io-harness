@@ -64,10 +64,13 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
-// The BPF opcodes this filter uses, from `linux/bpf_common.h`. Four of them.
-const LD_W_ABS: u16 = 0x00 | 0x00 | 0x20; // BPF_LD | BPF_W | BPF_ABS
-const JMP_JEQ_K: u16 = 0x05 | 0x10 | 0x00; // BPF_JMP | BPF_JEQ | BPF_K
-const RET_K: u16 = 0x06; // BPF_RET | BPF_K
+// The BPF opcodes this filter uses, from `linux/bpf_common.h`. Written as their
+// composed values with the derivation beside them, rather than as an `|` chain:
+// two of the three classes are zero, and an expression like `0x00 | 0x00 | 0x20`
+// is `identity_op` and `eq_op` to clippy however well it documents itself.
+const LD_W_ABS: u16 = 0x20; // BPF_LD (0x00) | BPF_W (0x00) | BPF_ABS (0x20)
+const JMP_JEQ_K: u16 = 0x15; // BPF_JMP (0x05) | BPF_JEQ (0x10) | BPF_K (0x00)
+const RET_K: u16 = 0x06; // BPF_RET (0x06) | BPF_K (0x00)
 
 /// Byte offsets into `struct seccomp_data`.
 const OFF_NR: u32 = 0;
@@ -198,6 +201,20 @@ fn program() -> Vec<SockFilter> {
 /// Must be called in a forked child before `exec`.
 #[allow(unreachable_code, unused_variables)]
 pub(crate) unsafe fn install() -> io::Result<()> {
+    if !AVAILABLE {
+        // Never claim a filter that was not installed. The rung is still the
+        // Landlock rule set, which is the boundary; this layer is hardening, and
+        // an architecture without a table gets the boundary and not the
+        // hardening. Said once per process rather than per command.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                "sandbox: no seccomp syscall table for this architecture, so the Landlock \
+                 rung is applied WITHOUT the deny-list; the filesystem boundary is unaffected"
+            )
+        });
+        return Ok(());
+    }
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
     {
         let prog = program();
