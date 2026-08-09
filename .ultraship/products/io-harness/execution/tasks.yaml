@@ -314,7 +314,7 @@ tasks:
     in `drive`, and clear the staging whatever the outcome.'
   why_required: The one path an operator would hand a screenshot to is the only one that cannot take it.
     One staging method covers all six turn shapes without a signature change or a seventh entry point.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F9 — an image reaches the wire through a conversational turn.** `Session::attach` then `Session::turn`,
@@ -334,7 +334,22 @@ tasks:
   files:
   - src/session.rs
   - tests/session_media.rs
-  evidence: []
+  evidence:
+  - '`Session::attach<I: IntoIterator<Item = Media>>(&mut self) -> &mut Self` added under
+    `#[cfg(feature = "media")]`, staging into a `staged` field on `Session` that carries the same
+    gate. `drive` clones the contract, extends its `images` with `std::mem::take(&mut self.staged)`
+    and runs that — so the staging is cleared however the turn ends, and a `turn_bounded` caller''s own
+    `with_images` are kept beside the staged one rather than replaced.'
+  - 'One method covers all six turn shapes. Staging is orthogonal to how a turn is driven, and an
+    images-carrying variant of each would owe a seventh the next time a turn shape is added.'
+  - '`cargo check` on the default feature set is clean: the field, the append and the clear all carry
+    the same `cfg`, so a build without `media` is byte-identical to 0.42.0''s.'
+  - '`cargo test --features media --test session_media` exit 0, 4 passed. Every assertion is against
+    the `CompletionRequest` the provider received, not the contract that was built: the image reaches
+    the wire through `turn` and through `turn_observed`, the *next* turn carries none without a second
+    `attach`, a bounded turn whose contract has its own image sends two, and a provider whose
+    `accepts_images` is false refuses with zero completions recorded — the refusal is 0.42.0''s,
+    reached through a new door.'
 - id: US-IO-HARNESS-0.43.0-T08
   summary: 'Documentation: the four `docs/CONTRACT.md` guarantees, the guide pages, the `CHANGELOG.md`
     entry with its `*Migration:*` note, `docs/public-api.txt` by hand, and a worked doctest on every new
