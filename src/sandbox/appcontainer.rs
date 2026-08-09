@@ -15,12 +15,15 @@
 //!   module is `cfg(windows)`, docs.rs renders on Linux, and an intra-doc link
 //!   into code that does not exist on the rendering host is a broken link on the
 //!   only page a reader actually sees.
-//! - **Network** — the capability array is **empty**. `internetClient` is the
-//!   capability that buys a socket to the outside, and it is not requested, so
-//!   there is no route off the machine. This is the absence of a permission
-//!   rather than the presence of a filter, which is the same shape as an empty
-//!   network namespace on Linux and is why it is worth preferring over a
-//!   filesystem-ACL scheme with a separate network story bolted beside it.
+//! - **Network** — the capability array carries `internetClient` when the run's
+//!   policy permits egress and is **empty** when it does not. Empty is the
+//!   denial: `internetClient` is the capability that buys a socket to the
+//!   outside, so without it there is no route off the machine. This is the
+//!   absence of a permission rather than the presence of a filter, which is the
+//!   same shape as an empty network namespace on Linux and as a Landlock rule
+//!   set that handles `CONNECT_TCP` and permits no port, and is why it is worth
+//!   preferring over a filesystem-ACL scheme with a separate network story
+//!   bolted beside it.
 //!
 //! ## Why this module owns its own spawn
 //!
@@ -56,14 +59,11 @@
 //! empty, which is stated here because it is a real difference from the other
 //! backends rather than an accident.
 
-// Exercised by this module's own tests and by nothing else yet. The smoke test
-// exists to answer whether an AppContainer can be created and entered on the CI
-// runner at all; wiring the backend into `Sandbox` and `select` is the work that
-// answer gates, so until it lands these items are legitimately dead in a
-// non-test build. The allowance comes off with the wiring.
+// The wiring landed in 0.47.0, so the `allow(dead_code)` this module carried
+// since 0.26.0 has come off: `Profile`, `grant` and `Spawned` are now reached by
+// `super::windows`, which selects this backend rather than only testing it.
 #[cfg(windows)]
-#[allow(dead_code)]
-mod win {
+pub(crate) mod win {
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
@@ -82,14 +82,17 @@ mod win {
         CreateAppContainerProfile, DeleteAppContainerProfile,
         DeriveAppContainerSidFromAppContainerName,
     };
-    use windows_sys::Win32::Security::{FreeSid, ACL, DACL_SECURITY_INFORMATION, PSID};
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, FreeSid, WinCapabilityInternetClientSid, ACL,
+        DACL_SECURITY_INFORMATION, PSID, SID_AND_ATTRIBUTES,
+    };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-        STARTUPINFOW,
+        InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
+        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW,
     };
 
     /// A NUL-terminated UTF-16 string, kept alive by the caller.
@@ -122,6 +125,24 @@ mod win {
         }
     }
 
+    /// Apply one entry of the grant set `super::super::windows::grants` derived.
+    ///
+    /// The bridge exists so the *decision* and the *ACE mask* stay separate
+    /// types: the decision is portable data asserted on the build host, and this
+    /// is the one place it becomes Win32. A single `match` rather than making the
+    /// portable half depend on a `cfg(windows)` enum.
+    pub(crate) fn grant_for(
+        path: &Path,
+        sid: PSID,
+        g: crate::sandbox::windows::Grant,
+    ) -> io::Result<()> {
+        let access = match g {
+            crate::sandbox::windows::Grant::ReadExecute => Access::ReadExecute,
+            crate::sandbox::windows::Grant::Full => Access::Full,
+        };
+        grant(path, sid, access)
+    }
+
     /// An AppContainer profile, and the SID it is addressed by.
     ///
     /// The profile is a registry-backed, named object with a lifetime longer than
@@ -147,15 +168,64 @@ mod win {
     impl Profile {
         /// Create (or adopt) the profile called `name`.
         ///
-        /// **The capability array is empty and that is the network boundary.** No
-        /// `internetClient`, no `internetClientServer`, no
-        /// `privateNetworkClientServer` — a payload in this container has no
-        /// capability that grants it a socket to anywhere, so the denial is the
-        /// token's own and not a rule something has to keep enforcing.
-        pub(crate) fn create(name: &str) -> io::Result<Self> {
+        /// **The capability array is the network boundary, in both directions.**
+        ///
+        /// Empty is the denial: no `internetClient`, no `internetClientServer`,
+        /// no `privateNetworkClientServer`, so a payload in this container holds
+        /// no capability that grants it a socket to anywhere and the refusal is
+        /// the token's own rather than a rule something has to keep enforcing.
+        /// That is the same shape as an empty network namespace on Linux and as
+        /// a Landlock rule set that handles `CONNECT_TCP` and permits no port.
+        ///
+        /// A run whose policy *permits* egress is the other direction, and it is
+        /// why this takes an argument at all (0.47.0). Before it, selecting this
+        /// backend would have silently broken every network-permitting run,
+        /// which is a good reason not to select a backend and a bad reason to
+        /// leave one unwired. Exactly `internetClient` is requested — the
+        /// outbound capability — and never the server or private-network ones:
+        /// the crate's own authority on the network is the run's `Policy`, and
+        /// nothing here widens what that already decided.
+        pub(crate) fn create(name: &str, allow_network: bool) -> io::Result<Self> {
             let name = wide(name);
             let display = wide("io-harness sandbox");
             let mut sid: PSID = std::ptr::null_mut();
+
+            // The capability SID buffer, built before the create call and kept
+            // alive across it. `SECURITY_MAX_SID_SIZE` is 68; a fixed buffer
+            // avoids an allocation whose lifetime would be one more thing to get
+            // right.
+            let mut cap_sid = [0u8; 68];
+            let mut caps: [SID_AND_ATTRIBUTES; 1] = unsafe { std::mem::zeroed() };
+            let cap_count = if allow_network {
+                let mut len = cap_sid.len() as u32;
+                // SAFETY: `cap_sid` is a live buffer of at least
+                // `SECURITY_MAX_SID_SIZE` bytes and `len` is its true length as a
+                // live in/out parameter. A null domain SID is what a
+                // capability SID takes.
+                if unsafe {
+                    CreateWellKnownSid(
+                        WinCapabilityInternetClientSid,
+                        std::ptr::null_mut(),
+                        cap_sid.as_mut_ptr().cast::<core::ffi::c_void>(),
+                        &mut len,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                caps[0].Sid = cap_sid.as_mut_ptr().cast::<core::ffi::c_void>();
+                // `SE_GROUP_ENABLED`. The attribute that makes the capability
+                // present rather than merely listed.
+                caps[0].Attributes = 0x0000_0004;
+                1u32
+            } else {
+                0
+            };
+            let cap_ptr = if cap_count == 0 {
+                std::ptr::null_mut()
+            } else {
+                caps.as_mut_ptr()
+            };
 
             // SAFETY: `name` and `display` are live NUL-terminated UTF-16 buffers
             // owned by this frame and outliving the call. The capability array is
@@ -166,8 +236,8 @@ mod win {
                     name.as_ptr(),
                     display.as_ptr(),
                     display.as_ptr(),
-                    std::ptr::null(),
-                    0,
+                    cap_ptr,
+                    cap_count,
                     &mut sid,
                 )
             };
@@ -457,7 +527,15 @@ mod win {
                     std::ptr::null(),
                     std::ptr::null(),
                     1,
-                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    // `CREATE_SUSPENDED` since 0.47.0, and it is the same
+                    // correctness argument `super::super::windows` makes for the
+                    // Job Object — now holding twice, because this process has
+                    // to join the job *as well as* the container. A process that
+                    // runs even briefly outside the job can spawn a descendant
+                    // that is never a member, which then outlives the run and
+                    // ignores every limit, and nothing reports a failure. The
+                    // caller assigns and then calls `resume`.
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                     std::ptr::null(),
                     wcwd.as_ptr(),
                     std::ptr::from_mut(&mut si).cast::<STARTUPINFOW>(),
@@ -473,6 +551,35 @@ mod win {
                 thread: pi.hThread,
                 reaped: false,
             })
+        }
+
+        /// The process handle, for the caller that has to assign this process to
+        /// a Job Object before it runs.
+        ///
+        /// Borrowed, never owned: `Spawned` closes both handles in `Drop` and
+        /// stays the only owner. A caller that closed this would leave `Drop`
+        /// closing a handle it does not have.
+        pub(crate) fn process(&self) -> HANDLE {
+            self.process
+        }
+
+        /// Let the initial thread run.
+        ///
+        /// Called after the process has been assigned to its job, which is the
+        /// only ordering under which there is no instant where the process is
+        /// both running and unassigned.
+        ///
+        /// Unlike `super::super::windows::job`, this needs no ToolHelp thread
+        /// snapshot: `CreateProcessW` handed back the initial thread's handle and
+        /// this type kept it. That detour exists only on the `std::Command` path,
+        /// which closes the thread handle before returning a `Child`.
+        pub(crate) fn resume(&self) -> io::Result<()> {
+            // SAFETY: `self.thread` is this type's own still-open handle to the
+            // initial thread of a suspended process.
+            if unsafe { ResumeThread(self.thread) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         /// Wait up to `ms` for the process, killing it if the ceiling is reached.

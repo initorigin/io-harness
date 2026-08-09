@@ -323,17 +323,40 @@ tasks:
     the small fixed read-execute set (the program''s directory and the system root) is fixed. The user''s
     profile directory is deliberately excluded and there is a test that makes a future convenience addition
     argue with an assertion — that is where credentials live.'
-  - '**NOT DONE**: the Win32 wiring itself. `appcontainer::Profile::create` still hardcodes an empty capability
-    array, `Spawned::start` spawns running rather than `CREATE_SUSPENDED`, the process handle is not exposed
-    for `AssignProcessToJobObject`, and `WindowsSandbox::run` still goes straight to `job::run`. Until
-    those four land, `select` on Windows still returns the Job Object and the platform table''s Windows
-    row is unchanged.'
+  - The Win32 wiring landed. `WindowsSandbox::run` tries `job::run_contained` whenever the mode is not
+    `FullAccess` and falls back to `job::run` — the Job Object alone, reporting `WindowsJobObject` — on
+    any failure in the container path. A degradation, never a break.
+  - '`Spawned::start` now spawns `CREATE_SUSPENDED`, `Spawned::process()` exposes the handle for `Job::adopt_raw`,
+    and `Spawned::resume()` lets the initial thread run only after the process is in the job. **The ordering
+    argument now holds twice** — container and job — and needs no ToolHelp snapshot here, because `CreateProcessW`
+    handed back the thread handle and this type kept it. That detour exists only on the `std::Command`
+    path.'
+  - '`backend()` reports `WindowsAppContainer` when a profile can actually be created (attempted, once
+    per process, not inferred) and `WindowsJobObject` otherwise. A `FullAccess` run never consults `select`
+    at all — 0.46.0''s F2 — so every run that reaches this backend is a contained one and the container
+    answer is true of all of them. That is what makes the report honest without the method needing a run
+    to read.'
+  - '`command_line` was added and asserted on the build host, because the container path passes a command
+    *line* and not a vector. **The first version of its test was wrong and the assertion caught it**:
+    an argument with no space and no quote must be passed through untouched, and a trailing backslash
+    is only dangerous inside quotes — quoting `c:\dir\` would have been the bug. The real case, a quoted
+    argument ending in a separator, is asserted with a following argument so a swallowed one would fail.'
+  - '**The Win32 body was type-checked against `x86_64-pc-windows-msvc` without a matrix round**, using
+    the same standalone `rustc --emit=metadata` technique the Linux half used: `windows-sys` built alone
+    for the target (the link step fails for want of an MSVC linker, but the `.rmeta` is what is needed),
+    and the module compiled against it with `Grant` shimmed. Exit 0 — covering the capability array, `CreateWellKnownSid`,
+    `SID_AND_ATTRIBUTES`, `CREATE_SUSPENDED`, `ResumeThread` and `grant_for`.'
+  - 'The `#[allow(dead_code)]` this module carried since 0.26.0 has come off: the items are reached by
+    a backend that selects them rather than only by tests.'
+  - '**Not yet proven**: F7 and F10''s live arms — a refused read, the job''s cap still firing on a contained
+    run, and the degradation path — all need the Windows runner. `run_contained` itself is not covered
+    by the standalone check, since it depends on the crate''s own runner types.'
 - id: US-IO-HARNESS-0.47.0-T07
   summary: Map the run's egress answer onto the container's capability array.
   why_required: An empty capability array denies the network, which is the release's Windows egress boundary,
     but it also breaks every run whose policy permits egress. Without the mapping the backend would be
     selected and immediately have to be turned off.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.47.0-T06
   acceptance_criteria:
@@ -349,7 +372,18 @@ tasks:
   - src/sandbox/appcontainer.rs
   - src/sandbox/windows.rs
   - tests/net.rs
-  evidence: []
+  evidence:
+  - '`Profile::create` takes `allow_network` and requests exactly `internetClient` when the run''s policy
+    permits egress, and an empty capability array when it does not. Empty is the denial — without that
+    capability there is no route off the machine — which is the same shape as an empty network namespace
+    and as a Landlock rule set that handles `CONNECT_TCP` and permits no port.'
+  - 'Never `internetClientServer` and never `privateNetworkClientServer`: the crate''s authority on the
+    network is the run''s `Policy`, and nothing here widens what that already decided.'
+  - Without this, selecting the backend would have silently broken every network-permitting run — which
+    is a good reason not to select a backend and a bad reason to leave one unwired. The capability SID
+    is built into a fixed `SECURITY_MAX_SID_SIZE` buffer that outlives the create call.
+  - 'Type-checked for `x86_64-pc-windows-msvc` as part of the T06 standalone check. **Not yet proven**:
+    F9''s two live arms need the Windows runner.'
 - id: US-IO-HARNESS-0.47.0-T08
   summary: Make every degradation complete the run and report the backend that was actually applied.
   why_required: A rung that names an isolation it did not apply is the defect this crate shipped in 0.40.0

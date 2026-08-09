@@ -94,6 +94,20 @@ impl Sandbox for WindowsSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
         #[cfg(windows)]
         {
+            // The container first, unless the run asked for the machine. A
+            // `FullAccess` run is asking for the host's own privileges, and
+            // wrapping it in a default-deny token would be answering a different
+            // question than the one the caller asked.
+            //
+            // `None` is the container path declining — a profile that cannot be
+            // created, a grant that cannot be applied — and the answer to that is
+            // the Job Object alone, reporting `WindowsJobObject`, which is
+            // exactly 0.46.0's behaviour. A degradation, never a break.
+            if spec.mode != ExecMode::FullAccess {
+                if let Some(outcome) = job::run_contained(&spec).await {
+                    return outcome;
+                }
+            }
             job::run(spec).await
         }
         // The type is compiled everywhere so its limit mapping can be unit-tested
@@ -106,10 +120,27 @@ impl Sandbox for WindowsSandbox {
         }
     }
 
+    /// What a run reaching this backend gets: the container when this host can
+    /// build one, the Job Object alone when it cannot.
+    ///
+    /// **This method has no run to read, and it does not need one.** The only
+    /// run-dependent input is the mode, and a `FullAccess` run never consults
+    /// `select` at all — 0.46.0 made that its F2, and it is why the mode check
+    /// in [`run`](Sandbox::run) is defence in depth rather than the deciding
+    /// branch. So every run that actually reaches here is a contained one, and
+    /// the container answer is true of all of them.
+    ///
+    /// The probe behind it *attempts* the thing, as every probe in this crate
+    /// does since 0.40.0: it creates a profile and deletes it. A host where that
+    /// fails reports the Job Object, which is what such a host will really get.
     fn backend(&self) -> Backend {
         #[cfg(windows)]
         {
-            Backend::WindowsJobObject
+            if job::container_available() {
+                Backend::WindowsAppContainer
+            } else {
+                Backend::WindowsJobObject
+            }
         }
         #[cfg(not(windows))]
         {
@@ -252,6 +283,59 @@ pub(crate) fn grants(
     out
 }
 
+/// Join an argv into one Windows command line.
+///
+/// Windows passes a *string*, not a vector, and every process parses it back
+/// itself. The rules being followed are the documented MSVCRT ones: a backslash
+/// run is literal unless it precedes a quote, in which case it is doubled, and a
+/// quote inside an argument is escaped.
+///
+/// Out here rather than in the Win32 module so it is asserted on the build host.
+/// A quoting bug is the kind of defect that only shows up on the one argument
+/// containing a space, which is every path on this platform.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn command_line(argv: &[String]) -> String {
+    let mut out = String::new();
+    for (i, arg) in argv.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+            out.push_str(arg);
+            continue;
+        }
+        out.push('"');
+        let mut slashes = 0usize;
+        for c in arg.chars() {
+            match c {
+                '\\' => {
+                    slashes += 1;
+                    out.push('\\');
+                }
+                '"' => {
+                    // The run before a quote is doubled, then the quote escaped.
+                    for _ in 0..slashes {
+                        out.push('\\');
+                    }
+                    slashes = 0;
+                    out.push_str("\\\"");
+                }
+                _ => {
+                    slashes = 0;
+                    out.push(c);
+                }
+            }
+        }
+        // A run at the very end sits before the closing quote, so it is doubled
+        // too — the case that is easiest to leave out and hardest to notice.
+        for _ in 0..slashes {
+            out.push('\\');
+        }
+        out.push('"');
+    }
+    out
+}
+
 /// The Win32 half. Compiled only on Windows; everything above this line builds
 /// on every host so the mapping and its test do too.
 ///
@@ -285,6 +369,161 @@ pub(crate) mod job {
     use super::JobLimits;
     use crate::error::{Error, Result};
     use crate::sandbox::{run_capped, run_capped_hooked, Backend, Cap, RunSpec, SandboxOutcome};
+
+    /// Can this host build an AppContainer at all?
+    ///
+    /// Attempted, not inferred: a profile is created and dropped, which is where
+    /// a host with AppContainers disabled by policy fails. One attempt per
+    /// process — the answer cannot change under a running one.
+    pub(crate) fn container_available() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            crate::sandbox::appcontainer::win::Profile::create("io-harness-probe", false).is_ok()
+        })
+    }
+
+    /// Run one command inside an AppContainer **and** a Job Object.
+    ///
+    /// Access and resources together, which is the whole of what 0.47.0 adds to
+    /// this platform. `None` means this path declined and the caller should take
+    /// the Job Object alone: a profile that cannot be created, a grant that
+    /// cannot be applied, a spawn that fails. Declining is a degradation with a
+    /// backend name attached, never an error handed to a caller who asked for a
+    /// contained run and would rather have had a weaker one than none.
+    ///
+    /// **Standard output and standard error arrive merged**, in that order, on
+    /// `stdout`. The container path owns its own spawn — the container SID
+    /// reaches a child only through a process-thread attribute list, which
+    /// neither `std`'s nor `tokio`'s `Command` can carry on stable Rust — and it
+    /// redirects both streams to one file rather than draining two pipes. A
+    /// caller that was parsing `stderr` separately on Windows sees it empty; the
+    /// text is not lost, it is in `stdout`. Stated here because it is the one
+    /// observable difference between this backend and every other.
+    pub(super) async fn run_contained(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
+        use crate::sandbox::appcontainer::win::{grant_for, Profile, Spawned};
+
+        let tmp = std::env::temp_dir();
+        let program_dir = std::path::Path::new(&spec.argv[0])
+            .parent()
+            .map(|p| p.to_path_buf());
+        let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+        let granted = super::grants(
+            spec.mode,
+            spec.workdir,
+            spec.writable_roots,
+            program_dir.as_deref(),
+            system_root.as_deref(),
+            &tmp,
+        );
+
+        // A deterministic name, so a profile stranded by a crashed run is
+        // re-entered rather than becoming a permanent failure — the module's own
+        // `ERROR_ALREADY_EXISTS` path. Bounded well under the 64-character limit.
+        let profile = match Profile::create("io-harness-sandbox", spec.allow_network) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "sandbox: could not create an AppContainer profile ({e}); \
+                     falling back to the job object, which contains resources and not access"
+                );
+                return None;
+            }
+        };
+        for g in &granted {
+            if let Err(e) = grant_for(&g.path, profile.sid(), g.grant) {
+                tracing::warn!(
+                    "sandbox: could not grant {} to the container ({e}); \
+                     falling back to the job object",
+                    g.path.display()
+                );
+                return None;
+            }
+        }
+
+        let limits = JobLimits::from(spec.limits);
+        let job = match Job::create(&limits) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("sandbox: could not create a job object for the container ({e})");
+                return None;
+            }
+        };
+
+        let out_path = tmp.join(format!("io-harness-{}.out", std::process::id()));
+        let file = match std::fs::File::create(&out_path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("sandbox: could not open the container's capture file ({e})");
+                return None;
+            }
+        };
+        let cmdline = super::command_line(spec.argv);
+        let mut child = match Spawned::start(&cmdline, spec.workdir, profile.sid(), &file) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("sandbox: could not spawn into the AppContainer ({e})");
+                let _ = std::fs::remove_file(&out_path);
+                return None;
+            }
+        };
+        drop(file);
+
+        // The ordering that is the correctness argument, and it now has to hold
+        // twice: the process is suspended, so it joins the job before it runs an
+        // instruction, and only then is it resumed. A failure here kills rather
+        // than continuing — a process running outside the job it was promised is
+        // worse than a spawn that never happened.
+        if let Err(e) = job.adopt_raw(child.process()) {
+            child.kill();
+            let _ = std::fs::remove_file(&out_path);
+            return Some(Err(e));
+        }
+        if let Err(e) = child.resume() {
+            child.kill();
+            let _ = std::fs::remove_file(&out_path);
+            return Some(Err(Error::Sandbox {
+                reason: format!(
+                    "the contained process was put in its job object but could not be \
+                     resumed ({e}); it is being killed rather than left suspended"
+                ),
+            }));
+        }
+
+        let wall_ms = spec
+            .limits
+            .max_wall_secs
+            .map(|s| s.saturating_mul(1000).min(u32::MAX as u64) as u32)
+            .unwrap_or(u32::MAX);
+        let waited = tokio::task::block_in_place(|| child.wait(wall_ms));
+        let (exit_code, wall) = match waited {
+            Ok(Some(code)) => (Some(code), false),
+            // `wait` has already terminated it by the time it answers `None`.
+            Ok(None) => (None, true),
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                return Some(Err(Error::Sandbox {
+                    reason: format!("waiting for the contained process failed: {e}"),
+                }));
+            }
+        };
+
+        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+
+        let mut cap_hit = wall.then_some(Cap::Wall);
+        if cap_hit.is_none() && exit_code != Some(0) {
+            cap_hit = job.cap_hit(&limits);
+        }
+
+        Some(Ok(SandboxOutcome {
+            backend: Backend::WindowsAppContainer,
+            argv: spec.argv.to_vec(),
+            exit_code,
+            cap_hit,
+            stdout,
+            stderr: String::new(),
+        }))
+    }
 
     /// Run one command inside a fresh job object.
     ///
@@ -370,7 +609,7 @@ pub(crate) mod job {
         }
 
         /// Create the job and apply `limits` to it, before any process is in it.
-        fn create(limits: &JobLimits) -> io::Result<Self> {
+        pub(crate) fn create(limits: &JobLimits) -> io::Result<Self> {
             // SAFETY: both arguments are the documented "default security, no
             // name" nulls, which `CreateJobObjectW` is specified to accept and
             // not dereference. The returned handle is owned by the `Job` built
@@ -459,6 +698,27 @@ pub(crate) mod job {
             })
         }
 
+        /// Put an already-created process in the job, without resuming it.
+        ///
+        /// [`adopt`](Job::adopt) does both, because the `std::Command` path has
+        /// no thread handle left and has to go the ToolHelp way round. The
+        /// container path kept its thread handle from `CreateProcessW`, so it
+        /// resumes itself and needs only this half.
+        pub(crate) fn adopt_raw(&self, handle: HANDLE) -> Result<()> {
+            // SAFETY: `handle` belongs to a `Spawned` borrowed by the caller for
+            // longer than this call, so it cannot be closed underneath it, and
+            // `self.0` is this job's own handle.
+            if unsafe { AssignProcessToJobObject(self.0, handle) } == 0 {
+                return Err(Error::Sandbox {
+                    reason: format!(
+                        "could not assign the contained process to its job object: {}",
+                        io::Error::last_os_error()
+                    ),
+                });
+            }
+            Ok(())
+        }
+
         /// What, if anything, the job stopped this run for. Consulted only after
         /// a failed run, and only when no other cap already fired.
         ///
@@ -472,7 +732,7 @@ pub(crate) mod job {
         // a job completion port (`JobObjectAssociateCompletionPortInformation`)
         // if a caller ever needs to know *which* allocation was refused, or
         // needs to be told the instant a limit is hit rather than afterwards.
-        fn cap_hit(&self, limits: &JobLimits) -> Option<Cap> {
+        pub(crate) fn cap_hit(&self, limits: &JobLimits) -> Option<Cap> {
             let acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
                 self.query(JobObjectBasicAccountingInformation)?;
 
@@ -628,6 +888,34 @@ pub(crate) mod job {
 mod tests {
     use super::*;
     use crate::sandbox::SandboxLimits;
+
+    /// The container path passes a command *line*, not a vector, so the quoting
+    /// is load-bearing. Asserted on the build host because a quoting bug only
+    /// shows up on the one argument containing a space — which on this platform
+    /// is every path.
+    #[test]
+    fn the_command_line_quotes_what_needs_quoting_and_nothing_else() {
+        assert_eq!(command_line(&["cargo".into(), "test".into()]), "cargo test");
+        assert_eq!(
+            command_line(&["c:\\a b\\cargo.exe".into(), "--x".into()]),
+            "\"c:\\a b\\cargo.exe\" --x"
+        );
+        // An argument with nothing to escape is passed through untouched, and a
+        // trailing backslash is only dangerous *inside* quotes — so this one is
+        // correct unquoted, and quoting it would be the bug.
+        assert_eq!(command_line(&["c:\\dir\\".into()]), "c:\\dir\\");
+        // Quoted, the same trailing run has to be doubled or it escapes the
+        // closing quote and swallows the next argument. This is the case that is
+        // easiest to leave out and hardest to notice.
+        assert_eq!(
+            command_line(&["c:\\a b\\".into(), "next".into()]),
+            "\"c:\\a b\\\\\" next"
+        );
+        // A quote inside an argument is escaped, and the run before it doubled.
+        assert_eq!(command_line(&["say \"hi\"".into()]), "\"say \\\"hi\\\"\"");
+        // An empty argument must survive as an empty argument.
+        assert_eq!(command_line(&["x".into(), String::new()]), "x \"\"");
+    }
 
     fn find<'a>(g: &'a [GrantedPath], p: &str) -> Option<&'a GrantedPath> {
         g.iter().find(|x| x.path == Path::new(p))
