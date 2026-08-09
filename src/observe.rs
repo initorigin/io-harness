@@ -800,6 +800,53 @@ pub enum EventKind {
         /// [`Session::branch_from`](crate::Session::branch_from) takes.
         turn_id: i64,
     },
+    /// The run's older observations were folded into one written summary
+    /// (0.43.0).
+    ///
+    /// Emitted by the compaction helper the moment the fold lands, whether it was
+    /// triggered by the ledger crossing [`Compaction::at_share`](crate::Compaction)
+    /// or by a provider refusing the request as too large. What the summary *says*
+    /// is not on the wire: it is an observation the model reads, and a durable row
+    /// ([`Store::summaries`](crate::Store::summaries)) an operator reads. The
+    /// event is the fact and its cost.
+    ///
+    /// The two token figures are the estimate for the observation section before
+    /// and after the fold, by the same estimator assembly uses — so a reader can
+    /// see what the fold bought without re-deriving it, and a fold that bought
+    /// nothing is visible as such.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// /// Reports what each fold saved.
+    /// struct Folds;
+    ///
+    /// impl Observer for Folds {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::Compacted { through_step, before_tokens, after_tokens } = &event.kind {
+    ///             println!("step {through_step}: {before_tokens} -> {after_tokens} tokens");
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let flow = Folds.event(&RunEvent::new(
+    ///     7,
+    ///     12,
+    ///     EventKind::Compacted { through_step: 12, before_tokens: 19_400, after_tokens: 5_100 },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    Compacted {
+        /// The step whose assembly triggered the fold. The key
+        /// [`Store::summary_at`](crate::Store::summary_at) reads by, so a trace and
+        /// the store agree on which boundary this was.
+        through_step: u32,
+        /// Estimated tokens the observation section held before the fold.
+        before_tokens: u64,
+        /// Estimated tokens it holds after it.
+        after_tokens: u64,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -866,6 +913,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "plugin_dropped",
     "rewound",
     "answered",
+    "compacted",
     "finished",
 ];
 
@@ -1392,6 +1440,11 @@ mod tests {
                 queued: 0,
             },
             EventKind::Answered { turn_id: 3 },
+            EventKind::Compacted {
+                through_step: 12,
+                before_tokens: 19_400,
+                after_tokens: 5_100,
+            },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -1504,6 +1557,8 @@ mod tests {
                 | EventKind::Rewound { .. }
                 // 0.37.0 — a turn answered instead of run.
                 | EventKind::Answered { .. }
+                // 0.43.0 — the run's older observations folded into a summary.
+                | EventKind::Compacted { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

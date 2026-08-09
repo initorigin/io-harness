@@ -398,7 +398,7 @@ pub use approve::{
 };
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
-pub use context::ContextBudget;
+pub use context::{Compaction, ContextBudget};
 pub use contract::{Routing, TaskContract};
 pub use error::{Error, ProviderErrorKind, Result};
 pub use hooks::Hooks;
