@@ -162,7 +162,7 @@ tasks:
   summary: Discover `AGENTS.md` with no `[instructions]` table; `files = []` is the opt-out.
   why_required: A repository carrying the file every other agent reads and no `io.toml` at all is read
     by none of it today, which is the discovery half of the release outcome.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F6 — `AGENTS.md` is found with no table, and an empty list is the opt-out.** Three trees: (a) `AGENTS.md`
@@ -176,12 +176,25 @@ tasks:
   files:
   - src/config.rs
   - tests/config.rs
-  evidence: []
+  evidence:
+  - '`read_instructions` (`src/config.rs`) now falls to `DEFAULT_INSTRUCTIONS` when the `[instructions]`
+    table is absent, and honours an explicit `files = []` as the opt-out. The distinction is the one `Option<Vec<_>>`
+    already carried and nothing read: absent table versus present-and-empty.'
+  - 'F6 — `discovered_instructions_reach_the_contract_as_instructions` (`tests/config.rs`) covers four
+    trees: `AGENTS.md` with `[instructions]`, with an unrelated `[run]` table, with **no `io.toml` at
+    all**, and with `files = []`. The two pre-existing behaviours are asserted unchanged: a named file
+    that does not exist is skipped, and one holding only whitespace is skipped.'
+  - '**This test asserted the opposite before and was changed deliberately, with the reason in its doc
+    comment** — 0.27.0 ran discovery only where the table was present and put the text in `constraints`.
+    Changing a test because the behaviour deliberately changed is legitimate; doing it without the sentence
+    is not (0.43.0''s rule).'
+  - Sabotage — treat an explicit empty list as an absent table (`.filter(|f| !f.is_empty())`) — fails
+    `discovered_instructions_reach_the_contract_as_instructions` on the `files = []` arm and nothing else.
 - id: US-IO-HARNESS-0.45.0-T05
   summary: Carry discovered instructions in the contract and the prompt, not in `constraints`.
   why_required: Guidance read as a constraint is misfiled and re-sent in the user turn every step. This
     task is also where untrusted repository text is bounded by delimiting and ordering.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.45.0-T01
   - US-IO-HARNESS-0.45.0-T04
@@ -209,12 +222,30 @@ tasks:
   - src/run.rs
   - tests/prompt.rs
   - tests/config.rs
-  evidence: []
+  evidence:
+  - '`Config::apply_to` (`src/config.rs`) pushes discovered text through `with_instruction` instead of
+    `with_constraint`; `TaskContract::instructions` carries it, and `compose` emits it as a delimited
+    `instructions_section` framed as the repository''s own guidance that grants nothing and cannot change
+    how the turn ends. It is emitted BEFORE the boundary section and before the ending, so it structurally
+    cannot be the last word.'
+  - 'F7 — `repository_guidance_is_carried_once_and_is_not_a_constraint` (`tests/prompt.rs`) asserts the
+    text appears exactly once in the system block, does NOT appear in the user turn, and that a caller''s
+    own constraint still rides in the user turn and not in the system block. The absence is the discriminating
+    half: the same text in both blocks is paid for on every step of every run.'
+  - 'F5 — `hostile_text_cannot_displace_the_crates_own_rules` (`tests/prompt.rs`) drives the same hostile
+    sentence in by both routes that exist — a caller''s `SystemPrompt::Replace` and a repository''s `AGENTS.md`
+    — and asserts the composed prompt still ends with the crate''s sentence, that the boundary section
+    is still the last thing the crate says, and that the hostile text precedes both. Asserted over the
+    string: what a model does with a prompt is not a claim this crate makes, and the record says so.'
+  - Sabotage — keep the 0.27.0 `with_constraint` push beside the new field — fails `discovered_instructions_reach_the_contract_as_instructions`
+    (`constraints` is no longer empty) and nothing else.
+  - '`Config::instructions`'' own doc comment and the 0.27.0 rationale comment at `apply_to` both stated
+    the old behaviour and were corrected in the same commit — the trap 0.44.0 paid for.'
 - id: US-IO-HARNESS-0.45.0-T06
   summary: Derive `PromptFamily` and shape the delimiters, and nothing else, per family.
   why_required: The crate reaches four wire shapes and roughly two dozen vendors in one voice. The claim
     this task must make good is that only delimiters differ, asserted by equality.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.45.0-T01
   - US-IO-HARNESS-0.45.0-T02
@@ -234,13 +265,31 @@ tasks:
   - src/provider/mod.rs
   - src/provider/anthropic.rs
   - src/provider/openai.rs
-  - src/provider/openrouter.rs
-  - src/provider/compatible.rs
   - src/run.rs
   - src/lib.rs
   - tests/prompt.rs
   - docs/public-api.txt
-  evidence: []
+  evidence:
+  - '`PromptFamily` (`Anthropic` / `OpenAi` / `Generic`, `#[non_exhaustive]`) and `PromptFamily::from_model`
+    added at `src/provider/mod.rs`, with `Provider::prompt_family` **defaulted** to reading `model_hint()`
+    through `from_model` — so `OpenRouter`, `Compatible` and any out-of-tree provider that reports its
+    model are classified without writing anything, and nothing downstream changes to compile. `Anthropic`
+    and `OpenAi` override it to state their own family, so an account-defined alias cannot reclassify
+    them.'
+  - '`framed(family, tag, body)` in `src/run.rs` is the whole of what a family changes: Anthropic gets
+    `<boundary>` / `<repository_guidance>` tagged blocks, every other family reads the same body plainly.
+    Two of the three families share the plain form today, which is stated in the doc comment — the type
+    exists so a family CAN differ, not so each must.'
+  - F8 — `a_family_changes_the_delimiters_and_nothing_else` (`tests/prompt.rs`) passes. (a) five slugs
+    classified, including an unrecognised vendor falling to `Generic`, plus the two built-in providers
+    stating their own family against a deliberately unrecognisable alias. (b) one contract composed under
+    all three families, delimiters stripped, remainders asserted **byte-identical to one another**, and
+    every family asserted to keep the ending, the boundary and the guidance.
+  - Sabotage — drop the last line of the boundary section for one family only — fails `a_family_changes_the_delimiters_and_nothing_else`
+    and nothing else, which is the point of asserting equality rather than each template separately.
+  - '`docs/public-api.txt` gains its second and final line (`enum PromptFamily`), refused by `tests/public_api.rs`
+    until added by hand.'
+  - 'Gates: 76 suites exit 0, 399 doctests pass, `cargo fmt --check` clean, clippy `-D warnings` clean.'
 - id: US-IO-HARNESS-0.45.0-T07
   summary: Emit `EventKind::PromptComposed` once per run.
   why_required: Without it, `what prompt did this run actually use` has no answer in the trace, and the

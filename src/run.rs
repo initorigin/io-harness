@@ -30,7 +30,9 @@ use crate::mcp::McpSession;
 use crate::net::{self, NetGuard};
 use crate::observe::{EventKind, Ignore, Observer, RunEvent};
 use crate::policy::{Act, Effect, Policy, Rule};
-use crate::provider::{CompletionRequest, CompletionResponse, Provider, ToolCall, ToolSpec};
+use crate::provider::{
+    CompletionRequest, CompletionResponse, PromptFamily, Provider, ToolCall, ToolSpec,
+};
 use crate::resilience::{Progress, Progressing};
 use crate::sandbox::{Backend, Sandbox, SandboxConfig};
 use crate::skills::Skills;
@@ -3780,6 +3782,7 @@ fn open_turn_kind(store: &Store, run_id: i64, extras: &TurnExtras<'_>) -> Result
 /// different worlds (one of them has sub-agents) and must keep saying so — but
 /// what is wrapped around it, and the condition under which it is used at all,
 /// is one rule in one place.
+#[allow(clippy::too_many_arguments)]
 fn conversational_opening(
     base: &str,
     contract: &TaskContract,
@@ -3788,6 +3791,7 @@ fn conversational_opening(
     skills: &Skills,
     planning: bool,
     boundary: Option<&str>,
+    family: PromptFamily,
 ) -> Option<String> {
     if !extras.classify {
         return None;
@@ -3802,6 +3806,7 @@ fn conversational_opening(
         directive: planning.then(|| planning_directive(&contract.agents)),
         instructions: &contract.instructions,
         boundary,
+        family,
         // 0.45.0 — the sentence that decides what a turn is, emitted last so that
         // nothing an embedder or a repository supplied can be read after it.
         ending: CONVERSATIONAL_ENDING,
@@ -3933,6 +3938,7 @@ async fn run_from<P: Provider>(
         directive: None,
         instructions: &contract.instructions,
         boundary: None,
+        family: provider.prompt_family(),
         ending: "",
     });
     let tool = write_file_tool();
@@ -4170,6 +4176,7 @@ async fn run_workspace_from<P: Provider>(
         directive: None,
         instructions: &contract.instructions,
         boundary: after_planning.as_deref(),
+        family: provider.prompt_family(),
         ending: CALL_TOOLS_ENDING,
     });
     let mut system = match planning {
@@ -4181,6 +4188,7 @@ async fn run_workspace_from<P: Provider>(
             directive: Some(planning_directive(&contract.agents)),
             instructions: &contract.instructions,
             boundary: boundary_section(&effective, contract.exec_sandbox.as_ref()).as_deref(),
+            family: provider.prompt_family(),
             ending: CALL_TOOLS_ENDING,
         }),
         false => base_system.clone(),
@@ -4203,6 +4211,7 @@ async fn run_workspace_from<P: Provider>(
         skills,
         planning,
         after_planning.as_deref(),
+        provider.prompt_family(),
     );
     let mut tools = workspace_tools();
     tools.extend(extra);
@@ -5840,6 +5849,7 @@ fn run_agent<'f, P: Provider>(
                 directive,
                 instructions: &contract.instructions,
                 boundary,
+                family: tree.provider.prompt_family(),
                 ending: CALL_TOOLS_ENDING,
             });
             match identity.and_then(|d| d.role.as_deref()) {
@@ -5867,6 +5877,7 @@ fn run_agent<'f, P: Provider>(
             tree.skills,
             planning,
             after_planning.as_deref(),
+            tree.provider.prompt_family(),
         );
         let mut tools = tree_tools(tree.agents);
         tools.extend(extra);
@@ -11252,6 +11263,9 @@ struct PromptSpec<'a> {
     instructions: &'a [String],
     /// The boundary this run enforces, or `None` when it enforces none.
     boundary: Option<&'a str>,
+    /// Whose conventions the sections are delimited by. Delimiters only: every
+    /// family is given the same sections, in the same order, with the same words.
+    family: PromptFamily,
     /// The crate's own last word.
     ending: &'a str,
 }
@@ -11279,18 +11293,34 @@ fn compose(spec: PromptSpec<'_>) -> String {
             out.push_str(text);
         }
     }
-    for section in [
-        instructions_section(spec.instructions).as_deref(),
-        spec.boundary,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for (tag, section) in [
+        (
+            "repository_guidance",
+            instructions_section(spec.instructions).as_deref(),
+        ),
+        ("boundary", spec.boundary),
+    ] {
+        let Some(section) = section else { continue };
         out.push_str("\n\n");
-        out.push_str(section);
+        out.push_str(&framed(spec.family, tag, section));
     }
     out.push_str(spec.ending);
     out
+}
+
+/// Delimit one section the way this family's own guidance asks for (0.45.0).
+///
+/// **This is the whole of what a family changes.** Anthropic's guidance asks for
+/// long structured context in tagged blocks; every other family reads the same
+/// section plainly, and today two of the three share that plain form — the type
+/// exists so a family can differ when there is a reason, not so that each one must.
+/// The body is byte-identical in every case, which is what `tests/prompt.rs`
+/// asserts by stripping the tags and comparing.
+fn framed(family: PromptFamily, tag: &str, body: &str) -> String {
+    match family {
+        PromptFamily::Anthropic => format!("<{tag}>\n{body}\n</{tag}>"),
+        _ => body.to_string(),
+    }
 }
 
 /// How many patterns one act names before the line says it stopped naming them.

@@ -932,6 +932,56 @@ pub struct ModelInfo {
     pub price_source: Option<PriceSource>,
 }
 
+/// Which vendor family's conventions a system prompt is shaped for (0.45.0).
+///
+/// It decides **delimiters and nothing else**. Anthropic's own guidance asks for
+/// long structured context in tagged blocks; the others read the same sections
+/// plainly. The sections, their order, their wording and the crate's ending
+/// sentence are identical across families, and that is asserted rather than
+/// intended.
+///
+/// ```
+/// use io_harness::provider::PromptFamily;
+///
+/// assert_eq!(PromptFamily::from_model("anthropic/claude-haiku-4.5"), PromptFamily::Anthropic);
+/// assert_eq!(PromptFamily::from_model("openai/gpt-5.6-luna"), PromptFamily::OpenAi);
+/// // Anything this crate does not recognise reads the plain form, which is the
+/// // safe answer for the two dozen endpoints it does not control.
+/// assert_eq!(PromptFamily::from_model("some-vendor/some-model"), PromptFamily::Generic);
+/// ```
+///
+/// `#[non_exhaustive]`: a family is a thing a minor may add.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PromptFamily {
+    /// Tagged blocks, as Anthropic's own prompting guidance asks for.
+    Anthropic,
+    /// The plain form, as the OpenAI wire's guidance uses.
+    OpenAi,
+    /// The plain form, for everything this crate does not recognise.
+    Generic,
+}
+
+impl PromptFamily {
+    /// Classify a model slug.
+    ///
+    /// Deliberately a short table: every entry is a claim that has to stay true,
+    /// and a slug this crate has never heard of gets the plain form rather than a
+    /// guess. Matching is case-insensitive and looks at the vendor prefix a
+    /// gateway supplies as well as the bare name a vendor's own API takes.
+    #[must_use]
+    pub fn from_model(model: &str) -> Self {
+        let model = model.to_ascii_lowercase();
+        if model.starts_with("anthropic/") || model.contains("claude") {
+            return Self::Anthropic;
+        }
+        if model.starts_with("openai/") || model.contains("gpt") {
+            return Self::OpenAi;
+        }
+        Self::Generic
+    }
+}
+
 /// Anything that can turn a [`CompletionRequest`] into a [`CompletionResponse`].
 ///
 /// Implemented by [`OpenRouter`], [`Anthropic`], and [`OpenAi`]; tests supply
@@ -1173,6 +1223,41 @@ pub trait Provider {
     /// compiling; the built-in providers override it.
     fn name(&self) -> &str {
         "provider"
+    }
+
+    /// Which family's conventions this provider's model reads best (0.45.0).
+    ///
+    /// The crate reaches four wire shapes and, through
+    /// [`Compatible`](crate::Compatible), some two dozen vendors, and the families
+    /// document different conventions for delimiting a long system block. **Only the
+    /// delimiters differ**: every family is given the same sections, in the same
+    /// order, ending with the same sentence, and the crate asserts that by stripping
+    /// the delimiters and comparing the rest. A per-family prompt that dropped a rule
+    /// for one vendor would be a crate that behaved differently depending on who
+    /// answered.
+    ///
+    /// Defaults to reading [`model_hint`](Provider::model_hint) through
+    /// [`PromptFamily::from_model`], so `OpenRouter`, `Compatible` and an out-of-tree
+    /// provider that reports its model are all classified without writing anything.
+    /// Anything unrecognised is [`PromptFamily::Generic`], which is the plain form.
+    ///
+    /// ```
+    /// use io_harness::provider::{CompletionRequest, CompletionResponse, PromptFamily, Provider};
+    ///
+    /// struct Mine;
+    ///
+    /// impl Provider for Mine {
+    ///     async fn complete(&self, _r: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+    ///         Ok(CompletionResponse::default())
+    ///     }
+    ///     fn model_hint(&self) -> Option<&str> { Some("anthropic/claude-haiku-4.5") }
+    /// }
+    ///
+    /// assert_eq!(Mine.prompt_family(), PromptFamily::Anthropic);
+    /// ```
+    fn prompt_family(&self) -> PromptFamily {
+        self.model_hint()
+            .map_or(PromptFamily::Generic, PromptFamily::from_model)
     }
 
     /// Whether this provider's model accepts image input.
