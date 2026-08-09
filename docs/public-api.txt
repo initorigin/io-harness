@@ -194,6 +194,8 @@ struct TaskContract src/contract.rs
 struct Template src/template.rs
 struct Templates src/template.rs
 struct TodoItem src/state.rs
+struct Transcript src/session.rs
+struct TranscriptTurn src/session.rs
 struct ToolCall src/provider/mod.rs
 struct ToolSpec src/provider/mod.rs
 struct Toolbox src/tools/custom.rs

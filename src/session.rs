@@ -619,6 +619,56 @@ impl Session {
         .await
     }
 
+    /// The whole conversation as one readable artifact (0.43.0).
+    ///
+    /// A pure read: no provider is called, no row is written, and a session whose
+    /// runs have all finished can be exported forever without costing anything.
+    ///
+    /// **The whole tree, not the path.** [`Session::history`] returns the turns
+    /// the model currently sees, which is what a next turn needs and is
+    /// deliberately not what an export needs: a [`branch_from`](Session::branch_from)
+    /// leaves earlier turns off the path, and those are exactly the ones no other
+    /// surface will show you. Every turn of the session is here, oldest first, with
+    /// [`TranscriptTurn::on_path`] marking which ones the model can still see.
+    ///
+    /// It is also the other half of compaction. A fold replaces the older half of
+    /// a run's observations with a paragraph, which is acceptable precisely because
+    /// the observations stay on disk — and this is how they come back out: each
+    /// turn carries the [`Summary`] rows its run wrote, so a reader can see where a
+    /// paragraph stands in for the steps behind it.
+    ///
+    /// ```no_run
+    /// use io_harness::{Session, Store};
+    ///
+    /// # fn demo(store: &Store, session: &Session) -> io_harness::Result<()> {
+    /// let transcript = session.transcript(store)?;
+    /// println!("{}", transcript.to_markdown());
+    /// # Ok(()) }
+    /// ```
+    pub fn transcript(&self, store: &Store) -> Result<Transcript> {
+        let on_path: std::collections::HashSet<i64> =
+            self.history(store)?.iter().map(|t| t.id).collect();
+        let mut turns = Vec::new();
+        for turn in store.session_turns(self.id)? {
+            turns.push(TranscriptTurn {
+                turn_id: turn.id,
+                parent_turn_id: turn.parent_turn_id,
+                run_id: turn.run_id,
+                on_path: on_path.contains(&turn.id),
+                prompt: turn.prompt,
+                reply: turn.reply,
+                outcome: turn.outcome,
+                created_at: turn.created_at,
+                summaries: store.summaries(turn.run_id)?,
+            });
+        }
+        Ok(Transcript {
+            session_id: self.id,
+            root: self.root.clone(),
+            turns,
+        })
+    }
+
     /// What an unbounded turn runs under: the session's workspace, no criterion,
     /// and the crate's own defaults for everything else.
     fn default_contract(&self, text: impl Into<String>) -> TaskContract {
@@ -1051,4 +1101,126 @@ fn last_message(store: &Store, run_id: i64) -> Result<Option<String>> {
         }
     }
     Ok(None)
+}
+
+/// A whole conversation, read back (0.43.0).
+///
+/// Built by [`Session::transcript`], which is a read and never a provider call.
+/// The turns are every turn of the session, oldest first — including the ones a
+/// [`branch_from`](Session::branch_from) took off the path, which no other surface
+/// will show you.
+///
+/// ```no_run
+/// use io_harness::{Session, Store};
+///
+/// # fn demo(store: &Store, session: &Session) -> io_harness::Result<()> {
+/// let transcript = session.transcript(store)?;
+///
+/// // Every turn of the conversation, including the ones a branch left behind.
+/// for turn in &transcript.turns {
+///     let seen = if turn.on_path { "" } else { " (branched away from)" };
+///     println!("{}{seen}: {}", turn.turn_id, turn.prompt);
+/// }
+///
+/// std::fs::write("session.md", transcript.to_markdown())?;
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Transcript {
+    /// The session this is.
+    pub session_id: i64,
+    /// The workspace it was held over.
+    pub root: PathBuf,
+    /// Every turn, oldest first.
+    pub turns: Vec<TranscriptTurn>,
+}
+
+impl Transcript {
+    /// Render it as Markdown.
+    ///
+    /// One `String`, and one method. A library does not choose the caller's file,
+    /// its encoding or its pagination; what it owes is the text.
+    ///
+    /// Each turn is a section: what was asked, what was answered, and — where the
+    /// run folded — a marked line saying what a summary stands in for, so the part
+    /// compaction took out of the model's context is visible rather than merely
+    /// still in the database. A turn that is off the current path says so, because
+    /// a reader comparing a transcript against what the model seems to know needs
+    /// to know which turns it can still see.
+    pub fn to_markdown(&self) -> String {
+        let mut out = format!("# Session {}\n\n`{}`\n", self.session_id, self.root.display());
+        if self.turns.is_empty() {
+            out.push_str("\n_No turns._\n");
+            return out;
+        }
+        for turn in &self.turns {
+            out.push_str(&format!("\n## Turn {}", turn.turn_id));
+            if !turn.on_path {
+                out.push_str(" — branched away from");
+            }
+            out.push('\n');
+            out.push_str(&format!("\n> {}\n", turn.prompt.replace('\n', "\n> ")));
+            match turn.reply.as_deref().filter(|r| !r.is_empty()) {
+                Some(reply) => out.push_str(&format!("\n{reply}\n")),
+                None => out.push_str("\n_No reply._\n"),
+            }
+            for summary in &turn.summaries {
+                out.push_str(&format!(
+                    "\n_At step {}, {} earlier observations were summarised as:_ {}\n",
+                    summary.through_step, summary.folded, summary.text
+                ));
+            }
+            if let Some(outcome) = &turn.outcome {
+                out.push_str(&format!("\n_({outcome}, run {})_\n", turn.run_id));
+            }
+        }
+        out
+    }
+}
+
+/// One turn in a [`Transcript`].
+///
+/// ```no_run
+/// use io_harness::{Session, Store, TranscriptTurn};
+///
+/// /// What a turn cost, and what it folded away to stay affordable.
+/// fn describe(turn: &TranscriptTurn) -> String {
+///     format!(
+///         "turn {} ({} folds) — {}",
+///         turn.turn_id,
+///         turn.summaries.len(),
+///         turn.outcome.as_deref().unwrap_or("still running")
+///     )
+/// }
+///
+/// # fn demo(store: &Store, session: &Session) -> io_harness::Result<()> {
+/// for turn in &session.transcript(store)?.turns {
+///     println!("{}", describe(turn));
+/// }
+/// # Ok(()) }
+/// ```
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TranscriptTurn {
+    /// The turn's own id.
+    pub turn_id: i64,
+    /// The turn it answers from, or `None` for the root of a conversation.
+    pub parent_turn_id: Option<i64>,
+    /// The run that served it.
+    pub run_id: i64,
+    /// Whether the model can still see this turn — that is, whether it is on the
+    /// path [`Session::history`] returns. `false` for a turn a branch left behind.
+    pub on_path: bool,
+    /// What the operator said.
+    pub prompt: String,
+    /// What the agent said back, where it said anything.
+    pub reply: Option<String>,
+    /// Why the turn stopped, as the run's outcome string.
+    pub outcome: Option<String>,
+    /// UTC creation time.
+    pub created_at: String,
+    /// The folds this turn's run wrote, oldest first. Empty for a turn that never
+    /// compacted, which is most of them.
+    pub summaries: Vec<crate::state::Summary>,
 }
