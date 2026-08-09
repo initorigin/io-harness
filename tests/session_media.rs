@@ -63,7 +63,10 @@ fn shot() -> Media {
 }
 
 fn open_policy() -> Policy {
-    Policy::default().layer("test").allow_read("*").allow_write("*")
+    Policy::default()
+        .layer("test")
+        .allow_read("*")
+        .allow_write("*")
 }
 
 // ---------------------------------------------------------------- F9
@@ -102,7 +105,11 @@ async fn a_staged_image_reaches_the_request_and_only_the_next_turn() {
         .unwrap();
 
     let seen = provider.seen.lock().unwrap().clone();
-    assert_eq!(seen.first().copied(), Some(1), "the image never reached the wire");
+    assert_eq!(
+        seen.first().copied(),
+        Some(1),
+        "the image never reached the wire"
+    );
     assert_eq!(
         seen.get(1).copied(),
         Some(0),

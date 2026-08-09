@@ -357,7 +357,7 @@ tasks:
   why_required: The release notes are taken verbatim from the changelog, the migration note is the only
     warning a consumer matching `ProviderErrorKind` exhaustively gets, and the checked-in doc surfaces
     are gates that fail the build when they drift.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.43.0-T05
   - US-IO-HARNESS-0.43.0-T06
@@ -389,7 +389,29 @@ tasks:
   - src/error.rs
   - src/session.rs
   - src/state.rs
-  evidence: []
+  evidence:
+  - '`CHANGELOG.md` gains the 0.43.0 section with **a `*Migration:*` note** — the one this release owes
+    — saying a `match` on `ProviderErrorKind` now needs a wildcard arm, and recommending one that
+    fails loudly over one that guesses. A second Changed entry states the behaviour change nobody
+    would otherwise see: a long run now makes a summarising call it did not make on 0.42.0, with the
+    one-line way back.'
+  - '`docs/CONTRACT.md` gains four guarantees — what compaction folds, costs and never loses (with the
+    prompt-injection answer stated: the summariser has no tools and the policy is untouched); what a
+    context overflow does now, including that the classifier is deliberately not exhaustive; that a
+    transcript is a read of the whole tree; and how long `Session::attach` attaches for.'
+  - 'Guide pages: `context-and-memory.md` documents the fold beside the context budget,
+    `resilience.md` documents the overflow beside the other failures you can branch on, and
+    `sessions.md` documents the transcript and `attach`. No new page, so no `GUIDES` or
+    `CAPABILITIES.md` bookkeeping — the precedent since 0.31.0.'
+  - '`Cargo.toml` 0.42.0 -> 0.43.0 and the README install snippet `"0.42"` -> `"0.43"`, which
+    `tests/docs_drift.rs` checks.'
+  - 'The nightly rustdoc gate earned its keep again — three errors stable `cargo doc` did not report:
+    a link to `Summary::kept_from` left behind by the rename, a bare `[`Summary`]` in `session.rs`
+    where the type is not `use`d, and a *redundant* explicit target on `Provider::accepts_images`
+    where it is. The two intra-doc rules partition on scope exactly as recorded.'
+  - '`cargo test --doc` exit 0, **392** passed (up 4). `cargo test --tests --no-fail-fast` — 74 suites
+    green. `cargo clippy --all-features --all-targets` clean. `cargo fmt` applied and `--check` clean.
+    `RUSTDOCFLAGS=... cargo +nightly doc --all-features --no-deps` clean.'
 - id: US-IO-HARNESS-0.43.0-T09
   summary: 'Run the release gates: dependency count, MSRV, the full suite in both feature polarities,
     and the three-platform matrix.'

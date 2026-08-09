@@ -840,7 +840,7 @@ pub enum EventKind {
     Compacted {
         /// The step whose assembly triggered the fold, so a trace and the
         /// `summaries` row agree on when it happened. The row is looked *up* by
-        /// [`Summary::kept_from`](crate::Summary::kept_from), which is stable
+        /// [`Summary::folded`](crate::Summary::folded), which is stable
         /// across a resume in a way a step number is not.
         through_step: u32,
         /// Estimated tokens the observation section held before the fold.

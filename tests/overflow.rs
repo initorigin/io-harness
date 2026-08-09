@@ -231,7 +231,12 @@ mod the_recovery {
     }
 
     const NAMES: [&str; 6] = [
-        "alpha.txt", "beta.txt", "gamma.txt", "delta.txt", "epsilon.txt", "zeta.txt",
+        "alpha.txt",
+        "beta.txt",
+        "gamma.txt",
+        "delta.txt",
+        "epsilon.txt",
+        "zeta.txt",
     ];
 
     fn workspace() -> tempfile::TempDir {
@@ -279,7 +284,10 @@ mod the_recovery {
     }
 
     fn open_policy() -> Policy {
-        Policy::default().layer("test").allow_read("*").allow_write("*")
+        Policy::default()
+            .layer("test")
+            .allow_read("*")
+            .allow_write("*")
     }
 
     // ------------------------------------------------------------------ F4
@@ -311,7 +319,10 @@ mod the_recovery {
         .unwrap();
 
         let refusals = provider.refusals.load(Ordering::SeqCst);
-        assert!(refusals > 0, "the provider never refused; nothing was recovered from");
+        assert!(
+            refusals > 0,
+            "the provider never refused; nothing was recovered from"
+        );
         assert!(
             !seen_folds.lock().unwrap().is_empty(),
             "a refusal produced no fold"
@@ -390,7 +401,10 @@ mod the_recovery {
         )
         .await;
 
-        assert!(failed.is_err(), "an unanswerable request must still escalate");
+        assert!(
+            failed.is_err(),
+            "an unanswerable request must still escalate"
+        );
         assert_eq!(
             provider.refusals.load(Ordering::SeqCst),
             2,

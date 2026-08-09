@@ -1115,6 +1115,81 @@ list.
 already holds; computing and keeping hunks is a later release's work. A file the
 run wrote and something then removed is omitted rather than reported as empty.
 
+## What compaction folds, what it costs, and what it never loses (0.43.0)
+
+**When it happens.** A fold is attempted before each step's request is assembled,
+and happens when the observation ledger's estimated tokens cross
+`Compaction::at_share` of that turn's own effective context budget — or when the
+provider has just refused the request as too large, in which case the threshold is
+not consulted because the vendor has stated what it was guessing at. Under the
+threshold, nothing happens and no provider is called.
+
+**What it costs.** One ordinary completion, through the same path as every other:
+one `provider_calls` row for the step it happened in, retried by the same
+`RetryPolicy`, counted in `Store::spent_tokens`, and inside the run's token budget.
+There is no separate summarising provider and no second model to configure — the
+run's own provider writes it, because a summariser describes the run's work rather
+than judging it.
+
+**What it never loses.** Every folded observation stays in `ledger_observations`
+and is still returned by `Store::observations` and rendered by
+`Session::transcript`. What a fold changes is what the *next request* carries, not
+what the trace holds. The paragraph itself is a `summaries` row keyed on how many
+entries it stands in for, and `restore_ledger` replays those rows — so a resumed,
+branched or replayed run reconstructs the same fold instead of buying it again.
+
+**What it is not.** It is not a guarantee that the summary is right. A model
+writing about a model's work can miss the decision that mattered, and a paragraph
+is less visibly incomplete than a stub. `keep_recent` keeps the newest
+observations whole beside it, and the transcript is how a person checks. The
+summariser is given no tools, its output is one observation among others rather
+than an instruction, and the `Policy` is untouched and remains the wall: a summary
+cannot widen a boundary, approve an act, or call anything — which is the whole
+answer to a folded observation containing text from a repository the agent did not
+author.
+
+**Off is a setting, not an absence.** `Compaction { at_share: 1.0, .. }` never
+folds, and that includes the overflow recovery: a caller who turned folding off
+asked for 0.42.0's behaviour, and an over-window request being terminal is part of
+what they asked for.
+
+## What a context overflow does now (0.43.0)
+
+**It is classified from the vendor's own words.** `ProviderErrorKind::from_response`
+answers `ContextOverflow` for a 400 or 413 whose message carries one of a short
+list of known wordings, and `from_status` for everything else. The list is
+deliberately conservative and is not exhaustive: a wording it does not know costs
+exactly what an overflow cost on 0.42.0, while a false positive would make the loop
+re-send a request the server had already read and refused.
+
+**It is not retryable, and the recovery is not a retry.** `is_retryable()` is
+`false`, because re-sending the same bytes cannot make them fit. What answers it is
+a different request: the loop folds the ledger and asks once more. That happens at
+most once per step; a second overflow escalates with both attempts in the trace.
+
+## What a transcript is (0.43.0)
+
+`Session::transcript` is a **read**. It calls no provider, writes no row, and can
+be called as often as you like on a finished session for the same cost.
+
+It renders the **whole session tree**, not the path the model sees. A
+`Session::branch_from` leaves earlier turns off that path, and those are exactly
+the turns no other surface will show you; `TranscriptTurn::on_path` marks which
+ones the model can still see. `Transcript::to_markdown` returns a `String` — the
+crate does not choose your file, its encoding or its pagination.
+
+## What `Session::attach` attaches, and for how long (0.43.0)
+
+Staged images ride **the next turn only**, and the staging is cleared once that
+turn has been driven whatever its outcome. A screenshot is about the thing being
+said now; re-sending it every later turn would bill for it every turn.
+
+`TaskContract::with_images` is unchanged and still means what it always did — for
+the whole run — so a `turn_bounded` whose contract carries images and whose session
+has staged one sends both. A provider whose `accepts_images` is false refuses the
+turn before anything is sent, which is 0.42.0's refusal reached through a new door.
+`media` feature only; without it, nothing here exists.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

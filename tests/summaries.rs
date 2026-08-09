@@ -32,7 +32,9 @@ fn a_summary_round_trips_through_the_store() {
 fn the_ledger_position_is_the_key_and_a_neighbouring_one_is_not_it() {
     let store = Store::memory().unwrap();
     let run_id = store.start_run("port the parser", "openrouter").unwrap();
-    store.put_summary(run_id, 12, 40, "the fold at forty observations", 4).unwrap();
+    store
+        .put_summary(run_id, 12, 40, "the fold at forty observations", 4)
+        .unwrap();
 
     assert!(
         store.summary_for(run_id, 39).unwrap().is_none(),
@@ -48,8 +50,12 @@ fn the_ledger_position_is_the_key_and_a_neighbouring_one_is_not_it() {
 fn a_corrected_fold_reads_back_as_the_correction() {
     let store = Store::memory().unwrap();
     let run_id = store.start_run("port the parser", "openrouter").unwrap();
-    store.put_summary(run_id, 12, 40, "first attempt", 2).unwrap();
-    store.put_summary(run_id, 12, 40, "second attempt", 2).unwrap();
+    store
+        .put_summary(run_id, 12, 40, "first attempt", 2)
+        .unwrap();
+    store
+        .put_summary(run_id, 12, 40, "second attempt", 2)
+        .unwrap();
 
     assert_eq!(
         store.summary_for(run_id, 40).unwrap().unwrap().text,
@@ -70,8 +76,12 @@ fn summaries_are_per_run_and_ordered_oldest_first() {
     let theirs = store.start_run("theirs", "openrouter").unwrap();
 
     store.put_summary(mine, 8, 20, "the first fold", 3).unwrap();
-    store.put_summary(theirs, 4, 10, "another run's fold", 3).unwrap();
-    store.put_summary(mine, 19, 44, "the second fold", 3).unwrap();
+    store
+        .put_summary(theirs, 4, 10, "another run's fold", 3)
+        .unwrap();
+    store
+        .put_summary(mine, 19, 44, "the second fold", 3)
+        .unwrap();
 
     let folds = store.summaries(mine).unwrap();
     assert_eq!(folds.len(), 2, "another run's fold is not this run's");

@@ -61,7 +61,10 @@ fn the_threshold_is_taken_from_the_budget_the_assembler_will_use() {
     // No run token budget: the section's ceiling is `max_tokens` flat, so the
     // fold happens at 80% of that and not at 80% of some other number.
     assert_eq!(budget.effective_tokens(None), 24_000);
-    assert_eq!(folding.threshold_tokens(budget.effective_tokens(None)), 19_200);
+    assert_eq!(
+        folding.threshold_tokens(budget.effective_tokens(None)),
+        19_200
+    );
 
     // With a run running low, the ceiling shrinks and the fold threshold shrinks
     // with it — the two cannot drift apart because there is one derivation.
@@ -109,8 +112,8 @@ mod the_fold {
 
     use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
     use io_harness::{
-        resume_with, run_with, ApproveAll, Compaction, ContextBudget, EventKind, Flow, Observer, Policy,
-        Provider, RunEvent, Store, TaskContract, Verification,
+        resume_with, run_with, ApproveAll, Compaction, ContextBudget, EventKind, Flow, Observer,
+        Policy, Provider, RunEvent, Store, TaskContract, Verification,
     };
     use serde_json::json;
 
@@ -262,7 +265,13 @@ mod the_fold {
     }
 
     const NAMES: [&str; 8] = [
-        "alpha.txt", "beta.txt", "gamma.txt", "delta.txt", "epsilon.txt", "zeta.txt", "eta.txt",
+        "alpha.txt",
+        "beta.txt",
+        "gamma.txt",
+        "delta.txt",
+        "epsilon.txt",
+        "zeta.txt",
+        "eta.txt",
         "theta.txt",
     ];
 
@@ -288,7 +297,10 @@ mod the_fold {
     }
 
     fn open_policy() -> Policy {
-        Policy::default().layer("test").allow_read("*").allow_write("*")
+        Policy::default()
+            .layer("test")
+            .allow_read("*")
+            .allow_write("*")
     }
 
     // ------------------------------------------------------------------ F1
@@ -310,7 +322,13 @@ mod the_fold {
         let seen = Arc::clone(&folds.0);
 
         let result = io_harness::run_with_observed(
-            &contract(dir.path(), Compaction { at_share: 0.8, keep_recent: 2 }),
+            &contract(
+                dir.path(),
+                Compaction {
+                    at_share: 0.8,
+                    keep_recent: 2,
+                },
+            ),
             &provider,
             &store,
             &open_policy(),
@@ -321,7 +339,10 @@ mod the_fold {
         .unwrap();
 
         let folded = seen.lock().unwrap().clone();
-        assert!(!folded.is_empty(), "the run never folded; nothing below is meaningful");
+        assert!(
+            !folded.is_empty(),
+            "the run never folded; nothing below is meaningful"
+        );
         assert!(
             folded[0].2 < folded[0].1,
             "a fold must shrink the section: {folded:?}"
@@ -371,7 +392,13 @@ mod the_fold {
         let seen = Arc::clone(&folds.0);
 
         let result = io_harness::run_with_observed(
-            &contract(dir.path(), Compaction { at_share: 1.0, ..Compaction::default() }),
+            &contract(
+                dir.path(),
+                Compaction {
+                    at_share: 1.0,
+                    ..Compaction::default()
+                },
+            ),
             &provider,
             &store,
             &open_policy(),
@@ -457,7 +484,10 @@ mod the_fold {
             run_with(&contract, &first, &store, &open_policy(), &ApproveAll),
         )
         .await;
-        assert!(dropped.is_err(), "the first pass was meant to be dropped mid-step");
+        assert!(
+            dropped.is_err(),
+            "the first pass was meant to be dropped mid-step"
+        );
         let run_id = store.last_run().unwrap().expect("a run row");
         let rows = store.summaries(run_id).unwrap();
         assert_eq!(rows.len(), 1, "one fold, one row: {rows:?}");
@@ -519,7 +549,13 @@ mod the_fold {
         let seen = Arc::clone(&folds.0);
 
         let result = io_harness::run_with_observed(
-            &contract(dir.path(), Compaction { at_share: 0.8, keep_recent: 2 }),
+            &contract(
+                dir.path(),
+                Compaction {
+                    at_share: 0.8,
+                    keep_recent: 2,
+                },
+            ),
             &provider,
             &store,
             &open_policy(),
@@ -550,7 +586,11 @@ mod the_fold {
         }
         assert_eq!(
             store.spent_tokens(result.run_id).unwrap(),
-            calls.iter().filter_map(|c| c.usage).map(|u| u.total_tokens).sum::<u64>(),
+            calls
+                .iter()
+                .filter_map(|c| c.usage)
+                .map(|u| u.total_tokens)
+                .sum::<u64>(),
             "the fold's tokens are inside what the run is billed"
         );
     }

@@ -4307,95 +4307,97 @@ async fn run_workspace_from<P: Provider>(
         let mut fold_tokens = 0;
         let mut recovered = false;
         let (response, assembled, user) = loop {
-        fold_tokens += compact_ledger(
-            provider,
-            contract,
-            store,
-            run_id,
-            step,
-            watch,
-            0,
-            &mut ledger,
-            &mut written,
-            budget_tokens,
-            recovered,
-        )
-        .await?;
-        let assembled = assemble(
-            &ledger,
-            budget_tokens,
-            &notes,
-            Assembly {
-                ws: Some(&ws),
-                policy: &effective,
+            fold_tokens += compact_ledger(
+                provider,
+                contract,
                 store,
                 run_id,
                 step,
-            },
-        )
-        .await?;
-        let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
-        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
-        let request = CompletionRequest {
-            // 0.37.0 — the conversational prompt is this turn's opening only. Every
-            // later step is the loop of 0.36.1, asked the way it has always been
-            // asked: permitting an answer is a decision about a turn's first
-            // completion, not a licence to stop at a plan in prose on step nine.
-            system: match &conversational {
-                Some(c) if step == start_step => c.clone(),
-                _ => system.clone(),
-            },
-            user: user.clone(),
-            tools: tools.clone(),
-            // 0.22.0 — the run's web declaration, unchanged per step.
-            web: contract.web.clone(),
-            // 0.31.0 — the root's tier, unchanged per step.
-            effort: contract.effort,
-            #[cfg(feature = "media")]
-            media: attach_media(contract, pending_media)?,
-            ..Default::default()
-        };
-        // 0.34.0 — the rule that changes which model answers, applied to the
-        // request that is actually sent rather than recorded beside it.
-        let mut request = request;
-        apply_routing(
-            contract,
-            &mut request,
-            &mut routed_model,
-            store,
-            run_id,
-            root,
-            step,
-            watch,
-            0,
-        );
+                watch,
+                0,
+                &mut ledger,
+                &mut written,
+                budget_tokens,
+                recovered,
+            )
+            .await?;
+            let assembled = assemble(
+                &ledger,
+                budget_tokens,
+                &notes,
+                Assembly {
+                    ws: Some(&ws),
+                    policy: &effective,
+                    store,
+                    run_id,
+                    step,
+                },
+            )
+            .await?;
+            let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+            #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+            let request = CompletionRequest {
+                // 0.37.0 — the conversational prompt is this turn's opening only. Every
+                // later step is the loop of 0.36.1, asked the way it has always been
+                // asked: permitting an answer is a decision about a turn's first
+                // completion, not a licence to stop at a plan in prose on step nine.
+                system: match &conversational {
+                    Some(c) if step == start_step => c.clone(),
+                    _ => system.clone(),
+                },
+                user: user.clone(),
+                tools: tools.clone(),
+                // 0.22.0 — the run's web declaration, unchanged per step.
+                web: contract.web.clone(),
+                // 0.31.0 — the root's tier, unchanged per step.
+                effort: contract.effort,
+                #[cfg(feature = "media")]
+                media: attach_media(contract, pending_media)?,
+                ..Default::default()
+            };
+            // 0.34.0 — the rule that changes which model answers, applied to the
+            // request that is actually sent rather than recorded beside it.
+            let mut request = request;
+            apply_routing(
+                contract,
+                &mut request,
+                &mut routed_model,
+                store,
+                run_id,
+                root,
+                step,
+                watch,
+                0,
+            );
 
-        match complete_with_retry(
-            provider,
-            &request,
-            contract,
-            store,
-            run_id,
-            step,
-            watch,
-            0,
-            extras.stream,
-            !recovered && contract.compaction.enabled(),
-        )
-        .await
-        {
-            Ok(response) => break (response, assembled, user),
-            // The same condition `may_compact` was passed under, so the loop and
-            // `complete_with_retry` cannot disagree about whether this run is
-            // allowed to recover — with folding off, the call above has already
-            // finished the run as escalated and retrying here would drive a run
-            // that has ended.
-            Err(e) if !recovered && contract.compaction.enabled() && is_context_overflow(&e) => {
-                recovered = true;
-                continue;
+            match complete_with_retry(
+                provider,
+                &request,
+                contract,
+                store,
+                run_id,
+                step,
+                watch,
+                0,
+                extras.stream,
+                !recovered && contract.compaction.enabled(),
+            )
+            .await
+            {
+                Ok(response) => break (response, assembled, user),
+                // The same condition `may_compact` was passed under, so the loop and
+                // `complete_with_retry` cannot disagree about whether this run is
+                // allowed to recover — with folding off, the call above has already
+                // finished the run as escalated and retrying here would drive a run
+                // that has ended.
+                Err(e)
+                    if !recovered && contract.compaction.enabled() && is_context_overflow(&e) =>
+                {
+                    recovered = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => return Err(e),
-        }
         };
         // 0.30.0: which notes this turn actually leaned on, recorded per run. The
         // trace already said how many were carried; it could not say which, and a
@@ -5866,89 +5868,91 @@ fn run_agent<'f, P: Provider>(
             let mut fold_tokens = 0;
             let mut recovered = false;
             let (response, assembled, user) = loop {
-            fold_tokens += compact_ledger(
-                tree.provider,
-                contract,
-                tree.store,
-                run_id,
-                step,
-                tree.watch,
-                depth,
-                &mut ledger,
-                &mut written,
-                budget_tokens,
-                recovered,
-            )
-            .await?;
-            let assembled = assemble(
-                &ledger,
-                budget_tokens,
-                &notes,
-                Assembly {
-                    ws: Some(&ws),
-                    policy,
-                    store: tree.store,
+                fold_tokens += compact_ledger(
+                    tree.provider,
+                    contract,
+                    tree.store,
                     run_id,
                     step,
-                },
-            )
-            .await?;
-            let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
-            #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
-            let request = CompletionRequest {
-                // 0.39.0 — a contained turn's opening is its first completion
-                // only. Every later step is the tree loop of 0.38.0, asked the way
-                // it has always been asked.
-                system: match &conversational {
-                    Some(c) if step == start_step => c.clone(),
-                    _ => system.clone(),
-                },
-                user: user.clone(),
-                tools: tools.clone(),
-                // 0.21.0 — a named agent's model. `None` for the root and for any
-                // child spawned without a definition, which is what every provider
-                // reads as "the model you were built with".
-                model: identity.and_then(|d| d.model.clone()),
-                // 0.22.0 — this agent's declaration, which for a child is the
-                // root's, copied in by `spawn_child` rather than taken from the
-                // spawn arguments.
-                web: contract.web.clone(),
-                // 0.31.0 — this role's tier, falling back to the run's. The
-                // definition wins because that is where "search cheaply, think hard
-                // only where thinking is the work" is said; the contract's is the
-                // root's own, and a child spawned without a definition inherits it.
-                effort: identity.and_then(|d| d.effort).or(contract.effort),
-                #[cfg(feature = "media")]
-                media: attach_media(contract, pending_media)?,
-                ..Default::default()
-            };
-            match complete_with_retry(
-                tree.provider,
-                &request,
-                contract,
-                tree.store,
-                run_id,
-                step,
-                tree.watch,
-                depth,
-                // Streaming is the turn's choice and reaches the root only: a
-                // child's text is composed back into its parent, not shown.
-                extras.stream,
-                !recovered && contract.compaction.enabled(),
-            )
-            .await
-            {
-                Ok(response) => break (response, assembled, user),
-                // Same condition as `may_compact` above, for the reason the flat
-                // loop states.
-                Err(e)
-                    if !recovered && contract.compaction.enabled() && is_context_overflow(&e) =>
+                    tree.watch,
+                    depth,
+                    &mut ledger,
+                    &mut written,
+                    budget_tokens,
+                    recovered,
+                )
+                .await?;
+                let assembled = assemble(
+                    &ledger,
+                    budget_tokens,
+                    &notes,
+                    Assembly {
+                        ws: Some(&ws),
+                        policy,
+                        store: tree.store,
+                        run_id,
+                        step,
+                    },
+                )
+                .await?;
+                let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
+                #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+                let request = CompletionRequest {
+                    // 0.39.0 — a contained turn's opening is its first completion
+                    // only. Every later step is the tree loop of 0.38.0, asked the way
+                    // it has always been asked.
+                    system: match &conversational {
+                        Some(c) if step == start_step => c.clone(),
+                        _ => system.clone(),
+                    },
+                    user: user.clone(),
+                    tools: tools.clone(),
+                    // 0.21.0 — a named agent's model. `None` for the root and for any
+                    // child spawned without a definition, which is what every provider
+                    // reads as "the model you were built with".
+                    model: identity.and_then(|d| d.model.clone()),
+                    // 0.22.0 — this agent's declaration, which for a child is the
+                    // root's, copied in by `spawn_child` rather than taken from the
+                    // spawn arguments.
+                    web: contract.web.clone(),
+                    // 0.31.0 — this role's tier, falling back to the run's. The
+                    // definition wins because that is where "search cheaply, think hard
+                    // only where thinking is the work" is said; the contract's is the
+                    // root's own, and a child spawned without a definition inherits it.
+                    effort: identity.and_then(|d| d.effort).or(contract.effort),
+                    #[cfg(feature = "media")]
+                    media: attach_media(contract, pending_media)?,
+                    ..Default::default()
+                };
+                match complete_with_retry(
+                    tree.provider,
+                    &request,
+                    contract,
+                    tree.store,
+                    run_id,
+                    step,
+                    tree.watch,
+                    depth,
+                    // Streaming is the turn's choice and reaches the root only: a
+                    // child's text is composed back into its parent, not shown.
+                    extras.stream,
+                    !recovered && contract.compaction.enabled(),
+                )
+                .await
                 {
-                    recovered = true;
-                    continue;
+                    Ok(response) => break (response, assembled, user),
+                    // Same condition as `may_compact` above, for the reason the flat
+                    // loop states.
+                    Err(e)
+                        if !recovered
+                            && contract.compaction.enabled()
+                            && is_context_overflow(&e) =>
+                    {
+                        recovered = true;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
-            }
             };
             // Same record on the tree path: a sub-agent's run is a run, and its
             // recalls belong to it rather than to whoever spawned it. Recorded once,

@@ -261,7 +261,7 @@ impl Session {
     /// [`turn_bounded`](Session::turn_bounded) carrying both sends both.
     ///
     /// A provider that does not accept images refuses the turn before anything is
-    /// sent; see [`Provider::accepts_images`](crate::Provider::accepts_images).
+    /// sent; see [`Provider::accepts_images`].
     ///
     /// ```no_run
     /// use io_harness::provider::Media;
@@ -691,7 +691,7 @@ impl Session {
     /// It is also the other half of compaction. A fold replaces the older half of
     /// a run's observations with a paragraph, which is acceptable precisely because
     /// the observations stay on disk — and this is how they come back out: each
-    /// turn carries the [`Summary`] rows its run wrote, so a reader can see where a
+    /// turn carries the [`Summary`](crate::Summary) rows its run wrote, so a reader can see where a
     /// paragraph stands in for the steps behind it.
     ///
     /// ```no_run
@@ -1216,7 +1216,11 @@ impl Transcript {
     /// a reader comparing a transcript against what the model seems to know needs
     /// to know which turns it can still see.
     pub fn to_markdown(&self) -> String {
-        let mut out = format!("# Session {}\n\n`{}`\n", self.session_id, self.root.display());
+        let mut out = format!(
+            "# Session {}\n\n`{}`\n",
+            self.session_id,
+            self.root.display()
+        );
         if self.turns.is_empty() {
             out.push_str("\n_No turns._\n");
             return out;

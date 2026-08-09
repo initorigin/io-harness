@@ -439,9 +439,7 @@ pub use sandbox::{
     copy_back, select, Backend, Cap, Sandbox, SandboxConfig, SandboxLimits, SandboxOutcome,
     Selected,
 };
-pub use session::{
-    Session, Steer, SteerInbox, Transcript, TranscriptTurn, TurnKind, TurnResult,
-};
+pub use session::{Session, Steer, SteerInbox, Transcript, TranscriptTurn, TurnKind, TurnResult};
 pub use skills::{Skill, Skills};
 // `AgentEvent` and `SpawnRow` were `pub` inside this private module but were not
 // re-exported, so `Store::agent_events` and `Store::find_spawn` returned values an
@@ -455,8 +453,7 @@ pub use state::{
     MemoryEntry, MemoryKind, MemoryRecall, MemoryWrite, Pending, PendingPlan, PendingQuestion,
     PolicyEvent, ProcessHandle, ProviderCall, Recovery, RewindRecord, RunStatus, RunSummary,
     SandboxEvent, SpawnRow, StepRecord, Store, Summary, Tally, TodoItem, TodoState, Turn,
-    BUSY_TIMEOUT,
-    CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
+    BUSY_TIMEOUT, CHECKPOINT_FORMAT, MEMORY_MAX_CHARS, MEMORY_MAX_ENTRIES, MEMORY_MAX_ENTRY_CHARS,
     SUCCESS_OUTCOME, TODO_MAX_ITEMS, TODO_TEXT_CAP, UNKNOWN_MODEL,
 };
 pub use template::{Template, Templates};

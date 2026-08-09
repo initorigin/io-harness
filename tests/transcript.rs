@@ -53,7 +53,10 @@ impl Provider for Talker {
 }
 
 fn open_policy() -> Policy {
-    Policy::default().layer("test").allow_read("*").allow_write("*")
+    Policy::default()
+        .layer("test")
+        .allow_read("*")
+        .allow_write("*")
 }
 
 // ---------------------------------------------------------------- F7
@@ -164,18 +167,33 @@ async fn a_summary_is_rendered_as_standing_in_for_what_it_replaced() {
     let provider = Talker::new(&["done"]);
     let mut session = Session::open(&store, dir.path()).unwrap();
     let turn = session
-        .turn("what changed?", &provider, &store, &open_policy(), &ApproveAll)
+        .turn(
+            "what changed?",
+            &provider,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
         .await
         .unwrap();
 
     // Written directly: what is under test is the rendering, not the fold, and
     // the fold has its own suite.
     store
-        .put_summary(turn.run_id, 9, 21, "Read the lexer; kept the token enum.", 8)
+        .put_summary(
+            turn.run_id,
+            9,
+            21,
+            "Read the lexer; kept the token enum.",
+            8,
+        )
         .unwrap();
 
     let md = session.transcript(&store).unwrap().to_markdown();
-    assert!(md.contains("21 earlier observations were summarised"), "{md}");
+    assert!(
+        md.contains("21 earlier observations were summarised"),
+        "{md}"
+    );
     assert!(md.contains("kept the token enum"), "{md}");
     assert!(md.contains("At step 9"), "{md}");
 }
@@ -190,7 +208,13 @@ async fn exporting_calls_no_provider_and_writes_no_row() {
     let provider = Talker::new(&["done"]);
     let mut session = Session::open(&store, dir.path()).unwrap();
     let turn = session
-        .turn("what changed?", &provider, &store, &open_policy(), &ApproveAll)
+        .turn(
+            "what changed?",
+            &provider,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
         .await
         .unwrap();
 
