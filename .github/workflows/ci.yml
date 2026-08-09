@@ -280,6 +280,21 @@ jobs:
         run: |
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
           cat /sys/kernel/security/lsm || true
+      # `--lib --tests` does not build `examples/`, and five of the fixtures are
+      # spawned as child processes by tests this leg runs. Trap 86: splitting a
+      # job removes an ordering nothing declared, and this leg is a split of the
+      # `test` job above. The list is the same one, guarded by
+      # `tests/ci_workflow.rs` against the set the tests actually spawn.
+      - run: >
+          cargo build --tests
+          --example attach_fixture
+          --example crash_fixture
+          --example fleet_fixture
+          --example flood
+          --example mcp_fixture_server
+          --example orphan
+          --example plan_gate_fixture
+          --example tick
       - run: cargo nextest run --lib --tests
         env:
           IO_HARNESS_EXPECT_BACKEND: linux-landlock

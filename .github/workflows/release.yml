@@ -185,6 +185,18 @@ jobs:
         run: |
           sysctl kernel.apparmor_restrict_unprivileged_userns || true
           cat /sys/kernel/security/lsm || true
+      # See the note in ci.yml: `--lib --tests` does not build `examples/`, and
+      # this leg runs tests that spawn five of them.
+      - run: >
+          cargo build --tests
+          --example attach_fixture
+          --example crash_fixture
+          --example fleet_fixture
+          --example flood
+          --example mcp_fixture_server
+          --example orphan
+          --example plan_gate_fixture
+          --example tick
       - run: cargo test --lib --tests
         env:
           IO_HARNESS_EXPECT_BACKEND: linux-landlock
