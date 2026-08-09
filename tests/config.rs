@@ -1897,10 +1897,19 @@ fn an_unknown_key_inside_a_profile_that_is_never_selected_is_rejected_naming_it(
     assert!(err.contains("may not contain profiles"), "{err}");
 }
 
-/// F7 — a repository's own instructions reach the model without a new
-/// `TaskContract` field.
+/// F6/F7 (0.45.0) — a repository's own instructions are discovered without being
+/// asked for, and reach the contract as instructions rather than as constraints.
+///
+/// **This test asserted the opposite until 0.45.0 and was changed on purpose.**
+/// 0.27.0 put the discovered text in `constraints` because a new `TaskContract`
+/// field was a break at the time, and ran discovery only where an `[instructions]`
+/// table was present. Both were deliberate then and both are deliberately reversed
+/// now: the type has been `#[non_exhaustive]` since 0.35.0 so the field is free, a
+/// constraint is a rule the goal is checked against rather than guidance, and a
+/// repository carrying the file every other agent reads was being read by none of
+/// this crate. The opt-out is an explicit empty list, asserted below.
 #[test]
-fn discovered_instructions_reach_the_contract_as_constraints() {
+fn discovered_instructions_reach_the_contract_as_instructions() {
     let user_dir = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let _guard = env(user_dir.path());
@@ -1911,25 +1920,45 @@ fn discovered_instructions_reach_the_contract_as_constraints() {
     let applied = Config::discover(project.path())
         .unwrap()
         .apply_to(contract(project.path()));
-    assert_eq!(applied.constraints.len(), 1);
-    assert!(applied.constraints[0].contains("Never touch `generated/`."));
+    assert_eq!(applied.instructions.len(), 1);
+    assert!(applied.instructions[0].contains("Never touch `generated/`."));
     assert!(
-        applied.constraints[0].contains("AGENTS.md"),
-        "each constraint names the file it came from: {:?}",
-        applied.constraints[0]
+        applied.instructions[0].contains("AGENTS.md"),
+        "each instruction names the file it came from: {:?}",
+        applied.instructions[0]
+    );
+    assert!(
+        applied.constraints.is_empty(),
+        "the repository's guidance is not a constraint: {:?}",
+        applied.constraints
     );
 
-    // Control one: with no `[instructions]` section, the very same `AGENTS.md` is
-    // not read. Nothing is loaded implicitly, including this.
+    // F6 — with no `[instructions]` table at all, the same `AGENTS.md` is read. The
+    // caller still chose to read the configuration; what changed is that a project
+    // no longer has to name the file every other agent already reads.
     write(project.path(), "io.toml", "[run]\nmax_steps = 3\n");
     let config = Config::discover(project.path()).unwrap();
-    assert!(config.instructions().is_empty());
+    assert_eq!(config.instructions().len(), 1);
+
+    // F6 — and with no `io.toml` whatsoever, which is the case the release is for.
+    std::fs::remove_file(project.path().join("io.toml")).unwrap();
+    let config = Config::discover(project.path()).unwrap();
+    assert_eq!(config.instructions().len(), 1);
+
+    // F6 — the opt-out, and the distinction that makes it one: an explicit empty
+    // list is not an absent table.
+    write(project.path(), "io.toml", "[instructions]\nfiles = []\n");
+    let config = Config::discover(project.path()).unwrap();
+    assert!(
+        config.instructions().is_empty(),
+        "`files = []` did not turn discovery off"
+    );
     assert!(config
         .apply_to(contract(project.path()))
-        .constraints
+        .instructions
         .is_empty());
 
-    // Control two: a named file that is absent is skipped rather than failing the
+    // Control: a named file that is absent is skipped rather than failing the
     // load. This is discovery, not substitution — the one place this module's
     // "resolve or fail" rule deliberately does not apply.
     write(
@@ -1939,6 +1968,18 @@ fn discovered_instructions_reach_the_contract_as_constraints() {
     );
     let config = Config::discover(project.path()).unwrap();
     assert_eq!(config.instructions().len(), 1);
+
+    // Control: a file that holds only whitespace is skipped too.
+    write(project.path(), "BLANK.md", "   \n\n");
+    write(
+        project.path(),
+        "io.toml",
+        "[instructions]\nfiles = [\"BLANK.md\"]\n",
+    );
+    assert!(Config::discover(project.path())
+        .unwrap()
+        .instructions()
+        .is_empty());
 }
 
 /// F8 — `IO_CONFIG` names the user-scope file directly, and the scopes stay four.

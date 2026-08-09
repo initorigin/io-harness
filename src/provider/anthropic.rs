@@ -289,6 +289,12 @@ impl Anthropic {
 }
 
 impl Provider for Anthropic {
+    /// 0.45.0 — stated rather than derived from the slug, so a caller pointing this
+    /// provider at an alias its own account defines still gets this family.
+    fn prompt_family(&self) -> crate::provider::PromptFamily {
+        crate::provider::PromptFamily::Anthropic
+    }
+
     fn name(&self) -> &str {
         "anthropic"
     }

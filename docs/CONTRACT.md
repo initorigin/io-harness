@@ -1225,6 +1225,108 @@ has staged one sends both. A provider whose `accepts_images` is false refuses th
 turn before anything is sent, which is 0.42.0's refusal reached through a new door.
 `media` feature only; without it, nothing here exists.
 
+## What the system prompt says, and who may change it (0.45.0)
+
+The system prompt is composed once per run, before the first request, from parts
+in a fixed order:
+
+1. the description of the agent and its tools — the crate's, or the caller's when
+   `TaskContract::prompt` is `SystemPrompt::Replace`;
+2. the extra-tool catalogue and the skills catalogue, as since 0.20.0;
+3. the planning directive, when the plan gate is on;
+4. the caller's own text, when `TaskContract::prompt` is `SystemPrompt::Append`;
+5. the repository's own guidance, when `[instructions]` discovered any;
+6. the boundary section, when the run enforces a policy or asked for containment;
+7. **the crate's ending sentence, last, always.**
+
+**Nothing a caller or a repository supplies is emitted after step 7.** The ending
+of a classifying turn's opening is the sentence that lets a turn answer instead of
+working, and the guarantee it produces — a `TurnKind::Reply` stages no step, no
+gate, no checkpoint, no snapshot and no approval (0.37.0) — is one this document
+makes to a reader who never sees the embedder's prompt. A composable prompt that
+could contradict its own runtime's contract would not be a feature. What this
+crate asserts is the composition: the sentence is present, byte-exact, and last,
+under every `SystemPrompt` including `Replace("")`, and under any text a
+repository carries. **What a model then does with a prompt is not a claim this
+crate can make.**
+
+**The ending moved in 0.45.0.** Until 0.44.0 it sat inside the base description,
+which put the tool and skill catalogues after it. Every sentence a 0.44.0 prompt
+carried is still carried, in the same words; one of them is in a different place.
+
+`SystemPrompt::Replace` replaces the description and nothing else — the
+catalogues, the guidance, the boundary and the ending are still composed around
+it. There is no preset catalogue and there will not be one: a preset shipped by a
+library is an opinion about model behaviour the library cannot test and cannot
+withdraw.
+
+## What the boundary section tells the agent, and what it leaves out (0.45.0)
+
+When a run enforces a policy, the system block carries one line per act — read,
+write, execute, network — naming that tier's default and the patterns the layers
+rule on, grouped by what `Policy::explain` returns for each and attributed, on a
+refusal, to the layer that produced it. It is the same vocabulary a `Refused`
+event carries, so the prompt and the refusal name the same thing.
+
+- **A permissive policy renders nothing**, and single-file mode never renders it,
+  because single-file mode enforces no policy. A section describing an
+  enforcement that does not happen would be worse than silence.
+- **At most 24 patterns per act are named**, and the line says how many it did not
+  name. The unnamed rules are enforced exactly the same.
+- **`Effect::Ask` is rendered as itself** — allowed once a human or an approver
+  says yes. Neither "allowed" nor "refused" is true of it, and both mislead.
+- **A rule an approver remembers mid-run is not reflected**, because the prompt is
+  composed once. The remembered rule *widens* what is permitted, so the section
+  stays conservative rather than wrong. A plan gate is reflected: the narrowed
+  policy is what the planning prompt describes, and the loop already switches
+  prompts when the phase ends.
+- **The section is not the boundary.** The `Policy` is, enforced in the tool and
+  verification layers before any call runs. Telling the agent is an optimisation
+  against paying a step per refusal, and no prompt text widens anything.
+
+With `TaskContract::exec_sandbox` set, one further line names the backend
+`sandbox::select` **actually returned** on this host — not the one that was asked
+for. Where that is the portable floor or a Windows Job Object, the line says the
+resource caps apply and filesystem and outbound-network confinement do not, which
+on a stock Ubuntu 24.04 is the truth an agent would otherwise have to discover
+(0.40.0).
+
+## What a repository's own guidance is, and where it now rides (0.45.0)
+
+`[instructions]` is discovered **by default** from 0.45.0: `Config::discover`
+looks for `AGENTS.md` whether or not an `[instructions]` table is present, and
+`[instructions] files = []` is how a project says no. Nothing became implicit that
+was not already — the caller still chooses to read the configuration, once, before
+the run.
+
+What it finds lands in `TaskContract::instructions` and rides in the **system
+block**. From 0.27.0 to 0.44.0 it landed in `TaskContract::constraints` and rode
+in the user turn on every step. The two are different things: a constraint is a
+rule the goal is checked against, and this is guidance the agent reads.
+
+**It is untrusted text, and 0.45.0 moved it somewhere more authoritative.** A
+repository is not the operator. What bounds it is structural rather than
+advisory: the text is delimited, framed to the model as the repository's own
+guidance that grants nothing and does not change how the turn ends, and emitted
+**before** both the boundary section and the crate's ending, so it cannot be the
+last word. It grants nothing because the policy is enforced before any call runs.
+Treat a workspace whose instructions file you have not read the way you would
+treat its code.
+
+## What a prompt family changes (0.45.0)
+
+`Provider::prompt_family` classifies the model answering — from the provider for
+the two built-in vendors, from the model slug for `OpenRouter` and `Compatible`,
+and `PromptFamily::Generic` for everything this crate does not recognise, which
+includes every `Compatible` endpoint it does not control.
+
+**It decides delimiters and nothing else.** Every family is given the same
+sections, in the same order, with the same words, ending with the same sentence;
+the crate asserts that by stripping the delimiters and comparing the rest byte for
+byte. Today the Anthropic family wraps sections in tagged blocks, as that vendor's
+own prompting guidance asks for, and the others read the same text plainly. No
+claim is made anywhere that one family's wording performs better than another's.
+
 ## Limits that hold today
 
 Stated here rather than discovered later. Each is real, each is known, and none

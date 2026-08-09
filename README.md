@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.44"
+io-harness = "0.45"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -329,7 +329,8 @@ embedder reads a `ProviderSpec` rather than writing provider-selection code.
 `[app]` is a section the crate stores and never validates, so the programs built
 on it keep their own settings in the same file; `[profile.<name>]` overlays a
 named set of choices; `[instructions]` discovers the `AGENTS.md` a repository
-already carries. `${env:...}`, `${file:...}` and `${cmd:...}` keep a credential
+already carries — by default as of 0.45.0, with `files = []` as the opt-out — and
+carries it in the system block as the repository's own guidance. `${env:...}`, `${file:...}` and `${cmd:...}` keep a credential
 out of the file, an unknown key is an error rather than a shrug, and nothing is
 loaded implicitly: the caller reads the file, before the run, once. A **project**
 file may narrow the boundary and may never widen it — the keys that would make

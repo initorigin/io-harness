@@ -589,9 +589,10 @@ pub struct Config {
     /// [`Config::with_profile`] can overlay through the same [`merge`] the scopes
     /// use rather than inventing a second set of merge semantics.
     raw: toml::value::Table,
-    /// What `[instructions]` found, already worded as constraints. Read once, in
-    /// [`Config::discover`], which is the caller's own call — the run loop never
-    /// reads a file.
+    /// What `[instructions]` found, already worded and attributed to the file it
+    /// came from. Read once, in [`Config::discover`], which is the caller's own
+    /// call — the run loop never reads a file. Carried in the system block since
+    /// 0.45.0, not in `TaskContract::constraints`.
     instructions: Vec<String>,
     /// Which file decided each key, by dotted path (0.30.0).
     ///
@@ -1016,19 +1017,29 @@ impl Config {
             .map_err(|e: toml::de::Error| Error::Config(format!("`[app.{key}]`: {}", e.message())))
     }
 
-    /// What `[instructions]` discovered, worded as constraints (0.27.0).
+    /// What `[instructions]` discovered, worded and attributed (0.27.0).
     ///
     /// One entry per file that existed and carried text, each naming the file it came
-    /// from, and applied to a contract by [`Config::apply_to`]. Empty where the file
-    /// has no `[instructions]` section, where no named file exists, and always for
-    /// [`Config::from_toml`], which has no root to discover against.
+    /// from, and applied to a contract by [`Config::apply_to`] — which since 0.45.0
+    /// puts it in [`TaskContract::instructions`](crate::TaskContract::instructions)
+    /// and carries it in the **system block**, not in
+    /// [`constraints`](crate::TaskContract::constraints) and not in the user turn. A
+    /// constraint is a rule the goal is checked against; this is guidance the agent
+    /// reads. Empty where no named file exists, where a project opted out with
+    /// `[instructions] files = []`, and always for [`Config::from_toml`], which has no
+    /// root to discover against.
+    ///
+    /// Since 0.45.0 the search runs whether or not an `[instructions]` table is
+    /// present, so a repository carrying `AGENTS.md` and no `io.toml` is read.
     ///
     /// The files are read inside [`Config::discover`] — the caller's own call, before
     /// the run — so "nothing is loaded implicitly" still holds exactly.
     ///
-    /// **They are untrusted text.** A discovered `AGENTS.md` reaches the model
-    /// verbatim and grants nothing: the boundary is still the [`Policy`] the caller
-    /// loaded.
+    /// **They are untrusted text**, and 0.45.0 moved them somewhere more
+    /// authoritative. A discovered `AGENTS.md` reaches the model inside a delimited
+    /// section that frames it as the repository's guidance, ahead of the boundary
+    /// section and the crate's own ending, and it grants nothing: the boundary is
+    /// still the [`Policy`] the caller loaded, enforced before any call runs.
     pub fn instructions(&self) -> &[String] {
         &self.instructions
     }
@@ -1430,12 +1441,15 @@ impl Config {
         if let Some(web) = &self.file.web {
             out = out.with_web(web.clone());
         }
-        // 0.27.0 — discovered project instructions land in `constraints`, the field
-        // that already exists to carry "extra rules the agent must respect, surfaced
-        // to the model verbatim". A new `TaskContract` field would be a break, and
-        // this release carries none.
+        // 0.45.0 — discovered project instructions land in `instructions`, not in
+        // `constraints`. 0.27.0 put them in `constraints` because a new
+        // `TaskContract` field was a break at the time; the type has been
+        // `#[non_exhaustive]` since 0.35.0, so the field is free, and the two things
+        // were never the same: a constraint is a rule the goal is checked against and
+        // rides in the user turn on every step, while this is a repository's guidance,
+        // carried once in the system block.
         for instruction in &self.instructions {
-            out = out.with_constraint(instruction.clone());
+            out = out.with_instruction(instruction.clone());
         }
 
         let Some(run) = &self.file.run else {
@@ -1679,10 +1693,13 @@ fn refuse_nested_profiles(file: &File, path: &Path) -> Result<()> {
 /// governs `${...}` deliberately does not apply. The file name rides in the text so a
 /// reader of the constraint — or of the trace — can see where it came from.
 fn read_instructions(file: &File, root: &Path) -> Result<Vec<String>> {
-    let Some(section) = &file.instructions else {
-        return Ok(Vec::new());
-    };
-    let names = match &section.files {
+    // 0.45.0 — an absent `[instructions]` table now means the defaults rather than
+    // nothing. `AGENTS.md` has been the default name since 0.27.0, but discovery ran
+    // only where the table was present, so a repository carrying the file every other
+    // agent reads and no `io.toml` at all was read by none of it. An explicit
+    // `files = []` is how a project says no, and it is distinct from an absent table
+    // — the same distinction `Option<Vec<_>>` already carried and nothing read.
+    let names = match file.instructions.as_ref().and_then(|s| s.files.as_ref()) {
         Some(files) => files.clone(),
         None => DEFAULT_INSTRUCTIONS.iter().map(PathBuf::from).collect(),
     };

@@ -399,7 +399,7 @@ pub use approve::{
 pub use config::{Config, ProviderSpec};
 pub use containment::{Containment, Draw, FleetTally, Ledger, SpawnRefusal};
 pub use context::{Compaction, ContextBudget};
-pub use contract::{Routing, TaskContract};
+pub use contract::{Routing, SystemPrompt, TaskContract};
 pub use error::{Error, ProviderErrorKind, Result};
 pub use hooks::Hooks;
 pub use mcp::{McpServer, McpTransport, MCP_TOOL_PREFIX};
@@ -414,7 +414,7 @@ pub use plugin::{Dropped, Plugin, Plugins, MAX_ID, NAMESPACE, PLUGIN_FILE};
 pub use policy::{Act, Defaults, Effect, Layer, Policy, Rule, Verdict};
 pub use provider::{
     Anthropic, Auth, Compatible, CompletionRequest, CompletionResponse, Effort, ModelInfo, OpenAi,
-    OpenRouter, PriceSource, Provider, Reference, ToolCall, ToolSpec, Usage,
+    OpenRouter, PriceSource, PromptFamily, Provider, Reference, ToolCall, ToolSpec, Usage,
 };
 #[cfg(feature = "media")]
 pub use provider::{Media, IMAGE_MEDIA_TYPES};
