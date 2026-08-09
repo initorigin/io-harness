@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.45"
+io-harness = "0.46"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -137,27 +137,30 @@ beside `deny_exec("cargo publish*")` means what it reads. A whole command line �
 pipelines, redirects, `&&` — is `shell`, parsed in this crate rather than by a
 shell and checked stage by stage before the first process starts. `shell_start`,
 `shell_poll` and `shell_kill` are the same line with a longer life, for a dev
-server or a log tail that has to outlive the step that started it. By default a
-command runs with your process's privileges and is **not** sandboxed — that bound
-is stated in full in the [command execution guide](docs/guide/command-execution.md),
-because it is the widest thing the crate grants.
+server or a log tail that has to outlive the step that started it.
 
-**And a contract can ask for the narrower thing.**
-`TaskContract::with_contained_exec(SandboxConfig)` puts every command `exec` and
-the foreground `shell` start inside the sandbox backend this host offers: the
-config's resource caps, filesystem writes confined to the workspace, and outbound
-network denied unless the run's policy would permit it. The **workspace root**
-stays the working directory — nothing is copied in and nothing is discarded — so
-an incremental build survives between commands, which is what made containment
-unusable for a project's own toolchain before. What each platform actually
-enforces differs and the difference is not cosmetic: macOS and Linux confine
-writes and deny egress, a Windows Job Object applies the resource caps and has no
-filesystem or network facility at all, and a host that refuses the native
-primitive falls back to the portable floor and **records the floor**, so a run
-contained less than you asked for is legible afterwards. The costs — egress is one
-boolean per run, the long-lived `shell_start` handles are not contained, and a
-toolchain writing to a user-level cache like `~/.cargo/registry` fails under
-containment on macOS — are stated in
+**A run is contained unless you say otherwise.** Since 0.46.0 every command
+`exec` and the foreground `shell` start runs inside the sandbox backend this host
+offers, writing to the workspace root, the system temporary directory and the
+detected toolchain's own caches — and nowhere else. `ExecMode` names the three
+grants: `ReadOnly`, `WorkspaceWrite` (the default) and `FullAccess`, which is what
+every release up to 0.45.0 did by default and is now
+`TaskContract::with_full_access()` — a sentence in your source rather than a field
+you never set, because it is the widest thing the crate grants. The default
+carries **no resource cap**: containment says where a command may write, and
+`with_contained_exec(SandboxConfig::new())` is how you add the ceilings.
+
+The **workspace root** stays the working directory — nothing is copied in and
+nothing is discarded — so an incremental build survives between commands, and the
+toolchain's own cache being writable is what lets a default-contained `cargo` or
+`npm` run at all. What each platform actually enforces differs and the difference
+is not cosmetic: macOS and Linux confine writes and deny egress, a Windows Job
+Object applies the resource caps and has no filesystem or network facility at all,
+and a host that refuses the native primitive falls back to the portable floor and
+**records the floor**, so a run contained less than you asked for is legible
+afterwards — in the trace, in `EventKind::Contained`, and in the agent's own
+prompt. The remaining costs — egress is one boolean per run, and the long-lived
+`shell_start` handles are not contained — are stated in
 [docs/CONTRACT.md](docs/CONTRACT.md) rather than discovered.
 
 **Verification in any language, or none — or a second model.** A

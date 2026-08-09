@@ -1124,7 +1124,7 @@ versions:
       spelled at the call site so choosing it is a decision on the page. The detected toolchain's
       own cache directories become writable roots, which is what makes a default-contained build
       survive contact with a real package manager.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.47.0
     outcome: >

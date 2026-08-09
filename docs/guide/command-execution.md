@@ -303,18 +303,22 @@ lacks is not a failed run.
 
 ## The boundary, stated plainly
 
-**A command runs in the workspace root with the embedding program's privileges.
-It is not sandboxed.** The policy decides what may *start*; it does not decide
-what a started process then does. This is the same bound this crate already
-states for a registered `Tool` and for a stdio MCP server, and it is the widest
-capability the crate grants.
+**A command runs in the workspace root, contained, unless the contract says
+otherwise (0.46.0).** It may write to the workspace, the system temporary
+directory and the detected toolchain's own caches, and nowhere else. The policy
+still decides what may *start*; the `ExecMode` decides where what started may
+write. `TaskContract::with_full_access()` is how a run asks for the embedding
+program's own privileges — the widest capability the crate grants, and up to
+0.45.0 what every run got without asking.
 
-That is a deliberate trade, not an oversight. The `Sandbox` denies network egress
-by default and confines writes to its workdir, which is right for a verification
-gate and makes `npm install`, `pip install` and `cargo fetch` impossible. A
-sandboxed `exec` would have made this release's own purpose unreachable.
+Up to 0.45.0 this section said the opposite, and the trade it described was real:
+the sandbox denied egress and, as the verification gate used it, threw its working
+directory away, which is right for a gate and makes `npm install`, `pip install`
+and `cargo fetch` impossible. Both halves are answered now — a contained command
+keeps the workspace root, and the toolchain's own cache directories are writable —
+so containment no longer costs the capability this module exists to provide.
 
-Four consequences worth writing down:
+Four consequences worth writing down, and the first three are unchanged:
 
 - **A policy written for file access does not constrain command execution.**
   `allow_read("*")` and `deny_write("secrets/*")` say nothing about `exec`. If
@@ -331,28 +335,37 @@ Four consequences worth writing down:
   is the null device — a command that prompts fails rather than waiting forever
   on a terminal that will never answer — and both output streams are piped.
 
-If none of that is acceptable for your workload, the answer today is not to allow
+If none of that is acceptable for your workload, the answer is not to allow
 `exec` at all: leave the tier default at `Deny`, or deny the programs by rule.
-Sandboxed execution as an opt-in is later work.
 
-## Running them contained (0.40.0)
-
-By default a command runs in the workspace root at the privileges of whatever
-program embedded this crate. That is a decision rather than an oversight — the
-sandbox denies egress and, as the verification gate uses it, throws its working
-directory away, which is right for a gate and useless for `npm install`.
-
-One field changes it for a run that does not need what containment takes away:
+## The three modes (0.40.0, 0.46.0)
 
 ```rust
 use io_harness::sandbox::SandboxConfig;
-use io_harness::TaskContract;
+use io_harness::{ExecMode, TaskContract};
 
-let contract = TaskContract::workspace("run the test suite", "/repo")
+// Contained, without asking: the default since 0.46.0.
+let default = TaskContract::workspace("run the test suite", "/repo");
+
+// Nothing this run starts may write into the workspace at all.
+let audit = TaskContract::workspace("summarise the architecture", "/repo")
+    .with_exec_mode(ExecMode::ReadOnly);
+
+// The host's own privileges — a decision, on the page.
+let wide = TaskContract::workspace("upgrade the toolchain", "/repo")
+    .with_full_access();
+
+// Contained *and* capped: the mode is a boundary, the config adds ceilings.
+let bounded = TaskContract::workspace("run untrusted code", "/repo")
     .with_contained_exec(SandboxConfig::new());
 ```
 
-Every command `exec` and `shell` start is then wrapped by the backend this host
+The default carries **no resource cap at all**. Containment says where a command
+may write; a 120-second wall clock would say how long your build may take, and
+that is not a default this crate can set for you. `with_contained_exec` is where
+the ceilings live.
+
+Every command `exec` and `shell` start is wrapped by the backend this host
 offers. The working directory stays the **workspace root**, which is the part
 that makes it usable: nothing is copied to a temporary directory and nothing is
 discarded, so `target/`, `node_modules/` and an incremental build survive from one
@@ -360,21 +373,22 @@ command to the next.
 
 What a contained command gives up:
 
-| | Contained | Not contained |
+| | Contained (the default) | `with_full_access()` |
 | --- | --- | --- |
 | working directory | the workspace root | the workspace root |
-| writes outside the workspace | refused on macOS and Linux | allowed |
+| writes outside the workspace | refused on macOS and Linux, except the toolchain's own caches | allowed |
 | outbound network | only if the policy permits `Act::Net`, and then to every host | whatever the host allows |
 | resource caps | the config's, and a kill names the cap | none |
 | audit | `sandbox_events` records the backend that applied | nothing |
 
-Three things are worth knowing before you turn it on. Egress is a single boolean,
-so a policy naming one host opens all of them *at the sandbox wall* — the crate's
-own tools are still checked per host. A toolchain that writes to a user-level
-cache (`~/.cargo/registry`, `~/.npm`) **fails** under containment, because those
-are outside the workspace; point the cache inside the workspace or leave the field
-unset. And the `shell_start` handles are not contained at all, because a handle
-outlives the call that made it.
+Three things are worth knowing. Egress is a single boolean, so a policy naming one
+host opens all of them *at the sandbox wall* — the crate's own tools are still
+checked per host. A toolchain that writes to a user-level cache
+(`~/.cargo/registry`, `~/.npm`) **works**, because since 0.46.0 the detected
+toolchain's cache directories are writable roots; a build that writes somewhere
+else the caller configured needs `with_full_access()`. And the `shell_start`
+handles are not contained at all, because a handle outlives the call that made
+it.
 
 [The contract](../CONTRACT.md) states the per-platform table: Windows gets the
 resource caps and neither a filesystem nor a network boundary, because a Job

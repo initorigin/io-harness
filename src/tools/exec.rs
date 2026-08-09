@@ -21,38 +21,33 @@
 //! command with a metacharacter in it does not become two commands, because
 //! nothing on this path ever parses one.
 //!
-//! ## What this does not bound, unless it is asked to
+//! ## What this bounds, and what it does not
 //!
-//! By default a command runs in the workspace root **with the embedding
-//! program's privileges**, not inside the [`Sandbox`]. That is
-//! the owner's decision of 2026-07-29, recorded in `US-IO-HARNESS-0.17.0-I02`,
-//! and it is taken with its cost stated: the sandbox denies network egress by
-//! default and discards its working directory, which is right for a verification
-//! gate and makes `npm install` impossible. So the policy decides what may
-//! *start*, and not what a started process then does — the same honest bound this
-//! crate already states for a registered [`Tool`](super::Tool) and for a stdio
-//! MCP server.
+//! **A command is contained by default (0.46.0).** It runs in the workspace root
+//! inside the backend [`select`](crate::sandbox::select) chose, and may write to
+//! the workspace, the system temporary directory and the detected toolchain's own
+//! caches — and nowhere else. Up to 0.45.0 the default was the embedding
+//! program's own privileges (the owner's decision of 2026-07-29, recorded in
+//! `US-IO-HARNESS-0.17.0-I02`); that grant is still available and is now spelled
+//! at the call site by
+//! [`TaskContract::with_full_access`](crate::TaskContract::with_full_access).
 //!
-//! **0.40.0 makes the other choice available without changing that default.**
-//! [`TaskContract::with_contained_exec`](crate::TaskContract::with_contained_exec)
-//! puts every command this tool and `shell` start inside the selected backend.
-//! The half of the 0.17.0 objection that was about the working directory is
-//! answered rather than argued with: the discarding was never the sandbox's, it
-//! was the verification gate's choice of [`sandbox::workdir`](crate::sandbox::workdir)
-//! and [`copy_back`](crate::sandbox::copy_back). A contained command is given the
-//! **workspace root**, so nothing is copied in, nothing is copied out, and an
-//! incremental build survives from one command to the next.
+//! The 0.17.0 objection is answered rather than argued with, in both halves. The
+//! working directory was never the sandbox's doing — the discarding was the
+//! verification gate's choice of [`sandbox::workdir`](crate::sandbox::workdir)
+//! and [`copy_back`](crate::sandbox::copy_back) — so a contained command is given
+//! the **workspace root**, nothing is copied in or out, and an incremental build
+//! survives from one command to the next. And the toolchain's own cache
+//! directories are writable roots, so the cold `cargo fetch` writing
+//! `~/.cargo/registry`, or `npm install` writing `~/.npm`, that failed under
+//! 0.40.0's containment now succeeds under 0.46.0's default.
 //!
-//! What a contained command loses is everything outside that root — on macOS and
-//! Linux its writes are confined to the workspace, and its egress is denied
-//! unless this run's [`Policy`](crate::Policy) would permit
-//! [`Act::Net`](crate::Act::Net). The half of the objection that was about the
-//! network therefore stands: a build that must fetch needs a policy that allows
-//! it. And there is a real cost on macOS in particular — writes outside the
-//! workspace and the system temporary directory are refused, so a toolchain
-//! populating a user-level cache such as `~/.cargo/registry` or `~/.npm` fails
-//! under containment. `docs/CONTRACT.md` states this, and the answer is to leave
-//! the field unset or to point the cache inside the workspace.
+//! What a contained command still loses is everything outside those roots, and
+//! its egress unless this run's [`Policy`](crate::Policy) would permit
+//! [`Act::Net`](crate::Act::Net) — so a build that must fetch needs a policy that
+//! allows it. What a Windows Job Object and the portable floor enforce is the
+//! resource caps alone: there the mode is reported and not applied.
+//! `docs/CONTRACT.md` carries the per-platform table.
 //!
 //! Two ceilings apply to what a started process may do to the *run*: a wall-clock
 //! timeout, so a wedged command dies naming itself instead of consuming the
