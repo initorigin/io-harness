@@ -25,7 +25,7 @@ trace you can read afterwards.
 
 ```toml
 [dependencies]
-io-harness = "0.46"
+io-harness = "0.47"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 ```
 
@@ -154,11 +154,11 @@ The **workspace root** stays the working directory — nothing is copied in and
 nothing is discarded — so an incremental build survives between commands, and the
 toolchain's own cache being writable is what lets a default-contained `cargo` or
 `npm` run at all. What each platform actually enforces differs and the difference
-is not cosmetic: macOS and Linux confine writes and deny egress, a Windows Job
-Object applies the resource caps and has no filesystem or network facility at all,
-and a host that refuses the native primitive falls back to the portable floor and
-**records the floor**, so a run contained less than you asked for is legible
-afterwards — in the trace, in `EventKind::Contained`, and in the agent's own
+is not cosmetic: since 0.47.0 all three confine writes and deny egress, Linux
+through a chain whose first rung needs no namespace and Windows through an
+AppContainer alongside the Job Object, and a host that can deliver none of it
+falls back to the portable floor and **records the floor**, so a run contained
+less than you asked for is legible afterwards — in the trace, in `EventKind::Contained`, and in the agent's own
 prompt. The remaining costs — egress is one boolean per run, and the long-lived
 `shell_start` handles are not contained — are stated in
 [docs/CONTRACT.md](docs/CONTRACT.md) rather than discovered.
@@ -417,19 +417,29 @@ dependency at all.
 | Platform | Sandbox containment |
 | --- | --- |
 | macOS | Native, `sandbox-exec` |
-| Linux | Native, mount and network namespaces plus rlimits |
-| Windows | Native resource containment (memory, CPU, process count, tree kill); no filesystem or network boundary |
+| Linux | Native, a chain: Landlock, `bwrap`, namespaces, floor |
+| Windows | Native, AppContainer (files, network) **and** Job Object (memory, CPU, process count, tree kill) |
 
 The full suite runs on all three in CI.
 
-The Linux row needs one caveat, because it is the easiest thing on this page to
-over-read. The backend needs an unprivileged user namespace, and Ubuntu 24.04
-ships `kernel.apparmor_restrict_unprivileged_userns=1`, which refuses one — so
-on a stock 24.04 host the sandbox takes the portable floor: the resource caps
-still apply, the filesystem confinement and egress denial do not. It is
-reported, not hidden (`select().backend()` answers before the run and the trace
-records it afterwards), and setting that sysctl to `0` — what most other
-distributions already ship — gives the real backend.
+**0.47.0 closed the two holes this table used to carry**, and the Linux one was
+the easiest thing on this page to over-read. The namespace backend needs an
+unprivileged user namespace; Ubuntu 24.04 ships
+`kernel.apparmor_restrict_unprivileged_userns=1` and refuses one, so on a stock
+24.04 host — which is what `ubuntu-latest` is — every contained run took the
+portable floor and the filesystem confinement was applied nowhere. Linux is now
+a chain, and its first rung is Landlock, which needs no namespace at all. The
+rung a host takes is the strongest that can enforce what the run asked for, and
+a run denying egress is never given one that cannot deny egress.
+
+Windows had no filesystem or network boundary at all until 0.47.0, because a Job
+Object has neither facility. A contained run now also gets an AppContainer,
+whose grants are derived from what the run already resolved. **If your program
+relied on a command reading outside the workspace on Windows, that read now
+fails** — `TaskContract::with_full_access()` is the escape hatch.
+
+Both are still reported rather than assumed: `select().backend()` answers before
+the run and the trace records what actually applied.
 
 ## Stability
 

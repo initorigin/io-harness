@@ -26,6 +26,84 @@ notes are produced from it.
 
 ### Security
 
+## [0.47.0] - 2026-08-09
+
+### Added
+
+- **Linux containment is a chain, and its first rung needs no namespace.**
+  `Backend` gains `LinuxLandlock` and `LinuxBubblewrap`, and a contained Linux run
+  now takes the strongest rung the host can actually deliver: Landlock first, a
+  `bwrap` helper where the host has a working one, the existing `unshare` backend
+  after that, and the portable floor last. **A run that denies egress is never
+  given a rung that cannot deny egress** — the one rule that can send a host below
+  its strongest available primitive, and what makes the chain honest rather than
+  merely ordered.
+- **The Landlock rung, which is why this release exists.** A stock Ubuntu 24.04
+  ships `kernel.apparmor_restrict_unprivileged_userns=1` and refuses the namespace
+  the older backend needs — and `ubuntu-latest` is a stock Ubuntu 24.04 — so on the
+  commonest Linux CI image in the world every contained run up to 0.46.0 took the
+  portable floor, and the filesystem confinement this crate documents was applied
+  nowhere. Landlock needs no namespace. It is also the only rung that wraps the
+  payload in nothing: the restriction is installed in the child between fork and
+  exec, so the argv spawned is the argv you asked for and `current_dir` means what
+  it says. Egress is denied through Landlock's own network rules where the kernel
+  has them (ABI 4, Linux 6.7); below that the chain hands the run to a rung with a
+  network namespace instead.
+- **A seccomp deny-list beside the Landlock rule set.** `mount`, `umount2`,
+  `pivot_root`, `ptrace`, `process_vm_readv`, `process_vm_writev`, `init_module`,
+  `finit_module`, `delete_module`, `kexec_load`, `kexec_file_load`, `bpf` and
+  `perf_event_open`, refused with `EPERM` rather than a kill so the failure is
+  diagnosable. It is a deny-list and not a jail, and it says so; it is written in
+  the host architecture's syscall numbers, so a process under a foreign
+  personality is allowed through rather than denied by coincidence.
+- **Windows access confinement, selected.** `Backend::WindowsAppContainer`. The
+  AppContainer has been built and proven on the Windows runner since 0.26.0 and
+  was never what `select` returned, because naming every path an arbitrary
+  toolchain needs was a discovery problem that release did not close. 0.46.0
+  closed most of it without meaning to — a run resolves its own writable roots —
+  so the grant set is now derived from facts the run has. A contained Windows run
+  gets the container **and** the Job Object: access and resources together, with
+  the process spawned suspended so it joins the job before it executes an
+  instruction.
+
+### Changed
+
+- **A contained Windows run now has a filesystem and a network boundary, and this
+  is the release's largest behaviour change.** Up to 0.46.0 a Job Object contained
+  resources and nothing else, so `ExecMode` was routed and reported on Windows and
+  enforced nothing. A program written against 0.46.0 on Windows has therefore
+  never had a filesystem boundary, and may be reading configuration, credentials
+  or a sibling checkout from outside the workspace without anything having refused
+  it. **Those reads now fail.** *Migration:* the grant set is stated in
+  `docs/CONTRACT.md` so a refusal is diagnosable from the documentation rather
+  than from a Win32 error code; `TaskContract::with_full_access()` restores the
+  old behaviour at the construction site, and `SandboxConfig::floor_only()` keeps
+  containment while taking the portable floor. The user's profile directory is
+  deliberately **not** granted.
+- **A contained Linux run on a host with Landlock now confines writes where it
+  previously did not**, and on kernel 6.7 or later refuses outbound TCP for an
+  egress-denying run. Same remedy if a program was relying on the absent
+  boundary. *Migration:* `TaskContract::with_full_access()`, or a mode that says
+  what the run actually needs.
+- **On the Windows AppContainer backend, standard error arrives merged into
+  `stdout`.** That backend owns its own spawn — the container SID reaches a child
+  only through a process-thread attribute list, which no stable `Command` can
+  carry — and redirects both streams to one file rather than draining two pipes.
+  Nothing is lost; a caller parsing `stderr` separately on Windows sees it empty.
+- `Backend::as_str` gains `"linux-landlock"`, `"linux-bubblewrap"` and
+  `"windows-appcontainer"`. `EventKind::Contained` and the `SandboxEvent` rows
+  carry them through their existing fields, so an observer written against 0.46.0
+  reads the new backends with no change and a trace written by 0.46.0 stays
+  readable.
+
+### Security
+
+- The two hosts where "contained by default" was true of the API and not of the
+  machine — a stock Ubuntu 24.04 and every Windows host — now enforce it. Both
+  degradations remain *reported* rather than silent: `select().backend()` answers
+  before a run, `EventKind::Contained` records what was applied, and the agent is
+  told its boundary in its own prompt.
+
 ## [0.46.0] - 2026-08-09
 
 ### Added

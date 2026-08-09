@@ -128,8 +128,39 @@ change for every `match` a caller wrote.
 | Platform | Status | Sandbox containment |
 | --- | --- | --- |
 | macOS | Supported, full suite in CI | Native, `sandbox-exec` |
-| Linux | Supported, full suite in CI | Native, mount and network namespaces plus rlimits |
-| Windows | Supported, full suite in CI | **Native resource containment only** |
+| Linux | Supported, full suite in CI | Native, a **chain** — Landlock, `bwrap`, namespaces, floor |
+| Windows | Supported, full suite in CI | Native, AppContainer **and** Job Object |
+
+Since 0.47.0 Linux is not one backend and a fallback but an ordered chain, and
+the rung a host takes is the strongest one that can enforce what the run asked
+for:
+
+| Rung | Needs | Confines writes | Denies egress |
+| --- | --- | --- | --- |
+| `linux-landlock` | Landlock (kernel 5.13+) | Yes | Only at ABI 4+ (kernel 6.7) |
+| `linux-bubblewrap` | a working `bwrap` | Yes | Yes |
+| `linux-namespaces` | unprivileged user namespaces | Yes | Yes |
+| `portable-floor` | nothing | No | No |
+
+**A run that denies egress is never given a rung that cannot deny egress.** That
+is the one rule that can send a host below its strongest available primitive: a
+kernel whose Landlock predates the network rules falls through to a rung with a
+network namespace rather than taking a filesystem-only rung and leaving the
+run's own policy unenforced.
+
+The Landlock rung is the reason the chain exists. A stock Ubuntu 24.04 ships
+`kernel.apparmor_restrict_unprivileged_userns=1` and refuses the namespace the
+older rung needs — and `ubuntu-latest` is a stock Ubuntu 24.04 — so on the
+commonest Linux CI image every contained run up to 0.46.0 took the portable
+floor. Landlock needs no namespace at all. It is also the only rung that wraps
+the payload in nothing: the restriction is installed in the child between fork
+and exec, so the argv spawned is the argv asked for and `current_dir` means what
+it says. Alongside it a small **seccomp deny-list** refuses `mount`, `umount2`,
+`pivot_root`, `ptrace`, the two `process_vm` calls, the three module calls, both
+`kexec` calls, `bpf` and `perf_event_open`, with `EPERM` rather than a kill. It
+is a deny-list and not a jail, and it is written in the host architecture's
+syscall numbers, so a process under a foreign personality is allowed through
+rather than denied by coincidence.
 
 Since 0.24.0 a Windows run is contained by a Job Object. Memory, CPU and active
 process count are real bounds, the whole process tree dies when the job handle
@@ -983,11 +1014,39 @@ cosmetic.**
 | Platform | Resource caps | Writes confined | Egress denied |
 | --- | --- | --- | --- |
 | macOS | Yes | Yes, to what the mode grants | Yes |
-| Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes |
-| Windows | Yes | **No** | **No** |
+| Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes, on every rung but Landlock below ABI 4 |
+| Windows | Yes | Yes, to what the mode grants (0.47.0) | Yes (0.47.0) |
 
-A Job Object contains resources and nothing else, so on Windows a contained
-command gets the caps and nothing more. **On Windows and on the portable floor
+**Windows changed in 0.47.0 and it is the larger of the release's two surprises.**
+Up to 0.46.0 a Job Object contained resources and nothing else, so a contained
+Windows command got the caps and nothing more — no filesystem boundary and no
+egress boundary, because a job object has neither facility. A contained run now
+also gets an **AppContainer**: a low-box token that answers *no* to every
+securable object it was not granted, with an explicit ACE per granted path, plus
+the job object's limits and kill-on-close. Both halves, one backend,
+`windows-appcontainer`.
+
+What is granted is derived from what the run already resolved — the workspace
+(read-only under `ExecMode::ReadOnly`), the system temporary directory and the
+detected toolchain's cache directories — plus read-execute on the program's own
+directory and the system root, which a process needs in order to start at all.
+**The user's profile directory is deliberately not granted**: that is where
+credentials live. Egress is the capability array: exactly `internetClient` when
+the run's policy permits egress, and empty when it does not, so the denial is
+the token's own.
+
+**A program written against 0.46.0 on Windows has never had a filesystem
+boundary**, and may be reading configuration or a sibling checkout from outside
+the workspace without anything having refused it. Those reads now fail. The
+remedy is `TaskContract::with_full_access()` or a mode that says what the run
+actually needs. A host where the container cannot be built falls back to the Job
+Object alone and reports `windows-job-object`.
+
+One observable difference, stated rather than left to be found: on the
+AppContainer backend **standard error arrives merged into `stdout`**. That
+backend owns its own spawn — the container SID reaches a child only through a
+process-thread attribute list, which no stable `Command` can carry — and
+redirects both streams to one file rather than draining two pipes. **On Windows and on the portable floor
 the `ExecMode` is therefore routed and reported and enforces nothing for the
 filesystem** — it is a statement of what the run asked for, not of what the host
 delivered, and `EventKind::Contained`'s `backend` is where the difference shows. On Linux the filesystem half is new in

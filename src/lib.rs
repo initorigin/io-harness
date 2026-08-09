@@ -304,13 +304,22 @@
 //! degrades to [`Backend::PortableFloor`] and **reports the floor**, because the
 //! one thing worse than no boundary is a boundary that is named and absent.
 //!
-//! The access half is `AppContainer`, and 0.26.0 built it — `sandbox::appcontainer`
-//! creates a container, grants paths to its SID, and spawns into it with an empty
-//! capability array, proven on CI against negative controls for both a refused
-//! read and a refused socket. It is **not** what the sandbox selects on Windows,
-//! because an AppContainer is default-deny for reads and naming everything an
-//! arbitrary toolchain needs is a discovery problem that release did not close. So
-//! the table above still describes what a run gets.
+//! The access half is `AppContainer`, 0.26.0 built it, and **0.47.0 selects it**.
+//! `sandbox::appcontainer` creates a container, grants paths to its SID and spawns
+//! into it, proven on CI against negative controls for both a refused read and a
+//! refused socket. What kept it unselected was a discovery problem — an
+//! AppContainer is default-deny for reads, and naming everything an arbitrary
+//! toolchain needs is not something a release can guess at. 0.46.0 closed most of
+//! it without meaning to: a run resolves its own writable roots, so the grant set
+//! is now derived from facts the run has. A contained Windows run gets the
+//! container **and** the job object, and reports [`Backend::WindowsAppContainer`].
+//!
+//! Linux likewise stopped being one backend and a fallback. It is a chain —
+//! Landlock, `bwrap`, the namespace backend, the floor — and the rung a host takes
+//! is the strongest that can enforce what the run asked for, with one rule that can
+//! send it lower: a run denying egress is never given a rung that cannot deny
+//! egress. The Landlock rung needs no namespace, which is the whole point, because
+//! a stock Ubuntu 24.04 refuses the one the older rung needs.
 //!
 //! Two smaller differences worth knowing rather than discovering: the job's CPU
 //! limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time

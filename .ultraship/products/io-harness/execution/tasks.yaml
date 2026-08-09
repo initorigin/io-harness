@@ -421,7 +421,7 @@ tasks:
   why_required: Every existing Linux leg unsets the restriction, so the rung a real user gets is exercised
     nowhere. Without this leg F1 is asserted only on a host configured to avoid the problem the release
     exists to fix.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.47.0-T02
   acceptance_criteria:
@@ -440,13 +440,26 @@ tasks:
   - .github/workflows/ci.yml
   - .github/workflows/release.yml
   - tests/ci_workflow.rs
-  evidence: []
+  evidence:
+  - 'O1/O3 — a `contained-linux` job added to **both** `ci.yml` and `release.yml`, running on `ubuntu-latest`
+    with **no** `sysctl` step, so it exercises the configuration a real user is actually in. It sets `IO_HARNESS_EXPECT_BACKEND:
+    linux-landlock` and `tests/sandbox.rs` fails if the chain answers otherwise. It also logs the host''s
+    userns sysctl and `/sys/kernel/security/lsm` so a reader of the log sees which state the leg ran in
+    rather than inferring it from an absence.'
+  - '`release.yml`''s `release` job names `contained-linux` in its `needs:`, so a tree that fails the
+    new gate cannot be published — the property 0.36.1''s parallel split was most at risk of losing.'
+  - 'Three guards added to `tests/ci_workflow.rs`, each naming **both** files explicitly: the leg exists
+    and states its expected rung, the legs that restore the namespace still do so somewhere (the new leg
+    is an addition, not a replacement, or the namespace rung would be tested nowhere), and the release
+    job names the gate. Trap 87 is that a guard written for one workflow file cannot see its sibling.'
+  - 'Sabotage: removing `contained-linux` from the release job''s `needs:` failed `the_release_job_will_not_ship_past_the_contained_leg`
+    by assertion and nothing else. Reverted by hand and re-run green — 9 of 9.'
 - id: US-IO-HARNESS-0.47.0-T10
   summary: Bring every documentation surface to what the code now does.
   why_required: Two platform tables, the crate-root prose and the README all currently state that Windows
     confines nothing and that Linux depends on a namespace. Leaving them is shipping a release whose own
     documentation contradicts it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.47.0-T03
   - US-IO-HARNESS-0.47.0-T04
@@ -476,7 +489,21 @@ tasks:
   - docs/public-api.txt
   - tests/docs_drift.rs
   - tests/changelog.rs
-  evidence: []
+  evidence:
+  - O4 — both `docs/CONTRACT.md` platform tables rewritten. The first gains a per-rung table (what each
+    needs, whether it confines writes, whether it denies egress) and states the egress honesty rule; the
+    second changes the Windows row from **No**/**No** to Yes/Yes with the behaviour change, the derived
+    grant set, the deliberately-excluded profile directory, and the merged-stderr difference.
+  - '`src/lib.rs`''s platform prose no longer says the AppContainer is unselected — it says 0.47.0 selects
+    it and why the discovery problem shrank — and describes the Linux chain.'
+  - '`README.md`: the platform table, the containment paragraph, and a new passage saying plainly that
+    a Windows program relying on a read outside the workspace now fails.'
+  - '`CHANGELOG.md` gains a `[0.47.0]` section with Added/Changed/Security. Both behaviour changes carry
+    a `*Migration:*` note rather than being line items.'
+  - '**The install-snippet checker earned its keep again.** Bumping `Cargo.toml` to 0.47.0 failed `readme_dependency_version_matches_cargo_toml`
+    — README still said `io-harness = "0.46"`. Fixed. That checker was added in 0.36.1 after the snippet
+    sat stale for eleven releases.'
+  - '`tests/docs_drift.rs` 15 of 15, `tests/changelog.rs` 5 of 5, `tests/guide_pages.rs` 7 of 7.'
 - id: US-IO-HARNESS-0.47.0-T11
   summary: Measure each rung's per-command overhead and record the figures.
   why_required: The Landlock rung's claim is that it avoids a wrapper spawn, which is a claim about a

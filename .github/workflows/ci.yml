@@ -239,6 +239,51 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo nextest run ${{ matrix.flags }} --lib --tests
 
+  # 0.47.0 — the Linux leg that does NOT touch the sysctl, which is the leg this
+  # release exists for.
+  #
+  # Every leg above restores unprivileged user namespaces so the namespace
+  # backend is exercised rather than the fallback. That was right in 0.40.0 and
+  # it is still right — but it means the configuration a real user is actually
+  # in, a stock Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns=1`,
+  # was tested nowhere. On that host every release up to 0.46.0 took the portable
+  # floor: a contained run got resource caps, an ephemeral working directory and
+  # a proxy-environment strip, and the filesystem confinement the crate documents
+  # was applied on no machine anywhere.
+  #
+  # So this job leaves the setting alone. `IO_HARNESS_EXPECT_BACKEND` states which
+  # rung is expected, and `tests/sandbox.rs` fails if the chain answers with
+  # anything else — a test-only assertion, read by no code in the crate. On
+  # today's kernels that rung is Landlock, which needs no namespace at all.
+  #
+  # If this job ever reports `portable-floor`, the release regressed to 0.46.0's
+  # behaviour on the commonest Linux CI image in the world, and it will say so
+  # rather than passing.
+  contained-linux:
+    name: contained (ubuntu, userns restricted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: contained
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-nextest
+      # Deliberately no `sysctl` step. Reported so a reader of the log can see
+      # which state the leg ran in rather than inferring it from an absence.
+      - name: report the host's namespace and Landlock state
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          cat /sys/kernel/security/lsm || true
+      - run: cargo nextest run --lib --tests
+        env:
+          IO_HARNESS_EXPECT_BACKEND: linux-landlock
+
   # 0.36.1 — the doctests, as a job of their own, per operating system.
   #
   # They were 172s of the Windows `cargo test` step's 295s and they are not test

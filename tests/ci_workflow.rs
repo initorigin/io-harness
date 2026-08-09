@@ -355,3 +355,67 @@ fn control_the_plural_examples_flag_is_not_a_named_build() {
             .collect::<BTreeSet<_>>()
     );
 }
+
+// --- 0.47.0: the leg that leaves the Ubuntu restriction alone ---------------
+//
+// Trap 87 is that a guard written for one workflow file does not cover its
+// sibling. `tests/ci_workflow.rs` was written in 0.36.1 to stop exactly that and
+// could not see `release.yml`; this pair names both files explicitly, because
+// the leg that matters most is worth nothing if it exists in only one of them.
+
+/// The restricted-userns leg exists in **both** workflow files and states which
+/// rung it expects.
+///
+/// Without it the configuration a real user is in — a stock Ubuntu 24.04, which
+/// is what `ubuntu-latest` is — is exercised nowhere, and every release up to
+/// 0.46.0 silently took the portable floor there.
+#[test]
+fn both_workflows_have_a_leg_with_the_userns_restriction_left_in_place() {
+    for file in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+        let yaml = read(file);
+        assert!(
+            yaml.contains("contained-linux:"),
+            "{file} has no leg that leaves the userns restriction in place"
+        );
+        assert!(
+            yaml.contains("IO_HARNESS_EXPECT_BACKEND: linux-landlock"),
+            "{file}'s contained leg does not say which rung it expects, so it \
+             would pass on the portable floor"
+        );
+    }
+}
+
+/// The legs that *do* restore the namespace keep doing so, in both files.
+///
+/// The new leg is an addition, not a replacement: without these the namespace
+/// rung is exercised nowhere and the chain's lower rungs go untested.
+#[test]
+fn both_workflows_still_restore_unprivileged_user_namespaces_somewhere() {
+    for file in [".github/workflows/ci.yml", ".github/workflows/release.yml"] {
+        let yaml = read(file);
+        assert!(
+            yaml.contains("kernel.apparmor_restrict_unprivileged_userns=0"),
+            "{file} no longer restores unprivileged user namespaces on any leg, \
+             so the namespace rung is tested nowhere"
+        );
+    }
+}
+
+/// The release job names the new gate in its `needs:`.
+///
+/// 0.36.1's release gate caught a defect and refused to ship precisely because
+/// `release` names every gate. A gate that runs and is not named is a gate the
+/// release can ship past.
+#[test]
+fn the_release_job_will_not_ship_past_the_contained_leg() {
+    let yaml = read(".github/workflows/release.yml");
+    let needs = yaml
+        .lines()
+        .find(|l| l.trim_start().starts_with("needs: [checks, lint,"))
+        .expect("the release job's needs: list");
+    assert!(
+        needs.contains("contained-linux"),
+        "the release job does not name the contained leg, so a tree that failed \
+         it could still be published: {needs}"
+    );
+}

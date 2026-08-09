@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "io-harness"
-version = "0.46.0"
+version = "0.47.0"
 dependencies = [
  "base64 0.23.0",
  "calamine",

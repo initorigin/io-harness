@@ -162,6 +162,33 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo test
 
+  # 0.47.0 — the release gate's copy of the leg that leaves the sysctl alone.
+  #
+  # It is a separate job rather than a step because trap 87 is exactly this: a
+  # guard written for ci.yml does not cover this file, and the leg that matters
+  # most is the one asserting the rung a real user gets. Every other Linux job
+  # here restores unprivileged user namespaces; this one does not, and states
+  # which rung it expects.
+  contained-linux:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-contained
+      - name: report the host's namespace and Landlock state
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          cat /sys/kernel/security/lsm || true
+      - run: cargo test --lib --tests
+        env:
+          IO_HARNESS_EXPECT_BACKEND: linux-landlock
+
   # The other polarity. 155s on run 30834005895, run after the 222s above it
   # rather than beside it, and the feature flip invalidated the artifacts that
   # step had just produced. Its own job and its own cache key for the same
@@ -220,7 +247,7 @@ jobs:
   # Every gate is named here. This list is the ordering the split had to keep:
   # a Release is cut only when all five have passed.
   release:
-    needs: [checks, lint, test-default, test-all-features, package]
+    needs: [checks, lint, test-default, test-all-features, contained-linux, package]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
