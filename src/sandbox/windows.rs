@@ -81,7 +81,9 @@
 //! from the shared runner before the job is queried — so a timeout cannot be
 //! reported as a CPU or memory breach.
 
-use super::{Backend, RunSpec, Sandbox, SandboxOutcome};
+use std::path::{Path, PathBuf};
+
+use super::{Backend, ExecMode, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::Result;
 
 /// The Windows backend: every command runs inside a fresh Job Object whose
@@ -152,6 +154,102 @@ impl From<&super::SandboxLimits> for JobLimits {
             kill_on_close: true,
         }
     }
+}
+
+/// What an AppContainer may do with one path.
+///
+/// Mirrors `appcontainer::Access`, out here where it can be decided and tested
+/// on any host. The two are kept as separate types on purpose: this one is the
+/// *decision* and that one is the ACE mask, and a build host that has no Win32
+/// can still assert the decision.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grant {
+    /// Read and execute. What a binary, a toolchain or a read-only input tree
+    /// needs, and the most that should ever be given to one.
+    ReadExecute,
+    /// Everything. The workspace and the roots the run resolved, and nothing
+    /// else — these are the directories the payload is *meant* to change.
+    Full,
+}
+
+/// One granted path.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantedPath {
+    pub(crate) path: PathBuf,
+    pub(crate) grant: Grant,
+}
+
+/// The grant set for one run.
+///
+/// **This is the problem 0.26.0 declined to solve, and 0.46.0 solved most of it
+/// without meaning to.** An AppContainer is default-deny for reads, so selecting
+/// one means naming every path an arbitrary toolchain needs — which 0.26.0
+/// correctly called a discovery problem and left the module unwired for. Then
+/// 0.46.0 made a run resolve its own writable roots: the workspace, the system
+/// temporary directory and the detected toolchain's cache directories, already
+/// exists-filtered. So the list is now *derived from facts the run has* rather
+/// than guessed, and what remains is the small fixed read-execute set a process
+/// needs in order to start at all.
+///
+/// "Derived" is not "complete", and the release says so rather than implying
+/// otherwise: a toolchain reading a machine-wide configuration file outside this
+/// set will be refused. The answers to that are the escape hatch
+/// (`TaskContract::with_full_access`) and a named addition here with its reason,
+/// not a wider default. In particular the user's profile directory is **not**
+/// granted: that is where credentials live, and a default-deny boundary whose
+/// first act is to hand over the home directory is not one.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn grants(
+    mode: ExecMode,
+    workdir: &Path,
+    writable_roots: &[PathBuf],
+    program_dir: Option<&Path>,
+    system_root: Option<&Path>,
+    tmp: &Path,
+) -> Vec<GrantedPath> {
+    let mut out: Vec<GrantedPath> = Vec::new();
+
+    // The workspace: writable unless the mode withholds it, readable either way.
+    // Under `ReadOnly` this is the mode's entire difference, exactly as it is on
+    // the unix rungs.
+    out.push(GrantedPath {
+        path: workdir.to_path_buf(),
+        grant: if mode == ExecMode::ReadOnly {
+            Grant::ReadExecute
+        } else {
+            Grant::Full
+        },
+    });
+
+    if mode != ExecMode::ReadOnly {
+        for root in writable_roots {
+            out.push(GrantedPath {
+                path: root.clone(),
+                grant: Grant::Full,
+            });
+        }
+    }
+    // The temporary directory in every mode: a toolchain that cannot open a
+    // temporary file cannot run at all. The same allowance every other backend
+    // makes.
+    out.push(GrantedPath {
+        path: tmp.to_path_buf(),
+        grant: Grant::Full,
+    });
+
+    // Read-execute on the two places a process needs to start: its own program's
+    // directory and the system root. Without these an AppContainer cannot load
+    // the binary or the system libraries it links, and the run fails in a way
+    // that looks like the payload being broken.
+    for dir in [program_dir, system_root].into_iter().flatten() {
+        out.push(GrantedPath {
+            path: dir.to_path_buf(),
+            grant: Grant::ReadExecute,
+        });
+    }
+    out
 }
 
 /// The Win32 half. Compiled only on Windows; everything above this line builds
@@ -530,6 +628,99 @@ pub(crate) mod job {
 mod tests {
     use super::*;
     use crate::sandbox::SandboxLimits;
+
+    fn find<'a>(g: &'a [GrantedPath], p: &str) -> Option<&'a GrantedPath> {
+        g.iter().find(|x| x.path == Path::new(p))
+    }
+
+    /// F8 — the grant set is derived from the run's own resolved facts.
+    #[test]
+    fn the_grant_set_comes_from_what_the_run_already_resolved() {
+        let roots = vec![
+            PathBuf::from(r"C:\cache\cargo"),
+            PathBuf::from(r"C:\cache\npm"),
+        ];
+        let g = grants(
+            ExecMode::WorkspaceWrite,
+            Path::new(r"C:\work"),
+            &roots,
+            Some(Path::new(r"C:\tools\bin")),
+            Some(Path::new(r"C:\Windows")),
+            Path::new(r"C:\Temp"),
+        );
+
+        assert_eq!(find(&g, r"C:\work").unwrap().grant, Grant::Full);
+        assert_eq!(find(&g, r"C:\cache\cargo").unwrap().grant, Grant::Full);
+        assert_eq!(find(&g, r"C:\cache\npm").unwrap().grant, Grant::Full);
+        assert_eq!(find(&g, r"C:\Temp").unwrap().grant, Grant::Full);
+        // The two places a process needs in order to start at all, and no more
+        // than read-execute on either.
+        assert_eq!(find(&g, r"C:\tools\bin").unwrap().grant, Grant::ReadExecute);
+        assert_eq!(find(&g, r"C:\Windows").unwrap().grant, Grant::ReadExecute);
+        assert_eq!(g.len(), 6, "nothing is granted that was not named");
+    }
+
+    /// F8's mode arm — `ReadOnly` downgrades the workspace to read-execute and
+    /// withholds the writable roots entirely, while the temp directory stays.
+    #[test]
+    fn read_only_downgrades_the_workspace_and_withholds_the_roots() {
+        let roots = vec![PathBuf::from(r"C:\cache\cargo")];
+        let g = grants(
+            ExecMode::ReadOnly,
+            Path::new(r"C:\work"),
+            &roots,
+            None,
+            None,
+            Path::new(r"C:\Temp"),
+        );
+        assert_eq!(find(&g, r"C:\work").unwrap().grant, Grant::ReadExecute);
+        assert!(
+            find(&g, r"C:\cache\cargo").is_none(),
+            "a read-only run has nothing to build and no cache to populate"
+        );
+        assert_eq!(find(&g, r"C:\Temp").unwrap().grant, Grant::Full);
+    }
+
+    /// The user's profile directory is deliberately **not** in the set. It is
+    /// where credentials live, and a default-deny boundary whose first act is to
+    /// hand over the home directory is not one. Asserted so that a future
+    /// "convenience" addition has to argue with a test.
+    #[test]
+    fn the_home_directory_is_never_granted() {
+        let home = PathBuf::from(r"C:\Users\someone");
+        let g = grants(
+            ExecMode::WorkspaceWrite,
+            Path::new(r"C:\work"),
+            &[],
+            Some(Path::new(r"C:\tools\bin")),
+            Some(Path::new(r"C:\Windows")),
+            Path::new(r"C:\Temp"),
+        );
+        assert!(
+            !g.iter().any(|x| x.path == home),
+            "the profile directory must never be granted by default"
+        );
+    }
+
+    /// A path a run resolved but which is not there must not reach the grant
+    /// list — the exists-filter is the caller's, and this asserts the derivation
+    /// does not re-add anything of its own.
+    #[test]
+    fn nothing_is_granted_that_the_run_did_not_resolve() {
+        let g = grants(
+            ExecMode::WorkspaceWrite,
+            Path::new(r"C:\work"),
+            &[],
+            None,
+            None,
+            Path::new(r"C:\Temp"),
+        );
+        assert_eq!(
+            g.len(),
+            2,
+            "the workspace and the temp directory, and that is all"
+        );
+    }
 
     #[test]
     fn maps_limits_to_job_object_fields_and_ticks() {

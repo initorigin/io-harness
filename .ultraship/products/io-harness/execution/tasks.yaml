@@ -279,7 +279,7 @@ tasks:
   why_required: Windows has never had a filesystem boundary and the mechanism has been built and unselected
     since 0.26.0. This is the whole of the Windows half; without it the platform table's Windows row does
     not change.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.47.0-T01
   acceptance_criteria:
@@ -312,7 +312,22 @@ tasks:
   - src/sandbox/appcontainer.rs
   - src/sandbox.rs
   - tests/sandbox_job_object.rs
-  evidence: []
+  evidence:
+  - 'F8 is **done and proven on the development host**. `sandbox::windows::grants(mode, workdir, writable_roots,
+    program_dir, system_root, tmp)` derives the grant set as portable data — the same treatment `JobLimits`
+    gets — so the decision is testable without Win32. Four named tests pass: `the_grant_set_comes_from_what_the_run_already_resolved`,
+    `read_only_downgrades_the_workspace_and_withholds_the_roots`, `the_home_directory_is_never_granted`,
+    `nothing_is_granted_that_the_run_did_not_resolve`. 41 of 41 `sandbox::` unit tests.'
+  - 'The derivation is the answer to the discovery problem 0.26.0 declined to close: the workspace, the
+    temp directory and the run''s already-resolved writable roots come from facts the run has, and only
+    the small fixed read-execute set (the program''s directory and the system root) is fixed. The user''s
+    profile directory is deliberately excluded and there is a test that makes a future convenience addition
+    argue with an assertion — that is where credentials live.'
+  - '**NOT DONE**: the Win32 wiring itself. `appcontainer::Profile::create` still hardcodes an empty capability
+    array, `Spawned::start` spawns running rather than `CREATE_SUSPENDED`, the process handle is not exposed
+    for `AssignProcessToJobObject`, and `WindowsSandbox::run` still goes straight to `job::run`. Until
+    those four land, `select` on Windows still returns the Job Object and the platform table''s Windows
+    row is unchanged.'
 - id: US-IO-HARNESS-0.47.0-T07
   summary: Map the run's egress answer onto the container's capability array.
   why_required: An empty capability array denies the network, which is the release's Windows egress boundary,
