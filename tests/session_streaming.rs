@@ -243,15 +243,16 @@ async fn a_one_shot_run_emits_no_deltas_and_a_session_turn_does() {
         "a one-shot run asked the provider to stream"
     );
     // The event sequence a 0.19.0 consumer would have seen, plus 0.45.0's
-    // `PromptComposed` — which arrives before the first step because that is when
-    // the prompt is composed, and which is the "other" below. The expectation was
-    // changed deliberately: an additive variant on a `#[non_exhaustive]` enum is
-    // exactly what this crate has told observers to expect since 0.24.0, and the
-    // claim this assertion is really making — that streaming adds no `Token` events
-    // to a one-shot run — is the two assertions above it.
+    // `PromptComposed` and 0.46.0's `Contained` — both of which arrive before the
+    // first step, because both are resolved once at run start, and which are the
+    // two "other"s below. The expectation was changed deliberately, twice now: an
+    // additive variant on a `#[non_exhaustive]` enum is exactly what this crate has
+    // told observers to expect since 0.24.0, and the claim this assertion is really
+    // making — that streaming adds no `Token` events to a one-shot run — is the two
+    // assertions above it.
     assert_eq!(
         *quiet.kinds.lock().unwrap(),
-        vec!["started", "other", "step", "finished"]
+        vec!["started", "other", "other", "step", "finished"]
     );
 
     // The control: the same provider, through a session turn.

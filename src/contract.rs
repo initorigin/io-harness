@@ -230,34 +230,40 @@ pub struct TaskContract {
     /// the run's whole time budget and the run reports a budget stop, which is
     /// the wrong diagnosis for what happened.
     pub exec_timeout: Duration,
-    /// Run the project's own commands inside the [`Sandbox`](crate::Sandbox), or
-    /// `None` (the default) to run them at the embedding program's privileges.
+    /// Where this run's own commands may write, and under what caps.
     ///
-    /// `None` is 0.39.0 and every release before it, and it is a decision rather
-    /// than an omission: `exec` exists so a run can invoke a toolchain, and the
-    /// sandbox as the verification gate uses it denies egress and discards its
-    /// working directory, which makes `npm install` impossible. Set it with
-    /// [`TaskContract::with_contained_exec`] when this run's commands do not need
-    /// what containment takes away.
+    /// **Contained by default since 0.46.0.** The default is
+    /// [`ExecMode::WorkspaceWrite`](crate::ExecMode::WorkspaceWrite) with
+    /// [`SandboxLimits::none`](crate::sandbox::SandboxLimits::none): every command
+    /// `exec` and the `shell` tools start is wrapped by the backend
+    /// [`select`](crate::sandbox::select) chooses, may write inside the workspace
+    /// root, the system temp directory and the detected toolchain's own cache
+    /// directories — and nowhere else — with **no** resource cap at all. The
+    /// **workspace root** is its working directory, so nothing is copied to a
+    /// temporary directory and nothing is discarded, and an incremental build
+    /// survives between commands.
     ///
-    /// What changes when it is `Some`: every command `exec` and the `shell` tools
-    /// start is wrapped by the backend [`select`](crate::sandbox::select) chooses,
-    /// with the resource caps in the config, the **workspace root** as its working
-    /// directory, and egress permitted only where this run's [`Policy`] would
-    /// permit [`Act::Net`](crate::Act::Net). The working directory is the answer
-    /// to the objection above: nothing is copied to a temporary directory and
-    /// nothing is discarded, so an incremental build survives between commands.
+    /// Up to 0.45.0 this was an `Option` defaulting to `None`, which ran every
+    /// command at the embedding program's own privileges. That grant is still
+    /// available and is now a sentence rather than an omission:
+    /// [`TaskContract::with_full_access`]. The caps are likewise a decision —
+    /// [`TaskContract::with_contained_exec`] with
+    /// [`SandboxConfig::new`](crate::sandbox::SandboxConfig::new) asks for the
+    /// standing CPU, wall, memory and file-descriptor ceilings on top of the
+    /// boundary.
     ///
-    /// What it does **not** change, and each is documented in `docs/CONTRACT.md`:
-    /// egress is one boolean per run, so a policy that allows one host permits all
-    /// of them under containment; the `shell_start` / `shell_poll` / `shell_kill`
-    /// handles are not contained, because a handle outlives the call that made it;
-    /// and what each platform actually enforces differs — macOS and Linux confine
-    /// writes and deny egress, while a Windows Job Object applies the resource
-    /// caps and has no filesystem or network facility at all.
+    /// What the mode does **not** decide, and each is documented in
+    /// `docs/CONTRACT.md`: egress, which comes from this run's [`Policy`] and is
+    /// still one boolean per run, so a policy allowing one host permits all of
+    /// them under containment; the `shell_start` / `shell_poll` / `shell_kill`
+    /// handles, which are not contained because a handle outlives the call that
+    /// made it; and what a host can actually enforce — macOS and Linux confine
+    /// writes and deny egress, while a Windows Job Object and the portable floor
+    /// apply the resource caps and have no filesystem facility at all, so there
+    /// the mode is routed and reported and enforces nothing for the filesystem.
     ///
     /// [`Policy`]: crate::Policy
-    pub exec_sandbox: Option<crate::sandbox::SandboxConfig>,
+    pub exec_sandbox: crate::sandbox::SandboxConfig,
     /// Directory of skill files to offer the agent, or `None` (the default) for
     /// no skills.
     ///
@@ -414,7 +420,10 @@ impl TaskContract {
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
-            exec_sandbox: None,
+            exec_sandbox: crate::sandbox::SandboxConfig {
+                limits: crate::sandbox::SandboxLimits::none(),
+                ..crate::sandbox::SandboxConfig::new()
+            },
             skills: None,
             plugins: crate::plugin::Plugins::none(),
             agents: crate::agent::Agents::new(),
@@ -478,7 +487,10 @@ impl TaskContract {
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
-            exec_sandbox: None,
+            exec_sandbox: crate::sandbox::SandboxConfig {
+                limits: crate::sandbox::SandboxLimits::none(),
+                ..crate::sandbox::SandboxConfig::new()
+            },
             skills: None,
             plugins: crate::plugin::Plugins::none(),
             agents: crate::agent::Agents::new(),
@@ -1006,21 +1018,22 @@ impl TaskContract {
     ///
     /// ```
     /// use io_harness::sandbox::{SandboxConfig, SandboxLimits};
-    /// use io_harness::TaskContract;
+    /// use io_harness::{ExecMode, TaskContract};
     ///
     /// // The default caps, egress denied, and the strongest backend this host
-    /// // offers — the same configuration the verification gate uses.
+    /// // offers — the same configuration the verification gate uses. Since
+    /// // 0.46.0 this adds the *ceilings*; the boundary was already there.
     /// let contained = TaskContract::workspace("run the test suite", "/repo")
     ///     .with_contained_exec(SandboxConfig::new());
     ///
-    /// assert!(contained.exec_sandbox.is_some());
-    /// assert!(!contained.exec_sandbox.as_ref().unwrap().allow_network);
+    /// assert_eq!(contained.exec_sandbox.mode, ExecMode::WorkspaceWrite);
+    /// assert_eq!(contained.exec_sandbox.limits.max_wall_secs, Some(120));
+    /// assert!(!contained.exec_sandbox.allow_network);
     ///
-    /// // A build that legitimately reaches outside the workspace — a package
-    /// // manager writing to a user-level cache, say — leaves the field unset and
-    /// // keeps the 0.17.0 behaviour.
-    /// let uncontained = TaskContract::workspace("install and build", "/repo");
-    /// assert!(uncontained.exec_sandbox.is_none());
+    /// // A run that never asks is confined just the same, and pays no ceiling.
+    /// let default = TaskContract::workspace("install and build", "/repo");
+    /// assert_eq!(default.exec_sandbox.mode, ExecMode::WorkspaceWrite);
+    /// assert_eq!(default.exec_sandbox.limits, SandboxLimits::none());
     ///
     /// // Caps are the config's, so a run that wants a tighter memory ceiling than
     /// // the default says so here rather than anywhere else.
@@ -1033,13 +1046,67 @@ impl TaskContract {
     ///         ..SandboxConfig::new()
     ///     });
     /// assert_eq!(
-    ///     tight.exec_sandbox.unwrap().limits.max_memory_bytes,
+    ///     tight.exec_sandbox.limits.max_memory_bytes,
     ///     Some(256 * 1024 * 1024)
     /// );
     /// ```
     #[must_use]
     pub fn with_contained_exec(mut self, sandbox: crate::sandbox::SandboxConfig) -> Self {
-        self.exec_sandbox = Some(sandbox);
+        self.exec_sandbox = sandbox;
+        self
+    }
+
+    /// Run this run's commands at the embedding program's own privileges.
+    ///
+    /// The escape hatch from 0.46.0's default, and the reason it is a named method
+    /// rather than a field left unset: a run that may write anywhere the host user
+    /// can write is the widest grant this crate makes, and it should be legible in
+    /// a diff and findable with `grep -r with_full_access`. Every release up to
+    /// 0.45.0 did this by default.
+    ///
+    /// Reach for it when the commands this run invokes genuinely need the machine —
+    /// a toolchain installer, a system package manager, a build that writes to a
+    /// path the caller configured outside the workspace. Everything else is better
+    /// served by the default, whose writable roots already include the detected
+    /// toolchain's own caches.
+    ///
+    /// ```
+    /// use io_harness::{ExecMode, TaskContract};
+    ///
+    /// let wide = TaskContract::workspace("upgrade the toolchain", "/repo")
+    ///     .with_full_access();
+    ///
+    /// assert_eq!(wide.exec_sandbox.mode, ExecMode::FullAccess);
+    /// assert!(!wide.exec_sandbox.mode.is_contained());
+    /// ```
+    ///
+    /// It leaves the caps alone. A `FullAccess` command reaches no backend at all,
+    /// so nothing in [`SandboxLimits`](crate::sandbox::SandboxLimits) applies to it
+    /// — the contract's `exec_timeout` is what still bounds it, exactly as it did
+    /// before 0.46.0.
+    #[must_use]
+    pub fn with_full_access(mut self) -> Self {
+        self.exec_sandbox.mode = crate::sandbox::ExecMode::FullAccess;
+        self
+    }
+
+    /// Set the [`ExecMode`](crate::ExecMode) without touching the caps.
+    ///
+    /// [`TaskContract::with_full_access`] is the one worth spelling out, so it has
+    /// its own method; this is how a run asks for the third mode.
+    ///
+    /// ```
+    /// use io_harness::{ExecMode, TaskContract};
+    ///
+    /// // A run that reads a codebase and reports on it has nothing to write.
+    /// let audit = TaskContract::workspace("summarise the architecture", "/repo")
+    ///     .with_exec_mode(ExecMode::ReadOnly);
+    ///
+    /// assert_eq!(audit.exec_sandbox.mode, ExecMode::ReadOnly);
+    /// ```
+    #[must_use]
+    pub fn with_exec_mode(mut self, mode: crate::sandbox::ExecMode) -> Self {
+        self.exec_sandbox.mode = mode;
         self
     }
 

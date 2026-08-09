@@ -1109,11 +1109,13 @@ pub(crate) struct Shell {
 /// several processes and the escape this release closes is a *later* stage, not
 /// the first one.
 pub(crate) struct ShellSandbox {
-    pub(crate) config: crate::sandbox::SandboxConfig,
+    /// The containment the run resolved, with this call's egress answer already
+    /// folded in — the mode, the caps and the writable roots travel together so a
+    /// stage cannot be wrapped under a different grant than the `exec` beside it.
+    pub(crate) containment: std::sync::Arc<crate::sandbox::ExecContainment>,
     /// The workspace root — the directory writes are confined to. Not the
     /// stage's `cwd`, which `cd` may have moved somewhere below it.
     pub(crate) workdir: std::path::PathBuf,
-    pub(crate) allow_network: bool,
 }
 
 /// Where a detached line's output goes, and who to tell about its processes.
@@ -1294,9 +1296,10 @@ impl Shell {
             let argv = match &self.sandbox {
                 Some(sb) => {
                     crate::sandbox::wrap_argv(
-                        &sb.config,
+                        &sb.containment.config,
                         &sb.workdir,
-                        sb.allow_network,
+                        sb.containment.config.allow_network,
+                        &sb.containment.roots,
                         &stage.argv,
                     )
                     .1
@@ -1310,7 +1313,7 @@ impl Shell {
             // The same caps the sandbox's own runner applies, through the same
             // helper rather than a second copy of the `pre_exec` block.
             if let Some(sb) = &self.sandbox {
-                crate::sandbox::apply_rlimits(&mut cmd, &sb.config.limits);
+                crate::sandbox::apply_rlimits(&mut cmd, &sb.containment.config.limits);
             }
 
             // A detached line's stages go into containment of their own, and a

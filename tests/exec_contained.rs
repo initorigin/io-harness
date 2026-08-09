@@ -182,7 +182,7 @@ async fn an_uncontained_command_still_writes_outside_the_workspace() {
     let provider = MockScript::new(vec![vec![exec_call(&["touch", target.to_str().unwrap()])]]);
 
     run_with(
-        &contract(dir.path()),
+        &contract(dir.path()).with_full_access(),
         &provider,
         &store,
         &permissive(),
@@ -193,7 +193,7 @@ async fn an_uncontained_command_still_writes_outside_the_workspace() {
 
     assert!(
         target.exists(),
-        "0.39.0 behaviour is unchanged when the field is absent: {} should exist",
+        "0.45.0 behaviour survives `with_full_access()`, and only there: {} should exist",
         target.display()
     );
 }
@@ -568,7 +568,7 @@ async fn an_uncontained_shell_line_still_writes_outside_the_workspace() {
     let provider = MockScript::new(vec![vec![shell_call(&line)]]);
 
     run_with(
-        &contract(dir.path()),
+        &contract(dir.path()).with_full_access(),
         &provider,
         &store,
         &permissive(),
@@ -579,7 +579,7 @@ async fn an_uncontained_shell_line_still_writes_outside_the_workspace() {
 
     assert!(
         target.exists(),
-        "0.39.0 shell behaviour is unchanged when the field is absent: {} should exist",
+        "a full-access shell line still writes outside the workspace: {} should exist",
         target.display()
     );
 }
@@ -719,7 +719,7 @@ async fn an_uncontained_command_records_no_sandbox_at_all() {
     let provider = MockScript::new(vec![vec![exec_call(&["touch", "unaudited.txt"])]]);
 
     let result = run_with(
-        &contract(dir.path()),
+        &contract(dir.path()).with_full_access(),
         &provider,
         &store,
         &permissive(),
@@ -731,5 +731,445 @@ async fn an_uncontained_command_records_no_sandbox_at_all() {
     assert!(
         store.sandbox_events(result.run_id).unwrap().is_empty(),
         "an uncontained command must not leave rows claiming it was contained"
+    );
+}
+
+// ===========================================================================
+// 0.46.0 — the default is containment, and the exception is a sentence
+// ===========================================================================
+
+use io_harness::observe::{EventKind, Flow, Observer, RunEvent};
+use io_harness::{run_with_observed, ExecMode};
+
+/// Serialises the tests that set `CARGO_HOME`.
+///
+/// The environment is process-global and `cargo test` runs a binary's tests in
+/// parallel, so two tests redirecting a toolchain's cache at once would read each
+/// other's answer — trap 102's family, and the reason `tests/plugin.rs` needs
+/// `XDG_CONFIG_HOME` redirected rather than `HOME`. Held across the whole run,
+/// including its awaits, which is sound because `#[tokio::test]` is a
+/// current-thread runtime.
+static ENV: Mutex<()> = Mutex::new(());
+
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    // A test that panicked while holding it poisoned it; the next test still
+    // wants the lock, not a second failure blamed on the first.
+    ENV.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A workspace that is **not** under the system temp directory.
+///
+/// `tempfile::tempdir()` puts a directory under `/private/var/folders`, which the
+/// macOS profile allows writes to unconditionally — so a test asserting that a
+/// mode refuses a write into its own workspace needs the workspace somewhere the
+/// deny actually reaches. Reuses [`EscapeDir`]'s location and its drop.
+struct OutsideTemp(EscapeDir);
+
+impl OutsideTemp {
+    fn path(&self) -> &Path {
+        &self.0 .0
+    }
+}
+
+/// Collects the `Contained` report a run makes at start.
+#[derive(Default)]
+struct Contained(Mutex<Vec<(String, String, u32)>>);
+
+impl Observer for Contained {
+    fn event(&self, event: &RunEvent) -> Flow {
+        if let EventKind::Contained {
+            mode,
+            backend,
+            roots,
+        } = &event.kind
+        {
+            self.0
+                .lock()
+                .unwrap()
+                .push((mode.clone(), backend.clone(), *roots));
+        }
+        Flow::Continue
+    }
+}
+
+/// F1 — the default confines a write, with no builder call at all.
+///
+/// The whole release in one assertion. `contract()` is
+/// `TaskContract::workspace(goal, root)` and nothing else — the shape every
+/// embedder writes — and up to 0.45.0 this write landed.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_default_contract_confines_a_write_with_no_builder_call() {
+    let dir = workspace();
+    let escape = EscapeDir::new("default-confines");
+    let target = escape.file();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&["touch", target.to_str().unwrap()])]]);
+
+    run_with(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    if !backend_confines_writes() {
+        // The degraded host — a stock Ubuntu 24.04 or a Windows Job Object.
+        // Asserted rather than skipped: 0.40.0's Linux defect survived three CI
+        // runs precisely because the tests stepped over the fallback.
+        assert!(
+            target.exists(),
+            "this host confines nothing, so the write must land: {}",
+            target.display()
+        );
+        return;
+    }
+    assert!(
+        !target.exists(),
+        "the default contract let a command write outside the workspace: {}",
+        target.display()
+    );
+}
+
+/// F2 — and the write lands again the moment the caller says so, which is what
+/// makes the containment a default rather than a policy.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_escape_hatch_is_one_call_and_it_is_complete() {
+    let dir = workspace();
+    let escape = EscapeDir::new("escape-hatch");
+    let target = escape.file();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&["touch", target.to_str().unwrap()])]]);
+    let seen = Contained::default();
+
+    let result = run_with_observed(
+        &contract(dir.path()).with_full_access(),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+        &seen,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        target.exists(),
+        "with_full_access() must restore 0.45.0's behaviour exactly: {}",
+        target.display()
+    );
+    // Complete, not partial: no backend was consulted and no row claims one.
+    assert!(
+        store.sandbox_events(result.run_id).unwrap().is_empty(),
+        "a full-access run left rows claiming containment"
+    );
+    // But the run still says what it is. An absent event is not a statement.
+    let reports = seen.0.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(reports[0].0, "full-access");
+    assert_eq!(reports[0].1, "none");
+    assert_eq!(reports[0].2, 0);
+}
+
+/// F3 — `ReadOnly` refuses a write into the workspace root itself, and still
+/// permits the read.
+///
+/// The mode whose whole difference from the default is one directory, so the
+/// assertion is on that directory.
+///
+/// **The workspace here is not a `tempfile::tempdir()`, and that is the module
+/// header's trap read a second time.** The macOS profile blanket-allows
+/// `/private/var/folders`, so a read-only workspace placed there would be
+/// writable no matter what this release does, and the test would pass on the
+/// development host while asserting nothing. The escape tests moved to `target/`
+/// for that reason in 0.40.0; a read-only *workspace* has to move for the same
+/// one.
+#[cfg(unix)]
+#[tokio::test]
+async fn read_only_refuses_a_write_into_the_workspace_and_permits_the_read() {
+    let dir = EscapeDir::new("read-only-workspace");
+    let dir = OutsideTemp(dir);
+    std::fs::write(dir.path().join("readable.txt"), "already here\n").unwrap();
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![
+        vec![exec_call(&["touch", "written-under-read-only.txt"])],
+        vec![exec_call(&["cat", "readable.txt"])],
+    ]);
+
+    let result = run_with(
+        &contract(dir.path()).with_exec_mode(ExecMode::ReadOnly),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+
+    let steps = store.steps(result.run_id).unwrap();
+    if !backend_confines_writes() {
+        assert!(
+            dir.path().join("written-under-read-only.txt").exists(),
+            "this host confines nothing, so the write must land"
+        );
+        return;
+    }
+    assert!(
+        !dir.path().join("written-under-read-only.txt").exists(),
+        "read-only let a command write into the workspace"
+    );
+    // The read is the other half, and it is what separates this from "nothing
+    // runs at all under this mode".
+    assert!(
+        steps.iter().any(|s| s.prompt.contains("already here")),
+        "read-only refused a read as well: {:?}",
+        steps.iter().map(|s| s.prompt.len()).collect::<Vec<_>>()
+    );
+}
+
+/// F6 — a granted root that does not exist never reaches a backend, and the
+/// backend stays native.
+///
+/// 0.40.0's defect, reproduced deliberately: the Linux mount setup `fail`s on a
+/// bind it cannot perform, and a failed setup degrades the whole backend to the
+/// floor. The feature would appear to work while confining nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_writable_root_that_does_not_exist_does_not_degrade_the_backend() {
+    let _env = env_guard();
+    use io_harness::sandbox::{select, Backend, Sandbox};
+
+    let dir = workspace();
+    let store = Store::memory().unwrap();
+    // A cargo project whose registry cache is somewhere that is not there.
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let absent = dir.path().join("no-such-cargo-home");
+    std::env::set_var("CARGO_HOME", &absent);
+
+    let provider = MockScript::new(vec![vec![exec_call(&["touch", "landed.txt"])]]);
+    let seen = Contained::default();
+    let result = run_with_observed(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+        &seen,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("CARGO_HOME");
+
+    // The command ran, inside the workspace, under this host's real backend.
+    assert!(
+        dir.path().join("landed.txt").exists(),
+        "the run did not survive an absent writable root"
+    );
+    let expected = select(&SandboxConfig::new()).backend();
+    let reports = seen.0.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "{reports:?}");
+    assert_eq!(
+        reports[0].1,
+        expected.as_str(),
+        "an absent root degraded the backend"
+    );
+    assert_eq!(
+        reports[0].2, 0,
+        "a root that does not exist was granted anyway"
+    );
+    let _ = Backend::PortableFloor;
+    assert!(!store.sandbox_events(result.run_id).unwrap().is_empty());
+}
+
+/// F9's other arm — the report names the backend that applied and counts the
+/// roots that were granted, for an ordinary contained run.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_containment_report_names_what_actually_applied() {
+    let _env = env_guard();
+    use io_harness::sandbox::{select, Sandbox};
+
+    let dir = workspace();
+    // A cargo project whose registry cache exists, so there is a root to count.
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let home = dir.path().join("cargo-home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::env::set_var("CARGO_HOME", &home);
+
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&["true"])]]);
+    let seen = Contained::default();
+    let _ = run_with_observed(
+        &contract(dir.path()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+        &seen,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("CARGO_HOME");
+
+    let reports = seen.0.lock().unwrap().clone();
+    assert_eq!(reports.len(), 1, "exactly one report per run: {reports:?}");
+    assert_eq!(reports[0].0, "workspace-write");
+    assert_eq!(
+        reports[0].1,
+        select(&SandboxConfig::new()).backend().as_str(),
+        "the report must name the selection, not the request"
+    );
+    assert_eq!(
+        reports[0].2, 1,
+        "the toolchain's own cache is the granted root: {reports:?}"
+    );
+}
+
+/// F4 — a real package manager completes under the default, and fails without
+/// the cache roots.
+///
+/// `cargo generate-lockfile --offline` is the smallest real invocation that
+/// **must** write outside the project it is building: measured on this host, it
+/// creates `$CARGO_HOME/.package-cache` and `$CARGO_HOME/.global-cache` and
+/// touches the network for nothing. That is the whole 0.40.0 limitation — "under
+/// containment a toolchain writing `~/.cargo/registry` fails" — in one command.
+///
+/// The control differs in exactly one thing: whether the workspace root carries
+/// the marker `toolchain::detect` reads. Without it there is no detection, so
+/// there are no cache roots, so the same command is refused. A test asserting
+/// only that `cache_dirs()` returned a plausible `PathBuf` would pass in exactly
+/// the case that matters.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_real_package_manager_completes_under_the_default() {
+    let _env = env_guard();
+    let ws = OutsideTemp(EscapeDir::new("cargo-granted"));
+    let home = OutsideTemp(EscapeDir::new("cargo-home"));
+    std::fs::create_dir_all(ws.path().join("src")).unwrap();
+    std::fs::write(
+        ws.path().join("Cargo.toml"),
+        "[package]\nname = \"p\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    std::fs::write(ws.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "cargo",
+        "generate-lockfile",
+        "--offline",
+    ])]]);
+    std::env::set_var("CARGO_HOME", home.path());
+    let result = run_with(
+        &contract(ws.path()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("CARGO_HOME");
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        ws.path().join("Cargo.lock").exists(),
+        "the granted run did not complete: {:?}",
+        steps[0].decision
+    );
+    assert!(
+        home.path().join(".package-cache").exists(),
+        "the toolchain's own cache was not writable, which is the whole grant"
+    );
+
+    if !backend_confines_writes() {
+        return; // nothing is confined here, so there is no control to run
+    }
+
+    // The control: the same command, the same cache, one marker file apart.
+    let bare = OutsideTemp(EscapeDir::new("cargo-ungranted"));
+    let home2 = OutsideTemp(EscapeDir::new("cargo-home-2"));
+    std::fs::create_dir_all(bare.path().join("sub/src")).unwrap();
+    std::fs::write(
+        bare.path().join("sub/Cargo.toml"),
+        "[package]\nname = \"q\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\n",
+    )
+    .unwrap();
+    std::fs::write(bare.path().join("sub/src/main.rs"), "fn main() {}\n").unwrap();
+
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![exec_call(&[
+        "cargo",
+        "generate-lockfile",
+        "--offline",
+        "--manifest-path",
+        "sub/Cargo.toml",
+    ])]]);
+    std::env::set_var("CARGO_HOME", home2.path());
+    let result = run_with(
+        &contract(bare.path()),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("CARGO_HOME");
+
+    let steps = store.steps(result.run_id).unwrap();
+    assert!(
+        !home2.path().join(".package-cache").exists(),
+        "an ungranted cache was written to anyway: {:?}",
+        steps[0].decision
+    );
+}
+
+/// F8 — the verification gate is contained under the same roots as the run.
+///
+/// The gate runs the project's *own* build command in an ephemeral workdir, so it
+/// is the one place this crate runs a package manager on purpose. A gate that
+/// could not populate a registry cache would fail for a reason that has nothing
+/// to do with the code it is judging.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_verification_gate_gets_the_same_writable_roots() {
+    let _env = env_guard();
+    use io_harness::Verification;
+
+    let ws = OutsideTemp(EscapeDir::new("gate-granted"));
+    let home = OutsideTemp(EscapeDir::new("gate-home"));
+    std::fs::write(ws.path().join("Cargo.toml"), "[package]\nname = \"g\"\n").unwrap();
+    let marker = home.path().join("gate-wrote.txt");
+
+    let store = Store::memory().unwrap();
+    let provider = MockScript::new(vec![vec![]]);
+    std::env::set_var("CARGO_HOME", home.path());
+    let _ = run_with(
+        &contract(ws.path()).with_verification(Verification::Command {
+            argv: vec![
+                "sh".into(),
+                "-c".into(),
+                format!("touch {}", marker.display()),
+            ],
+            expect_exit: 0,
+        }),
+        &provider,
+        &store,
+        &permissive(),
+        &ApproveAll,
+    )
+    .await
+    .unwrap();
+    std::env::remove_var("CARGO_HOME");
+
+    assert!(
+        marker.exists(),
+        "the gate could not write to the toolchain's own cache: {}",
+        marker.display()
     );
 }

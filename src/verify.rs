@@ -914,6 +914,15 @@ pub struct ExecGuard<'a> {
     /// ephemeral sandbox — the 0.6.0 default; `None` opts back to direct host
     /// execution, the exact 0.5.0 behaviour.
     sandbox: Option<SandboxConfig>,
+    /// Directories the gate's command may write to besides its ephemeral workdir
+    /// (0.46.0).
+    ///
+    /// Empty by default, which is every release before 0.46.0. The run fills it
+    /// with the detected toolchain's own caches, because a gate that runs
+    /// `cargo test` and cannot populate a registry cache fails for a reason that
+    /// has nothing to do with the code it is judging — the 0.40.0 limitation, in
+    /// the one place this crate runs a build on purpose.
+    writable_roots: Vec<std::path::PathBuf>,
 }
 
 impl<'a> ExecGuard<'a> {
@@ -924,6 +933,7 @@ impl<'a> ExecGuard<'a> {
             trace: None,
             watch: None,
             sandbox: Some(SandboxConfig::default()),
+            writable_roots: Vec::new(),
         }
     }
 
@@ -948,6 +958,14 @@ impl<'a> ExecGuard<'a> {
         self
     }
 
+    /// Grant the gate's command write access to these directories besides its own
+    /// workdir (0.46.0). Absolute and existing — see
+    /// [`RunSpec::writable_roots`](crate::sandbox::RunSpec::writable_roots).
+    pub(crate) fn with_writable_roots(mut self, roots: Vec<std::path::PathBuf>) -> Self {
+        self.writable_roots = roots;
+        self
+    }
+
     /// Opt out of the sandbox: run the compile directly on the host, exactly as
     /// 0.5.0 did. Additive and reversible — the sandbox is the default, not a
     /// forced change.
@@ -965,6 +983,7 @@ impl<'a> ExecGuard<'a> {
             trace: None,
             watch: None,
             sandbox: Some(SandboxConfig::default()),
+            writable_roots: Vec::new(),
         }
     }
 
@@ -1083,12 +1102,12 @@ impl<'a> ExecGuard<'a> {
                     );
                 }
                 let outcome = sb
-                    .run(RunSpec {
-                        argv,
-                        workdir,
-                        limits: &cfg.limits,
-                        allow_network: cfg.allow_network,
-                    })
+                    .run(
+                        RunSpec::new(argv, workdir, &cfg.limits)
+                            .with_network(cfg.allow_network)
+                            .with_mode(cfg.mode)
+                            .with_writable_roots(&self.writable_roots),
+                    )
                     .await?;
                 if let Some((store, run_id, step)) = self.trace {
                     if let Some(cap) = outcome.cap_hit {
