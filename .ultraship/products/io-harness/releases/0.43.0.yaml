@@ -1,0 +1,600 @@
+product: io-harness
+version: 0.43.0
+status: planned
+release_type: minor
+
+outcome:
+  user_can: >
+    Run a long job to the end. Today a long enough one either forgets its own beginning or dies,
+    and both failures are silent until they are expensive.
+
+    **A long run stops forgetting what it decided.** `context::assemble` (`src/context.rs:413`)
+    bounds every turn's observation section to `ContextBudget::effective_tokens`
+    (`src/context.rs:285`, 24,000 tokens by default) with four rules — supersession, invalidation,
+    re-read and fit. The fourth is where the loss is: newest first, whole while it fits, and
+    everything after that becomes a one-line stub (`Assembled::stubbed`, `src/context.rs:377`) or,
+    past the ceiling, one collapsed line for all of them (`Assembled::collapsed`, `:391`). A stub
+    says a read happened and how big it was. It does not say what the run learned from it, which
+    file it decided to change, or what it has not done yet. So on step 60 the agent is working from
+    the last eight observations and a list of sizes, and nothing in the crate has ever written a
+    sentence about the fifty-two before them. 0.43.0 makes the fold a summary instead of a
+    truncation: when the ledger no longer fits its share of the turn's budget, everything but the
+    newest observations becomes one model-written paragraph — what was being attempted, which files
+    were touched, what was decided, and what is still open — and the run continues from that.
+
+    **A context overflow stops being the end of the run.** A request that does not fit comes back
+    from every vendor as a 4xx, which `ProviderErrorKind::from_status` (`src/error.rs:99`) maps to
+    `Request`, which `is_retryable` (`:81`) correctly calls terminal: the server has read these
+    exact bytes and refused them, so sending them again is two failures instead of one. That
+    reasoning is right and its conclusion is wrong for this one case, because the answer is not to
+    resend the same bytes — it is to send *fewer* of them. 0.43.0 classifies the overflow as its own
+    kind, and the run loop answers it by compacting once and re-asking with the shorter request. A
+    second overflow after that escalates exactly as today.
+
+    **What compaction folds away is still reachable.** The summary is a stored row bound to the step
+    it covers, so a resumed, branched or replayed run reads it rather than paying a model to write it
+    again — and, because it is stored, an operator can export a session's whole transcript as one
+    readable artifact: every turn in order, what was asked, what was answered, and where a summary
+    stands in for the steps behind it. `Store::session_turns` (`src/state.rs:6456`) and
+    `Store::observations` (`:4442`) have held the material since 0.32.0; nothing has ever rendered
+    it, so the way to read a conversation back today is to write the SQL yourself.
+
+    **And a turn can carry an image.** `TaskContract::with_images` (`src/contract.rs:510`) has
+    accepted them since the `media` feature shipped, and every one of the six `Session` turn entry
+    points (`src/session.rs:245`, `:298`, `:353`, `:413`, `:437`, `:525`, `:595`) builds its
+    contract from a `&str` and nothing else. So the one path an operator would hand a screenshot to
+    — a conversation — is the only path that cannot take one. `Session::attach` stages images for
+    the next turn through the same field, on every entry point at once, without a seventh method or
+    a changed signature.
+
+  business_value: >
+    Each of the four closes a gap only the library can close, which is the test the last seven
+    releases were chosen by.
+
+    Compaction cannot be written outside the crate. The ledger is `context::Ledger`
+    (`src/context.rs:138`), built and owned by the run loop; an embedder never holds it, cannot
+    replace an entry, and cannot see `Assembled::stubbed` until after the request it would have
+    changed has been built. An application that wants this today has exactly one move — set
+    `ContextBudget::max_tokens` higher and pay for it every turn — which buys fidelity with money
+    rather than with a summary, and stops working at the model's real window.
+
+    The overflow answer is the same shape. The classification could in principle live in an
+    embedder's error handler, but the *recovery* cannot: it needs the ledger, the assembler and the
+    request builder, all of which are inside the loop. Without it, the honest advice to an operator
+    running an unattended job is "size the budget so this never happens", which is a guess against a
+    window the vendor can change.
+
+    The transcript is the smallest piece and the one an operator asks for first. The library already
+    owes them a readable trace — that is what `observe`, `attach` (0.33.0) and the whole `Store`
+    surface are for — and the conversation is the one view of a run it has never rendered. It is
+    also what makes compaction honest rather than lossy: a summary that replaces fifty observations
+    is acceptable precisely because the fifty are still on disk and now have a way out.
+
+    Images on a turn is a one-method gap that reads as an oversight in every demo. The capability,
+    the wire encoding, the per-provider refusal (`Provider::accepts_images`,
+    `ensure_media_accepted`, `src/run.rs:10286`) and the per-request budget (`src/run.rs:7602`) all
+    exist; only the conversational door is closed.
+
+    The price: one break, taken deliberately and paid once — `ProviderErrorKind` gains a variant and
+    `#[non_exhaustive]` in the same release, the move `Verification` (0.34.0), `TaskContract`
+    (0.35.0), `AgentDef` (0.36.0) and `TurnResult` (0.37.0) each made. Everything else is additive:
+    one table, one index, one event variant on an already-`#[non_exhaustive]` enum, one field and
+    one builder on `#[non_exhaustive]` `TaskContract`, and four new public types. An embedder who
+    upgrades and edits nothing gets a compile error only if they matched `ProviderErrorKind`
+    exhaustively, and identical behaviour everywhere else.
+
+  evidence_of_value: >
+    Executed in the technique the last twelve releases used: a discriminating assertion per claim, a
+    negative control that must not move, one sabotage per arm of every two-armed claim, and a
+    sabotage that fails nothing reported as a finding rather than propped up.
+
+    The compaction claims are proven from what the summarising provider was **handed** and what the
+    next request **contains**, never from a description. A fixture provider that records every
+    request it is given proves both halves at once: the summarising call receives the text of the
+    observations being folded, and the *next* step's request contains the summary's own sentence and
+    does **not** contain a distinctive string that appeared only in a folded observation. A prompt
+    built by today's stubbing passes every weaker assertion and fails that pair, which is what makes
+    it the discriminating one.
+
+    The stored-row claim is proven by a **counting** provider: a run compacts, is resumed, and the
+    counter shows the summarising model was called once in total rather than once per resume. That
+    is the same shape 0.34.0 and 0.42.0 used for their refusals, and it is the only way to prove a
+    thing did not happen a second time.
+
+    The overflow claim is proven against a provider that refuses a request over a byte threshold and
+    accepts one under it — so the recovery is a real change in what was sent, not a re-send that
+    happened to work. The run finishes; the trace holds one `Compacted` event and one overflow;
+    and a control run whose request is under the threshold compacts zero times. The sabotage —
+    retry without compacting — reaches the same refusal twice and fails it.
+
+    The transcript claim rests on one assertion a naive implementation cannot satisfy: a branched
+    session's export contains the turn that `Session::history` (`src/session.rs:176`) no longer
+    returns, marked as off the path. An export built from `history()` passes every other assertion
+    and fails that one.
+
+    The image claim is proven from the `CompletionRequest` the provider received, not from the
+    contract that was built: the media reaches the wire for a turn taken through `turn` and through
+    `turn_observed`, is **absent** from the turn after it without a second `attach`, and a provider
+    that does not accept images refuses before any request is sent.
+
+scope:
+  included:
+  - >
+    **`Compaction`, and `TaskContract::compaction` + `with_compaction`.**
+    `#[non_exhaustive] pub struct Compaction { at_share: f32, keep_recent: usize }` —
+    the share of the turn's own effective budget (`ContextBudget::effective_tokens`,
+    `src/context.rs:285`) above which the ledger is folded, and how many of the newest observations
+    are kept whole beside the summary. Default `at_share: 0.8`, `keep_recent: 8`. `TaskContract` is
+    `#[non_exhaustive]` (`src/contract.rs:70`), so the field and the builder are free.
+    **On by default**, because the failure it replaces is silent: a run whose oldest work became a
+    list of byte counts reports nothing, and an embedder cannot opt into a defect they cannot see.
+    `with_compaction` takes the knob for a caller who wants it off (`at_share: 1.0` never fires) or
+    tighter.
+  - >
+    **The fold itself, as one crate-internal helper called from both loops.** The two assembly sites
+    — the flat workspace loop (`src/run.rs:4263`) and the tree loop (`src/run.rs:5780`) — call it
+    immediately before `assemble`, on the loop's own thread, with the same `budget_tokens` assembly
+    is about to use. It compares the ledger's estimated tokens (`context::estimate_tokens`,
+    `src/context.rs:194`) against `at_share × budget_tokens`; under it, nothing happens and no
+    provider is called. Over it, everything but the newest `keep_recent` observations is replaced in
+    the ledger by one `ObsKind::Message` observation carrying the summary, and assembly then runs
+    over the shorter ledger exactly as it does today. One definition and two call sites, asserted by
+    shape, because a rule added to one of two loops is a rule that lapses in the other — the
+    constraint 0.41.0 and 0.42.0 both recorded.
+  - >
+    **The summary is written by the run's own provider and model.** Not a second provider held by a
+    new type: `ModelReviewer` (0.34.0) and `ModelApprover` (0.42.0) hold their own because a judge
+    must be able to be a different model from the one it judges, and a summariser is not a judge —
+    it is the run describing its own work. So no new trait, no new generic, and no second key to
+    configure. The summarising call is a plain `CompletionRequest` with no tools, it goes through
+    `complete_with_retry` (`src/run.rs:10268`) like every other completion, and it therefore lands
+    one `provider_calls` row and is billed and rate-limited with everything else.
+  - >
+    **A `summaries` table, and `Store::summaries` / `Summary`.**
+    `summaries (id, run_id, through_step, kept_from, text, est_tokens, created_at)` with an index on
+    `(run_id, through_step)`. Written before the ledger is edited, so a process that dies between
+    the summarising call and the next request has already paid for and kept the summary. Read back
+    on resume, branch and replay by the same helper, keyed on the step it covers — which is what
+    makes a resumed run reproduce the fold rather than buy it again. Additive: `summaries` and its
+    index go into `ADDED_SINCE_0_22_0` (`tests/cross_version.rs:149`), `CHECKPOINT_FORMAT`
+    (`src/state.rs:107`) is **unmoved** at 7, and no existing table, column or index is altered.
+  - >
+    **`EventKind::Compacted { through_step, before_tokens, after_tokens }`.** `EventKind` is
+    `#[non_exhaustive]` since 0.24.0 (`src/observe.rs:290`), so the variant is additive. Emitted at
+    the fold, with the census in `src/observe.rs`'s test module and `EVENT_NAMES` updated in the
+    same commit — the bookkeeping trap 45 records. An operator watching a run sees the moment its
+    history was folded and what it cost, rather than inferring it from a token count that dropped.
+  - >
+    **`ProviderErrorKind::ContextOverflow`, and `#[non_exhaustive]` on the enum.** One break, paid
+    once, in the release that needs the variant. `is_retryable()` returns **false** for it, and that
+    is the correct answer rather than a compromise: re-sending bytes the server said were too many
+    cannot work. The recovery is a different request, and it belongs to the loop, not to the retry
+    policy.
+  - >
+    **Classification from the response, in the one place the mapping lives.**
+    `ProviderErrorKind::from_status` (`src/error.rs:99`) keeps its exact signature and behaviour;
+    beside it, `from_response(status: u16, message: &str) -> Self` answers `ContextOverflow` for a
+    400 or 413 whose message carries one of a small, conservative, case-insensitive set of vendor
+    signatures, and delegates to `from_status` otherwise. The three built-in providers call the new
+    one, so OpenRouter, OpenAI and Anthropic cannot drift apart — the reason `from_status` was
+    centralised in the first place. A signature list that misses a vendor's wording costs the run
+    exactly what it costs today, which is why the list is allowed to be conservative.
+  - >
+    **Compact-and-retry-once, in the same helper.** A step whose completion fails with
+    `ContextOverflow` folds the ledger **unconditionally** — ignoring `at_share`, because the
+    provider has just said what the threshold was guessing at — rebuilds the request from the
+    compacted ledger, and asks once more. A second `ContextOverflow` escalates as today, with the
+    step row naming both attempts. Bounded at one recovery per step, so a pathological request
+    cannot loop.
+  - >
+    **`Session::transcript`, `Transcript`, `TranscriptTurn`.**
+    `Session::transcript(&self, store: &Store) -> Result<Transcript>`, a pure read that calls no
+    provider. `#[non_exhaustive] pub struct Transcript { session_id: i64, root: PathBuf, turns:
+    Vec<TranscriptTurn> }` and `#[non_exhaustive] pub struct TranscriptTurn { turn_id, parent_turn_id,
+    run_id, kind, prompt, reply, outcome, on_path: bool, summaries: Vec<Summary> }`.
+    Built from `Store::session_turns` (`src/state.rs:6456`) — **the whole tree, not the head path**
+    — because the turns `Session::history` (`src/session.rs:176`) drops are exactly the ones a
+    reader cannot otherwise reach, and an export that loses them is the failure the export exists to
+    prevent. `on_path` marks which turns the model currently sees.
+    `Transcript::to_markdown(&self) -> String` renders it: one section per turn in id order, the
+    prompt, the reply, a marked line where a summary stands in for folded steps, and an off-path
+    turn marked as such. Returned as a `String` — a library does not choose the caller's file.
+  - >
+    **`Session::attach`, under `#[cfg(feature = "media")]`.**
+    `pub fn attach<I: IntoIterator<Item = Media>>(&mut self, images: I) -> &mut Self`, staging images
+    for the **next turn only**. `drive` (`src/session.rs:640`) appends them to the contract it is
+    about to run — after `default_contract` (`:624`) or `rooted` (`:629`), so a `turn_bounded`
+    caller's own `with_images` are kept and the staged ones are added — and clears the staging
+    whatever the turn's outcome. One method rather than a seventh, eighth and ninth entry point:
+    every existing turn shape gains images at once and no signature changes. Gated exactly as
+    `TaskContract::images` (`src/contract.rs:119`) is, so the default build is untouched.
+  - >
+    **Documentation as part of the release.** `docs/CONTRACT.md` gains four guarantees in the terms
+    an embedder needs them: when compaction fires, that it costs one provider call attributable in
+    `provider_calls`, and that a summary is written once and re-read; that a `ContextOverflow` is
+    answered by compacting and re-asking exactly once and escalates on the second; that a transcript
+    is a read of the whole tree and never a provider call; and that staged images ride one turn.
+    `docs/guide/` documents compaction beside the context budget and `attach` beside the session
+    turns. `CHANGELOG.md` gains the entry **with** a `*Migration:*` note for the `ProviderErrorKind`
+    break — the one this release owes. **No new guide page**, so no `GUIDES` / `CAPABILITIES.md`
+    bookkeeping, the precedent since 0.31.0. `docs/public-api.txt` updated by hand; every new public
+    item carries a worked doctest for the `every_public_item_has_a_worked_example` gate.
+  excluded:
+  - >
+    **A second cache breakpoint at the compaction boundary.** That is 0.44.0's whole outcome, and it
+    depends on this release existing. Marking a prefix as cacheable is a request-shape decision with
+    its own live evidence and its own vendor differences; folding it in here would make one release
+    that is two.
+  - >
+    **Compaction across turns of a session, or across runs.** `Session::seed` (`src/session.rs:757`)
+    renders each prior turn into a bounded observation and the assembler treats it like any other, so
+    a long conversation is folded by this release through the same path as a long run. A summary that
+    replaces *turns* in the session tree is a different object with a different lifetime, and it
+    would make `Session::history` lossy — which is what the transcript exists to prevent.
+  - >
+    **A separate summarising provider or model.** A knob for it is one line to add later and
+    impossible to remove; nothing in the release needs it, and every embedder who does not need it
+    would have to decide about it.
+  - >
+    **Summarising the durable memory notes.** `render_notes` (`src/context.rs:624`) has its own
+    ceiling and its own rules, and memory is already the crate's answer to "what should survive". A
+    summary of a summary is not this release's problem.
+  - >
+    **Any change to elision.** Supersession, invalidation, re-read and fit are untouched.
+    Compaction runs *before* assembly and hands it a shorter ledger; it does not become a fifth rule
+    inside `assemble`, which would put a provider call inside a function that has never made one.
+  - >
+    **Making `ContextOverflow` retryable.** `is_retryable` keeps its meaning — "could re-sending
+    these same bytes succeed" — and the answer stays no. The loop's recovery is a different request
+    and is not a retry.
+  - >
+    **Rendering a transcript to a file, a directory or a format the caller did not ask for.** One
+    `String`, one method. HTML, JSON and pagination are an application's.
+  - >
+    **Audio, video, or documents on a turn.** `attach` takes the same `Media` the contract takes and
+    nothing new; the `documents` feature's extraction path is unchanged.
+  - >
+    **Any new dependency, `CHECKPOINT_FORMAT` bump, or altered table.**
+  fallback_scope:
+  - >
+    **Compaction and the overflow recovery — the two that cannot be written outside the crate.**
+    Together they are a coherent release and the roadmap's headline sentence: a long conversation
+    stops forgetting its own beginning, and a context overflow stops ending the run. The transcript
+    and the images each move to their own version. What is given up is stated in the record rather
+    than discovered: an operator still reads a conversation back by writing SQL, and a screenshot
+    still cannot reach a turn. Both are additive and neither is made harder by shipping later — the
+    transcript in particular gets *easier*, because `summaries` will already exist.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a fold replaces the oldest observations with a written summary, and the next request
+    carries it.** A run driven past the threshold with a fixture provider that records every request
+    it receives. Two assertions, and the pair is what discriminates: the summarising request contains
+    the text of an observation being folded, and the **next step's** request contains a distinctive
+    sentence from the summary while **not** containing a distinctive string that appeared only in a
+    folded observation. Sabotage: fold by stubbing instead of summarising (today's behaviour), under
+    which the second assertion fails and every weaker one passes.
+  - >
+    **F2 — under the threshold, nothing happens and nothing is spent.** The same run with
+    `at_share: 1.0`, and separately with a ledger that never crosses the share: zero `summaries`
+    rows, zero `Compacted` events, and the counting provider records exactly the completions the
+    steps required. Byte-for-byte, the requests are 0.42.0's. Sabotage: fold every turn, under which
+    the completion count is wrong and this fails while F1 still passes.
+  - >
+    **F3 — the summary is stored once and re-read.** A run that compacts, is interrupted, and is
+    resumed under the same run id: the counting provider shows the summarising model was called
+    **once in total**, one `summaries` row exists with the `through_step` it covers, and the resumed
+    run's next request carries the same summary text. Sabotage: read the row but write a fresh
+    summary anyway, under which the counter is two and only this fails.
+  - >
+    **F4 — a context overflow is classified, and the run survives it.** A fixture provider that
+    refuses any request over a byte threshold with the vendor wording, and serves one under it. The
+    run finishes; the trace holds exactly one `Compacted` event and the failing attempt; and the
+    request that succeeded is provably shorter than the one that failed. `ProviderErrorKind` on the
+    failing attempt's recorded error is `ContextOverflow` and not `Request`. Sabotage: re-ask without
+    compacting, under which the second attempt hits the same refusal and the run escalates.
+  - >
+    **F5 — the recovery happens once.** A provider that refuses **every** request whatever its size:
+    the run escalates with `RunOutcome::Escalated { retryable: false, .. }` after exactly two
+    completion attempts for that step and one fold, not a loop. The step row names both. Sabotage:
+    remove the once-per-step bound, under which the attempt count grows past two.
+  - >
+    **F6 — classification is conservative and does not swallow a real 400.** A 400 with a message
+    carrying none of the signatures stays `Request`, terminal, with no fold and no second attempt —
+    the negative control that must not move. A 401 stays `Auth`, a 429 stays `RateLimited`, a 500
+    stays `Server`; `from_status` is asserted byte-identical in behaviour to 0.42.0's over the whole
+    status range it maps. Sabotage: classify any 400 as an overflow, under which the control run
+    compacts and re-asks a request the server had already read and refused.
+  - >
+    **F7 — a transcript renders the whole tree, including what the model can no longer see.** A
+    session of three turns, branched from the first, then one more turn. `Session::history` returns
+    three; `Session::transcript` returns **four**, in id order, with the branched-away turn present
+    and `on_path: false`. The markdown contains both turns' prompts, and marks where a summary stands
+    in for folded steps. Sabotage: build the export from `history()`, under which the fourth turn is
+    missing and only this criterion fails.
+  - >
+    **F8 — a transcript is a read.** The same export run against a counting provider that must
+    record **zero** completions, on a session whose runs have already finished. Sabotage: summarise
+    anything at export time, under which the counter is non-zero.
+  - >
+    **F9 — an image reaches the wire through a conversational turn.** `Session::attach` then
+    `Session::turn`, over a fixture provider that records the `CompletionRequest` it received: the
+    media is on the request. The same through `turn_observed`. The **next** turn, with no second
+    `attach`, carries none — the staging is cleared. A `turn_bounded` whose contract already carries
+    an image of its own carries both. Sabotage: keep the staging across turns, under which the
+    second turn's request carries an image nobody attached.
+  - >
+    **F10 — a provider that does not accept images still refuses, and before anything is sent.** A
+    turn with staged images over a provider whose `accepts_images` is false fails with the existing
+    error from `ensure_media_accepted` (`src/run.rs:10286`), and the counting provider records zero
+    completions. The refusal is 0.42.0's, reached through a new door. Sabotage: attach after the
+    media check, under which a request is sent that must not be.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` for the default feature set has the same number of
+    crates as 0.42.0 (**402**). Summarising needs a `Provider`, which is the crate's own trait; the
+    transcript needs `std::fmt`; the table needs `rusqlite`, already there.
+  - >
+    **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
+  - >
+    **N3 — exactly one public break, and it is the one named.** `ProviderErrorKind` gains
+    `ContextOverflow` and `#[non_exhaustive]` together. Everything else is additive: `Compaction`,
+    `Summary`, `Transcript`, `TranscriptTurn` are new; `EventKind::Compacted` sits on an
+    already-`#[non_exhaustive]` enum; the `TaskContract` field and builder sit on a
+    `#[non_exhaustive]` struct; `Session::attach`, `Session::transcript`, `Store::summaries`,
+    `Transcript::to_markdown` and `ProviderErrorKind::from_response` are added and nothing is
+    removed or altered. `docs/public-api.txt` gains the lines **its checker can see** — the
+    crate-root re-exports `Compaction`, `Summary`, `Transcript` and `TranscriptTurn` — and not the
+    methods, the enum variant or the struct field, which are members of already-listed items. Stated
+    this way at plan time because the same criterion has been met "in a different form" four
+    releases running (traps 114 and the 0.41.0 N3 note).
+  - >
+    **N4 — a fold costs one provider call and is visible where spend already is.** The summarising
+    completion lands exactly one `provider_calls` row for the step it happened in, attributed to the
+    run, and its tokens are inside `Store::spent_tokens` and inside the run's token budget. Asserted
+    by row count and by a budget tight enough that the summarising call is what exhausts it — a fold
+    that spent money invisibly would be the one defect this release could ship without noticing.
+  - >
+    **N5 — 0.41.0's batch and 0.42.0's gate are unaffected.** With compaction on, three read-only
+    tools still rendezvous inside the bound and are still folded back in the model's call order, and
+    a `before_tool` hook is still consulted exactly once per call. The fold is in the serial phase
+    before assembly and touches neither. Asserted rather than assumed, because a helper inserted into
+    both loops is exactly where a regression to either would hide.
+  operational:
+  - >
+    **O1 — the full suite passes on all three platforms**, which the standing CI matrix already runs.
+    Nothing here is process-spawning or path-shaped, so this is the routine bar rather than a
+    load-bearing one; the `media` arm of the matrix is what covers `Session::attach`.
+  - >
+    **O2 — the store migration is additive and proven so.** One new table and one new index,
+    `CHECKPOINT_FORMAT` unmoved at 7, no existing table, column or index created or altered,
+    `git diff main -- src/state.rs` containing exactly that DDL and its reader. A 0.42.0 store opens,
+    resumes and rewinds under 0.43.0, and a 0.43.0 store opens under a 0.42.0 binary, asserted by the
+    cross-version tests that already read the 0.22.0 and 0.29.0 fixture stores.
+    `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0` (`tests/cross_version.rs:149`, `:233`)
+    updated in the same commit as the DDL.
+  - >
+    **O3 — the documentation gates pass**: the nightly rustdoc gate, the two intra-doc link rules,
+    and the checked-in doc surfaces (`docs/public-api.txt`, `CAPABILITIES.md`, the guide index,
+    `CHANGELOG.md` including its `*Migration:*` note) consistent with the code in the same commit
+    range.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.43.0, GitHub at initorigin/io-harness with the tag `v0.43.0` and a
+    Release titled `io-harness 0.43.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.43.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head checked against the tree the gates ran on immediately
+    before the release PR is opened. Release PR `develop` into `main`, merged the same way. The
+    GitHub Release is cut by `release.yml` —
+    `gh workflow run release.yml --ref main -f version=0.43.0` — which takes its notes verbatim from
+    the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and
+    the Release exist, with the registry token sourced from the repo-local `.env` in the same shell
+    invocation. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    One additive table, `summaries`, and one index on `(run_id, through_step)`. No existing table,
+    column or index is created or altered, `CHECKPOINT_FORMAT` is unmoved at 7, and a 0.42.0 store
+    and a 0.43.0 store are the same store in both directions: an older binary opens a newer store and
+    simply never reads the table.
+  - >
+    One public break: `ProviderErrorKind` gains the `ContextOverflow` variant **and**
+    `#[non_exhaustive]`. A consumer matching that enum exhaustively adds a wildcard arm; the
+    changelog carries the `*Migration:*` note saying exactly that, and says why the two are paid in
+    the same release — the enum becoming `#[non_exhaustive]` is what makes the *next* variant free.
+  - >
+    One behaviour change with no compile consequence, and it is the one to read carefully:
+    compaction is **on by default**, so a run long enough to cross `at_share` now makes a
+    summarising provider call it did not make on 0.42.0 — billed, traced and inside the token budget.
+    A caller who wants 0.42.0's behaviour exactly writes `with_compaction(Compaction { at_share: 1.0,
+    ..Default::default() })`. The changelog states this beside the addition rather than leaving an
+    operator to find it in an invoice.
+  observability:
+  - >
+    A fold emits `EventKind::Compacted { through_step, before_tokens, after_tokens }` and writes one
+    `summaries` row. Both are new; an observer that does not know the variant is unaffected, because
+    the enum has been `#[non_exhaustive]` since 0.24.0.
+  - >
+    A context overflow appears in the trace as the existing failed-attempt `provider_calls` row and
+    step record, with `ContextOverflow` where `Request` would have been. No new event: an overflow
+    that is recovered from is a fold, and the fold already has one.
+  - >
+    The summarising completion is an ordinary `provider_calls` row for the step it happened in.
+    Nothing about spend moves to a new place, which is the point of not giving the summariser its own
+    provider.
+  - >
+    A transcript emits nothing at all. It is a read, and a read that announced itself would be a
+    surprise in every trace that ever exported one.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.43.1 and `cargo yank --version
+    0.43.0` is the escape hatch, leaving 0.42.0 as what `cargo install` resolves. Reverting is
+    unusually cheap and partial: compaction is one contract knob away from 0.42.0's exact behaviour,
+    the overflow recovery only fires on a request that would otherwise have been terminal, and both
+    the transcript and `attach` are inert until called. A suspected defect is bisected by setting
+    `at_share: 1.0` rather than by downgrading.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    No live provider is required. The summarising, refusing and counting providers are all fixtures;
+    the evidence is recorded requests, stored rows and counters, none of which needs a vendor.
+  - >
+    One live check is worth doing once and is **not** an acceptance criterion: that a real vendor's
+    over-window 400 carries one of the signatures the classifier matches. It is recorded as an open
+    question rather than a gate, because a signature list is a heuristic and a criterion that depends
+    on a third party's wording is a criterion that fails on their release schedule, not ours.
+    Assert the structure; record the observation.
+  human_approvals:
+  - >
+    Compaction is **on by default** with `at_share: 0.8`, `keep_recent: 8`, accepted with its
+    consequence stated: a long run makes one provider call it did not make on 0.42.0. Chosen over
+    opt-in because the failure being replaced is invisible — an embedder cannot opt into fixing a
+    defect whose symptom is a prompt they never see.
+  - >
+    The summary is written by the **run's own provider and model**, not by a new type holding its
+    own. A summariser describes the run's work rather than judging it, so the `ModelReviewer` /
+    `ModelApprover` shape does not apply.
+  - >
+    `ProviderErrorKind` takes the variant **and** `#[non_exhaustive]` in the same release — one
+    break, paid once, the move four previous releases made on four other types.
+  - >
+    Images reach a turn through **one staging method** (`Session::attach`) rather than through new
+    entry points. Six turn shapes exist; adding an images variant to each is six methods and a
+    standing obligation to add a seventh every time a turn shape is added.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: large
+  uncertainty: medium
+  likely_cost_drivers:
+  - >
+    **Four capabilities, and the first two are entangled.** The overflow recovery is the compaction
+    helper called for a different reason, so building compaction first and the recovery as its second
+    caller is cheaper than treating them as two features. The transcript and `attach` are
+    independent and small; do them last, and drop them to the fallback if the first two run long.
+  - >
+    **The discriminating test for F1 needs a fixture provider that records every request it was
+    handed** — the same machinery 0.42.0 built for its recorded prompts. Find it and reuse it; a
+    second one would drift.
+  - >
+    **The fold must not become a fifth elision rule.** `assemble` (`src/context.rs:413`) has never
+    made a provider call and must not start: the helper runs before it, edits the ledger, and hands
+    it a shorter one. Budget time for confirming by call site — not by assumption — that both loops
+    fold before assembling and that neither folds twice in a step. That is the shape whose first
+    reading was wrong in 0.42.0 and cost `US-IO-HARNESS-0.42.0-I01`.
+  - >
+    **Choosing where the summary sits in the ledger.** It replaces observations, so it must satisfy
+    the rules that run after it: supersession must not delete it, invalidation must not stale it, and
+    it must not be the entry the fit rule stubs first. Expect a round on `ObsKind` and on the ordering
+    the assembler emits.
+  - >
+    **The signature list is a heuristic and must be written as one.** Conservative, case-insensitive,
+    only on 400/413, and covered by a negative control (F6) rather than by confidence. Budget time
+    for reading the three built-in providers' error paths rather than pattern-matching one.
+  - >
+    **`Session::attach` touches a `cfg`-gated field from an ungated function.** `drive` is not gated
+    and `TaskContract::images` is; the staging field, the append and the clear each need the same
+    gate, and the default build must be byte-identical. This is a five-minute change that costs an
+    hour if the gates are discovered one compile error at a time.
+  preferred_tools:
+  - >
+    `context::Ledger` (`src/context.rs:138`) and `estimate_tokens` (`:194`) for the trigger — the
+    same estimator assembly already uses, so the threshold and the budget cannot drift apart.
+  - >
+    `complete_with_retry` (`src/run.rs:10268`) for the summarising call. It is the single choke point
+    every completion in every loop goes through, so a summary is billed, retried and traced like
+    everything else without a line of new plumbing.
+  - >
+    `Store::observations` (`src/state.rs:4442`) and the `ledger_observations` table (`:2891`) as the
+    model for the `summaries` reader and writer — same shape, same run-keyed access, same place in
+    the file.
+  - >
+    `Store::session_turns` (`src/state.rs:6456`) for the transcript. It already returns the whole
+    tree, which is the half `Session::history` deliberately does not.
+  - >
+    The existing fixture-provider and recorded-provider machinery for every criterion. The only new
+    fixture is a provider that refuses over a byte threshold, which is ten lines.
+  constraints:
+  - >
+    No new dependency in the default build.
+  - >
+    MSRV stays 1.95.
+  - >
+    Exactly one public break, and it is `ProviderErrorKind`. Everything else is additive.
+  - >
+    `CHECKPOINT_FORMAT` stays 7. One new table, one new index, nothing altered.
+  - >
+    `assemble` makes no provider call, in this release or any other. Compaction runs before it.
+  - >
+    Nothing on the step path may serialise 0.41.0's read batch, move a recorded artifact out of the
+    model's call order, or change how often 0.42.0's `before_tool` hook is consulted.
+  - >
+    The transcript calls no provider and writes no row.
+
+risks:
+- >
+  **Compaction on by default changes what a long run costs, and the invoice is where an operator will
+  notice.** Mitigation: the call is an ordinary `provider_calls` row rather than a hidden one, the
+  fold emits an event, N4 asserts both, the changelog states it beside the addition, and
+  `at_share: 1.0` is a one-line return to 0.42.0. The residual risk is an operator who reads neither
+  and is surprised once.
+- >
+  **A summary is a model writing about a model's work, and it can be wrong.** A summary that misses
+  the decision that mattered is worse than a stub, because a stub is visibly incomplete and a
+  paragraph is not. Mitigation: `keep_recent` keeps the newest observations whole beside it, the
+  folded observations stay in `ledger_observations` and are reachable through the transcript, and the
+  summary is asked for intent, files, decisions and open work — four named things — rather than for
+  "a summary". Stated in `docs/CONTRACT.md` as a property of the feature, not buried.
+- >
+  **The overflow signature list is a heuristic against wording a vendor can change.** Mitigation: the
+  cost of a miss is exactly today's behaviour, F6 is the negative control that stops a false positive
+  being worse than that, and the list is documented as extendable rather than exhaustive. This risk
+  is asymmetric in the safe direction and should stay that way — a broader match is the tempting fix
+  and the wrong one.
+- >
+  **Prompt injection reaches the summariser.** The folded observations include file contents from a
+  repository the agent did not author, and they go into a prompt. Mitigation: the summariser has **no
+  tools**, its output is one observation among others rather than an instruction, and the policy is
+  untouched and remains the wall — a summary cannot widen a boundary, approve an act or call
+  anything. Stated in `docs/CONTRACT.md` in those terms.
+- >
+  **Two loops, one helper, and a fold in the wrong phase.** If the helper lands inside the concurrent
+  read phase or after assembly in one loop and before it in the other, the defect is a quiet
+  behaviour difference between a flat run and a contained one. Mitigation: N5, plus the shape
+  assertion both 0.41.0 and 0.42.0 used — one definition, two call sites, asserted by reading the
+  source rather than by trusting the diff.
+- >
+  **Fallback pressure.** Four capabilities is the widest scope since 0.40.0. If the fold cannot be
+  placed without disturbing assembly's four rules, the honest retreat is the fallback scope —
+  compaction and the overflow recovery — rather than a half-built transcript.
+
+open_questions:
+- >
+  Whether a real vendor's over-window 400 carries a signature the classifier matches. Worth one live
+  observation during development, recorded in the release record as an observation rather than
+  asserted as a criterion: a gate that depends on a third party's error wording fails on their
+  release schedule.
+- >
+  Whether `keep_recent` should be a count of observations or a share of the budget. A count is
+  predictable and a share adapts; the count is chosen for this release because it is the one a
+  reader can reason about without knowing the budget. Revisit if a run with eight very large
+  observations folds and still does not fit.
+- >
+  Whether a fold should be able to fold a fold — a second summary that supersedes the first once the
+  ledger fills again. It will happen naturally in a long enough run, and the honest answer for this
+  release is that the second summary summarises the first alongside the observations after it.
+  Whether that degrades over four or five generations is a question for a run long enough to show
+  it, not for plan time.
+- >
+  Whether `Transcript` should carry the run's steps as well as its turns. Deferred: the turn is the
+  conversational unit and the steps are already reachable through `Store::steps`. Revisit with a
+  caller who needs both in one artifact.
