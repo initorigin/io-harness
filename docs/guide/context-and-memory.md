@@ -135,6 +135,52 @@ that is a decision about what is being counted, and the crate does not make it f
 you. A recall is a fact about a run rather than a flag on an entry, so two runs
 over one workspace each record their own and neither disturbs the other.
 
+## When the history is folded instead of truncated (0.43.0)
+
+Elision has one failure it cannot avoid: past a point, the oldest observations
+become one-line stubs. A stub says a read happened and how big it was. It does not
+say what the run *learned* from it, which file it decided to change, or what it has
+not done yet — so on step sixty the agent is working from its last few
+observations and a list of sizes.
+
+Compaction replaces that truncation with a paragraph:
+
+```rust
+use io_harness::{Compaction, TaskContract};
+
+let contract = TaskContract::workspace("port the parser", "/repo")
+    // Fold sooner and keep less whole: a small window, or large observations.
+    .with_compaction(Compaction { at_share: 0.6, keep_recent: 4 });
+```
+
+When the ledger crosses `at_share` of the turn's own budget, everything but the
+newest `keep_recent` observations becomes one model-written paragraph covering
+four named things — what was attempted, which files were touched, what was
+decided, and what is still open — and the run continues from that.
+
+**It is on by default**, at `at_share: 0.8` and `keep_recent: 8`. The failure it
+replaces is invisible from outside: nothing reports that a run's oldest work became
+a list of byte counts. Turning it off is a setting rather than an absence:
+
+```rust
+use io_harness::{Compaction, TaskContract};
+
+let contract = TaskContract::workspace("port the parser", "/repo")
+    .with_compaction(Compaction { at_share: 1.0, ..Compaction::default() });
+```
+
+**What it costs, and where you see it.** One ordinary completion, written by the
+run's own provider and model — there is no second provider to configure. It lands
+one `provider_calls` row for the step it happened in, is inside `spent_tokens` and
+inside the token budget, and emits `EventKind::Compacted` with the tokens before
+and after. A fold is spend you can see where you already look.
+
+**What it never loses.** Every folded observation stays in the store. The
+paragraph is a `summaries` row, and a resumed, branched or replayed run replays its
+folds rather than paying for them again — so a fold is bought once per run, not
+once per process. `Session::transcript` is how a person reads back what a fold took
+out of the model's context.
+
 ## The limits, stated plainly
 
 Assembly **bounds** what a request carries and applies exactly the two staleness

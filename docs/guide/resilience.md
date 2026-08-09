@@ -77,6 +77,25 @@ hitting its step cap.
 
 Run it live: `cargo run --example stall_live`.
 
+## A request that did not fit (0.43.0)
+
+Every vendor reports an over-window request as a plain 4xx, which is terminal:
+the server has read these exact bytes and refused them, so sending them again is
+two failures instead of one. That reasoning is right, and its conclusion is wrong
+for this one case — because the answer is not to resend the same bytes, it is to
+send fewer of them.
+
+`ProviderErrorKind::ContextOverflow` tells that rejection apart from any other,
+from the vendor's own wording. It is **not** retryable, and the run loop does not
+retry it: it folds the ledger (see the context guide) and asks once more with a
+smaller request. A second overflow after that escalates, with both attempts in the
+trace.
+
+The classification is conservative on purpose. A wording it does not recognise
+costs exactly what an overflow cost before; a false positive would make the loop
+re-send a request the server had already refused. If you turned compaction off, an
+overflow stays terminal — that is part of what turning it off asks for.
+
 ## The limits, stated plainly
 
 **Fallback does not promise equivalence.** Falling over swaps the model mid-run,

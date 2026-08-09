@@ -35,7 +35,13 @@ use std::time::Duration;
 /// }
 /// # }
 /// ```
+// `#[non_exhaustive]` since 0.43.0, which added `ContextOverflow`. Paid together
+// with the variant, once, for the reason `Verification` (0.34.0), `TaskContract`
+// (0.35.0), `AgentDef` (0.36.0) and `TurnResult` (0.37.0) each paid it: a caller
+// matching this enum exhaustively adds a wildcard arm now, and the next kind of
+// failure a vendor invents costs nobody anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProviderErrorKind {
     /// The request never completed: connection refused, DNS failure, TLS failure,
     /// a mid-stream byte error.
@@ -52,6 +58,19 @@ pub enum ProviderErrorKind {
     Request,
     /// The response arrived and nothing in it could be read.
     Malformed,
+    /// The request did not fit the model's context window (0.43.0).
+    ///
+    /// A 4xx like any other as far as the wire is concerned, and told apart by the
+    /// vendor's own wording — see [`from_response`](Self::from_response). It is
+    /// **not** retryable, and that is the correct answer rather than a compromise:
+    /// re-sending bytes a server has said were too many cannot work.
+    ///
+    /// What answers it is a *different* request. The run loop folds the older half
+    /// of its observations into a summary and asks once more with the shorter one;
+    /// a second overflow after that escalates. So the recovery belongs to the loop
+    /// and not to the retry policy, and this variant exists so the loop has
+    /// something to branch on.
+    ContextOverflow,
 }
 
 impl ProviderErrorKind {
@@ -78,6 +97,9 @@ impl ProviderErrorKind {
     ///   second apart. Retrying burns the retry budget to reach the same 401.
     /// - [`Request`](Self::Request): the server has already read this exact
     ///   request and refused it. Sending it again is two failures instead of one.
+    /// - [`ContextOverflow`](Self::ContextOverflow): the same request cannot
+    ///   become small enough by being sent again. The answer is a smaller request,
+    ///   which the run loop builds by compacting; that is a recovery, not a retry.
     pub fn is_retryable(self) -> bool {
         match self {
             Self::Transport
@@ -85,7 +107,7 @@ impl ProviderErrorKind {
             | Self::RateLimited
             | Self::Server
             | Self::Malformed => true,
-            Self::Auth | Self::Request => false,
+            Self::Auth | Self::Request | Self::ContextOverflow => false,
         }
     }
 
@@ -104,6 +126,70 @@ impl ProviderErrorKind {
             _ => Self::Request,
         }
     }
+
+    /// The kind a status *and the server's own words* map to (0.43.0).
+    ///
+    /// [`from_status`](Self::from_status) cannot tell an over-window request from
+    /// any other rejected one, because every vendor reports it as a plain 4xx.
+    /// Only the message says which it was, so this is the one classification that
+    /// reads it — and it stays deliberately conservative: a signature this list
+    /// misses costs the run exactly what it costs today, while a false positive
+    /// makes the loop compact and re-send a request the server had already read
+    /// and refused. The asymmetry is in the safe direction and should stay there;
+    /// widening the match is the tempting fix and the wrong one.
+    ///
+    /// Only a 400 or a 413 is eligible. A 429 is a rate limit whatever it says,
+    /// and a 500 is the server's own admission of fault.
+    ///
+    /// ```
+    /// use io_harness::ProviderErrorKind;
+    ///
+    /// let over = ProviderErrorKind::from_response(400, "This model's maximum context length is 8192 tokens");
+    /// assert_eq!(over, ProviderErrorKind::ContextOverflow);
+    /// assert!(!over.is_retryable(), "the same bytes cannot fit on a second try");
+    ///
+    /// // A 400 that is simply a bad request stays a bad request.
+    /// assert_eq!(
+    ///     ProviderErrorKind::from_response(400, "unknown parameter: temperture"),
+    ///     ProviderErrorKind::Request
+    /// );
+    /// // And nothing else moves.
+    /// assert_eq!(ProviderErrorKind::from_response(429, "too many tokens per minute"),
+    ///            ProviderErrorKind::RateLimited);
+    /// ```
+    pub fn from_response(status: u16, message: &str) -> Self {
+        if matches!(status, 400 | 413) && is_context_overflow(message) {
+            return Self::ContextOverflow;
+        }
+        Self::from_status(status)
+    }
+}
+
+/// The vendor wordings that mean "this request did not fit".
+///
+/// A list rather than a regex, and short rather than clever: each entry is a
+/// phrase a vendor actually sends, and anything not here is left alone. Matched
+/// case-insensitively because the same vendor capitalises it differently in an
+/// error code and in a human-readable message.
+const CONTEXT_OVERFLOW_SIGNATURES: &[&str] = &[
+    // OpenAI and every wire that copies its error shape, including OpenRouter.
+    "context_length_exceeded",
+    "maximum context length",
+    "reduce the length of the messages",
+    // Anthropic.
+    "prompt is too long",
+    "exceed context limit",
+    // Common to several compatible endpoints.
+    "context window",
+    "too many tokens",
+];
+
+/// Whether a rejection's message is one of [`CONTEXT_OVERFLOW_SIGNATURES`].
+fn is_context_overflow(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    CONTEXT_OVERFLOW_SIGNATURES
+        .iter()
+        .any(|needle| lower.contains(needle))
 }
 
 /// Errors io-harness can return from a run.
@@ -257,18 +343,24 @@ impl Error {
     }
 
     /// A non-success HTTP status, with the kind derived once by
-    /// [`ProviderErrorKind::from_status`] so no provider can classify it
+    /// [`ProviderErrorKind::from_response`] so no provider can classify it
     /// differently.
+    ///
+    /// Every built-in provider builds its status failures here, which is why
+    /// 0.43.0's over-window classification needed no per-vendor edit: one funnel,
+    /// three wires, and no way for OpenRouter, OpenAI and Anthropic to drift apart
+    /// on what an over-window rejection is.
     pub fn provider_status(
         status: u16,
         retry_after: Option<Duration>,
         message: impl Into<String>,
     ) -> Self {
+        let message = message.into();
         Self::Provider {
-            kind: ProviderErrorKind::from_status(status),
+            kind: ProviderErrorKind::from_response(status, &message),
             status: Some(status),
             retry_after,
-            message: message.into(),
+            message,
         }
     }
 }

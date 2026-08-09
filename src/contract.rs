@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::context::ContextBudget;
+use crate::context::{Compaction, ContextBudget};
 use crate::resilience::{RetryPolicy, StallPolicy};
 use crate::verify::Verification;
 
@@ -151,6 +151,13 @@ pub struct TaskContract {
     /// though the two are related, since the share is taken of what the spend
     /// budget has left.
     pub context: ContextBudget,
+    /// When the run's history is folded into a written summary (0.43.0).
+    ///
+    /// Defaults to [`Compaction::default`], which folds — the failure it replaces
+    /// is a prompt the caller never sees, so it is not one an embedder can opt
+    /// into fixing. `Compaction { at_share: 1.0, .. }` is 0.42.0's behaviour
+    /// exactly, and is a setting rather than an absence.
+    pub compaction: Compaction,
     /// How long a command the agent runs with the `exec` tool may take before it
     /// is killed and reported as a timeout.
     ///
@@ -340,6 +347,7 @@ impl TaskContract {
             images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
+            compaction: Compaction::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -401,6 +409,7 @@ impl TaskContract {
             images: Vec::new(),
             tools: crate::tools::Toolbox::new(),
             context: ContextBudget::default(),
+            compaction: Compaction::default(),
             retry: RetryPolicy::default(),
             stall: StallPolicy::default(),
             exec_timeout: crate::tools::DEFAULT_EXEC_TIMEOUT,
@@ -934,6 +943,32 @@ impl TaskContract {
     /// any one request carries of what it has already observed.
     pub fn with_context_budget(mut self, context: ContextBudget) -> Self {
         self.context = context;
+        self
+    }
+
+    /// Set when the run's history is folded into a written summary (0.43.0).
+    ///
+    /// The companion to [`TaskContract::with_context_budget`]: that decides how
+    /// much of the history one request may carry, this decides what happens to
+    /// the rest of it. Without a fold the remainder becomes one-line stubs, which
+    /// say a read happened and not what it taught the run.
+    ///
+    /// ```
+    /// use io_harness::{Compaction, TaskContract};
+    ///
+    /// // Fold sooner and keep less whole: a small window, or large observations.
+    /// let tight = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_compaction(Compaction { at_share: 0.6, keep_recent: 4 });
+    /// assert!(tight.compaction.enabled());
+    ///
+    /// // Or never, which is what 0.42.0 did.
+    /// let never = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_compaction(Compaction { at_share: 1.0, ..Compaction::default() });
+    /// assert!(!never.compaction.enabled());
+    /// ```
+    #[must_use]
+    pub fn with_compaction(mut self, compaction: Compaction) -> Self {
+        self.compaction = compaction;
         self
     }
 

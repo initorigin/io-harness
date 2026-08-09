@@ -1,427 +1,451 @@
 product: io-harness
-version: 0.42.0
+version: 0.43.0
 tasks:
-- id: US-IO-HARNESS-0.42.0-T01
-  summary: Add `ApprovalContext`, the defaulted `Approver::decide_in_context` and `Approver::model`, and
-    route both approval sites through one crate-internal helper that builds the context from the policy's
-    own `Verdict`.
-  why_required: Every approval claim in the release rests on the approver being handed the rule and the
-    layer that flagged the call, and neither is on `Request` today. Without this the model approver is
-    as blind as an out-of-crate one, and the two loops would each grow their own copy of the context.
+- id: US-IO-HARNESS-0.43.0-T01
+  summary: Add the `summaries` table, its `(run_id, through_step)` index, `Summary`, `Store::put_summary`
+    and `Store::summaries`, and extend the cross-version lists.
+  why_required: 'Every compaction claim rests on the summary being durable: a resumed run must re-read
+    it rather than pay for it again, and the transcript renders it. The row must exist before anything
+    writes one, and the additive-migration criterion is asserted against this DDL and no other.'
   status: done
   depends_on: []
   acceptance_criteria:
-  - '**F3 — an approver that overrides nothing is unaffected.** `ApproveAll`, `DenyAll` and a hand-written
-    approver implementing only `decide` are each run through the tool path and the pre-run net authorization,
-    and each decides exactly as it does on 0.41.0 — same outcome, same stored rows. Sabotage: make `decide_in_context`
-    return `Decision::Defer` instead of forwarding to `decide`, under which all three arms stop at an
-    approval nobody asked for.
+  - '**O2 — the store migration is additive and proven so.** One new table and one new index, `CHECKPOINT_FORMAT`
+    unmoved at 7, no existing table, column or index created or altered, `git diff main -- src/state.rs`
+    containing exactly that DDL and its reader. A 0.42.0 store opens, resumes and rewinds under 0.43.0,
+    and a 0.43.0 store opens under a 0.42.0 binary, asserted by the cross-version tests that already read
+    the 0.22.0 and 0.29.0 fixture stores. `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0` (`tests/cross_version.rs:149`,
+    `:233`) updated in the same commit as the DDL.
 
     '
   files:
-  - src/approve.rs
-  - src/lib.rs
-  - src/run.rs
-  - tests/model_approver.rs
-  evidence:
-  - '`ApprovalContext { goal, rule, layer }` landed in `src/approve.rs` as a `#[non_exhaustive]` struct
-    with `new` and `flagged_by`, re-exported from `src/lib.rs`. `Approver` gained two defaulted methods:
-    `decide_in_context`, which forwards to `decide` and ignores the context, and `model`, which returns
-    `None`.'
-  - Both approval sites go through one helper. `fn approval_context(goal, verdict)` in `src/run.rs` is
-    called by `gate` (the tool path) and by `authorize_provider` (the pre-run provider authorization);
-    the latter now keeps the asking host's `Verdict` beside its target rather than the target alone, because
-    only that verdict is the answer to "which rule asked".
-  - The goal reaches the tool path by parameter, threaded through `dispatch`, `prepare_read`, `read_batch`,
-    `check_shell_line` and all eleven `gate` call sites, from `contract.goal` at both loops' entry.
-  - '`cargo test --test model_approver` exit 0, 2 passed: F3''s three arms (`ApproveAll` writes, `DenyAll`
-    does not, and an approver implementing only `decide` is asked exactly once and its reason reaches
-    the model''s observations), and the structural test — one definition of `approval_context`, at least
-    two call sites, zero `.decide(&request)` call sites left in the loop and exactly two `decide_in_context(`
-    ones.'
-  - 'Regression, same invocation: `net` 9 passed, `policy` 24 passed, `shell` 11 passed. The net suite
-    is the one that exercises the second approval site end to end.'
-- id: US-IO-HARNESS-0.42.0-T02
-  summary: Add `ModelApprover<P>` with `new`, `allow_self_approval`, the verdict prompt and parse, defer
-    on an unparseable verdict, and an always-empty `remember`.
-  why_required: 'This is the release''s headline: the thing that lets an unattended run answer the grey
-    tier at all. It is also where F1 and F2 become provable, because a fixture provider can record the
-    prompt it was handed and return each of the three answers.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.42.0-T01
-  acceptance_criteria:
-  - '**F1 — a model approver is handed the rule and the layer that flagged the call.** A policy whose
-    Ask tier comes from a **named** layer with a named glob; a fixture provider standing in for the approving
-    model that records the request it was given and returns an approving verdict. The recorded prompt
-    contains the layer''s name and the rule''s pattern, and the run''s goal. Asserted against the same
-    `Verdict` the policy produced, not against a literal. Sabotage: build the context with `rule: None,
-    layer: None`, under which the assertion fails while every other approval test still passes.
-
-    '
-  - '**F2 — the three answers, each with its own stored consequence.** The same completion — one `write_file`
-    the policy marks `Ask` — run three times against a `ModelApprover` whose fixture provider returns
-    approve, deny and defer. Approve: one `Edit` row and the file on disk holds the new bytes. Deny: **no**
-    `Edit` row, the file is byte-identical to before, and the model''s next observation carries the reason
-    the verdict gave. Defer: `RunOutcome::AwaitingApproval`, an unresolved row in `pending`, and `resume_with_decision`
-    with an approving decision then lands exactly the persisted write. Sabotage: map an unparseable verdict
-    to approve instead of defer, under which the malformed-verdict arm lands a write it must not.
-
-    '
-  files:
-  - src/approve.rs
-  - src/lib.rs
-  - tests/model_approver.rs
-  evidence:
-  - '`ModelApprover<P>` landed in `src/approve.rs` with `new`, `allow_self_approval` and `self_approval_allowed`,
-    re-exported from `src/lib.rs`. It overrides both `decide` and `decide_in_context`, so it works with
-    or without the context and prompts with whatever it was given.'
-  - 'The three answers plus a fourth case: `approve` and `deny` map to their `Decision`s, `defer` and
-    **anything unreadable** map to `Decision::Defer` — including a provider error, because a decision
-    nobody gave must park the question rather than answer it. `modified` is always `None` and `remember`
-    is always empty, so a model can neither rewrite the action nor widen the run''s boundary.'
-  - 'One scanner, not two. `parse_verdict`''s balanced-object walk moved to `verify::first_json_object`
-    / `json_object_from` and both readers use it; `parse_verdict` still tries each candidate in turn,
-    so a model writing `{"note": …} {"passed": true}` is still read as before.'
-  - F1 — `the_approving_model_is_told_which_rule_and_which_layer_asked` passes. The approving provider
-    keeps every prompt; the assertion is against the `Verdict` the policy itself produced (`ops-baseline`,
-    `out.*`), plus the run's goal and the target. A decision alone could not show the model was told anything,
-    which is why the prompt is what is asserted.
-  - 'F2 — `approve_deny_and_defer_each_leave_their_own_trace` passes. Approve: one `Edit` row, the bytes
-    on disk. Deny: no `Edit` row, no file, and the model''s own observation carries the verdict''s reason.
-    Defer, run twice — once for `{"decision": "defer"}` and once for a verdict with no JSON in it at all:
-    `RunOutcome::AwaitingApproval`, an unresolved `pending` row, and `resume_with_decision` then lands
-    exactly the persisted write.'
-  - '`cargo test --test model_approver` exit 0, 4 passed; `--test review` 11 passed, which is the regression
-    on the scanner the two now share.'
-- id: US-IO-HARNESS-0.42.0-T03
-  summary: Refuse a `ModelApprover` whose model is the model under it, in `preflight_review_and_routing`,
-    before the first request is built.
-  why_required: A model approving its own call reports what the run already believes. The contract states
-    the refusal costs zero completions, and only a check in the preflight can be that.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.42.0-T02
-  acceptance_criteria:
-  - '**F4 — a model cannot approve its own call, and the refusal costs nothing.** A `ModelApprover` whose
-    model equals the run''s model, over a counting provider: the run fails at start with `Error::Config`,
-    and the counter shows **zero** completions on both providers. With `allow_self_approval(true)` and
-    nothing else changed, the same run proceeds and the approval is answered. Sabotage: move the check
-    after the first completion, under which the counter is non-zero and this fails.
-
-    '
-  files:
-  - src/run.rs
-  - tests/model_approver.rs
-  evidence:
-  - '`refuse_self_approval(contract, provider, approver)` landed in `src/run.rs`, comparing `Approver::model()`
-    against the contract''s `Routing` models and `Provider::model_hint()` — the same two answers 0.34.0''s
-    review refusal compares — and returning `Error::Config` naming the model and how to say you meant
-    it.'
-  - 'Called from BOTH loops, which is why it is a helper rather than a fourth arm of the preflight: `preflight_review_and_routing`
-    covers the flat and session loops, and `run_tree_with_extras` calls it directly because a tree entry
-    never preflights. An unattended tree is where a self-approving model would do the most damage.'
-  - '`Approver::self_approval_allowed` was added as a third defaulted method (`false`), read only when
-    `model()` names one, so the knob stays on the approver the caller built rather than on the contract.'
-  - 'F4 — `a_model_cannot_approve_its_own_call` passes both arms. Refused: the error names `one-model`,
-    the approving provider recorded **zero** completions and the run''s own provider recorded **zero**
-    as well, and nothing was written. Control, same models with `allow_self_approval(true)`: the run proceeds,
-    the approver is asked exactly once, the file lands. The zero-count is the discriminating assertion
-    — a refusal implemented after the response arrives would produce the same message and one call each.'
-  - '`cargo test --test model_approver` exit 0, 7 passed; `--test agents` 5 passed, the regression on
-    the tree entry the refusal was added to.'
-- id: US-IO-HARNESS-0.42.0-T04
-  summary: Add `at` and `tools` to the `[[hook]]` table with exactly-one-of `at`/`on` validation and a
-    named value list, add `OnFailure::Refuse`, and keep the project-scope refusal covering the new keys
-    inside a `[profile]` too.
-  why_required: A lifecycle hook has to be expressible and validated before anything can consult it, and
-    the trust rule has to be extended in the same change that creates the thing it must cover.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - '**F6 — the trust rule is extended, never weakened.** The same table in a project-scoped `io.toml`
-    fails to load with the existing "may not declare hooks" error — and so does the same table nested
-    inside a `[profile]`, which is where the boundary has been widened by accident before. The identical
-    file at user or local scope loads. Sabotage: accept `at` tables at project scope on the grounds that
-    they only *stop* things, under which both refusal arms fail.
-
-    '
-  files:
-  - src/hooks.rs
-  - src/config.rs
-  - tests/tool_hooks.rs
-  evidence:
-  - '`Hook` gained `at: Option<String>` and `tools: Vec<String>`, both `pub(crate)` like the struct, so
-    the table grows with no public surface. `AT_BEFORE_TOOL`/`AT_NAMES` name the one lifecycle point for
-    the same reason `EVENT_NAMES` exists: a misspelling that loads, installs and never fires is a check
-    that silently approves everything.'
-  - '`OnFailure` gained `Refuse`, and `on_failure` became `Option<OnFailure>` read through `Hook::on_failure()`,
-    which applies the kind''s own default — `Refuse` for a lifecycle hook, `Continue` for an event hook,
-    unchanged since 0.28.0.'
-  - '`Hook::check` refuses four shapes at load, each naming what is wrong: an `at` value this crate does
-    not have, `on` and `at` together, `tools` on an event hook, and a lifecycle hook whose only action
-    is `append` — appending a line cannot stop a call, so that table is a check that always passes.'
-  - '`Hook::wants` now answers `false` for a lifecycle hook whatever the event tag, so a `[[hook]]` with
-    `at` is never fired as an observer.'
-  - 'F6 — `a_lifecycle_hook_is_refused_in_a_project_scoped_file` passes: the table is refused in `io.toml`
-    with the existing "may not declare hooks" error, refused again nested in `[profile.ci]`, and the identical
-    file at local scope loads. The project-scope refusal covers the whole `hook` key, so `at` inherits
-    it rather than reopening the question.'
-  - '`a_lifecycle_table_that_cannot_fire_is_refused_at_load` passes all four shapes.'
-  - '`cargo test --test tool_hooks --test hooks --test config` exit 0: 2, 5 and 48 passed. The hooks and
-    config suites are the 0.28.0 regression on a struct this changed the shape of.'
-- id: US-IO-HARNESS-0.42.0-T05
-  summary: Consult a matching `before_tool` hook in `prepare_read` before the call executes, capture its
-    first line of stdout as the refusal reason, report the refusal through `EventKind::Refused`, and install
-    the tables with `TaskContract::with_tool_hooks`.
-  why_required: 'This is the capability itself: without the consult in the shared serial policy phase,
-    an operator''s table is a file nothing reads. It is also where the release''s interaction with 0.41.0''s
-    batch is settled.'
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.42.0-T04
-  acceptance_criteria:
-  - '**F5 — a `before_tool` hook refuses a call, from a config file, with no Rust written.** An `io.local.toml`
-    carrying `at = "before_tool"`, `tools = ["write_file"]` and a `run` argv that exits non-zero, installed
-    with `TaskContract::with_tool_hooks(config.hooks())`. The completion''s `write_file` leaves the target
-    byte-identical on disk and **no** `Edit` row; the model''s observation carries the hook''s own first
-    line of stdout as the reason; the run continues to its next step rather than ending. Sabotage: consult
-    the hook after the tool has run, under which the file has changed and this fails.
-
-    '
-  - '**F7 — `on_failure` decides the consequence, and a `before_tool` hook defaults to refusing.** Four
-    tables identical but for `on_failure`: absent and `"refuse"` both leave no `Edit` row and the run
-    continuing; `"cancel"` ends the run `RunOutcome::Cancelled` at the step boundary with the earlier
-    calls'' rows intact; `"continue"` lets the call execute despite the non-zero exit and the `Edit` row
-    appears. Sabotage: default a `before_tool` hook to `Continue`, under which the first arm''s write
-    lands.
-
-    '
-  - '**N4 — 0.41.0''s batch survives the gate.** With a `before_tool` hook whose `tools` filter names
-    `read_file`, three read-only tools sharing a barrier still rendezvous inside the bound — the hook
-    is spawned in the serial policy phase and the read work still runs concurrently. And with a hook filtered
-    to `write_file`, a completion of twenty reads spawns the hook **zero** times, counted by the hook
-    itself. Sabotage: run the gate inside the concurrent phase, or ignore the `tools` filter, and one
-    arm each fails.
-
-    '
-  - '**N5 — a hook cannot hang a run.** A `before_tool` hook whose argv sleeps past its `timeout_ms` is
-    killed at the deadline and takes its `on_failure` path, exactly as an event hook does. The test asserts
-    the run finishes inside a bound comfortably under the sleep. The existing `wait_bounded` poll is what
-    makes this true; it is asserted rather than assumed because a hook on the tool path is spawned far
-    more often than one on an event.
-
-    '
-  files:
-  - src/hooks.rs
-  - src/contract.rs
-  - src/run.rs
-  - src/lib.rs
-  - tests/tool_hooks.rs
-  evidence:
-  - '`Hooks::before_tool(tool, payload) -> ToolGate` landed in `src/hooks.rs`: it spawns every table whose
-    `at` is `before_tool` and whose `tools` filter wants this call, with `{at, run_id, step, depth, tool,
-    arguments}` on the child''s stdin, and the first hook to object decides — a second opinion cannot
-    change the outcome of a call already stopped.'
-  - One spawn implementation for both kinds of hook. `fire` and the gate both call `spawn_and_wait(dir,
-    line, capture)`, so the argv, the working directory, the payload and the deadline cannot drift; `capture`
-    is the lifecycle hook's single difference. Stdout is drained on its own thread and only then waited
-    on — reading after the wait would turn a chatty hook into a timeout — and `first_line` bounds what
-    reaches the model at 4096 characters.
-  - 'The gate is one helper called from two places, as `US-IO-HARNESS-0.42.0-I01` recorded: `tool_gate`
-    at the head of `dispatch` (every non-batched call) and in `read_batch`''s per-call loop (0.41.0''s
-    concurrent reads). Each call is asked about exactly once.'
-  - A refusal is reported through the existing `EventKind::Refused` with the hook's program where a rule's
-    pattern would be and `io.toml hook` where a layer would be. No new `EventKind` variant. `Watch::cancel`
-    is what `on_failure = "cancel"` reaches, honoured at the next step boundary like every other cancellation.
-  - '`TaskContract::with_tool_hooks(Arc<Hooks>)` installs the same `Hooks` value an application installs
-    as an `Observer`: as an observer it ignores the `at` tables (`Hook::wants` answers false for them),
-    as a gate it ignores the `on` ones.'
-  - 'F5 — `a_before_tool_hook_refuses_the_call_and_the_model_reads_why` passes: no file on disk, no `Edit`
-    row, the hook''s own first line of stdout in the model''s observations, and the run not `Cancelled`.'
-  - 'F7 — `on_failure_decides_what_a_failing_hook_costs` passes all four arms: absent and `refuse` leave
-    no write and the run continuing, `cancel` ends it `RunOutcome::Cancelled`, `continue` lets the call
-    through.'
-  - 'N4 — `the_gate_is_serial_but_the_batch_is_not_and_a_filter_costs_nothing` passes both arms: three
-    registered read-only tools sharing a barrier of three still rendezvous under a hook matching all three,
-    and a hook filtered to `write_file` is spawned **zero** times across a completion of twenty reads,
-    counted by the hook itself on disk.'
-  - 'N5 — `a_hook_that_never_returns_is_killed_and_the_call_is_refused` passes: a hook sleeping 30s under
-    `timeout_ms = 200` is killed at the deadline, the call is refused and the run finishes.'
-  - '`cargo test --test tool_hooks` exit 0, 6 passed. Regression: `parallel_reads` 15 passed and `hooks`
-    5 passed — 0.41.0''s batch and 0.28.0''s event hooks, the two things this could have broken.'
-- id: US-IO-HARNESS-0.42.0-T06
-  summary: Add `FileChange`, `ChangeReview` and the defaulted `Reviewer::review_change`, build the change
-    from the 0.28.0 restore points, and override it in `ModelReviewer` so the reviewing prompt carries
-    the change.
-  why_required: The review criterion answers from post-change contents today, which cannot show a deletion.
-    Without this the release's third capability does not exist, and the criterion keeps being answered
-    from the wrong evidence.
-  status: done
-  depends_on: []
-  acceptance_criteria:
-  - '**F8 — the reviewer is handed the change, and the change contains what was deleted.** A recorded
-    case whose run deletes a distinctive line from an existing file and adds another, with a fixture reviewing
-    provider that records its prompt. The prompt contains **the deleted line**, which the file''s current
-    contents provably do not; it contains the added line; a file the run created appears with no before;
-    and a file the run never touched does not appear at all. Sabotage: build `before` from a second read
-    of the current contents, under which the deleted line is absent and only this criterion fails.
-
-    '
-  - '**F9 — a reviewer that overrides nothing still receives the outcome.** A `Reviewer` impl byte-identical
-    to one written against 0.41.0 — `review` only — is called for a `Verification::Review` criterion and
-    receives a `ReviewRequest` whose `files` are the written files with their current contents, exactly
-    as today, and its verdict decides the gate. Sabotage: make the default `review_change` return a failing
-    verdict instead of forwarding, under which this fails while F8 passes.
-
-    '
-  files:
-  - src/verify.rs
   - src/state.rs
-  - src/run.rs
   - src/lib.rs
-  - tests/review_change.rs
+  - tests/cross_version.rs
+  - tests/summaries.rs
   evidence:
-  - '`FileChange { path, before, after, unkept }` and `ChangeReview { goal, rubric, changes }` landed
-    in `src/verify.rs`, both `#[non_exhaustive]`, re-exported from `src/lib.rs`. `ChangeReview::into_outcome_request`
-    is the one place the old shape is now built.'
-  - '`Reviewer::review_change` is defaulted to `self.review(request.into_outcome_request())`, so `ReviewRequest`
-    was not touched at all — no field, no `#[non_exhaustive]`, no break. `ModelReviewer` overrides it
-    and prompts with a before/after section per file; both paths now go through one `ModelReviewer::judge`,
-    so the system prompt and the verdict parse cannot drift between them.'
-  - 'The change comes from the store''s existing rows: `written_changes` reads `Store::snapshot(run_id,
-    path)` — the restore point 0.28.0 has written at each file''s FIRST edit, which is exactly "before
-    this run touched it". `Kept::Text`, `Kept::Absent` and `Kept::Unkept` map onto `before: Some`, `before:
-    None` and `unkept: Some(why)`. **No table, column or index was added**, and the stored hunks stay
-    0.51.0''s.'
-  - 'A store with no row for a path reports `unkept: "no restore point was recorded"` rather than `Absent`:
-    claiming the run created a file it only rewrote is the one wrong answer a reviewer could not detect.'
-  - F8 — `the_reviewing_model_is_shown_what_the_run_removed` passes. The reviewing prompt contains a line
-    the run **deleted**, asserted alongside the proof that the file itself no longer holds it; it contains
-    the added line; a file the run created appears with no before; a file the run never touched does not
-    appear at all.
-  - F9 — `a_reviewer_that_overrides_nothing_still_reads_the_outcome` passes. A reviewer implementing only
-    `review` receives the files the run wrote with their contents as they stand, exactly as on 0.41.0,
-    and its verdict decides the gate. It passed BEFORE the implementation landed and still passes after,
-    which is the point of it.
-  - '`cargo test --test review_change --test review` exit 0: 2 and 11 passed.'
-- id: US-IO-HARNESS-0.42.0-T07
-  summary: 'Bump to 0.42.0 and bring the checked-in doc surfaces with it: `docs/CONTRACT.md`, the tool
-    and approval guide pages, `CHANGELOG.md` and `docs/public-api.txt`, each new public item carrying
-    a worked doctest.'
-  why_required: The documentation is part of the release rather than an afterthought, and three of the
-    release's guarantees — what a model approver may decide, where a lifecycle hook is refused, and which
-    reviewers see the change — exist for an embedder only if they are written down.
+  - '`summaries (id, run_id, through_step, kept_from, text, est_tokens, at)` and `CREATE INDEX summaries_run
+    ON summaries (run_id, through_step)` added in `Store::open`''s DDL batch, immediately before the
+    `CHECKPOINT_FORMAT` stamp. `text` is deliberately in no index — the control column, the same shape
+    `gate_attempts.detail` and `runs.finish_reason` use.'
+  - '`Summary` is `#[non_exhaustive]` in `src/state.rs`, re-exported from `src/lib.rs`, with `Store::put_summary`,
+    `Store::summary_at` (newest row at a boundary wins) and `Store::summaries` (per run, oldest first).'
+  - '`ADDED_SINCE_0_22_0` (`tests/cross_version.rs`) gains `summaries` and `summaries_run`. `COLUMNS_ADDED_SINCE_0_22_0`
+    is unchanged: no table is altered.'
+  - '`cargo test --test summaries` exit 0, 6 passed: round trip, a neighbouring step is not the boundary,
+    a corrected fold reads back as the correction while both rows survive, per-run isolation and ordering,
+    an unfolded run is empty, and `CHECKPOINT_FORMAT == 7`.'
+  - '`cargo test --test cross_version` exit 0, 5 passed — including `the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it`
+    and `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing`, which are O2''s
+    migration half and pass over the new DDL.'
+- id: US-IO-HARNESS-0.43.0-T02
+  summary: Add `Compaction`, `TaskContract::compaction` and `with_compaction`, and `EventKind::Compacted`,
+    with the event census and `EVENT_NAMES` updated in the same commit.
+  why_required: The knob decides when a fold happens and is the one-line return to 0.42.0's behaviour
+    the changelog promises; the event is how an operator sees a fold at all. Both are needed before the
+    helper that reads them exists.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.42.0-T03
-  - US-IO-HARNESS-0.42.0-T05
-  - US-IO-HARNESS-0.42.0-T06
+  - US-IO-HARNESS-0.43.0-T01
   acceptance_criteria:
-  - '**N3 — no public break.** Every item is added; none is removed or altered. `ReviewRequest`, `Request`
-    and `Decision` are untouched, both new trait methods are defaulted, and the new `TaskContract` field
-    sits on a `#[non_exhaustive]` struct. A consumer that upgrades and changes nothing compiles and behaves
-    identically. `docs/public-api.txt` gains the lines **its checker can see** — the crate-root re-exports
-    `ApprovalContext`, `ModelApprover`, `ChangeReview` and `FileChange` — and not the trait methods or
-    the struct field, which are members of already-listed items. Stated this way at plan time because
-    the same criterion has been met "in a different form" three releases running.
-
-    '
-  - '**O3 — the documentation gates pass**: the nightly rustdoc gate, the intra-doc link rules, and the
-    checked-in doc surfaces (`docs/public-api.txt`, `CAPABILITIES.md`, the guide index, `CHANGELOG.md`)
-    consistent with the code in the same commit range.
+  - '**F2 — under the threshold, nothing happens and nothing is spent.** The same run with `at_share:
+    1.0`, and separately with a ledger that never crosses the share: zero `summaries` rows, zero `Compacted`
+    events, and the counting provider records exactly the completions the steps required. Byte-for-byte,
+    the requests are 0.42.0''s. Sabotage: fold every turn, under which the completion count is wrong and
+    this fails while F1 still passes.
 
     '
   files:
-  - Cargo.toml
-  - Cargo.lock
-  - CHANGELOG.md
-  - README.md
+  - src/context.rs
+  - src/contract.rs
+  - src/observe.rs
+  - src/lib.rs
+  - tests/compaction.rs
+  evidence:
+  - '`Compaction { at_share, keep_recent }` landed in `src/context.rs` beside `ContextBudget`, with
+    `Default` (0.8 / 8), `enabled()`, `threshold_tokens(effective_tokens)` and `keep()`. Re-exported
+    from `src/lib.rs`.'
+  - 'Deliberately NOT `#[non_exhaustive]`, and the reason is recorded at the type: it is `ContextBudget`''s
+    sibling and every caller and doctest writes `Compaction { .. ..default() }`, which `#[non_exhaustive]`
+    refuses outside the crate with `E0639`. Found by the tests, not by reasoning — `tests/compaction.rs`
+    failed to compile three times against the first version.'
+  - '`TaskContract::compaction` + `with_compaction` added to the `#[non_exhaustive]` struct; both
+    constructors default it, so an existing caller is unchanged in source and folds by default in
+    behaviour.'
+  - '`EventKind::Compacted { through_step, before_tokens, after_tokens }` added before `Finished`, with
+    `EVENT_NAMES` gaining `"compacted"`, the `every_kind()` sample vector gaining an instance and the
+    compile-time census arm naming it — the three-file bookkeeping a new variant owes.'
+  - '`cargo test --test compaction` exit 0, 6 passed: the default folds and reaches a contract built the
+    ordinary way; `at_share: 1.0` is 0.42.0 exactly and its threshold is unreachable; NaN, infinity,
+    negative and zero all read as never rather than always; the threshold is derived from the same
+    `effective_tokens` the assembler uses; `keep_recent: 0` floors at 1; and the config-file round trip
+    refuses a misspelled key. This is F2''s threshold half — the run-level half is T03.'
+  - '`cargo test --lib` exit 0, 388 passed, including `event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+    and `every_variant_round_trips`, which are what prove the new variant''s bookkeeping complete rather
+    than merely written.'
+- id: US-IO-HARNESS-0.43.0-T03
+  summary: Add the fold helper — threshold, summarising prompt, ledger edit and stored-row re-read — and
+    call it from both loops immediately before `assemble`.
+  why_required: This is the release's headline capability. It is also the shape most at risk of landing
+    in one loop and not the other, or inside assembly, which is why it is one definition with two asserted
+    call sites.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.43.0-T02
+  acceptance_criteria:
+  - '**F1 — a fold replaces the oldest observations with a written summary, and the next request carries
+    it.** A run driven past the threshold with a fixture provider that records every request it receives.
+    Two assertions, and the pair is what discriminates: the summarising request contains the text of an
+    observation being folded, and the **next step''s** request contains a distinctive sentence from the
+    summary while **not** containing a distinctive string that appeared only in a folded observation.
+    Sabotage: fold by stubbing instead of summarising (today''s behaviour), under which the second assertion
+    fails and every weaker one passes.
+
+    '
+  - '**F3 — the summary is stored once and re-read.** A run that compacts, is interrupted, and is resumed
+    under the same run id: the counting provider shows the summarising model was called **once in total**,
+    one `summaries` row exists with the `through_step` it covers, and the resumed run''s next request
+    carries the same summary text. Sabotage: read the row but write a fresh summary anyway, under which
+    the counter is two and only this fails.
+
+    '
+  - '**N4 — a fold costs one provider call and is visible where spend already is.** The summarising completion
+    lands exactly one `provider_calls` row for the step it happened in, attributed to the run, and its
+    tokens are inside `Store::spent_tokens` and inside the run''s token budget. Asserted by row count
+    and by a budget tight enough that the summarising call is what exhausts it — a fold that spent money
+    invisibly would be the one defect this release could ship without noticing.
+
+    '
+  - '**N5 — 0.41.0''s batch and 0.42.0''s gate are unaffected.** With compaction on, three read-only tools
+    still rendezvous inside the bound and are still folded back in the model''s call order, and a `before_tool`
+    hook is still consulted exactly once per call. The fold is in the serial phase before assembly and
+    touches neither. Asserted rather than assumed, because a helper inserted into both loops is exactly
+    where a regression to either would hide.
+
+    '
+  files:
+  - src/context.rs
+  - src/run.rs
+  - tests/compaction.rs
+  evidence:
+  - '`compact_ledger` in `src/run.rs` is the one definition, called from both loops immediately before
+    `assemble` — the flat workspace loop and the tree loop — and never from inside `assemble`, which
+    still makes no provider call. It compares the ledger''s estimated tokens against `at_share ×
+    effective_tokens`, folds all but `keep_recent` from the front, and returns the tokens it spent.'
+  - 'The summarising call goes through `complete_with_retry`, the single choke point every completion
+    uses, with `SUMMARY_SYSTEM` and no tools — so it lands one ordinary `provider_calls` row and is
+    retried, traced and billed like everything else. Never streamed.'
+  - 'A fold may only replace observations the store already holds: `count = (len - keep).min(written)`,
+    where `written` is the durable watermark. Found by the tests, not by reasoning — the first version
+    panicked in `persist_ledger` with "range start index 5 out of range for slice of length 4", because
+    folding shrank the vector the watermark indexes into. The watermark moves with the fold.'
+  - '`US-IO-HARNESS-0.43.0-I01`: the row is keyed on `folded` rather than on the step, and
+    `restore_ledger` replays the stored folds. Both corrections came from F3 failing three different
+    ways; see the iteration record.'
+  - 'N4 caught the invisible spend it was written for. `Store::spent_tokens` sums `steps.tokens`, so a
+    fold billed only in `provider_calls` was money the run''s own token budget never saw — 96 against
+    120. The fold''s tokens now join the step''s total in both loops.'
+  - 'An empty summary is not a fold: a summariser that returns no text leaves the ledger alone rather
+    than replacing the notes with nothing. The call still happened and is still billed.'
+  - '`cargo test --test compaction` exit 0, 11 passed. F1 is the discriminating pair — the summarising
+    request contains the folded observation, and a later working request contains the summary''s own
+    sentence and no longer contains a marker that appeared only in the folded text. F3 parks a
+    completion forever, drops the run mid-step (the only interruption that leaves a run resumable —
+    every clean stop, cancellation included, is terminal to `resume` by design) and resumes: the
+    summarising model is called once in total and the paragraph is still in the request. N4 asserts one
+    extra `provider_calls` row per fold, filed under the step it happened in, and `spent_tokens` equal
+    to the sum over those rows.'
+  - 'N5: the whole corpus is the control, because compaction is on by default and every suite now runs
+    with it. `cargo test --tests --no-fail-fast` — 68 suites green, including `parallel_reads`
+    (0.41.0''s batch) and `tool_hooks` (0.42.0''s gate). One existing test needed a line:
+    `tests/context.rs`''s prompt-stabilisation test drives a positional script under a 1,000-token
+    budget, where the fold now fires and inserts a completion the script cannot see coming — it sets
+    `at_share: 1.0` and says why, because it is 0.13.0''s elision claim and the fold''s own
+    stabilisation is asserted in `tests/compaction.rs`.'
+  - '`cargo test --doc` exit 0, 388 passed; `cargo test --lib` exit 0, 388 passed;
+    `cargo test --test public_api` exit 0 after `docs/public-api.txt` gained `Compaction` and
+    `Summary` by hand.'
+- id: US-IO-HARNESS-0.43.0-T04
+  summary: Add `ProviderErrorKind::ContextOverflow` and `#[non_exhaustive]` to the enum, add `from_response`,
+    and route the three built-in providers through it.
+  why_required: An overflow is indistinguishable from any other 4xx today, so the recovery has nothing
+    to branch on. This is the release's one public break and it is paid here, once, with the conservative
+    classifier and its negative control.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - '**F6 — classification is conservative and does not swallow a real 400.** A 400 with a message carrying
+    none of the signatures stays `Request`, terminal, with no fold and no second attempt — the negative
+    control that must not move. A 401 stays `Auth`, a 429 stays `RateLimited`, a 500 stays `Server`; `from_status`
+    is asserted byte-identical in behaviour to 0.42.0''s over the whole status range it maps. Sabotage:
+    classify any 400 as an overflow, under which the control run compacts and re-asks a request the server
+    had already read and refused.
+
+    '
+  files:
+  - src/error.rs
+  - src/provider/mod.rs
+  - src/provider/openai_wire.rs
+  - src/provider/anthropic.rs
+  - tests/overflow.rs
+  evidence:
+  - '`ProviderErrorKind::ContextOverflow` added, and `#[non_exhaustive]` on the enum in the same
+    release — one break, paid once, the move four previous releases each made on a different type.
+    `is_retryable()` returns false for it, and the doc says why that is the right answer rather than a
+    compromise: re-sending bytes a server called too many cannot work, and the recovery is a different
+    request.'
+  - '`ProviderErrorKind::from_response(status, message)` added beside `from_status`, which keeps its
+    exact signature and behaviour. Only a 400 or a 413 is eligible; the seven vendor signatures are a
+    short list matched case-insensitively, documented as conservative on purpose.'
+  - 'No per-vendor edit was needed. Every built-in provider builds its status failures through
+    `Error::provider_status`, which is the single funnel — so OpenRouter, OpenAI and Anthropic cannot
+    drift apart on what an over-window rejection is, and `src/provider/` is untouched by this task.'
+  - '`cargo test --test overflow` exit 0, 6 passed. F6''s negative control is
+    `an_ordinary_400_is_left_exactly_where_it_was` (four ordinary 400s, including an empty message,
+    stay `Request`); `a_status_that_means_something_else_is_not_reclassified_by_its_wording` proves a
+    429 carrying a signature verbatim is still a rate limit; and `from_status_behaves_exactly_as_it_did_on_0_42_0`
+    asserts the old mapping over the whole 400..600 range rather than at a few points.'
+- id: US-IO-HARNESS-0.43.0-T05
+  summary: Answer a `ContextOverflow` by folding unconditionally and re-asking once, bounded at one recovery
+    per step, in the same helper both loops call.
+  why_required: Classification without recovery leaves the run dying exactly as it does today. The bound
+    is what stops a pathological request looping, and it is the second caller the fold helper was built
+    for.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.43.0-T03
+  - US-IO-HARNESS-0.43.0-T04
+  acceptance_criteria:
+  - '**F4 — a context overflow is classified, and the run survives it.** A fixture provider that refuses
+    any request over a byte threshold with the vendor wording, and serves one under it. The run finishes;
+    the trace holds exactly one `Compacted` event and the failing attempt; and the request that succeeded
+    is provably shorter than the one that failed. `ProviderErrorKind` on the failing attempt''s recorded
+    error is `ContextOverflow` and not `Request`. Sabotage: re-ask without compacting, under which the
+    second attempt hits the same refusal and the run escalates.
+
+    '
+  - '**F5 — the recovery happens once.** A provider that refuses **every** request whatever its size:
+    the run escalates with `RunOutcome::Escalated { retryable: false, .. }` after exactly two completion
+    attempts for that step and one fold, not a loop. The step row names both. Sabotage: remove the once-per-step
+    bound, under which the attempt count grows past two.
+
+    '
+  files:
+  - src/run.rs
+  - tests/overflow.rs
+  evidence:
+  - 'Both loops now make at most two attempts at a step''s completion: the fold, the assembly, the
+    request and the call are inside a `loop`, and a `ContextOverflow` on the first attempt sets
+    `recovered` and continues. The recovery fold is unconditional — the threshold was guessing at what
+    the vendor has now stated — and bounded at one per step.'
+  - '`complete_with_retry` gained a `may_compact` parameter. Without it the recovery was unreachable:
+    on a non-retryable failure the function records the escalation *and calls `finish`*, so the run was
+    already marked escalated before the loop saw the error. With `may_compact`, an overflow the caller
+    can answer is recorded as a step row and handed back without finishing the run; every other
+    failure, and a second overflow, escalate exactly as on 0.42.0.'
+  - 'The loop''s recovery arm and `may_compact` are guarded by the same condition, `!recovered &&
+    contract.compaction.enabled()`. The first version guarded only the loop, so a caller with folding
+    off got a second attempt on a run `complete_with_retry` had already finished — caught by
+    `with_folding_off_an_overflow_is_terminal_at_once`, which counted two refusals where 0.42.0 makes
+    one.'
+  - 'The summarising call passes `may_compact: false`: a fold cannot be answered by folding. The
+    single-file loop passes `false` too — it has no ledger, so an over-window request there is terminal
+    exactly as it was.'
+  - '`record_memory_recall` moved below the loop in both, so a recovered step writes one recall row
+    rather than two.'
+  - '`cargo test --test overflow` exit 0, 10 passed. F4 uses a provider that refuses any user block
+    over a byte ceiling and serves anything under it, so the request that succeeded is provably smaller
+    than the one refused — a recovery, not a re-send that got lucky — with a negative-control run under
+    the ceiling that never folds. F5''s provider refuses every request whatever its size: exactly two
+    refusals for the step, one fold, then an escalated run.'
+  - '`cargo test --tests --no-fail-fast` — 72 suites green. Four `fleet` failures and one `plan_gate`
+    failure on the way were a stale `target/debug/examples/` binary carrying the pre-rename `summaries`
+    DDL under `CREATE TABLE IF NOT EXISTS`; `cargo build --examples` fixed them, which is the standing
+    trap that `--tests` does not rebuild examples.'
+  - '`cargo clippy --all-features --all-targets` clean. `tests/provider_failures.rs` needed the
+    wildcard arm the `#[non_exhaustive]` break now requires — the same one-line migration a consumer
+    writes — and it panics rather than defaulting, so a kind added later still cannot slip in without a
+    decision about retrying it.'
+- id: US-IO-HARNESS-0.43.0-T06
+  summary: Add `Session::transcript`, `Transcript`, `TranscriptTurn` and `Transcript::to_markdown`, built
+    from the whole session tree.
+  why_required: A summary that replaces fifty observations is only honest if the fifty stay reachable,
+    and today reading a conversation back means writing the SQL yourself. The whole tree rather than the
+    head path is the half that cannot be recovered any other way.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.43.0-T01
+  acceptance_criteria:
+  - '**F7 — a transcript renders the whole tree, including what the model can no longer see.** A session
+    of three turns, branched from the first, then one more turn. `Session::history` returns three; `Session::transcript`
+    returns **four**, in id order, with the branched-away turn present and `on_path: false`. The markdown
+    contains both turns'' prompts, and marks where a summary stands in for folded steps. Sabotage: build
+    the export from `history()`, under which the fourth turn is missing and only this criterion fails.
+
+    '
+  - '**F8 — a transcript is a read.** The same export run against a counting provider that must record
+    **zero** completions, on a session whose runs have already finished. Sabotage: summarise anything
+    at export time, under which the counter is non-zero.
+
+    '
+  files:
+  - src/session.rs
+  - src/lib.rs
+  - tests/transcript.rs
+  evidence:
+  - '`Session::transcript(&Store) -> Result<Transcript>` added, built from `Store::session_turns` —
+    the whole tree — with `on_path` computed from `Session::history`''s ids. `Transcript`,
+    `TranscriptTurn` and `Transcript::to_markdown` are `#[non_exhaustive]` and re-exported; each turn
+    carries its run''s `Summary` rows.'
+  - 'The markdown marks a branched-away turn as such and renders each fold as a line saying what it
+    stands in for — "At step 9, 21 earlier observations were summarised as: …" — which is the half that
+    makes compaction honest rather than lossy. One `String`, one method: a library does not choose the
+    caller''s file.'
+  - '`cargo test --test transcript` exit 0, 4 passed. F7 branches a three-turn session and asserts
+    `history` returns 2 while `transcript` returns 3, with exactly the branched-away turn marked
+    `on_path: false` and both branches present in the markdown — the assertion an export built from
+    `history()` fails and every weaker one passes. F8 exports three times against a counting provider
+    and asserts zero extra completions, zero extra `provider_calls` rows and no summary written.'
+  - '`docs/public-api.txt` gained `Transcript` and `TranscriptTurn` by hand, and both needed a worked
+    doctest before `every_public_item_has_a_worked_example` would pass — the three-file cost of a new
+    public item, paid here as it is every release.'
+- id: US-IO-HARNESS-0.43.0-T07
+  summary: 'Add `Session::attach` under the `media` feature: stage images for the next turn, append them
+    in `drive`, and clear the staging whatever the outcome.'
+  why_required: The one path an operator would hand a screenshot to is the only one that cannot take it.
+    One staging method covers all six turn shapes without a signature change or a seventh entry point.
+  status: done
+  depends_on: []
+  acceptance_criteria:
+  - '**F9 — an image reaches the wire through a conversational turn.** `Session::attach` then `Session::turn`,
+    over a fixture provider that records the `CompletionRequest` it received: the media is on the request.
+    The same through `turn_observed`. The **next** turn, with no second `attach`, carries none — the staging
+    is cleared. A `turn_bounded` whose contract already carries an image of its own carries both. Sabotage:
+    keep the staging across turns, under which the second turn''s request carries an image nobody attached.
+
+    '
+  - '**F10 — a provider that does not accept images still refuses, and before anything is sent.** A turn
+    with staged images over a provider whose `accepts_images` is false fails with the existing error from
+    `ensure_media_accepted` (`src/run.rs:10286`), and the counting provider records zero completions.
+    The refusal is 0.42.0''s, reached through a new door. Sabotage: attach after the media check, under
+    which a request is sent that must not be.
+
+    '
+  files:
+  - src/session.rs
+  - tests/session_media.rs
+  evidence:
+  - '`Session::attach<I: IntoIterator<Item = Media>>(&mut self) -> &mut Self` added under
+    `#[cfg(feature = "media")]`, staging into a `staged` field on `Session` that carries the same
+    gate. `drive` clones the contract, extends its `images` with `std::mem::take(&mut self.staged)`
+    and runs that — so the staging is cleared however the turn ends, and a `turn_bounded` caller''s own
+    `with_images` are kept beside the staged one rather than replaced.'
+  - 'One method covers all six turn shapes. Staging is orthogonal to how a turn is driven, and an
+    images-carrying variant of each would owe a seventh the next time a turn shape is added.'
+  - '`cargo check` on the default feature set is clean: the field, the append and the clear all carry
+    the same `cfg`, so a build without `media` is byte-identical to 0.42.0''s.'
+  - '`cargo test --features media --test session_media` exit 0, 4 passed. Every assertion is against
+    the `CompletionRequest` the provider received, not the contract that was built: the image reaches
+    the wire through `turn` and through `turn_observed`, the *next* turn carries none without a second
+    `attach`, a bounded turn whose contract has its own image sends two, and a provider whose
+    `accepts_images` is false refuses with zero completions recorded — the refusal is 0.42.0''s,
+    reached through a new door.'
+- id: US-IO-HARNESS-0.43.0-T08
+  summary: 'Documentation: the four `docs/CONTRACT.md` guarantees, the guide pages, the `CHANGELOG.md`
+    entry with its `*Migration:*` note, `docs/public-api.txt` by hand, and a worked doctest on every new
+    public item.'
+  why_required: The release notes are taken verbatim from the changelog, the migration note is the only
+    warning a consumer matching `ProviderErrorKind` exhaustively gets, and the checked-in doc surfaces
+    are gates that fail the build when they drift.
+  status: done
+  depends_on:
+  - US-IO-HARNESS-0.43.0-T05
+  - US-IO-HARNESS-0.43.0-T06
+  - US-IO-HARNESS-0.43.0-T07
+  acceptance_criteria:
+  - '**N3 — exactly one public break, and it is the one named.** `ProviderErrorKind` gains `ContextOverflow`
+    and `#[non_exhaustive]` together. Everything else is additive: `Compaction`, `Summary`, `Transcript`,
+    `TranscriptTurn` are new; `EventKind::Compacted` sits on an already-`#[non_exhaustive]` enum; the
+    `TaskContract` field and builder sit on a `#[non_exhaustive]` struct; `Session::attach`, `Session::transcript`,
+    `Store::summaries`, `Transcript::to_markdown` and `ProviderErrorKind::from_response` are added and
+    nothing is removed or altered. `docs/public-api.txt` gains the lines **its checker can see** — the
+    crate-root re-exports `Compaction`, `Summary`, `Transcript` and `TranscriptTurn` — and not the methods,
+    the enum variant or the struct field, which are members of already-listed items. Stated this way at
+    plan time because the same criterion has been met "in a different form" four releases running (traps
+    114 and the 0.41.0 N3 note).
+
+    '
+  - '**O3 — the documentation gates pass**: the nightly rustdoc gate, the two intra-doc link rules, and
+    the checked-in doc surfaces (`docs/public-api.txt`, `CAPABILITIES.md`, the guide index, `CHANGELOG.md`
+    including its `*Migration:*` note) consistent with the code in the same commit range.
+
+    '
+  files:
   - docs/CONTRACT.md
   - docs/public-api.txt
-  - docs/guide/tools-and-skills.md
+  - docs/guide
+  - CHANGELOG.md
+  - src/context.rs
+  - src/error.rs
+  - src/session.rs
+  - src/state.rs
   evidence:
-  - '`Cargo.toml` and `Cargo.lock` at **0.42.0**; `README.md`''s dependency snippet moved to `"0.42"`,
-    which `docs_drift` refuses to let go stale.'
-  - 'N3 — `docs/public-api.txt` gained **exactly four lines**, the crate-root re-exports the checker can
-    see: `ApprovalContext`, `ModelApprover`, `ChangeReview`, `FileChange`. The three new trait methods
-    and the new `TaskContract` field add no line, because they are members of already-listed items — which
-    is what the criterion predicted at plan time rather than discovering afterwards. `cargo test --test
-    public_api` exit 0, 9 passed, including the worked-example gate on every new item.'
-  - '`docs/CONTRACT.md` gained three sections: what a model approving an action can and cannot decide
-    (including that a hostile repository can address the approving model, and that `DenyAll` remains the
-    honest posture for a run that must never act), what a `before_tool` hook stops and where it may be
-    written, and what a reviewer is shown of a change.'
-  - '`docs/guide/hooks.md` documents `at`/`tools`/`refuse` in the keys table and a worked lifecycle hook
-    with its stdin payload, its refusal script and its per-call spawn cost. `docs/guide/permissions.md`
-    documents `ModelApprover` beside the three built-in approvers. `docs/guide/verification.md` documents
-    `review_change` and states the default''s consequence.'
-  - '`CHANGELOG.md` carries the 0.42.0 entry with **no** `*Migration:*` note, because nothing breaks —
-    and with the one config-file consequence stated: a table written for 0.42.0 is refused by an older
-    binary rather than silently ignored.'
-  - No new guide page, so no `GUIDES` / `CAPABILITIES.md` bookkeeping — the precedent since 0.31.0.
-  - 'O3 — the checked-in doc surfaces are consistent with the code: `changelog` 5 passed, `docs_drift`
-    15, `guide_pages` 7, `public_api` 9, `readme` 8.'
-- id: US-IO-HARNESS-0.42.0-T08
-  summary: 'Run the release''s own gates: the full suite in both feature polarities, clippy, fmt, the
-    nightly rustdoc gate, MSRV 1.95, `cargo tree`, the cross-version stores, and one sabotage per arm
-    of every two-armed claim.'
-  why_required: A criterion nobody tried to break is a criterion nobody has tested. The sabotage pass
-    and the platform matrix are what turn the contract's claims into evidence the record can cite.
+  - '`CHANGELOG.md` gains the 0.43.0 section with **a `*Migration:*` note** — the one this release owes
+    — saying a `match` on `ProviderErrorKind` now needs a wildcard arm, and recommending one that
+    fails loudly over one that guesses. A second Changed entry states the behaviour change nobody
+    would otherwise see: a long run now makes a summarising call it did not make on 0.42.0, with the
+    one-line way back.'
+  - '`docs/CONTRACT.md` gains four guarantees — what compaction folds, costs and never loses (with the
+    prompt-injection answer stated: the summariser has no tools and the policy is untouched); what a
+    context overflow does now, including that the classifier is deliberately not exhaustive; that a
+    transcript is a read of the whole tree; and how long `Session::attach` attaches for.'
+  - 'Guide pages: `context-and-memory.md` documents the fold beside the context budget,
+    `resilience.md` documents the overflow beside the other failures you can branch on, and
+    `sessions.md` documents the transcript and `attach`. No new page, so no `GUIDES` or
+    `CAPABILITIES.md` bookkeeping — the precedent since 0.31.0.'
+  - '`Cargo.toml` 0.42.0 -> 0.43.0 and the README install snippet `"0.42"` -> `"0.43"`, which
+    `tests/docs_drift.rs` checks.'
+  - 'The nightly rustdoc gate earned its keep again — three errors stable `cargo doc` did not report:
+    a link to `Summary::kept_from` left behind by the rename, a bare `[`Summary`]` in `session.rs`
+    where the type is not `use`d, and a *redundant* explicit target on `Provider::accepts_images`
+    where it is. The two intra-doc rules partition on scope exactly as recorded.'
+  - '`cargo test --doc` exit 0, **392** passed (up 4). `cargo test --tests --no-fail-fast` — 74 suites
+    green. `cargo clippy --all-features --all-targets` clean. `cargo fmt` applied and `--check` clean.
+    `RUSTDOCFLAGS=... cargo +nightly doc --all-features --no-deps` clean.'
+- id: US-IO-HARNESS-0.43.0-T09
+  summary: 'Run the release gates: dependency count, MSRV, the full suite in both feature polarities,
+    and the three-platform matrix.'
+  why_required: These are the criteria that fail late and cheaply-avoidably. A dependency added without
+    noticing or an MSRV drift is found here or on a release run, and the second is far more expensive.
   status: done
   depends_on:
-  - US-IO-HARNESS-0.42.0-T07
+  - US-IO-HARNESS-0.43.0-T08
   acceptance_criteria:
   - '**N1 — no new dependency.** `cargo tree` for the default feature set has the same number of crates
-    as 0.41.0. The approver needs a `Provider`, which is the crate''s own trait; the hook needs `std::process`,
-    which 0.28.0 already spawns through.
+    as 0.42.0 (**402**). Summarising needs a `Provider`, which is the crate''s own trait; the transcript
+    needs `std::fmt`; the table needs `rusqlite`, already there.
 
     '
   - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
 
     '
-  - '**O1 — the full suite passes on all three platforms**, which is what the standing CI matrix already
-    runs. Load-bearing rather than routine here: the hook spawns a child per matching call, and the fixture
-    hook must be an argv that exists on macOS, Ubuntu **and** Windows — the same portability problem 0.28.0''s
-    hook tests solved, solved the same way rather than with a shell script that silently skips.
-
-    '
-  - '**O2 — no store migration.** `CHECKPOINT_FORMAT` unmoved, no table, column or index added or altered,
-    `git diff main -- src/state.rs` confined to whatever making `Store::snapshot` reachable from the review
-    path requires and containing no DDL. A 0.41.0 store opens and resumes under 0.42.0 unchanged, asserted
-    by the cross-version tests that already read the 0.22.0 and 0.29.0 fixture stores.
+  - '**O1 — the full suite passes on all three platforms**, which the standing CI matrix already runs.
+    Nothing here is process-spawning or path-shaped, so this is the routine bar rather than a load-bearing
+    one; the `media` arm of the matrix is what covers `Session::attach`.
 
     '
   files:
-  - tests/model_approver.rs
-  - tests/tool_hooks.rs
-  - tests/review_change.rs
+  - Cargo.toml
+  - Cargo.lock
   evidence:
-  - TEN sabotages, each failing a NAMED test, none silent. S1 the context is built empty → F1. S2 an unreadable
-    verdict approves → F2. S3 the defaulted `decide_in_context` does not forward → F3. S4 the self-approval
-    check is not taken → F4. S5 the gate's refusal is ignored → F5. S6 a lifecycle hook defaults to continue
-    → F7. S7 the `tools` filter is ignored → N4's spawn count. S8 a gated batch is run one call at a time
-    → N4's rendezvous. S9 `before` is read from the file as it stands → F8. S10 the defaulted `review_change`
-    does not forward → F9. Every sabotage was reverted by `git checkout` and the tree re-verified afterwards.
-  - 'The four load-bearing sabotages were checked for HOW they failed: S1, S5, S8 and S9 each produce
-    `panicked at` in the named test with no compile error, so the criterion caught the defect rather than
-    the compiler catching the edit.'
-  - 'O1/the suites, in separate invocations under a redirected `XDG_CONFIG_HOME`: `cargo test` exit 0,
-    70 binaries, **1423 passed / 0 failed**; `cargo test --all-features` exit 0, 70 binaries, **1502 passed
-    / 0 failed**. Doctests are inside both figures and all of them pass.'
-  - 'Per-suite counts read with each suite run ALONE (trap 118): `model_approver` 5, `tool_hooks` 6, `review_change`
-    2.'
-  - '`cargo clippy --all-targets --all-features -- -D warnings` exit 0 — after fixing one `needless_range_loop`
-    the extracted scanner tripped. `cargo fmt --check` clean.'
-  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` exit 0, zero
-    warnings — the gate stable `cargo doc` cannot see, run before the release PR.'
-  - 'N2 — `cargo +1.95 check --all-features --lib` exit 0: MSRV unmoved.'
-  - N1 — `cargo tree` **402** lines, the same figure as 0.41.0 and every release since 0.23.0. The approver
-    uses the crate's own `Provider` trait and the hook uses `std::process`, which 0.28.0 already spawns
-    through.
-  - 'O2 — no store migration. `git diff main -- src/state.rs` is **empty**: not one line of the schema
-    file changed. `CHECKPOINT_FORMAT` unmoved at **7**. The cross-version gate: `cargo build --manifest-path
-    tests/fixtures/gen-0.29.0/Cargo.toml` exit 0, then `cargo test --test cross_version_0_29_0 -- --ignored`
-    exit 0, 1 passed — a 0.29.0 binary reading a store this tree wrote.'
-  - '`cargo clean && cargo package --locked` exit 0, producing `io-harness-0.42.0.crate` at **1,424,538
-    bytes**. Disk checked before and after: 61 GiB free.'
+  - 'N1 — `cargo tree` on the default feature set is **402** crates, the same number as 0.41.0 and
+    0.42.0. Nothing was added: the summariser needs a `Provider`, which is the crate''s own trait; the
+    transcript needs `std::fmt`; the table needs `rusqlite`, already there.'
+  - 'N2 — `rust-version = "1.95"` in `Cargo.toml` is unmoved, and both feature polarities build and
+    test on it.'
+  - 'O1 — both polarities green locally. All-features: **1,152** passed across 74 suites, plus 395
+    doctests. Default: **1,071** passed across 74 suites, plus 392 doctests. `cargo build
+    --all-features --examples` clean.'
+  - 'The three-platform matrix is CI''s, and is the gate the release PR runs; nothing in this release
+    is process-spawning or path-shaped, so the `media` arm covering `Session::attach` is the only part
+    that is more than routine.'

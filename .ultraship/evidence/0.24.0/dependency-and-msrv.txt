@@ -1,5 +1,0 @@
-cargo tree (default features, macOS host): 402 lines
-crates matching 'windows': 0
-0
-0.23.0 baseline was 402 lines
-windows-sys 0.61.2 rust-version = 1.71, license MIT OR Apache-2.0 — below the declared 1.95 floor, so MSRV does not move

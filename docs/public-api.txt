@@ -112,6 +112,7 @@ struct Citation src/web.rs
 struct Compatible src/provider/compatible.rs
 struct CompletionRequest src/provider/mod.rs
 struct CompletionResponse src/provider/mod.rs
+struct Compaction src/context.rs
 struct Config src/config.rs
 struct Containment src/containment.rs
 struct ContextBudget src/context.rs
@@ -187,11 +188,14 @@ struct Steer src/session.rs
 struct SteerInbox src/session.rs
 struct StepRecord src/state.rs
 struct Store src/state.rs
+struct Summary src/state.rs
 struct Tally src/state.rs
 struct TaskContract src/contract.rs
 struct Template src/template.rs
 struct Templates src/template.rs
 struct TodoItem src/state.rs
+struct Transcript src/session.rs
+struct TranscriptTurn src/session.rs
 struct ToolCall src/provider/mod.rs
 struct ToolSpec src/provider/mod.rs
 struct Toolbox src/tools/custom.rs

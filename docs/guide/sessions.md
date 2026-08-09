@@ -342,6 +342,50 @@ Four things are worth knowing before you reach for it:
 The five entry points above are untouched by this and still never offer the spawn
 tool: a session that does not ask for containment behaves exactly as it did.
 
+## Reading a conversation back (0.43.0)
+
+```rust,no_run
+use io_harness::{Session, Store};
+
+# fn demo(store: &Store, session: &Session) -> io_harness::Result<()> {
+std::fs::write("session.md", session.transcript(store)?.to_markdown())?;
+# Ok(()) }
+```
+
+`Session::transcript` is a read: no provider is called and no row is written. It
+renders the **whole tree**, not the path — a `branch_from` leaves earlier turns off
+what the model sees, and those are precisely the turns nothing else will show you.
+Each one is marked `on_path` so a reader can tell which the model can still see.
+
+It is also where a compacted run's folded history comes back out: each turn carries
+the summaries its run wrote, rendered as a line saying what each paragraph stands
+in for.
+
+## A turn can carry an image (0.43.0)
+
+```rust,no_run
+use io_harness::provider::Media;
+use io_harness::{ApproveAll, OpenRouter, Policy, Session, Store};
+
+# async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+let mut session = Session::open(store, "/repo")?;
+let shot = Media::image("image/png", &std::fs::read("screenshot.png")?)?;
+
+session.attach([shot]);
+session.turn("why is this button misaligned?", &OpenRouter::from_env()?,
+             store, policy, &ApproveAll).await?;
+# Ok(()) }
+```
+
+The staging rides **the next turn only** and is cleared once that turn has been
+driven, whatever its outcome — a screenshot is about the thing being said now.
+One method covers all seven entry points, because staging is orthogonal to how a
+turn is driven. `TaskContract::with_images` is the other half and still means what
+it always did, for the whole run, so a `turn_bounded` carrying both sends both.
+
+`media` feature only. A provider whose `accepts_images` is false refuses the turn
+before anything is sent.
+
 ## The limits, stated plainly
 
 * **Steering is text, not authorization.** An operator's mid-turn message reaches
