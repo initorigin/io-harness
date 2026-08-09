@@ -268,7 +268,7 @@ tasks:
   summary: Measure the saving once against a real vendor, with the no-marker control.
   why_required: The entire benefit of this release is vendor-side. Every other criterion proves the crate
     asks correctly; only this one proves anything was cached.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.44.0-T04
   acceptance_criteria:
@@ -282,8 +282,30 @@ tasks:
 
     '
   files:
-  - tests/cache_boundary.rs
-  evidence: []
+  - examples/cache_live.rs
+  evidence:
+  - MEASURED LIVE 2026-08-09, OpenRouter, `anthropic/claude-haiku-4.5` pinned and read back from `CompletionResponse::model`
+    on every call. System block ~8.5k tokens, frozen transcript prefix 21,817 chars (~5.4k tokens).
+  - 'THE NUMBER. System breakpoint alone (0.43.0''s request, `cache_boundary: None`): prompt=13113, cache_read=7408.
+    Both breakpoints, second call: prompt=13113, cache_read=13093. The transcript breakpoint is worth
+    5,685 tokens per step beyond what the system block already saved, and 13,093 of a 13,113-token prompt
+    — 99.8% — is served from cache. Priced through the shipped table that is the cache-read rate rather
+    than the input rate on all of it.'
+  - '0.38.0''s control still holds on the same run: marked call 2 cache_read=7408, and the SAME endpoint
+    and model through `Compatible` — which sends no marker — reads 0 on both of its calls. One key different,
+    not one vendor different.'
+  - '`cache_write` is 0 on every call, as trap 108 records: OpenRouter reports no cache-write counter,
+    so the writing call''s cost is UNREPORTED rather than measured. The example prints that in as many
+    words so nobody infers it from the prompt length.'
+  - 'FINDING, and the second release to pay for it: the first attempt failed HTTP 402 — ''You requested
+    up to 64000 tokens, but can only afford 43047''. The OpenAI wire sends no `max_tokens`, so the vendor
+    applied `claude-sonnet-4.5`''s own 64k default. Not a caching failure and it reads exactly like one.
+    `DEFAULT_MODEL` in the example is now haiku with the reason written at the constant, so the next run
+    does not rediscover it.'
+  - 'Harness: 0.38.0''s `examples/cache_live.rs` extended rather than a second live example added, so
+    the two breakpoints are measured by one thing that cannot drift. The 0.44.0 half needs its own baseline
+    rather than the unmarked control, because OpenRouter now always sends the system marker and ''did
+    anything cache'' cannot tell the two breakpoints apart.'
 - id: US-IO-HARNESS-0.44.0-T07
   summary: Document the second breakpoint, correct the two shipped sentences that deny it, and write the
     changelog entry with its migration note.
