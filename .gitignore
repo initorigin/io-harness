@@ -15,5 +15,10 @@ node_modules/
 # scope split fails the moment it is shared.
 io.local.toml
 
-# UltraShip: transient deploy/publish hook output
+# UltraShip: release gate evidence and deploy/publish hook output. Local only,
+# never committed. The canonical location is the product tree below — the second
+# line exists because ignoring the first one is what pushed evidence out to the
+# workspace root in the first place. Both stay ignored; neither is a place to
+# "rescue" evidence into git.
 .ultraship/products/*/evidence/
+.ultraship/evidence/
