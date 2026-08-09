@@ -1074,7 +1074,7 @@ versions:
       construction. So a second breakpoint goes at the end of the frozen prefix, the reads land in
       the accounting rows beside every other token, and the operator sees it where they already
       look.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.45.0
     outcome: >
