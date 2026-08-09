@@ -380,17 +380,33 @@ profile is rejected at load even when that profile is never selected, because a
 profile body is validated as the file format. Profiles do not compose and do not
 nest.
 
-### `[instructions]` — discovering a repository's own rules (0.27.0)
+### `[instructions]` — discovering a repository's own rules (0.27.0, 0.45.0)
 
 ```toml
+# Nothing at all: `AGENTS.md` is discovered anyway, as of 0.45.0.
+
 [instructions]
-files = ["AGENTS.md"]     # the default; relative to the discovery root
+files = ["AGENTS.md", "docs/HOUSE-STYLE.md"]   # or name your own, relative to the root
+
+[instructions]
+files = []                # ...and this is how a project opts out
 ```
 
 `Config::discover` reads each file that exists and `Config::apply_to` lands them in
-`TaskContract::constraints`, one per file, each naming the file it came from — so
+`TaskContract::instructions`, one per file, each naming the file it came from — so
 the instructions a repository already carries reach the model without being pasted
-into a goal string.
+into a goal string. They ride in the **system block**, inside a delimited section
+framed as the repository's own guidance.
+
+**Since 0.45.0 the search runs whether or not this table is present**, so a
+repository carrying the file every other agent reads and no `io.toml` at all is
+read. An explicit `files = []` is the opt-out, and it is distinct from an absent
+table.
+
+**Before 0.45.0 the text landed in `TaskContract::constraints`** and rode in the
+user turn on every step. A constraint is a rule the goal is checked against; this
+is guidance the agent reads. A caller that read `constraints` to find a
+repository's `AGENTS.md` reads `instructions` now.
 
 A named file that does not exist is **skipped**. This is discovery, not
 substitution: the "resolve or fail" rule that governs `${...}` deliberately does
@@ -600,10 +616,15 @@ is not reported. This is the one place the "resolve or fail" rule above does not
 apply, and it is deliberate: `AGENTS.md` is present in some repositories and not in
 others, which is the normal case rather than the failure.
 
-**A discovered `AGENTS.md` is untrusted text.** It comes from the repository, it
-reaches the model verbatim as a constraint, and it grants nothing: the boundary is
-still the `Policy` you loaded. Treat a workspace whose instructions file you have
-not read the way you would treat any other text a stranger wrote into your prompt.
+**A discovered `AGENTS.md` is untrusted text, and since 0.45.0 it rides somewhere
+more authoritative.** It comes from the repository, it reaches the model verbatim
+in the system block, and it grants nothing: the boundary is still the `Policy` you
+loaded, enforced before any call runs. What bounds it is structural — the text is
+delimited, framed as the repository's guidance rather than the operator's
+instruction, and emitted before both the boundary section and the crate's own
+ending, so it cannot be the last word. Treat a workspace whose instructions file
+you have not read the way you would treat any other text a stranger wrote into
+your prompt.
 
 **A project file may narrow and never widen, and that is all it does.** See the
 section above for the four keys, and for the sentence it is not.

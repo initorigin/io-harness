@@ -1245,7 +1245,7 @@ pub trait Provider {
     /// Which family's conventions this provider's model reads best (0.45.0).
     ///
     /// The crate reaches four wire shapes and, through
-    /// [`Compatible`](crate::Compatible), some two dozen vendors, and the families
+    /// [`Compatible`], some two dozen vendors, and the families
     /// document different conventions for delimiting a long system block. **Only the
     /// delimiters differ**: every family is given the same sections, in the same
     /// order, ending with the same sentence, and the crate asserts that by stripping

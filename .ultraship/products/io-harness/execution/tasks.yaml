@@ -405,7 +405,7 @@ tasks:
   summary: Bring the shipped documentation to 0.45.0 and clear the sentences it contradicts.
   why_required: Two doc surfaces state that discovered instructions become constraints, and the composition
     guarantee is only a guarantee if `docs/CONTRACT.md` states it.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.45.0-T08
   acceptance_criteria:
@@ -432,4 +432,27 @@ tasks:
   - src/config.rs
   - src/contract.rs
   - src/run.rs
-  evidence: []
+  evidence:
+  - '`docs/CONTRACT.md` gains four sections: the composition order with the ending last and the relocation
+    stated; what the boundary section tells the agent and what it leaves out (permissive and single-file
+    absences, the 24-per-act cap, `Ask` rendered as itself, a remembered rule not reflected, and the section
+    not being the boundary); where a repository''s guidance now rides and what bounds it; and that a prompt
+    family changes delimiters only.'
+  - '`CHANGELOG.md` gains the 0.45.0 section with all six additions, **three `*Migration:*`-carrying Changed
+    entries** (discovery by default with `files = []` as the opt-out; instructions leaving `constraints`;
+    the ending relocating), and a Security entry stating plainly that repository-controlled text moved
+    into the system block and what bounds it.'
+  - '`docs/guide/configuration.md`''s `[instructions]` section and its untrusted-text note both rewritten;
+    `README.md`''s configuration paragraph updated and its dependency snippet bumped to `0.45` (which
+    `tests/docs_drift.rs` refused until it was).'
+  - 'O3 — `grep -rn instructions src/ docs/ README.md CAPABILITIES.md | grep -i constraint` returns **nothing**.
+    Three sites said the old thing and all three were corrected in this commit: `Config::instructions`''
+    doc, the `apply_to` rationale comment, and the `Config.instructions` field comment.'
+  - '**The nightly rustdoc gate caught one error stable `cargo doc` did not report** — a redundant explicit
+    link target on `[`Compatible`](crate::Compatible)` in a file that has it in scope. Five of the last
+    seven releases. `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps`
+    now exits clean.'
+  - '`Cargo.toml` bumped to 0.45.0. Final gates: default `cargo test --lib --tests --no-fail-fast` exit
+    0 over **76** suites; **all-features** the same, 76 suites, exit 0; `cargo test --doc` **401 passed
+    / 0 failed**; `cargo fmt --check` clean; `cargo clippy --all-targets --all-features -- -D warnings`
+    clean; nightly rustdoc gate clean.'

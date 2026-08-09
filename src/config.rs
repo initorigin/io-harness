@@ -589,9 +589,10 @@ pub struct Config {
     /// [`Config::with_profile`] can overlay through the same [`merge`] the scopes
     /// use rather than inventing a second set of merge semantics.
     raw: toml::value::Table,
-    /// What `[instructions]` found, already worded as constraints. Read once, in
-    /// [`Config::discover`], which is the caller's own call — the run loop never
-    /// reads a file.
+    /// What `[instructions]` found, already worded and attributed to the file it
+    /// came from. Read once, in [`Config::discover`], which is the caller's own
+    /// call — the run loop never reads a file. Carried in the system block since
+    /// 0.45.0, not in `TaskContract::constraints`.
     instructions: Vec<String>,
     /// Which file decided each key, by dotted path (0.30.0).
     ///
