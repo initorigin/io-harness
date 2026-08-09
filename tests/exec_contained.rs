@@ -376,40 +376,25 @@ async fn loopback_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
 /// the ubuntu runners took the floor: the two escape tests failed loudly and the
 /// egress tests skipped silently, which is the same defect wearing two faces.
 fn backend_confines_writes() -> bool {
-    use io_harness::sandbox::{select, Backend, Sandbox};
-    // 0.47.0 added three confining backends and this enumeration is why the
-    // matrix caught it: the helper listed the two that existed in 0.46.0, so a
-    // host reporting `LinuxLandlock` took the *floor* branch and asserted that a
-    // write it had correctly refused ought to have landed. Enumerating backends
-    // is the right shape — the floor genuinely confines nothing and must assert
-    // that — but the list has to move when the set does.
-    matches!(
-        select(&SandboxConfig::new()).backend(),
-        Backend::MacosSandboxExec
-            | Backend::LinuxLandlock
-            | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces
-            | Backend::WindowsAppContainer
-    )
+    use io_harness::sandbox::{select, Sandbox};
+    // One question, one answer, and it lives on `Backend` itself.
+    //
+    // This was a `matches!` list written out here and in three other places. When
+    // 0.47.0's chain added three backends every one of them went silently wrong
+    // at once: a host reporting `LinuxLandlock` took the branch meaning "this
+    // backend confines nothing" and asserted that a write it had correctly
+    // refused ought to have landed. `Backend::confines_writes` is an exhaustive
+    // match, so the next backend added is a compile error there rather than a
+    // passing test here that proves nothing.
+    select(&SandboxConfig::new()).backend().confines_writes()
 }
 
 /// Does this host's backend claim a network boundary at all? A Job Object and the
 /// portable floor do not, and asserting a denial they never promised is how a
 /// suite starts lying about what it proved.
 fn backend_claims_a_network_boundary() -> bool {
-    use io_harness::sandbox::{select, Backend, Sandbox};
-    // `backend()` answers for a run that denies egress, so a host reporting the
-    // Landlock rung can deny egress on it — that is the chain's honesty rule, and
-    // it is what makes including the rung here correct rather than optimistic.
-    // The AppContainer's empty capability array is a boundary in the same sense.
-    matches!(
-        select(&SandboxConfig::new()).backend(),
-        Backend::MacosSandboxExec
-            | Backend::LinuxLandlock
-            | Backend::LinuxBubblewrap
-            | Backend::LinuxNamespaces
-            | Backend::WindowsAppContainer
-    )
+    use io_harness::sandbox::{select, Sandbox};
+    select(&SandboxConfig::new()).backend().denies_egress()
 }
 
 #[cfg(unix)]
@@ -625,11 +610,7 @@ async fn linux_confines_a_contained_commands_writes_to_the_workspace() {
     // Which one a host takes is the chain's business; what this test asserts is
     // that a host claiming to confine writes actually does.
     let backend = select(&SandboxConfig::new()).backend();
-    let confining = matches!(
-        backend,
-        Backend::LinuxLandlock | Backend::LinuxBubblewrap | Backend::LinuxNamespaces
-    );
-    if !confining {
+    if !backend.confines_writes() {
         assert!(
             std::env::var("CI").is_err(),
             "this runner reported {backend:?}, which is not a confining rung of the Linux \

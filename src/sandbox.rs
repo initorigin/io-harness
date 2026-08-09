@@ -130,6 +130,70 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Does a run under this backend have its writes confined to what the mode
+    /// granted?
+    ///
+    /// **One exhaustive `match`, and that is the entire point of it.** Before
+    /// 0.47.0 this question was answered by `matches!(backend, MacosSandboxExec |
+    /// LinuxNamespaces)` written out in four places across the test suite. When
+    /// the chain added three backends, every one of those lists was silently
+    /// wrong — a host reporting `LinuxLandlock` took the branch meaning "this
+    /// backend confines nothing" and asserted that a write it had correctly
+    /// refused ought to have landed. Four CI rounds went on that one shape.
+    ///
+    /// A `match` with no wildcard cannot go stale: the next backend added to this
+    /// enum is a compile error here, in one place, instead of a passing test
+    /// somewhere else that proves nothing.
+    ///
+    /// ```
+    /// use io_harness::Backend;
+    ///
+    /// assert!(Backend::MacosSandboxExec.confines_writes());
+    /// // A Job Object has no filesystem facility at all.
+    /// assert!(!Backend::WindowsJobObject.confines_writes());
+    /// assert!(!Backend::PortableFloor.confines_writes());
+    /// ```
+    pub fn confines_writes(&self) -> bool {
+        match self {
+            Backend::MacosSandboxExec
+            | Backend::LinuxLandlock
+            | Backend::LinuxBubblewrap
+            | Backend::LinuxNamespaces
+            | Backend::WindowsAppContainer => true,
+            // A Job Object is a resource container: there is no path rule to set
+            // on one. The floor is an ephemeral working directory and nothing.
+            Backend::WindowsJobObject | Backend::PortableFloor => false,
+        }
+    }
+
+    /// Does this backend enforce the run's egress answer with a real boundary,
+    /// rather than approximating it by stripping proxy variables?
+    ///
+    /// Same exhaustive shape and the same reason. Note that a backend reported by
+    /// [`Sandbox::backend`] for a run that denies egress already satisfies the
+    /// chain's honesty rule — a rung that cannot deny egress is never handed such
+    /// a run — so `LinuxLandlock` appearing here is a consequence of that rule and
+    /// not an assumption on top of it.
+    ///
+    /// ```
+    /// use io_harness::Backend;
+    ///
+    /// assert!(Backend::LinuxNamespaces.denies_egress());
+    /// // The floor's denial is a proxy-environment strip, which a payload that
+    /// // does not read those variables ignores completely.
+    /// assert!(!Backend::PortableFloor.denies_egress());
+    /// ```
+    pub fn denies_egress(&self) -> bool {
+        match self {
+            Backend::MacosSandboxExec
+            | Backend::LinuxLandlock
+            | Backend::LinuxBubblewrap
+            | Backend::LinuxNamespaces
+            | Backend::WindowsAppContainer => true,
+            Backend::WindowsJobObject | Backend::PortableFloor => false,
+        }
+    }
+
     /// A stable label for the trace and logs.
     pub fn as_str(&self) -> &'static str {
         match self {
