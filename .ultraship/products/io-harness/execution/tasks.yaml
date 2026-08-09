@@ -171,7 +171,7 @@ tasks:
   why_required: An overflow is indistinguishable from any other 4xx today, so the recovery has nothing
     to branch on. This is the release's one public break and it is paid here, once, with the conservative
     classifier and its negative control.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F6 — classification is conservative and does not swallow a real 400.** A 400 with a message carrying
@@ -188,7 +188,23 @@ tasks:
   - src/provider/openai_wire.rs
   - src/provider/anthropic.rs
   - tests/overflow.rs
-  evidence: []
+  evidence:
+  - '`ProviderErrorKind::ContextOverflow` added, and `#[non_exhaustive]` on the enum in the same
+    release — one break, paid once, the move four previous releases each made on a different type.
+    `is_retryable()` returns false for it, and the doc says why that is the right answer rather than a
+    compromise: re-sending bytes a server called too many cannot work, and the recovery is a different
+    request.'
+  - '`ProviderErrorKind::from_response(status, message)` added beside `from_status`, which keeps its
+    exact signature and behaviour. Only a 400 or a 413 is eligible; the seven vendor signatures are a
+    short list matched case-insensitively, documented as conservative on purpose.'
+  - 'No per-vendor edit was needed. Every built-in provider builds its status failures through
+    `Error::provider_status`, which is the single funnel — so OpenRouter, OpenAI and Anthropic cannot
+    drift apart on what an over-window rejection is, and `src/provider/` is untouched by this task.'
+  - '`cargo test --test overflow` exit 0, 6 passed. F6''s negative control is
+    `an_ordinary_400_is_left_exactly_where_it_was` (four ordinary 400s, including an empty message,
+    stay `Request`); `a_status_that_means_something_else_is_not_reclassified_by_its_wording` proves a
+    429 carrying a signature verbatim is still a rate limit; and `from_status_behaves_exactly_as_it_did_on_0_42_0`
+    asserts the old mapping over the whole 400..600 range rather than at a few points.'
 - id: US-IO-HARNESS-0.43.0-T05
   summary: Answer a `ContextOverflow` by folding unconditionally and re-asking once, bounded at one recovery
     per step, in the same helper both loops call.
