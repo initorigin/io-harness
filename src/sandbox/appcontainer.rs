@@ -669,7 +669,7 @@ mod tests {
     /// Run `cmdline` inside a container that has `Full` access to `cwd`, and
     /// return its exit code and combined output.
     fn in_container(tag: &str, cmdline: &str, cwd: &std::path::Path) -> (Option<i32>, String) {
-        let profile = Profile::create(&name(tag)).unwrap_or_else(|e| {
+        let profile = Profile::create(&name(tag), false).unwrap_or_else(|e| {
             panic!(
                 "F1: could not create an AppContainer profile on this host ({e}). This is \
                  fallback_scope Trigger A: the release's central mechanism is unavailable here."
@@ -823,7 +823,7 @@ mod tests {
         let bin_dir = exe.parent().expect("it has a directory").to_path_buf();
         let work = tempfile::tempdir().expect("tempdir");
 
-        let profile = Profile::create(&name("toolchain")).expect("profile");
+        let profile = Profile::create(&name("toolchain"), false).expect("profile");
         grant(work.path(), profile.sid(), Access::Full).expect("grant the workspace");
         grant(&bin_dir, profile.sid(), Access::ReadExecute).expect("grant the binary's directory");
 
@@ -859,7 +859,7 @@ mod tests {
     #[test]
     fn the_wall_clock_kills_only_what_overruns() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let profile = Profile::create(&name("wall")).expect("profile");
+        let profile = Profile::create(&name("wall"), false).expect("profile");
         grant(dir.path(), profile.sid(), Access::Full).expect("grant");
         let file = std::fs::File::create(dir.path().join("o.txt")).expect("capture");
 
