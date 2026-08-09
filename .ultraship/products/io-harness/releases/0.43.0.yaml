@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.43.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -601,3 +601,187 @@ open_questions:
   Whether `Transcript` should carry the run's steps as well as its turns. Deferred: the turn is the
   conversational unit and the steps are already reachable through `Store::steps`. Revisit with a
   caller who needs both in one artifact.
+
+released_at: 2026-08-09T04:33:24Z
+mode: published
+delivered: >
+  A long run stops forgetting its own beginning, and a request that does not fit stops ending the
+  run. When the observation ledger crosses a share of the turn's context budget, everything but the
+  newest few observations becomes one model-written paragraph — what was attempted, which files were
+  touched, what was decided, what is still open — written by the run's own provider, costing one
+  ordinary `provider_calls` row, and stored so a resumed, branched or replayed run replays it rather
+  than buying it again. `ProviderErrorKind::ContextOverflow` tells an over-window rejection apart
+  from any other 4xx by the vendor's own wording, and the loop answers it by folding unconditionally
+  and asking once more with a smaller request; a second overflow escalates as before. Beside them,
+  `Session::transcript` renders a conversation as one Markdown artifact — the whole tree, including
+  the turns a branch left off the model's path, with each fold marked where the steps behind it used
+  to be — and `Session::attach` stages images for the next turn, closing the one path an operator
+  would hand a screenshot to. One public break, paid once: `ProviderErrorKind` gains the variant and
+  `#[non_exhaustive]` together. Everything else is additive, and the store gains one table and one
+  index with `CHECKPOINT_FORMAT` unmoved at 7.
+
+evidence:
+  tests:
+  - >
+    F1 — `the_fold::a_fold_writes_a_summary_and_the_next_request_carries_it` passes. The
+    discriminating pair, and neither half alone would do: the summarising request contains the text
+    of the observation being folded, and a later working request contains the summary's own sentence
+    while **no longer containing** a marker that appeared only in the folded text. A request missing
+    the marker proves only that something dropped it, which is what 0.42.0 already did.
+  - >
+    F2 — `the_fold::with_folding_off_nothing_folds_and_nothing_extra_is_spent` and
+    `the_fold::a_short_run_under_the_share_never_folds` pass, plus six type-level assertions in
+    `tests/compaction.rs`. Zero rows, zero events, and exactly one completion per step. The
+    type-level half matters because a knob that reads as "never" and computes as "always" is a
+    defect a run-level test finds late and expensively: `NaN`, infinity, a negative share and zero
+    all read as never rather than always.
+  - >
+    F3 — `the_fold::a_resumed_run_re_reads_the_summary_instead_of_buying_it_again` passes. The run
+    parks a completion forever and is dropped mid-step, which is the **only** interruption that
+    leaves a run resumable — every clean stop, cancellation included, is terminal to `resume` by
+    design, and finding that out is what shaped the test. The resume records **zero** summarising
+    completions, one row survives, and the paragraph is still in the request.
+  - >
+    F4 — `the_recovery::a_request_that_did_not_fit_is_compacted_and_asked_again` passes, with
+    `the_recovery::a_run_under_the_ceiling_never_compacts` as its control. The provider refuses any
+    user block over a byte ceiling and serves anything under it, so the request that succeeded is
+    provably smaller than the one refused — a recovery rather than a re-send that got lucky.
+  - >
+    F5 — `the_recovery::a_request_that_cannot_be_made_to_fit_escalates_after_one_recovery` and
+    `the_recovery::with_folding_off_an_overflow_is_terminal_at_once` pass. Exactly two refusals for
+    the step and one fold against a provider that refuses everything; exactly one with folding off.
+  - >
+    F6 — `an_ordinary_400_is_left_exactly_where_it_was`,
+    `a_status_that_means_something_else_is_not_reclassified_by_its_wording`,
+    `from_status_behaves_exactly_as_it_did_on_0_42_0`, `an_over_window_rejection_is_told_apart_from_every_other_rejection`,
+    `an_overflow_is_not_retryable_and_the_reason_is_the_point` and
+    `the_classification_reaches_the_error_every_provider_builds` pass. The negative control is the
+    load-bearing one: four ordinary 400s including an empty message stay `Request`, a 429 carrying a
+    signature verbatim stays `RateLimited`, and `from_status` is asserted unchanged over the whole
+    400..600 range rather than at a few points.
+  - >
+    F7 — `a_branched_session_exports_the_turn_history_no_longer_returns` passes. Three turns,
+    branched: `history` returns 2 and `transcript` returns 3, with exactly the branched-away turn
+    marked `on_path: false` and both branches in the markdown. An export built from `history()`
+    passes every other assertion in the file and fails this one.
+  - >
+    F8 — `exporting_calls_no_provider_and_writes_no_row` passes. Three exports, zero extra
+    completions, zero extra `provider_calls` rows, no summary written.
+  - >
+    F9 — `a_staged_image_reaches_the_request_and_only_the_next_turn`,
+    `the_observed_entry_point_carries_it_too` and `a_contracts_own_images_are_kept_beside_the_staged_one`
+    pass. Every assertion is against the `CompletionRequest` the provider received, not the contract
+    that was built.
+  - >
+    F10 — `a_provider_that_takes_no_images_refuses_before_the_first_request` passes: the turn fails
+    and the counting provider records **zero** completions, which is what distinguishes a refusal
+    taken before the request was built from one taken after.
+  - >
+    N4 — `the_fold::a_fold_lands_one_ordinary_provider_call_row_and_is_billed` passes. One extra
+    `provider_calls` row per fold, filed under the step it happened in, and `spent_tokens` equal to
+    the sum over those rows. It **failed on its first run** — 96 tokens billed against 120 — because
+    `spent_tokens` sums `steps.tokens` and the fold was landing only a `provider_calls` row. The
+    criterion caught exactly the invisible spend it was written for.
+  - >
+    N5 — the whole corpus is the control, since compaction is on by default and every suite now runs
+    with it. `parallel_reads` (0.41.0's batch) and `tool_hooks` (0.42.0's gate) are green among 74
+    suites. One existing test needed a line: `tests/context.rs`'s prompt-stabilisation test drives a
+    positional script under a 1,000-token budget where the fold now fires and inserts a completion
+    the script cannot anticipate, so it sets `at_share: 1.0` and says why — it is 0.13.0's elision
+    claim, and the fold's own stabilisation is asserted in `tests/compaction.rs`.
+  - >
+    O1 — both feature polarities green locally. All-features: **1,152** passed across 74 suites plus
+    **395** doctests. Default: **1,071** passed across 74 suites plus **392** doctests. The
+    three-platform matrix is CI's and runs on the release PR.
+  - >
+    O2 — `cargo test --test cross_version` passes, including
+    `the_schema_this_release_creates_adds_to_0_22_0s_and_alters_none_of_it` and
+    `the_checkpoint_format_is_still_7_and_opening_a_0_22_0_store_alters_nothing`.
+    `git diff main -- src/state.rs` adds exactly two DDL statements — the `summaries` table and its
+    index — and no `ALTER` or `DROP`. `CHECKPOINT_FORMAT` is 7.
+  - >
+    **Eleven sabotages, each reverted immediately, recorded in
+    `evidence/0.43.0/sabotage.txt`.** Nine failed a named test. Two are findings and are stated
+    below rather than propped up.
+  builds:
+  - >
+    `cargo build --all-features --examples` exit 0. `cargo clippy --all-features --all-targets` zero
+    warnings. `cargo fmt --check` clean.
+  - >
+    `RUSTDOCFLAGS="-D warnings -D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links --cfg docsrs" cargo +nightly doc --all-features --no-deps`
+    exit 0 — after catching **three** errors stable `cargo doc` did not report: a link to
+    `Summary::kept_from` left behind by a rename, a bare `[`Summary`]` in a file that does not `use`
+    it, and a *redundant* explicit target on `Provider::accepts_images` in a file that does. The two
+    intra-doc rules partition on scope exactly as recorded, and this gate has now caught something in
+    five of the last six releases.
+  - >
+    `cargo package` exit 0, verifying compile included. The packaged crate is **1,458,100 bytes**.
+  - >
+    N1 — `cargo tree` on the default feature set is **402**, unchanged for the fourth release
+    running. N2 — `rust-version = "1.95"` unmoved.
+  reviews:
+  - >
+    Scope checked mechanically rather than by memory (`evidence/0.43.0/scope-check.txt`): `after_tool`
+    appears in the crate only inside a comment explaining why it is not here; `git diff main` touches
+    no `cache_control` site, so 0.38.0's single breakpoint is exactly where it was and 0.44.0's second
+    one is unclaimed; and no stored hunk is added, which stays 0.51.0's.
+  - >
+    No secret in the diff: `git diff main -- src/ tests/ docs/` matched no key pattern, and the
+    repo-local `.env` is untracked and ignored.
+  deployments: []
+  health_checks: []
+
+known_limitations:
+- >
+  **The record is sealed before the crates.io upload.** `mode: published` states the authorised
+  target; the flow makes it true. The upload follows the `develop` → `main` merge and the GitHub
+  Release, in that order, as it has for every release since 0.7.0.
+- >
+  **F3 is over-determined, and only the combined sabotage discriminates.** Two independent
+  mechanisms satisfy it: `restore_ledger` replaying the stored folds, and `compact_ledger` looking a
+  summary up by the boundary it is about to fold at. Removing either alone fails **nothing**;
+  removing both fails the named test. Reported rather than propped up, and the second mechanism is
+  kept because it is what makes an identical replay free even when the first has nothing to replay.
+- >
+  **F5's sabotage is a hang, not a failing assertion.** Removing the once-per-step bound makes the
+  suite non-terminating rather than wrong, because an unbounded recovery is an infinite loop. It was
+  run under a 420-second timeout and recorded as a hang. That is the honest shape of the evidence,
+  and it is why the test asserts a refusal *count* rather than an outcome.
+- >
+  **A summariser that returns empty text costs one call per step and folds nothing.** The fold
+  declines to replace the notes with nothing — stubbing is strictly better than an empty paragraph —
+  but it does not remember that the attempt failed, so a model that keeps returning empty text is
+  asked again at the next step that crosses the threshold. Bounded by the same order of cost as the
+  retry policy, and not worth run-scoped state until a real provider does it.
+- >
+  **`Compaction` is deliberately not `#[non_exhaustive]`**, unlike most structs this crate adds. It
+  is `ContextBudget`'s sibling — same module, two knobs, the same `#[serde(default)]` config story —
+  and every caller and doctest writes `Compaction { .. ..default() }`, which `#[non_exhaustive]`
+  refuses outside the crate with `E0639`. The cost is stated rather than hidden: a third field would
+  be a break.
+- >
+  **A summary can be wrong, and a paragraph is less visibly incomplete than a stub.** `keep_recent`
+  keeps the newest observations whole beside it and the folded ones stay in `ledger_observations`,
+  but nothing checks that the model summarised the thing that mattered. Stated in `docs/CONTRACT.md`
+  as a property of the feature.
+- >
+  **The overflow signature list is a heuristic and is not exhaustive.** A vendor wording it does not
+  know costs exactly what an overflow cost on 0.42.0. Deliberately asymmetric in the safe direction;
+  a broader match is the tempting fix and the wrong one.
+- >
+  **No live provider was asked to produce a real over-window 400.** Every criterion here is met with
+  fixtures, which is what makes them deterministic; whether a real vendor's wording matches the list
+  is recorded as an open question rather than gated on a third party's release schedule.
+- >
+  **`US-IO-HARNESS-0.43.0-I01` corrected two claims the contract made about how a fold survives a
+  resume.** The row is keyed on `folded` rather than on the step, and `restore_ledger` replays the
+  stored folds. Both prose sites were corrected, not only the scope bullet — the 0.42.0 lesson about
+  grepping the whole contract for a claim, applied at implementation time this once rather than at
+  sealing time.
+- >
+  **docs.rs is not verified at seal.** The nightly gate passed locally and in CI on this tree, so it
+  builds; the hosted build is queued after the publish. Check it once rather than assume.
+
+supersedes: 0.42.0
+next_recommended_version: 0.44.0
+immutable: true
