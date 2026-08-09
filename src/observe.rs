@@ -848,6 +848,60 @@ pub enum EventKind {
         /// Estimated tokens it holds after it.
         after_tokens: u64,
     },
+    /// The request began asking a vendor to cache a prefix of the transcript
+    /// (0.44.0).
+    ///
+    /// Emitted when the marked prefix **changes**, never once per step: the step it is
+    /// first offered on, and again whenever a later fold or a moved prefix makes the
+    /// crate mark different bytes. A run marking the same prefix for forty steps emits
+    /// this once. That is `Routed`'s rule and it is here for `Routed`'s reason — an
+    /// event recomputed from each freshly built request reports a transition every
+    /// step and stops meaning anything.
+    ///
+    /// **The absence of this event is the signal that nothing was marked**, and it is
+    /// the answer to "why is this run getting no cache reads". The marker is withheld
+    /// until a run folds (there is no frozen prefix before that) and until the prefix
+    /// has repeated byte-identically since the previous step (the crate never asks a
+    /// vendor to cache bytes it has not already sent). A run with no `CacheMarked` never
+    /// asked; a run with three marked three different prefixes; and one of these beside
+    /// a zero `cache_read_tokens` on the same step's `provider_calls` row says the
+    /// vendor declined a marker the crate did send — most often because the prefix is
+    /// under the vendor's minimum cacheable length.
+    ///
+    /// Named for what the crate knows. At the moment a request is built nothing has
+    /// been cached; a marker has been asked for. What was actually served from a cache
+    /// is [`Usage::cache_read_tokens`](crate::Usage::cache_read_tokens).
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// struct Marks;
+    ///
+    /// impl Observer for Marks {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::CacheMarked { through_step, prefix_bytes } = &event.kind {
+    ///             println!("step {through_step}: caching {prefix_bytes} bytes of prefix");
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let flow = Marks.event(&RunEvent::new(
+    ///     7,
+    ///     13,
+    ///     EventKind::CacheMarked { through_step: 13, prefix_bytes: 8_412 },
+    /// ));
+    /// assert_eq!(flow, Flow::Continue);
+    /// ```
+    CacheMarked {
+        /// The step the marker was first sent on, so a trace reads the same way
+        /// [`Compacted`](EventKind::Compacted) does beside it.
+        through_step: u32,
+        /// Bytes of the request's `user` the vendor was asked to cache. Not tokens:
+        /// this is what the crate measured, and converting it would be a guess at the
+        /// vendor's tokeniser.
+        prefix_bytes: u64,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -915,6 +969,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "rewound",
     "answered",
     "compacted",
+    "cache_marked",
     "finished",
 ];
 
@@ -1446,6 +1501,10 @@ mod tests {
                 before_tokens: 19_400,
                 after_tokens: 5_100,
             },
+            EventKind::CacheMarked {
+                through_step: 13,
+                prefix_bytes: 8_412,
+            },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -1560,6 +1619,7 @@ mod tests {
                 | EventKind::Answered { .. }
                 // 0.43.0 — the run's older observations folded into a summary.
                 | EventKind::Compacted { .. }
+                | EventKind::CacheMarked { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

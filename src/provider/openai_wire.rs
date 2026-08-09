@@ -68,19 +68,29 @@ pub(crate) fn body(
     if let Some(content) = cached_system(flavor, &request.system) {
         body["messages"][0]["content"] = content;
     }
+    // 0.44.0 — the second breakpoint, added the fourth time in the shape the three
+    // above established, and absent entirely for a wire that does not take one and for
+    // a request whose caller named no stable prefix.
+    if let Some(content) = cached_user(flavor, request) {
+        body["messages"][1]["content"] = content;
+    }
     body
 }
 
 /// The system message's `content` for a wire that takes a request-side cache
 /// breakpoint, or `None` for one that does not and keeps the bare string.
 ///
-/// The breakpoint sits at the end of the instructions and nowhere else. That block
-/// — the system prompt, the skill catalogue folded into it, and the tool schemas
-/// the vendor orders ahead of it — is what this crate re-sends identically on every
-/// step of a run and every turn of a session. The transcript deliberately carries
-/// no breakpoint: [`crate::context::assemble`] supersedes, invalidates, re-reads
-/// and re-fits earlier observations on each turn, so it is not a byte-stable prefix
-/// and marking it would be billed as a cache *write* on nearly every turn.
+/// The first of the request's two breakpoints, at the end of the instructions. That
+/// block — the system prompt, the skill catalogue folded into it, and the tool
+/// schemas the vendor orders ahead of it — is what this crate re-sends identically on
+/// every step of a run and every turn of a session.
+///
+/// Through 0.43.0 it was the only one, because [`crate::context::assemble`]
+/// supersedes, invalidates, re-reads and re-fits earlier observations on each turn:
+/// the transcript was not a byte-stable prefix and marking it would have been billed
+/// as a cache *write* on nearly every turn. 0.43.0's compaction froze the part ahead
+/// of the folded summary, and 0.44.0 marks that part in [`cached_user`] — still never
+/// past it, because everything after the summary is rewritten exactly as before.
 fn cached_system(flavor: WebFlavor, system: &str) -> Option<serde_json::Value> {
     match flavor {
         // OpenAI caches a repeated prefix by itself with no request-side control,
@@ -220,18 +230,62 @@ fn user_content(request: &CompletionRequest) -> serde_json::Value {
     }
     // Text first, then images: the order OpenAI's own examples use.
     let mut parts = vec![json!({ "type": "text", "text": request.user })];
-    parts.extend(request.media.iter().map(|m| {
-        json!({
-            "type": "image_url",
-            "image_url": { "url": format!("data:{};base64,{}", m.media_type, m.base64) },
-        })
-    }));
+    parts.extend(request.media.iter().map(image_part));
     json!(parts)
 }
 
 #[cfg(not(feature = "media"))]
 fn user_content(request: &CompletionRequest) -> serde_json::Value {
     json!(request.user)
+}
+
+/// One image, in the shape this wire spells it.
+#[cfg(feature = "media")]
+fn image_part(m: &crate::provider::Media) -> serde_json::Value {
+    json!({
+        "type": "image_url",
+        "image_url": { "url": format!("data:{};base64,{}", m.media_type, m.base64) },
+    })
+}
+
+/// The user message's `content` for a wire that takes 0.44.0's second breakpoint, or
+/// `None` for one that does not and keeps whatever [`user_content`] built.
+///
+/// The first breakpoint, on `system`, covers what a run re-sends identically on every
+/// step. This one covers what 0.43.0's compaction froze: the prompt header, the memory
+/// block and the summary standing in for the folded observations. `assemble` still
+/// rewrites everything *after* the summary on every turn, which is why the boundary is
+/// an offset the run loop computes rather than a shape this function guesses at — and
+/// why the loop only ever names a prefix it has already sent, so the marker cannot be
+/// billed as a cache write on a prefix that then moves.
+///
+/// Images follow the text on this wire, so unlike Anthropic's builder a request
+/// carrying media can still be marked: the two text blocks lead and the image blocks
+/// come after, leaving the marked span a genuine prefix of the message. That the same
+/// request is marked here and not there is a property of the two vendors' orderings,
+/// not a policy this crate chose.
+fn cached_user(flavor: WebFlavor, request: &CompletionRequest) -> Option<serde_json::Value> {
+    match flavor {
+        // Nothing to ask for, and 21 `Compatible` endpoints behind this flavour that
+        // would answer an unknown key with a 400. New surface starts closed — the same
+        // rule `cached_system` follows one function above.
+        WebFlavor::OpenAi => None,
+        WebFlavor::OpenRouter => {
+            let (prefix, rest) = crate::provider::split_at_boundary(request)?;
+            #[allow(unused_mut)] // `media` is cfg'd out in the default build
+            let mut parts = vec![
+                json!({
+                    "type": "text",
+                    "text": prefix,
+                    "cache_control": { "type": "ephemeral" },
+                }),
+                json!({ "type": "text", "text": rest }),
+            ];
+            #[cfg(feature = "media")]
+            parts.extend(request.media.iter().map(image_part));
+            Some(json!(parts))
+        }
+    }
 }
 
 /// Parse the SSE stream of an OpenAI-style response into one completion.
@@ -704,8 +758,10 @@ mod cache_wire {
         assert_eq!(content[0]["text"], "you are a careful agent");
         assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
 
-        // The user turn is untouched — the breakpoint sits at the end of the
-        // instructions, never inside the transcript.
+        // The user turn is untouched: this request names no cache boundary, and
+        // without one the transcript carries no breakpoint. 0.44.0's second marker is
+        // asserted separately, and only ever appears when the loop has said which
+        // prefix has already been sent.
         assert_eq!(b["messages"][1]["content"], "hi");
         assert_eq!(
             b.to_string().matches("cache_control").count(),
@@ -723,6 +779,118 @@ mod cache_wire {
         assert_eq!(
             strip(body("m", &req(), WebFlavor::OpenRouter)),
             strip(body("m", &req(), WebFlavor::OpenAi)),
+        );
+    }
+
+    /// The 0.44.0 request: whitespace on both sides of the split, so trimming either
+    /// half is caught rather than silently passing.
+    #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+    fn boundary_req(cache_boundary: Option<usize>) -> CompletionRequest {
+        CompletionRequest {
+            system: "you are a careful agent".into(),
+            user: "FROZEN PREFIX\n---\n  volatile tail".into(),
+            cache_boundary,
+            ..Default::default()
+        }
+    }
+
+    const PREFIX: &str = "FROZEN PREFIX\n---\n";
+
+    /// F1 — the OpenRouter body splits the user turn and marks only the first half.
+    ///
+    /// The concatenation assertion is the discriminating one, for the reason it is on
+    /// the Anthropic side: a marked block that is not a byte-exact prefix of the
+    /// message buys an entry the vendor can never hit, and is billed at the write
+    /// premium for the privilege.
+    #[test]
+    fn the_openrouter_body_splits_the_user_turn_at_the_boundary() {
+        let req = boundary_req(Some(PREFIX.len()));
+        let b = body("vendor/model", &req, WebFlavor::OpenRouter);
+        let content = b["messages"][1]["content"]
+            .as_array()
+            .expect("a marked user turn is a parts array");
+
+        assert_eq!(content.len(), 2, "prefix and remainder: {b}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(content[1]["type"], "text");
+        assert!(
+            content[1].get("cache_control").is_none(),
+            "the remainder must not be marked: {}",
+            content[1]
+        );
+
+        let rejoined = format!(
+            "{}{}",
+            content[0]["text"].as_str().expect("prefix text"),
+            content[1]["text"].as_str().expect("remainder text"),
+        );
+        assert_eq!(rejoined, req.user, "the split must lose nothing: {b}");
+        assert_eq!(content[0]["text"], PREFIX);
+
+        // Two: the system block's and this one.
+        assert_eq!(
+            b.to_string().matches("cache_control").count(),
+            2,
+            "exactly two breakpoints in the body, got {b}"
+        );
+    }
+
+    /// F5 — `WebFlavor::OpenAi` sends no boundary under any input.
+    ///
+    /// This flavour fronts OpenAI *and* all 21 `Compatible` endpoints this crate does
+    /// not control, where an unknown body key is a 400 nobody asked for. The
+    /// byte-identity assertion is the strong form: not "the marker is absent" but
+    /// "the body is the one 0.43.0 sent".
+    #[test]
+    fn the_openai_body_ignores_a_boundary_entirely() {
+        let unmarked = body("gpt-x", &boundary_req(None), WebFlavor::OpenAi);
+        for at in [Some(PREFIX.len()), Some(0), Some(usize::MAX)] {
+            let b = body("gpt-x", &boundary_req(at), WebFlavor::OpenAi);
+            assert!(
+                b["messages"][1]["content"].is_string(),
+                "the user turn must stay a bare string for this flavour: {b}"
+            );
+            assert_eq!(
+                b.to_string().matches("cache_control").count(),
+                0,
+                "no breakpoint anywhere in an OpenAI-flavoured body, got {b}"
+            );
+            assert_eq!(b, unmarked, "a boundary of {at:?} must change nothing");
+        }
+    }
+
+    /// F2 — an offset this crate cannot honour sends the body it has always sent, on
+    /// the flavour that *does* take markers. Zero would mark an empty prefix, an
+    /// offset at or past the end would leave an empty remainder, and one inside a
+    /// multi-byte character would panic on the slice.
+    #[test]
+    fn an_unusable_boundary_leaves_the_openrouter_user_turn_alone() {
+        let unmarked = body("m", &boundary_req(None), WebFlavor::OpenRouter);
+        let len = boundary_req(None).user.len();
+        for at in [Some(0), Some(len), Some(len + 1), Some(usize::MAX)] {
+            assert_eq!(
+                body("m", &boundary_req(at), WebFlavor::OpenRouter),
+                unmarked,
+                "an unusable boundary {at:?} must change nothing"
+            );
+        }
+
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let accented = CompletionRequest {
+            system: "s".into(),
+            user: "é".into(),
+            cache_boundary: Some(1),
+            ..Default::default()
+        };
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let plain = CompletionRequest {
+            cache_boundary: None,
+            ..accented.clone()
+        };
+        assert_eq!(
+            body("m", &accented, WebFlavor::OpenRouter),
+            body("m", &plain, WebFlavor::OpenRouter),
         );
     }
 }
@@ -989,6 +1157,52 @@ mod web_wire {
 mod media_wire {
     use super::*;
     use crate::provider::Media;
+
+    /// F6 (the OpenRouter half) — a request carrying an image **is** marked here, and
+    /// the same request is not marked on Anthropic.
+    ///
+    /// This wire puts text first, so the two text blocks lead and the image parts
+    /// follow: the marked span is still a genuine prefix of the message. Anthropic
+    /// puts images first, so there the marked span would begin with an attachment that
+    /// rides one turn only, and the boundary is ignored instead. Two vendors, one
+    /// request, two correct answers — asserted rather than reasoned, because the
+    /// tempting implementation applies one rule to both.
+    #[test]
+    fn an_image_still_leaves_a_markable_prefix_because_the_text_comes_first() {
+        #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
+        let req = CompletionRequest {
+            system: "sys".into(),
+            user: "FROZEN PREFIX\n---\n  what is this".into(),
+            media: vec![Media::image("image/jpeg", &[1, 2, 3]).unwrap()],
+            cache_boundary: Some("FROZEN PREFIX\n---\n".len()),
+            ..Default::default()
+        };
+        let b = body("vendor/model", &req, WebFlavor::OpenRouter);
+        let content = b["messages"][1]["content"]
+            .as_array()
+            .expect("a marked user turn is a parts array");
+
+        assert_eq!(content.len(), 3, "prefix, remainder, then the image: {b}");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(content[1]["type"], "text");
+        assert!(content[1].get("cache_control").is_none());
+        assert_eq!(
+            content[2]["type"], "image_url",
+            "the image follows the text, so the marked span is still a prefix: {b}"
+        );
+
+        // Byte-exact reassembly, as on every other marked wire.
+        let rejoined = format!(
+            "{}{}",
+            content[0]["text"].as_str().expect("prefix text"),
+            content[1]["text"].as_str().expect("remainder text"),
+        );
+        assert_eq!(rejoined, req.user);
+
+        // The system breakpoint and this one.
+        assert_eq!(b.to_string().matches("cache_control").count(), 2, "{b}");
+    }
 
     #[test]
     fn an_image_becomes_a_data_url_part_after_the_text() {

@@ -447,6 +447,22 @@ impl std::fmt::Display for Effort {
 /// # Ok(())
 /// # }
 /// ```
+// 0.44.0 considered `#[non_exhaustive]` here — the move `Verification` (0.34.0),
+// `TaskContract` (0.35.0), `AgentDef` (0.36.0), `TurnResult` (0.37.0) and
+// `ProviderErrorKind` (0.43.0) each made — and it is deliberately NOT taken, for the
+// reason 0.43.0 recorded at `Compaction`: decide by call shape, not by reflex.
+//
+// `#[non_exhaustive]` forbids every struct expression outside the defining crate,
+// including the functional-update form. This type's entire ergonomic is
+// `CompletionRequest { system, user, ..Default::default() }` — what the worked example
+// above has advised since 0.15.0, what all five construction sites in `tests/` and
+// `examples/` use, and what the doc example itself is compiled as (a doctest is an
+// external crate). Marking it would not make the next field free; it would make the
+// type unconstructible without a builder this crate does not have and does not want.
+//
+// So `cache_boundary` is a break of exactly the kind `media` (0.15.0), `model`
+// (0.21.0), `web` (0.22.0) and `effort` (0.31.0) each were: an exhaustive literal
+// outside the crate stops compiling, and `..Default::default()` keeps working.
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CompletionRequest {
     /// System instructions.
@@ -502,6 +518,50 @@ pub struct CompletionRequest {
     /// field keeps working and is honestly non-thinking.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    /// (0.44.0) A byte offset into [`user`](CompletionRequest::user): the end of the
+    /// prefix the caller states is byte-stable across requests, or `None` (the
+    /// default, and every caller before 0.44.0) for a request with no such prefix.
+    ///
+    /// A provider that takes a request-side cache marker splits `user` there and marks
+    /// the first half, so the vendor serves it from its cache on the next request that
+    /// repeats it. 0.38.0 marked the end of the `system` block for the same reason;
+    /// this is the second breakpoint, and it exists because 0.43.0's compaction makes
+    /// everything up to the folded summary stop changing.
+    ///
+    /// A *request*, not a fact, exactly as [`CompletionRequest::model`] and
+    /// [`CompletionRequest::effort`] are. An out-of-tree [`Provider`] that ignores this
+    /// field keeps working and is honestly non-caching; a vendor may decline to cache a
+    /// prefix under its own minimum length and says nothing about having declined; and
+    /// [`Usage::cache_read_tokens`] is what says whether anything was actually served
+    /// from a cache.
+    ///
+    /// An offset past the end of `user`, one that is not on a UTF-8 character boundary,
+    /// and `Some(0)` are all **ignored** rather than refused: a boundary is an
+    /// optimisation, and an optimisation that turns a working run into an `Err` costs
+    /// more than it can save.
+    ///
+    /// The crate's own run loop never sets this to a prefix it has not already sent at
+    /// least once, so a marker it produces is never billed as a cache write on a prefix
+    /// that then changes. A caller building a request by hand owns that judgement
+    /// itself.
+    ///
+    /// ```
+    /// use io_harness::provider::CompletionRequest;
+    ///
+    /// let user = "Goal: tidy the README\n\nObservations so far:\n…".to_string();
+    /// // Everything through the goal line is what this caller re-sends verbatim.
+    /// let frozen = user.find("\n\n").map(|i| i + 2);
+    /// let request = CompletionRequest {
+    ///     system: "You are an agent.".into(),
+    ///     user,
+    ///     cache_boundary: frozen,
+    ///     ..Default::default()
+    /// };
+    /// // 21 bytes of goal line, plus the blank line that ends it.
+    /// assert_eq!(request.cache_boundary, Some(23));
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_boundary: Option<usize>,
     /// Images the model should see alongside `user`.
     ///
     /// A provider that does not accept images refuses a request carrying any,
@@ -512,6 +572,35 @@ pub struct CompletionRequest {
     #[cfg(feature = "media")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub media: Vec<Media>,
+}
+
+/// Split `user` at [`CompletionRequest::cache_boundary`], or `None` when there is no
+/// boundary or the one there is cannot be honoured.
+///
+/// One helper rather than one rule per wire, for the reason [`web_key`], `effort_key`
+/// and `cached_system` are each one function: two vendors differ in the *shape* they
+/// carry a marker in, never in what makes an offset valid, and a validity rule written
+/// twice is a validity rule that drifts once.
+///
+/// [`None`] is returned — the request is sent exactly as it was before 0.44.0 — when:
+///
+/// - there is no boundary;
+/// - the offset is `0`, which would mark an empty prefix;
+/// - the offset is at or past the end, which would leave an empty remainder that a
+///   vendor rejects as an empty content block;
+/// - the offset is not on a UTF-8 character boundary, where slicing would panic.
+///
+/// None of these is an error. A boundary is an optimisation, and an optimisation that
+/// turns a working run into an `Err` — or into a panic — costs more than it can save.
+/// The same reasoning `TaskContract::max_parallel_reads` uses when it clamps `0`.
+///
+/// [`web_key`]: crate::provider::openai_wire::web_key
+pub(crate) fn split_at_boundary(request: &CompletionRequest) -> Option<(&str, &str)> {
+    let at = request.cache_boundary?;
+    if at == 0 || at >= request.user.len() || !request.user.is_char_boundary(at) {
+        return None;
+    }
+    Some(request.user.split_at(at))
 }
 
 /// Refuse a request carrying media that `provider` does not accept.

@@ -44,8 +44,15 @@
 use io_harness::{Auth, Compatible, CompletionRequest, OpenRouter, Provider, Usage};
 
 /// An Anthropic slug, because Anthropic is the vendor whose caching is
-/// request-side. Override to measure another one.
-const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
+/// request-side. Override with `CACHE_LIVE_MODEL` to measure another one.
+///
+/// Haiku rather than a larger sibling on purpose. The OpenAI wire sends no
+/// `max_tokens`, so the vendor applies the *model's* own default maximum output — 64k
+/// on `claude-sonnet-4.5` — and a credit-limited account is refused with an HTTP 402
+/// before a single token is generated. That is not a caching failure and reads like
+/// one. The measurement does not care which model answers, only that its vendor caches
+/// on request, so the cheap one is the right default.
+const DEFAULT_MODEL: &str = "anthropic/claude-haiku-4.5";
 
 /// Enough repetitions to clear any vendor's minimum cacheable prefix with room to
 /// spare. Below that minimum a marker is accepted and does nothing, which reads
@@ -96,6 +103,33 @@ fn request(system: &str, user: &str) -> CompletionRequest {
     }
 }
 
+/// 0.44.0 — a user turn whose leading `at` bytes the caller says are byte-stable.
+fn request_marked_at(system: &str, user: &str, at: Option<usize>) -> CompletionRequest {
+    CompletionRequest {
+        cache_boundary: at,
+        ..request(system, user)
+    }
+}
+
+/// The frozen half of a transcript: what 0.43.0's compaction leaves unchanging ahead
+/// of the summary, standing in here for a real run's prompt header, memory block and
+/// folded paragraph.
+///
+/// Long enough on its own to clear a vendor's minimum cacheable length, so that the
+/// second breakpoint is measurable independently of the first rather than riding on
+/// it.
+fn frozen_transcript() -> String {
+    let mut s = String::from("Goal: port the tokenizer\n\nObservations so far:\n");
+    for i in 0..PARAGRAPHS {
+        s.push_str(&format!(
+            "[read src/lex{i}.rs] The lexer walks the input by byte and emits a Token for each \
+             run it recognises, holding the span so a later pass can report a position without \
+             re-scanning. Earlier work, summarised: the enum was kept and the span widened.\n"
+        ));
+    }
+    s
+}
+
 #[tokio::main]
 async fn main() -> io_harness::Result<()> {
     let key = std::env::var("OPENROUTER_API_KEY")
@@ -135,7 +169,7 @@ async fn main() -> io_harness::Result<()> {
         .await?;
     let b2 = report("call 2", &fourth.model, fourth.usage);
 
-    println!("\n--- verdict ---");
+    println!("\n--- verdict: one breakpoint (0.38.0) ---");
     println!("marked:  call 1 cache_read={a1}, call 2 cache_read={a2}");
     println!("control: call 1 cache_read={b1}, call 2 cache_read={b2}");
     if a2 > 0 && b2 == 0 {
@@ -152,5 +186,62 @@ async fn main() -> io_harness::Result<()> {
              vendor caches on request, and that the prefix clears its minimum length."
         );
     }
+
+    // ---- 0.44.0: the second breakpoint, at the compaction boundary -------------
+    //
+    // The question this half answers is narrower than the one above, and needs its
+    // own baseline rather than the unmarked control: OpenRouter *always* sends the
+    // system breakpoint now, so "did anything get cached" cannot tell the two
+    // breakpoints apart. The comparison is therefore between two marked arms —
+    // system-only, and system plus the frozen transcript prefix — and what the
+    // second breakpoint is worth is the difference between them.
+    let frozen = frozen_transcript();
+    let user = format!("{frozen}\n[read src/parse.rs] the volatile tail, different each turn.\n");
+    println!(
+        "\nfrozen transcript prefix: {} chars, ~{} estimated tokens",
+        frozen.len(),
+        frozen.len() / 4,
+    );
+
+    println!("\nsystem breakpoint only (0.43.0's request, no cache_boundary):");
+    // One call, not two: the system prefix is already in the vendor's cache from the
+    // arms above, so this reads it and the number is the baseline the second
+    // breakpoint has to beat.
+    let sys_only = marked
+        .complete(request_marked_at(&system, &user, None))
+        .await?;
+    let c1 = report("call 1", &sys_only.model, sys_only.usage);
+
+    println!("\nboth breakpoints (cache_boundary at the end of the frozen prefix):");
+    let at = Some(frozen.len());
+    let m1 = marked
+        .complete(request_marked_at(&system, &user, at))
+        .await?;
+    let d1 = report("call 1 (writes)", &m1.model, m1.usage);
+    let m2 = marked
+        .complete(request_marked_at(&system, &user, at))
+        .await?;
+    let d2 = report("call 2 (should read)", &m2.model, m2.usage);
+
+    println!("\n--- verdict: two breakpoints (0.44.0) ---");
+    println!("system only:      cache_read={c1}");
+    println!("both breakpoints: call 1 cache_read={d1}, call 2 cache_read={d2}");
+    if d2 > c1 {
+        println!(
+            "PASS — the transcript breakpoint reads {} tokens beyond what the system block \
+             alone accounts for.",
+            d2 - c1
+        );
+    } else {
+        println!(
+            "FAIL — marking the transcript prefix bought nothing over the system breakpoint. \
+             Check that the frozen prefix clears the vendor's minimum cacheable length."
+        );
+    }
+    println!(
+        "\nNote: OpenRouter reports no cache-write counter, so every `cache_write` above is \
+         zero by construction on this wire and the writing call's cost is unreported rather \
+         than measured. Do not infer it from the prompt length."
+    );
     Ok(())
 }

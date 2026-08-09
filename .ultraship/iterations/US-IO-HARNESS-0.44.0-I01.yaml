@@ -1,0 +1,121 @@
+id: US-IO-HARNESS-0.44.0-I01
+timestamp: 2026-08-09T06:06:29Z
+category:
+- implementation-level
+- release-level
+trigger: >
+  The contract specifies that `CompletionRequest` gains `cache_boundary` **and** `#[non_exhaustive]`
+  in the same release — "one break, paid once, the move five previous releases made on five other
+  types" — and states the migration as "a consumer constructing it with an exhaustive struct literal
+  adds `..Default::default()`; a consumer already doing so changes nothing". Applying the attribute
+  showed the second sentence is false and the first is therefore the wrong trade: `#[non_exhaustive]`
+  forbids the functional-update form too, so `..Default::default()` is exactly what stops compiling.
+
+  A second, smaller claim in the same task was also disproved: the contract justifies the field's
+  `skip_serializing_if` by saying a naked field would "silently stop every recorded cassette in the
+  repository from matching". Neither half of that is true.
+evidence:
+- >
+  Adding `#[non_exhaustive]` to `CompletionRequest` and building failed `E0639` — "cannot create
+  non-exhaustive struct using struct expression" — at three sites in one test file alone:
+  `tests/replay.rs:136`, `:392` and `:428`. The first of those is
+  `CompletionRequest { system, user, tools, ..Default::default() }`, which is the exact construction
+  the type's own worked example has prescribed since 0.15.0. The attribute refuses every struct
+  expression outside the defining crate, functional update included; it is not limited to exhaustive
+  literals, which is what the contract assumed.
+- >
+  The construction sites the attribute would break are `tests/skills.rs:40`, `tests/plugin.rs:39`,
+  `tests/deadline.rs:66`, `tests/template.rs:44`, `tests/replay.rs:136`/`:392`,
+  `examples/cache_live.rs:92` and the type's own `///` example at `src/provider/mod.rs:426` — a
+  doctest is compiled as an external crate, so the documentation would stop compiling with the code.
+  Every one of them uses `..Default::default()` or the `..base` form. None uses an exhaustive
+  literal, so the break the contract described has no instances and the break it would actually have
+  caused has eight.
+- >
+  The four preceding fields on this type — `media` (0.15.0), `model` (0.21.0), `web` (0.22.0) and
+  `effort` (0.31.0) — were each added as a minor without the attribute, so "the type has escaped it
+  for forty-three releases" describes a deliberate and repeated decision rather than an oversight
+  waiting to be corrected.
+- >
+  The five types the contract cited as precedent are not this shape. `Verification` and
+  `ProviderErrorKind` are enums, matched rather than constructed; `TaskContract`, `AgentDef` and
+  `TurnResult` are built through `new`/`with_*` builders or returned by the crate. `CompletionRequest`
+  has no builder and its documented ergonomic is the struct expression the attribute forbids.
+- >
+  On the serde claim - `Replay::load` already refuses a recording whose `harness` version is from
+  another `major.minor` series (`src/provider/record.rs:99`), for the stated reason that "a recording
+  read by a build whose request or response shapes may have changed replays something other than what
+  was recorded". A 0.43.0 recording is therefore refused by a 0.44.0 build before any key is compared.
+  And `tests/fixtures/` holds no recordings at all - every one in the suite is made into a tempdir and
+  replayed in the same process.
+- >
+  Measured directly - with `skip_serializing_if` dropped, the replay suite reports 8 passed / 1
+  failed, and the one failure is the new criterion. Every pre-existing test passes, because one build
+  serialises both sides of a recording the same way. The attribute is a convention worth keeping and
+  the criterion is worth having; the danger the contract described is not the reason for either.
+before:
+  scope:
+  - '`CompletionRequest::cache_boundary: Option<usize>`, and `#[non_exhaustive]` on `CompletionRequest`'
+  - The field's `skip_serializing_if`, justified as protecting every recorded cassette in the repository
+  assumptions:
+  - '`#[non_exhaustive]` breaks only exhaustive struct literals, so `..Default::default()` survives it.'
+  - The five previous `#[non_exhaustive]` adoptions are precedent for this type.
+  - A recording made by an earlier release would otherwise be silently mis-keyed.
+  implementation: Attribute plus field on the struct; the attribute makes the next field free.
+change:
+  summary: >
+    Take the field without `#[non_exhaustive]`. The release's one break stays what a new field on
+    this type has always been — an exhaustive struct literal outside the crate stops compiling, and
+    `..Default::default()` keeps working. Restate the `skip_serializing_if` justification as the
+    convention it is rather than the compatibility guarantee it is not.
+
+    The rule this release re-learned was already in the project's own record, twice, and was applied
+    by reflex anyway. 0.42.0 recorded that `#[non_exhaustive]` breaks a type's own doc examples
+    because a doctest is an external crate; 0.43.0 recorded, at `Compaction`, that the right answer
+    is sometimes to leave the attribute off and say so at the type — "decide by call shape, not by
+    reflex". `CompletionRequest`'s call shape is `Foo { a, b, ..Default::default() }`, which is the
+    exact shape that note describes. The check is cheap and belongs at plan time: before writing
+    `#[non_exhaustive]` into a contract, grep for how the type is constructed outside `src/`.
+  added: []
+  removed:
+  - '`#[non_exhaustive]` on `CompletionRequest`'
+  - The claim that a naked field breaks the repository's recorded cassettes
+  deferred: []
+  replaced:
+  - >
+    F9 restated. It was "an unmarked request keys exactly as it did on 0.43.0, and every recorded
+    cassette still replays"; it is now "an unmarked request keys as it always has, and a marked one
+    is a different question", with the load-bearing arm being that a marked request must not be
+    answered by an unmarked one's recording, and with the sabotage's observed result — every other
+    test in the suite still passing — recorded as the reason the criterion exists.
+  - >
+    N3 restated. "`CompletionRequest` gains `cache_boundary` **and** `#[non_exhaustive]` together"
+    becomes "gains `cache_boundary` and **no** `#[non_exhaustive]`", with `..Default::default()`
+    still compiling asserted by every out-of-crate construction site building unchanged.
+impact:
+  products:
+  - io-harness
+  versions:
+  - 0.44.0
+  tasks:
+  - US-IO-HARNESS-0.44.0-T01
+  - US-IO-HARNESS-0.44.0-T07
+  dependencies: []
+  resource_effect: >
+    Removes work rather than adding it. The rejected alternative — keeping the attribute and adding
+    the `new` plus six `with_*` methods that would make the type constructible again — is seven new
+    public items, a rewrite of eight construction sites, and a migration note telling every downstream
+    caller to stop using the form the documentation has recommended for twenty-nine releases. That is
+    its own release and was declined.
+versioning:
+  previous_target: 0.44.0
+  new_target: 0.44.0
+  consequence: no-version-change
+approval:
+  source: user
+  reference: >
+    Asked in session 2026-08-09 with both options and their downstream compile consequences shown
+    side by side; the owner chose "field only, no attribute".
+canonical_updates:
+- products/io-harness/releases/0.44.0.yaml
+- products/io-harness/execution/tasks.yaml

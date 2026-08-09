@@ -400,6 +400,66 @@ async fn a_request_with_no_recording_is_a_typed_error_not_an_empty_response() {
     assert!(replay.complete(with_tools).await.is_err());
 }
 
+// ------------------------------------------------------- the cache boundary key
+
+/// 0.44.0's `cache_boundary` must not enter the key of a request that does not use
+/// one, and must enter the key of one that does.
+///
+/// `Replay` keys on `serde_json::to_string(request)` — the whole request as JSON,
+/// deliberately not a hash so a mismatch can be read. `cache_boundary` is therefore
+/// skipped when `None`, like `model`, `web` and `effort` before it, so an unmarked
+/// request's key is the string it has always been. This is **not** what protects a
+/// recording made by an earlier release: `Replay::load` already refuses anything from
+/// another `major.minor` series (`src/provider/record.rs:99`), and it refuses it for
+/// this exact reason — a request shape a minor release may change.
+///
+/// What the first half does protect is the convention, and the fact that nothing else
+/// in the suite would notice it breaking: a recording made and replayed by one build
+/// serialises both sides the same way, so a `"cache_boundary":null` in every key is
+/// self-consistent and every other test here still passes.
+///
+/// The second half is the load-bearing arm: a marked request genuinely is a different
+/// question from the unmarked one, so it must *not* be answered by the unmarked one's
+/// recording.
+#[tokio::test]
+async fn a_boundary_is_absent_from_an_unmarked_key_and_present_in_a_marked_one() {
+    let unmarked = req("recorded");
+    let json = serde_json::to_string(&unmarked).expect("a request is always serialisable");
+    assert!(
+        !json.contains("cache_boundary"),
+        "an unmarked request must serialise exactly as it did before the field existed, \
+         or every recording in this repository stops matching: {json}"
+    );
+
+    let marked = CompletionRequest {
+        cache_boundary: Some(8),
+        ..req("recorded")
+    };
+    let marked_json = serde_json::to_string(&marked).expect("a request is always serialisable");
+    assert!(
+        marked_json.contains("cache_boundary"),
+        "a marked request must carry the offset in its key: {marked_json}"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = recording_path(&dir);
+    let recorder = Record::new(Canned::new(vec![text("only answer")]));
+    recorder.complete(unmarked.clone()).await.unwrap();
+    recorder.save(&path).unwrap();
+    let replay = Replay::load(&path).unwrap();
+
+    assert_eq!(
+        replay.complete(unmarked).await.unwrap(),
+        text("only answer"),
+        "the recording was made by this same unmarked request"
+    );
+    assert!(
+        replay.complete(marked).await.is_err(),
+        "a marked request is not the request that was recorded, and must not be \
+         silently answered by it"
+    );
+}
+
 // ------------------------------------------------------------- version refusal
 
 /// A recording made by another release series is refused, not misread: the request

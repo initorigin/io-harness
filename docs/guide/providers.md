@@ -451,12 +451,18 @@ Which vendors are asked, and why the other two are not:
 
 | provider | marker sent | note |
 | --- | --- | --- |
-| `Anthropic` | yes, on the one `system` block | that wire orders tools before system, so one marker covers both |
-| `OpenRouter` | yes, on the system message part | it translates the marker for the vendors that take one |
+| `Anthropic` | yes, on the one `system` block, and on the frozen half of the user turn | that wire orders tools before system, so one marker covers both |
+| `OpenRouter` | yes, on both, in the parts shape that wire spells them in | it translates the markers for the vendors that take them |
 | `OpenAi` | no | it caches a repeated prefix by itself; there is no request-side control |
 | `Compatible` | no | 21 endpoints this crate does not control, where an unknown key is a 400 |
 
-Three things worth knowing before you read an invoice.
+One difference between the two wires is worth stating because it looks like a bug:
+a request carrying an **image** is marked on OpenRouter and not on Anthropic.
+Anthropic puts image blocks before the text, so a marked text block would write a
+one-turn attachment into the cache entry that the next turn could never hit; the
+OpenAI-shaped wire puts text first, so the marked span is still a real prefix.
+
+Four things worth knowing before you read an invoice.
 
 **It pays from the second call, not the first.** A cache write is billed above a
 fresh read and a cache read far below one, so a block used exactly once costs more
@@ -467,15 +473,30 @@ which is why this is unconditional rather than a setting.
 length and declines below it without saying so. If `cache_read_tokens` stays zero,
 the prefix being too short is the first thing to check.
 
-**Only the instructions are marked, never the transcript.** The observation ledger
-is re-derived on every turn — superseded, invalidated, re-read, re-fitted — so it
-is not the byte-identical prefix a cache needs, and marking it would be billed as
-a write on nearly every turn. See
-[the contract](../CONTRACT.md#what-prompt-caching-asks-for-and-what-it-cannot-promise-0380)
+**Since 0.44.0 the transcript is marked too, but only from a compaction boundary.**
+The observation ledger is re-derived on every turn — superseded, invalidated,
+re-read, re-fitted — so it is not the byte-identical prefix a cache needs. What
+0.43.0's fold changed is that everything from the top of the prompt through the
+written summary stops changing, and that part gets the request's second breakpoint.
+Everything *after* the summary is rewritten exactly as before and is still never
+marked, and a run that has not compacted marks nothing in its transcript at all.
+
+**The marker is withheld until the prefix has repeated.** Even after a fold the
+prefix is not immutable: the memory block renders ahead of the summary and is
+re-read every turn, so a note the run writes moves it. The loop holds the previous
+step's candidate and marks only on a byte-identical repeat — which costs one
+unmarked step after every fold and after every note, and buys the guarantee that a
+marker can never be billed as a write on a prefix that then changes. Watch
+`EventKind::CacheMarked` to see when it starts; no event means nothing was marked.
+See
+[the contract](../CONTRACT.md#what-prompt-caching-asks-for-and-what-it-cannot-promise-0380-0440)
 for the full statement.
 
 `examples/cache_live.rs` measures all of this against a real endpoint, with an
-unmarked control over the same route so the numbers mean something.
+unmarked control over the same route so the numbers mean something. Measured there
+on `anthropic/claude-haiku-4.5`: the system breakpoint alone served 7,408 tokens of
+a 13,113-token prompt from cache, and with the transcript breakpoint the same
+request served 13,093.
 
 ## The limits, stated plainly
 
