@@ -430,14 +430,43 @@ pub(crate) mod job {
             }
         };
         for g in &granted {
-            if let Err(e) = grant_for(&g.path, profile.sid(), g.grant) {
-                tracing::warn!(
-                    "sandbox: could not grant {} to the container ({e}); \
-                     falling back to the job object",
+            let Err(e) = grant_for(&g.path, profile.sid(), g.grant) else {
+                continue;
+            };
+            // **A read-execute grant that fails is not fatal, and this is not a
+            // softening.** Granting means rewriting the path's DACL, which needs
+            // `WRITE_DAC` on it — and a process that is not an administrator does
+            // not have that on `%SystemRoot%` or on a toolchain installed under
+            // `Program Files`. Those locations already carry an ALL APPLICATION
+            // PACKAGES ACE by default, which is exactly the access an
+            // AppContainer needs to load a binary and the system libraries it
+            // links, so the grant is belt-and-braces rather than the mechanism.
+            //
+            // Treating it as fatal is what made `windows-latest` decline the
+            // container on every run: the probe could create a profile, so
+            // `backend()` reported `WindowsAppContainer`, and then the run took
+            // the Job Object. The test that caught it was asserting a network
+            // boundary against a run that had honestly reported it did not get
+            // one.
+            //
+            // A **writable** grant that fails stays fatal. That one is the
+            // mechanism: without it the payload cannot write to the workspace at
+            // all, and a container that silently could not is worse than the Job
+            // Object, which at least says what it is.
+            if g.grant == Grant::ReadExecute {
+                tracing::debug!(
+                    "sandbox: no DACL write on {} ({e}); relying on its ALL APPLICATION \
+                     PACKAGES access",
                     g.path.display()
                 );
-                return None;
+                continue;
             }
+            tracing::warn!(
+                "sandbox: could not grant {} to the container ({e}); \
+                 falling back to the job object",
+                g.path.display()
+            );
+            return None;
         }
 
         let limits = JobLimits::from(spec.limits);

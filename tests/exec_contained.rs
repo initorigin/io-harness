@@ -604,7 +604,7 @@ async fn an_uncontained_shell_line_still_writes_outside_the_workspace() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn linux_confines_a_contained_commands_writes_to_the_workspace() {
-    use io_harness::sandbox::{select, Backend, Sandbox};
+    use io_harness::sandbox::{select, Sandbox};
 
     // 0.47.0: any confining rung of the chain, not the namespace rung alone.
     // Which one a host takes is the chain's business; what this test asserts is

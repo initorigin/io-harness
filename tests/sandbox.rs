@@ -222,7 +222,17 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         .await
         .unwrap();
 
-    if sb.backend().denies_egress() {
+    // **The outcome's backend, not the selection's.** `Sandbox::backend` answers
+    // before the run, from a probe; `SandboxOutcome::backend` is what actually
+    // applied. Those can differ, and on `windows-latest` they do: a profile can
+    // be created — so the probe says `WindowsAppContainer` — while the container
+    // path then declines for this particular run and the Job Object takes it,
+    // which is the designed degradation. Asserting against the probe made this
+    // test demand a network boundary from a run that had honestly reported it
+    // did not get one.
+    //
+    // A run's own report is the only oracle that cannot be wrong about the run.
+    if out.backend.denies_egress() {
         assert!(
             !out.success(),
             "a backend that claims a network boundary must deny network, got {out:?}"
