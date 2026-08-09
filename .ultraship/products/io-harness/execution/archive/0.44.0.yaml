@@ -20,9 +20,10 @@ release_fit:
       cross-version surface is asserted by being unchanged rather than extended — the cheapest
       migration shape this repository has, and the first release since 0.38.0 with no DDL at all.
     - The accounting half of the roadmap outcome is already built. `Usage::cache_read_tokens`
-      (0.18.0), both wires' parsers, the `provider_calls` columns and `spend_by_run`/`spend_by_model`
-      /`spend_by_day` all exist, so that clause is read back as evidence rather than implemented.
-      This was confirmed by reading the code during planning, not assumed.
+      (0.18.0), both wires' parsers, the `provider_calls` columns and
+      `spend_by_run`/`spend_by_model` /`spend_by_day` all exist, so that clause is read back as
+      evidence rather than implemented. This was confirmed by reading the code during planning, not
+      assumed.
     - No constraints have been recorded for this release, so this assessment is grounded in the
       repository's own condition rather than in a stated limit.
   major_cost_drivers:
@@ -39,9 +40,9 @@ release_fit:
       wire after it - so the boundary is honoured on one wire and refused on the other for the same
       request. Both `user_content` functions get read; pattern-matching one produces a marked block
       that is not a prefix, which costs money instead of saving it.
-    - '`Replay` keys on the whole request JSON (`src/provider/replay.rs:68`), so the serde attribute
+    - "`Replay` keys on the whole request JSON (`src/provider/replay.rs:68`), so the serde attribute
       on the new field is load-bearing rather than tidy. Getting it wrong breaks every recorded
-      cassette in the repository, in tests nothing else in this release touches.'
+      cassette in the repository, in tests nothing else in this release touches."
     - The live measurement carries three traps that have each bitten before - pin an Anthropic model
       and read back what actually answered, expect no cache-write counter from OpenRouter, and keep
       the request small enough that a credit-limited account does not answer 402.

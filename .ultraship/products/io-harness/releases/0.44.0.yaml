@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.44.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -622,3 +622,160 @@ open_questions:
   directly. The field is public and takes one today, so the capability exists; whether the crate
   should document that as a supported use or as an implementation detail is a question for a caller
   who asks.
+
+released_at: 2026-08-09T07:06:00Z
+mode: published
+delivered: >
+  A long run stops paying full price for the part of the request that never changes. Once a run has
+  compacted, everything from the top of the prompt through 0.43.0's written summary is marked as a
+  cache breakpoint — the request's second, after 0.38.0's at the end of the system block — and the
+  vendors that sell request-side caching serve it back instead of reading it fresh. Measured live:
+  the system breakpoint alone served 7,408 tokens of a 13,113-token prompt from cache; with the
+  transcript breakpoint the same request served 13,093.
+
+  The half that decides when it is safe is the release's real content. "Everything before a
+  compaction boundary is immutable by construction" is not true of the whole prefix — the memory
+  block renders ahead of the summary and is re-read from the store every turn — so the crate holds
+  the previous step's candidate prefix and marks only on a byte-identical repeat. It therefore never
+  asks a vendor to cache bytes it has not already sent, and the failure mode of the whole feature is
+  lost saving rather than lost money.
+
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — exit 0, 76 binaries, **1,478 passed / 0 failed**.
+  - >
+    `cargo test --all-features` — exit 0, 76 binaries, **1,564 passed / 0 failed**. Separate
+    invocation, as CI runs it.
+  - >
+    F1/F2/F5/F6 (the wire) — `cargo test --lib --features media provider::` 104 passed / 0 failed.
+    A marked request is two text blocks whose concatenation is byte-identical to `request.user`,
+    with `cache_control` on the first and absent from the second, and exactly two `cache_control`
+    in the whole body. `WebFlavor::OpenAi` bodies are byte-identical to 0.43.0's for
+    `Some(len)`, `Some(0)` and `Some(usize::MAX)`.
+  - >
+    F3/F4/F8/N5/N6/O3 — `cargo test --test cache_boundary` 7 passed / 0 failed. The four-step
+    sequence holds: unmarked on the fold's own step, marked on the next, withdrawn for exactly one
+    step when a `remember` call moves the prefix, re-marked afterwards with different bytes that
+    contain the note.
+  - >
+    F9 — `cargo test --test replay` 9 passed / 0 failed.
+  - >
+    O2 — cross-version, both baselines. `tests/cross_version.rs` (0.22.0): 5 passed. **None of its
+    tests is `#[ignore]`**, so `-- --ignored` filters all five out and they run in the ordinary
+    suite, which they did. `tests/cross_version_0_29_0.rs`: 2 in the ordinary run plus the
+    `#[ignore]` one, run with `-- --ignored` against a freshly built `tests/fixtures/gen-0.29.0`
+    and passed.
+  - >
+    ELEVEN SABOTAGES, ten failing a named test. `rest.trim_start()` and `prefix.trim_end()` each
+    fail F1 alone. Honouring the boundary with images present fails two named media tests.
+    Honouring it on the `OpenAi` flavour fails F5 alone. Dropping the images from the marked path
+    fails F6 alone. Dropping the guard fails F3 and F4. Comparing only the summary instead of the
+    whole candidate prefix fails F3 and F4. Removing the tree loop's call site fails the shape
+    test alone. Emitting on every marked step fails F8 alone. Dropping `skip_serializing_if` fails
+    F9 alone. The eleventh is in `known_limitations`.
+  builds:
+  - >
+    `cargo fmt --check` — exit 0.
+  - >
+    `cargo clippy --all-targets --all-features -- -D warnings` — exit 0.
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings -D rustdoc::broken_intra_doc_links
+    -D rustdoc::redundant_explicit_links" cargo +nightly doc --all-features --no-deps` — exit 0,
+    and it caught **nothing**. Recorded because it caught something in five of the last six
+    releases; a gate going quiet is a fact worth stating rather than a non-event.
+  - >
+    `cargo package --locked` — exit 0, packaged crate **1,478,864 bytes** (0.43.0: 1,458,100).
+  - >
+    N1 — `cargo tree` **402** lines, unmoved since 0.23.0.
+  - >
+    N3 — `docs/public-api.txt` **byte-identical**, `git diff` empty. Claimed at plan time rather
+    than discovered at seal, which is what four of the last six releases failed to do.
+  - >
+    N4 — `git diff main -- src/state.rs` **EMPTY**. No table, column, index or reader;
+    `CHECKPOINT_FORMAT` untouched at 7. The first release since 0.38.0 with no DDL at all.
+  - >
+    Exclusions held, asserted rather than assumed: `git diff main -- src/context.rs` is **empty**,
+    so compaction's trigger and all four elision rules are untouched, and no line changing
+    `at_share`, `keep_recent`, `fold_first`, `put_summary` or `threshold_tokens` appears in the
+    `src/run.rs` diff.
+  reviews: []
+  deployments:
+  - >
+    F7, MEASURED LIVE 2026-08-09 against OpenRouter with `anthropic/claude-haiku-4.5` pinned and
+    read back from `CompletionResponse::model` on every call. System breakpoint alone:
+    prompt=13,113, cache_read=**7,408**. Both breakpoints, second call: prompt=13,113,
+    cache_read=**13,093** — 5,685 tokens a step beyond what the system block accounts for, and
+    99.8% of the prompt served from cache. Control: the same endpoint and model through
+    `Compatible`, which sends no marker, read **0** on both its calls.
+  health_checks:
+  - >
+    No secrets in the release diff; `.env` is matched by `.gitignore:10`. Evidence output is stored
+    under `.ultraship/products/io-harness/evidence/0.44.0/` and is gitignored by design.
+known_limitations:
+- >
+  **The record was sealed before the registry upload.** `cargo publish` is done by hand and last,
+  after both merges and the GitHub Release exist. `mode: published` describes the release's target
+  and its completed flow, not a step taken before this line was written.
+- >
+  **The marker is always one turn behind the boundary, and this is deliberate.** The step a fold
+  happens on presents a prefix that has been sent zero times, so it is never marked; the step after
+  it is. A note written mid-run withdraws the marker for exactly one step for the same reason. The
+  alternative — marking whenever a fold exists — buys one turn and pays a cache write every time the
+  prefix moves, which is the one way this feature could cost money instead of saving it.
+- >
+  **A run whose stubs collapse never presents a stable prefix, and this was not measured on a real
+  long run.** When elision's stub ceiling is crossed, `assemble` emits a single line naming how many
+  observations were elided — a count that changes as they accumulate — and it is emitted *ahead* of
+  the carried entries. Such a turn's candidate prefix differs every step and the guard correctly
+  withholds the marker. It should be rare after a fold, because a fold leaves few entries to stub,
+  but "should be rare" is a prediction and not a measurement. Recorded as an open question rather
+  than asserted either way.
+- >
+  **A request carrying an image gets no transcript breakpoint on Anthropic.** That wire orders image
+  blocks before the text, so there is no text prefix to mark. The OpenAI-shaped wire puts text first
+  and does honour it. Both are asserted; the difference is a property of the two vendors' orderings.
+- >
+  **A prefix under the vendor's minimum cacheable length is silently not cached**, the marker inert
+  and `cache_read_tokens` zero with no error to read. 0.38.0's limitation, unchanged and restated
+  because the second breakpoint inherits it.
+- >
+  **A run cached through OpenRouter still under-reports what the write cost.** That wire reports no
+  cache-write counter, so `Usage::cache_write_tokens` was zero on every call of the live run,
+  including the ones that must have written the entries. The crate does not infer the write from the
+  prompt length.
+- >
+  **The live measurement is one vendor, one route, one model, one moment.** It says the marker
+  reaches a vendor that honours it and that the counters come back. It says nothing about any other
+  vendor, and the second call's saving depends on the entry still being alive, which is the vendor's
+  clock.
+- >
+  **A resumed run re-earns the marker.** `PrefixGuard` is run-scoped and not restored, so a resume
+  spends one unmarked step rebuilding the comparison. Correct rather than merely acceptable: from
+  where a resumed run stands it has sent that prefix zero times.
+- >
+  **F8 was met in substance and not in its prose's arithmetic — stated, not glossed.** The criterion
+  named "exactly two `CacheMarked` events for four marked steps". The test asserts exactly two
+  events across two distinct prefixes and that marked steps strictly outnumber events, which is the
+  claim that discriminates; the literal count of four marked steps was a plan-time guess about how
+  many steps the fixture would run after its fold and is not pinned. Every substantive half — fires
+  on change, not per step, `prefix_bytes` equal to an offset actually sent, none at all in a run
+  that cannot fold — is asserted.
+- >
+  **A SABOTAGE FAILED NOTHING, and the finding was about the test rather than the code.** The first
+  `trim_start()` sabotage of F1 passed every assertion, because the fixture's remainder began with a
+  letter and trimming its start was a no-op. The fixture now carries whitespace on **both** sides of
+  the split; both trim arms then fail F1 alone. Reported rather than quietly repaired: the test was
+  only half discriminating until this was run, and F1 is the assertion the whole release rests on.
+- >
+  **`cargo clean` was not run before `cargo package`.** The standing gate list pairs them; the
+  package was taken on a warm tree. `cargo package` unpacks and compiles the packaged sources in
+  `target/package/io-harness-0.44.0`, so the artifact and its verification come from the packaged
+  files either way, and CI's release job runs the gate on a clean checkout of `main`.
+- >
+  **O1's three-platform matrix is CI's, not this machine's.** Every gate above ran on macOS. Nothing
+  in this release spawns a process or shapes a path, so the matrix is the routine bar here; the
+  `media` arm is what covers the two-wire image assertion.
+supersedes: 0.43.0
+next_recommended_version: 0.45.0
+immutable: true

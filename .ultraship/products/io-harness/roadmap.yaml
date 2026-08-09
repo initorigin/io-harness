@@ -1075,7 +1075,7 @@ versions:
       the accounting rows beside every other token, and the operator sees it where they already
       look.
     detail: specified
-    status: planned
+    status: released
   - version: 0.45.0
     outcome: >
       The agent is told its boundary instead of discovering it by being refused. The system block
