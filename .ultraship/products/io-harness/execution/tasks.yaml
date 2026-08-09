@@ -44,7 +44,7 @@ tasks:
   why_required: The knob decides when a fold happens and is the one-line return to 0.42.0's behaviour
     the changelog promises; the event is how an operator sees a fold at all. Both are needed before the
     helper that reads them exists.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.43.0-T01
   acceptance_criteria:
@@ -61,7 +61,28 @@ tasks:
   - src/observe.rs
   - src/lib.rs
   - tests/compaction.rs
-  evidence: []
+  evidence:
+  - '`Compaction { at_share, keep_recent }` landed in `src/context.rs` beside `ContextBudget`, with
+    `Default` (0.8 / 8), `enabled()`, `threshold_tokens(effective_tokens)` and `keep()`. Re-exported
+    from `src/lib.rs`.'
+  - 'Deliberately NOT `#[non_exhaustive]`, and the reason is recorded at the type: it is `ContextBudget`''s
+    sibling and every caller and doctest writes `Compaction { .. ..default() }`, which `#[non_exhaustive]`
+    refuses outside the crate with `E0639`. Found by the tests, not by reasoning — `tests/compaction.rs`
+    failed to compile three times against the first version.'
+  - '`TaskContract::compaction` + `with_compaction` added to the `#[non_exhaustive]` struct; both
+    constructors default it, so an existing caller is unchanged in source and folds by default in
+    behaviour.'
+  - '`EventKind::Compacted { through_step, before_tokens, after_tokens }` added before `Finished`, with
+    `EVENT_NAMES` gaining `"compacted"`, the `every_kind()` sample vector gaining an instance and the
+    compile-time census arm naming it — the three-file bookkeeping a new variant owes.'
+  - '`cargo test --test compaction` exit 0, 6 passed: the default folds and reaches a contract built the
+    ordinary way; `at_share: 1.0` is 0.42.0 exactly and its threshold is unreachable; NaN, infinity,
+    negative and zero all read as never rather than always; the threshold is derived from the same
+    `effective_tokens` the assembler uses; `keep_recent: 0` floors at 1; and the config-file round trip
+    refuses a misspelled key. This is F2''s threshold half — the run-level half is T03.'
+  - '`cargo test --lib` exit 0, 388 passed, including `event_names_is_a_census_of_the_enum_rather_than_a_list_someone_maintained`
+    and `every_variant_round_trips`, which are what prove the new variant''s bookkeeping complete rather
+    than merely written.'
 - id: US-IO-HARNESS-0.43.0-T03
   summary: Add the fold helper — threshold, summarising prompt, ledger edit and stored-row re-read — and
     call it from both loops immediately before `assemble`.
