@@ -77,6 +77,13 @@ pub struct Session {
     id: i64,
     root: PathBuf,
     head: Option<i64>,
+    /// Images staged by [`Session::attach`] for the next turn only (0.43.0).
+    ///
+    /// Not durable, and deliberately: a screenshot is about the thing the operator
+    /// is saying now, and a conversation that silently re-sent it on every later
+    /// turn would be paying for it every turn.
+    #[cfg(feature = "media")]
+    staged: Vec<crate::provider::Media>,
 }
 
 impl Session {
@@ -103,6 +110,8 @@ impl Session {
             id,
             root,
             head: None,
+            #[cfg(feature = "media")]
+            staged: Vec::new(),
         })
     }
 
@@ -138,6 +147,8 @@ impl Session {
             id,
             root: PathBuf::from(root),
             head: store.session_head(id)?,
+            #[cfg(feature = "media")]
+            staged: Vec::new(),
         })
     }
 
@@ -230,6 +241,52 @@ impl Session {
         self.head = Some(turn_id);
         store.set_session_head(self.id, self.head)?;
         Ok(())
+    }
+
+    /// Hand the next turn images to look at, alongside whatever it says (0.43.0).
+    ///
+    /// [`TaskContract::with_images`](crate::TaskContract::with_images) has taken
+    /// images since the `media` feature shipped, and every turn entry point builds
+    /// its contract from a `&str` — so the one path an operator would hand a
+    /// screenshot to was the only path that could not take one. This is that path,
+    /// and it is one method rather than an images-carrying variant of each of the
+    /// six turn shapes: staging is orthogonal to how the turn is driven, and a
+    /// seventh entry point would owe an eighth the next time a turn shape is added.
+    ///
+    /// **The next turn only.** The staging is cleared once the turn has been
+    /// driven, whatever its outcome, because a screenshot is about the thing being
+    /// said now and re-sending it every later turn would bill for it every turn.
+    /// A contract's own [`with_images`](crate::TaskContract::with_images) is the
+    /// other half and still means what it always did — for the whole run — so a
+    /// [`turn_bounded`](Session::turn_bounded) carrying both sends both.
+    ///
+    /// A provider that does not accept images refuses the turn before anything is
+    /// sent; see [`Provider::accepts_images`](crate::Provider::accepts_images).
+    ///
+    /// ```no_run
+    /// use io_harness::provider::Media;
+    /// use io_harness::{ApproveAll, OpenRouter, Policy, Session, Store};
+    ///
+    /// # async fn demo(store: &Store, policy: &Policy) -> io_harness::Result<()> {
+    /// let mut session = Session::open(store, "/repo")?;
+    /// let shot = Media::image("image/png", &std::fs::read("screenshot.png")?)?;
+    ///
+    /// session.attach([shot]);
+    /// session.turn("why is this button misaligned?", &OpenRouter::from_env()?,
+    ///              store, policy, &ApproveAll).await?;
+    ///
+    /// // The next turn carries no image unless another is attached.
+    /// session.turn("and the one below it?", &OpenRouter::from_env()?,
+    ///              store, policy, &ApproveAll).await?;
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "media")]
+    pub fn attach<I>(&mut self, images: I) -> &mut Self
+    where
+        I: IntoIterator<Item = crate::provider::Media>,
+    {
+        self.staged.extend(images);
+        self
     }
 
     /// Take one turn: say `text` and let the agent work until it stops calling
@@ -702,6 +759,16 @@ impl Session {
         containment: Option<&Containment>,
         mut extras: TurnExtras<'_>,
     ) -> Result<TurnResult> {
+        // 0.43.0 — the staged images ride this turn and only this turn. Appended
+        // to whatever the contract carries, so a `turn_bounded` caller's own
+        // `with_images` are kept; taken rather than copied, so the staging is clear
+        // however the turn ends.
+        #[cfg(feature = "media")]
+        let contract = &{
+            let mut owned = contract.clone();
+            owned.images.extend(std::mem::take(&mut self.staged));
+            owned
+        };
         let seed = self.seed(store, contract)?;
         extras.seed = &seed;
 
