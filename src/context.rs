@@ -166,6 +166,43 @@ impl Ledger {
         &self.entries
     }
 
+    /// Replace all but the newest `keep` observations with one summary (0.43.0).
+    ///
+    /// The single exception to "append-only", and it is narrower than it looks:
+    /// what is replaced is the *working* view the assembler reads, not history.
+    /// Every folded observation is still in `ledger_observations`, still returned
+    /// by [`Store::observations`](crate::Store::observations), and still rendered
+    /// by a session transcript — so nothing an operator can audit is lost, and
+    /// what changes is only what the next request carries.
+    ///
+    /// `pub(crate)`: the run loop is the only thing that may fold, because a fold
+    /// is only honest when the durable half was written first, and only the loop
+    /// knows that it was. Returns how many observations the summary stands in for.
+    ///
+    /// `count` is a count from the *front*, not a count to keep, because the run
+    /// loop's durable ledger is tracked by a watermark index into this vector: it
+    /// may only fold observations the store already holds, and it is the loop —
+    /// not this type — that knows how many those are.
+    pub(crate) fn fold_first(&mut self, count: usize, summary: Observation) -> usize {
+        if count == 0 || count > self.entries.len() {
+            return 0;
+        }
+        let recent = self.entries.split_off(count);
+        self.entries.clear();
+        self.entries.push(summary);
+        self.entries.extend(recent);
+        count
+    }
+
+    /// Estimated tokens for everything the assembler would read (0.43.0).
+    ///
+    /// The figure compaction's threshold is compared against, taken through
+    /// [`estimate_tokens`] so the fold and the budget it is a share of are
+    /// measured by one estimator rather than two.
+    pub fn est_tokens(&self) -> u64 {
+        estimate_tokens(&self.full_text())
+    }
+
     /// The whole log, unelided — what an operator reconstructing a run wants, so
     /// bounding what the model sees never bounds what can be audited.
     pub fn full_text(&self) -> String {

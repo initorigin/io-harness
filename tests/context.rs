@@ -17,8 +17,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use io_harness::context::{
-    assemble, entry_cap_chars, estimate_tokens, Assembly, ContextBudget, Ledger, ObsKind,
-    Observation,
+    assemble, entry_cap_chars, estimate_tokens, Assembly, Compaction, ContextBudget, Ledger,
+    ObsKind, Observation,
 };
 use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall};
 use io_harness::tools::{Tool, ToolFuture, Toolbox, Workspace};
@@ -250,7 +250,16 @@ async fn prompt_size_stabilises_across_many_turns_instead_of_tracking_step_count
         )
         .unwrap();
     }
-    let contract = never_passes(dir.path(), 21).with_context_budget(tight(1_000));
+    // Elision, not compaction: this is 0.13.0's claim and the budget is tight
+    // enough that 0.43.0's fold would fire and add a completion of its own, which
+    // a positional script cannot see coming. That the *fold* also stabilises the
+    // prompt is asserted in `tests/compaction.rs`, against its own provider.
+    let contract = never_passes(dir.path(), 21)
+        .with_context_budget(tight(1_000))
+        .with_compaction(Compaction {
+            at_share: 1.0,
+            ..Compaction::default()
+        });
     let provider = MockScript::new(
         (0..20)
             .map(|i| vec![call("read_file", json!({ "path": format!("f{i:02}.txt") }))])

@@ -838,9 +838,10 @@ pub enum EventKind {
     /// assert_eq!(flow, Flow::Continue);
     /// ```
     Compacted {
-        /// The step whose assembly triggered the fold. The key
-        /// [`Store::summary_at`](crate::Store::summary_at) reads by, so a trace and
-        /// the store agree on which boundary this was.
+        /// The step whose assembly triggered the fold, so a trace and the
+        /// `summaries` row agree on when it happened. The row is looked *up* by
+        /// [`Summary::kept_from`](crate::Summary::kept_from), which is stable
+        /// across a resume in a way a step number is not.
         through_step: u32,
         /// Estimated tokens the observation section held before the fold.
         before_tokens: u64,

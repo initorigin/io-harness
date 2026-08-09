@@ -1635,11 +1635,12 @@ pub struct GateAttempt {
 /// let run_id = store.start_run("port the parser", "openrouter")?;
 /// store.put_summary(run_id, 12, 40, "Read the lexer, decided to keep the token enum.", 11)?;
 ///
-/// // Looked up by the boundary it covers, which is what makes a resume free.
-/// let found = store.summary_at(run_id, 12)?.unwrap();
-/// assert_eq!(found.kept_from, 40);
-/// assert!(found.text.contains("token enum"));
-/// assert!(store.summary_at(run_id, 13)?.is_none(), "another step is another boundary");
+/// // Looked up by where in the history it folded, which is what survives a
+/// // resume — the step a run restarts at is one later than the step it died on.
+/// let found = store.summary_for(run_id, 40)?.unwrap();
+/// assert_eq!(found.through_step, 12);
+/// assert_eq!(found.folded, 40, "this paragraph stands in for forty entries");
+/// assert!(store.summary_for(run_id, 41)?.is_none(), "another prefix is another summary");
 /// # Ok(())
 /// # }
 /// ```
@@ -1648,11 +1649,12 @@ pub struct GateAttempt {
 pub struct Summary {
     /// Row id, ascending in the order the folds happened.
     pub id: i64,
-    /// The step whose assembly triggered the fold. The key a resume reads by.
+    /// The step whose assembly triggered the fold. For a trace reader; not the
+    /// key, because it is not stable across a resume.
     pub through_step: u32,
-    /// How many observations the ledger held when the fold happened, so a reader
-    /// can tell what the paragraph stands in for.
-    pub kept_from: u32,
+    /// How many entries from the front of the ledger this paragraph stands in
+    /// for. The lookup key, and what a resume replays the fold by.
+    pub folded: u32,
     /// The summary itself: what was attempted, which files were touched, what was
     /// decided, and what is still open.
     pub text: String,
@@ -1666,7 +1668,7 @@ fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
     Ok(Summary {
         id: r.get(0)?,
         through_step: r.get::<_, i64>(1)? as u32,
-        kept_from: r.get::<_, i64>(2)? as u32,
+        folded: r.get::<_, i64>(2)? as u32,
         text: r.get(3)?,
         est_tokens: r.get::<_, i64>(4)? as u64,
         at: r.get(5)?,
@@ -3465,12 +3467,12 @@ impl Store {
                  id           INTEGER PRIMARY KEY AUTOINCREMENT,
                  run_id       INTEGER NOT NULL,
                  through_step INTEGER NOT NULL,
-                 kept_from    INTEGER NOT NULL,
+                 folded       INTEGER NOT NULL,
                  text         TEXT NOT NULL,
                  est_tokens   INTEGER NOT NULL DEFAULT 0,
                  at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
              );
-             CREATE INDEX IF NOT EXISTS summaries_run ON summaries (run_id, through_step);",
+             CREATE INDEX IF NOT EXISTS summaries_run ON summaries (run_id, folded);",
         )?;
 
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
@@ -4553,22 +4555,23 @@ impl Store {
     ///
     /// Written *before* the ledger is edited, so a process that dies between the
     /// summarising call and the next request has already kept what it paid for.
+    /// `folded` is how many entries from the front the paragraph stands in for.
     /// See [`Summary`].
     pub fn put_summary(
         &self,
         run_id: i64,
         through_step: u32,
-        kept_from: u32,
+        folded: u32,
         text: &str,
         est_tokens: u64,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO summaries (run_id, through_step, kept_from, text, est_tokens)
+            "INSERT INTO summaries (run_id, through_step, folded, text, est_tokens)
              VALUES (?1, ?2, ?3, ?4, ?5)",
             (
                 run_id,
                 through_step as i64,
-                kept_from as i64,
+                folded as i64,
                 text,
                 est_tokens as i64,
             ),
@@ -4581,13 +4584,22 @@ impl Store {
     /// The read that makes a resumed run free: the same boundary reached twice
     /// reads the paragraph rather than asking a model to write it again. The
     /// newest row wins, so a run whose fold was corrected reads the correction.
-    pub fn summary_at(&self, run_id: i64, through_step: u32) -> Result<Option<Summary>> {
+    ///
+    /// Keyed on `kept_from` — how many observations the ledger held when the fold
+    /// happened — and **not** on the step, which is what
+    /// `US-IO-HARNESS-0.43.0-I01` corrected. A resumed run restarts at the step
+    /// after the last committed one, so it reaches the same fold one step later
+    /// than the run that paid for it and a step key would miss by exactly one and
+    /// buy the paragraph again. The ledger position is stable across a resume, a
+    /// branch and a replay, because it is a property of the history rather than of
+    /// when the process died.
+    pub fn summary_for(&self, run_id: i64, folded: u32) -> Result<Option<Summary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, through_step, kept_from, text, est_tokens, at
-             FROM summaries WHERE run_id = ?1 AND through_step = ?2
+            "SELECT id, through_step, folded, text, est_tokens, at
+             FROM summaries WHERE run_id = ?1 AND folded = ?2
              ORDER BY id DESC LIMIT 1",
         )?;
-        let mut rows = stmt.query_map((run_id, through_step as i64), summary_row)?;
+        let mut rows = stmt.query_map((run_id, folded as i64), summary_row)?;
         rows.next().transpose().map_err(Into::into)
     }
 
@@ -4597,7 +4609,7 @@ impl Store {
     /// what an operator reads to see how often a long run folded.
     pub fn summaries(&self, run_id: i64) -> Result<Vec<Summary>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, through_step, kept_from, text, est_tokens, at
+            "SELECT id, through_step, folded, text, est_tokens, at
              FROM summaries WHERE run_id = ?1 ORDER BY id ASC",
         )?;
         let rows = stmt.query_map([run_id], summary_row)?;
