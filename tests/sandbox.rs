@@ -48,11 +48,19 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
     #[cfg(target_os = "macos")]
     assert_eq!(native.backend(), Backend::MacosSandboxExec);
 
-    // Linux: namespaces when the kernel permits unprivileged user namespaces,
-    // the floor when it does not (Ubuntu 24.04 restricts them by default). Pin
-    // it against the same question the backend asks, so a wrong answer in
-    // either direction fails: promising namespaces it cannot create, or falling
-    // back on a host where the wrapper works fine.
+    // Linux: 0.47.0 made this a chain rather than one backend and a fallback,
+    // so the assertion changed with it. Up to 0.46.0 the only two answers were
+    // `LinuxNamespaces` and `PortableFloor`, and pinning against `unshare`'s own
+    // exit status was exact. It is not any more: a host may have Landlock and no
+    // usable user namespace — which is what a stock Ubuntu 24.04 is, and the
+    // whole reason the chain exists — and would now correctly report
+    // `LinuxLandlock` where this test used to demand the floor. The behaviour
+    // changed deliberately, so the test changed with it rather than the chain
+    // being bent to keep an old assertion true.
+    //
+    // What is still exactly assertable, and is the regression that matters: the
+    // floor is reachable *only* when nothing above it can serve. A host whose
+    // `unshare` wrapper works must never report the floor.
     #[cfg(target_os = "linux")]
     {
         let wrapper_works = std::process::Command::new("unshare")
@@ -72,15 +80,25 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert_eq!(
-            native.backend(),
-            if wrapper_works {
-                Backend::LinuxNamespaces
-            } else {
-                Backend::PortableFloor
-            },
-            "must report the strongest backend the kernel actually allows"
+        assert!(
+            matches!(
+                native.backend(),
+                Backend::LinuxLandlock
+                    | Backend::LinuxBubblewrap
+                    | Backend::LinuxNamespaces
+                    | Backend::PortableFloor
+            ),
+            "a Linux host must report a rung of the Linux chain, got {:?}",
+            native.backend()
         );
+        if wrapper_works {
+            assert_ne!(
+                native.backend(),
+                Backend::PortableFloor,
+                "the floor is only for a host where no rung above it can serve, and this one's \
+                 namespace wrapper works"
+            );
+        }
     }
 
     // Windows: since 0.24.0 the Job Object is implemented, so it *is* the
@@ -93,6 +111,32 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
     // selection ladder is observable.
     let floor = select(&SandboxConfig::new().floor_only());
     assert_eq!(floor.backend(), Backend::PortableFloor);
+}
+
+/// F1's selection half, on the one host configuration that is the point of the
+/// release.
+///
+/// A CI leg that deliberately leaves a host in a particular state says which
+/// rung it expects through `IO_HARNESS_EXPECT_BACKEND`, and this fails if the
+/// chain answers differently. It exists because the Linux leg that matters most
+/// is the one running with `kernel.apparmor_restrict_unprivileged_userns` at
+/// Ubuntu's own default, where every release up to 0.46.0 took the portable
+/// floor — and "the rung we expected" is not something a test can work out from
+/// the host alone without re-implementing the chain it is supposed to be
+/// checking.
+///
+/// The variable only ever *asserts*. Nothing in the crate reads it, and no
+/// environment can weaken a boundary through it.
+#[tokio::test]
+async fn the_host_reports_the_backend_its_ci_leg_expects() {
+    let Ok(expected) = std::env::var("IO_HARNESS_EXPECT_BACKEND") else {
+        return; // an ordinary developer machine states no expectation
+    };
+    assert_eq!(
+        select(&SandboxConfig::new()).backend().as_str(),
+        expected,
+        "this leg was configured to exercise a specific rung and got a different one"
+    );
 }
 
 // --- transparent to verification, and reversible ----------------------------

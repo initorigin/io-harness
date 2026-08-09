@@ -121,13 +121,29 @@ tasks:
     arm and F6 all need a Linux host. Nothing on this rung''s enforcement — that a write outside the granted
     roots is actually refused — can be evaluated on the macOS development host, exactly as the contract''s
     `resource_profile` predicted. Marked `in-progress` rather than `done` until the matrix says so.'
+  - 'F1/F4/F5/F6 arms written where they can pin the rung: `sandbox::linux::tests::landlock_rung`, a `cfg(target_os
+    = "linux")` module inside the crate. They live in `src/` rather than `tests/` because a criterion
+    that pins a rung must reach it, and the alternative — an environment variable the production selection
+    path reads — would be an ambient way to downgrade containment. Every arm returns early with a printed
+    reason on a host with no Landlock rather than passing quietly.'
+  - '`tests/sandbox.rs::selection_picks_native_on_this_host_and_floor_when_forced` was changed because
+    the behaviour deliberately changed: up to 0.46.0 a Linux host had exactly two possible answers and
+    pinning against `unshare`''s exit status was exact, and a host with Landlock and no usable user namespace
+    now correctly reports `LinuxLandlock` where the old assertion demanded the floor. What remains exactly
+    assertable is kept — a host whose `unshare` wrapper works must never report the floor.'
+  - '`IO_HARNESS_EXPECT_BACKEND` added as a **test-only assertion** (`the_host_reports_the_backend_its_ci_leg_expects`).
+    Nothing in the crate reads it and no environment can weaken a boundary through it; it exists so a
+    CI leg configured to exercise one rung fails loudly if the chain answers differently.'
+  - The `cfg(target_os = "linux")` test module was type-checked on the macOS host by temporarily widening
+    its cfg to include macOS, running `cargo check --lib --tests` (clean), and reverting. A second local
+    compile round bought for seconds.
 - id: US-IO-HARNESS-0.47.0-T03
   summary: Restrict outbound TCP on the Landlock rung where the kernel has the network rules, and enforce
     the egress honesty rule.
   why_required: A run that denies egress must not be handed a rung that cannot deny egress. Without the
     network access flags and the ABI negotiation that masks them down, the chain would either claim a
     denial it never applied or fail ruleset creation on an older kernel.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.47.0-T02
   acceptance_criteria:
@@ -147,7 +163,23 @@ tasks:
   - src/sandbox.rs
   - tests/net.rs
   - tests/sandbox.rs
-  evidence: []
+  evidence:
+  - The network half is `landlock::net_rights_for(abi, deny_egress)` feeding `RulesetAttr::handled_access_net`,
+    and **no network rule is ever added** — handling `CONNECT_TCP` and `BIND_TCP` while granting no port
+    is how Landlock spells no route out, the same shape as an empty net namespace and the Windows container's
+    empty capability array.
+  - The ABI is negotiated by asking the kernel and every request is masked down to it, so a kernel below
+    the network ABI is never sent a flag it would refuse the whole rule set for. Asserted host-free by
+    `network_rights_are_asked_for_only_when_they_can_be_enforced` and `each_abi_gets_exactly_the_rights_its_kernel_knows`.
+  - 'The egress honesty rule lives in `sandbox::linux::rung` and nowhere else, and is asserted by F3''s
+    table: `((Some(3), true, true, true), LinuxBubblewrap)` and `((Some(3), false, true, true), LinuxNamespaces)`
+    — a kernel that cannot deny egress is not handed a run that denies it.'
+  - 'F2''s rung-level arm written as `egress_is_denied_only_where_the_kernel_can_enforce_it`: a loopback
+    listener the test starts, dialled through bash''s `/dev/tcp` so no network tool need be installed
+    on the runner, asserted refused under an egress-denying run and permitted under an egress-permitting
+    one. On a kernel below ABI 4 it asserts the honesty rule itself rather than skipping the connection.'
+  - '**Not yet proven**: the live connection arms need a Linux host with Landlock ABI 4 or later. Pending
+    the matrix.'
 - id: US-IO-HARNESS-0.47.0-T04
   summary: Install the seccomp deny-list on the Landlock rung, per architecture, returning EPERM.
   why_required: The roadmap entry names a namespace-free filesystem AND syscall restriction. Without it

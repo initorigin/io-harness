@@ -501,6 +501,247 @@ mod tests {
         }
     }
 
+    /// The Landlock rung's enforcement arms.
+    ///
+    /// These live here rather than in `tests/` for one reason and it is a
+    /// deliberate one: a criterion that pins a rung has to be able to *reach*
+    /// that rung, and the alternative — an environment variable the production
+    /// selection path reads — would be an ambient, attacker-reachable way to
+    /// downgrade containment. A crate-internal test needs no such seam.
+    ///
+    /// Every one of them returns early on a host with no usable Landlock, which
+    /// is every developer machine that is not Linux and every kernel before
+    /// 5.13. That is a skip, and a skip states its reason rather than passing
+    /// quietly — 0.40.0's egress tests reported success for three matrix runs
+    /// while stepping over the thing they existed to assert.
+    #[cfg(target_os = "linux")]
+    mod landlock_rung {
+        use super::*;
+        use crate::sandbox::SandboxLimits;
+
+        /// Run `argv` under the Landlock rung specifically, or `None` when this
+        /// host has no Landlock to pin.
+        async fn pinned(
+            argv: &[String],
+            workdir: &Path,
+            mode: ExecMode,
+            allow_network: bool,
+            writable: &[PathBuf],
+        ) -> Option<SandboxOutcome> {
+            if landlock_abi().is_none() {
+                eprintln!("skipped: this host has no usable Landlock");
+                return None;
+            }
+            let limits = SandboxLimits::none();
+            let spec = RunSpec::new(argv, workdir, &limits)
+                .with_network(allow_network)
+                .with_mode(mode)
+                .with_writable_roots(writable);
+            let outcome = landlock_run(&spec).await?.expect("the rung must run");
+            assert_eq!(
+                outcome.backend,
+                Backend::LinuxLandlock,
+                "the rung under test must be the rung that ran"
+            );
+            Some(outcome)
+        }
+
+        fn sh(script: &str) -> Vec<String> {
+            vec!["/bin/sh".into(), "-c".into(), script.into()]
+        }
+
+        /// F4 — a write inside the granted roots lands and a write outside them
+        /// is refused. Both arms, because a rule set that refused everything
+        /// would pass the second alone.
+        #[tokio::test]
+        async fn the_rung_confines_writes_to_what_it_granted() {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let target = outside.path().join("escaped");
+
+            let inside = pinned(
+                &sh("echo in > ./inside"),
+                dir.path(),
+                ExecMode::WorkspaceWrite,
+                true,
+                &[],
+            )
+            .await;
+            let Some(inside) = inside else { return };
+            assert!(inside.success(), "a granted write must land: {inside:?}");
+            assert!(dir.path().join("inside").exists());
+
+            let out = pinned(
+                &sh(&format!("echo out > {}", target.display())),
+                dir.path(),
+                ExecMode::WorkspaceWrite,
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(!out.success(), "a write outside the roots must be refused");
+            assert!(
+                !target.exists(),
+                "and must not have landed: the rung reported success while enforcing nothing"
+            );
+        }
+
+        /// F4's second half — a root the run resolved is writable, which is what
+        /// makes a real toolchain able to run at all under this rung.
+        #[tokio::test]
+        async fn a_resolved_writable_root_is_granted() {
+            let dir = tempfile::tempdir().unwrap();
+            let cache = tempfile::tempdir().unwrap();
+            let target = cache.path().join("artifact");
+
+            let out = pinned(
+                &sh(&format!("echo x > {}", target.display())),
+                dir.path(),
+                ExecMode::WorkspaceWrite,
+                true,
+                &[cache.path().to_path_buf()],
+            )
+            .await;
+            let Some(out) = out else { return };
+            assert!(
+                out.success(),
+                "a granted cache root must be writable: {out:?}"
+            );
+            assert!(target.exists());
+        }
+
+        /// F5 — `ReadOnly` refuses a write into the workspace itself and still
+        /// permits the read. The mode's entire difference is that one directory,
+        /// so both halves are asserted against the same file.
+        #[tokio::test]
+        async fn read_only_refuses_the_workspace_and_still_reads_it() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("seed"), "hello").unwrap();
+
+            let read = pinned(&sh("cat ./seed"), dir.path(), ExecMode::ReadOnly, true, &[]).await;
+            let Some(read) = read else { return };
+            assert!(read.success(), "a read-only run must still read: {read:?}");
+            assert!(read.stdout.contains("hello"));
+
+            let write = pinned(
+                &sh("echo no > ./seed"),
+                dir.path(),
+                ExecMode::ReadOnly,
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(!write.success(), "read-only must refuse the workspace");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("seed")).unwrap(),
+                "hello",
+                "and must not have changed it"
+            );
+
+            // The temporary directory stays writable in every mode: a toolchain
+            // that cannot open a temporary file cannot run at all.
+            let tmp = pinned(
+                &sh("echo t > \"${TMPDIR:-/tmp}/io-harness-ro-probe\""),
+                dir.path(),
+                ExecMode::ReadOnly,
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(
+                tmp.success(),
+                "the temp directory is writable under every mode"
+            );
+        }
+
+        /// F6 — this rung wraps the payload in nothing, so the argv recorded is
+        /// the argv asked for, and `current_dir` means what it says.
+        #[tokio::test]
+        async fn the_rung_spawns_the_callers_own_argv_and_honours_the_workdir() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir(dir.path().join("sub")).unwrap();
+
+            let argv = sh("pwd");
+            let out = pinned(
+                &argv,
+                &dir.path().join("sub"),
+                ExecMode::WorkspaceWrite,
+                true,
+                &[dir.path().to_path_buf()],
+            )
+            .await;
+            let Some(out) = out else { return };
+            assert_eq!(
+                out.argv, argv,
+                "no wrapper: the recorded argv is the caller's own"
+            );
+            assert!(
+                !out.argv.iter().any(|a| a == "unshare" || a == "bwrap"),
+                "and names no helper program"
+            );
+            // 0.46.0's defect at its root cause: the wrapper entered the
+            // directory it was handed and beat `Command::current_dir`. There is
+            // no wrapper here, so the working directory is the one named.
+            assert!(
+                out.stdout.trim().ends_with("sub"),
+                "the payload ran in the directory it was given, got {:?}",
+                out.stdout
+            );
+        }
+
+        /// F2's rung-level arm — an egress-denying run cannot dial out, and the
+        /// same run with egress permitted can.
+        ///
+        /// On a kernel below the network ABI the rung is not given an
+        /// egress-denying run at all, so the assertion there is the honesty rule
+        /// itself rather than a skipped connection.
+        #[tokio::test]
+        async fn egress_is_denied_only_where_the_kernel_can_enforce_it() {
+            let Some(abi) = landlock_abi() else {
+                eprintln!("skipped: this host has no usable Landlock");
+                return;
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let dir = tempfile::tempdir().unwrap();
+            // `/dev/tcp` is a bash builtin; the probe uses it because it needs no
+            // network tool to be installed on the runner.
+            let dial = vec![
+                "/bin/bash".into(),
+                "-c".into(),
+                format!("exec 3<>/dev/tcp/127.0.0.1/{port}"),
+            ];
+
+            if abi < LANDLOCK_NET_ABI {
+                assert_ne!(
+                    rung(probes(), true),
+                    Backend::LinuxLandlock,
+                    "a kernel that cannot deny egress must not be handed a run that denies it"
+                );
+                return;
+            }
+
+            let allowed = pinned(&dial, dir.path(), ExecMode::WorkspaceWrite, true, &[])
+                .await
+                .unwrap();
+            assert!(
+                allowed.success(),
+                "a run permitting egress must still connect: {allowed:?}"
+            );
+
+            let denied = pinned(&dial, dir.path(), ExecMode::WorkspaceWrite, false, &[])
+                .await
+                .unwrap();
+            assert!(
+                !denied.success(),
+                "an egress-denying run must be refused the connection"
+            );
+        }
+    }
+
     #[test]
     fn denies_network_with_a_new_net_namespace() {
         let argv = unshare_argv(
