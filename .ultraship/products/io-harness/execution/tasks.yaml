@@ -272,7 +272,7 @@ tasks:
   why_required: A summary that replaces fifty observations is only honest if the fifty stay reachable,
     and today reading a conversation back means writing the SQL yourself. The whole tree rather than the
     head path is the half that cannot be recovered any other way.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.43.0-T01
   acceptance_criteria:
@@ -292,7 +292,23 @@ tasks:
   - src/session.rs
   - src/lib.rs
   - tests/transcript.rs
-  evidence: []
+  evidence:
+  - '`Session::transcript(&Store) -> Result<Transcript>` added, built from `Store::session_turns` —
+    the whole tree — with `on_path` computed from `Session::history`''s ids. `Transcript`,
+    `TranscriptTurn` and `Transcript::to_markdown` are `#[non_exhaustive]` and re-exported; each turn
+    carries its run''s `Summary` rows.'
+  - 'The markdown marks a branched-away turn as such and renders each fold as a line saying what it
+    stands in for — "At step 9, 21 earlier observations were summarised as: …" — which is the half that
+    makes compaction honest rather than lossy. One `String`, one method: a library does not choose the
+    caller''s file.'
+  - '`cargo test --test transcript` exit 0, 4 passed. F7 branches a three-turn session and asserts
+    `history` returns 2 while `transcript` returns 3, with exactly the branched-away turn marked
+    `on_path: false` and both branches present in the markdown — the assertion an export built from
+    `history()` fails and every weaker one passes. F8 exports three times against a counting provider
+    and asserts zero extra completions, zero extra `provider_calls` rows and no summary written.'
+  - '`docs/public-api.txt` gained `Transcript` and `TranscriptTurn` by hand, and both needed a worked
+    doctest before `every_public_item_has_a_worked_example` would pass — the three-file cost of a new
+    public item, paid here as it is every release.'
 - id: US-IO-HARNESS-0.43.0-T07
   summary: 'Add `Session::attach` under the `media` feature: stage images for the next turn, append them
     in `drive`, and clear the staging whatever the outcome.'
