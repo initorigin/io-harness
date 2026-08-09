@@ -1619,6 +1619,60 @@ pub struct GateAttempt {
     pub at: String,
 }
 
+/// One fold of a run's history into a paragraph (0.43.0).
+///
+/// Written when compaction replaces the older half of the observation ledger with
+/// a model-written summary, and read back rather than rewritten when the same run
+/// is resumed, branched or replayed. That is the whole reason it is a row: a
+/// summary is the one thing in the ledger that cost a provider call to produce,
+/// so paying for it twice is paying for the same sentence twice.
+///
+/// ```
+/// use io_harness::Store;
+///
+/// # fn main() -> io_harness::Result<()> {
+/// let store = Store::memory()?;
+/// let run_id = store.start_run("port the parser", "openrouter")?;
+/// store.put_summary(run_id, 12, 40, "Read the lexer, decided to keep the token enum.", 11)?;
+///
+/// // Looked up by the boundary it covers, which is what makes a resume free.
+/// let found = store.summary_at(run_id, 12)?.unwrap();
+/// assert_eq!(found.kept_from, 40);
+/// assert!(found.text.contains("token enum"));
+/// assert!(store.summary_at(run_id, 13)?.is_none(), "another step is another boundary");
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Summary {
+    /// Row id, ascending in the order the folds happened.
+    pub id: i64,
+    /// The step whose assembly triggered the fold. The key a resume reads by.
+    pub through_step: u32,
+    /// How many observations the ledger held when the fold happened, so a reader
+    /// can tell what the paragraph stands in for.
+    pub kept_from: u32,
+    /// The summary itself: what was attempted, which files were touched, what was
+    /// decided, and what is still open.
+    pub text: String,
+    /// The summary's estimated tokens, by the same estimator assembly uses.
+    pub est_tokens: u64,
+    /// When it was written.
+    pub at: String,
+}
+
+fn summary_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Summary> {
+    Ok(Summary {
+        id: r.get(0)?,
+        through_step: r.get::<_, i64>(1)? as u32,
+        kept_from: r.get::<_, i64>(2)? as u32,
+        text: r.get(3)?,
+        est_tokens: r.get::<_, i64>(4)? as u64,
+        at: r.get(5)?,
+    })
+}
+
 fn gate_attempt_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<GateAttempt> {
     let outcome: String = r.get(3)?;
     Ok(GateAttempt {
@@ -3389,6 +3443,36 @@ impl Store {
             "CREATE INDEX IF NOT EXISTS provider_calls_run ON provider_calls (run_id);",
         )?;
 
+        // 0.43.0 — what a fold wrote, so a run pays for its own history once.
+        //
+        // `through_step` is the step whose assembly triggered the fold and is the
+        // key the reader looks a summary up by: a resumed, branched or replayed run
+        // reaching the same boundary reads this row instead of asking a model to
+        // write the same paragraph again. `kept_from` records which observation the
+        // ledger was cut at, so a reader can tell what the paragraph stands in for
+        // rather than inferring it from a step number.
+        //
+        // `text` is deliberately in **no** index: it is the control column the
+        // query-plan test filters on, for the reason `gate_attempts.detail` and
+        // `runs.finish_reason` are — a trailing composite column is skip-scanned and
+        // is not a control.
+        //
+        // Additive, and NOT a `CHECKPOINT_FORMAT` bump: a 0.42.0 binary never names
+        // this table, and bumping the format would make [`Self::check_resumable`]
+        // refuse every 0.42.x store over one table it does not read.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS summaries (
+                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                 run_id       INTEGER NOT NULL,
+                 through_step INTEGER NOT NULL,
+                 kept_from    INTEGER NOT NULL,
+                 text         TEXT NOT NULL,
+                 est_tokens   INTEGER NOT NULL DEFAULT 0,
+                 at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+             );
+             CREATE INDEX IF NOT EXISTS summaries_run ON summaries (run_id, through_step);",
+        )?;
+
         // Stamp the checkpoint-format version. A fresh or pre-0.7.0 database reads
         // back 0; we bump it to the current format. A database written by a NEWER
         // format reads back a higher number and [`Store::check_resumable`] refuses
@@ -4461,6 +4545,65 @@ impl Store {
                 target,
                 text,
             ));
+        }
+        Ok(out)
+    }
+
+    /// Record one fold of a run's history (0.43.0).
+    ///
+    /// Written *before* the ledger is edited, so a process that dies between the
+    /// summarising call and the next request has already kept what it paid for.
+    /// See [`Summary`].
+    pub fn put_summary(
+        &self,
+        run_id: i64,
+        through_step: u32,
+        kept_from: u32,
+        text: &str,
+        est_tokens: u64,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO summaries (run_id, through_step, kept_from, text, est_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                run_id,
+                through_step as i64,
+                kept_from as i64,
+                text,
+                est_tokens as i64,
+            ),
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// The summary written at one boundary, if a fold has happened there.
+    ///
+    /// The read that makes a resumed run free: the same boundary reached twice
+    /// reads the paragraph rather than asking a model to write it again. The
+    /// newest row wins, so a run whose fold was corrected reads the correction.
+    pub fn summary_at(&self, run_id: i64, through_step: u32) -> Result<Option<Summary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, through_step, kept_from, text, est_tokens, at
+             FROM summaries WHERE run_id = ?1 AND through_step = ?2
+             ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map((run_id, through_step as i64), summary_row)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    /// Every fold recorded for a run, oldest first.
+    ///
+    /// What a transcript renders where the steps behind a summary used to be, and
+    /// what an operator reads to see how often a long run folded.
+    pub fn summaries(&self, run_id: i64) -> Result<Vec<Summary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, through_step, kept_from, text, est_tokens, at
+             FROM summaries WHERE run_id = ?1 ORDER BY id ASC",
+        )?;
+        let rows = stmt.query_map([run_id], summary_row)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
         }
         Ok(out)
     }
