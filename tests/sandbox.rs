@@ -212,9 +212,16 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         .await
         .unwrap();
 
+    // Every rung `backend()` can report for an egress-denying run claims a
+    // network boundary — that is the chain's honesty rule — plus the Windows
+    // container, whose empty capability array is the same statement.
     if matches!(
         sb.backend(),
-        Backend::MacosSandboxExec | Backend::LinuxNamespaces
+        Backend::MacosSandboxExec
+            | Backend::LinuxLandlock
+            | Backend::LinuxBubblewrap
+            | Backend::LinuxNamespaces
+            | Backend::WindowsAppContainer
     ) {
         assert!(
             !out.success(),
