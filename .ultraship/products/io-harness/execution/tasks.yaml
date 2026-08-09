@@ -50,7 +50,7 @@ tasks:
   why_required: This is the rung that turns a stock Ubuntu host from enforcing nothing into confining
     writes. Without it the chain has nothing above the existing namespace backend and the release delivers
     nothing on the hosts it exists for.
-  status: todo
+  status: in-progress
   depends_on:
   - US-IO-HARNESS-0.47.0-T01
   acceptance_criteria:
@@ -96,7 +96,31 @@ tasks:
   - src/sandbox.rs
   - tests/sandbox.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`src/sandbox/landlock.rs` added. The rule *plan* is portable data with no descriptor in it — `fs_rights_for`,
+    `net_rights_for`, `plan` — and the syscalls that create and apply a rule set are `cfg(target_os =
+    "linux")`, following the same split `linux.rs` and `windows.rs` already use.'
+  - 'The rung installs its restriction in the child through the shared runner''s existing `configure`
+    hook (`tokio::process::Command::pre_exec`), so it spawns **no wrapper**: `Ruleset::build` does every
+    allocating step in the parent and what runs between fork and exec is `prctl(PR_SET_NO_NEW_PRIVS)`
+    plus one `landlock_restrict_self`.'
+  - 'F4/F5 host-free half proven on the macOS development host: `the_plan_grants_the_same_list_the_mount_setup_binds`,
+    `read_only_withholds_the_workdir_and_keeps_the_temp_directory`, `each_abi_gets_exactly_the_rights_its_kernel_knows`,
+    `no_rule_asks_for_a_right_the_ruleset_does_not_handle`. 34 of 34 `sandbox::` unit tests pass; `cargo
+    clippy --lib --all-targets -- -D warnings` reports nothing; `cargo fmt --check` clean.'
+  - '**The Linux-only half was type-checked against `x86_64-unknown-linux-gnu` without a matrix round.**
+    `cargo check --target` is blocked by rusqlite''s bundled C needing a cross `gcc` — the environment
+    limit already recorded in `src/sandbox.rs` — so the module was compiled standalone with `rustc --target
+    x86_64-unknown-linux-gnu --emit=metadata --test` against the target''s own `liblibc` rmeta, with a
+    shim supplying `ExecMode` and `LANDLOCK_NET_ABI`. Exit 0, tests included. This is a technique worth
+    reusing: it costs seconds and it is the only local evidence available for a `cfg(linux)` body.'
+  - '`landlock_path_beneath_attr` is `#[repr(C, packed)]` and asserted to be 12 bytes with alignment 1.
+    A `#[repr(C)]` version is 16 bytes with `parent_fd` after four bytes of padding, so the kernel would
+    read the descriptor out of padding and fail `EINVAL` on a call whose every line reads correctly.'
+  - '**Not yet proven, and this is the honest state of the task**: F1, F4''s Landlock arm, F5''s Landlock
+    arm and F6 all need a Linux host. Nothing on this rung''s enforcement — that a write outside the granted
+    roots is actually refused — can be evaluated on the macOS development host, exactly as the contract''s
+    `resource_profile` predicted. Marked `in-progress` rather than `done` until the matrix says so.'
 - id: US-IO-HARNESS-0.47.0-T03
   summary: Restrict outbound TCP on the Landlock rung where the kernel has the network rules, and enforce
     the egress honesty rule.

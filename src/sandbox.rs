@@ -1545,6 +1545,13 @@ pub mod linux;
 pub mod macos;
 pub mod windows;
 
+// The Landlock rung follows the same split: its rule *plan* — which paths, which
+// rights, masked to which ABI — is portable data with no descriptor in it and is
+// unit-tested on the build host, while the syscalls that create and apply a rule
+// set are `cfg(target_os = "linux")`. Most of what can go wrong in this rung is
+// in the plan, and the plan is the half that does not need a matrix round.
+pub(crate) mod landlock;
+
 // The AppContainer half is the exception to the paragraph above: it has no
 // portable logic to unit-test on the build host, because unlike a Job Object's
 // limit mapping there is no pure-data layer between the configuration and the

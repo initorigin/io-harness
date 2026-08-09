@@ -92,6 +92,16 @@ pub struct LinuxSandbox;
 
 impl Sandbox for LinuxSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
+        // The chain, in strength order. `rung` decides; this matches on what it
+        // decided. A rung that cannot build its own apparatus for *this* run —
+        // a rule set the kernel refuses, a helper that is not there — falls to
+        // the next one rather than failing the run, and every one of them
+        // reports the backend that was actually applied.
+        if rung(probes(), !spec.allow_network) == Backend::LinuxLandlock {
+            if let Some(outcome) = landlock_run(&spec).await {
+                return outcome;
+            }
+        }
         if !unshare_works() {
             // No usable namespaces on this host: take the floor rather than
             // failing every run, and report the floor rather than naming an
@@ -118,13 +128,109 @@ impl Sandbox for LinuxSandbox {
         }
     }
 
+    /// The rung this host takes, reported **conservatively**.
+    ///
+    /// The trait method has no run to read, and the chain's one run-dependent
+    /// input is the egress requirement — so this answers for the stricter of the
+    /// two: what a run that *denies* egress would get. A host whose Landlock
+    /// predates the network rules therefore reports the namespace rung here
+    /// while a run permitting egress would really take Landlock.
+    ///
+    /// Under-reporting rather than over-reporting, on purpose. The rule this
+    /// crate keeps is that a backend never names an isolation it did not apply;
+    /// naming a weaker one than was applied costs a reader precision, naming a
+    /// stronger one costs them the boundary. The exact per-command answer is in
+    /// [`SandboxOutcome::backend`] and in the `SandboxEvent` rows either way.
     fn backend(&self) -> Backend {
-        if unshare_works() {
-            Backend::LinuxNamespaces
-        } else {
-            Backend::PortableFloor
-        }
+        rung(probes(), true)
     }
+}
+
+/// Ask every rung, once per process.
+///
+/// Cached inside each probe rather than here, because the probes are three
+/// independent questions and a host can gain none of these answers while a
+/// process is running.
+fn probes() -> Rungs {
+    Rungs {
+        landlock_abi: landlock_abi(),
+        // The bubblewrap rung is not built yet, so the chain must not be able to
+        // select it: a rung `rung` names and `run` cannot deliver would report
+        // an isolation that was never applied, which is the one thing no part of
+        // this module may do.
+        bubblewrap: false,
+        unshare: unshare_works(),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_abi() -> Option<u32> {
+    super::landlock::abi()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn landlock_abi() -> Option<u32> {
+    None
+}
+
+/// Run `spec` under a Landlock rule set, or return `None` to fall to the next
+/// rung.
+///
+/// `None` is not a failure of the run — it is this rung declining. A kernel that
+/// answers the version query and then refuses a rule set, or a granted path that
+/// cannot be opened, means the confinement this rung would report was not
+/// installed; the honest response is the next rung down, not a run that reports
+/// Landlock and enforces nothing.
+#[cfg(target_os = "linux")]
+async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
+    use std::os::fd::RawFd;
+
+    let abi = super::landlock::abi()?;
+    let tmp = std::env::temp_dir();
+    let plan = super::landlock::plan(
+        abi,
+        spec.mode,
+        !spec.allow_network,
+        spec.workdir,
+        spec.writable_roots,
+        &tmp,
+    );
+    let ruleset = match super::landlock::Ruleset::build(&plan) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "sandbox: the Landlock rule set could not be built ({e}); taking the next rung"
+            );
+            return None;
+        }
+    };
+    let fd: RawFd = ruleset.raw();
+
+    let wspec = RunSpec::new(spec.argv, spec.workdir, spec.limits)
+        .with_network(spec.allow_network)
+        .with_mode(spec.mode)
+        .with_writable_roots(spec.writable_roots);
+
+    // The argv is the caller's own, untouched: this rung wraps the payload in
+    // nothing. What runs between fork and exec is two syscalls with no
+    // allocation, which is why the rule set was built above rather than here.
+    let outcome = run_capped(Backend::LinuxLandlock, wspec, move |cmd| {
+        // SAFETY: the closure runs in the forked child before `exec`. It
+        // allocates nothing, takes no lock and calls only `prctl` and one
+        // `landlock_restrict_self`, both async-signal-safe. `fd` is owned by
+        // `ruleset`, which outlives the spawn below.
+        unsafe {
+            cmd.pre_exec(move || unsafe { super::landlock::restrict_self(fd) });
+        }
+    })
+    .await;
+    drop(ruleset);
+    Some(outcome)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn landlock_run(_spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
+    None
 }
 
 /// Does the exact wrapper this backend builds actually work on this host?
