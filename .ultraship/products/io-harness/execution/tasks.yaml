@@ -6,7 +6,7 @@ tasks:
   why_required: Every other task routes a mode somewhere. Until `ExecMode` exists and `TaskContract::exec_sandbox`
     is a `SandboxConfig` whose default is `WorkspaceWrite`, there is no default to flip and no escape
     hatch to spell.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F2 — `with_full_access()` is the only way back, and it is complete.** The same tree, the same command,
@@ -33,13 +33,30 @@ tasks:
   - src/lib.rs
   - docs/public-api.txt
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`ExecMode` (`ReadOnly` / `WorkspaceWrite` / `FullAccess`, `#[non_exhaustive]`, serde kebab-case,
+    `Default` = `WorkspaceWrite`, `as_str`, `is_contained`) added at `src/sandbox.rs` and re-exported
+    from `src/lib.rs`. `docs/public-api.txt` gains exactly one line, `enum ExecMode src/sandbox.rs` —
+    the number stated at plan time (N3), and `git diff main -- docs/public-api.txt` shows one addition
+    and no removal.'
+  - '`SandboxConfig::mode` + `with_mode`, and `SandboxLimits::none()`. The attribute was deliberately
+    NOT put on `SandboxConfig`: it is built by literal with `..SandboxConfig::new()` at six sites under
+    `tests/` and `examples/` and in the crate''s own doc examples, and `#[non_exhaustive]` forbids functional-update
+    syntax too (`US-IO-HARNESS-0.44.0-I01`).'
+  - '`TaskContract::exec_sandbox` is a `SandboxConfig`, defaulting to `WorkspaceWrite` with `SandboxLimits::none()`
+    at both construction sites — the owner''s specification-time decision that the default flip is a boundary
+    and not a ceiling. `with_full_access()` and `with_exec_mode()` added beside the unchanged `with_contained_exec`.'
+  - 'F2 — `the_escape_hatch_is_one_call_and_it_is_complete` (`tests/exec_contained.rs`) passes: the same
+    tree and the same command, one method call apart, and the write lands again; no `sandbox_events` row
+    claims containment; and the run still reports `mode: full-access`, `backend: none`. Sabotage S2 —
+    return a containment for every mode, so `with_full_access` sets the mode but the command is still
+    wrapped — fails that test and only it.'
 - id: US-IO-HARNESS-0.46.0-T02
   summary: Carry the mode and its writable roots to the backends through RunSpec.
   why_required: The backends are where a mode becomes an enforcement, and `RunSpec` is the only OS-neutral
     thing that reaches them. The `#[non_exhaustive]` + constructor break is paid here once so 0.47.0 and
     0.48.0 add fields to this type for free.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T01
   acceptance_criteria:
@@ -63,13 +80,23 @@ tasks:
   - tests/sandbox.rs
   - tests/sandbox_job_object.rs
   - examples/sandbox_run.rs
-  evidence: []
+  evidence:
+  - '`RunSpec` gains `mode` and `writable_roots`, plus `#[non_exhaustive]` and `RunSpec::new(argv, workdir,
+    limits)` with `with_network` / `with_mode` / `with_writable_roots`. Every construction site moved
+    in the same commit: `src/verify.rs`, `src/tools/exec.rs`, `src/sandbox/{linux,macos}.rs`, the crate''s
+    own `Sandbox` doc example, `tests/sandbox.rs` (2), `tests/sandbox_job_object.rs` and `examples/sandbox_run.rs`
+    (2).'
+  - The doc example on `Sandbox` failed `cargo test --doc` with `E0639` until it moved to the builder
+    — the standing rule that `#[non_exhaustive]` breaks your own doctests, met again and fixed rather
+    than worked around.
+  - 'N3 — the two fields are one break, not two, because the attribute is what makes 0.47.0''s and 0.48.0''s
+    additions to this type free. `docs/public-api.txt` is unaffected: `RunSpec` is not a crate-root re-export.'
 - id: US-IO-HARNESS-0.46.0-T03
   summary: Derive the detected toolchain's own cache directories.
   why_required: A default-contained run that cannot populate a registry cache teaches every embedder to
     reach for `with_full_access()` on its first failure, which would make the default flip worse than
     no flip.
-  status: todo
+  status: done
   depends_on: []
   acceptance_criteria:
   - '**F5 — `cache_dirs` reads the ecosystem''s own environment, and reads it per ecosystem.** A pure
@@ -89,12 +116,25 @@ tasks:
     '
   files:
   - src/toolchain.rs
-  evidence: []
+  evidence:
+  - '`Toolchain::cache_dirs()` added at `src/toolchain.rs`, keyed on `ecosystem` and `manager` over the
+    strings `toolchain::detect` actually emits — verified against the table rather than assumed: the ecosystems
+    are `cargo`, `deno`, `node`, `python`, `go`, `maven`, `gradle`, `elixir`, `ruby`, `php`, `swift`,
+    `dotnet`, `cmake`, `make` (an earlier draft keyed on a `java` ecosystem that does not exist).'
+  - 'Each ecosystem''s own environment variable wins over the conventional path: `CARGO_HOME`, `npm_config_cache`,
+    `PNPM_HOME`, `PIP_CACHE_DIR`, `POETRY_CACHE_DIR`, `UV_CACHE_DIR`, `DENO_DIR`, `GOMODCACHE`/`GOPATH`/`GOCACHE`,
+    `GRADLE_USER_HOME`, `NUGET_PACKAGES`, `GEM_HOME`/`BUNDLE_PATH`, `COMPOSER_HOME`, `MIX_HOME`/`HEX_HOME`.
+    `XDG_CACHE_HOME` is honoured only where the ecosystem documents it — not for cargo or go, where it
+    would name a path the toolchain never writes to.'
+  - N1 — no new dependency. The home directory is read from `HOME` / `USERPROFILE` through `std::env::var_os`;
+    `cargo tree` is **402** lines, unchanged since 0.34.0.
+  - '`make` and `cmake` return an empty list, stated in a comment as the honest answer rather than left
+    as a gap: those ecosystems drive whatever the project configured.'
 - id: US-IO-HARNESS-0.46.0-T04
   summary: Render one writable-root list as a macOS profile and a Linux bind loop.
   why_required: Two backends express the same grant in two languages. Asserted from the pure builders,
     a root dropped from one rendering is caught without spawning anything.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T02
   acceptance_criteria:
@@ -110,14 +150,27 @@ tasks:
   files:
   - src/sandbox/macos.rs
   - src/sandbox/linux.rs
-  evidence: []
+  evidence:
+  - macOS renders one `(allow file-write* (subpath …))` line per root after the standing `(deny file-write*
+    (subpath "/"))`; Linux renders them as entries in the mount setup's bind loop. The Linux script's
+    calling convention changed from a fixed pair to `sh <workdir> <n> <root>… <argv…>` — a counted list,
+    so the payload is still findable after a variable number of roots.
+  - F7 — `every_writable_root_gets_exactly_one_allow_line` (`src/sandbox/macos.rs`) and `the_writable_roots_are_a_counted_list_before_the_payload`
+    (`src/sandbox/linux.rs`), both asserted from the pure builders without spawning anything, the way
+    `unshare_argv`'s existing tests are. Sabotage S7 — render the roots on macOS and drop them from the
+    Linux loop — fails the Linux half alone, which is why the criterion asserts both renderings rather
+    than 'the roots are plumbed'.
+  - F3's platform halves — `read_only_does_not_grant_the_workdir` (macOS) and `read_only_does_not_put_the_workdir_in_the_writable_list`
+    (Linux). Under `ReadOnly` the process still `cd`s into the workspace and the workspace is not in the
+    writable set, which is what makes the mode a mode rather than a label. Sabotage S3 — grant the workdir
+    under `ReadOnly` — fails both, and F3's end-to-end test with them.
 - id: US-IO-HARNESS-0.46.0-T05
   summary: 'Contain the run by default: compute the roots, filter to what exists, wire exec, shell and
     the gate.'
   why_required: This is the release. Everything before it is surface; this is where a contract built with
     no builder call confines a write, and where the exists-filter stops a granted path from degrading
     the Linux backend to the floor.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T01
   - US-IO-HARNESS-0.46.0-T02
@@ -163,12 +216,38 @@ tasks:
   - src/tools/shell.rs
   - src/verify.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`ExecContainment { config, roots }` resolved once per run by `exec_containment`, called from **both**
+    loops beside their `toolchain::detect` — the standing rule that a rule added to one loop must be a
+    helper both call. `dispatch` takes `Option<&Arc<ExecContainment>>`, where `None` is `FullAccess`.'
+  - Egress stays resolved per call through `ExecContainment::with_egress`, because a plan gate narrows
+    the effective policy mid-run and the run's `Policy` remains the single authority on the network. The
+    mode and the roots do not move, which is why they are resolved once and this is not.
+  - 'F1 — `the_default_contract_confines_a_write_with_no_builder_call`: a contract that is `TaskContract::workspace(goal,
+    root)` and nothing else refuses a write outside the root. Branches on `select().backend()`, so a host
+    that took the floor asserts the floor''s truth rather than skipping — 0.40.0''s lesson. Sabotage S1
+    — default the mode back to `FullAccess` — fails it alone.'
+  - 'F3 — `read_only_refuses_a_write_into_the_workspace_and_permits_the_read`. **The fixture is not a
+    `tempfile::tempdir()`**, and that is the module header''s own trap read a second time: the macOS profile
+    blanket-allows `/private/var/folders`, so a read-only workspace placed there is writable no matter
+    what this release does. The workspace moved under `target/`, where the deny reaches it.'
+  - 'F6 — `a_writable_root_that_does_not_exist_does_not_degrade_the_backend`: a run whose computed cache
+    root is absent still succeeds, still reports this host''s native backend, and grants **0** roots.
+    This is 0.40.0''s defect reproduced on purpose — a wrapper that `fail`s degrades the confinement while
+    the feature appears to work. Sabotage S5 — drop the exists-filter — fails it alone.'
+  - 'F8 — `the_verification_gate_gets_the_same_writable_roots`: a gate command writing into the toolchain''s
+    cache succeeds. Sabotage S8 — leave the gate on an empty root list — fails it alone.'
+  - '**A defect the flip would have shipped, found by an existing test and fixed at the root.** `a_program_this_machine_does_not_have_is_an_observation_not_a_failed_run`
+    (`tests/exec_tool.rs`) failed: a contained spawn is of the *wrapper* (`sandbox-exec`, `unshare`),
+    which exists, so a missing payload came back as the wrapper''s own non-zero exit instead of `[exec
+    unavailable]`. With containment defaulted on, every ''no such program on PATH'' would have become
+    ''your command failed''. Fixed by resolving the program against `PATH` before a contained spawn —
+    one guard, so the answer is the same contained or not.'
 - id: US-IO-HARNESS-0.46.0-T06
   summary: Report the containment that was applied, once per run.
   why_required: An audit has to answer whether a run was contained and by which backend. A `FullAccess`
     run emits the event too, because an absent event is not a statement.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T05
   acceptance_criteria:
@@ -190,13 +269,24 @@ tasks:
   - src/observe.rs
   - src/run.rs
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - '`EventKind::Contained { mode, backend, roots }` added on the enum `#[non_exhaustive]` since 0.24.0,
+    emitted once per run at run start from both workspace loops. `EVENT_NAMES` gained `"contained"` and
+    the round-trip census was updated in the same commit — both of the observe tests failed first and
+    are what caught the omission.'
+  - 'It carries the count of writable roots, not their paths: a path is host-identifying and of unbounded
+    length. A `FullAccess` run emits it with `backend: "none"`, because an absent event is not a statement.'
+  - 'F9 — `the_containment_report_names_what_actually_applied` and the full-access arm of `the_escape_hatch_is_one_call_and_it_is_complete`:
+    exactly one event per run, `backend` equal to `select(&SandboxConfig::new()).backend().as_str()`.
+    Sabotage S6 — report the requested backend rather than the selected one — fails it alone.'
+  - N4 — no DDL. `git diff main -- src/state.rs` is **empty** and `CHECKPOINT_FORMAT` is unmoved at 7;
+    the variant is serialized into the `run_events` row that already exists.
 - id: US-IO-HARNESS-0.46.0-T07
   summary: Tell the agent which mode it is under, without moving the prompt between steps.
   why_required: 0.45.0's boundary section exists so a boundary is known rather than discovered by refusal,
     and this release adds a boundary. The byte-identity half protects 0.38.0's cache breakpoint, which
     sits at the end of the block the line lives in.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T05
   acceptance_criteria:
@@ -212,13 +302,33 @@ tasks:
   files:
   - src/run.rs
   - tests/prompt.rs
-  evidence: []
+  evidence:
+  - '`containment_line` (`src/run.rs`) leads with the mode, and `boundary_section` now renders for any
+    run that is contained rather than only for one that opted in. A `FullAccess` run gets the line too,
+    stating that commands run at this program''s own privileges — since 0.46.0 that is a decision the
+    caller made.'
+  - 'F10 — the byte-identity half is 0.45.0''s own `the_prompt_is_composed_once_and_does_not_move` (`tests/prompt.rs`),
+    unchanged and still passing: `select` is called once per run, so the containment line cannot move
+    between steps and 0.38.0''s cache breakpoint is not converted into a per-step cache write.'
+  - '**Three of 0.45.0''s prompt tests changed, each with the reason in its own comment, and the change
+    is the behaviour deliberately changing rather than a test propped up.** `a_run_with_no_boundary_is_told_about_none`
+    now asks for `with_full_access()` — a contained run *has* a boundary, and what the test asserts is
+    that a run enforcing and confining nothing is still told nothing; `containment_names_the_backend_the_host_actually_gave`
+    asserts the mode beside the backend and that a full-access run is told it is not contained; `prompt_composed_fires_once_and_says_what_was_composed`''s
+    nothing-optional arm likewise, since a contained run reporting `boundary: false` would be the event
+    lying.'
+  - 'One further existing test''s expected event sequence changed, for the second release running and
+    for the same reason: `a_one_shot_run_emits_no_deltas_and_a_session_turn_does` (`tests/session_streaming.rs`)
+    sees `Contained` beside 0.45.0''s `PromptComposed` before the first step. An additive variant on an
+    enum `#[non_exhaustive]` since 0.24.0 is what this crate has told observers to expect; the claim that
+    test is really making — that streaming adds no `Token` events to a one-shot run — is asserted separately
+    and is untouched.'
 - id: US-IO-HARNESS-0.46.0-T08
   summary: Prove a real package manager completes under the default, and fails without the roots.
   why_required: 'The cache-root table is the part most likely to be quietly wrong, because a wrong path
     is invisible: the run works and the toolchain re-downloads forever. Only a real invocation with a
     control arm says so.'
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T05
   acceptance_criteria:
@@ -234,13 +344,25 @@ tasks:
     '
   files:
   - tests/exec_contained.rs
-  evidence: []
+  evidence:
+  - 'F4 — `a_real_package_manager_completes_under_the_default`. `cargo generate-lockfile --offline` is
+    the smallest real invocation that **must** write outside the project it builds: measured on this host
+    it creates `$CARGO_HOME/.package-cache` and `.global-cache` and touches the network for nothing. Under
+    the default it completes and the cache is written.'
+  - '**The control differs in exactly one thing**: whether the workspace root carries the marker `toolchain::detect`
+    reads. The second arm runs the same command against a manifest in a subdirectory, so there is no detection,
+    so there are no cache roots — and the cache is **not** written. Sabotage S4 — return no cache directories
+    for the cargo ecosystem — fails the first arm alone.'
+  - The three tests that redirect `CARGO_HOME` are serialised behind a `tokio::sync::Mutex`, because the
+    environment is process-global and `cargo test` runs a binary's tests in parallel — trap 102's family.
+    A `std` mutex was refused by `clippy::await_holding_lock` and the async one is the guard that may
+    be held across the run's awaits.
 - id: US-IO-HARNESS-0.46.0-T09
   summary: State the default, both breaks and the hosts that cannot enforce it, in the shipped documentation.
   why_required: A behaviour change with no compile error reaches an embedder as a mystery unless the changelog
     names the remedy, and at least three sentences in the crate currently say an uncontained run is the
     default.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T05
   - US-IO-HARNESS-0.46.0-T06
@@ -273,12 +395,31 @@ tasks:
   - src/contract.rs
   - src/tools/exec.rs
   - src/sandbox.rs
-  evidence: []
+  evidence:
+  - '`docs/CONTRACT.md` — the three modes as a table, the boundary-not-a-ceiling reason the default carries
+    no cap, the writable roots and the exists-only rule with the degrade-to-floor consequence spelled
+    out, the gate taking the same roots, `EventKind::Contained`, the `io.toml` key under the trust rule,
+    and the plain statement that on a Windows Job Object and the portable floor the mode is routed, reported
+    and not enforced.'
+  - '`CHANGELOG.md` — the behaviour change as a migration note naming `with_full_access()`, both compile
+    breaks with their exact replacement text, and the no-cap decision stated so nobody looks for a ceiling
+    that is not there.'
+  - 'O3 — the grep the criterion names: **no surviving sentence in `src/` or `docs/` says an uncontained
+    run is the default.** Three said so and were rewritten: `src/tools/exec.rs`''s module doc, `README.md`''s
+    containment paragraph, and `docs/guide/command-execution.md`''s ''The boundary, stated plainly'' section
+    — whose comparison table is now keyed on the default rather than on the opt-in, and whose closing
+    ''Sandboxed execution as an opt-in is later work'' is gone.'
+  - '`io.toml` gains `[sandbox] mode`, added to `PROJECT_WIDENING` so `full-access` is refused at project
+    scope beside `force_floor = false` and `allow_network = true` — the standing trust rule extended rather
+    than weakened. Asserted by a doctest on `Config::from_toml`.'
+  - Every new public item carries a worked doctest; `cargo test --doc` is **410 passed**, up from 0.45.0's
+    401. `Cargo.toml` and the README install snippet bumped to 0.46.0, which `tests/docs_drift.rs`'s fourth
+    checker verifies.
 - id: US-IO-HARNESS-0.46.0-T10
   summary: Run every release gate and record what the default costs in wall time.
   why_required: Flipping a default every run now takes is where a regression to the four preceding releases
     would hide, and wrapping every command is not free.
-  status: todo
+  status: done
   depends_on:
   - US-IO-HARNESS-0.46.0-T08
   - US-IO-HARNESS-0.46.0-T09
@@ -321,4 +462,34 @@ tasks:
   files:
   - Cargo.toml
   - CHANGELOG.md
-  evidence: []
+  evidence:
+  - '`cargo test` (default features) — exit 0, **77 test binaries, 1,517 passed, 0 failed**, with `XDG_CONFIG_HOME`
+    redirected to a scratch directory (this machine''s standing environment fix for `tests/plugin.rs`,
+    unrelated to the release).'
+  - '`cargo test --all-features` — exit 0, **77 binaries, 1,603 passed, 0 failed**, as a separate invocation.
+    `cargo test --doc` — **410 passed, 0 failed**.'
+  - '`cargo fmt --check` exit 0. `cargo clippy --all-targets --all-features -- -D warnings` exit 0, **after
+    it refused a `std::sync::MutexGuard` held across an await** in the new env-serialising tests.'
+  - '`RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0, **after
+    it caught one error stable `cargo doc` did not report**: a redundant explicit link target on `[`select`](crate::sandbox::select)`
+    in a file that has the type in scope. The sixth of the last eight releases this gate has found something.'
+  - N1 — `cargo tree` is **402** lines, unchanged since 0.34.0. N2 — MSRV unmoved at 1.95. N3 — `docs/public-api.txt`
+    gains **exactly one line** (`enum ExecMode`) and loses none, the number stated at plan time. N4 —
+    `git diff main -- src/state.rs` is **empty** and `CHECKPOINT_FORMAT` is unmoved at 7.
+  - 'N5 — **measured, not asserted to be small.** On this macOS host under `macos-sandbox-exec`, 30 iterations
+    of the same trivial command: full-access **5.48 ms** per command, workspace-write **11.73 ms** per
+    command, so wrapping costs **~6.25 ms per command**. Noise against a build that takes seconds; real
+    for a run issuing hundreds of tiny commands, and now a figure rather than a hope.'
+  - 'N6 — the four preceding releases'' own suites pass unchanged in the full run: `cache_boundary`, `compaction`,
+    `parallel_reads`, `tool_hooks`. O2 — cross-version both directions: the forward halves in the ordinary
+    suite, and the backward half run as CI runs it (`cargo build` in `tests/fixtures/gen-0.29.0`, then
+    `cargo test --test cross_version_0_29_0 -- --ignored`) — **1 passed**. `ADDED_SINCE_0_22_0` and `COLUMNS_ADDED_SINCE_0_22_0`
+    unchanged, which is itself the assertion.'
+  - '**Nine sabotages, each failing a NAMED test, none silent.** S1 the default flipped back → F1; S2
+    full-access still wrapped → F2; S3 read-only grants the workdir → F3 plus both platform unit tests;
+    S4 no cargo cache directories → F4; S5 no exists-filter → F6; S6 the requested backend reported →
+    F9; S7 the Linux loop drops the roots → F7''s Linux half; S8 the gate keeps an empty root list → F8.'
+  - '**A process finding worth keeping: a sabotage that appears to survive must first be checked for having
+    applied.** One run reported S2 as surviving; the patch had been written against pre-`cargo fmt` source
+    and matched nothing, so nothing was sabotaged. Re-applied against the formatted text it fails F2 immediately.
+    A sabotage harness must assert its own patch landed, or it manufactures findings.'
