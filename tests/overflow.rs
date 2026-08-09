@@ -133,3 +133,303 @@ fn the_classification_reaches_the_error_every_provider_builds() {
         other => panic!("expected a provider error, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------- the recovery
+
+mod the_recovery {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use io_harness::provider::{CompletionRequest, CompletionResponse, ToolCall, Usage};
+    use io_harness::{
+        run_with, ApproveAll, Compaction, ContextBudget, EventKind, Flow, Observer, Policy,
+        Provider, RunEvent, RunOutcome, Store, TaskContract, Verification,
+    };
+    use serde_json::json;
+
+    const SUMMARISER: &str = "compacting an agent's own working notes";
+
+    /// Refuses any request whose user block is over `ceiling` chars, with the
+    /// wording a vendor sends, and serves anything under it. So a recovery is a
+    /// real change in what was sent rather than a re-send that happened to work.
+    struct Fussy {
+        steps: Vec<Vec<ToolCall>>,
+        at: AtomicUsize,
+        ceiling: usize,
+        /// Every user block it was handed, refused or served.
+        seen: Arc<Mutex<Vec<usize>>>,
+        refusals: Arc<AtomicUsize>,
+        /// When true, refuses whatever the size — nothing can be made to fit.
+        implacable: bool,
+    }
+
+    impl Fussy {
+        fn new(steps: Vec<Vec<ToolCall>>, ceiling: usize) -> Self {
+            Self {
+                steps,
+                at: AtomicUsize::new(0),
+                ceiling,
+                seen: Arc::new(Mutex::new(Vec::new())),
+                refusals: Arc::new(AtomicUsize::new(0)),
+                implacable: false,
+            }
+        }
+
+        fn implacable(steps: Vec<Vec<ToolCall>>) -> Self {
+            Self {
+                implacable: true,
+                ..Self::new(steps, 0)
+            }
+        }
+    }
+
+    impl Provider for Fussy {
+        async fn complete(&self, req: CompletionRequest) -> io_harness::Result<CompletionResponse> {
+            let usage = Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                ..Default::default()
+            });
+            // A summarising request is always served: it is the recovery, and a
+            // provider that refused it would be refusing the way out.
+            if req.system.contains(SUMMARISER) {
+                return Ok(CompletionResponse {
+                    text: Some("Read four files; nothing decided yet; the port is open.".into()),
+                    usage,
+                    ..Default::default()
+                });
+            }
+            self.seen.lock().unwrap().push(req.user.len());
+            if self.implacable || req.user.len() > self.ceiling {
+                self.refusals.fetch_add(1, Ordering::SeqCst);
+                return Err(io_harness::Error::provider_status(
+                    400,
+                    None,
+                    "This model's maximum context length is 8192 tokens, however you requested more",
+                ));
+            }
+            let i = self.at.fetch_add(1, Ordering::SeqCst);
+            Ok(CompletionResponse {
+                tool_calls: self.steps.get(i).cloned().unwrap_or_default(),
+                usage,
+                ..Default::default()
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct Folds(Arc<Mutex<Vec<u32>>>);
+
+    impl Observer for Folds {
+        fn event(&self, event: &RunEvent) -> Flow {
+            if let EventKind::Compacted { through_step, .. } = &event.kind {
+                self.0.lock().unwrap().push(*through_step);
+            }
+            Flow::Continue
+        }
+    }
+
+    const NAMES: [&str; 6] = [
+        "alpha.txt", "beta.txt", "gamma.txt", "delta.txt", "epsilon.txt", "zeta.txt",
+    ];
+
+    fn workspace() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for name in NAMES {
+            std::fs::write(
+                dir.path().join(name),
+                format!("{name}\n{}", "padding line\n".repeat(120)),
+            )
+            .unwrap();
+        }
+        dir
+    }
+
+    fn script() -> Vec<Vec<ToolCall>> {
+        NAMES
+            .iter()
+            .map(|n| {
+                vec![ToolCall {
+                    name: "read_file".into(),
+                    arguments: json!({ "path": n }),
+                }]
+            })
+            .collect()
+    }
+
+    fn contract(root: &std::path::Path) -> TaskContract {
+        TaskContract::workspace("read the files and report", root)
+            .with_verification(Verification::WorkspaceFileContains {
+                file: "unreachable.txt".into(),
+                needle: "never".into(),
+            })
+            .with_max_steps(NAMES.len() as u32)
+            // Large enough that the *threshold* never fires: the only thing that
+            // can make this run fold is the provider refusing the request, which
+            // is what F4 is about.
+            .with_context_budget(ContextBudget::default())
+            // One kept whole: a forced fold has to be able to remove enough for
+            // the second request to be materially smaller than the refused one.
+            .with_compaction(Compaction {
+                at_share: 0.8,
+                keep_recent: 1,
+            })
+            .with_max_retries(0)
+    }
+
+    fn open_policy() -> Policy {
+        Policy::default().layer("test").allow_read("*").allow_write("*")
+    }
+
+    // ------------------------------------------------------------------ F4
+
+    /// F4 — an overflow is classified, and the run survives it.
+    ///
+    /// The provider refuses anything over a byte ceiling and serves anything
+    /// under it, so the request that succeeded is provably smaller than the one
+    /// that failed — a recovery, not a re-send that got lucky.
+    #[tokio::test]
+    async fn a_request_that_did_not_fit_is_compacted_and_asked_again() {
+        let dir = workspace();
+        // Crossed only once several reads have accumulated, so the fold has
+        // something to remove when it happens.
+        let provider = Fussy::new(script(), 5_000);
+        let store = Store::memory().unwrap();
+        let folds = Folds::default();
+        let seen_folds = Arc::clone(&folds.0);
+
+        let result = io_harness::run_with_observed(
+            &contract(dir.path()),
+            &provider,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+            &folds,
+        )
+        .await
+        .unwrap();
+
+        let refusals = provider.refusals.load(Ordering::SeqCst);
+        assert!(refusals > 0, "the provider never refused; nothing was recovered from");
+        assert!(
+            !seen_folds.lock().unwrap().is_empty(),
+            "a refusal produced no fold"
+        );
+        assert!(
+            !matches!(result.outcome, RunOutcome::Escalated { .. }),
+            "the run died on a request it could have made smaller: {:?}",
+            result.outcome
+        );
+
+        // The discriminating pair: the request after the refusal is smaller than
+        // the one refused.
+        let sizes = provider.seen.lock().unwrap().clone();
+        let refused_at = sizes
+            .iter()
+            .position(|n| *n > 5_000)
+            .expect("no request was over the ceiling");
+        let after = sizes
+            .get(refused_at + 1)
+            .copied()
+            .expect("nothing was sent after the refusal");
+        assert!(
+            after < sizes[refused_at],
+            "the retry sent {after} chars against the refused {}",
+            sizes[refused_at]
+        );
+
+        // And the fold is a durable row, not only an event.
+        assert!(!store.summaries(result.run_id).unwrap().is_empty());
+    }
+
+    /// F4's negative control — a run whose requests all fit never compacts, and
+    /// the provider is never refused.
+    #[tokio::test]
+    async fn a_run_under_the_ceiling_never_compacts() {
+        let dir = workspace();
+        let provider = Fussy::new(script(), 1_000_000);
+        let store = Store::memory().unwrap();
+        let folds = Folds::default();
+        let seen_folds = Arc::clone(&folds.0);
+
+        let result = run_with(
+            &contract(dir.path()),
+            &provider,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.refusals.load(Ordering::SeqCst), 0);
+        assert!(seen_folds.lock().unwrap().is_empty());
+        assert!(store.summaries(result.run_id).unwrap().is_empty());
+        assert!(!matches!(result.outcome, RunOutcome::Escalated { .. }));
+    }
+
+    // ------------------------------------------------------------------ F5
+
+    /// F5 — the recovery happens once.
+    ///
+    /// A provider that refuses every request whatever its size: the run escalates
+    /// after exactly two working attempts for that step and one fold, not a loop.
+    #[tokio::test]
+    async fn a_request_that_cannot_be_made_to_fit_escalates_after_one_recovery() {
+        let dir = workspace();
+        let provider = Fussy::implacable(script());
+        let store = Store::memory().unwrap();
+
+        let failed = run_with(
+            &contract(dir.path()),
+            &provider,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await;
+
+        assert!(failed.is_err(), "an unanswerable request must still escalate");
+        assert_eq!(
+            provider.refusals.load(Ordering::SeqCst),
+            2,
+            "the step asked more than twice, or gave up without recovering"
+        );
+
+        let run_id = store.last_run().unwrap().unwrap();
+        let outcome = store.outcome(run_id).unwrap().unwrap();
+        assert!(
+            outcome.starts_with("escalated"),
+            "the run should end escalated, not {outcome}"
+        );
+    }
+
+    /// F5's other half — with folding off, an overflow is terminal on the first
+    /// refusal, exactly as it was on 0.42.0.
+    #[tokio::test]
+    async fn with_folding_off_an_overflow_is_terminal_at_once() {
+        let dir = workspace();
+        let provider = Fussy::implacable(script());
+        let store = Store::memory().unwrap();
+
+        let failed = run_with(
+            &contract(dir.path()).with_compaction(Compaction {
+                at_share: 1.0,
+                ..Compaction::default()
+            }),
+            &provider,
+            &store,
+            &open_policy(),
+            &ApproveAll,
+        )
+        .await;
+
+        assert!(failed.is_err());
+        assert_eq!(
+            provider.refusals.load(Ordering::SeqCst),
+            1,
+            "a caller who turned folding off asked for 0.42.0's behaviour and got a second attempt"
+        );
+    }
+}

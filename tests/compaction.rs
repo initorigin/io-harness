@@ -239,26 +239,6 @@ mod the_fold {
         }
     }
 
-    /// Stops the run at the first step boundary after it folds — the resumable
-    /// stop, and the only one `resume` will drive past.
-    #[derive(Default)]
-    struct CancelAfterFold {
-        folded: AtomicUsize,
-    }
-
-    impl Observer for CancelAfterFold {
-        fn event(&self, event: &RunEvent) -> Flow {
-            match &event.kind {
-                EventKind::Compacted { .. } => {
-                    self.folded.fetch_add(1, Ordering::SeqCst);
-                    Flow::Continue
-                }
-                EventKind::Step { .. } if self.folded.load(Ordering::SeqCst) > 0 => Flow::Cancel,
-                _ => Flow::Continue,
-            }
-        }
-    }
-
     fn read(path: &str) -> ToolCall {
         ToolCall {
             name: "read_file".into(),

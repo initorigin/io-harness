@@ -3978,6 +3978,9 @@ async fn run_from<P: Provider>(
 
         let response = complete_with_retry(
             provider, &request, contract, store, run_id, step, watch, 0, false,
+            // The single-file loop has no ledger to fold, so an over-window
+            // request there is terminal exactly as it was on 0.42.0.
+            false,
         )
         .await?;
 
@@ -4296,7 +4299,15 @@ async fn run_workspace_from<P: Provider>(
         // 0.43.0 — before assembly, never inside it. Over the threshold, the older
         // observations become one written paragraph and the assembler bounds a
         // shorter ledger; under it, nothing happens and no provider is called.
-        let fold_tokens = compact_ledger(
+        // 0.43.0 — at most two attempts at this step's completion, and the second
+        // only when the first came back "this request did not fit". The threshold
+        // was guessing at what the vendor has now stated, so the recovery fold is
+        // unconditional; the bound is one per step, so a request that cannot be
+        // made to fit escalates rather than looping.
+        let mut fold_tokens = 0;
+        let mut recovered = false;
+        let (response, assembled, user) = loop {
+        fold_tokens += compact_ledger(
             provider,
             contract,
             store,
@@ -4307,7 +4318,7 @@ async fn run_workspace_from<P: Provider>(
             &mut ledger,
             &mut written,
             budget_tokens,
-            false,
+            recovered,
         )
         .await?;
         let assembled = assemble(
@@ -4323,10 +4334,6 @@ async fn run_workspace_from<P: Provider>(
             },
         )
         .await?;
-        // 0.30.0: which notes this turn actually leaned on, recorded per run. The
-        // trace already said how many were carried; it could not say which, and a
-        // count cannot tell a load-bearing entry from a passenger.
-        store.record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
         let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
         #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
         let request = CompletionRequest {
@@ -4363,7 +4370,7 @@ async fn run_workspace_from<P: Provider>(
             0,
         );
 
-        let response = complete_with_retry(
+        match complete_with_retry(
             provider,
             &request,
             contract,
@@ -4373,8 +4380,29 @@ async fn run_workspace_from<P: Provider>(
             watch,
             0,
             extras.stream,
+            !recovered && contract.compaction.enabled(),
         )
-        .await?;
+        .await
+        {
+            Ok(response) => break (response, assembled, user),
+            // The same condition `may_compact` was passed under, so the loop and
+            // `complete_with_retry` cannot disagree about whether this run is
+            // allowed to recover — with folding off, the call above has already
+            // finished the run as escalated and retrying here would drive a run
+            // that has ended.
+            Err(e) if !recovered && contract.compaction.enabled() && is_context_overflow(&e) => {
+                recovered = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+        };
+        // 0.30.0: which notes this turn actually leaned on, recorded per run. The
+        // trace already said how many were carried; it could not say which, and a
+        // count cannot tell a load-bearing entry from a passenger. Recorded once,
+        // after the attempt that succeeded, so a recovered step does not write the
+        // recall twice.
+        store.record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
 
         // Which provider answered, when that is not a foregone conclusion. A
         // `Fallback` that fell over served this step from its secondary, and a trace
@@ -5834,7 +5862,11 @@ fn run_agent<'f, P: Provider>(
             // 0.43.0 — the tree loop's own call to the one fold helper, in the same
             // place for the same reason. A child folds its own ledger at its own
             // depth: the summary is of the work that agent did, not of the tree.
-            let fold_tokens = compact_ledger(
+            // At most two attempts, for the reason the flat loop states.
+            let mut fold_tokens = 0;
+            let mut recovered = false;
+            let (response, assembled, user) = loop {
+            fold_tokens += compact_ledger(
                 tree.provider,
                 contract,
                 tree.store,
@@ -5845,7 +5877,7 @@ fn run_agent<'f, P: Provider>(
                 &mut ledger,
                 &mut written,
                 budget_tokens,
-                false,
+                recovered,
             )
             .await?;
             let assembled = assemble(
@@ -5861,10 +5893,6 @@ fn run_agent<'f, P: Provider>(
                 },
             )
             .await?;
-            // Same record on the tree path: a sub-agent's run is a run, and its
-            // recalls belong to it rather than to whoever spawned it.
-            tree.store
-                .record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
             let user = workspace_user_prompt(contract, &assembled.text, toolchain.as_ref());
             #[allow(clippy::needless_update)] // `media` is cfg'd out in the default build
             let request = CompletionRequest {
@@ -5894,7 +5922,7 @@ fn run_agent<'f, P: Provider>(
                 media: attach_media(contract, pending_media)?,
                 ..Default::default()
             };
-            let response = complete_with_retry(
+            match complete_with_retry(
                 tree.provider,
                 &request,
                 contract,
@@ -5906,8 +5934,27 @@ fn run_agent<'f, P: Provider>(
                 // Streaming is the turn's choice and reaches the root only: a
                 // child's text is composed back into its parent, not shown.
                 extras.stream,
+                !recovered && contract.compaction.enabled(),
             )
-            .await?;
+            .await
+            {
+                Ok(response) => break (response, assembled, user),
+                // Same condition as `may_compact` above, for the reason the flat
+                // loop states.
+                Err(e)
+                    if !recovered && contract.compaction.enabled() && is_context_overflow(&e) =>
+                {
+                    recovered = true;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
+            };
+            // Same record on the tree path: a sub-agent's run is a run, and its
+            // recalls belong to it rather than to whoever spawned it. Recorded once,
+            // after the attempt that succeeded.
+            tree.store
+                .record_memory_recall(run_id, step, &mem_key, &assembled.recalled_keys)?;
 
             // Which provider answered, when that is not a foregone conclusion. A
             // `Fallback` that fell over served this step from its secondary, and a
@@ -10334,6 +10381,20 @@ fn memory_key(root: &Path) -> String {
         .into_owned()
 }
 
+/// Whether a failure is a request that did not fit the model's window.
+///
+/// One place, so the loop's recovery and `complete_with_retry`'s escape hatch
+/// cannot disagree about what they are answering.
+fn is_context_overflow(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::Provider {
+            kind: crate::error::ProviderErrorKind::ContextOverflow,
+            ..
+        }
+    )
+}
+
 /// What the summarising model is asked for, and what it must not do.
 ///
 /// Four named things rather than "summarise this": a paragraph asked for a
@@ -10437,6 +10498,10 @@ async fn compact_ledger<P: Provider>(
             // already looking. Never streamed: nobody is reading it as it arrives.
             let response = complete_with_retry(
                 provider, &request, contract, store, run_id, step, watch, depth, false,
+                // A summarising request cannot itself be answered by compacting:
+                // it is what compacting *is*, and a recursion here would be a fold
+                // trying to fold its own prompt.
+                false,
             )
             .await?;
             spent = response.usage.map(|u| u.total_tokens).unwrap_or(0);
@@ -10506,6 +10571,12 @@ async fn complete_with_retry<P: Provider>(
     watch: &Watch<'_>,
     depth: u32,
     stream: bool,
+    // 0.43.0 — whether the caller can answer a `ContextOverflow` by compacting and
+    // asking again with a smaller request. When it can, such a failure is handed
+    // back *without* the run being finished as escalated, because a run that is
+    // about to recover is not a run that has ended. Every other failure, and a
+    // second overflow after the recovery, escalates exactly as it did on 0.42.0.
+    may_compact: bool,
 ) -> Result<CompletionResponse> {
     // The general media boundary. Every completion in every loop goes through
     // here, so this covers an out-of-tree `Provider` as well as the three built
@@ -10612,6 +10683,21 @@ async fn complete_with_retry<P: Provider>(
                 if !wait.is_zero() {
                     tokio::time::sleep(wait).await;
                 }
+            }
+            // The request did not fit and the caller can make it smaller. Recorded
+            // as a step row so the attempt is in the trace, and handed back without
+            // finishing the run: the recovery is the caller's, and it is about to
+            // ask again with a request the ledger has been folded out of.
+            Err(e) if may_compact && is_context_overflow(&e) => {
+                store.record(
+                    run_id,
+                    &StepRecord::new(
+                        step,
+                        String::from("compacting after a context overflow"),
+                        e.to_string(),
+                    ),
+                )?;
+                return Err(e);
             }
             Err(e) => {
                 store.record(
