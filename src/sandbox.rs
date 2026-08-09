@@ -1084,7 +1084,7 @@ pub(crate) fn contain_command(
                 seccomp::install()
             });
         }
-        return Some(Contained { _ruleset: ruleset });
+        Some(Contained { _ruleset: ruleset })
     }
     #[cfg(not(target_os = "linux"))]
     None

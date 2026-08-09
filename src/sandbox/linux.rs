@@ -1149,27 +1149,44 @@ mod tests {
         }
     }
 
-    // The degrade path itself, which runs on any host without a working
-    // `unshare` — including the macOS build host, where the binary does not
-    // exist at all, and the restricted-userns CI runner this release is about.
+    /// The degrade path, and 0.47.0 changed what it degrades *to*.
+    ///
+    /// Written in 0.9.1, when a host without a working `unshare` had exactly one
+    /// place left to fall: the portable floor. That premise is the hole this
+    /// release closes. On a stock Ubuntu 24.04 — the very host the assertion was
+    /// written for — the chain now hands the run to Landlock, and the CI leg that
+    /// leaves the restriction in place is where this first failed, reporting
+    /// `LinuxLandlock` where the test demanded `PortableFloor`.
+    ///
+    /// So the assertion is the property rather than the destination: a host with
+    /// no rung it can serve still *runs*, and reports whatever rung actually
+    /// applied rather than failing. The floor arm is asserted where the floor is
+    /// genuinely what is left.
     #[tokio::test]
-    async fn degrades_to_the_floor_when_the_wrapper_does_not_work() {
-        if unshare_works() {
-            return; // this host has real namespaces; nothing to degrade to
-        }
+    async fn a_host_with_no_working_rung_still_runs_and_reports_what_applied() {
+        let expected = rung(probes(), false);
         let dir = tempfile::tempdir().unwrap();
         let argv = vec!["sh".into(), "-c".into(), "echo hi".into()];
         let out = LinuxSandbox
-            .run(RunSpec::new(
-                &argv,
-                dir.path(),
-                &crate::sandbox::SandboxLimits::default(),
-            ))
+            .run(
+                RunSpec::new(&argv, dir.path(), &crate::sandbox::SandboxLimits::default())
+                    .with_network(true),
+            )
             .await
             .unwrap();
         assert!(out.success(), "a degraded run must still run, got {out:?}");
-        assert_eq!(out.backend, Backend::PortableFloor);
         assert!(out.stdout.contains("hi"));
+        assert_eq!(
+            out.backend, expected,
+            "the backend reported must be the rung the chain chose for this run"
+        );
+        if expected == Backend::PortableFloor {
+            let p = probes();
+            assert!(
+                p.landlock_abi.is_none() && !p.bubblewrap && !p.unshare,
+                "the floor is only reached when nothing above it works: {p:?}"
+            );
+        }
     }
 
     #[test]
