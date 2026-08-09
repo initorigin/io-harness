@@ -1113,7 +1113,7 @@ versions:
       un-overridable, and what an embedder supplies sits before it. A composable prompt that can
       contradict its own runtime's contract is not a feature.
     detail: specified
-    status: planned
+    status: released
   - version: 0.46.0
     outcome: >
       A run is contained unless its caller says otherwise. 0.40.0 made containment askable; the

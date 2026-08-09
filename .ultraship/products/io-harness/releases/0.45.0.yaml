@@ -1,6 +1,6 @@
 product: io-harness
 version: 0.45.0
-status: planned
+status: released
 release_type: minor
 
 outcome:
@@ -33,11 +33,13 @@ outcome:
     states.** The boundary section is rendered from the very `Policy` the run enforces and, when
     containment is on, from the backend `select` actually returned — including a degraded floor,
     named as degraded. `TaskContract::prompt: SystemPrompt` is `Builtin` (today's prompt, and the
-    default, unchanged byte for byte), `Append(String)` (the caller's text after the crate's
-    description of the agent and its tools, before the crate's own rules), or `Replace(String)` (the
-    caller's description instead of the crate's). A run whose policy enforces nothing and whose
-    prompt is `Builtin` sends the bytes 0.44.0 sent, which is the negative control this release is
-    checked against.
+    default), `Append(String)` (the caller's text after the crate's description of the agent and its
+    tools, before the crate's own rules), or `Replace(String)` (the caller's description instead of
+    the crate's). A run whose policy enforces nothing and whose prompt is `Builtin` sends 0.44.0's
+    own sentences with the ending relocated to the end and nothing else altered — a byte-exact
+    prefix plus a byte-exact suffix, corrected from byte-identity by `US-IO-HARNESS-0.45.0-I01`
+    because the ending was not last in 0.44.0. That is the negative control this release is checked
+    against.
 
     **What a repository says about itself stops being a constraint and stops being invisible.**
     `read_instructions` (`src/config.rs:1681`) already defaults to `AGENTS.md`
@@ -684,3 +686,184 @@ open_questions:
   Whether `PromptFamily` should eventually be readable by the embedder for its own purposes (it is
   public, so it is), and whether the crate should document that as supported or as an implementation
   detail. Left open until someone asks.
+
+released_at: 2026-08-09T11:05:38Z
+mode: published
+delivered: >
+  An agent is told the boundary it is working inside instead of discovering it one refused call at a
+  time, and an embedder can give that agent its own voice without forking the crate.
+
+  The system block now carries, in a fixed order: the description of the agent and its tools —
+  the crate's, or the caller's through `SystemPrompt::Replace`; the tool and skill catalogues; the
+  planning directive; the caller's own text through `SystemPrompt::Append`; the repository's own
+  guidance, discovered from `AGENTS.md` by default; the boundary section, rendered from the very
+  `Policy` the run enforces and, under containment, from the backend `sandbox::select` actually
+  returned; and the crate's own ending sentence, last and un-overridable. A permissive, uncontained,
+  uninstructed `Builtin` run sends 0.44.0's own sentences with that ending relocated to the end and
+  nothing else altered.
+
+  `PromptFamily` classifies the model answering — from the provider for the two built-in vendors,
+  from the model slug for `OpenRouter` and `Compatible`, `Generic` for everything unrecognised — and
+  decides delimiters and nothing else, asserted by stripping the delimiters and comparing the rest
+  byte for byte.
+
+  Zero compile breaks. Two behaviour changes, both in the changelog with migration notes: a
+  discovered `AGENTS.md` moves out of `TaskContract::constraints` into the system block, and
+  `[instructions]` is discovered without an `[instructions]` table (with `files = []` as the
+  opt-out). One relocation, also stated: the crate's ending sentence now follows the catalogues it
+  used to precede.
+evidence:
+  tests:
+  - >
+    `cargo test` (default features) — exit 0, **77 test binaries, 1,497 passed, 0 failed**. Run with
+    `XDG_CONFIG_HOME` redirected to a scratch directory, which is this machine's standing
+    environment fix for `tests/plugin.rs` and unrelated to the release.
+  - >
+    `cargo test --all-features` — exit 0, **77 test binaries, 1,583 passed, 0 failed**, as a separate
+    invocation.
+  - >
+    `cargo test --doc` — **401 passed, 0 failed**, including the worked examples on `SystemPrompt`,
+    `TaskContract::with_system_prompt`, `TaskContract::with_instruction`, `PromptFamily`,
+    `PromptFamily::as_str`, `Provider::prompt_family` and `EventKind::PromptComposed`.
+  - >
+    F1 — `the_boundary_section_says_what_the_policy_does`: every pattern read back off the rendered
+    line is re-evaluated through `Policy::explain` and asserted to sit under that effect's heading,
+    against a policy whose `app` layer allows what `ops-baseline` denies beneath it. Sabotages: skip
+    the layers (fails F1 and N5, nothing else); print each rule's own effect rather than the stack's
+    answer (fails F1 alone).
+  - >
+    F2 — `containment_names_the_backend_the_host_actually_gave`: both arms branch on
+    `select(&config).backend()`, so each platform asserts its own truth and the degraded floor is
+    asserted rather than stepped over. Sabotage: report the requested mode rather than the selection
+    (fails F2 alone).
+  - >
+    F3 — `a_default_run_is_0_44_0_with_the_ending_moved_to_the_end` and
+    `the_ending_follows_the_catalogues_it_used_to_precede`, against 0.44.0 strings captured from
+    0.44.0's own output before any code changed. Single-file mode asserts full byte-identity, since
+    it has no ending to relocate. **Met in the corrected form recorded as `US-IO-HARNESS-0.45.0-I01`
+    — see `known_limitations`.**
+  - >
+    F4 — `no_caller_prompt_can_get_past_the_ending`, over `Builtin`, `Append`, `Replace` and
+    `Replace("")`, including that the boundary section is the last `\n\n`-separated block before the
+    ending. Sabotage: let `Replace` return the caller's string as the whole prompt (fails F4 alone,
+    on the `Replace("")` arm).
+  - >
+    F5 — `hostile_text_cannot_displace_the_crates_own_rules`, driving the same hostile sentence in by
+    both routes that exist (a caller's `Replace`, a repository's `AGENTS.md`). Sabotage: emit the
+    guidance section after the boundary (fails F5 alone).
+  - >
+    F6 — `discovered_instructions_reach_the_contract_as_instructions` (`tests/config.rs`), over four
+    trees including a repository with **no `io.toml` at all** and one opting out with
+    `[instructions] files = []`. Sabotage: treat an explicit empty list as an absent table (fails F6
+    alone).
+  - >
+    F7 — `repository_guidance_is_carried_once_and_is_not_a_constraint`: the text appears exactly once
+    in the system block and not in the user turn, while a caller's constraint still rides in the user
+    turn. Sabotage: keep the 0.27.0 `with_constraint` push beside the new field (fails F6/F7's config
+    arm alone).
+  - >
+    F8 — `a_family_changes_the_delimiters_and_nothing_else`: five slugs classified, the two built-in
+    providers asserted against a deliberately unrecognisable alias, and one contract composed under
+    all three families with the delimiters stripped and the remainders asserted byte-identical.
+    Sabotage: drop one line from a single family's template (fails F8 alone).
+  - >
+    F9 — `prompt_composed_fires_once_and_says_what_was_composed`: exactly one event over a four-step
+    run, with `bytes` equal to the length of the system string the provider received. Sabotage: emit
+    inside the step loop (fails F9 alone).
+  - >
+    F10 — `the_prompt_is_composed_once_and_does_not_move`: a four-step run that writes a memory note
+    and rewrites `AGENTS.md` from inside the run, with every request's `system` asserted
+    byte-identical to the first. Sabotage: re-read the instructions from disk and recompose per step
+    — fails F10 with `the system prompt moved on step 2`, and five other tests besides, because the
+    crude recomposition also drops the catalogues. Reported rather than tidied.
+  - >
+    N5 — measured system-prompt bytes: permissive **432**, `Policy::default()` **1,164**,
+    `Policy::default()` plus containment **1,347**, forty rules on one act **1,586** with the read
+    line capped at 24 named patterns and stating the omission.
+  - >
+    N6 — the four prior releases asserted by their own suites, unchanged: `cache_boundary` 7 passed,
+    `compaction` 11 passed, `parallel_reads` 8 passed, `tool_hooks` 6 passed.
+  - >
+    O2 — cross-version, both directions. Forward halves in the ordinary suite; the backward half run
+    as CI runs it: `cargo build` in `tests/fixtures/gen-0.29.0` then
+    `cargo test --test cross_version_0_29_0 -- --ignored` — 1 passed. `ADDED_SINCE_0_22_0` and
+    `COLUMNS_ADDED_SINCE_0_22_0` unchanged, which is the assertion.
+  builds:
+  - '`cargo fmt --check` — exit 0.'
+  - '`cargo clippy --all-targets --all-features -- -D warnings` — exit 0.'
+  - >
+    `RUSTDOCFLAGS="--cfg docsrs -D warnings" cargo +nightly doc --all-features --no-deps` — exit 0,
+    **after it caught one error stable `cargo doc` did not report**: a redundant explicit link target
+    on `[`Compatible`](crate::Compatible)` in a file that has the type in scope. Five of the last
+    seven releases.
+  - >
+    `cargo clean && cargo package --locked` — exit 0, **1,502,358 bytes**, packaged from a clean tree.
+  - >
+    N1 — `cargo tree` is **402** lines, unchanged since 0.34.0. N2 — MSRV unmoved at 1.95.
+  - >
+    N3 — zero compile breaks, and `docs/public-api.txt` gains **exactly two lines**
+    (`enum SystemPrompt`, `enum PromptFamily`) and loses none, which is the number stated at plan
+    time. N4 — `git diff main -- src/state.rs` is **empty** and `CHECKPOINT_FORMAT` is unmoved at 7.
+  reviews: []
+  deployments: []
+  health_checks: []
+known_limitations:
+- >
+  **The record was sealed before the crates.io upload.** `mode: published` states the authorized
+  target; the upload follows the feat→develop and develop→main merges and the GitHub Release, and is
+  the last step of the flow.
+- >
+  **F3 was corrected before implementation and the correction is `US-IO-HARNESS-0.45.0-I01`.** The
+  contract asked for byte-identity with 0.44.0 while also requiring the crate's ending sentence to be
+  emitted last; the ending was not last in 0.44.0 (it sat inside the base description, ahead of the
+  tool and skill catalogues), so the two could not both hold. The criterion became a byte-exact
+  prefix plus a byte-exact suffix, which still admits no sentence being added, dropped or reworded —
+  and admits exactly the one relocation the release makes on purpose. Approved by the owner before
+  any code was written.
+- >
+  **One sabotage did not fail the test whose criterion it attacks, and that is a finding.** Emitting
+  the ending before the catalogues — 0.44.0's order — fails
+  `the_ending_follows_the_catalogues_it_used_to_precede` and `no_caller_prompt_can_get_past_the_ending`,
+  while F3's own no-catalogue arm still passes. With no extra tools and no skills the two orders
+  produce the same bytes, so a test written without a catalogue would have rubber-stamped an
+  implementation that relocated nothing. The catalogue-bearing arm exists for exactly that reason and
+  is what makes F3 discriminating.
+- >
+  **Family shaping ships the mechanism and one difference.** `PromptFamily` has three variants and
+  today only `Anthropic` delimits differently (tagged blocks, as that vendor's guidance asks for);
+  `OpenAi` and `Generic` share the plain form. This is stated in the type's own documentation rather
+  than left for a reader to notice: the enum exists so a family *can* differ when there is a reason
+  to, not so that each one must. No claim is made anywhere that one family's wording performs better
+  than another's, because this release cannot measure that.
+- >
+  **A rule an approver remembers mid-run is not reflected in the boundary section.** The prompt is
+  composed once — which F10 requires, since 0.38.0's cache breakpoint sits at the end of this block —
+  and a remembered rule widens what is permitted, so the section stays conservative rather than
+  wrong. A plan gate *is* reflected: the narrowed policy is what the planning prompt describes, and
+  the loop already switches prompts when the phase ends. Documented in `docs/CONTRACT.md`.
+- >
+  **Single-file mode gets no boundary section and no ending.** It enforces no policy (0.4.0) and has
+  no turn to classify, so there is no rule for a caller's prompt to weaken and nothing true to say
+  about a boundary. `SystemPrompt` still applies there. Stated rather than left to be inferred from a
+  test that only covers the workspace loop.
+- >
+  **Repository-controlled text now speaks in the system block, deliberately.** What bounds it is
+  structural — delimited, framed as the repository's guidance, emitted before both the boundary
+  section and the ending, and granting nothing because the `Policy` is enforced before any call runs.
+  What the crate asserts is the composition. **What a model does with a prompt is not a claim this
+  crate can make**, and nothing in this release claims it.
+- >
+  **The release's premise is not measured.** That telling an agent its boundary reduces refused steps
+  is the reason the section exists and is not an acceptance criterion: measuring it needs a matched
+  pair of long live runs under an identical policy, and the difference would be confounded by the
+  model's own variance. It is recorded as an open question.
+- >
+  **One existing test's expected event sequence was changed**, with the reason in its own comment:
+  `a_one_shot_run_emits_no_deltas_and_a_session_turn_does` (`tests/session_streaming.rs`) asserted
+  the exact sequence a 0.19.0 consumer sees, and `PromptComposed` now arrives before the first step.
+  An additive variant on an enum `#[non_exhaustive]` since 0.24.0 is what this crate has told
+  observers to expect; the claim that test is really making — that streaming adds no `Token` events
+  to a one-shot run — is asserted separately and is untouched.
+supersedes: 0.44.0
+next_recommended_version: 0.46.0
+immutable: true
