@@ -7,6 +7,53 @@ use crate::context::{Compaction, ContextBudget};
 use crate::resilience::{RetryPolicy, StallPolicy};
 use crate::verify::Verification;
 
+/// What the caller wants the system prompt to say (0.45.0).
+///
+/// Until 0.45.0 the system prompt was three private `const`s an embedder could
+/// neither read nor change, so a program built on this crate could not give its
+/// agent its own voice without forking. This is the whole of the answer, and it
+/// is deliberately three states rather than a catalogue: a preset shipped by a
+/// library is an opinion about model behaviour that library cannot test and can
+/// never withdraw, and a preset written by the embedder is a `const` in the
+/// embedder's own crate.
+///
+/// What no variant can reach is the crate's own ending — the sentence that
+/// decides what a turn is. It is emitted **last**, after everything here, because
+/// the guarantee it produces ([`TurnKind::Reply`](crate::TurnKind::Reply) stages
+/// no step, no gate, no checkpoint and no approval) is one `docs/CONTRACT.md`
+/// makes to a reader who never sees the embedder's prompt:
+///
+/// ```
+/// use io_harness::{SystemPrompt, TaskContract};
+///
+/// let contract = TaskContract::workspace("port the parser", "/tmp/repo")
+///     .with_system_prompt(SystemPrompt::Append(
+///         "You are Acme's release bot. Prefer the smallest diff that works.".into(),
+///     ));
+///
+/// assert!(matches!(contract.prompt, SystemPrompt::Append(_)));
+/// ```
+///
+/// `#[non_exhaustive]` from birth: a fourth state is a thing a minor may add, and
+/// this way it costs nobody a recompile.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SystemPrompt {
+    /// The crate's own description of the agent and its tools. Every release
+    /// before 0.45.0, and still the default.
+    #[default]
+    Builtin,
+    /// The crate's description, then this text, then the crate's own sections and
+    /// its ending.
+    Append(String),
+    /// This text **instead of** the crate's description. The tool catalogue, the
+    /// skills catalogue, the repository's instructions, the boundary section and
+    /// the ending are all still composed around it — replacing the description
+    /// does not replace what the crate has to say about the request it is
+    /// building.
+    Replace(String),
+}
+
 /// A single unit of work handed to the harness.
 ///
 /// The agent edits one file to meet [`Verification`], bounded by budgets. v0.2
@@ -80,6 +127,20 @@ pub struct TaskContract {
     pub root: Option<PathBuf>,
     /// Extra rules the agent must respect, surfaced to the model verbatim.
     pub constraints: Vec<String>,
+    /// What the system prompt says (0.45.0). [`SystemPrompt::Builtin`] by
+    /// default, which is every release before it.
+    pub prompt: SystemPrompt,
+    /// A repository's own guidance, carried in the system block (0.45.0).
+    ///
+    /// What `[instructions]` discovers (`AGENTS.md` by default) lands here rather
+    /// than in [`TaskContract::constraints`], where it landed from 0.27.0 to
+    /// 0.44.0. The two are different things: a constraint is a rule the goal is
+    /// checked against, and this is guidance the agent reads. It is also
+    /// **untrusted text** — a repository is not the operator — so it is carried in
+    /// a delimited section, framed as guidance rather than instruction, and
+    /// emitted before both the boundary section and the crate's ending, which it
+    /// therefore cannot displace.
+    pub instructions: Vec<String>,
     /// The checkable success criterion. The run succeeds when this passes.
     ///
     /// [`TaskContract::new`] takes it positionally; [`TaskContract::workspace`]
@@ -331,6 +392,8 @@ impl TaskContract {
             file: file.into(),
             root: None,
             constraints: Vec::new(),
+            prompt: SystemPrompt::Builtin,
+            instructions: Vec::new(),
             verify,
             plan_gate: None,
             effort: None,
@@ -393,6 +456,8 @@ impl TaskContract {
             file: root.clone(),
             root: Some(root),
             constraints: Vec::new(),
+            prompt: SystemPrompt::Builtin,
+            instructions: Vec::new(),
             verify: Verification::None,
             plan_gate: None,
             reviewer: None,
@@ -573,6 +638,48 @@ impl TaskContract {
     /// the model then does is checked as it always is.
     pub fn with_skills(mut self, dir: impl Into<PathBuf>) -> Self {
         self.skills = Some(dir.into());
+        self
+    }
+
+    /// Say what the system prompt says (0.45.0).
+    ///
+    /// [`SystemPrompt::Builtin`] is the default and is every release before this
+    /// one. Neither [`SystemPrompt::Append`] nor [`SystemPrompt::Replace`] can
+    /// reach the crate's ending sentence, the repository's instructions section or
+    /// the boundary section — those are composed after the caller's text, in that
+    /// order, and the ending is last.
+    ///
+    /// ```
+    /// use io_harness::{SystemPrompt, TaskContract};
+    ///
+    /// let contract = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_system_prompt(SystemPrompt::Replace("You are Acme's bot.".into()));
+    /// assert_eq!(contract.prompt, SystemPrompt::Replace("You are Acme's bot.".into()));
+    /// ```
+    pub fn with_system_prompt(mut self, prompt: SystemPrompt) -> Self {
+        self.prompt = prompt;
+        self
+    }
+
+    /// Carry one piece of repository guidance in the system block (0.45.0).
+    ///
+    /// This is what [`Config::apply_to`](crate::Config::apply_to) calls with what
+    /// `[instructions]` discovered, and it is public for a caller that has its own
+    /// source of the same kind of text. It is **not** a constraint: a constraint is
+    /// a rule the goal is checked against ([`with_constraint`](TaskContract::with_constraint)),
+    /// and this is guidance the agent reads, carried in a delimited section that
+    /// cannot displace the crate's own rules.
+    ///
+    /// ```
+    /// use io_harness::TaskContract;
+    ///
+    /// let contract = TaskContract::workspace("port the parser", "/repo")
+    ///     .with_instruction("Project instructions from `AGENTS.md`:\nprefer small diffs");
+    /// assert_eq!(contract.instructions.len(), 1);
+    /// assert!(contract.constraints.is_empty());
+    /// ```
+    pub fn with_instruction(mut self, text: impl Into<String>) -> Self {
+        self.instructions.push(text.into());
         self
     }
 

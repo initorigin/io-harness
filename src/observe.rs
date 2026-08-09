@@ -902,6 +902,58 @@ pub enum EventKind {
         /// vendor's tokeniser.
         prefix_bytes: u64,
     },
+    /// The system prompt this run will send, composed once (0.45.0).
+    ///
+    /// Emitted once per run, at composition time, and never per step: the prompt is
+    /// built before the loop and reused, which is what keeps 0.38.0's cache
+    /// breakpoint at the end of a block that does not move.
+    ///
+    /// It carries no prompt text, deliberately. The text can include a repository's
+    /// whole `AGENTS.md`, and an event that large on every run is a trace nobody
+    /// keeps — what an operator needs from it is which family answered, how big the
+    /// block got, and whether the two optional sections were there at all.
+    ///
+    /// ```
+    /// use io_harness::{EventKind, Flow, Observer, RunEvent};
+    ///
+    /// struct Prompts;
+    ///
+    /// impl Observer for Prompts {
+    ///     fn event(&self, event: &RunEvent) -> Flow {
+    ///         if let EventKind::PromptComposed { family, bytes, source, boundary, .. } = &event.kind {
+    ///             // "this run told its agent nothing about its boundary" is a
+    ///             // question with an answer here and nowhere else.
+    ///             println!("{family} prompt, {bytes} bytes, from {source}, boundary: {boundary}");
+    ///         }
+    ///         Flow::Continue
+    ///     }
+    /// }
+    ///
+    /// let composed = EventKind::PromptComposed {
+    ///     family: "anthropic".into(),
+    ///     bytes: 2_140,
+    ///     source: "builtin".into(),
+    ///     boundary: true,
+    ///     instructions: false,
+    /// };
+    /// assert!(matches!(composed, EventKind::PromptComposed { boundary: true, .. }));
+    /// # let _ = Prompts;
+    /// ```
+    PromptComposed {
+        /// The [`PromptFamily`](crate::PromptFamily) the prompt was shaped for, by
+        /// its stable label.
+        family: String,
+        /// How large the composed system block is, in bytes.
+        bytes: u64,
+        /// Which [`SystemPrompt`](crate::SystemPrompt) produced the description:
+        /// `builtin`, `appended` or `replaced`.
+        source: String,
+        /// Whether a boundary section was included. `false` means the run enforces
+        /// no policy and asked for no containment — not that one was withheld.
+        boundary: bool,
+        /// Whether a repository's own guidance was included.
+        instructions: bool,
+    },
     /// The run ended. Emitted once, last.
     Finished {
         /// The outcome string as written to `runs.outcome`.
@@ -970,6 +1022,7 @@ pub(crate) const EVENT_NAMES: &[&str] = &[
     "answered",
     "compacted",
     "cache_marked",
+    "prompt_composed",
     "finished",
 ];
 
@@ -1505,6 +1558,13 @@ mod tests {
                 through_step: 13,
                 prefix_bytes: 8_412,
             },
+            EventKind::PromptComposed {
+                family: "anthropic".into(),
+                bytes: 2_140,
+                source: "builtin".into(),
+                boundary: true,
+                instructions: false,
+            },
             EventKind::Token {
                 text: "hello".into(),
             },
@@ -1620,6 +1680,8 @@ mod tests {
                 // 0.43.0 — the run's older observations folded into a summary.
                 | EventKind::Compacted { .. }
                 | EventKind::CacheMarked { .. }
+                // 0.45.0 — the system prompt this run composed.
+                | EventKind::PromptComposed { .. }
                 | EventKind::Finished { .. } => {}
             }
         }

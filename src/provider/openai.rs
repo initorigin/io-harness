@@ -97,6 +97,12 @@ impl OpenAi {
 }
 
 impl Provider for OpenAi {
+    /// 0.45.0 — stated rather than derived from the slug, for the reason
+    /// [`Anthropic`](crate::Anthropic) states its own.
+    fn prompt_family(&self) -> crate::provider::PromptFamily {
+        crate::provider::PromptFamily::OpenAi
+    }
+
     fn name(&self) -> &str {
         "openai"
     }

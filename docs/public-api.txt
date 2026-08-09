@@ -81,6 +81,7 @@ enum MemoryKind src/state.rs
 enum PlanVerdict src/approve.rs
 enum PriceSource src/provider/mod.rs
 enum Progressing src/resilience.rs
+enum PromptFamily src/provider/mod.rs
 enum ProviderErrorKind src/error.rs
 enum ProviderSpec src/config.rs
 enum Rewind src/run.rs
@@ -88,6 +89,7 @@ enum RunOutcome src/run.rs
 enum RunStatus src/state.rs
 enum Selected src/sandbox.rs
 enum SpawnRefusal src/containment.rs
+enum SystemPrompt src/contract.rs
 enum TodoState src/state.rs
 enum ToolEffect src/tools/custom.rs
 enum TurnKind src/session.rs

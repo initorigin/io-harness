@@ -26,6 +26,104 @@ notes are produced from it.
 
 ### Security
 
+## [0.45.0] - 2026-08-09
+
+### Added
+
+- **The agent is told the boundary it is working inside, instead of discovering
+  it one refused call at a time.** A run under a `Policy` learns its edges by
+  being refused — a completion billed, a tool call dispatched, a refusal written
+  into the context every later completion carries — for facts the crate knew
+  before it built the request. The system block now carries them: one line per act
+  (read, write, execute, network) naming that tier's default and the patterns the
+  layers rule on, grouped by what `Policy::explain` actually returns for each and
+  attributed, on a refusal, to the layer that produced it — the same vocabulary a
+  `Refused` event carries. `Effect::Ask` is rendered as itself, because neither
+  "allowed" nor "refused" is true of it and both mislead. A permissive policy
+  renders nothing at all, single-file mode never renders it, and at most 24
+  patterns per act are named with the omitted count stated. Measured cost on the
+  policy most runs carry: **732 bytes** of system prompt, which 0.38.0's cache
+  breakpoint serves at the cache-read rate from the second call onward.
+
+- **With containment on, the agent is told which backend it actually got.** One
+  further line names what `sandbox::select` returned on this host — not what was
+  asked for. Where that is the portable floor or a Windows Job Object it says the
+  resource caps apply and filesystem and outbound-network confinement do not,
+  which on a stock Ubuntu 24.04 is the truth an agent would otherwise have to find
+  out by trying (0.40.0).
+
+- **`SystemPrompt` and `TaskContract::prompt`: an embedder can give its agent its
+  own voice.** `Builtin` is the default and is every release before this one;
+  `Append(String)` puts the caller's text after the crate's description of the
+  agent and its tools; `Replace(String)` supplies that description instead.
+  Neither can reach the crate's own sections or its ending. There is no preset
+  catalogue and there will not be one — a preset shipped by a library is an
+  opinion about model behaviour the library cannot test and cannot withdraw.
+
+- **`TaskContract::instructions` and `with_instruction`.** Where a repository's
+  own guidance now lives.
+
+- **`PromptFamily`, `PromptFamily::from_model` and a defaulted
+  `Provider::prompt_family`.** The crate reaches four wire shapes and, through
+  `Compatible`, some two dozen vendors. The family is read from the provider for
+  the two built-in vendors, from the model slug for `OpenRouter` and `Compatible`,
+  and is `Generic` for everything unrecognised. **It decides delimiters and
+  nothing else**: every family is given the same sections, in the same order, with
+  the same words and the same ending, asserted by stripping the delimiters and
+  comparing the rest byte for byte. Nothing here claims one family's wording
+  performs better than another's. Defaulted, so no `Provider` implementation
+  changes.
+
+- **`EventKind::PromptComposed { family, bytes, source, boundary, instructions }`.**
+  Once per run, at composition time. It carries no prompt text — that can be a
+  repository's whole `AGENTS.md` — and it is where "this run told its agent
+  nothing about its boundary" has an answer.
+
+### Changed
+
+- **`[instructions]` is discovered by default.** `Config::discover` looks for
+  `AGENTS.md` whether or not an `[instructions]` table is present, so a repository
+  carrying the file every other agent reads and no `io.toml` at all is now read.
+  *Migration:* `[instructions] files = []` is the opt-out, and it is distinct from
+  an absent table. Nothing became implicit that was not already — the caller still
+  chooses to read the configuration, once, before the run.
+
+- **A discovered `AGENTS.md` lands in `TaskContract::instructions`, not in
+  `TaskContract::constraints`, and rides in the system block rather than in the
+  user turn on every step.** A constraint is a rule the goal is checked against;
+  this is guidance the agent reads. *Migration:* a caller that read
+  `contract.constraints` after `Config::apply_to` to find the repository's
+  instructions reads `contract.instructions` now. It is untrusted text moving
+  somewhere more authoritative, and what bounds it is structural: delimited,
+  framed as the repository's own guidance that grants nothing, and emitted before
+  both the boundary section and the crate's ending — so it cannot be the last
+  word.
+
+- **The crate's ending sentence is now the last thing in the system prompt.**
+  Until 0.44.0 it sat inside the base description, which put the tool and skill
+  catalogues after it. Every sentence a 0.44.0 prompt carried is still carried, in
+  the same words; one of them is in a different place. *Migration:* nothing to do
+  unless you assert on the exact system string, which no public API exposes. The
+  move is what makes the guarantee real: nothing a caller or a repository supplies
+  is emitted after the sentence that decides what a turn is, so an embedder's
+  prompt cannot quietly turn every greeting into a run.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+- **Repository-controlled text moved into the system block, deliberately and with
+  its bounds stated.** A hostile or careless `AGENTS.md` now speaks where the
+  crate's own rules speak. It is delimited and framed as the repository's
+  guidance, it is emitted before the boundary section and the ending so it cannot
+  be the last word, and it grants nothing: the `Policy` is enforced in the tool and
+  verification layers before any call runs, and no prompt text widens it. What the
+  crate asserts is the composition, not what a model does with a prompt.
+
 ## [0.44.0] - 2026-08-09
 
 ### Added
