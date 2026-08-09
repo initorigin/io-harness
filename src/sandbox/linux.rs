@@ -838,7 +838,14 @@ mod tests {
             let sub = scratch.dir("ws/sub");
 
             let argv = sh("pwd");
-            let out = pinned(&argv, &sub, ExecMode::WorkspaceWrite, true, &[dir.clone()]).await;
+            let out = pinned(
+                &argv,
+                &sub,
+                ExecMode::WorkspaceWrite,
+                true,
+                std::slice::from_ref(&dir),
+            )
+            .await;
             let Some(out) = out else { return };
             assert_eq!(
                 out.argv, argv,

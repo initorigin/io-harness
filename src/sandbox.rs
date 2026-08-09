@@ -1023,8 +1023,77 @@ pub(crate) fn wrap_argv(
             linux::unshare_argv(argv, workdir, allow_network, config.mode, writable_roots),
         );
     }
+    #[cfg(target_os = "linux")]
+    if backend == Backend::LinuxBubblewrap {
+        return (
+            backend,
+            linux::bwrap_argv(argv, workdir, allow_network, config.mode, writable_roots),
+        );
+    }
     let _ = writable_roots;
     (backend, argv.to_vec())
+}
+
+/// Apply the containment that is **not** expressible as an argv wrapper.
+///
+/// [`wrap_argv`] answers "what should this command become" and is all the `shell`
+/// tool can use: it pipes stages into one another and therefore cannot hand an
+/// argv to [`Sandbox::run`] at all. That was enough while every rung was a
+/// wrapper program. The Landlock rung is not — it installs its restriction in the
+/// child between fork and exec — so a path that only rewrites argv would spawn a
+/// completely unconfined stage while `wrap_argv` reported a confining backend.
+///
+/// The CI matrix found exactly that: a contained shell line's second stage wrote
+/// outside the workspace. This is the other half of the answer, and the two are
+/// called together or neither is right.
+///
+/// The returned value must be held until after the spawn — it owns the rule set
+/// the child will apply. Dropping it early closes the descriptor.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub(crate) fn contain_command(
+    cmd: &mut tokio::process::Command,
+    config: &SandboxConfig,
+    workdir: &Path,
+    allow_network: bool,
+    writable_roots: &[PathBuf],
+) -> Option<Contained> {
+    #[cfg(target_os = "linux")]
+    {
+        if select(config).backend() != Backend::LinuxLandlock {
+            return None;
+        }
+        let abi = landlock::abi()?;
+        let tmp = std::env::temp_dir();
+        let plan = landlock::plan(
+            abi,
+            config.mode,
+            !allow_network,
+            workdir,
+            writable_roots,
+            &tmp,
+        );
+        let ruleset = landlock::Ruleset::build(&plan).ok()?;
+        let fd = ruleset.raw();
+        // SAFETY: the closure runs in the forked child before `exec`, allocates
+        // nothing and calls only `prctl`, `landlock_restrict_self` and one
+        // `seccomp` install. `fd` belongs to the returned guard, which the caller
+        // holds across the spawn.
+        unsafe {
+            cmd.pre_exec(move || {
+                landlock::restrict_self(fd)?;
+                seccomp::install()
+            });
+        }
+        return Some(Contained { _ruleset: ruleset });
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// The rule set a [`contain_command`] child will apply, alive until the spawn.
+pub(crate) struct Contained {
+    #[cfg(target_os = "linux")]
+    _ruleset: landlock::Ruleset,
 }
 
 async fn run_capped(

@@ -682,6 +682,10 @@ mod tests {
         let file = std::fs::File::create(&out_path).expect("create the capture file");
         let mut child = Spawned::start(cmdline, cwd, profile.sid(), &file)
             .unwrap_or_else(|e| panic!("F1: CreateProcessW into the AppContainer failed: {e}"));
+        // 0.47.0 spawns suspended so the backend can put the process in its
+        // job object before it runs an instruction. A caller that only starts
+        // and waits gets a frozen process and a wall-clock kill.
+        child.resume().expect("resume the contained process");
         drop(file);
 
         let code = child.wait(30_000).expect("wait");
@@ -837,6 +841,7 @@ mod tests {
         );
         let mut child =
             Spawned::start(&line, work.path(), profile.sid(), &file).expect("spawn the payload");
+        child.resume().expect("resume the contained process");
         let code = child.wait(60_000).expect("wait");
 
         let mut text = String::new();
@@ -882,6 +887,7 @@ mod tests {
             &file,
         )
         .expect("spawn the slow payload");
+        slow.resume().expect("resume the contained process");
         assert_eq!(
             slow.wait(1_000).expect("wait"),
             None,
@@ -890,6 +896,7 @@ mod tests {
 
         let mut quick =
             Spawned::start("cmd.exe /c exit 7", dir.path(), profile.sid(), &file).expect("spawn");
+        quick.resume().expect("resume the contained process");
         assert_eq!(
             quick.wait(30_000).expect("wait"),
             Some(7),
