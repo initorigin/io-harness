@@ -130,7 +130,9 @@ scope:
     `ExecContainment` the other spawns use, under the mode its own declaration resolves to, so
     `git_commit` writing `.git` and `git_worktree` writing `.worktrees/` are inside the granted
     roots rather than outside the boundary. Egress stays denied for all six: none of these fixed
-    argvs reaches the network.
+    argvs reaches the network. The three readers gain `--no-optional-locks`
+    (`US-IO-HARNESS-0.48.0-I01`), which is `git`'s own way of saying "do not take a lock to refresh
+    an index" and is what makes `ReadOnly` correct for them rather than merely survivable.
   - >
     **Each spawning tool declares the mode it needs, in the shape 0.41.0 used for `ToolEffect`.** A
     built-in table beside the effect table at `src/run.rs:7476`: `read_file` / `grep` / `find` need
@@ -276,11 +278,17 @@ acceptance:
     rather than before, under which the row exists and the refusal arrives as an errno, and only
     this fails.
   - >
-    **F5 — a call runs under the narrower of what it needs and what it was granted.** A read-only
-    built-in dispatched under a run granting `WorkspaceWrite` runs under `ReadOnly`: a write it
-    attempts inside the workspace is refused, while the same run's `exec` writing there succeeds in
-    the same step. Sabotage: resolve to the granted mode rather than the narrower one, under which
-    the read-only tool's write lands and only this fails.
+    **F5 — a call runs under the narrower of what it needs and what it was granted.** A git reader
+    dispatched under a run granting `WorkspaceWrite` is spawned under `ReadOnly`: the mode on its
+    `SandboxEvent` and `EventKind::Contained` reads `"read-only"` while the same run's `exec`, in
+    the same step, reads `"workspace-write"` and writes into the workspace successfully. A spawn
+    pinned to the resolved `ReadOnly` mode is refused a write inside the workspace, which is what
+    makes the resolution an enforcement and not a label. Under a `FullAccess` grant nothing is
+    narrowed and nothing is wrapped. Sabotage: resolve to the granted mode rather than the narrower
+    one, under which the git reader records `workspace-write` and only this fails.
+    **`US-IO-HARNESS-0.48.0-I01`**: this arm replaced one asserting a refused write from a
+    read-declared built-in, because no such built-in attempts a write and making one do so would
+    have regressed `git_status`.
   - >
     **F6 — a contained command reaches a permitted host and is refused a denied one, through the
     proxy.** Two loopback listeners the test starts, a policy permitting one and not the other, and

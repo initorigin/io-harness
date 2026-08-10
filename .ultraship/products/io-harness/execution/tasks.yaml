@@ -9,11 +9,16 @@ tasks:
   status: todo
   depends_on: []
   acceptance_criteria:
-  - '**F5 — a call runs under the narrower of what it needs and what it was granted.** A read-only built-in
-    dispatched under a run granting `WorkspaceWrite` runs under `ReadOnly`: a write it attempts inside
-    the workspace is refused, while the same run''s `exec` writing there succeeds in the same step. Sabotage:
-    resolve to the granted mode rather than the narrower one, under which the read-only tool''s write
-    lands and only this fails.
+  - '**F5 — a call runs under the narrower of what it needs and what it was granted.** A git reader dispatched
+    under a run granting `WorkspaceWrite` is spawned under `ReadOnly`: the mode on its `SandboxEvent`
+    and `EventKind::Contained` reads `"read-only"` while the same run''s `exec`, in the same step, reads
+    `"workspace-write"` and writes into the workspace successfully. A spawn pinned to the resolved `ReadOnly`
+    mode is refused a write inside the workspace, which is what makes the resolution an enforcement and
+    not a label. Under a `FullAccess` grant nothing is narrowed and nothing is wrapped. Sabotage: resolve
+    to the granted mode rather than the narrower one, under which the git reader records `workspace-write`
+    and only this fails. **`US-IO-HARNESS-0.48.0-I01`**: this arm replaced one asserting a refused write
+    from a read-declared built-in, because no such built-in attempts a write and making one do so would
+    have regressed `git_status`.
 
     '
   - '**N3 — zero compile breaks, and `docs/public-api.txt` is unchanged.** The public additions are a
