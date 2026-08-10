@@ -72,17 +72,30 @@ pub(crate) struct Rungs {
 /// modes, so the mode decides what goes in a rung's rule set and never which rung
 /// is chosen. The table test asserts that invariance rather than leaving it as a
 /// claim in this sentence.
-pub(crate) fn rung(probes: Rungs, deny_egress: bool) -> Backend {
+pub(crate) fn rung(probes: Rungs, deny_egress: bool, proxied: bool) -> Backend {
     if let Some(abi) = probes.landlock_abi {
-        if !deny_egress || abi >= LANDLOCK_NET_ABI {
+        // 0.48.0 — a proxied run needs the network rules for the same reason an
+        // egress-denying one does: without them this rung cannot scope outbound
+        // TCP at all, and a run whose policy names hosts would silently get every
+        // host. It is 0.47.0's rule with the second question added.
+        if (!deny_egress && !proxied) || abi >= LANDLOCK_NET_ABI {
             return Backend::LinuxLandlock;
         }
     }
-    if probes.bubblewrap {
-        return Backend::LinuxBubblewrap;
-    }
-    if probes.unshare {
-        return Backend::LinuxNamespaces;
+    // 0.48.0 — **the namespace rungs cannot serve a proxied run at all.** Both put
+    // the child in an empty network namespace, where the host's loopback is not
+    // reachable, so the proxy the run owns would be unreachable and the command
+    // would get no network rather than the hosts its policy names. A run that
+    // names hosts and finds no rung above them takes the boolean and reports the
+    // backend that applied — the weaker guarantee, said plainly, which is the same
+    // answer this chain has given since 0.47.0.
+    if !proxied {
+        if probes.bubblewrap {
+            return Backend::LinuxBubblewrap;
+        }
+        if probes.unshare {
+            return Backend::LinuxNamespaces;
+        }
     }
     Backend::PortableFloor
 }
@@ -97,7 +110,7 @@ impl Sandbox for LinuxSandbox {
         // a rule set the kernel refuses, a helper that is not there — falls to
         // the next one rather than failing the run, and every one of them
         // reports the backend that was actually applied.
-        match rung(probes(), !spec.allow_network) {
+        match rung(probes(), !spec.allow_network, spec.proxy.is_some()) {
             Backend::LinuxLandlock => {
                 if let Some(outcome) = landlock_run(&spec).await {
                     return outcome;
@@ -147,7 +160,7 @@ impl Sandbox for LinuxSandbox {
     /// stronger one costs them the boundary. The exact per-command answer is in
     /// [`SandboxOutcome::backend`] and in the `SandboxEvent` rows either way.
     fn backend(&self) -> Backend {
-        rung(probes(), true)
+        rung(probes(), true, false)
     }
 }
 
@@ -564,7 +577,7 @@ mod tests {
                 unshare,
             };
             assert_eq!(
-                rung(probes, deny_egress),
+                rung(probes, deny_egress, false),
                 expected,
                 "probes {probes:?}, deny_egress {deny_egress}"
             );
@@ -590,7 +603,7 @@ mod tests {
             bubblewrap: false,
             unshare: false,
         };
-        let under = |_mode: ExecMode| rung(probes, true);
+        let under = |_mode: ExecMode| rung(probes, true, false);
         assert_eq!(under(ExecMode::ReadOnly), Backend::LinuxLandlock);
         assert_eq!(under(ExecMode::WorkspaceWrite), Backend::LinuxLandlock);
         assert_eq!(under(ExecMode::FullAccess), Backend::LinuxLandlock);
@@ -600,6 +613,67 @@ mod tests {
     /// platform or to a rung the chain does not contain. Cheap, and it is what
     /// catches a variant added to `Backend` and wired into the chain by
     /// accident.
+    /// F8 — the rung a proxied run takes, as a table, decided without a host
+    /// (0.48.0).
+    ///
+    /// Two rules meet here. A proxied run needs Landlock's **network** rules, for
+    /// the same reason an egress-denying run does: without them the rung cannot
+    /// scope outbound TCP and the run would silently get every host. And the
+    /// namespace rungs cannot serve a proxied run **at all** — both put the child
+    /// in an empty network namespace where the host's loopback is unreachable, so
+    /// the proxy the run owns could not be dialled and the command would get no
+    /// network instead of the hosts its policy names.
+    ///
+    /// The negative control is the whole of 0.47.0's table: with `proxied` false,
+    /// every row must return exactly what it returned before this release.
+    #[test]
+    fn a_proxied_run_takes_a_rung_that_can_reach_its_proxy() {
+        let all = |abi, bubblewrap, unshare| Rungs {
+            landlock_abi: abi,
+            bubblewrap,
+            unshare,
+        };
+
+        // Landlock with the network rules serves a proxied run.
+        assert_eq!(
+            rung(all(Some(LANDLOCK_NET_ABI), true, true), false, true),
+            Backend::LinuxLandlock
+        );
+        // Below them it cannot, and neither can the namespace rungs — so a host
+        // with every other primitive still takes the floor and reports it.
+        assert_eq!(
+            rung(all(Some(3), true, true), false, true),
+            Backend::PortableFloor,
+            "a proxied run is never given a rung that cannot reach its proxy"
+        );
+        assert_eq!(
+            rung(all(None, true, true), false, true),
+            Backend::PortableFloor
+        );
+
+        // The negative control: with no proxy, every row is 0.47.0's answer.
+        for abi in [None, Some(1), Some(3), Some(4), Some(6)] {
+            for bubblewrap in [false, true] {
+                for unshare in [false, true] {
+                    for deny in [false, true] {
+                        let probes = all(abi, bubblewrap, unshare);
+                        let before = match abi {
+                            Some(a) if !deny || a >= LANDLOCK_NET_ABI => Backend::LinuxLandlock,
+                            _ if bubblewrap => Backend::LinuxBubblewrap,
+                            _ if unshare => Backend::LinuxNamespaces,
+                            _ => Backend::PortableFloor,
+                        };
+                        assert_eq!(
+                            rung(probes, deny, false),
+                            before,
+                            "abi {abi:?} bwrap {bubblewrap} unshare {unshare} deny {deny}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_chain_only_ever_returns_a_linux_rung_or_the_floor() {
         for abi in [None, Some(1), Some(3), Some(4), Some(6)] {
@@ -613,6 +687,7 @@ mod tests {
                                 unshare,
                             },
                             deny,
+                            false,
                         );
                         assert!(
                             matches!(
@@ -895,7 +970,7 @@ mod tests {
 
             if abi < LANDLOCK_NET_ABI {
                 assert_ne!(
-                    rung(probes(), true),
+                    rung(probes(), true, false),
                     Backend::LinuxLandlock,
                     "a kernel that cannot deny egress must not be handed a run that denies it"
                 );
@@ -1168,7 +1243,7 @@ mod tests {
     /// genuinely what is left.
     #[tokio::test]
     async fn a_host_with_no_working_rung_still_runs_and_reports_what_applied() {
-        let expected = rung(probes(), false);
+        let expected = rung(probes(), false, false);
         let dir = tempfile::tempdir().unwrap();
         let argv = vec!["sh".into(), "-c".into(), "echo hi".into()];
         let out = LinuxSandbox

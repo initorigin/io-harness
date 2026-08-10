@@ -4176,7 +4176,8 @@ async fn run_workspace_from<P: Provider>(
     // the prompt the loop falls back to when it ends is a different string already.
     // An approver's remembered rule is not reflected: it widens the boundary mid-run,
     // and a prompt composed once cannot follow it (`docs/CONTRACT.md`).
-    let after_planning = boundary_section(policy, &contract.exec_sandbox);
+    let after_planning =
+        boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
     let base_system = compose(PromptSpec {
         base: WORKSPACE_PROMPT,
         prompt: &contract.prompt,
@@ -4196,7 +4197,12 @@ async fn run_workspace_from<P: Provider>(
             skills,
             directive: Some(planning_directive(&contract.agents)),
             instructions: &contract.instructions,
-            boundary: boundary_section(&effective, &contract.exec_sandbox).as_deref(),
+            boundary: boundary_section(
+                &effective,
+                &contract.exec_sandbox,
+                will_proxy(&effective, contract),
+            )
+            .as_deref(),
             family: provider.prompt_family(),
             ending: CALL_TOOLS_ENDING,
         }),
@@ -5903,8 +5909,13 @@ fn run_agent<'f, P: Provider>(
         // while the phase is on. `policy` here is this agent's own — a child's is its
         // parent's narrowed by `Policy::contain` — so a child is told its boundary and
         // not the root's.
-        let after_planning = boundary_section(policy, &contract.exec_sandbox);
-        let while_planning = boundary_section(&effective, &contract.exec_sandbox);
+        let after_planning =
+            boundary_section(policy, &contract.exec_sandbox, will_proxy(policy, contract));
+        let while_planning = boundary_section(
+            &effective,
+            &contract.exec_sandbox,
+            will_proxy(&effective, contract),
+        );
         let agent_root = contract.root.as_deref().unwrap_or(&tree.root);
         let mut ws = Workspace::with_policy(agent_root, effective);
         // The tree shares one MCP session, so every agent in it — root or child —
@@ -7590,6 +7601,16 @@ fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::ExecMode> {
         EXEC_TOOL | SHELL_TOOL | SHELL_START_TOOL => None,
         _ => custom.get(name).and_then(|tool| tool.exec_mode()),
     }
+}
+
+/// Whether this run will route its contained commands through a proxy (0.48.0).
+///
+/// The same two questions [`start_egress_proxy`] asks, as a pure predicate, so the
+/// prompt's boundary section can say what the run is about to do without the
+/// listener having been started yet — and so the two can never disagree about
+/// whether a run is proxied.
+fn will_proxy(policy: &Policy, contract: &TaskContract) -> bool {
+    contract.exec_sandbox.mode.is_contained() && policy.names_hosts()
 }
 
 /// The run's egress proxy, when it needs one (0.48.0).
@@ -11867,7 +11888,7 @@ fn report_containment(
     ));
 }
 
-fn boundary_section(policy: &Policy, sandbox: &SandboxConfig) -> Option<String> {
+fn boundary_section(policy: &Policy, sandbox: &SandboxConfig, proxied: bool) -> Option<String> {
     let permissive = policy.is_permissive();
     if permissive && !sandbox.mode.is_contained() {
         return None;
@@ -11883,7 +11904,7 @@ fn boundary_section(policy: &Policy, sandbox: &SandboxConfig) -> Option<String> 
             lines.push(boundary_line(policy, act, label, defaults));
         }
     }
-    lines.push(containment_line(sandbox));
+    lines.push(containment_line(sandbox, proxied));
     Some(format!(
         "Your boundary. These are enforced before a call runs, so a call outside them is refused \
          rather than attempted — plan around them rather than finding them one refusal at a \
@@ -11961,7 +11982,7 @@ fn effect_label(effect: Effect) -> &'static str {
 /// the caller asked for: on a stock Ubuntu 24.04 the namespace backend is refused
 /// and the floor applies, and an agent told it is confined when it is not is worse
 /// informed than one told nothing (0.40.0).
-fn containment_line(config: &SandboxConfig) -> String {
+fn containment_line(config: &SandboxConfig, proxied: bool) -> String {
     if !config.mode.is_contained() {
         return "- Commands you run are not contained (mode: full-access): they run at this \
                 program's own privileges and may write anywhere this machine's user can write."
@@ -11981,20 +12002,37 @@ fn containment_line(config: &SandboxConfig) -> String {
     // Asked, not enumerated. This site listed the two resource-only backends by
     // name until 0.47.0, which is the shape that went wrong in four files at once
     // when the Linux chain added three rungs.
+    // 0.48.0 — what the egress half of this line may claim depends on whether the
+    // backend can scope the route out. Where it cannot, the proxy is an
+    // environment variable a command may ignore, and the word for that is
+    // *advisory*: saying anything stronger would be the defect 0.40.0 shipped,
+    // where every interface said contained and no machine enforced it.
+    let egress = match (proxied, backend.denies_egress()) {
+        (true, true) => {
+            " Outbound network goes through a proxy this run owns, which permits only the hosts \
+             this run's policy names."
+        }
+        (true, false) => {
+            " Outbound network is offered a proxy this run owns, but this backend cannot confine \
+             the route to it, so that boundary is advisory: a command that ignores the proxy \
+             settings reaches the network."
+        }
+        (false, _) => " Outbound network is permitted only where this run's policy permits it.",
+    };
     match backend.confines_writes() {
         false => format!(
             "- Commands you run are given resource limits only (mode: {}, backend: {}). This host \
-             provides no filesystem confinement and no outbound-network confinement for them, so \
-             neither is in force.",
-            config.mode.as_str(),
-            backend.as_str()
-        ),
-        true => format!(
-            "- Commands you run are contained (mode: {}, backend: {}): {}, and outbound network \
-             is permitted only where this run's policy permits it.",
+             provides no filesystem confinement for them, so that is not in force.{}",
             config.mode.as_str(),
             backend.as_str(),
-            where_writes_go
+            egress
+        ),
+        true => format!(
+            "- Commands you run are contained (mode: {}, backend: {}): {}.{}",
+            config.mode.as_str(),
+            backend.as_str(),
+            where_writes_go,
+            egress
         ),
     }
 }

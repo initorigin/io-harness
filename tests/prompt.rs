@@ -1103,3 +1103,93 @@ async fn a_classifying_turn_keeps_the_order_the_cache_boundary_reads() {
          the workspace prompt.\n--- user ---\n{user}"
     );
 }
+
+// ------------------------------------------------------------------------- F9
+//
+// 0.48.0 — where the backend cannot confine the route to the proxy, the proxy is
+// an environment variable a command may ignore. The word for that is *advisory*,
+// and the crate must say it: a boundary reported as enforced where it is not is
+// the defect 0.40.0 shipped for three matrix runs.
+
+/// The run's own words about its egress, on this host.
+async fn boundary_line_for(policy: &Policy, contract: &TaskContract) -> String {
+    let provider = Rec::new(vec![write_call()]);
+    let store = Store::memory().unwrap();
+    let _ = run_with(contract, &provider, &store, policy, &ApproveAll).await;
+    provider
+        .system()
+        .lines()
+        .find(|l| l.starts_with("- Commands you run"))
+        .expect("the boundary section names what commands get")
+        .to_string()
+}
+
+#[tokio::test]
+async fn a_proxied_run_says_whether_its_egress_boundary_is_enforced_or_advisory() {
+    use io_harness::sandbox::{select, Sandbox};
+    let dir = workspace();
+    // A policy that names a host is what makes a run proxied.
+    let policy = Policy::default().layer("test").allow_net("api.example.com");
+    let c = contract(dir.path()).with_contained_exec(SandboxConfig::new());
+
+    let line = boundary_line_for(&policy, &c).await;
+    let backend = select(&SandboxConfig::new()).backend();
+
+    if backend.denies_egress() {
+        assert!(
+            line.contains("proxy this run owns")
+                && line.contains("only the hosts this run's policy names"),
+            "an enforcing backend says what the proxy delivers: {line}"
+        );
+        assert!(
+            !line.contains("advisory"),
+            "and does not hedge what it does enforce: {line}"
+        );
+    } else {
+        assert!(
+            line.contains("advisory"),
+            "a backend that cannot confine the route says so in that word: {line}"
+        );
+    }
+}
+
+/// The advisory arm, forced rather than hoped for.
+///
+/// **A sabotage that failed nothing found this.** The test above branches on what
+/// this host's backend happens to be, and on a macOS development host that branch
+/// is always the enforcing one — so reporting the advisory case as enforced broke
+/// nothing. `floor_only()` is the one override that makes the weak case reachable
+/// everywhere, which is what turns "the crate says advisory when it must" from a
+/// claim into an assertion.
+#[tokio::test]
+async fn the_floor_is_told_its_proxy_is_advisory() {
+    let dir = workspace();
+    let policy = Policy::default().layer("test").allow_net("api.example.com");
+    let c = contract(dir.path()).with_contained_exec(SandboxConfig::new().floor_only());
+    let line = boundary_line_for(&policy, &c).await;
+    assert!(
+        line.contains("advisory") && line.contains("ignores the proxy"),
+        "the floor confines no route, and says so: {line}"
+    );
+    assert!(
+        !line.contains("only the hosts this run's policy names"),
+        "and never claims the boundary it does not have: {line}"
+    );
+}
+
+/// The negative control: a run whose policy names no host is not proxied, and its
+/// wording is what it was before this release.
+#[tokio::test]
+async fn a_run_that_names_no_host_is_not_told_about_a_proxy() {
+    let dir = workspace();
+    let c = contract(dir.path()).with_contained_exec(SandboxConfig::new());
+    let line = boundary_line_for(&Policy::default(), &c).await;
+    assert!(
+        !line.contains("proxy") && !line.contains("advisory"),
+        "no proxy is started and none is described: {line}"
+    );
+    assert!(
+        line.contains("only where this run's policy permits it"),
+        "0.47.0's wording survives for an unproxied run: {line}"
+    );
+}
