@@ -1,449 +1,260 @@
 product: io-harness
-version: 0.47.0
+version: 0.48.0
 tasks:
-- id: US-IO-HARNESS-0.47.0-T01
-  summary: Name the three new backends and decide the chain in one pure function.
-  why_required: Every rung below reports one of these labels and is reached through this decision. Until
-    the variants exist and the chain is a testable function, no rung can be selected, reported or ordered.
-  status: done
+- id: US-IO-HARNESS-0.48.0-T01
+  summary: Declare the mode each spawning tool needs and resolve it before the spawn.
+  why_required: Every later task runs a command under a mode, and until the declaration and the narrower-of-two
+    resolution exist there is nothing for the git built-ins or the handles to be contained under. It is
+    also the only task that adds a public trait method, so it settles the break surface first.
+  status: todo
   depends_on: []
   acceptance_criteria:
-  - '**F3 — the chain''s order is a table, decided without a host.** A pure test over the decision function
-    for every combination of the four probe answers, the three modes and both egress answers: the strongest
-    serviceable rung is returned; `PortableFloor` only when nothing above it can serve; and the ABI-3
-    Landlock host on an egress-denying run returns the next rung down rather than Landlock. Sabotage:
-    order bubblewrap ahead of Landlock, under which the Landlock-available rows return the wrong rung
-    and only this fails.
+  - '**F5 — a call runs under the narrower of what it needs and what it was granted.** A read-only built-in
+    dispatched under a run granting `WorkspaceWrite` runs under `ReadOnly`: a write it attempts inside
+    the workspace is refused, while the same run''s `exec` writing there succeeds in the same step. Sabotage:
+    resolve to the granted mode rather than the narrower one, under which the read-only tool''s write
+    lands and only this fails.
 
     '
-  - '**N3 — zero compile breaks, and `docs/public-api.txt` is byte-identical.** The only public additions
-    are three `Backend` variants and their `as_str` arms, and the checker (`tests/docs_drift.rs`) enumerates
-    items rather than variants — `enum Backend src/sandbox.rs` is one line at `docs/public-api.txt:69`
-    whether the enum has four variants or seven. **The number is stated at plan time as "unchanged"**
-    because a criterion promising a line count has been met in a different form in four of the last nine
-    releases, and because byte-identical is the stronger claim.
-
-    '
-  files:
-  - src/sandbox.rs
-  - tests/sandbox.rs
-  evidence:
-  - '`Backend::LinuxLandlock`, `Backend::LinuxBubblewrap` and `Backend::WindowsAppContainer` added with
-    the labels `linux-landlock`, `linux-bubblewrap` and `windows-appcontainer`. `Backend` was already
-    `#[non_exhaustive]`, and no internal match needed a new arm beyond `as_str` — the crate compiles and
-    clippy is clean with `--all-targets`.'
-  - 'F3 — `sandbox::linux::rung(Rungs, deny_egress) -> Backend` decides the chain as a pure function over
-    the four probe answers. Three named tests pass on the macOS development host: `the_chain_takes_the_strongest_rung_that_can_serve_the_run`
-    (15-row table), `the_mode_does_not_decide_which_rung_a_host_takes`, `the_chain_only_ever_returns_a_linux_rung_or_the_floor`.
-    29 of 29 `sandbox::` unit tests pass.'
-  - 'F3 sabotage — ordering bubblewrap ahead of Landlock in `rung` failed `the_chain_takes_the_strongest_rung_that_can_serve_the_run`
-    by assertion (`left: LinuxBubblewrap, right: LinuxLandlock` at `src/sandbox/linux.rs:331`), not by
-    compile error. Reverted by hand and re-run green.'
-  - The sabotage also failed `the_mode_does_not_decide_which_rung_a_host_takes`, which meant that test
-    was incidentally asserting the chain's order. Its probe set was narrowed to Landlock alone so each
-    criterion's failure names one cause. Reported rather than left as over-determination.
-  - N3 — `docs/public-api.txt` is byte-identical (`git diff --stat` empty) and `tests/docs_drift.rs` passes
-    15 of 15. The checker enumerates items, not variants, exactly as the contract stated at plan time.
-- id: US-IO-HARNESS-0.47.0-T02
-  summary: 'Build the Landlock rung: a filesystem ruleset applied between fork and exec, with no wrapper
-    process.'
-  why_required: This is the rung that turns a stock Ubuntu host from enforcing nothing into confining
-    writes. Without it the chain has nothing above the existing namespace backend and the release delivers
-    nothing on the hosts it exists for.
-  status: in-progress
-  depends_on:
-  - US-IO-HARNESS-0.47.0-T01
-  acceptance_criteria:
-  - '**F1 — on a host with the Ubuntu default restriction in place, a contained run confines its writes.**
-    Driven end to end from `TaskContract::workspace(goal, root)` with no builder call: a command writing
-    to an absolute path outside the granted roots is refused and the file does not exist afterwards; a
-    command writing inside the workspace root succeeds; and `select(&config).backend()` reports `linux-landlock`.
-    Run on a CI leg that does **not** set `kernel.apparmor_restrict_unprivileged_userns=0`. On today''s
-    build the same test reports `portable-floor` and the outside write lands. Sabotage: return the floor
-    from the chain when the namespace probe fails, which is today''s behaviour, under which both arms
-    fail and only this fails.
-
-    '
-  - '**F4 — every rung is proven to enforce, with the rung pinned.** For each of Landlock, bubblewrap
-    and the existing namespace rung, on a host that has it: a write outside the granted roots is refused,
-    a write inside lands, and the run''s own outcome carries the failure to the model rather than erroring
-    the run. Pinned for the test rather than left to the host''s answer, so a host that would have chosen
-    a different rung still asserts the one under test, and skipped with a stated reason — never silently
-    — where the primitive is absent. Sabotage: build each rung''s rule set from an empty root list, under
-    which the inside write is refused too and each arm fails on its own.
-
-    '
-  - '**F5 — `ReadOnly` withholds the workspace on every new rung.** A command writing into the workspace
-    root fails and a command reading the same file succeeds, under Landlock and under bubblewrap, with
-    the system temporary directory still writable in both. This is the mode whose entire difference is
-    one directory, so it is asserted per rung rather than once. Sabotage: include the workdir in the writable
-    set unconditionally, under which the write lands and only this fails.
-
-    '
-  - '**F6 — the Landlock rung installs no wrapper, and that is asserted rather than described.** The argv
-    the backend spawns is byte-identical to the argv the caller asked for — no `unshare`, no `sh`, no
-    `bwrap` — and `SandboxOutcome::argv` records exactly that. A payload that does not exist on `PATH`
-    therefore fails as a missing program rather than as the wrapper''s non-zero exit, and a `shell` stage
-    whose own `cd` is expressed through `Command::current_dir` runs in the directory it named. The second
-    half is 0.46.0''s defect asserted at its root cause on the rung where it cannot recur. Sabotage: wrap
-    the payload in `sh -c` on this rung, under which the argv assertion and the missing-program assertion
-    both fail and only this fails.
+  - '**N3 — zero compile breaks, and `docs/public-api.txt` is unchanged.** The public additions are a
+    defaulted trait method, one `EventKind` variant, and one `RunSpec` builder — and the checker (`tests/docs_drift.rs`)
+    enumerates crate-root items rather than methods or variants, so the file is byte-identical. **The
+    number is stated at plan time as "unchanged"**, because a criterion promising a line count has been
+    met in a different form in four of the last ten releases and byte-identical is the stronger claim.
 
     '
   files:
-  - src/sandbox/linux.rs
-  - src/sandbox/landlock.rs
-  - src/sandbox.rs
-  - tests/sandbox.rs
-  - tests/exec_contained.rs
-  evidence:
-  - '`src/sandbox/landlock.rs` added. The rule *plan* is portable data with no descriptor in it — `fs_rights_for`,
-    `net_rights_for`, `plan` — and the syscalls that create and apply a rule set are `cfg(target_os =
-    "linux")`, following the same split `linux.rs` and `windows.rs` already use.'
-  - 'The rung installs its restriction in the child through the shared runner''s existing `configure`
-    hook (`tokio::process::Command::pre_exec`), so it spawns **no wrapper**: `Ruleset::build` does every
-    allocating step in the parent and what runs between fork and exec is `prctl(PR_SET_NO_NEW_PRIVS)`
-    plus one `landlock_restrict_self`.'
-  - 'F4/F5 host-free half proven on the macOS development host: `the_plan_grants_the_same_list_the_mount_setup_binds`,
-    `read_only_withholds_the_workdir_and_keeps_the_temp_directory`, `each_abi_gets_exactly_the_rights_its_kernel_knows`,
-    `no_rule_asks_for_a_right_the_ruleset_does_not_handle`. 34 of 34 `sandbox::` unit tests pass; `cargo
-    clippy --lib --all-targets -- -D warnings` reports nothing; `cargo fmt --check` clean.'
-  - '**The Linux-only half was type-checked against `x86_64-unknown-linux-gnu` without a matrix round.**
-    `cargo check --target` is blocked by rusqlite''s bundled C needing a cross `gcc` — the environment
-    limit already recorded in `src/sandbox.rs` — so the module was compiled standalone with `rustc --target
-    x86_64-unknown-linux-gnu --emit=metadata --test` against the target''s own `liblibc` rmeta, with a
-    shim supplying `ExecMode` and `LANDLOCK_NET_ABI`. Exit 0, tests included. This is a technique worth
-    reusing: it costs seconds and it is the only local evidence available for a `cfg(linux)` body.'
-  - '`landlock_path_beneath_attr` is `#[repr(C, packed)]` and asserted to be 12 bytes with alignment 1.
-    A `#[repr(C)]` version is 16 bytes with `parent_fd` after four bytes of padding, so the kernel would
-    read the descriptor out of padding and fail `EINVAL` on a call whose every line reads correctly.'
-  - '**Not yet proven, and this is the honest state of the task**: F1, F4''s Landlock arm, F5''s Landlock
-    arm and F6 all need a Linux host. Nothing on this rung''s enforcement — that a write outside the granted
-    roots is actually refused — can be evaluated on the macOS development host, exactly as the contract''s
-    `resource_profile` predicted. Marked `in-progress` rather than `done` until the matrix says so.'
-  - 'F1/F4/F5/F6 arms written where they can pin the rung: `sandbox::linux::tests::landlock_rung`, a `cfg(target_os
-    = "linux")` module inside the crate. They live in `src/` rather than `tests/` because a criterion
-    that pins a rung must reach it, and the alternative — an environment variable the production selection
-    path reads — would be an ambient way to downgrade containment. Every arm returns early with a printed
-    reason on a host with no Landlock rather than passing quietly.'
-  - '`tests/sandbox.rs::selection_picks_native_on_this_host_and_floor_when_forced` was changed because
-    the behaviour deliberately changed: up to 0.46.0 a Linux host had exactly two possible answers and
-    pinning against `unshare`''s exit status was exact, and a host with Landlock and no usable user namespace
-    now correctly reports `LinuxLandlock` where the old assertion demanded the floor. What remains exactly
-    assertable is kept — a host whose `unshare` wrapper works must never report the floor.'
-  - '`IO_HARNESS_EXPECT_BACKEND` added as a **test-only assertion** (`the_host_reports_the_backend_its_ci_leg_expects`).
-    Nothing in the crate reads it and no environment can weaken a boundary through it; it exists so a
-    CI leg configured to exercise one rung fails loudly if the chain answers differently.'
-  - The `cfg(target_os = "linux")` test module was type-checked on the macOS host by temporarily widening
-    its cfg to include macOS, running `cargo check --lib --tests` (clean), and reverting. A second local
-    compile round bought for seconds.
-- id: US-IO-HARNESS-0.47.0-T03
-  summary: Restrict outbound TCP on the Landlock rung where the kernel has the network rules, and enforce
-    the egress honesty rule.
-  why_required: A run that denies egress must not be handed a rung that cannot deny egress. Without the
-    network access flags and the ABI negotiation that masks them down, the chain would either claim a
-    denial it never applied or fail ruleset creation on an older kernel.
-  status: in-progress
-  depends_on:
-  - US-IO-HARNESS-0.47.0-T02
-  acceptance_criteria:
-  - '**F2 — the Landlock rung refuses `connect` when the run denies egress and the kernel has the network
-    rules.** A contained command dialling a listener the test itself started on loopback is refused with
-    a connection error, while the same command under a run whose policy permits egress connects. On a
-    kernel whose negotiated ABI is below 4 the test asserts instead that the rung was **not** taken for
-    the egress-denying run — the honesty rule, asserted rather than skipped, which is 0.40.0''s lesson
-    about a test that steps over a fallback. Sabotage: request the network access flags unconditionally
-    rather than dropping them below ABI 4, under which the ruleset creation fails on an older kernel and
-    the rung wrongly reports success; and separately, allow the rung for an egress-denying run below ABI
-    4, under which the loopback dial succeeds and only this fails.
-
-    '
-  files:
-  - src/sandbox/landlock.rs
-  - src/sandbox.rs
-  - tests/net.rs
-  - tests/sandbox.rs
-  evidence:
-  - The network half is `landlock::net_rights_for(abi, deny_egress)` feeding `RulesetAttr::handled_access_net`,
-    and **no network rule is ever added** — handling `CONNECT_TCP` and `BIND_TCP` while granting no port
-    is how Landlock spells no route out, the same shape as an empty net namespace and the Windows container's
-    empty capability array.
-  - The ABI is negotiated by asking the kernel and every request is masked down to it, so a kernel below
-    the network ABI is never sent a flag it would refuse the whole rule set for. Asserted host-free by
-    `network_rights_are_asked_for_only_when_they_can_be_enforced` and `each_abi_gets_exactly_the_rights_its_kernel_knows`.
-  - 'The egress honesty rule lives in `sandbox::linux::rung` and nowhere else, and is asserted by F3''s
-    table: `((Some(3), true, true, true), LinuxBubblewrap)` and `((Some(3), false, true, true), LinuxNamespaces)`
-    — a kernel that cannot deny egress is not handed a run that denies it.'
-  - 'F2''s rung-level arm written as `egress_is_denied_only_where_the_kernel_can_enforce_it`: a loopback
-    listener the test starts, dialled through bash''s `/dev/tcp` so no network tool need be installed
-    on the runner, asserted refused under an egress-denying run and permitted under an egress-permitting
-    one. On a kernel below ABI 4 it asserts the honesty rule itself rather than skipping the connection.'
-  - '**Not yet proven**: the live connection arms need a Linux host with Landlock ABI 4 or later. Pending
-    the matrix.'
-- id: US-IO-HARNESS-0.47.0-T04
-  summary: Install the seccomp deny-list on the Landlock rung, per architecture, returning EPERM.
-  why_required: The roadmap entry names a namespace-free filesystem AND syscall restriction. Without it
-    the rung leaves a payload able to undo its own confinement, and the crate's standing confession that
-    it installs no filter would still be true.
-  status: in-progress
-  depends_on:
-  - US-IO-HARNESS-0.47.0-T02
-  acceptance_criteria:
-  - '**F8 — the seccomp deny-list refuses a named syscall and refuses it with `EPERM`.** On the Landlock
-    rung, a contained command invoking one of the denied syscalls directly fails with `EPERM` and the
-    process is **not** killed — the distinction matters, because a filter that killed would be indistinguishable
-    from a crash in the payload and would tell the model nothing. A command invoking a syscall that is
-    not on the list, and every command the crate''s own gates run, completes normally. On an architecture
-    with no syscall table the test asserts that the rung was taken **without** the filter and that this
-    is what the backend reports, rather than skipping. Sabotage: return `SECCOMP_RET_KILL_PROCESS` instead
-    of the errno, under which the first arm sees a signal rather than a failed call and only this fails.
-
-    '
-  files:
-  - src/sandbox/seccomp.rs
-  - src/sandbox/landlock.rs
-  - tests/sandbox.rs
-  evidence:
-  - '`src/sandbox/seccomp.rs` — a BPF program installed in the same `pre_exec` as the Landlock rule set
-    and after it, because `landlock::restrict_self` sets the `PR_SET_NO_NEW_PRIVS` that installing a filter
-    also requires.'
-  - '**The syscall numbers are `libc`''s own per-architecture `SYS_*` constants and are never written
-    out as numbers.** A hand-copied table is the one mistake in this module that would be invisible —
-    a wrong number denies some other syscall, on one architecture, and the symptom is a build failing
-    for no stated reason. Naming them makes a missing constant a compile error.'
-  - 'F11''s host-free half: `every_comparison_jumps_to_the_refusal` checks the jump arithmetic instruction
-    by instruction, which is the part of an assembled BPF program that is silently rather than loudly
-    wrong — a bad offset produces a filter the kernel accepts and that refuses the wrong call. It also
-    asserts the refusal is `SECCOMP_RET_ERRNO(EPERM)` and not a kill. `the_denied_set_is_the_documented_one`
-    asserts the list''s size and that `openat` and `execve` are absent.'
-  - '**Type-checked for BOTH Linux architectures without a matrix round, and aarch64 was worth checking.**
-    The standalone `rustc --target ... --emit=metadata --test` technique was run for `x86_64-unknown-linux-gnu`
-    (exit 0) and for `aarch64-unknown-linux-gnu` (exit 0, after `rustup target add` and building `libc`
-    alone for it). **CI has no ARM Linux leg**, so a `SYS_*` constant missing on aarch64 would have compiled
-    nowhere in the matrix and shipped. All 13 resolve on both.'
-  - 'Stated limitation, in the module doc rather than discovered: the filter is written in the host architecture''s
-    numbers, so a process under a foreign personality is allowed through rather than denied by coincidence.
-    The architecture guard jumps to `allow`, asserted by the jump test. This layer hardens; the Landlock
-    rule set beside it is the boundary.'
-  - '**Not yet proven**: that a denied syscall actually returns `EPERM` on a live kernel. Pending the
-    matrix.'
-- id: US-IO-HARNESS-0.47.0-T05
-  summary: Add the bubblewrap rung beneath Landlock, probed by spawning the wrapper it builds.
-  why_required: A setuid bwrap works on hosts whose kernel refuses an unprivileged user namespace, which
-    is exactly where the existing rung fails and where Landlock may be absent. Without it the chain skips
-    from Landlock to a backend the host has already refused.
-  status: in-progress
-  depends_on:
-  - US-IO-HARNESS-0.47.0-T01
-  acceptance_criteria:
-  - '**F4 — every rung is proven to enforce, with the rung pinned.** For each of Landlock, bubblewrap
-    and the existing namespace rung, on a host that has it: a write outside the granted roots is refused,
-    a write inside lands, and the run''s own outcome carries the failure to the model rather than erroring
-    the run. Pinned for the test rather than left to the host''s answer, so a host that would have chosen
-    a different rung still asserts the one under test, and skipped with a stated reason — never silently
-    — where the primitive is absent. Sabotage: build each rung''s rule set from an empty root list, under
-    which the inside write is refused too and each arm fails on its own.
-
-    '
-  - '**F5 — `ReadOnly` withholds the workspace on every new rung.** A command writing into the workspace
-    root fails and a command reading the same file succeeds, under Landlock and under bubblewrap, with
-    the system temporary directory still writable in both. This is the mode whose entire difference is
-    one directory, so it is asserted per rung rather than once. Sabotage: include the workdir in the writable
-    set unconditionally, under which the write lands and only this fails.
-
-    '
-  files:
-  - src/sandbox/linux.rs
-  - src/sandbox.rs
-  - tests/sandbox.rs
-  evidence:
-  - '`bwrap_argv` / `bwrap_works` / `bwrap_run` in `src/sandbox/linux.rs`. The argv binds `/` read-only,
-    binds each writable root back over it, populates `/proc` and `/dev`, adds `--unshare-net` when egress
-    is denied, `--die-with-parent`, and `--chdir` the run''s own workdir — with the payload as trailing
-    arguments after `--`, never interpolated.'
-  - 'The probe is a spawn of the exact wrapper this rung builds, not a `PATH` lookup: a `bwrap` without
-    the setuid bit on a kernel that refuses unprivileged user namespaces is present and useless, and that
-    is precisely the host this rung exists for.'
-  - '`wrapper_failure` gained the `bwrap:` prefix rather than a second copy of itself. The rule is about
-    wrappers in general and two copies is two places for it to drift.'
-  - 'Host-free arms pass on the macOS development host: `the_bwrap_argv_binds_the_tree_read_only_and_the_roots_back`
-    (including that the read-only bind precedes the writable ones, or the roots would be covered by it
-    rather than overriding it), `the_bwrap_argv_withholds_the_workdir_under_read_only`, `a_bwrap_setup_failure_is_a_wrapper_failure`.
-    37 of 37 `sandbox::` unit tests; clippy `-D warnings` clean; `cargo fmt --check` clean.'
-  - 'This rung is portable Rust with no `cfg` on it, so unlike the Landlock rung it compiles and unit-tests
-    on the development host directly. **Not yet proven**: enforcement on a host that actually has `bwrap`.
-    Pending the matrix.'
-- id: US-IO-HARNESS-0.47.0-T08
-  summary: Make every degradation complete the run and report the backend that was actually applied.
-  why_required: A rung that names an isolation it did not apply is the defect this crate shipped in 0.40.0
-    for three matrix runs. Without this the chain multiplies that surface by four and a caller reading
-    the trace is misled rather than informed.
+  - src/tools/custom.rs
+  - src/tools/mod.rs
+  - src/run.rs
+  - tests/exec_mode.rs
+  evidence: []
+- id: US-IO-HARNESS-0.48.0-T02
+  summary: Contain the six git built-ins under their declared mode.
+  why_required: '`Git::run` spawns `git` directly with no rung, so a run''s boundary today depends on
+    which tool the model picked. The release''s claim that everything a run starts is inside the boundary
+    is false until this spawn site is inside it.'
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.47.0-T02
-  - US-IO-HARNESS-0.47.0-T05
-  - US-IO-HARNESS-0.47.0-T06
+  - US-IO-HARNESS-0.48.0-T01
   acceptance_criteria:
-  - '**F7 — every degradation completes the run and reports the weaker backend.** A Linux host with no
-    rung above the floor runs to completion and reports `portable-floor`, `EventKind::Contained` carries
-    the backend that was applied, and `FullAccess` still reports `full-access` with no ruleset at all.
-    Sabotage: return an error from the backend instead of degrading, under which the run fails and only
-    this fails.
+  - '**F4 — the git built-ins are contained, and `git_commit` under a mode that withholds the workspace
+    is refused before it spawns.** Under `ExecMode::WorkspaceWrite` a `git_commit` succeeds and its `SandboxEvent`
+    rows name the backend that applied; under `ExecMode::ReadOnly` the call is refused with an observation
+    naming the tool, the mode it needs and the mode the run grants, **and no `git` process is spawned**
+    — asserted by the absence of an `"exec"` sandbox row for it, not by the refusal text alone. Sabotage:
+    resolve the declared mode after the spawn rather than before, under which the row exists and the refusal
+    arrives as an errno, and only this fails.
 
     '
-  - '**N4 — no durable state moves.** `git diff main -- src/state.rs` is **empty**: no table, column,
-    index or reader, and `CHECKPOINT_FORMAT` unmoved at 7. No `EventKind` variant is added; the new backends
-    travel through `Contained`''s existing `backend` field and the existing `SandboxEvent` rows.
+  files:
+  - src/tools/git.rs
+  - src/run.rs
+  - tests/exec_mode.rs
+  evidence: []
+- id: US-IO-HARNESS-0.48.0-T03
+  summary: Contain a `shell_start` handle, per stage, with the resource caps and not the wall clock.
+  why_required: This is the execution path the release is named for and the one `docs/CONTRACT.md` documents
+    as uncontained. Without it an agent contains `exec` and escapes with `shell_start`.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.48.0-T01
+  acceptance_criteria:
+  - '**F1 — a `shell_start` handle cannot write outside its granted roots.** Driven end to end from `TaskContract::workspace(goal,
+    root)` with no builder call: a line started through `shell_start` that writes to an absolute path
+    outside the workspace leaves no file, `shell_poll` shows the failure, and the same line started under
+    `with_full_access()` writes it. Asserted on the filesystem, never on the presence of a `ShellSandbox`.
+    Sabotage: pass `None` for the handle''s sandbox, which is today''s behaviour, under which the outside
+    file appears and only this fails.
+
+    '
+  - '**F2 — every stage of a handle is contained, not only the first.** A two-stage line whose *second*
+    stage writes outside the granted roots leaves no file, and the same line''s first stage still reaches
+    the second — the pipe is intact. This is asserted separately from F1 because a one-stage test passes
+    for an implementation that wraps only the head. Sabotage: wrap the first stage only, under which the
+    second stage''s write lands and only this fails.
+
+    '
+  - '**F3 — a handle takes the resource caps and not the wall clock.** Under a `SandboxConfig` whose `max_wall_secs`
+    is short, a handle started before that deadline is still running and still polled after it, while
+    a foreground `shell` line under the same config is killed and reported as a cap hit naming the resource.
+    The memory cap still applies to a handle, asserted by a stage that exceeds it being killed. Sabotage:
+    apply `max_wall_secs` to a handle, under which the handle is dead at the second poll and only this
+    fails.
+
+    '
+  files:
+  - src/tools/shell.rs
+  - src/run.rs
+  - tests/handles.rs
+  evidence: []
+- id: US-IO-HARNESS-0.48.0-T04
+  summary: Build the loopback egress proxy the run owns, and record every dial.
+  why_required: Per-host egress has no mechanism at all until a component exists that can be asked about
+    a host. It is also the release's only new long-lived resource, so its lifetime and shutdown are settled
+    before anything depends on it.
+  status: todo
+  depends_on: []
+  acceptance_criteria:
+  - '**F6 — a contained command reaches a permitted host and is refused a denied one, through the proxy.**
+    Two loopback listeners the test starts, a policy permitting one and not the other, and one contained
+    command dialling both: the first returns the listener''s bytes, the second is refused, `policy_events`
+    carries a `net` row per dial with the effect and the deciding layer, and a `SandboxEvent` of kind
+    `"dial"` names each `host:port`. On a host with no proxy-capable rung the test asserts instead that
+    the run took the boolean and that `EventKind::Contained` reported the backend that applied — the honesty
+    rule asserted rather than skipped, which is 0.40.0''s lesson about a test that steps over a fallback.
+    Sabotage: answer every `CONNECT` with `200` without consulting the policy, under which the denied
+    host is reached and only this fails.
+
+    '
+  - '**O3 — no test leaves a handle, a listener or a proxy running.** The proxy''s task ends with the
+    run that owns it, asserted by a test that starts a run with a proxy, ends it, and finds the port closed.
+    This is the same class of leak the handle registry exists to prevent and it gets the same treatment.
+
+    '
+  files:
+  - src/sandbox/proxy.rs
+  - src/sandbox.rs
+  - src/observe.rs
+  - src/state.rs
+  - src/run.rs
+  - tests/egress.rs
+  evidence: []
+- id: US-IO-HARNESS-0.48.0-T05
+  summary: Scope the sandbox to the proxy and nothing else, and put it in the command's environment.
+  why_required: A proxy a payload can dial past is a convention, not a boundary. This task is what makes
+    the difference, and F7 is the only criterion that can tell the two apart.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.48.0-T04
+  acceptance_criteria:
+  - '**F7 — the proxy is the only route out.** Under a run whose policy names hosts, a contained command
+    dialling a permitted host **directly**, with the proxy environment stripped from its own environment,
+    is refused by the sandbox rather than connecting — on a rung that can be address-scoped or port-scoped.
+    This is the criterion that separates a boundary from a convention, and on a rung that can enforce
+    neither it asserts the run did not take that rung for a per-host policy. Sabotage: emit `(allow network*)`
+    alongside the loopback rule, under which the direct dial succeeds and only this fails.
+
+    '
+  files:
+  - src/sandbox/macos.rs
+  - src/sandbox/linux.rs
+  - src/sandbox.rs
+  - tests/egress.rs
+  evidence: []
+- id: US-IO-HARNESS-0.48.0-T06
+  summary: Prefer a proxy-capable rung for a run whose policy names hosts.
+  why_required: The namespace rungs cannot reach the host's loopback, so without this a per-host run is
+    silently given a rung that cannot serve it. This is the honesty rule of the release and it is decided
+    in one pure function.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.48.0-T05
+  acceptance_criteria:
+  - '**F8 — the rung preference is a table, decided without a host.** A pure test over the decision function
+    for every combination of probe answers, mode, egress answer and *whether the policy names hosts*:
+    a per-host run returns a proxy-capable rung where one exists, returns the boolean rung with the flattened
+    answer where none does, and a run with no per-host rules returns exactly what 0.47.0''s table returned
+    — the negative control that must not move. Sabotage: prefer the namespace rung for a per-host run,
+    under which the per-host rows return a rung that cannot reach the proxy and only this fails.
+
+    '
+  files:
+  - src/sandbox/linux.rs
+  - src/sandbox.rs
+  - tests/egress.rs
+  evidence: []
+- id: US-IO-HARNESS-0.48.0-T07
+  summary: Report the proxy as advisory where it is advisory.
+  why_required: On the portable floor and on Windows the proxy is an environment variable and nothing
+    more. A boundary that is reported as enforced where it is not is the defect 0.40.0 shipped, and this
+    release must not repeat it.
+  status: todo
+  depends_on:
+  - US-IO-HARNESS-0.48.0-T05
+  acceptance_criteria:
+  - '**F9 — on the floor and on Windows the proxy is reported as advisory.** The run completes, the environment
+    carries the proxy variables, `EventKind::Contained` names the backend that applied, and the crate''s
+    own report says the egress boundary is advisory on that backend rather than enforced. A payload that
+    ignores the variables reaches the network, and the test asserts that this is what the crate says will
+    happen. Sabotage: report the per-host boundary as enforced on the floor, under which the assertion
+    on the reported wording fails and only this fails.
 
     '
   files:
   - src/sandbox.rs
-  - src/sandbox/linux.rs
-  - src/sandbox/windows.rs
   - src/run.rs
-  - tests/observe.rs
+  - tests/egress.rs
   evidence: []
-- id: US-IO-HARNESS-0.47.0-T09
-  summary: Add the Linux CI leg that leaves the Ubuntu userns restriction in place, in both workflow files,
-    and guard it.
-  why_required: Every existing Linux leg unsets the restriction, so the rung a real user gets is exercised
-    nowhere. Without this leg F1 is asserted only on a host configured to avoid the problem the release
-    exists to fix.
-  status: done
-  depends_on:
-  - US-IO-HARNESS-0.47.0-T02
-  acceptance_criteria:
-  - '**O1 — the full suite passes on all three platforms**, which the standing CI matrix already runs,
-    plus the new Linux leg with `kernel.apparmor_restrict_unprivileged_userns` at Ubuntu''s default. The
-    existing Linux legs keep the sysctl line in **both** `ci.yml` and `release.yml` (trap 87), so the
-    namespace rung is still exercised somewhere and F4''s namespace arm is not silently skipped everywhere.
-
-    '
-  - '**O3 — `tests/ci_workflow.rs` covers the new leg in both workflow files.** The guard asserts that
-    a Linux leg without the sysctl exists in `ci.yml` and in `release.yml`, and that the legs which do
-    carry it still do. Trap 87 is that a guard reads one file; this criterion names both.
-
-    '
-  files:
-  - .github/workflows/ci.yml
-  - .github/workflows/release.yml
-  - tests/ci_workflow.rs
-  evidence:
-  - 'O1/O3 — a `contained-linux` job added to **both** `ci.yml` and `release.yml`, running on `ubuntu-latest`
-    with **no** `sysctl` step, so it exercises the configuration a real user is actually in. It sets `IO_HARNESS_EXPECT_BACKEND:
-    linux-landlock` and `tests/sandbox.rs` fails if the chain answers otherwise. It also logs the host''s
-    userns sysctl and `/sys/kernel/security/lsm` so a reader of the log sees which state the leg ran in
-    rather than inferring it from an absence.'
-  - '`release.yml`''s `release` job names `contained-linux` in its `needs:`, so a tree that fails the
-    new gate cannot be published — the property 0.36.1''s parallel split was most at risk of losing.'
-  - 'Three guards added to `tests/ci_workflow.rs`, each naming **both** files explicitly: the leg exists
-    and states its expected rung, the legs that restore the namespace still do so somewhere (the new leg
-    is an addition, not a replacement, or the namespace rung would be tested nowhere), and the release
-    job names the gate. Trap 87 is that a guard written for one workflow file cannot see its sibling.'
-  - 'Sabotage: removing `contained-linux` from the release job''s `needs:` failed `the_release_job_will_not_ship_past_the_contained_leg`
-    by assertion and nothing else. Reverted by hand and re-run green — 9 of 9.'
-- id: US-IO-HARNESS-0.47.0-T10
+- id: US-IO-HARNESS-0.48.0-T08
   summary: Bring every documentation surface to what the code now does.
-  why_required: Two platform tables, the crate-root prose and the README all currently state that Windows
-    confines nothing and that Linux depends on a namespace. Leaving them is shipping a release whose own
-    documentation contradicts it.
-  status: done
+  why_required: '`docs/CONTRACT.md` states that handles are uncontained and `src/state.rs:809` states
+    that there is no dial to observe. Both become false in this release, and a checked-in surface that
+    contradicts the code is a defect the drift tests exist to catch.'
+  status: todo
   depends_on:
-  - US-IO-HARNESS-0.47.0-T03
-  - US-IO-HARNESS-0.47.0-T04
-  - US-IO-HARNESS-0.47.0-T05
-  - US-IO-HARNESS-0.47.0-T07
-  - US-IO-HARNESS-0.47.0-T08
+  - US-IO-HARNESS-0.48.0-T03
+  - US-IO-HARNESS-0.48.0-T07
   acceptance_criteria:
-  - '**O4 — the documentation surfaces agree with the code, in the same release.** Both `docs/CONTRACT.md`
-    platform tables, the `src/lib.rs` platform prose, the README''s table and `CHANGELOG.md` describe
-    the chain and what each rung does and does not enforce. `tests/docs_drift.rs` and `tests/changelog.rs`
-    pass. **No surface claims a Windows filesystem or network boundary**, and the Windows row still reads
-    "native resource containment only" — the deferral is a documentation criterion of this release, not
-    an omission from it.
+  - '**O4 — the documentation surfaces agree with the code, in the same release.** `docs/CONTRACT.md`
+    no longer states that handles are uncontained, states what a handle''s caps are and are not, states
+    per rung what the proxy proves and what it does not, and uses the word "advisory" where it is advisory.
+    `src/lib.rs`, the README table and `CHANGELOG.md` agree, and `tests/docs_drift.rs` and `tests/changelog.rs`
+    pass.
 
     '
-  - '**N3 — zero compile breaks, and `docs/public-api.txt` is byte-identical.** The only public additions
-    are three `Backend` variants and their `as_str` arms, and the checker (`tests/docs_drift.rs`) enumerates
-    items rather than variants — `enum Backend src/sandbox.rs` is one line at `docs/public-api.txt:69`
-    whether the enum has four variants or seven. **The number is stated at plan time as "unchanged"**
-    because a criterion promising a line count has been met in a different form in four of the last nine
-    releases, and because byte-identical is the stronger claim.
+  - '**N4 — no durable state moves.** `git diff main -- src/state.rs` shows **no DDL**: no table, column
+    or index, and `CHECKPOINT_FORMAT` unmoved at 7. The only change to that file is the corrected `kind`
+    documentation and the new value it now describes. Every other release since 0.44.0 has produced an
+    empty diff there and this one states the exception rather than letting a reader find it.
 
     '
   files:
   - docs/CONTRACT.md
   - src/lib.rs
+  - src/state.rs
   - README.md
   - CHANGELOG.md
-  - docs/public-api.txt
-  - tests/docs_drift.rs
-  - tests/changelog.rs
-  evidence:
-  - O4 — both `docs/CONTRACT.md` platform tables rewritten. The first gains a per-rung table (what each
-    needs, whether it confines writes, whether it denies egress) and states the egress honesty rule; the
-    second changes the Windows row from **No**/**No** to Yes/Yes with the behaviour change, the derived
-    grant set, the deliberately-excluded profile directory, and the merged-stderr difference.
-  - '`src/lib.rs`''s platform prose no longer says the AppContainer is unselected — it says 0.47.0 selects
-    it and why the discovery problem shrank — and describes the Linux chain.'
-  - '`README.md`: the platform table, the containment paragraph, and a new passage saying plainly that
-    a Windows program relying on a read outside the workspace now fails.'
-  - '`CHANGELOG.md` gains a `[0.47.0]` section with Added/Changed/Security. Both behaviour changes carry
-    a `*Migration:*` note rather than being line items.'
-  - '**The install-snippet checker earned its keep again.** Bumping `Cargo.toml` to 0.47.0 failed `readme_dependency_version_matches_cargo_toml`
-    — README still said `io-harness = "0.46"`. Fixed. That checker was added in 0.36.1 after the snippet
-    sat stale for eleven releases.'
-  - '`tests/docs_drift.rs` 15 of 15, `tests/changelog.rs` 5 of 5, `tests/guide_pages.rs` 7 of 7.'
-- id: US-IO-HARNESS-0.47.0-T11
-  summary: Measure each rung's per-command overhead and record the figures.
-  why_required: The Landlock rung's claim is that it avoids a wrapper spawn, which is a claim about a
-    number. An unmeasured regression in a default every run now pays would be discovered by an embedder
-    rather than by this release.
-  status: todo
-  depends_on:
-  - US-IO-HARNESS-0.47.0-T02
-  - US-IO-HARNESS-0.47.0-T05
-  acceptance_criteria:
-  - '**N5 — each rung''s per-command overhead is measured, not asserted to be small.** The same fixed
-    command is timed under `FullAccess`, under the Landlock rung and under the existing namespace rung
-    on a Linux host, over the same 30-iteration shape 0.46.0 used to record ~6.25 ms for `sandbox-exec`.
-    Every figure goes into the release record. The Landlock rung''s claim is that it avoids a wrapper
-    spawn entirely, which is a claim about a number and is therefore measured rather than argued.
-
-    '
-  files:
-  - tests/sandbox.rs
   evidence: []
-- id: US-IO-HARNESS-0.47.0-T12
-  summary: 'Run the standing gates: no new dependency, MSRV, cross-version, and the five prior releases
-    unaffected.'
-  why_required: The release adds enforcement to paths every existing test drives. Without the regression
-    gate a green suite would prove only that the new code compiles.
+- id: US-IO-HARNESS-0.48.0-T09
+  summary: Run every gate and measure what the release claims about numbers.
+  why_required: The release claims a flat dependency count, an unchanged public API, no DDL, and an affordable
+    per-dial overhead. Each is a claim about a number and none of them is true until it has been measured
+    on this tree.
   status: todo
   depends_on:
-  - US-IO-HARNESS-0.47.0-T10
+  - US-IO-HARNESS-0.48.0-T08
   acceptance_criteria:
   - '**N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402** crates
-    on macOS and Linux. Landlock and seccomp are `libc::syscall` with hand-written constants against the
-    existing `cfg(unix)` `libc`. No `landlock`, no `seccompiler`, no `libseccomp`, no `nix`, and no new
-    `windows-sys` feature.
+    on macOS and Linux. The proxy is `tokio::net::TcpListener` plus a hand-parsed request line; no `hyper`,
+    no `http`, no `tower`, no TLS crate.
 
     '
   - '**N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
 
     '
-  - '**N6 — 0.41.0''s batch, 0.42.0''s gate, 0.43.0''s fold, 0.44.0''s boundary, 0.45.0''s prompt and
-    0.46.0''s default are unaffected.** Their suites pass unchanged. Specifically: the composed system
-    prompt is still byte-identical across the steps of a run, and still composed once — the boundary section
-    names the selected backend, and a rung re-probed inside the step loop would convert 0.38.0''s cache
-    read into a cache write on every step of every run and fail no other test.
+  - '**N5 — the proxy''s per-dial overhead is measured, not asserted to be small.** The same fixed request
+    is timed direct, through the proxy on a permitted host, and refused on a denied one, over the 30-iteration
+    shape 0.46.0 used to record ~6.25 ms of containment overhead. Every figure goes into the release record.
+    A proxy is a hop and the claim that the hop is affordable is a claim about a number.
 
     '
-  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.46.0 store and a 0.47.0 store
+  - '**N6 — 0.41.0''s batch, 0.42.0''s gate, 0.43.0''s fold, 0.44.0''s boundary, 0.45.0''s prompt, 0.46.0''s
+    default and 0.47.0''s chain are unaffected.** Their suites pass unchanged. Specifically: the composed
+    system prompt is still byte-identical across the steps of a run and still composed once — the proxy
+    is started once per run and the boundary section names the backend `select` returned, and a per-step
+    re-resolution would turn 0.38.0''s cache read into a cache write on every step and fail no other test.
+
+    '
+  - '**O1 — the full suite passes on all three platforms**, on the standing CI matrix including 0.47.0''s
+    `contained (ubuntu, userns restricted)` leg, which is the leg where the Landlock rung and therefore
+    the Linux proxy path is the one actually taken.
+
+    '
+  - '**O2 — cross-version is unaffected and proven so.** No DDL, so a 0.47.0 store and a 0.48.0 store
     are the same store in both directions, asserted by the existing cross-version suites.
 
     '
   files:
-  - Cargo.toml
-  - Cargo.lock
+  - docs/public-api.txt
   evidence: []

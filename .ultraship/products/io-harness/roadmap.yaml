@@ -1153,7 +1153,7 @@ versions:
       command permitted one host can reach all of them. Sandboxed egress is routed through a
       loopback proxy the run owns, which enforces the host rules the policy already states and
       records every dial.
-    detail: outline
+    detail: specified
     status: planned
   - version: 0.49.0
     outcome: >

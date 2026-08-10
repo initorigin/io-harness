@@ -1,0 +1,587 @@
+product: io-harness
+version: 0.48.0
+release_type: minor
+
+outcome:
+  user_can: >
+    Embed this crate and know that *everything* the agent starts is inside the boundary — not only
+    the foreground commands — and that a policy naming three hosts means three hosts to a contained
+    command rather than all of them or none.
+
+    **Three execution paths still run at full privilege after 0.47.0, and two of them are not
+    documented as doing so.** `shell_start`'s backgrounded handles are stated as uncontained
+    (`docs/CONTRACT.md:1107`) because `Shell::detached` sets `sandbox: None`
+    (`src/tools/shell.rs:1164`) where the foreground line sets it. The six git built-ins spawn
+    `git` directly (`src/tools/git.rs:540`) and no surface mentions it at all. An agent that cannot
+    write outside the workspace with `exec` can start the same command with `shell_start` and write
+    wherever it likes — which makes the boundary a matter of which tool the model happened to pick.
+    **This release closes both**, so the sentence "a contained run's commands cannot write outside
+    their granted roots" stops carrying an exception list.
+
+    **The mode a command needs is resolved before it runs instead of discovered when it fails.**
+    Today one `TaskContract::exec_sandbox` mode covers every spawn. A run granting
+    `ExecMode::ReadOnly` still lets `git_commit` be dispatched, and it fails on a `.git` it cannot
+    write — a failure the model must interpret from an errno. Each tool that spawns now declares the
+    mode it needs, the run resolves that declaration against what the contract granted **before the
+    spawn**, and the two answers meet in the honest direction: a call runs under the *narrower* of
+    what it needs and what it was granted, and a need the grant cannot satisfy is refused up front
+    with a reason naming both. Least privilege per call rather than per run, and a refusal the model
+    can act on rather than an errno it must decode.
+
+    **And egress stops being one boolean for a whole run.** `Policy` has carried per-host `Act::Net`
+    rules since 0.8.0; `Policy::permits_any_egress` (`src/policy.rs:616`) flattens them to a single
+    flag because a backend takes one — a network namespace exists or it does not, an SBPL profile
+    says `(allow network*)` or it does not. So a run permitted `api.example.com` gives its contained
+    commands the whole internet. This release routes a contained command's egress through a loopback
+    proxy the run owns: the sandbox permits the proxy and nothing else, the proxy answers every
+    `CONNECT` by asking the run's own `Policy` about that host and port, and every dial — permitted
+    or refused — is recorded. The rule that keeps it honest is 0.47.0's, extended: **a run whose
+    policy names hosts is never given a rung that cannot route to the proxy**, and where no rung on
+    the host can, the run gets the old boolean and says so rather than implying a filter it does not
+    have.
+
+  business_value: >
+    **A boundary with an exception list is believed without its exceptions.** Every interface says
+    contained: the contract type, 0.45.0's boundary section in the agent's own prompt,
+    `EventKind::Contained`. None of them says "except handles, except git". An embedder reading
+    `TaskContract::workspace(goal, root)` after 0.46.0 made containment the default has no reason to
+    suspect that the tool the model chooses decides whether the boundary applies — and a model
+    choosing `shell_start` over `shell` for a long-running command is the ordinary case, not an
+    adversarial one. This is the same shape of gap 0.47.0 closed for Linux hosts: the claim was
+    right, the coverage was not, and the coverage is what a user actually gets.
+
+    **Per-host egress is the difference between a policy that documents intent and one that
+    enforces it.** A run permitted to reach its own package registry and nothing else is the
+    commonest real request an operator makes of an agent, and today the crate can express it in
+    `Policy` and cannot enforce it on a contained command. The boolean means the operator picks
+    between a run that can reach everything and a run that can reach nothing — so in practice they
+    pick everything, and the rules they wrote govern only the crate's own tools while the commands
+    the agent spawns ignore them. Closing that is worth more than any additional backend, because it
+    is the first time the sandbox and the policy describe the same boundary.
+
+    **It also unblocks the roadmap rather than only this release.** 0.53.0 specifies that a browser's
+    navigation "under containment goes through the same egress path as everything else". There is no
+    such path today. This release is what that entry is written against, and building it now — where
+    the payloads are commands whose failures are cheap to read — is materially safer than
+    discovering the design under a headless browser.
+
+    **The break surface is nearly nothing, and that is a deliberate consequence of two previous
+    releases.** `RunSpec` took `#[non_exhaustive]` plus a constructor in 0.46.0 explicitly so 0.47.0
+    and this release could add to it for free; `EventKind` has been `#[non_exhaustive]` since before
+    it; `Tool` gained a defaulted method in 0.41.0 and gains a second here in the same shape. No
+    signature changes, no field type changes, no table, column or index.
+
+  evidence_of_value: >
+    Executed in the technique the last seventeen releases used: a discriminating assertion per
+    claim, negative controls that must not move, one sabotage per arm of every two-armed claim, and
+    a sabotage that fails nothing reported as a finding rather than propped up.
+
+    **Every closed path is proven by the escape it closes, not by the flag it sets.** A handle is
+    asserted by starting a line through `shell_start` that writes to an absolute path outside the
+    granted roots and finding the file absent afterwards, and a git built-in by the same shape under
+    a mode that withholds the workspace. Asserting that `ShellSandbox` was passed would pass for a
+    containment that confines nothing — which is precisely the failure 0.40.0 shipped for three
+    matrix runs.
+
+    **Per-host egress is proven against listeners the test itself starts**, which is what makes it a
+    real network assertion with no external dependency and no flake: two loopback listeners on known
+    ports, a policy permitting one host and not the other, and a contained command that reaches the
+    first and is refused on the second — with the refusal attributed to the proxy's own answer and
+    recorded in `policy_events`, not inferred from a connection that merely failed.
+
+    **The rung preference is proven as a pure decision, separately from any host**, in the table
+    shape `rung()` already uses (`src/sandbox/linux.rs`), including the case the honesty rule exists
+    for: a host whose only usable rung is a network namespace, on a run whose policy names hosts,
+    must fall to the boolean and report it rather than take a rung it cannot proxy through.
+
+    **And the advisory case is asserted to be advisory.** On the portable floor and on Windows the
+    proxy is an environment variable and nothing more; the criterion asserts that the crate reports
+    exactly that, because a proxy a payload can ignore is the one thing in this release that could
+    be mistaken for a boundary.
+
+scope:
+  included:
+  - >
+    **`shell_start`'s handles are contained, per stage, exactly as the foreground line is.** The
+    dispatch resolves the same `ExecContainment` with this run's egress answer folded in and hands
+    `Shell::detached(...)` a `ShellSandbox`, so the shared runner wraps every stage — a line is
+    several processes and wrapping only the first would pass any one-stage test while leaving the
+    escape open. `SandboxEvent` create/exec rows are written at start and the destroy row when the
+    reaper records the handle finished or `shell_kill` ends it, so a handle's containment has a
+    beginning and an end in the trace like every other contained command.
+  - >
+    **The wall-clock cap is deliberately withheld from a handle, and that is a stated rule rather
+    than an omission.** `SandboxLimits::max_wall_secs` bounds a wedged *call*; a handle exists
+    precisely because its work outlives the call, and a dev server killed at 120 seconds by the
+    sandbox would be a containment feature deleting the tool's purpose. The memory, CPU and
+    open-file caps still apply. `docs/CONTRACT.md` states which caps a handle takes and which it
+    does not.
+  - >
+    **The sandbox-lifetime question `docs/CONTRACT.md:1107` names is answered rather than inherited.**
+    A handle's containment is applied at each stage's spawn and lives with those processes: on unix
+    it is a `pre_exec` restriction or a wrapper argv, on Windows the Job Object the handle already
+    owns. Nothing is left to tear down and nothing is re-entered, so a resumed run has no sandbox to
+    rejoin — it finds the previous run's handle rows and orphans them, which is what it already does
+    (`Store::check_resumable`). The answer is that there is no cross-run lifetime, and the contract
+    says so instead of leaving the question open.
+  - >
+    **The six git built-ins run contained.** `Git::run` spawns `git` directly today
+    (`src/tools/git.rs:540`) with no wrapper and no rung. It routes through the same
+    `ExecContainment` the other spawns use, under the mode its own declaration resolves to, so
+    `git_commit` writing `.git` and `git_worktree` writing `.worktrees/` are inside the granted
+    roots rather than outside the boundary. Egress stays denied for all six: none of these fixed
+    argvs reaches the network.
+  - >
+    **Each spawning tool declares the mode it needs, in the shape 0.41.0 used for `ToolEffect`.** A
+    built-in table beside the effect table at `src/run.rs:7476`: `read_file` / `grep` / `find` need
+    `ReadOnly`; the git built-ins need `WorkspaceWrite`; `exec`, `shell` and `shell_start` need
+    whatever the contract granted, because they are the tools the grant was written for. Custom
+    tools get a defaulted `Tool::exec_mode()` returning the granted mode, so every `Tool` written
+    against any earlier release compiles unchanged.
+  - >
+    **The resolution rule, and it runs before the spawn.** A call is executed under the **narrower**
+    of what it declares it needs and what the contract granted — a read-only tool spawning under a
+    run granting `WorkspaceWrite` gets `ReadOnly`, which is least privilege per call rather than per
+    run. A declared need the grant cannot satisfy is **refused before anything is spawned**, with an
+    observation naming the tool, the mode it needs and the mode this run grants, so the model can
+    ask for the narrower thing or take another route. It is an observation and never a run failure,
+    the treatment `grep` gives a malformed regex.
+  - >
+    **What a declaration does for a custom tool is stated exactly, because the crate cannot enforce
+    it.** A custom `Tool` spawns its own processes and the harness never sees that spawn. Its
+    declaration is therefore a **refusal** mechanism — the crate declines to call a tool whose
+    declared need exceeds the run's grant — and not a confinement one. The doc, `docs/CONTRACT.md`
+    and the changelog all say so in that word. This release adds no claim that a custom tool's own
+    child is contained.
+  - >
+    **The egress proxy: a loopback listener the run owns.** Started once per run, on an ephemeral
+    port, only when the run is contained and its policy names hosts. It speaks `CONNECT host:port`
+    and absolute-form plain HTTP, asks `Policy::check(Act::Net, "host:port")` about every dial,
+    tunnels the permitted ones and answers a refused one with a `403` whose body names the host and
+    the layer that denied it. No TLS is terminated and no payload is inspected: a `CONNECT` names
+    its host in cleartext, which is all the decision needs. Written against `tokio`, which is
+    already a dependency — no new crate.
+  - >
+    **The sandbox permits the proxy and nothing else.** On macOS the SBPL profile names the loopback
+    address and the port exactly, which is an address-scoped kernel boundary. On Linux the Landlock
+    rung's `LANDLOCK_ACCESS_NET_CONNECT_TCP` permits that one port, which is **port-scoped and not
+    address-scoped** — a payload could reach another host on the same port number, the port is
+    ephemeral and per-run, and the contract says this in those words rather than implying a proof it
+    does not have. The contained command's environment carries `HTTP_PROXY`, `HTTPS_PROXY`,
+    `ALL_PROXY` and their lowercase forms, with `NO_PROXY` empty.
+  - >
+    **The rung preference, as one line in the existing decision function.** A run whose policy names
+    hosts prefers a rung that can route to the proxy — Landlock ABI 4 on Linux, `sandbox-exec` on
+    macOS. The namespace rungs (`unshare`, `bwrap --unshare-net`) put the child in an empty network
+    namespace with no route to the host's loopback at all, so they cannot serve such a run; where
+    they are all a host has, the run takes the boolean, and `EventKind::Contained` and the
+    `SandboxEvent` rows report the backend that actually applied. Extends 0.47.0's rule in its own
+    vocabulary: never a rung that cannot enforce what this run asked for.
+  - >
+    **Every dial is recorded, in tables that already exist.** The decision goes to `policy_events`
+    with `act = "net"`, which is where the crate's own network decisions already live and where an
+    existing reader will find it, and a `SandboxEvent` of kind `"dial"` names `host:port` at command
+    scope. One additive `EventKind` variant carries it live, with its snake-case name added to the
+    hook-name list `observe.rs` asserts the completeness of. No table, column or index.
+  - >
+    **The comment at `src/state.rs:809` is corrected in this release, not the next one.** It states
+    that a `"net_deny"` kind never existed because "a sandbox denies egress *structurally* — the
+    backend gives the child no route out, so there is no attempt to observe and nothing to count."
+    That is true of every release up to this one and false after it: with a proxy there is an
+    attempt, and it is counted. Correcting the sentence that this release falsifies is a scope item
+    because 0.45.0 paid for finding one of those at sealing time.
+  - >
+    **The reporting surfaces, updated to describe what now happens.** `docs/CONTRACT.md` (the
+    handles paragraph at `:1107`, the platform tables, and a new section on what the proxy does and
+    does not prove per rung), the crate-root prose in `src/lib.rs`, the README table, and
+    `CHANGELOG.md` with a migration note for the behaviour change.
+  excluded:
+  - >
+    **Any TLS interception, certificate injection or payload inspection.** The proxy reads a
+    `CONNECT` line and a plain-HTTP request line and nothing else. A crate that mints a CA and
+    installs it in a child's trust store to read its traffic is a different product with a different
+    threat model, and the decision this release needs — which host — is available in cleartext
+    without it.
+  - >
+    **Per-host egress on the namespace rungs, on Windows, and on the portable floor.** A new network
+    namespace has no route to the host's loopback and cannot be given one without a userspace
+    network stack, which is a dependency and a research problem. Windows' Job Object contains
+    resources and not access (0.47.0, unchanged), and the floor confines nothing by definition. On
+    all three the run keeps the boolean; on the last two the proxy environment is advisory and the
+    crate says the word "advisory".
+  - >
+    **Containment of a custom `Tool`'s own child processes.** The crate does not see that spawn and
+    will not claim to govern it. `Tool::exec_mode` is a refusal mechanism, named as one.
+  - >
+    **Any change to `Policy`, `ExecMode`, `SandboxConfig`, `TaskContract` or `Backend`.** The rules
+    exist, the modes exist, the rungs exist. This release consumes them. In particular
+    `SandboxConfig` is **not** `#[non_exhaustive]`, so the proxy's address travels on `RunSpec`,
+    which is — a deliberate placement, not an accident of where it fit.
+  - >
+    **A caller-facing switch to disable the proxy while keeping per-host rules.** A run either has
+    per-host rules or it does not, and `with_full_access()` and `SandboxConfig::floor_only()` are
+    the two escape hatches that already exist. A third would be a way to ask for a boundary and
+    quietly not get it.
+  - >
+    **Any store, schema or event-table change.** No table, column or index; `CHECKPOINT_FORMAT`
+    stays at 7. `sandbox_events.kind` and `policy_events.act` are text columns and a new value in
+    them is data, not DDL.
+  - >
+    **Egress for the verification gate.** The gate shares `SandboxConfig` and has no `Policy` to
+    consult (`src/run.rs:9328` states why). It keeps the config's flag, unchanged, and no proxy is
+    started for it.
+  fallback_scope:
+  - >
+    **Everything a run starts is inside the boundary, and the mode is resolved before the spawn.**
+    The `shell_start` handles, the git built-ins, and the declared-mode resolution — with egress
+    left as today's single boolean. This is a coherent release on its own: it is the one that makes
+    "a contained run's commands cannot write outside their granted roots" true without an exception
+    list, which is what an embedder already believes.
+  - >
+    Dropped under pressure, in this order: absolute-form plain-HTTP proxying first (`CONNECT` alone
+    covers HTTPS, which is what a real dependency fetch uses), then the rung preference (the proxy
+    is used where the rung 0.47.0 picks can already reach it, and the netns rungs keep the boolean),
+    then the proxy entirely, and last the git built-ins' containment. Each stays in the roadmap as
+    named work rather than being quietly forgotten.
+
+acceptance:
+  functional:
+  - >
+    **F1 — a `shell_start` handle cannot write outside its granted roots.** Driven end to end from
+    `TaskContract::workspace(goal, root)` with no builder call: a line started through `shell_start`
+    that writes to an absolute path outside the workspace leaves no file, `shell_poll` shows the
+    failure, and the same line started under `with_full_access()` writes it. Asserted on the
+    filesystem, never on the presence of a `ShellSandbox`. Sabotage: pass `None` for the handle's
+    sandbox, which is today's behaviour, under which the outside file appears and only this fails.
+  - >
+    **F2 — every stage of a handle is contained, not only the first.** A two-stage line whose
+    *second* stage writes outside the granted roots leaves no file, and the same line's first stage
+    still reaches the second — the pipe is intact. This is asserted separately from F1 because a
+    one-stage test passes for an implementation that wraps only the head. Sabotage: wrap the first
+    stage only, under which the second stage's write lands and only this fails.
+  - >
+    **F3 — a handle takes the resource caps and not the wall clock.** Under a `SandboxConfig` whose
+    `max_wall_secs` is short, a handle started before that deadline is still running and still
+    polled after it, while a foreground `shell` line under the same config is killed and reported as
+    a cap hit naming the resource. The memory cap still applies to a handle, asserted by a stage
+    that exceeds it being killed. Sabotage: apply `max_wall_secs` to a handle, under which the
+    handle is dead at the second poll and only this fails.
+  - >
+    **F4 — the git built-ins are contained, and `git_commit` under a mode that withholds the
+    workspace is refused before it spawns.** Under `ExecMode::WorkspaceWrite` a `git_commit`
+    succeeds and its `SandboxEvent` rows name the backend that applied; under `ExecMode::ReadOnly`
+    the call is refused with an observation naming the tool, the mode it needs and the mode the run
+    grants, **and no `git` process is spawned** — asserted by the absence of an `"exec"` sandbox row
+    for it, not by the refusal text alone. Sabotage: resolve the declared mode after the spawn
+    rather than before, under which the row exists and the refusal arrives as an errno, and only
+    this fails.
+  - >
+    **F5 — a call runs under the narrower of what it needs and what it was granted.** A read-only
+    built-in dispatched under a run granting `WorkspaceWrite` runs under `ReadOnly`: a write it
+    attempts inside the workspace is refused, while the same run's `exec` writing there succeeds in
+    the same step. Sabotage: resolve to the granted mode rather than the narrower one, under which
+    the read-only tool's write lands and only this fails.
+  - >
+    **F6 — a contained command reaches a permitted host and is refused a denied one, through the
+    proxy.** Two loopback listeners the test starts, a policy permitting one and not the other, and
+    one contained command dialling both: the first returns the listener's bytes, the second is
+    refused, `policy_events` carries a `net` row per dial with the effect and the deciding layer,
+    and a `SandboxEvent` of kind `"dial"` names each `host:port`. On a host with no proxy-capable
+    rung the test asserts instead that the run took the boolean and that
+    `EventKind::Contained` reported the backend that applied — the honesty rule asserted rather
+    than skipped, which is 0.40.0's lesson about a test that steps over a fallback. Sabotage:
+    answer every `CONNECT` with `200` without consulting the policy, under which the denied host
+    is reached and only this fails.
+  - >
+    **F7 — the proxy is the only route out.** Under a run whose policy names hosts, a contained
+    command dialling a permitted host **directly**, with the proxy environment stripped from its own
+    environment, is refused by the sandbox rather than connecting — on a rung that can be
+    address-scoped or port-scoped. This is the criterion that separates a boundary from a
+    convention, and on a rung that can enforce neither it asserts the run did not take that rung
+    for a per-host policy. Sabotage: emit `(allow network*)` alongside the loopback rule, under
+    which the direct dial succeeds and only this fails.
+  - >
+    **F8 — the rung preference is a table, decided without a host.** A pure test over the decision
+    function for every combination of probe answers, mode, egress answer and *whether the policy
+    names hosts*: a per-host run returns a proxy-capable rung where one exists, returns the boolean
+    rung with the flattened answer where none does, and a run with no per-host rules returns exactly
+    what 0.47.0's table returned — the negative control that must not move. Sabotage: prefer the
+    namespace rung for a per-host run, under which the per-host rows return a rung that cannot reach
+    the proxy and only this fails.
+  - >
+    **F9 — on the floor and on Windows the proxy is reported as advisory.** The run completes, the
+    environment carries the proxy variables, `EventKind::Contained` names the backend that applied,
+    and the crate's own report says the egress boundary is advisory on that backend rather than
+    enforced. A payload that ignores the variables reaches the network, and the test asserts that
+    this is what the crate says will happen. Sabotage: report the per-host boundary as enforced on
+    the floor, under which the assertion on the reported wording fails and only this fails.
+  non_functional:
+  - >
+    **N1 — no new dependency.** `cargo tree` for the default feature set is unchanged at **402**
+    crates on macOS and Linux. The proxy is `tokio::net::TcpListener` plus a hand-parsed request
+    line; no `hyper`, no `http`, no `tower`, no TLS crate.
+  - >
+    **N2 — MSRV unmoved.** The crate builds on 1.95 with the toolchain gate CI already runs.
+  - >
+    **N3 — zero compile breaks, and `docs/public-api.txt` is unchanged.** The public additions are a
+    defaulted trait method, one `EventKind` variant, and one `RunSpec` builder — and the checker
+    (`tests/docs_drift.rs`) enumerates crate-root items rather than methods or variants, so the file
+    is byte-identical. **The number is stated at plan time as "unchanged"**, because a criterion
+    promising a line count has been met in a different form in four of the last ten releases and
+    byte-identical is the stronger claim.
+  - >
+    **N4 — no durable state moves.** `git diff main -- src/state.rs` shows **no DDL**: no table,
+    column or index, and `CHECKPOINT_FORMAT` unmoved at 7. The only change to that file is the
+    corrected `kind` documentation and the new value it now describes. Every other release since
+    0.44.0 has produced an empty diff there and this one states the exception rather than letting a
+    reader find it.
+  - >
+    **N5 — the proxy's per-dial overhead is measured, not asserted to be small.** The same fixed
+    request is timed direct, through the proxy on a permitted host, and refused on a denied one,
+    over the 30-iteration shape 0.46.0 used to record ~6.25 ms of containment overhead. Every figure
+    goes into the release record. A proxy is a hop and the claim that the hop is affordable is a
+    claim about a number.
+  - >
+    **N6 — 0.41.0's batch, 0.42.0's gate, 0.43.0's fold, 0.44.0's boundary, 0.45.0's prompt,
+    0.46.0's default and 0.47.0's chain are unaffected.** Their suites pass unchanged. Specifically:
+    the composed system prompt is still byte-identical across the steps of a run and still composed
+    once — the proxy is started once per run and the boundary section names the backend `select`
+    returned, and a per-step re-resolution would turn 0.38.0's cache read into a cache write on
+    every step and fail no other test.
+  operational:
+  - >
+    **O1 — the full suite passes on all three platforms**, on the standing CI matrix including
+    0.47.0's `contained (ubuntu, userns restricted)` leg, which is the leg where the Landlock rung
+    and therefore the Linux proxy path is the one actually taken.
+  - >
+    **O2 — cross-version is unaffected and proven so.** No DDL, so a 0.47.0 store and a 0.48.0 store
+    are the same store in both directions, asserted by the existing cross-version suites.
+  - >
+    **O3 — no test leaves a handle, a listener or a proxy running.** The proxy's task ends with the
+    run that owns it, asserted by a test that starts a run with a proxy, ends it, and finds the port
+    closed. This is the same class of leak the handle registry exists to prevent and it gets the
+    same treatment.
+  - >
+    **O4 — the documentation surfaces agree with the code, in the same release.**
+    `docs/CONTRACT.md` no longer states that handles are uncontained, states what a handle's caps
+    are and are not, states per rung what the proxy proves and what it does not, and uses the word
+    "advisory" where it is advisory. `src/lib.rs`, the README table and `CHANGELOG.md` agree, and
+    `tests/docs_drift.rs` and `tests/changelog.rs` pass.
+
+delivery:
+  target_mode: published
+  environment: >
+    crates.io as `io-harness` 0.48.0, GitHub at initorigin/io-harness with the tag `v0.48.0` and a
+    Release titled `io-harness 0.48.0`, and docs.rs.
+  deployment_method: >
+    The standing flow. All work on `feat/0.48.0` off `develop`, committed incrementally as it lands,
+    including the sealed UltraShip release record and the hand-appended lock pin. PR into `develop`,
+    merged with the PR button. `develop`'s head and tree checked against the tree the gates ran on
+    immediately before the release PR is opened. Release PR `develop` into `main`, merged the same
+    way. The GitHub Release is cut by `release.yml` —
+    `gh workflow run release.yml --ref main -f version=0.48.0` — which takes its notes verbatim from
+    the changelog. `cargo publish --locked` by hand afterwards, always last, after both merges and
+    the Release exist, with the registry token sourced from the repo-local `.env` in the same shell
+    invocation. `develop` synced to `main` fast-forward only at the end. No branch is deleted.
+  migrations:
+  - >
+    **No store migration at all.** No table, column or index is created or altered,
+    `CHECKPOINT_FORMAT` is unmoved at 7, and a 0.47.0 store and a 0.48.0 store are the same store in
+    both directions. A `sandbox_events` row of kind `"dial"` is a new value in an existing text
+    column, which an older reader displays and does not choke on.
+  - >
+    **No compile break.** A defaulted trait method, an additive variant on an already
+    `#[non_exhaustive]` enum, and a builder on an already `#[non_exhaustive]` struct. No signature,
+    field type or trait-method signature changes.
+  - >
+    **The behaviour change, and it is the release.** A backgrounded `shell_start` line and the six
+    git built-ins are now confined where before they were not. A program relying on a handle writing
+    outside the workspace — and getting away with it because the boundary did not apply, not because
+    it was permitted — sees that refused. The remedy is the one 0.46.0 named:
+    `TaskContract::with_full_access()`, or a `SandboxConfig` whose mode says what the run actually
+    needs. The changelog carries this as a migration note.
+  - >
+    **The second behaviour change: a run whose policy names hosts now gets those hosts and not the
+    internet.** Before this release such a run's contained commands could reach everything; after
+    it, they reach what the rules name, through the proxy. A command that ignores `HTTP_PROXY`
+    reaches nothing — which is stricter than before, and is stated in the changelog with both
+    escape hatches named. A run with no `Act::Net` rules, or one permitting everything, is
+    unaffected and no proxy is started for it.
+  observability:
+  - >
+    `EventKind::Contained { mode, backend, roots }` is unchanged and now fires for a handle and for
+    a git built-in as it already does for `exec`, so an existing observer sees the newly contained
+    paths with no code change.
+  - >
+    One additive `EventKind` variant per dial decision, carrying the host, the port and whether it
+    was permitted. Its snake-case name joins the hook-name list, so an operator can filter on it
+    from `io.toml` the day it ships.
+  - >
+    `policy_events` carries a row with `act = "net"` per dial — the table where the crate's own
+    network decisions already live, so a trace reader learns nothing new to read them — and a
+    `SandboxEvent` of kind `"dial"` names `host:port` at command scope, so a run that degraded
+    mid-flight is visible per command and not only per run.
+  - >
+    0.45.0's boundary section already renders the run's `Act::Net` rules and the backend `select`
+    returned. Where the backend cannot enforce per-host egress it says so in that section too, so
+    the agent is told the same thing the operator's trace says.
+  rollback: >
+    A published version cannot be recalled; the forward fix is 0.48.1 and `cargo yank --version
+    0.48.0` is the escape hatch, leaving 0.47.0 as what `cargo install` resolves. Reverting the
+    behaviour needs no downgrade and has two granularities:
+    `TaskContract::with_full_access()` restores an uncontained run at the construction site, and
+    `SandboxConfig::floor_only()` keeps containment while taking the portable floor — which for the
+    newly contained paths is 0.47.0's behaviour exactly. A policy with no `Act::Net` rules, or one
+    whose default permits the network, starts no proxy and is on the pre-0.48.0 path.
+
+dependencies:
+  products: []
+  services:
+  - >
+    crates.io and GitHub Actions for the release itself, as every version.
+  - >
+    **No live provider call is required.** Every claim here is about what a process may spawn,
+    write or dial and what the crate reports about it; each is proven from a real command under a
+    real rung, from loopback listeners the test itself starts, or from a pure decision function.
+  - >
+    **The Linux CI runner is load-bearing again.** The Landlock rung's network rule is the only
+    Linux path that can scope egress to the proxy, and it does not exist on the macOS development
+    host. F6, F7 and F9's Linux arms are CI-discovered by construction, which is the position
+    0.40.0, 0.46.0 and 0.47.0 were in and where each found the defect that mattered. Budget for it
+    rather than being surprised by it.
+  human_approvals:
+  - >
+    **All three gaps ship together rather than the egress half moving out.** Decided at
+    specification time, 2026-08-10, with the fallback scope on record as the escape if the Linux
+    proxy path turns into 0.47.0's Windows half.
+  - >
+    **A run whose policy names hosts prefers a rung that can route to the proxy**, and takes the
+    boolean where none can. Decided at specification time, 2026-08-10. This is the one rule that can
+    send a host to a weaker filesystem rung than its strongest available primitive, and it is the
+    same trade 0.47.0's egress rule already makes in the other direction.
+  - >
+    **`delivery.target_mode` is `published`.** Decided at specification time, 2026-08-10.
+  - >
+    The PR, both merges, the Release and the publish are pre-authorised for this version under the
+    standing flow.
+
+resource_profile:
+  complexity: large
+  uncertainty: high
+  likely_cost_drivers:
+  - >
+    **A proxy is a new kind of component for this crate.** Everything else it runs is a child
+    process that ends; this is a listener with a lifetime, a task per connection and a shutdown that
+    must not leak — the same class of resource the handle registry exists to manage, in a place that
+    has never needed one. Expect the leak and shutdown work to cost more than the request parsing.
+  - >
+    **Two of the three egress claims can only be evaluated on Linux CI**, because the Landlock
+    network rule is the Linux scoping mechanism and the development host has no Landlock at all.
+    Prefer splitting each claim into a host-free half — F8's table exists partly for that reason —
+    so the matrix answers only what only it can.
+  - >
+    **Containing two previously uncontained paths will fail existing tests that were correct
+    before.** 0.46.0 flipped the default and had to read failures that were the release working; the
+    git built-ins and the handles are two more surfaces where that happens. Each failure is a
+    decision, not a sweep: a test relying on a handle writing outside the workspace either says why
+    that is legitimate or should not have been doing it.
+  - >
+    **The narrower-of-two resolution touches every dispatch site.** 0.42.0's finding was that
+    "the serial policy phase all three dispatch sites share" did not exist and the gate had to go at
+    the head of `dispatch` and inside `read_batch`'s per-call loop. The same question applies here
+    and the same answer is the starting assumption; verify it against the current shape before
+    writing the resolution, not after.
+  preferred_tools:
+  - >
+    `cargo nextest` for the suite, `cargo test --doc` for the doctests, the standing CI matrix for
+    everything platform-shaped, and loopback listeners inside the tests for every network claim —
+    never an external host, which would make a boundary test a connectivity test.
+  - >
+    `strace` and `ss` when a refusal has to be attributed to a specific rule rather than guessed at.
+    A refused connection whose cause is inferred is how 0.40.0's defect survived three matrix runs.
+  constraints:
+  - >
+    **No new runtime dependency.** `cargo tree` flat at 402. The proxy is written against the
+    existing `tokio`.
+  - >
+    **MSRV 1.95, edition 2021, Apache-2.0.** Unchanged.
+  - >
+    **Every version stays 0.x.x.** This release has no compile break; it is a minor bump for new
+    functionality.
+  - >
+    **The reported boundary is a report, never a promise.** Nothing added here may name an
+    enforcement it did not apply. Where the proxy is only an environment variable the crate says
+    "advisory", and where Landlock's rule is port-scoped it says port-scoped rather than per-host.
+  - >
+    **`docs/CONTRACT.md` is a checked-in surface**, and so are the README table, the changelog and
+    the crate-root prose. They change in this release, not in the next one.
+
+risks:
+- >
+  **The proxy is reported as a boundary on a rung where it is a convention.** This is 0.40.0's
+  defect in a new place: a run that looks contained, reports a backend, and is enforcing nothing
+  because the payload can dial past the proxy. Mitigations: F7 asserts that a *direct* dial is
+  refused, which is the only assertion that distinguishes the two; F9 asserts that the advisory
+  case is reported as advisory in the crate's own words; and the rung preference means a per-host
+  run is not given a rung that cannot scope egress in the first place.
+- >
+  **A real toolchain does not honour `HTTP_PROXY` and a build that worked stops working.** `cargo`,
+  `npm` and `pip` all read the variables; a vendored binary or a raw socket in a test harness does
+  not, and under the new scoping it gets nothing. Mitigations: the proxy is started only for a run
+  whose policy actually names hosts, so the default path is untouched; the changelog carries it as
+  a migration note with both escape hatches; and the failure is a refused connection, which is
+  diagnosable, rather than a silent hang.
+- >
+  **Containing the git built-ins breaks a legitimate git operation.** `git` reads a user-level
+  config and may write objects outside the worktree when the caller configured it that way.
+  Mitigations: read and execute over `/` is granted on every rung, so config reads are unaffected;
+  the failure mode is a refused write inside a fixed argv the crate itself built, which is a small
+  surface; and this is the first item the fallback scope drops.
+- >
+  **A handle outlives its containment in a way the design did not anticipate.** The claim is that
+  there is no cross-run lifetime because the restriction lives with the processes. If a rung is
+  ever added whose containment is an external object needing teardown, that claim expires.
+  Mitigation: it is stated as a claim about today's rungs in `docs/CONTRACT.md` rather than as a
+  law, and O3 asserts nothing outlives the run.
+- >
+  **The listener leaks, or its port is reachable by something that is not this run.** A loopback
+  listener is reachable by every process on the machine. Mitigations: an ephemeral port bound to
+  `127.0.0.1` and never to `0.0.0.0`; the proxy's task ends with the run, asserted by O3; and the
+  threat model is stated — this is a boundary for the agent's own commands, not a security barrier
+  against another user on the same host, and the contract says so rather than letting a reader
+  assume the stronger thing.
+- >
+  **Two behaviour changes in one release is one more than usual.** Newly contained paths and newly
+  scoped egress both change what a working program does. Mitigation: they are independent — a run
+  with no `Act::Net` rules gets the first and not the second — and the fallback scope is drawn
+  exactly along that line, so shedding the second is a decision and not a rewrite.
+
+open_questions:
+- >
+  Whether the Landlock rung's port-scoped rule is enough to call the Linux path per-host, or
+  whether it should be described as "scoped to the proxy's port" everywhere and never as per-host.
+  The contract's current position is the second: say port-scoped, state that another host on the
+  same port is reachable, and let a reader judge. If a later Landlock ABI adds address-scoped
+  connect rules, this becomes a one-line change.
+- >
+  Whether a run should be able to reach the proxy from inside a network namespace by way of a
+  socket passed across the boundary, which would let the strongest filesystem rungs keep per-host
+  egress. Not attempted: a `CONNECT` proxy is addressed by `host:port` in an environment variable
+  and no common client speaks it over a unix socket, so this needs a userspace network stack or a
+  helper, and both are dependencies.
+- >
+  Whether `NO_PROXY` should be forced empty, as specified, or honoured when the caller's own
+  environment sets it. Forced empty here, on the argument that a caller-set `NO_PROXY` would punch
+  a hole in the boundary from outside it — but it means a run that legitimately needs a direct
+  loopback connection to something else has no way to say so.
+- >
+  Whether a custom `Tool`'s declared mode should eventually be enforced rather than only refused
+  on — which would need the crate to own the spawn, i.e. a `Tool` API that hands the harness an
+  argv instead of running it. That is a larger design and belongs in its own release if an embedder
+  asks for it.
+- >
+  Whether the wall-clock cap being withheld from a handle should instead be a caller decision — a
+  `SandboxLimits` field that says "and handles too". Excluded here as a knob for a case nobody has
+  asked for; the rule is stated and the caller can `shell_kill`.
+
+status: planned

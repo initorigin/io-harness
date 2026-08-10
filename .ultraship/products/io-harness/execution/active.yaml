@@ -1,0 +1,58 @@
+product: io-harness
+version: 0.48.0
+execution_state: DEVELOPING
+checkpoint: null
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      **No constraints are recorded for this workspace.** `ultraship constraints` reports none —
+      there is no active release to hold them — so this assessment is grounded in the repository's
+      own condition and in the seventeen releases of measured history behind it, never in a capacity
+      figure, which UltraShip has no telemetry to supply and which would be fiction with a decimal
+      point.
+    - >
+      **Two of the three gaps are small and land in code that already exists.** The handles need
+      `Shell::detached` to accept the `ShellSandbox` the foreground line already builds — the runner
+      is shared and wraps per stage today — and the git built-ins need `Git::run`'s one
+      `Command::new` (`src/tools/git.rs:540`) routed through the same `ExecContainment` the other
+      spawn sites use. Neither is a new mechanism; both are an existing mechanism reaching a site it
+      never reached.
+    - >
+      **The declared-mode resolution has a proven shape to copy.** 0.41.0 added `ToolEffect`, a
+      defaulted `Tool::effect`, and a built-in table at `src/run.rs:7476` that the loop reads before
+      dispatch. This release adds the same three things for `ExecMode`, in the same places, read at
+      the same point.
+    - >
+      **`probable` and not `high`, and the reason is the proxy.** It is the first component this
+      crate has owned that is a listener rather than a child process: a lifetime, a task per
+      connection, and a shutdown that must not leak. Its Linux scoping mechanism — Landlock's
+      `LANDLOCK_ACCESS_NET_CONNECT_TCP` — does not exist on the macOS development host, so F6, F7
+      and F9's Linux arms are CI-discovered by construction. That is the position 0.40.0, 0.46.0 and
+      0.47.0 were each in, and in every one of them the defect that mattered was found by the
+      matrix.
+    - >
+      **The fallback scope is drawn along a line the release can actually be cut on.** Gaps 1 and 2
+      are independent of the proxy — a run with no `Act::Net` rules gets them and never starts one —
+      so shedding the egress half is a decision rather than a rewrite. Recorded at specification
+      time for exactly this reason.
+  major_cost_drivers:
+    - >
+      A listener with a lifetime, in a crate whose every other spawned thing is a child process that
+      ends. Expect the shutdown and leak work to cost more than the request parsing, and assert it
+      (O3) rather than reasoning about it.
+    - >
+      Two previously uncontained paths becoming contained will fail existing tests that were correct
+      before. 0.46.0 flipped the default and had to read failures that were the release working
+      correctly; the handles and the git built-ins are two more surfaces where that happens. Each
+      failure is a decision, not a sweep.
+    - >
+      A debugging loop measured in matrix rounds for the Linux egress scoping. Mitigated by
+      splitting every claim with a host-free half into one — the rung preference table (F8) and the
+      proxy's own request handling are both settled locally.
+    - >
+      The narrower-of-two resolution touches every dispatch site, and 0.42.0's finding was that the
+      shared serial phase those sites were assumed to have did not exist. Verify the current shape
+      before writing the resolution rather than after.
+  recommended_scope_change: null
