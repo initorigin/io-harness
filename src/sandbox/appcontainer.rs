@@ -526,11 +526,31 @@ pub(crate) mod win {
         // has to outlive `SetEntriesInAclW` and be freed exactly once afterwards.
         let _sd = LocalGuard(sd);
 
+        // **A traverse ACE is not inheritable, and that is a cost decision as
+        // much as a scope one.**
+        //
+        // Scope first: traverse exists so a *named* directory can be reached by
+        // walking to it, and nothing below an ancestor should acquire rights
+        // because the run happened to name a path underneath it.
+        //
+        // The cost is why this is stated rather than assumed. `SetNamedSecurityInfoW`
+        // propagates *inheritable* ACEs to the objects under the path, and the
+        // flag that this function varies by `Reach` decides whether existing
+        // children are recomputed — it does not make an inheritable ACE stop
+        // being inheritable. The ancestors of a granted path include `C:\`, so an
+        // inheritable traverse ACE there is a request to walk the volume: both
+        // Windows legs of the first run with ancestors were still going at forty
+        // minutes and were cancelled by their own timeout, having failed no test.
+        // `NO_INHERITANCE` is one ACE on one directory and nothing to propagate.
+        let inheritance = match access {
+            Access::Traverse => 0,
+            // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE.
+            _ => 3,
+        };
         let ea = EXPLICIT_ACCESS_W {
             grfAccessPermissions: access.mask(),
             grfAccessMode: GRANT_ACCESS,
-            // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE.
-            grfInheritance: 3,
+            grfInheritance: inheritance,
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
                 MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,

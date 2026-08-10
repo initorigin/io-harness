@@ -366,10 +366,17 @@ pub(crate) fn grants(
     let mut seen: Vec<PathBuf> = named.clone();
     for path in named {
         for ancestor in path.ancestors().skip(1) {
-            // A bare prefix (`C:`) is not a directory and cannot carry an ACE;
-            // the volume root (`C:\`) can, and its grant is expected to fail on a
-            // machine this process does not own, which is not fatal.
-            if ancestor.as_os_str().is_empty() || seen.iter().any(|p| p == ancestor) {
+            // A bare prefix (`C:`) is not a directory and cannot carry an ACE.
+            // The volume root is skipped outright rather than attempted: a
+            // process that does not own the machine cannot rewrite its DACL, and
+            // it already permits an AppContainer to pass through — a path under
+            // the profile was reachable as far as its last granted component
+            // before any of this existed, which is the evidence that the volume
+            // root and `C:\Users` were never the missing link.
+            if ancestor.as_os_str().is_empty()
+                || ancestor.parent().is_none()
+                || seen.iter().any(|p| p == ancestor)
+            {
                 continue;
             }
             seen.push(ancestor.to_path_buf());
