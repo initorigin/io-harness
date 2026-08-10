@@ -124,7 +124,8 @@ impl Sandbox for LinuxSandbox {
         let wspec = RunSpec::new(&wrapped, spec.workdir, spec.limits)
             .with_network(spec.allow_network)
             .with_mode(spec.mode)
-            .with_writable_roots(spec.writable_roots);
+            .with_writable_roots(spec.writable_roots)
+            .with_proxy(spec.proxy);
         let outcome = run_capped(Backend::LinuxNamespaces, wspec, |_cmd| {}).await?;
         match wrapper_failure(&outcome) {
             Some(reason) => Err(Error::Sandbox { reason }),
@@ -268,7 +269,8 @@ async fn bwrap_run(spec: &RunSpec<'_>) -> Result<SandboxOutcome> {
     let wspec = RunSpec::new(&wrapped, spec.workdir, spec.limits)
         .with_network(spec.allow_network)
         .with_mode(spec.mode)
-        .with_writable_roots(spec.writable_roots);
+        .with_writable_roots(spec.writable_roots)
+        .with_proxy(spec.proxy);
     let outcome = run_capped(Backend::LinuxBubblewrap, wspec, |_cmd| {}).await?;
     match wrapper_failure(&outcome) {
         Some(reason) => Err(Error::Sandbox { reason }),
@@ -323,7 +325,8 @@ async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
     let wspec = RunSpec::new(spec.argv, spec.workdir, spec.limits)
         .with_network(spec.allow_network)
         .with_mode(spec.mode)
-        .with_writable_roots(spec.writable_roots);
+        .with_writable_roots(spec.writable_roots)
+        .with_proxy(spec.proxy);
 
     // The argv is the caller's own, untouched: this rung wraps the payload in
     // nothing. What runs between fork and exec is two syscalls with no

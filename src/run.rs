@@ -7609,8 +7609,12 @@ async fn start_egress_proxy(
     std::sync::Arc<std::sync::RwLock<Policy>>,
     std::sync::Arc<std::sync::atomic::AtomicU32>,
 )> {
+    if containment.is_none() {
+        eprintln!("ZZ no containment");
+    }
     containment?;
     if !policy.names_hosts() {
+        eprintln!("ZZ policy names no hosts");
         return None;
     }
     let shared = std::sync::Arc::new(std::sync::RwLock::new(policy.clone()));
@@ -7621,7 +7625,10 @@ async fn start_egress_proxy(
     )
     .await
     {
-        Ok(proxy) => Some((proxy, shared, step)),
+        Ok(proxy) => {
+            eprintln!("ZZ proxy started at {}", proxy.addr());
+            Some((proxy, shared, step))
+        }
         // A listener that will not bind is not a reason to fail the run. The run
         // keeps the boolean it had before this release and `EventKind::Contained`
         // reports the backend that actually applied, which is the same honesty

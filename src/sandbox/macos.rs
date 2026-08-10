@@ -17,6 +17,10 @@ pub struct MacosSandbox;
 
 impl Sandbox for MacosSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
+        eprintln!(
+            "ZZ macos spec.proxy={:?} allow_net={}",
+            spec.proxy, spec.allow_network
+        );
         let profile = profile_for(
             spec.workdir,
             spec.allow_network,
@@ -32,7 +36,8 @@ impl Sandbox for MacosSandbox {
         let wspec = RunSpec::new(&wrapped, spec.workdir, spec.limits)
             .with_network(spec.allow_network)
             .with_mode(spec.mode)
-            .with_writable_roots(spec.writable_roots);
+            .with_writable_roots(spec.writable_roots)
+            .with_proxy(spec.proxy);
         run_capped(Backend::MacosSandboxExec, wspec, move |cmd| {
             // Keep rustc's temp writes inside the confined workdir — except under
             // `ReadOnly`, where the workdir is exactly what may not be written to
