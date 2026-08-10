@@ -83,9 +83,10 @@ pub(crate) mod win {
         DeriveAppContainerSidFromAppContainerName,
     };
     use windows_sys::Win32::Security::{
-        CreateWellKnownSid, EqualSid, FreeSid, GetAce, WinCapabilityInternetClientSid,
-        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, PSID, SID_AND_ATTRIBUTES,
-        UNPROTECTED_DACL_SECURITY_INFORMATION,
+        CreateWellKnownSid, EqualSid, FreeSid, GetAce, InitializeSecurityDescriptor,
+        SetKernelObjectSecurity, SetSecurityDescriptorDacl, WinCapabilityInternetClientSid,
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, PSID, SECURITY_DESCRIPTOR,
+        SID_AND_ATTRIBUTES, UNPROTECTED_DACL_SECURITY_INFORMATION,
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
@@ -596,29 +597,96 @@ pub(crate) mod win {
         // SAFETY: `wpath` is live, `merged` is the ACL just built and still
         // owned by `_merged`, and the owner, group and SACL arguments are null,
         // which with the DACL bits alone means "change only the DACL".
-        let propagate = match reach {
-            Reach::Tree => UNPROTECTED_DACL_SECURITY_INFORMATION,
-            Reach::DirectoryOnly => 0,
-        };
-        let rc = unsafe {
-            SetNamedSecurityInfoW(
-                wpath.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | propagate,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                merged,
-                std::ptr::null(),
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(rc as i32));
+        match reach {
+            Reach::Tree => {
+                let rc = unsafe {
+                    SetNamedSecurityInfoW(
+                        wpath.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        merged,
+                        std::ptr::null(),
+                    )
+                };
+                if rc != ERROR_SUCCESS {
+                    return Err(io::Error::from_raw_os_error(rc as i32));
+                }
+            }
+            Reach::DirectoryOnly => set_dacl_on_this_object_alone(path, merged)?,
         }
         granted_here()
             .lock()
             .expect("the grant memo is not poisoned")
             .insert(memo_key);
         tracing::debug!(path = %path.display(), ?access, "sandbox: granted the AppContainer");
+        Ok(())
+    }
+
+    /// Write `dacl` onto `path` **and onto nothing else**.
+    ///
+    /// **Both `aclapi` entry points walk the subtree, and that is the whole
+    /// reason this exists.** `SetNamedSecurityInfoW` and `SetSecurityInfo` are
+    /// documented to "impose the current inheritance model on the ACLs of all
+    /// objects in the hierarchy below the target object" — the flag this module
+    /// varies by `Reach` decides whether existing children are *recomputed*, not
+    /// whether they are visited, and an ACE with `NO_INHERITANCE` does not spare
+    /// them either. The ancestors of a granted path include `%LOCALAPPDATA%`, so
+    /// one traverse grant meant enumerating the whole user profile: both Windows
+    /// legs of the run that introduced it were still going at forty minutes, with
+    /// tests that spawn a single contained command sitting at over three hundred
+    /// seconds each.
+    ///
+    /// The propagation is a user-mode convenience of `aclapi`, not something the
+    /// kernel does. `SetKernelObjectSecurity` sets the descriptor on the object
+    /// the handle names and returns, which is exactly the semantics a directory
+    /// granted for what it will *later* hold wants — new children inherit from
+    /// it, existing ones are not touched and not read.
+    ///
+    /// The DACL is written unprotected: nothing here sets `SE_DACL_PROTECTED`, so
+    /// the directory still inherits from its own parent as it did before.
+    fn set_dacl_on_this_object_alone(path: &Path, dacl: *mut ACL) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Opening a *directory* needs backup semantics; the two rights are the
+        // least that lets a DACL be read and replaced.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+
+        // An absolute security descriptor carrying just this DACL. `SECURITY_DESCRIPTOR_REVISION`
+        // is 1 and has been for the life of the API.
+        let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let psd = std::ptr::from_mut(&mut sd).cast::<core::ffi::c_void>();
+        // SAFETY: `sd` is a live, correctly sized descriptor owned by this frame.
+        if unsafe { InitializeSecurityDescriptor(psd, 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `psd` is the descriptor just initialised and `dacl` is the ACL
+        // the caller still owns for the rest of this call. `TRUE` for present,
+        // `FALSE` for defaulted: this DACL is deliberate, not a default.
+        if unsafe { SetSecurityDescriptorDacl(psd, 1, dacl, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the handle is open for `WRITE_DAC` and lives until the end of
+        // this function; `psd` is a valid absolute descriptor whose DACL outlives
+        // the call.
+        if unsafe {
+            SetKernelObjectSecurity(
+                dir.as_raw_handle() as HANDLE,
+                DACL_SECURITY_INFORMATION,
+                psd,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 
