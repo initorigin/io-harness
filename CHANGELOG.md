@@ -74,6 +74,16 @@ notes are produced from it.
   holds `credentials.toml` and this set is readable by the payload. A toolchain
   installed somewhere none of these name fails to start under the container,
   visibly, as its own error.
+- **The temporary directory is granted for what the run creates there, not for
+  what is already there.** Every path the run names — the workspace, a cache root,
+  a launcher home — is granted across what it already holds, because that content
+  predates the run and is the point. The system temporary directory is granted as
+  a directory: a toolchain can create a temporary file there, and every temporary
+  file already on the machine stays outside the boundary. A payload sitting in the
+  temporary directory rather than in the workspace is unreadable to the run unless
+  it is named as a writable root. A grant the container already holds is not
+  applied again, so the walk of a large tree is paid once per machine rather than
+  once per command.
 
 ### Changed
 
@@ -214,6 +224,15 @@ notes are produced from it.
   `[exec unavailable]`. With containment now the default that would have turned
   every "no such program on PATH" into "your command failed" — the wrong diagnosis
   for the model and for whoever reads the trace.
+- **A verification gate resolves its own writable cache roots when it was handed
+  none.** 0.46.0 gave the gate the detected toolchain's caches, and only the run
+  filled them in: a gate reached through `passes_in`, `passes_in_guarded` or an
+  `ExecGuard` an embedder built by hand got an empty set, so a `cargo` criterion
+  could not populate a registry cache. On the unix backends that is a refused
+  write, which cargo mostly survives; under the Windows AppContainer it is a
+  refused **read**, because that backend is default-deny for reads, and the gate
+  fails outright with the compiler's own error nowhere in sight. Both call paths
+  now derive the set from the same function.
 
 ## [0.45.0] - 2026-08-09
 

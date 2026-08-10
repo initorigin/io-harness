@@ -1047,6 +1047,25 @@ machine names, all of which a process needs in order to start at all.
 **The user's profile directory is deliberately not granted**: that is where
 credentials live.
 
+The temporary directory is granted **for what the run creates there, not for what
+is already there**. A grant is one inheritable ACE on a directory, and Windows
+inheritance is static: what a directory gains afterwards inherits it, and what it
+already holds is reached only by re-propagating the ACE across every object under
+the path. Every path the run *names* is re-propagated, because a workspace whose
+source files predate the run and a registry cache whose crates were downloaded
+last week are the point of granting them at all. The system temporary directory
+is not, for two reasons that point the same way: a toolchain needs to be able to
+create a temporary file, which inheritance already gives it, and handing a
+default-deny container every temporary file every other program on the machine
+has written is not a boundary. **A payload that lives in the temporary directory
+and is not inside the workspace is therefore unreadable to the run** — name it as
+a writable root, or put it in the workspace.
+
+A grant the container already holds is not applied again. The container SID is
+derived from a fixed profile name, so it is the same SID for every run on the
+machine: the first run pays for the walk of a large tree and no later one repeats
+it.
+
 The program's directory is the directory of the *resolved* program: a command is
 named the way every command is named, and the parent of a bare `rustc` is the
 empty path. The launcher homes are a separate question from the cache
