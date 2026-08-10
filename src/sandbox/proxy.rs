@@ -434,6 +434,48 @@ mod tests {
         panic!("the proxy is still listening on {addr} after the run that owned it ended");
     }
 
+    /// N5 — the per-dial overhead, measured rather than asserted to be small.
+    ///
+    /// A proxy is a hop, and "the hop is affordable" is a claim about a number.
+    /// Ignored by default because it is a measurement and not an assertion: run it
+    /// with `-- --ignored --nocapture` and put the figures in the release record,
+    /// the way 0.46.0 recorded containment overhead and 0.47.0 recorded each rung's.
+    #[tokio::test]
+    #[ignore = "measurement, not an assertion: run with --ignored --nocapture"]
+    async fn n5_per_dial_overhead() {
+        const N: u32 = 30;
+        let (upstream, _server) = echo_listener("pong").await;
+        let target = upstream.to_string();
+        let proxy = proxy_for(Policy::default().layer("m").allow_net("127.0.0.1")).await;
+        let denied = proxy_for(Policy::default().layer("m").deny_net("127.0.0.1")).await;
+
+        // Direct: what the connection costs with nothing in the way.
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = TcpStream::connect(upstream).await.unwrap();
+        }
+        let direct = t.elapsed().as_secs_f64() * 1000.0 / f64::from(N);
+
+        // Permitted: parse, ask the policy, dial upstream, answer 200.
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = connect_through(&proxy, &target).await;
+        }
+        let permitted = t.elapsed().as_secs_f64() * 1000.0 / f64::from(N);
+
+        // Refused: parse, ask the policy, answer 403 — no upstream dial at all.
+        let t = std::time::Instant::now();
+        for _ in 0..N {
+            let _ = connect_through(&denied, &target).await;
+        }
+        let refused = t.elapsed().as_secs_f64() * 1000.0 / f64::from(N);
+
+        println!(
+            "N5 per dial over {N} iterations: direct {direct:.3} ms, permitted {permitted:.3} ms, \
+             refused {refused:.3} ms"
+        );
+    }
+
     /// The policy is read per dial, not captured at start: a plan gate narrows the
     /// effective policy mid-run, and a proxy holding the policy the run began with
     /// would go on permitting what the run had stopped permitting.
