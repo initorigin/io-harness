@@ -1225,9 +1225,34 @@ mod tests {
             .unwrap_or_else(|_| dir.path().display().to_string());
         let short_abs = dir.path().join("probe.bat").display().to_string();
         let long_abs = format!("{long}\\probe.bat");
+        let txt_abs = dir.path().join("probe.txt").display().to_string();
+
+        // A second workspace that is not under the user profile at all. The
+        // target directory is beside the build output, which is on whichever
+        // volume the checkout is on — `D:` on this runner, and never `%TEMP%`.
+        let other = std::env::current_dir()
+            .unwrap_or_default()
+            .join("target")
+            .join(format!("io-harness-probe-{}", std::process::id()));
+        let other_bat = if std::fs::create_dir_all(&other).is_ok()
+            && std::fs::write(
+                other.join("probe.bat"),
+                "@echo off\r\necho io-harness-probe\r\n",
+            )
+            .is_ok()
+        {
+            other.join("probe.bat").display().to_string()
+        } else {
+            String::new()
+        };
 
         let limits = SandboxLimits::none();
-        let cases: [(&str, &[&str]); 8] = [
+        let roots: Vec<PathBuf> = if other_bat.is_empty() {
+            Vec::new()
+        } else {
+            vec![other.clone()]
+        };
+        let cases: [(&str, &[&str]); 10] = [
             // The control: a shell builtin needs nothing but `%SystemRoot%`,
             // which carries an ALL APPLICATION PACKAGES ACE of its own. If this
             // fails the container is not usable on this host at all.
@@ -1257,6 +1282,23 @@ mod tests {
             // The toolchain binary cargo could not start, reached the way cargo
             // reaches it: by absolute path, not through the launcher shim.
             ("the toolchain binary by absolute path", &["@RUSTC@", "-vV"]),
+            // The case that separates "an absolute path" from "a batch file".
+            // `type` is a builtin reading the same directory by the same kind of
+            // path, so if it passes while the two above fail, the path resolves
+            // and what cannot be reached is whatever `cmd` does to *start* a
+            // script.
+            (
+                "reading a granted file by absolute path",
+                &["cmd", "/c", "type @TXT@"],
+            ),
+            // And the case that separates "an absolute path" from "this chain".
+            // The workspace here sits beside the checkout on the runner's data
+            // volume rather than under the user profile, so `AppData\Local` and
+            // every ACL on it are out of the picture.
+            (
+                "a batch file by absolute path off the profile",
+                &["cmd", "/c", "@OTHER@"],
+            ),
         ];
 
         // Where the toolchain's own rustc is, which is what `cargo` executes and
@@ -1278,6 +1320,8 @@ mod tests {
                     "@SHORT@" => short_abs.clone(),
                     "@LONG@" => long_abs.clone(),
                     "@RUSTC@" => toolchain_rustc.clone(),
+                    "type @TXT@" => format!("type {txt_abs}"),
+                    "@OTHER@" => other_bat.clone(),
                     other => other.to_string(),
                 })
                 .collect();
@@ -1290,9 +1334,12 @@ mod tests {
                 ));
                 continue;
             }
+            // The second workspace is named as a writable root so the case that
+            // runs from it is testing the *path*, not an ungranted directory.
             let spec = RunSpec::new(&argv, dir.path(), &limits)
                 .with_mode(ExecMode::WorkspaceWrite)
-                .with_network(false);
+                .with_network(false)
+                .with_writable_roots(&roots);
             match job::run_contained(&spec).await {
                 None => {
                     failed += 1;
@@ -1401,7 +1448,23 @@ mod tests {
             find(&g, r"C:\Users\someone\.rustup").unwrap().grant,
             Grant::ReadExecute
         );
-        assert_eq!(g.len(), 7, "nothing is granted that was not named");
+        // Nothing is granted that was not named or walked to. The seven named
+        // paths, and on Windows the ancestors that make them reachable — a count
+        // that differs by platform because `Path::ancestors` splits on the host's
+        // separator and a backslash is an ordinary character in a unix path.
+        let named = 7;
+        assert_eq!(
+            g.iter().filter(|e| e.grant != Grant::Traverse).count(),
+            named,
+            "nothing is granted that was not named"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(g.len(), named, "no ancestors are found on this host");
+        #[cfg(windows)]
+        assert!(
+            g.len() > named && g[named..].iter().all(|e| e.grant == Grant::Traverse),
+            "the ancestors are added after the named set and are traverse-only: {g:?}"
+        );
     }
 
     /// F8's mode arm — `ReadOnly` downgrades the workspace to read-execute and
