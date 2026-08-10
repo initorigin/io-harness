@@ -107,7 +107,7 @@ pub(crate) mod win {
     }
 
     /// What a grant lets the container do with a path.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum Access {
         /// Read and execute. What a binary, a toolchain or a read-only input
         /// tree needs, and the most that should ever be given to one.
@@ -165,7 +165,7 @@ pub(crate) mod win {
     /// Mirrors `super::super::windows::Reach`, for the same reason `Access`
     /// mirrors `Grant`: the decision is portable data asserted on the build host
     /// and this is where it becomes a Win32 flag.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum Reach {
         /// The directory and everything already inside it.
         Tree,
@@ -355,6 +355,21 @@ pub(crate) mod win {
         }
     }
 
+    /// The grants this process has already applied, completed.
+    ///
+    /// Keyed by path, access and reach together: a directory granted for what it
+    /// will hold is not a directory granted across what it already holds, and a
+    /// read-execute grant does not stand in for a full one.
+    #[allow(clippy::type_complexity)]
+    fn granted_here(
+    ) -> &'static std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, Access, Reach)>>
+    {
+        static DONE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, Access, Reach)>>,
+        > = std::sync::OnceLock::new();
+        DONE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
     /// What `path`'s DACL already allows `sid`, if it names it at all.
     ///
     /// `None` is "this SID appears in no allow-ACE on this object", which is the
@@ -450,18 +465,25 @@ pub(crate) mod win {
         // same SID on every run of every process on the machine: the first run
         // pays for the walk and no later one repeats it.
         //
-        // The comparison is against the mask this function itself writes, which
-        // is why it can be a plain bit test rather than a generic-rights
-        // mapping: the ACE being looked for is the one a previous run added to
-        // this very path, in the same form. An ACE that says the same thing in
-        // its mapped form is not recognised and costs one more walk, which is
-        // the safe direction to be wrong in.
-        if let Some(have) = granted_mask(path, sid) {
-            let want = access.mask();
-            if have & want == want {
+        // **The memo is this process's own completed grants, and reading the ACE
+        // off the directory is not a substitute for it.** `SetNamedSecurityInfoW`
+        // writes the top-level ACE and then walks the tree, so a second process
+        // that only checks the directory can observe a grant that is still in
+        // flight — `.rustup` is thousands of files — conclude it is done, skip,
+        // and then be refused the binary deep inside that the walk had not
+        // reached. That is what the round-two check did, and it is why `cargo`
+        // could not start `rustc.exe` while the launcher shim beside it worked.
+        // A path this process granted itself is safe to skip, because
+        // `SetNamedSecurityInfoW` had returned before it was recorded.
+        let memo_key = (path.to_path_buf(), access, reach);
+        {
+            let done = granted_here()
+                .lock()
+                .expect("the grant memo is not poisoned");
+            if done.contains(&memo_key) {
                 tracing::debug!(
                     path = %path.display(), ?access,
-                    "sandbox: the AppContainer already has this grant"
+                    "sandbox: this process already granted the AppContainer this path"
                 );
                 return Ok(());
             }
@@ -561,6 +583,10 @@ pub(crate) mod win {
         if rc != ERROR_SUCCESS {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
+        granted_here()
+            .lock()
+            .expect("the grant memo is not poisoned")
+            .insert(memo_key);
         tracing::debug!(path = %path.display(), ?access, "sandbox: granted the AppContainer");
         Ok(())
     }

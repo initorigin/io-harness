@@ -1127,8 +1127,53 @@ mod tests {
         )
         .expect("probe batch");
 
+        // **The grant set itself, printed.** `run_contained` swallows a failed
+        // read-execute grant by design — those paths carry an ALL APPLICATION
+        // PACKAGES ACE of their own and a non-administrator cannot rewrite their
+        // DACLs — so a path missing from this set and a path whose grant failed
+        // look the same from outside, and neither is visible in a test that only
+        // reports the command's exit code. Derived exactly as the backend derives
+        // it, and applied to nothing: this is a report, not a second grant.
+        let tmp = std::env::temp_dir();
+        let program_dir = crate::sandbox::resolve_program("cmd")
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|p| !p.as_os_str().is_empty());
+        let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+        let derived = super::grants(
+            ExecMode::WorkspaceWrite,
+            dir.path(),
+            &[],
+            &crate::toolchain::Toolchain::launcher_homes(),
+            program_dir.as_deref(),
+            system_root.as_deref(),
+            &tmp,
+        );
+        let mut report = String::from("\n  the grant set this run derives:");
+        for g in &derived {
+            report.push_str(&format!(
+                "\n    {:?} {:?} exists={} {}",
+                g.grant,
+                g.reach,
+                g.path.is_dir(),
+                g.path.display()
+            ));
+        }
+
+        // The long form of the workspace path. `std::env::temp_dir` answers with
+        // whatever `%TEMP%` holds, and on this runner that is the **8.3 short
+        // name** (`RUNNER~1`), so every payload path these tests build carries
+        // one. Resolving a short name is not the same file-system operation as
+        // opening a long one, and the two cases that still fail are the two that
+        // use an absolute short-name path — so the comparison is made here rather
+        // than assumed either way.
+        let long = std::fs::canonicalize(dir.path())
+            .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+            .unwrap_or_else(|_| dir.path().display().to_string());
+        let short_abs = dir.path().join("probe.bat").display().to_string();
+        let long_abs = format!("{long}\\probe.bat");
+
         let limits = SandboxLimits::none();
-        let cases: [(&str, &[&str]); 5] = [
+        let cases: [(&str, &[&str]); 8] = [
             // The control: a shell builtin needs nothing but `%SystemRoot%`,
             // which carries an ALL APPLICATION PACKAGES ACE of its own. If this
             // fails the container is not usable on this host at all.
@@ -1146,12 +1191,51 @@ mod tests {
             ),
             // A program on PATH, through its launcher and toolchain home.
             ("a program on PATH", &["rustc", "--version"]),
+            // The same batch file by absolute path, in the two forms the path can
+            // take. Every remaining failure in this release runs a payload by an
+            // absolute path that carries an 8.3 short component, and every case
+            // that passes names it relative to a granted working directory.
+            ("a batch file by absolute path", &["cmd", "/c", "@SHORT@"]),
+            (
+                "a batch file by long absolute path",
+                &["cmd", "/c", "@LONG@"],
+            ),
+            // The toolchain binary cargo could not start, reached the way cargo
+            // reaches it: by absolute path, not through the launcher shim.
+            ("the toolchain binary by absolute path", &["@RUSTC@", "-vV"]),
         ];
 
-        let mut report = String::new();
+        // Where the toolchain's own rustc is, which is what `cargo` executes and
+        // what it was refused. Asked of the launcher rather than guessed.
+        let toolchain_rustc = std::process::Command::new("rustup")
+            .args(["which", "rustc"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        report.push_str(&format!("\n  rustup which rustc: {toolchain_rustc:?}"));
+
         let mut failed = 0;
         for (what, args) in cases {
-            let argv: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            let argv: Vec<String> = args
+                .iter()
+                .map(|s| match *s {
+                    "@SHORT@" => short_abs.clone(),
+                    "@LONG@" => long_abs.clone(),
+                    "@RUSTC@" => toolchain_rustc.clone(),
+                    other => other.to_string(),
+                })
+                .collect();
+            // A case whose subject this host could not name is reported as such
+            // rather than run as an empty argv, which would fail for a reason of
+            // its own and read like a denial.
+            if argv.iter().any(String::is_empty) {
+                report.push_str(&format!(
+                    "\n  {what}: not runnable here, no path to the subject"
+                ));
+                continue;
+            }
             let spec = RunSpec::new(&argv, dir.path(), &limits)
                 .with_mode(ExecMode::WorkspaceWrite)
                 .with_network(false);
