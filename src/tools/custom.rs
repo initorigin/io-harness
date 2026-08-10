@@ -245,6 +245,59 @@ pub trait Tool: Send + Sync {
     fn effect(&self) -> ToolEffect {
         ToolEffect::Mutating
     }
+
+    /// The containment mode this tool needs (0.48.0).
+    ///
+    /// Defaulted to `None`, which means *whatever this run was granted* — so a
+    /// tool written against any earlier release compiles unchanged and is treated
+    /// exactly as it was. Return [`ExecMode::ReadOnly`] to say this tool never
+    /// needs to write, or [`ExecMode::WorkspaceWrite`] to say it does.
+    ///
+    /// **This is a refusal mechanism and not a confinement one, and the
+    /// difference matters.** A registered tool spawns its own processes; the
+    /// harness never sees that spawn and cannot wrap it. What a declaration buys
+    /// is that a tool needing more than the run grants is *not called at all* —
+    /// refused before it runs, with the reason handed to the model — instead of
+    /// being called and failing on a permission error it has to explain. The
+    /// crate makes no claim that a registered tool's own child is contained.
+    ///
+    /// For the built-in tools whose spawn the harness *does* own — `exec`,
+    /// `shell`, `shell_start` and the git built-ins — the same declaration also
+    /// narrows: a call runs under
+    /// [`ExecMode::narrower`](crate::ExecMode::narrower) of what it needs and what
+    /// the contract granted.
+    ///
+    /// ```
+    /// use io_harness::tools::{Tool, ToolFuture};
+    /// use io_harness::{ExecMode, ToolSpec};
+    /// # use serde_json::{json, Value};
+    ///
+    /// struct Lookup;
+    ///
+    /// impl Tool for Lookup {
+    ///     # fn spec(&self) -> ToolSpec {
+    ///     #     ToolSpec { name: "lookup".into(), description: "Read a record.".into(),
+    ///     #                parameters: json!({"type": "object"}) }
+    ///     # }
+    ///     # fn invoke<'a>(&'a self, _a: &'a Value) -> ToolFuture<'a> {
+    ///     #     Box::pin(async { Ok("one row".to_string()) })
+    ///     # }
+    ///     // Reading a record writes nothing, so this tool is still callable in a
+    ///     // run that granted no more than read-only.
+    ///     fn exec_mode(&self) -> Option<ExecMode> {
+    ///         Some(ExecMode::ReadOnly)
+    ///     }
+    /// }
+    ///
+    /// assert_eq!(Lookup.exec_mode(), Some(ExecMode::ReadOnly));
+    /// ```
+    ///
+    /// Read once per call, before the call is dispatched, and it must answer the
+    /// same way every time: a tool that changed its mind after the resolution
+    /// would run under a grant it had just said it did not want.
+    fn exec_mode(&self) -> Option<crate::sandbox::ExecMode> {
+        None
+    }
 }
 
 /// The set of [`Tool`]s registered for a run.

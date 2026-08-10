@@ -319,6 +319,16 @@ impl Identity {
 }
 
 impl GitCmd {
+    /// Whether this command only reads the repository (0.48.0).
+    ///
+    /// The same three-and-four split `dispatch` already makes when it decides a
+    /// git call's `Act` on `.git`, and the reason it is a method here is that this
+    /// module builds the argv: a reader is what `--no-optional-locks` is for, and
+    /// a mode is what it is declared under.
+    pub(crate) fn reads_only(&self) -> bool {
+        matches!(self, Self::Status { .. } | Self::Diff { .. } | Self::Log { .. })
+    }
+
     /// The subcommand and its fixed options — everything this module chose, with
     /// nothing model-supplied in it.
     fn options(&self) -> Vec<String> {
@@ -453,6 +463,15 @@ pub(crate) struct Git<'a> {
     workdir: PathBuf,
     program: String,
     cap: usize,
+    /// The containment this call resolved (0.48.0), or `None` for a run that
+    /// granted [`ExecMode::FullAccess`](crate::ExecMode::FullAccess).
+    ///
+    /// Before 0.48.0 this spawn was the one the boundary never reached: a run
+    /// whose `exec` could not write outside the workspace could still reach `git`,
+    /// and no surface said so. The mode is the *call's*, already narrowed — the
+    /// three readers declare `ReadOnly` — so it is handed in rather than derived
+    /// here, which keeps one answer per call instead of two that can disagree.
+    sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
 }
 
 impl<'a> Git<'a> {
@@ -467,7 +486,17 @@ impl<'a> Git<'a> {
             workdir: workdir.into(),
             program: GIT.into(),
             cap,
+            sandbox: None,
         }
+    }
+
+    /// Run this call's `git` inside the containment the run resolved (0.48.0).
+    pub(crate) fn contained(
+        mut self,
+        sandbox: Option<std::sync::Arc<crate::sandbox::ExecContainment>>,
+    ) -> Self {
+        self.sandbox = sandbox;
+        self
     }
 
     /// Use a `git` that is not on `PATH` under that name.
@@ -491,12 +520,18 @@ impl<'a> Git<'a> {
     /// precede every model-supplied byte.
     pub(crate) fn argv(&self, cmd: &GitCmd) -> Result<Vec<String>> {
         cmd.check()?;
-        let mut argv = vec![
-            self.program.clone(),
-            "--no-pager".into(),
-            "-c".into(),
-            format!("{NO_HOOKS}={NULL_DEVICE}"),
-        ];
+        let mut argv = vec![self.program.clone(), "--no-pager".into()];
+        // 0.48.0 — a reader declares `ReadOnly`, and `git status` refreshing a
+        // stale index would take `.git/index.lock` under exactly that mode. This
+        // is git's own way of saying "do not take a lock you did not have to", so
+        // the declaration is correct for these three rather than merely survivable
+        // (`US-IO-HARNESS-0.48.0-I01`). It is a top-level option and must precede
+        // the subcommand.
+        if cmd.reads_only() {
+            argv.push("--no-optional-locks".into());
+        }
+        argv.push("-c".into());
+        argv.push(format!("{NO_HOOKS}={NULL_DEVICE}"));
         argv.extend(cmd.config()?);
         argv.extend(cmd.options());
         argv.push("--".into());
@@ -521,7 +556,46 @@ impl<'a> Git<'a> {
                 layer: verdict.layer,
             });
         }
-        match self.command(&argv).output().await {
+        // 0.48.0 — the same two halves every other spawn site in this crate uses:
+        // what the argv becomes under a wrapping backend, and the restriction that
+        // is installed in the child instead of expressed as an argv. Both, or a
+        // Landlock rung would report itself while this one command ran unconfined
+        // — which is the defect the matrix caught on a `shell` stage in 0.46.0.
+        let roots = self
+            .sandbox
+            .as_ref()
+            .map(|c| c.roots_for(&self.workdir))
+            .unwrap_or_default();
+        let spawn_argv = match &self.sandbox {
+            Some(c) => {
+                crate::sandbox::wrap_argv(
+                    &c.config,
+                    &self.workdir,
+                    c.config.allow_network,
+                    &roots,
+                    &argv,
+                )
+                .1
+            }
+            None => argv.clone(),
+        };
+        let mut child = self.command(&spawn_argv);
+        // Held across the spawn: the guard owns the rule set the child restricts
+        // itself with.
+        let _contained = match &self.sandbox {
+            Some(c) => {
+                crate::sandbox::apply_rlimits(&mut child, &c.config.limits);
+                crate::sandbox::contain_command(
+                    &mut child,
+                    &c.config,
+                    &self.workdir,
+                    c.config.allow_network,
+                    &roots,
+                )
+            }
+            None => None,
+        };
+        match child.output().await {
             Ok(out) => Ok(GitOutcome::Ran {
                 code: out.status.code(),
                 stdout: cap_result(String::from_utf8_lossy(&out.stdout).into_owned(), self.cap).0,

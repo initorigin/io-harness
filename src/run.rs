@@ -4359,6 +4359,24 @@ async fn run_workspace_from<P: Provider>(
                 store.record_handle_ended(run_id, id, "exited", code, None)?;
             }
         }
+        // 0.48.0 — and a contained handle's containment ends when its processes
+        // do. The `create` and `exec` rows were written where the handle was
+        // started; this is the only thread that can write the `destroy` one,
+        // because the reaping task cannot reach the store. Once per handle rather
+        // than once per step: the sweep above may be replayed harmlessly and a
+        // trace row may not, so the once-ness lives in the registry.
+        //
+        // A run that ends while a handle is still live writes no destroy row —
+        // the registry kills it on drop and there is no step left to record on,
+        // which is the same position `record_handle_ended` is in and is stated in
+        // the release record rather than papered over.
+        if containment.is_some() {
+            for id in handles.take_unreported_endings() {
+                let mut ended = crate::state::SandboxEvent::destroy(run_id, step);
+                ended.detail = Some(format!("shell_start handle {id}"));
+                record_sandbox_step(store, watch, 0, &ended);
+            }
+        }
 
         // The step boundary, where a cancellation is honoured (see `cancelled`).
         if let Some(o) = cancelled(store, watch, run_id, 0, step - 1)? {
@@ -7480,6 +7498,89 @@ fn tool_effect(name: &str, custom: &Toolbox) -> ToolEffect {
     }
 }
 
+/// The mode a call needs, before anything is spawned for it (0.48.0).
+///
+/// `None` means *whatever this run was granted*, which is the answer for `exec`,
+/// `shell` and `shell_start`: they are the tools
+/// [`TaskContract::exec_sandbox`](crate::TaskContract::exec_sandbox) was written
+/// for, and narrowing them would be the contract disagreeing with itself.
+///
+/// **The git built-ins are classified the way this crate already classifies
+/// them.** `dispatch` decides a git call's `Act` on `.git` at one place — writers
+/// are `git_add`, `git_commit`, `git_branch` and `git_worktree`, readers are
+/// `git_log`, `git_status` and `git_diff` — and a second, hand-maintained opinion
+/// about which of them writes is a fact in two files waiting to disagree. The
+/// modes here are that table read as grants.
+///
+/// The three read-only built-ins declare `ReadOnly` and it is **inert**: they
+/// spawn nothing, so no backend ever wraps them and no mode is ever applied. It
+/// is written down anyway because the alternative is a reader of this function
+/// wondering whether their absence meant "needs everything".
+///
+/// A registered tool answers for itself through
+/// [`Tool::exec_mode`](crate::tools::Tool), defaulted to `None`, so a toolbox
+/// assembled before 0.48.0 keeps running exactly as it did. An MCP tool declares
+/// nothing: the server owns that process and this crate does not model it.
+fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::ExecMode> {
+    use crate::sandbox::ExecMode;
+    match name {
+        GREP_TOOL | FIND_TOOL | READ_FILE_TOOL => Some(ExecMode::ReadOnly),
+        GIT_LOG_TOOL | GIT_STATUS_TOOL | GIT_DIFF_TOOL => Some(ExecMode::ReadOnly),
+        GIT_ADD_TOOL | GIT_COMMIT_TOOL | GIT_BRANCH_TOOL | GIT_WORKTREE_TOOL => {
+            Some(ExecMode::WorkspaceWrite)
+        }
+        EXEC_TOOL | SHELL_TOOL | SHELL_START_TOOL => None,
+        _ => custom.get(name).and_then(|tool| tool.exec_mode()),
+    }
+}
+
+/// What this call is contained under, decided before it is dispatched (0.48.0).
+///
+/// Three outcomes, and the order they are decided in is the release's own claim
+/// that a requirement is *resolved* rather than discovered:
+///
+/// 1. The tool needs more than the contract granted — refused here, with nothing
+///    spawned and nothing to attribute a permission error to.
+/// 2. The tool needs less — the call is contained under the narrower of the two,
+///    with the writable roots recomputed for it.
+/// 3. The tool declares nothing, or exactly what it was granted — the run's own
+///    containment, unchanged, which is every call made before this release.
+///
+/// A run that granted [`ExecMode::FullAccess`](crate::ExecMode::FullAccess) has
+/// no containment at all, and nothing here invents one: `exec_sandbox` is `None`,
+/// so there is nothing to narrow and nothing a declaration could be refused
+/// against. That is the documented escape hatch and it stays absolute.
+enum CallMode {
+    /// Run under this containment. `None` is uncontained, as before.
+    Contained(Option<std::sync::Arc<crate::sandbox::ExecContainment>>),
+    /// Refuse the call. The tool needs more than this run was granted.
+    Refused { needed: crate::sandbox::ExecMode },
+}
+
+fn resolve_call_mode(
+    name: &str,
+    custom: &Toolbox,
+    exec_sandbox: Option<&std::sync::Arc<crate::sandbox::ExecContainment>>,
+) -> CallMode {
+    let Some(containment) = exec_sandbox else {
+        // FullAccess: no backend, no roots, nothing to narrow or refuse against.
+        return CallMode::Contained(None);
+    };
+    let granted = containment.config.mode;
+    let Some(needed) = tool_mode(name, custom) else {
+        return CallMode::Contained(Some(std::sync::Arc::clone(containment)));
+    };
+    if !needed.satisfied_by(granted) {
+        return CallMode::Refused { needed };
+    }
+    let resolved = granted.narrower(needed);
+    if resolved == granted {
+        CallMode::Contained(Some(std::sync::Arc::clone(containment)))
+    } else {
+        CallMode::Contained(Some(std::sync::Arc::new(containment.with_mode(resolved))))
+    }
+}
+
 /// The part of a read-only call that can run at the same time as another one.
 ///
 /// Everything a call needs from the run has already been decided by the time one
@@ -8061,6 +8162,52 @@ async fn dispatch(
         return Ok(refused);
     }
     let name = call.name.as_str();
+    // 0.48.0 — what this call may do is decided here, before the arm that would
+    // spawn for it. A tool needing more than this run grants leaves with nothing
+    // started, which is what "resolved before execution rather than discovered by
+    // a failure" means: no process, and therefore no permission error for the
+    // model to interpret.
+    let narrowed;
+    let exec_sandbox = match resolve_call_mode(name, custom, exec_sandbox) {
+        CallMode::Refused { needed } => {
+            let granted = exec_sandbox
+                .map(|c| c.config.mode)
+                .unwrap_or(crate::sandbox::ExecMode::FullAccess);
+            return Ok(Dispatched::go(
+                format!("{name} refused: needs {}", needed.as_str()),
+                format!(
+                    "\n[{name} refused] this tool needs the `{}` containment mode and this run \
+                     grants `{}`. Nothing was started. Do this another way, or ask for a run that \
+                     grants it.\n",
+                    needed.as_str(),
+                    granted.as_str()
+                ),
+            ));
+        }
+        CallMode::Contained(resolved) => {
+            // Reported when it differs from the run's own answer, in the shape
+            // 0.44.0 used for `CacheMarked`: an event on the transition rather
+            // than one per call, so an observer sees the calls that were held to
+            // less than the run was granted and is not handed a copy of the run's
+            // own containment on every dispatch.
+            if let (Some(call_c), Some(run_c)) = (resolved.as_ref(), exec_sandbox) {
+                if call_c.config.mode != run_c.config.mode {
+                    watch.emit(RunEvent::at_depth(
+                        run_id,
+                        step,
+                        depth,
+                        EventKind::Contained {
+                            mode: call_c.config.mode.as_str().to_string(),
+                            backend: call_c.backend().as_str().to_string(),
+                            roots: call_c.roots.len() as u32,
+                        },
+                    ));
+                }
+            }
+            narrowed = resolved;
+            narrowed.as_ref()
+        }
+    };
     Ok(match name {
         // 0.41.0 — the three read-only built-ins go through the same two halves a
         // batched read does: the policy on this thread, then the read itself. One
@@ -9039,12 +9186,43 @@ async fn dispatch(
                         dyn Fn(&tokio::process::Child) -> crate::error::Result<()> + Send + Sync,
                     >
             };
+            // 0.48.0 — the same containment the foreground line gets, per stage,
+            // through the same shared runner. Until this release a handle was the
+            // one execution path left at full privilege, so an agent that could
+            // not write outside the workspace with `shell` could start the same
+            // line with `shell_start` and write wherever it liked.
+            //
+            // There is no cross-run lifetime to manage and that is the answer to
+            // the question `docs/CONTRACT.md` left open: the restriction lives
+            // with the processes — a `pre_exec` rule set or a wrapper argv on
+            // unix, the Job Object this handle already owns on Windows — so
+            // nothing is torn down and nothing is re-entered. A resumed run finds
+            // the previous run's handle rows and orphans them, exactly as before.
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            if let Some(containment) = &contained {
+                let backend = containment.backend();
+                for event in [
+                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
             let runner = Shell::detached(
                 cap,
                 crate::tools::shell::Capture {
                     path: capture,
                     on_spawn,
                 },
+            )
+            .contained(
+                contained
+                    .clone()
+                    .map(|containment| crate::tools::shell::ShellSandbox {
+                        containment,
+                        workdir: ws.root().to_path_buf(),
+                    }),
             );
             // Detached on purpose: this is the one tool whose work outlives its
             // dispatch. The task reaps, so a process that ends on its own is
@@ -9910,7 +10088,12 @@ async fn dispatch(
                 }
             };
 
-            let git = Git::new(ws.policy(), ws.root(), cap);
+            // 0.48.0 — `exec_sandbox` here is this call's own containment, already
+            // narrowed to what the tool declared: `read-only` for the three
+            // readers, `workspace-write` for the four that touch `.git`. A run
+            // granting `FullAccess` hands `None` and this spawn is what it always
+            // was.
+            let git = Git::new(ws.policy(), ws.root(), cap).contained(exec_sandbox.cloned());
             // 0.21.0 — a refused git built-in costs a step, not the run.
             //
             // Until here, `Git::run`'s refusal left the loop as `Error::Refused`, so

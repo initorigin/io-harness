@@ -340,6 +340,74 @@ impl ExecMode {
     pub fn is_contained(&self) -> bool {
         !matches!(self, ExecMode::FullAccess)
     }
+
+    /// How much this mode grants, as a number, so two of them can be compared
+    /// (0.48.0).
+    ///
+    /// Private because the ordering is the only thing callers need and
+    /// [`ExecMode::narrower`] is that. Publishing a rank would invite arithmetic
+    /// on it, and the moment a fourth mode exists the arithmetic is wrong while
+    /// the comparison still holds.
+    fn rank(&self) -> u8 {
+        match self {
+            ExecMode::ReadOnly => 0,
+            ExecMode::WorkspaceWrite => 1,
+            ExecMode::FullAccess => 2,
+        }
+    }
+
+    /// The lesser of two grants (0.48.0).
+    ///
+    /// A tool declares the mode it needs and a contract grants one; a call runs
+    /// under whichever of the two permits less. That is least privilege stated as
+    /// a function: a reader dispatched inside a run that may write is still only
+    /// a reader, and a run that may only read never becomes one that may write
+    /// because a tool asked.
+    ///
+    /// ```
+    /// use io_harness::ExecMode;
+    ///
+    /// // A git reader inside a run that may write the workspace.
+    /// assert_eq!(
+    ///     ExecMode::WorkspaceWrite.narrower(ExecMode::ReadOnly),
+    ///     ExecMode::ReadOnly
+    /// );
+    /// // A tool asking for more than the run was given gets the run's answer —
+    /// // the refusal that goes with it is the dispatcher's, not this function's.
+    /// assert_eq!(
+    ///     ExecMode::ReadOnly.narrower(ExecMode::WorkspaceWrite),
+    ///     ExecMode::ReadOnly
+    /// );
+    /// // Commutative, and equal modes are their own answer.
+    /// assert_eq!(
+    ///     ExecMode::FullAccess.narrower(ExecMode::FullAccess),
+    ///     ExecMode::FullAccess
+    /// );
+    /// ```
+    pub fn narrower(self, other: ExecMode) -> ExecMode {
+        if other.rank() < self.rank() {
+            other
+        } else {
+            self
+        }
+    }
+
+    /// Whether a call needing `self` can run under a contract granting `grant`
+    /// (0.48.0).
+    ///
+    /// The question the dispatcher asks *before* it spawns anything. A need the
+    /// grant cannot satisfy is a refusal the model reads, not an errno it has to
+    /// decode out of a failed command.
+    ///
+    /// ```
+    /// use io_harness::ExecMode;
+    ///
+    /// assert!(ExecMode::ReadOnly.satisfied_by(ExecMode::WorkspaceWrite));
+    /// assert!(!ExecMode::WorkspaceWrite.satisfied_by(ExecMode::ReadOnly));
+    /// ```
+    pub fn satisfied_by(self, grant: ExecMode) -> bool {
+        self.rank() <= grant.rank()
+    }
 }
 
 /// Resource caps applied to a sandboxed run. Serde-serializable like
@@ -999,9 +1067,54 @@ impl ExecContainment {
         }
     }
 
+    /// The same containment under a narrower mode, for one call (0.48.0).
+    ///
+    /// **The roots are recomputed rather than carried**, and that is the whole
+    /// reason this is a method instead of a struct update: `resolve` grants the
+    /// toolchain's cache directories only under
+    /// [`WorkspaceWrite`](ExecMode::WorkspaceWrite), so a containment narrowed to
+    /// [`ReadOnly`](ExecMode::ReadOnly) that kept them would be a read-only mode
+    /// with a list of writable directories attached — which is not read-only, and
+    /// would have been invisible in every test that only asserts the mode.
+    pub(crate) fn with_mode(&self, mode: ExecMode) -> Self {
+        Self {
+            config: SandboxConfig {
+                mode,
+                ..self.config.clone()
+            },
+            roots: if mode == ExecMode::WorkspaceWrite {
+                self.roots.clone()
+            } else {
+                Vec::new()
+            },
+        }
+    }
+
     /// The backend that will actually run this containment's commands.
     pub(crate) fn backend(&self) -> Backend {
         select(&self.config).backend()
+    }
+
+    /// The writable roots for a command whose workspace root is `workspace_root`
+    /// (0.48.0).
+    ///
+    /// One definition of "the root is writable unless the mode says otherwise",
+    /// shared by every caller that spawns a child itself instead of delegating to
+    /// [`Sandbox::run`] — the `shell` tool's stages, a `shell_start` handle's
+    /// stages, and the git built-ins. It was written out twice inside one function
+    /// before this release; a third copy in another file is how a mode ends up
+    /// meaning two things.
+    ///
+    /// Under [`ReadOnly`](ExecMode::ReadOnly) the root is **not** named, because
+    /// the workspace is exactly what that mode withholds and naming it here would
+    /// hand it back through the side door.
+    pub(crate) fn roots_for(&self, workspace_root: &Path) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(self.roots.len() + 1);
+        if self.config.mode != ExecMode::ReadOnly {
+            roots.push(workspace_root.to_path_buf());
+        }
+        roots.extend(self.roots.iter().cloned());
+        roots
     }
 
     /// A [`RunSpec`] for one command under this containment.
