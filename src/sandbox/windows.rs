@@ -506,6 +506,27 @@ pub(crate) mod job {
     /// caller that was parsing `stderr` separately on Windows sees it empty; the
     /// text is not lost, it is in `stdout`. Stated here because it is the one
     /// observable difference between this backend and every other.
+    /// Why the container path last declined, for whoever has to explain a run
+    /// that reported the Job Object on a host that can build containers.
+    ///
+    /// Deliberately a process-global last-one-wins rather than a channel: it
+    /// exists so a failure has something to print, and a decline is rare enough
+    /// that the most recent one is the interesting one.
+    pub(crate) fn last_decline() -> Option<String> {
+        DECLINE
+            .get()
+            .and_then(|m| m.lock().ok().and_then(|g| g.clone()))
+    }
+
+    static DECLINE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+
+    fn note_decline(why: &str) {
+        if let Ok(mut slot) = DECLINE.get_or_init(|| std::sync::Mutex::new(None)).lock() {
+            *slot = Some(why.to_string());
+        }
+    }
+
     pub(super) async fn run_contained(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
         use crate::sandbox::appcontainer::win::{grant_for, Profile, Spawned};
 
@@ -539,6 +560,7 @@ pub(crate) mod job {
                     "sandbox: could not create an AppContainer profile ({e}); \
                      falling back to the job object, which contains resources and not access"
                 );
+                note_decline(&format!("could not create an AppContainer profile: {e}"));
                 return None;
             }
         };
@@ -583,6 +605,16 @@ pub(crate) mod job {
                  falling back to the job object",
                 g.path.display()
             );
+            // **A decline must not be a silent fact.** The Job Object then runs
+            // the command with no access boundary and every assertion about the
+            // command still passes, so a test — and an operator reading a green
+            // run — cannot tell containment from its absence. `tracing` is not
+            // enough on its own: nothing subscribes to it in a test binary.
+            note_decline(&format!(
+                "could not grant {} ({:?}) to the container: {e}",
+                g.path.display(),
+                g.grant
+            ));
             return None;
         }
 
@@ -1252,36 +1284,65 @@ mod tests {
         } else {
             vec![other.clone()]
         };
-        let cases: [(&str, &[&str]); 10] = [
+        // `must_run` is false for the two cases this platform refuses, and they
+        // are kept rather than deleted: they are the control that says the
+        // refusal is `cmd.exe` starting a *script* by absolute path and nothing
+        // about the grant set. The `type` case reads that same file by that same
+        // kind of path, and the off-the-profile case runs from a workspace whose
+        // ancestors are not the user profile at all. If Windows ever changes
+        // this, the table fails and says so.
+        let cases: [(&str, &[&str], bool); 10] = [
             // The control: a shell builtin needs nothing but `%SystemRoot%`,
             // which carries an ALL APPLICATION PACKAGES ACE of its own. If this
             // fails the container is not usable on this host at all.
-            ("a shell builtin", &["cmd", "/c", "echo io-harness-probe"]),
+            (
+                "a shell builtin",
+                &["cmd", "/c", "echo io-harness-probe"],
+                true,
+            ),
             // Reading a file the workspace grant covers. This is the claim the
             // whole grant set rests on and nothing asserted it directly.
-            ("reading a granted file", &["cmd", "/c", "type probe.txt"]),
+            (
+                "reading a granted file",
+                &["cmd", "/c", "type probe.txt"],
+                true,
+            ),
             // Executing one. `cmd` opens a batch file itself, so this separates
             // "the payload cannot be read" from "the payload cannot be started".
-            ("running a granted batch file", &["cmd", "/c", "probe.bat"]),
+            (
+                "running a granted batch file",
+                &["cmd", "/c", "probe.bat"],
+                true,
+            ),
             // Writing into the workspace, which `Full` is entirely about.
             (
                 "writing into the workspace",
                 &["cmd", "/c", "echo written> written.txt"],
+                true,
             ),
             // A program on PATH, through its launcher and toolchain home.
-            ("a program on PATH", &["rustc", "--version"]),
+            ("a program on PATH", &["rustc", "--version"], true),
             // The same batch file by absolute path, in the two forms the path can
             // take. Every remaining failure in this release runs a payload by an
             // absolute path that carries an 8.3 short component, and every case
             // that passes names it relative to a granted working directory.
-            ("a batch file by absolute path", &["cmd", "/c", "@SHORT@"]),
+            (
+                "a batch file by absolute path",
+                &["cmd", "/c", "@SHORT@"],
+                false,
+            ),
             (
                 "a batch file by long absolute path",
                 &["cmd", "/c", "@LONG@"],
+                false,
             ),
             // The toolchain binary cargo could not start, reached the way cargo
             // reaches it: by absolute path, not through the launcher shim.
-            ("the toolchain binary by absolute path", &["@RUSTC@", "-vV"]),
+            (
+                "the toolchain binary by absolute path",
+                &["@RUSTC@", "-vV"],
+                true,
+            ),
             // The case that separates "an absolute path" from "a batch file".
             // `type` is a builtin reading the same directory by the same kind of
             // path, so if it passes while the two above fail, the path resolves
@@ -1290,6 +1351,7 @@ mod tests {
             (
                 "reading a granted file by absolute path",
                 &["cmd", "/c", "type @TXT@"],
+                true,
             ),
             // And the case that separates "an absolute path" from "this chain".
             // The workspace here sits beside the checkout on the runner's data
@@ -1298,6 +1360,7 @@ mod tests {
             (
                 "a batch file by absolute path off the profile",
                 &["cmd", "/c", "@OTHER@"],
+                false,
             ),
         ];
 
@@ -1313,7 +1376,7 @@ mod tests {
         report.push_str(&format!("\n  rustup which rustc: {toolchain_rustc:?}"));
 
         let mut failed = 0;
-        for (what, args) in cases {
+        for (what, args, must_run) in cases {
             let argv: Vec<String> = args
                 .iter()
                 .map(|s| match *s {
@@ -1344,9 +1407,8 @@ mod tests {
                 None => {
                     failed += 1;
                     report.push_str(&format!(
-                        "\n  {what}: THE CONTAINER DECLINED — a grant it must have could not be \
-                         applied, so this command would run under the job object with no access \
-                         boundary"
+                        "\n  {what}: THE CONTAINER DECLINED — {}",
+                        job::last_decline().unwrap_or_else(|| "no reason recorded".into())
                     ));
                 }
                 Some(Err(e)) => {
@@ -1354,19 +1416,22 @@ mod tests {
                     report.push_str(&format!("\n  {what}: the backend errored: {e}"));
                 }
                 Some(Ok(o)) => {
-                    if !o.success() {
+                    if o.success() != must_run {
                         failed += 1;
                     }
                     report.push_str(&format!(
-                        "\n  {what}: backend {:?}, exit {:?}, output {:?}",
-                        o.backend, o.exit_code, o.stdout
+                        "\n  {what}: backend {:?}, exit {:?}{}, output {:?}",
+                        o.backend,
+                        o.exit_code,
+                        if must_run { "" } else { " (expected: refused)" },
+                        o.stdout
                     ));
                 }
             }
         }
         assert_eq!(
             failed, 0,
-            "the AppContainer did not permit what the grant set says it grants:{report}"
+            "the AppContainer did not behave as the grant set says it does:{report}"
         );
     }
 

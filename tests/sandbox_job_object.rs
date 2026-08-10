@@ -32,11 +32,24 @@ use std::time::Duration;
 use io_harness::sandbox::{RunSpec, Sandbox};
 use io_harness::{select, Backend, Cap, SandboxConfig, SandboxLimits, SandboxOutcome};
 
-/// Write `body` as `name.bat` in `dir` and hand back its absolute path.
+/// Write `body` as `name.bat` in `dir` and hand back the name to invoke it by.
+///
+/// **The name is relative, and on this platform that is a requirement rather
+/// than a style.** Inside an AppContainer `cmd.exe` refuses to start a batch file
+/// named by an absolute path — "Access is denied." — while the same file, in the
+/// same directory, runs when it is named relative to the working directory. The
+/// container is not what refuses it: the crate's own capability table reads that
+/// very file by absolute path with `type` and gets its contents, and the refusal
+/// happens identically on a workspace that is nowhere near the user profile, so
+/// neither the grant set nor the path's ancestors are involved. It is what
+/// `cmd.exe` does to *start* a script.
+///
+/// So the payload is named the way a caller has to name one, and
+/// `docs/CONTRACT.md` says so under the Windows backend.
 fn bat(dir: &Path, name: &str, body: &str) -> String {
-    let path = dir.join(format!("{name}.bat"));
-    std::fs::write(&path, format!("@echo off\r\n{body}\r\n")).unwrap();
-    path.display().to_string()
+    let file = format!("{name}.bat");
+    std::fs::write(dir.join(&file), format!("@echo off\r\n{body}\r\n")).unwrap();
+    file
 }
 
 /// Run one batch file under `limits`, through whichever backend `config` picks.
@@ -394,19 +407,19 @@ async fn the_cpu_limit_is_a_real_bound_and_is_named_as_one() {
 /// The grandchild waits, then writes a sentinel. The sentinel existing after the
 /// run means it was still alive to write it.
 fn three_generations(dir: &Path) -> (String, std::path::PathBuf) {
-    let sentinel = dir.join("grandchild-was-alive.txt");
+    // Both the sentinel and the inner script are named relative to the working
+    // directory, which every generation inherits. The sentinel is still returned
+    // as an absolute path because the *test* looks for it from outside the run.
+    const SENTINEL: &str = "grandchild-was-alive.txt";
     // `ping` rather than `timeout`, because `timeout` refuses to run with stdin
     // redirected and the sandbox redirects stdin to null.
     let inner = bat(
         dir,
         "inner",
-        &format!(
-            "ping -n 6 127.0.0.1 >nul\r\necho alive> \"{}\"",
-            sentinel.display()
-        ),
+        &format!("ping -n 6 127.0.0.1 >nul\r\necho alive> \"{SENTINEL}\""),
     );
     let outer = bat(dir, "outer", &format!("start \"\" /b cmd /c \"{inner}\""));
-    (outer, sentinel)
+    (outer, dir.join(SENTINEL))
 }
 
 #[tokio::test]

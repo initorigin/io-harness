@@ -74,7 +74,7 @@ pub(crate) mod win {
         HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        GetNamedSecurityInfoW, SetEntriesInAclW, TreeSetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
         GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
         TRUSTEE_W,
     };
@@ -599,15 +599,34 @@ pub(crate) mod win {
         // which with the DACL bits alone means "change only the DACL".
         match reach {
             Reach::Tree => {
+                // **`TreeSetNamedSecurityInfoW`, because one locked file must not
+                // lose the whole grant.** `SetNamedSecurityInfoW` propagates
+                // until something refuses it and then returns that error, and a
+                // registry cache being read by another `cargo` at that moment is
+                // enough: the grant fails, `run_contained` declines, and the run
+                // silently gets the Job Object with no access boundary at all.
+                // That is what the crate's own gate caught — it ran, it passed,
+                // and it was not in a container.
+                //
+                // The tree variant visits the whole subtree and keeps going past
+                // an object it cannot set, which is the behaviour a best-effort
+                // grant over someone else's cache directory wants. `TREE_SEC_INFO_SET`
+                // is 1 and `ProgressInvokeNever` is 1; with no callback there is
+                // nothing for it to report to, and the return value still tells
+                // us whether the *root* could be set.
                 let rc = unsafe {
-                    SetNamedSecurityInfoW(
+                    TreeSetNamedSecurityInfoW(
                         wpath.as_ptr(),
                         SE_FILE_OBJECT,
                         DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
                         std::ptr::null_mut(),
                         std::ptr::null_mut(),
                         merged,
-                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        1,
+                        None,
+                        1,
+                        std::ptr::null_mut(),
                     )
                 };
                 if rc != ERROR_SUCCESS {
@@ -1188,6 +1207,7 @@ mod tests {
         let at0 = payload(root.path());
         let at1 = payload(&mid);
         let at2 = payload(&deep);
+        let _ = (&at0, &at1, &at2);
 
         let profile = Profile::create(&name("depth"), false).expect("profile");
         grant(root.path(), profile.sid(), Access::Full, Reach::Tree).expect("grant the root");
@@ -1208,12 +1228,20 @@ mod tests {
         );
 
         // And then the behaviour, so the ACL is not being read as a proxy for it.
-        for (level, script) in [at0, at1, at2].iter().enumerate() {
+        //
+        // Each payload is named **relative to its own directory**, which is the
+        // working directory the spawn is given. Inside an AppContainer `cmd.exe`
+        // refuses to start a batch file named by an absolute path, however the
+        // file is granted and wherever it lives — see the capability table in
+        // `super::super::windows`, which reads that same file by absolute path
+        // and gets its contents. Naming it absolutely here would be testing that
+        // behaviour of `cmd` rather than how far the grant reached.
+        for (level, dir) in [root.path(), &mid, &deep].iter().enumerate() {
             let out_path = root.path().join(format!("o{level}.txt"));
             let file = std::fs::File::create(&out_path).expect("capture");
-            let line = format!("cmd.exe /c \"{}\"", script.display());
-            let mut child = Spawned::start(&line, root.path(), profile.sid(), &file)
-                .expect("spawn the payload");
+            let line = "cmd.exe /c depth.bat".to_string();
+            let mut child =
+                Spawned::start(&line, dir, profile.sid(), &file).expect("spawn the payload");
             child.resume().expect("resume");
             let code = child.wait(30_000).expect("wait");
             drop(file);
