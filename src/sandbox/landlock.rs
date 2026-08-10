@@ -260,9 +260,20 @@ mod imp {
     /// returns the ABI the running kernel supports.
     const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1 << 0;
 
-    /// `LANDLOCK_RULE_PATH_BENEATH`. It is the only rule type this module adds:
+    /// `LANDLOCK_RULE_NET_PORT` (0.48.0). Added only for the loopback proxy's
+    /// port, and only where the negotiated ABI carries the network rules.
+    ///
+    /// **Port-scoped, not address-scoped**, because that is the whole of what the
+    /// kernel interface offers: the rule names a port and no address, so another
+    /// host on that port number is reachable. The port is ephemeral and chosen
+    /// per run, which narrows it in practice and is not a proof —
+    /// `docs/CONTRACT.md` says so per backend rather than letting a reader assume
+    /// this is per-host enforcement.
+    const RULE_NET_PORT: i32 = 2;
+
+    /// `LANDLOCK_RULE_PATH_BENEATH`. It is the first rule type this module adds:
     /// the network half is expressed by *handling* the network rights and
-    /// granting no port, so there is no `LANDLOCK_RULE_NET_PORT` here.
+    /// granting no port when nothing is proxied.
     const RULE_PATH_BENEATH: i32 = 1;
 
     /// The ABI 4 layout: filesystem rights, then network rights.
@@ -291,6 +302,15 @@ mod imp {
     struct PathBeneathAttr {
         allowed_access: u64,
         parent_fd: RawFd,
+    }
+
+    /// `struct landlock_net_port_attr` (0.48.0): two `__u64` fields and no
+    /// padding question, unlike its path sibling — the kernel takes the port as a
+    /// 64-bit value in host byte order rather than as a `__u16`.
+    #[repr(C)]
+    struct NetPortAttr {
+        allowed_access: u64,
+        port: u64,
     }
 
     /// The kernel's Landlock ABI, or `None` when this host has no usable
@@ -393,12 +413,44 @@ mod imp {
             for rule in &plan.rules {
                 ruleset.add_path(&rule.path, rule.rights & plan.handled_fs)?;
             }
-            // No network rule is ever added. Handling `CONNECT_TCP` and
-            // `BIND_TCP` while permitting no port is precisely how Landlock
-            // spells "no route out" — the denial is the absence of a permission,
-            // the same shape as an empty network namespace and as the Windows
-            // container's empty capability array.
+            // Handling `CONNECT_TCP` and `BIND_TCP` while permitting no port is
+            // precisely how Landlock spells "no route out" — the denial is the
+            // absence of a permission, the same shape as an empty network
+            // namespace and as the Windows container's empty capability array.
+            //
+            // 0.48.0 hands exactly one port back: the run's loopback proxy, which
+            // is the only route out a proxied run has. Nothing else is ever added.
+            for port in &plan.net_ports {
+                ruleset.add_net_port(*port, plan.handled_net & NET_CONNECT_TCP)?;
+            }
             Ok(ruleset)
+        }
+
+        /// Permit `connect` to one TCP port.
+        fn add_net_port(&self, port: u16, rights: u64) -> io::Result<()> {
+            if rights == 0 {
+                return Ok(());
+            }
+            let attr = NetPortAttr {
+                allowed_access: rights,
+                // The kernel takes the port as a 64-bit value in host byte order.
+                port: u64::from(port),
+            };
+            // SAFETY: `attr` is live and fully initialised for the whole call and
+            // the size passed is its own.
+            let rc = unsafe {
+                libc::syscall(
+                    SYS_LANDLOCK_ADD_RULE,
+                    self.fd.as_raw_fd(),
+                    RULE_NET_PORT,
+                    &attr as *const NetPortAttr,
+                    0u32,
+                )
+            };
+            if rc < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         fn add_path(&self, path: &Path, rights: u64) -> io::Result<()> {
