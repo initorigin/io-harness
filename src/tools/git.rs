@@ -961,8 +961,27 @@ mod tests {
         // Hooks are suppressed in the argv, because `-c` is the only place that
         // beats the repository's own config.
         assert_eq!(argv[1], "--no-pager");
-        assert_eq!(argv[2], "-c");
-        assert_eq!(argv[3], format!("core.hooksPath={NULL_DEVICE}"));
+        // 0.48.0 — a reader declares `ReadOnly`, so it must not take the index
+        // lock it would otherwise take to refresh a stale index. Both of these
+        // are top-level options and both must precede the subcommand, which is
+        // why the positions are asserted rather than mere presence.
+        assert_eq!(argv[2], "--no-optional-locks");
+        assert_eq!(argv[3], "-c");
+        assert_eq!(argv[4], format!("core.hooksPath={NULL_DEVICE}"));
+
+        // And a writer does not carry it: it is a statement about a reader's
+        // needs, not a blanket flag.
+        let writing = g
+            .argv(&GitCmd::Commit {
+                message: "m".into(),
+                identity: Identity::default(),
+            })
+            .unwrap();
+        assert!(
+            !writing.iter().any(|a| a == "--no-optional-locks"),
+            "a git write takes the locks it needs: {writing:?}"
+        );
+        assert_eq!(writing[2], "-c");
 
         let cmd = g.command(&argv);
         let env: Vec<(String, Option<String>)> = cmd

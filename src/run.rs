@@ -7534,6 +7534,26 @@ fn tool_mode(name: &str, custom: &Toolbox) -> Option<crate::sandbox::ExecMode> {
     }
 }
 
+/// The `create` row for one contained call, naming the mode that call resolved
+/// to (0.48.0).
+///
+/// The mode goes in `detail`, which was unused on a `create` row, because the
+/// mode is now a **per-call** fact and not a per-run one: a git reader declares
+/// `read-only` inside a run granting `workspace-write`, and a trace that recorded
+/// only the run's grant would say the opposite of what was enforced. `detail` is
+/// a text column, so this costs no schema change — and `SandboxEvent::create` is
+/// public, so its signature is left exactly as it is.
+fn sandbox_create(
+    run_id: i64,
+    step: u32,
+    containment: &crate::sandbox::ExecContainment,
+) -> crate::state::SandboxEvent {
+    let mut created =
+        crate::state::SandboxEvent::create(run_id, step, containment.backend().as_str());
+    created.detail = Some(containment.config.mode.as_str().to_string());
+    created
+}
+
 /// What this call is contained under, decided before it is dispatched (0.48.0).
 ///
 /// Three outcomes, and the order they are decided in is the release's own claim
@@ -8973,7 +8993,7 @@ async fn dispatch(
             if let Some(containment) = &contained {
                 let backend = containment.backend();
                 for event in [
-                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    sandbox_create(run_id, step, containment),
                     crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
                 ] {
                     record_sandbox_step(store, watch, depth, &event);
@@ -9203,7 +9223,7 @@ async fn dispatch(
             if let Some(containment) = &contained {
                 let backend = containment.backend();
                 for event in [
-                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    sandbox_create(run_id, step, containment),
                     crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), line_src),
                 ] {
                     record_sandbox_step(store, watch, depth, &event);
@@ -9513,7 +9533,7 @@ async fn dispatch(
             if let Some(containment) = &contained {
                 let backend = containment.backend();
                 for event in [
-                    crate::state::SandboxEvent::create(run_id, step, backend.as_str()),
+                    sandbox_create(run_id, step, containment),
                     crate::state::SandboxEvent::exec(run_id, step, backend.as_str(), &joined),
                 ] {
                     record_sandbox_step(store, watch, depth, &event);
@@ -10093,7 +10113,22 @@ async fn dispatch(
             // readers, `workspace-write` for the four that touch `.git`. A run
             // granting `FullAccess` hands `None` and this spawn is what it always
             // was.
-            let git = Git::new(ws.policy(), ws.root(), cap).contained(exec_sandbox.cloned());
+            let contained = exec_sandbox
+                .map(|c| std::sync::Arc::new(c.with_egress(ws.policy().permits_any_egress())));
+            if let Some(containment) = &contained {
+                for event in [
+                    sandbox_create(run_id, step, containment),
+                    crate::state::SandboxEvent::exec(
+                        run_id,
+                        step,
+                        containment.backend().as_str(),
+                        name,
+                    ),
+                ] {
+                    record_sandbox_step(store, watch, depth, &event);
+                }
+            }
+            let git = Git::new(ws.policy(), ws.root(), cap).contained(contained.clone());
             // 0.21.0 — a refused git built-in costs a step, not the run.
             //
             // Until here, `Git::run`'s refusal left the loop as `Error::Refused`, so
@@ -10136,6 +10171,14 @@ async fn dispatch(
                 }
                 Err(e) => return Err(e),
             };
+            if contained.is_some() {
+                record_sandbox_step(
+                    store,
+                    watch,
+                    depth,
+                    &crate::state::SandboxEvent::destroy(run_id, step),
+                );
+            }
             match outcome {
                 GitOutcome::Unavailable { reason } => Dispatched::go(
                     "git unavailable",
