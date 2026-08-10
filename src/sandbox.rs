@@ -1827,6 +1827,7 @@ pub async fn copy_back(
 // cross-check, which is an environment limit, not a limit of this code).
 pub mod linux;
 pub mod macos;
+pub(crate) mod proxy;
 pub mod windows;
 
 // The Landlock rung follows the same split: its rule *plan* — which paths, which
