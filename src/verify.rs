@@ -1101,12 +1101,31 @@ impl<'a> ExecGuard<'a> {
                         &SandboxEvent::exec(run_id, step, backend.as_str(), &argv.join(" ")),
                     );
                 }
+                // **A gate nobody handed roots resolves its own, and this is a
+                // fix rather than a convenience.** The run fills `writable_roots`
+                // with the detected toolchain's caches; a gate reached any other
+                // way — `passes_in`, `passes_in_guarded`, an embedder holding an
+                // `ExecGuard` — got an empty set and a `cargo` criterion that
+                // could not populate a registry cache. On the unix backends that
+                // is a *write* the sandbox refuses, which cargo mostly survives.
+                // Under a Windows AppContainer it is a **read** that is refused,
+                // because that backend is default-deny for reads, and the same
+                // gate fails outright. Both call paths now derive the same set
+                // from the same function, which is what stops them drifting.
+                let derived;
+                let roots: &[std::path::PathBuf] = if self.writable_roots.is_empty() {
+                    derived =
+                        sandbox::writable_cache_roots(crate::toolchain::detect(workdir).as_ref());
+                    &derived
+                } else {
+                    &self.writable_roots
+                };
                 let outcome = sb
                     .run(
                         RunSpec::new(argv, workdir, &cfg.limits)
                             .with_network(cfg.allow_network)
                             .with_mode(cfg.mode)
-                            .with_writable_roots(&self.writable_roots),
+                            .with_writable_roots(roots),
                     )
                     .await?;
                 if let Some((store, run_id, step)) = self.trace {

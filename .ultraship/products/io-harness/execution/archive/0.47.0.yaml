@@ -1,0 +1,49 @@
+product: io-harness
+version: 0.47.0
+execution_state: DEVELOPING
+checkpoint: 2026-08-09T164726Z-io-harness-0.47.0
+blockers: []
+release_fit:
+  assessment: probable
+  reasons:
+    - >
+      **No constraints are recorded for this workspace.** `ultraship constraints` reports none, so
+      this assessment is grounded in the repository's own condition and in the sixteen releases of
+      measured history behind it — never in a capacity figure, which UltraShip has no telemetry to
+      supply and which would be fiction with a decimal point.
+    - >
+      **Both halves have a place to land and neither is a new architecture.** The chain replaces one
+      branch in `LinuxSandbox::run` with an ordered decision over probes, and the shared runner
+      already takes a per-backend `configure` closure that a Landlock rung uses exactly as the floor
+      uses a no-op. The Windows half selects a module that was built, tested and proven on the
+      Windows runner in 0.26.0 — its profile, its grants and its container spawn all exist.
+    - >
+      **The grant list the Windows half needed is already resolved.** 0.46.0 added
+      `Toolchain::cache_dirs` and the exists-filtered writable roots, which is most of the discovery
+      problem 0.26.0 declined to close. That is why this is being attempted now rather than a
+      release earlier.
+    - >
+      **`probable` and not `high`, for two reasons that are about the loop rather than the design.**
+      Landlock and seccomp are raw syscalls written in `unsafe` with no crate to lean on under the
+      no-new-dependency constraint, and the Windows default-deny read set cannot be proven complete
+      by reasoning. Neither can be exercised on the macOS development host at all, so both are
+      CI-discovered by construction — the position 0.40.0 and 0.46.0 were both in, and in both the
+      defect that mattered was found by the matrix.
+  major_cost_drivers:
+    - >
+      Two kernel interfaces written against raw syscalls, whose setup failures look like the payload
+      failing. Answered by probing through an attempted restriction and asserting through a refused
+      write, never through a successful setup call.
+    - >
+      The Windows default-deny read set, which is incomplete until a real toolchain proves it is
+      not. Expect the first Windows matrix run to name at least one path and to require a decision
+      about whether it belongs in the fixed read-execute set.
+    - >
+      A debugging loop measured in matrix rounds. Mitigated by splitting every claim that has a
+      host-free half into one — the chain's order, the spawned argv and the grant list are all
+      settled locally.
+    - >
+      The existing suite runs commands on every platform, and enforcement is new on two of them.
+      Each failure is a decision about whether the test was relying on an absent boundary, not a
+      sweep.
+  recommended_scope_change: null

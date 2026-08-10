@@ -48,11 +48,19 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
     #[cfg(target_os = "macos")]
     assert_eq!(native.backend(), Backend::MacosSandboxExec);
 
-    // Linux: namespaces when the kernel permits unprivileged user namespaces,
-    // the floor when it does not (Ubuntu 24.04 restricts them by default). Pin
-    // it against the same question the backend asks, so a wrong answer in
-    // either direction fails: promising namespaces it cannot create, or falling
-    // back on a host where the wrapper works fine.
+    // Linux: 0.47.0 made this a chain rather than one backend and a fallback,
+    // so the assertion changed with it. Up to 0.46.0 the only two answers were
+    // `LinuxNamespaces` and `PortableFloor`, and pinning against `unshare`'s own
+    // exit status was exact. It is not any more: a host may have Landlock and no
+    // usable user namespace — which is what a stock Ubuntu 24.04 is, and the
+    // whole reason the chain exists — and would now correctly report
+    // `LinuxLandlock` where this test used to demand the floor. The behaviour
+    // changed deliberately, so the test changed with it rather than the chain
+    // being bent to keep an old assertion true.
+    //
+    // What is still exactly assertable, and is the regression that matters: the
+    // floor is reachable *only* when nothing above it can serve. A host whose
+    // `unshare` wrapper works must never report the floor.
     #[cfg(target_os = "linux")]
     {
         let wrapper_works = std::process::Command::new("unshare")
@@ -72,27 +80,71 @@ async fn selection_picks_native_on_this_host_and_floor_when_forced() {
             .status()
             .map(|s| s.success())
             .unwrap_or(false);
-        assert_eq!(
-            native.backend(),
-            if wrapper_works {
-                Backend::LinuxNamespaces
-            } else {
-                Backend::PortableFloor
-            },
-            "must report the strongest backend the kernel actually allows"
+        assert!(
+            matches!(
+                native.backend(),
+                Backend::LinuxLandlock
+                    | Backend::LinuxBubblewrap
+                    | Backend::LinuxNamespaces
+                    | Backend::PortableFloor
+            ),
+            "a Linux host must report a rung of the Linux chain, got {:?}",
+            native.backend()
         );
+        if wrapper_works {
+            assert_ne!(
+                native.backend(),
+                Backend::PortableFloor,
+                "the floor is only for a host where no rung above it can serve, and this one's \
+                 namespace wrapper works"
+            );
+        }
     }
 
-    // Windows: since 0.24.0 the Job Object is implemented, so it *is* the
-    // strongest available backend and reporting the floor would now be the lie.
-    // Before 0.24.0 this asserted `PortableFloor`, and that was correct then.
+    // Windows: 0.24.0 made the Job Object the strongest available backend and
+    // this asserts it exactly. The access half that would have made a second
+    // answer possible here is 0.59.0's, so on this platform the Job Object is
+    // the native backend and there is nothing else it could legitimately be.
+    // What must never happen is the floor, which on Windows would mean the Job
+    // Object was not created either.
     #[cfg(target_os = "windows")]
-    assert_eq!(native.backend(), Backend::WindowsJobObject);
+    assert_eq!(
+        native.backend(),
+        Backend::WindowsJobObject,
+        "a Windows host must report a native backend, got {:?}",
+        native.backend()
+    );
 
     // ...and forcing the floor selects the portable backend, recorded so the
     // selection ladder is observable.
     let floor = select(&SandboxConfig::new().floor_only());
     assert_eq!(floor.backend(), Backend::PortableFloor);
+}
+
+/// F1's selection half, on the one host configuration that is the point of the
+/// release.
+///
+/// A CI leg that deliberately leaves a host in a particular state says which
+/// rung it expects through `IO_HARNESS_EXPECT_BACKEND`, and this fails if the
+/// chain answers differently. It exists because the Linux leg that matters most
+/// is the one running with `kernel.apparmor_restrict_unprivileged_userns` at
+/// Ubuntu's own default, where every release up to 0.46.0 took the portable
+/// floor — and "the rung we expected" is not something a test can work out from
+/// the host alone without re-implementing the chain it is supposed to be
+/// checking.
+///
+/// The variable only ever *asserts*. Nothing in the crate reads it, and no
+/// environment can weaken a boundary through it.
+#[tokio::test]
+async fn the_host_reports_the_backend_its_ci_leg_expects() {
+    let Ok(expected) = std::env::var("IO_HARNESS_EXPECT_BACKEND") else {
+        return; // an ordinary developer machine states no expectation
+    };
+    assert_eq!(
+        select(&SandboxConfig::new()).backend().as_str(),
+        expected,
+        "this leg was configured to exercise a specific rung and got a different one"
+    );
 }
 
 // --- transparent to verification, and reversible ----------------------------
@@ -168,10 +220,15 @@ async fn the_selected_backend_denies_outbound_network_by_default() {
         .await
         .unwrap();
 
-    if matches!(
-        sb.backend(),
-        Backend::MacosSandboxExec | Backend::LinuxNamespaces
-    ) {
+    // **The outcome's backend, not the selection's.** `Sandbox::backend` answers
+    // before the run, from a probe; `SandboxOutcome::backend` is what actually
+    // applied. Those can differ — a rung that probes as available can still
+    // decline a particular run and hand it to the one below — and asserting
+    // against the probe makes a test demand a boundary from a run that honestly
+    // reported it did not get one.
+    //
+    // A run's own report is the only oracle that cannot be wrong about the run.
+    if out.backend.denies_egress() {
         assert!(
             !out.success(),
             "a backend that claims a network boundary must deny network, got {out:?}"

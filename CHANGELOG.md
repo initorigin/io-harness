@@ -26,6 +26,69 @@ notes are produced from it.
 
 ### Security
 
+## [0.47.0] - 2026-08-09
+
+### Added
+
+- **Linux containment is a chain, and its first rung needs no namespace.**
+  `Backend` gains `LinuxLandlock` and `LinuxBubblewrap`, and a contained Linux run
+  now takes the strongest rung the host can actually deliver: Landlock first, a
+  `bwrap` helper where the host has a working one, the existing `unshare` backend
+  after that, and the portable floor last. **A run that denies egress is never
+  given a rung that cannot deny egress** — the one rule that can send a host below
+  its strongest available primitive, and what makes the chain honest rather than
+  merely ordered.
+- **The Landlock rung, which is why this release exists.** A stock Ubuntu 24.04
+  ships `kernel.apparmor_restrict_unprivileged_userns=1` and refuses the namespace
+  the older backend needs — and `ubuntu-latest` is a stock Ubuntu 24.04 — so on the
+  commonest Linux CI image in the world every contained run up to 0.46.0 took the
+  portable floor, and the filesystem confinement this crate documents was applied
+  nowhere. Landlock needs no namespace. It is also the only rung that wraps the
+  payload in nothing: the restriction is installed in the child between fork and
+  exec, so the argv spawned is the argv you asked for and `current_dir` means what
+  it says. Egress is denied through Landlock's own network rules where the kernel
+  has them (ABI 4, Linux 6.7); below that the chain hands the run to a rung with a
+  network namespace instead.
+- **A seccomp deny-list beside the Landlock rule set.** `mount`, `umount2`,
+  `pivot_root`, `ptrace`, `process_vm_readv`, `process_vm_writev`, `init_module`,
+  `finit_module`, `delete_module`, `kexec_load`, `kexec_file_load`, `bpf` and
+  `perf_event_open`, refused with `EPERM` rather than a kill so the failure is
+  diagnosable. It is a deny-list and not a jail, and it says so; it is written in
+  the host architecture's syscall numbers, so a process under a foreign
+  personality is allowed through rather than denied by coincidence.
+- **A note about Windows, because a reader will look for it here.** This release
+  was planned with a Windows half — the AppContainer selected, so a Windows run
+  would enforce files and network rather than resource caps alone — and it is not
+  in it. That work moved whole to **0.59.0** on 2026-08-10; the record is
+  `US-IO-HARNESS-0.47.0-I01`. A Windows run gets exactly what 0.46.0 gave it: a
+  Job Object, which contains resources and not access. `Sandbox::select` returns
+  `WindowsJobObject` as it has since 0.24.0, and `docs/CONTRACT.md` says "native
+  resource containment only" in the platform table because that is what is true.
+  Nothing on Windows is refused today that was permitted yesterday.
+
+### Changed
+
+- **A contained Linux run on a host with Landlock now confines writes where it
+  previously did not**, and on kernel 6.7 or later refuses outbound TCP for an
+  egress-denying run. Same remedy if a program was relying on the absent
+  boundary. *Migration:* `TaskContract::with_full_access()`, or a mode that says
+  what the run actually needs.
+- `Backend::as_str` gains `"linux-landlock"` and `"linux-bubblewrap"`.
+  `EventKind::Contained` and the `SandboxEvent` rows
+  carry them through their existing fields, so an observer written against 0.46.0
+  reads the new backends with no change and a trace written by 0.46.0 stays
+  readable.
+
+### Security
+
+- The host where "contained by default" was true of the API and not of the
+  machine — a stock Ubuntu 24.04, which is what `ubuntu-latest` is — now enforces
+  it. **Windows remains the host where it is not**, and that is stated rather than
+  implied: `select().backend()` answers `WindowsJobObject` before a run,
+  `EventKind::Contained` records what was applied, the agent is told its boundary
+  in its own prompt, and the platform table says resource containment only. The
+  access half is 0.59.0.
+
 ## [0.46.0] - 2026-08-09
 
 ### Added
@@ -127,6 +190,15 @@ notes are produced from it.
   `[exec unavailable]`. With containment now the default that would have turned
   every "no such program on PATH" into "your command failed" — the wrong diagnosis
   for the model and for whoever reads the trace.
+- **A verification gate resolves its own writable cache roots when it was handed
+  none.** 0.46.0 gave the gate the detected toolchain's caches, and only the run
+  filled them in: a gate reached through `passes_in`, `passes_in_guarded` or an
+  `ExecGuard` an embedder built by hand got an empty set, so a `cargo` criterion
+  could not populate a registry cache. On the unix backends that is a refused
+  write, which cargo mostly survives; under the Windows AppContainer it is a
+  refused **read**, because that backend is default-deny for reads, and the gate
+  fails outright with the compiler's own error nowhere in sight. Both call paths
+  now derive the set from the same function.
 
 ## [0.45.0] - 2026-08-09
 

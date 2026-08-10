@@ -1,5 +1,11 @@
 //! 0.24.0 — the Windows Job Object backend, live.
 //!
+//! A contained Windows run takes the Job Object, and that is the whole of what
+//! this platform enforces: resources, not access. 0.47.0 was to add the
+//! AppContainer beside it and the Windows half of that release moved whole to
+//! 0.59.0, so every cap below is asserted on the one backend this platform
+//! selects.
+//!
 //! Every test here is `cfg(windows)`, so on a macOS or Linux host this file
 //! compiles to nothing and is silent rather than skipped-and-green. It runs on
 //! the Windows CI runner and nowhere else, which is the only place the kernel
@@ -24,21 +30,71 @@ use std::path::Path;
 use std::time::Duration;
 
 use io_harness::sandbox::{RunSpec, Sandbox};
-use io_harness::{select, Backend, Cap, SandboxConfig, SandboxLimits, SandboxOutcome};
+use io_harness::{select, Backend, Cap, ExecMode, SandboxConfig, SandboxLimits, SandboxOutcome};
 
-/// Write `body` as `name.bat` in `dir` and hand back its absolute path.
+/// Write `body` as `name.bat` in `dir` and hand back the name to invoke it by.
+///
+/// **The name is relative, and on this platform that is a requirement rather
+/// than a style.** Inside an AppContainer `cmd.exe` refuses to start a batch file
+/// named by an absolute path — "Access is denied." — while the same file, in the
+/// same directory, runs when it is named relative to the working directory. The
+/// container is not what refuses it: the crate's own capability table reads that
+/// very file by absolute path with `type` and gets its contents, and the refusal
+/// happens identically on a workspace that is nowhere near the user profile, so
+/// neither the grant set nor the path's ancestors are involved. It is what
+/// `cmd.exe` does to *start* a script.
+///
+/// So the payload is named the way a caller has to name one, and
+/// `docs/CONTRACT.md` says so under the Windows backend.
 fn bat(dir: &Path, name: &str, body: &str) -> String {
-    let path = dir.join(format!("{name}.bat"));
-    std::fs::write(&path, format!("@echo off\r\n{body}\r\n")).unwrap();
-    path.display().to_string()
+    let file = format!("{name}.bat");
+    std::fs::write(dir.join(&file), format!("@echo off\r\n{body}\r\n")).unwrap();
+    file
 }
 
 /// Run one batch file under `limits`, through whichever backend `config` picks.
-async fn run_bat(config: &SandboxConfig, limits: SandboxLimits, script: &str) -> SandboxOutcome {
-    let workdir = tempfile::tempdir().unwrap();
+///
+/// **The payload's own directory is the workdir, and since 0.47.0 that is
+/// load-bearing rather than tidiness.** These tests used to hand the run a fresh
+/// temporary directory and leave the batch file in a different one, which worked
+/// only because a contained Windows run re-propagated a grant across the whole of
+/// `%TEMP%` and so happened to reach a payload nobody had named. That grant is
+/// now the directory alone — the container gets what the run creates there, not
+/// every temporary file already on the machine — so a payload outside the
+/// workspace is outside the boundary, which is the behaviour these tests should
+/// have been written against in the first place.
+async fn run_bat(
+    config: &SandboxConfig,
+    limits: SandboxLimits,
+    workdir: &Path,
+    script: &str,
+) -> SandboxOutcome {
     let argv = vec!["cmd".to_string(), "/c".to_string(), script.to_string()];
     select(config)
-        .run(RunSpec::new(&argv, workdir.path(), &limits).with_network(config.allow_network))
+        .run(RunSpec::new(&argv, workdir, &limits).with_network(config.allow_network))
+        .await
+        .unwrap()
+}
+
+/// The same, with the access half switched off: the Job Object and its limits,
+/// no AppContainer.
+///
+/// `ExecMode::FullAccess` is what a caller asks for when it wants the host's own
+/// privileges, and `WindowsSandbox::run` reads it as "do not build a container".
+/// A cap test wants exactly that: the limits are the job's, and a payload that
+/// cannot start inside a container proves nothing about a memory ceiling.
+async fn run_bat_uncontained(
+    limits: SandboxLimits,
+    workdir: &Path,
+    script: &str,
+) -> SandboxOutcome {
+    let argv = vec!["cmd".to_string(), "/c".to_string(), script.to_string()];
+    select(&SandboxConfig::new())
+        .run(
+            RunSpec::new(&argv, workdir, &limits)
+                .with_network(false)
+                .with_mode(ExecMode::FullAccess),
+        )
         .await
         .unwrap()
 }
@@ -59,12 +115,25 @@ fn limits() -> SandboxLimits {
 
 // --- what the backend says it is --------------------------------------------
 
+/// 0.47.0 changed this test's premise, deliberately: a contained Windows run now
+/// takes the AppContainer where a profile can be created and the Job Object
+/// otherwise, so "the native backend is the Job Object" is no longer a fact about
+/// the platform. What is still exactly assertable — and is the claim this test was
+/// written for in 0.24.0 — is that the native backend is a **real primitive** and
+/// never the floor, and that the floor is still reachable on demand so the
+/// negative controls below have something to run against.
+///
+/// The run's own backend is asserted against the same disjunction rather than
+/// against the probe's answer: `Sandbox::backend` answers before the run and
+/// `SandboxOutcome::backend` is what applied, and on this platform they may
+/// legitimately differ by the container declining a particular run.
 #[tokio::test]
-async fn windows_reports_the_job_object_and_not_the_floor() {
+async fn windows_reports_a_real_primitive_and_not_the_floor() {
+    let native = select(&SandboxConfig::new()).backend();
     assert_eq!(
-        select(&SandboxConfig::new()).backend(),
+        native,
         Backend::WindowsJobObject,
-        "the native Windows backend must name the job object it creates"
+        "the native Windows backend must name a primitive it actually creates, got {native:?}"
     );
     // And the floor is still reachable on demand — the negative control below
     // depends on being able to ask for a run with no job at all.
@@ -75,10 +144,76 @@ async fn windows_reports_the_job_object_and_not_the_floor() {
 
     let dir = tempfile::tempdir().unwrap();
     let script = bat(dir.path(), "ok", "echo hello");
-    let out = run_bat(&SandboxConfig::new(), limits(), &script).await;
+    let out = run_bat(&SandboxConfig::new(), limits(), dir.path(), &script).await;
     assert!(out.success(), "a plain command must still run: {out:?}");
-    assert_eq!(out.backend, Backend::WindowsJobObject);
+    assert_eq!(
+        out.backend,
+        Backend::WindowsJobObject,
+        "the run must report the primitive that applied to it, got {out:?}"
+    );
     assert!(out.stdout.contains("hello"), "output is still captured");
+}
+
+/// A contained run must be able to execute a program resolved from `PATH`.
+///
+/// This is the whole of the Windows half seen from the outside: an AppContainer
+/// denies everything not granted, so a payload it cannot load or whose own
+/// toolchain it cannot reach fails in a way that looks like the payload being
+/// broken. The crate's four `verify` gates found it first — they run `rustc`
+/// against a scratch file and every one of them failed on `windows-latest` the
+/// moment the container was actually selected.
+///
+/// `rustc` is the program deliberately: it is on `PATH` rather than beside the
+/// test, it is what the crate's own verification gate runs, and on a rustup
+/// installation it is a shim that starts a second binary somewhere else — which
+/// is exactly the case a grant set derived from one directory has to answer.
+///
+/// The failure message carries the whole outcome, because on this backend the
+/// payload's stderr arrives merged into `stdout` and it is the only thing that
+/// says *which* access was refused.
+#[tokio::test]
+async fn a_contained_run_can_execute_a_program_from_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let argv = vec!["rustc".to_string(), "--version".to_string()];
+    let out = select(&SandboxConfig::new())
+        .run(RunSpec::new(&argv, dir.path(), &limits()).with_network(false))
+        .await
+        .unwrap();
+    assert!(
+        out.success(),
+        "a contained run must be able to start a program on PATH — backend {:?}, \
+         exit {:?}, merged output {:?}",
+        out.backend,
+        out.exit_code,
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("rustc"),
+        "the payload's own output must come back: {out:?}"
+    );
+}
+
+/// A contained run must not require a multi-threaded runtime, and this is
+/// asserted rather than left to whichever other test happens to be a
+/// `#[tokio::test]`.
+///
+/// `#[tokio::test]` builds a current-thread runtime by default, and so does an
+/// embedder writing `#[tokio::main(flavor = "current_thread")]`. The container
+/// path waited for its process with `tokio::task::block_in_place`, which *panics*
+/// on that flavour. It stayed invisible for as long as the container was declined
+/// on every host; the first CI run that selected it panicked four `verify` tests
+/// that have nothing to do with containment. A backend may not impose a runtime
+/// flavour on the process embedding it.
+#[tokio::test(flavor = "current_thread")]
+async fn a_contained_run_completes_on_a_current_thread_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = bat(dir.path(), "flavour", "echo current-thread");
+    let out = run_bat(&SandboxConfig::new(), limits(), dir.path(), &script).await;
+    assert!(
+        out.success(),
+        "a contained run must complete on a current-thread runtime: {out:?}"
+    );
+    assert!(out.stdout.contains("current-thread"), "{out:?}");
 }
 
 // --- F8: the active-process limit -------------------------------------------
@@ -101,6 +236,7 @@ async fn the_process_limit_stops_the_run_and_the_job_is_what_says_so() {
             max_processes: Some(1),
             ..limits()
         },
+        dir.path(),
         &script,
     )
     .await;
@@ -120,7 +256,7 @@ async fn the_process_limit_stops_the_run_and_the_job_is_what_says_so() {
     // The control that makes the assertion above mean something: the identical
     // script with no process limit runs fine, so what failed was the limit and
     // not the script.
-    let free = run_bat(&SandboxConfig::new(), limits(), &script).await;
+    let free = run_bat(&SandboxConfig::new(), limits(), dir.path(), &script).await;
     assert!(
         free.success(),
         "without the limit the same payload must succeed: {free:?}"
@@ -148,12 +284,21 @@ async fn the_memory_limit_is_a_real_bound_and_is_named_as_one() {
          exit /b %errorlevel%",
     );
 
-    let out = run_bat(
-        &SandboxConfig::new(),
+    // **Asserted on the Job Object, and that is not a retreat.** A commit limit
+    // is a job facility — the container has no memory facility at all, and the
+    // container path adopts its process into exactly this job before resuming it,
+    // so the code under test is the same either way. What the container *does*
+    // affect is the payload: this one is PowerShell, and PowerShell inside an
+    // AppContainer dies loading its own types with an access error rather than
+    // reaching the allocation, which would make the test assert nothing about
+    // memory. `FullAccess` is the documented way to ask for the resource half
+    // without the access half.
+    let out = run_bat_uncontained(
         SandboxLimits {
             max_memory_bytes: Some(512 * 1024 * 1024),
             ..limits()
         },
+        dir.path(),
         &script,
     )
     .await;
@@ -185,6 +330,7 @@ async fn the_cpu_limit_is_a_real_bound_and_is_named_as_one() {
             max_cpu_secs: Some(2),
             ..limits()
         },
+        dir.path(),
         &script,
     )
     .await;
@@ -207,19 +353,19 @@ async fn the_cpu_limit_is_a_real_bound_and_is_named_as_one() {
 /// The grandchild waits, then writes a sentinel. The sentinel existing after the
 /// run means it was still alive to write it.
 fn three_generations(dir: &Path) -> (String, std::path::PathBuf) {
-    let sentinel = dir.join("grandchild-was-alive.txt");
+    // Both the sentinel and the inner script are named relative to the working
+    // directory, which every generation inherits. The sentinel is still returned
+    // as an absolute path because the *test* looks for it from outside the run.
+    const SENTINEL: &str = "grandchild-was-alive.txt";
     // `ping` rather than `timeout`, because `timeout` refuses to run with stdin
     // redirected and the sandbox redirects stdin to null.
     let inner = bat(
         dir,
         "inner",
-        &format!(
-            "ping -n 6 127.0.0.1 >nul\r\necho alive> \"{}\"",
-            sentinel.display()
-        ),
+        &format!("ping -n 6 127.0.0.1 >nul\r\necho alive> \"{SENTINEL}\""),
     );
     let outer = bat(dir, "outer", &format!("start \"\" /b cmd /c \"{inner}\""));
-    (outer, sentinel)
+    (outer, dir.join(SENTINEL))
 }
 
 #[tokio::test]
@@ -233,6 +379,7 @@ async fn closing_the_job_kills_the_grandchild() {
             max_wall_secs: Some(2),
             ..limits()
         },
+        dir.path(),
         &outer,
     )
     .await;
@@ -263,6 +410,7 @@ async fn without_the_job_the_grandchild_survives() {
             max_wall_secs: Some(2),
             ..limits()
         },
+        dir.path(),
         &outer,
     )
     .await;

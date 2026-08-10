@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use io_harness::provider::{CompletionRequest, CompletionResponse, PromptFamily, ToolCall};
-use io_harness::sandbox::{select, Backend, Sandbox, SandboxConfig};
+use io_harness::sandbox::{select, Sandbox, SandboxConfig};
 use io_harness::{
     run_tree, run_with, run_with_observed, Act, ApproveAll, Containment, ContextBudget, Effect,
     EventKind, Flow, Observer, Policy, Provider, RunEvent, Session, Store, SystemPrompt,
@@ -560,15 +560,16 @@ async fn containment_names_the_backend_the_host_actually_gave() {
             line.contains(backend.as_str()),
             "the line names a backend the host did not give: {line}"
         );
-        match backend {
+        match backend.confines_writes() {
             // A resource-only backend is stated as one. This is the degraded case
             // and the whole reason the line reports the selection rather than the
-            // request.
-            Backend::PortableFloor | Backend::WindowsJobObject => {
+            // request. Asked rather than enumerated, so that a backend added to
+            // the enum cannot make this test quietly assert the wrong half.
+            false => {
                 assert!(line.contains("resource limits only"), "{line}");
                 assert!(line.contains("no filesystem confinement"), "{line}");
             }
-            _ => {
+            true => {
                 assert!(line.contains("are contained"), "{line}");
                 assert!(line.contains("confined to the workspace"), "{line}");
                 // 0.46.0 — the mode is named beside the backend, because a mode a

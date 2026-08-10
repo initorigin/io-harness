@@ -128,8 +128,51 @@ change for every `match` a caller wrote.
 | Platform | Status | Sandbox containment |
 | --- | --- | --- |
 | macOS | Supported, full suite in CI | Native, `sandbox-exec` |
-| Linux | Supported, full suite in CI | Native, mount and network namespaces plus rlimits |
-| Windows | Supported, full suite in CI | **Native resource containment only** |
+| Linux | Supported, full suite in CI | Native, a **chain** — Landlock, `bwrap`, namespaces, floor |
+| Windows | Supported, full suite in CI | Native, Job Object — **resources only** |
+
+Since 0.47.0 Linux is not one backend and a fallback but an ordered chain, and
+the rung a host takes is the strongest one that can enforce what the run asked
+for:
+
+| Rung | Needs | Confines writes | Denies egress |
+| --- | --- | --- | --- |
+| `linux-landlock` | Landlock (kernel 5.13+) | Yes | Only at ABI 4+ (kernel 6.7) |
+| `linux-bubblewrap` | a working `bwrap` | Yes | Yes |
+| `linux-namespaces` | unprivileged user namespaces | Yes | Yes |
+| `portable-floor` | nothing | No | No |
+
+**A workspace inside the system temporary directory is not confined**, on any
+unix backend. Every one of them grants the system
+temporary directory writable — the mount setup binds `${TMPDIR:-/tmp}`, the macOS
+profile allows `/private/var/folders`, and the Landlock rung grants it — because a
+toolchain that cannot open a temporary file cannot run at all. A workspace *located* under that directory therefore sits
+inside a writable grant, and `ExecMode::ReadOnly` does not make it read-only.
+This was found by the CI matrix in 0.47.0, on a test whose own workspace and
+whose "outside" target were both `tempfile::tempdir()`s and so had both been
+granted. It is a property of the design, not a defect in one rung: put a
+workspace somewhere other than the temporary directory if the mode is meant to
+bind.
+
+**A run that denies egress is never given a rung that cannot deny egress.** That
+is the one rule that can send a host below its strongest available primitive: a
+kernel whose Landlock predates the network rules falls through to a rung with a
+network namespace rather than taking a filesystem-only rung and leaving the
+run's own policy unenforced.
+
+The Landlock rung is the reason the chain exists. A stock Ubuntu 24.04 ships
+`kernel.apparmor_restrict_unprivileged_userns=1` and refuses the namespace the
+older rung needs — and `ubuntu-latest` is a stock Ubuntu 24.04 — so on the
+commonest Linux CI image every contained run up to 0.46.0 took the portable
+floor. Landlock needs no namespace at all. It is also the only rung that wraps
+the payload in nothing: the restriction is installed in the child between fork
+and exec, so the argv spawned is the argv asked for and `current_dir` means what
+it says. Alongside it a small **seccomp deny-list** refuses `mount`, `umount2`,
+`pivot_root`, `ptrace`, the two `process_vm` calls, the three module calls, both
+`kexec` calls, `bpf` and `perf_event_open`, with `EPERM` rather than a kill. It
+is a deny-list and not a jail, and it is written in the host architecture's
+syscall numbers, so a process under a foreign personality is allowed through
+rather than denied by coincidence.
 
 Since 0.24.0 a Windows run is contained by a Job Object. Memory, CPU and active
 process count are real bounds, the whole process tree dies when the job handle
@@ -143,22 +186,39 @@ network namespaces; Windows does neither. So "sandboxed" on Windows means
 resource-capped and does not mean access-confined, and the two must not be read
 as the same claim.
 
-**The access half is `AppContainer`, and 0.26.0 built it without making it the
-default.** `io_harness::sandbox::appcontainer` creates a container profile,
-derives its SID, grants a path to it with an explicit ACE, and spawns into it
-through `CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES`
-attribute list. On the Windows CI runner a payload inside one is refused a read it
-was not granted and has no route off the machine, each against a negative control
-that must succeed outside the container.
+**The access half is `AppContainer`, 0.26.0 built it, and nothing selects it
+yet.** `io_harness::sandbox::appcontainer` creates a container profile, derives
+its SID, grants a path to it with an explicit ACE, and spawns into it through
+`CreateProcessW` with a `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` attribute
+list. On the Windows CI runner a payload inside one is refused a read it was not
+granted and has no route off the machine, each against a negative control that
+must succeed outside the container.
 
-`Sandbox::select` still chooses the Job Object on Windows, so **the table above is
-what a run actually gets** and is unchanged by this release. The obstacle is the
-grant set, not the mechanism: an AppContainer is default-deny for reads, so the
-workspace is the easy part and the executed binary, the toolchain, the redirected
-temporary directory and every language's install tree are the rest. Naming those
-for arbitrary ecosystems is a discovery problem 0.26.0 did not close, and a
-default boundary that cannot run the payload would be worse than one a caller
-reaches for deliberately. Recorded in `US-IO-HARNESS-0.26.0-I02`.
+`Sandbox::select` chooses the Job Object on Windows, so **the table above is what
+a run actually gets**.
+
+**0.47.0 was specified to select the container and does not.** The Windows half
+was taken out of that release whole on 2026-08-10 and rescheduled to **0.59.0**;
+the record is `US-IO-HARNESS-0.47.0-I01`. Three real defects in the module were
+found and fixed on the way and are in the tree: an ACE built from `GENERIC_ALL`
+is stored verbatim by `SetEntriesInAclW` and matches no access check, so every
+grant the module made between 0.26.0 and 0.47.0 was inert while being readable
+back off the DACL; a tree grant must survive a descendant another process holds
+open, because `CARGO_HOME` is being read by the very build that asked for the
+sandbox; and a grant on a directory alone must not enumerate it, because both
+`aclapi` write entry points walk the whole subtree below their target. What
+remains open is why the container declines the `CARGO_HOME` grant on
+`windows-latest`, and whether `cmd.exe` refusing to start a batch file named by an
+absolute path inside an AppContainer is a property of the platform or of this
+spawn.
+
+The original obstacle stands and is the grant set rather than the mechanism: an
+AppContainer is default-deny for reads, so the workspace is the easy part and the
+executed binary, the toolchain, the redirected temporary directory and every
+language's install tree are the rest. Naming those for arbitrary ecosystems is a
+discovery problem 0.26.0 did not close, and a default boundary that cannot run the
+payload would be worse than one a caller reaches for deliberately. Recorded in
+`US-IO-HARNESS-0.26.0-I02`.
 
 Two further differences, stated rather than left to be discovered. The job's CPU
 limit counts user-mode time only, where unix `RLIMIT_CPU` counts kernel time as
@@ -983,11 +1043,25 @@ cosmetic.**
 | Platform | Resource caps | Writes confined | Egress denied |
 | --- | --- | --- | --- |
 | macOS | Yes | Yes, to what the mode grants | Yes |
-| Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes |
+| Linux | Yes | Yes, to what the mode grants (0.40.0) | Yes, on every rung but Landlock below ABI 4 |
 | Windows | Yes | **No** | **No** |
 
-A Job Object contains resources and nothing else, so on Windows a contained
-command gets the caps and nothing more. **On Windows and on the portable floor
+**Windows is the row that is still open, and it did not change in 0.47.0.** A
+Job Object contains resources and nothing else, so a contained Windows command
+gets the caps and nothing more — no filesystem boundary and no egress boundary,
+because a job object has neither facility. `ExecMode` is routed and reported on
+this platform and enforces nothing for the filesystem.
+
+That was to change in 0.47.0. The Windows half of that release — the AppContainer
+selected, a grant set derived from the run's resolved facts, an empty capability
+array as the egress denial — was taken out of it whole on 2026-08-10 and is
+**0.59.0**. The record is `US-IO-HARNESS-0.47.0-I01`, and the reason is that the
+half could not be verified from the development host: ten CI rounds on
+`windows-latest` found three real defects in the module, fixed them, and did not
+converge. What a Windows run gets today is exactly what 0.46.0 gave it, which is
+why there is no migration note for this platform in this release.
+
+**On Windows and on the portable floor
 the `ExecMode` is therefore routed and reported and enforces nothing for the
 filesystem** — it is a statement of what the run asked for, not of what the host
 delivered, and `EventKind::Contained`'s `backend` is where the difference shows. On Linux the filesystem half is new in
