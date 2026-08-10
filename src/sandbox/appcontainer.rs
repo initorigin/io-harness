@@ -876,6 +876,159 @@ mod tests {
         );
     }
 
+    /// What `path`'s DACL says about `sid`, read back rather than assumed.
+    ///
+    /// `None` is "this SID appears in no allow-ACE on this object", which is the
+    /// only thing that distinguishes a grant that did not reach a file from a
+    /// grant that reached it and was not enough. Every Windows failure this
+    /// release has debugged so far has been one of those two and the difference
+    /// was guessed at.
+    fn granted_mask(
+        path: &std::path::Path,
+        sid: windows_sys::Win32::Security::PSID,
+    ) -> Option<u32> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{LocalFree, ERROR_SUCCESS};
+        use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_FILE_OBJECT};
+        use windows_sys::Win32::Security::{
+            EqualSid, GetAce, ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION,
+        };
+
+        let wpath: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: `wpath` is a live NUL-terminated path and every out-parameter
+        // is a live local; the owner, group and SACL outs are null, which the API
+        // documents as "do not return this".
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        assert_eq!(
+            rc,
+            ERROR_SUCCESS,
+            "could not read the DACL of {}",
+            path.display()
+        );
+
+        let mut found = None;
+        if !dacl.is_null() {
+            // SAFETY: `dacl` points into the security descriptor `sd` still owns.
+            let count = unsafe { (*dacl).AceCount };
+            for i in 0..count {
+                let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+                // SAFETY: `i` is below the ACE count just read from this ACL.
+                if unsafe { GetAce(dacl, u32::from(i), &mut ace) } == 0 {
+                    continue;
+                }
+                let allow = ace.cast::<ACCESS_ALLOWED_ACE>();
+                // Only an allow-ACE (`ACCESS_ALLOWED_ACE_TYPE`, 0) has a SID at
+                // this offset; reading any other type through this layout would
+                // be reading the wrong bytes.
+                // SAFETY: `allow` is the ACE `GetAce` just returned.
+                if unsafe { (*allow).Header.AceType } != 0 {
+                    continue;
+                }
+                // SAFETY: `SidStart` is the first word of the ACE's inline SID.
+                let ace_sid = unsafe { std::ptr::addr_of!((*allow).SidStart) }
+                    as windows_sys::Win32::Security::PSID;
+                // SAFETY: both are live SIDs — one inside the ACL, one the
+                // caller's.
+                if unsafe { EqualSid(ace_sid, sid) } != 0 {
+                    // SAFETY: as above.
+                    found = Some(unsafe { (*allow).Mask });
+                    break;
+                }
+            }
+        }
+        // SAFETY: `sd` came from `GetNamedSecurityInfoW`, which documents it as
+        // `LocalAlloc` memory, and is freed once here.
+        unsafe { LocalFree(sd) };
+        found
+    }
+
+    /// **How deep a grant on a directory actually goes**, read off the ACL.
+    ///
+    /// `grant` adds one inheritable ACE and relies on the system to re-propagate
+    /// it to what is already inside — the whole of the fix that took
+    /// `windows-latest` from thirty-six failures to thirteen. Every one of the
+    /// thirteen that is left has the same shape: the payload it could not reach
+    /// is **two** levels under a granted directory (`%TEMP%\.tmpXXXX\ok.bat`,
+    /// `<workspace>\src\lib.rs`) while every case that works is one
+    /// (`<workspace>\a.rs`, `<bindir>\test.exe`).
+    ///
+    /// So this measures the depth rather than arguing about it: one file at each
+    /// of three levels, the ACL read back at each, and the payload run at each.
+    /// A failure here names the level, which is the fact the next fix needs.
+    #[test]
+    fn a_grant_on_a_directory_reaches_every_depth_under_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mid = root.path().join("mid");
+        let deep = mid.join("deeper");
+        std::fs::create_dir_all(&deep).expect("the two directories under the root");
+
+        let payload = |dir: &std::path::Path| {
+            let p = dir.join("depth.bat");
+            std::fs::write(&p, "@echo off\r\necho io-harness-depth\r\n")
+                .expect("write the payload");
+            p
+        };
+        let at0 = payload(root.path());
+        let at1 = payload(&mid);
+        let at2 = payload(&deep);
+
+        let profile = Profile::create(&name("depth"), false).expect("profile");
+        grant(root.path(), profile.sid(), Access::Full).expect("grant the root");
+
+        // The ACL first: a payload that fails cannot say whether the ACE was
+        // missing or insufficient, and that is the question.
+        let masks = [
+            granted_mask(&at0, profile.sid()),
+            granted_mask(&at1, profile.sid()),
+            granted_mask(&at2, profile.sid()),
+        ];
+        assert!(
+            masks.iter().all(Option::is_some),
+            "a grant on a directory did not reach every file under it — depth 0/1/2 \
+             masks {masks:?}. A `None` names the level the system's re-propagation \
+             stopped at, and the level below it is where every remaining Windows \
+             failure lives."
+        );
+
+        // And then the behaviour, so the ACL is not being read as a proxy for it.
+        for (level, script) in [at0, at1, at2].iter().enumerate() {
+            let out_path = root.path().join(format!("o{level}.txt"));
+            let file = std::fs::File::create(&out_path).expect("capture");
+            let line = format!("cmd.exe /c \"{}\"", script.display());
+            let mut child = Spawned::start(&line, root.path(), profile.sid(), &file)
+                .expect("spawn the payload");
+            child.resume().expect("resume");
+            let code = child.wait(30_000).expect("wait");
+            drop(file);
+            let mut text = String::new();
+            std::fs::File::open(&out_path)
+                .and_then(|mut f| f.read_to_string(&mut text))
+                .ok();
+            assert_eq!(
+                code,
+                Some(0),
+                "the payload {level} level(s) under the granted directory did not run: {text:?}"
+            );
+        }
+    }
+
     /// F4 — the wall clock fires, and does not fire on a payload that finishes.
     ///
     /// Both halves, because a ceiling that always fires and a ceiling that never

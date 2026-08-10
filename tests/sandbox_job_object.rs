@@ -147,6 +147,71 @@ async fn a_contained_run_can_execute_a_program_from_the_path() {
     );
 }
 
+/// The crate's **own** verification gate, contained, with its own output.
+///
+/// `cargo test --offline` is what `tests/policy.rs`, `tests/sandbox.rs` and four
+/// `verify` unit tests all use as their criterion, and every one of them fails on
+/// `windows-latest` under the container while a `rustc` gate in the same shape
+/// passes. Those tests assert a boolean, so the run's own account of what it could
+/// not reach is discarded exactly where it is needed.
+///
+/// This runs the same command through the same backend and puts the merged output
+/// in the failure message. It is not a diagnostic bolted on beside the release:
+/// "the crate's own gate runs contained on this platform" is the release's claim,
+/// and until now nothing asserted it with the evidence attached.
+#[tokio::test]
+async fn the_crates_own_cargo_gate_runs_contained_and_says_what_it_could_not_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn hello() -> u32 { 42 }\n#[test] fn t() { assert_eq!(hello(), 42); }\n",
+    )
+    .unwrap();
+
+    // The roots the run's own gate resolves, so this is the gate's real
+    // configuration rather than a stricter one invented here.
+    let roots: Vec<std::path::PathBuf> = io_harness::toolchain::detect(root)
+        .map(|tc| tc.cache_dirs())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .collect();
+    let limits = SandboxLimits {
+        max_wall_secs: Some(600),
+        ..limits()
+    };
+    let argv = vec![
+        "cargo".to_string(),
+        "test".to_string(),
+        "--offline".to_string(),
+    ];
+    let out = select(&SandboxConfig::new())
+        .run(
+            RunSpec::new(&argv, root, &limits)
+                .with_network(false)
+                .with_writable_roots(&roots),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        out.success(),
+        "the crate's own gate could not run contained — backend {:?}, exit {:?}, \
+         writable roots {:?}, merged output:\n{}",
+        out.backend,
+        out.exit_code,
+        roots,
+        out.stdout
+    );
+}
+
 /// A contained run must not require a multi-threaded runtime, and this is
 /// asserted rather than left to whichever other test happens to be a
 /// `#[tokio::test]`.
