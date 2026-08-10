@@ -71,7 +71,7 @@ pub(crate) fn profile_for(
     // first because the last matching rule wins.
     let net = match (proxy, allow_network) {
         (Some(addr), _) => format!(
-            "(deny network*)\n(allow network-outbound (remote tcp \"localhost:{}\"))",
+            "(deny network*)\n(allow network-outbound (remote ip \"localhost:{}\"))",
             addr.port()
         ),
         (None, true) => "(allow network*)".to_string(),
@@ -133,7 +133,7 @@ mod tests {
         );
         assert!(p.contains("(deny network*)"), "everything is denied first");
         assert!(
-            p.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"),
+            p.contains("(allow network-outbound (remote ip \"localhost:54321\"))"),
             "and exactly the proxy is allowed back: {p}"
         );
         // Even though the run permits egress: with a proxy, permission is the

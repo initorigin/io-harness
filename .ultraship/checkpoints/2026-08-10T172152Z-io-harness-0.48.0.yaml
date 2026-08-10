@@ -47,12 +47,25 @@ active_hypotheses:
     reaches `RunSpec` and the macOS profile, and `run_capped` sets `HTTP_PROXY` for every backend.
     But `curl` exits 7 and **no `dial` row is written at all**, so the connection is being refused
     before it reaches the proxy — which points at the profile rather than at the proxy or the
-    environment. Tried and failed: `(allow network-outbound (remote ip "localhost:PORT"))` and the
-    same with `remote tcp`. Next: check whether the trailing `(allow file-write* …)` lines after the
-    `net` block re-order precedence in a way that matters, try `(remote ip "127.0.0.1:PORT")` and
-    `(remote ip "localhost:*")`, and read what `sandbox-exec` reports with the profile alone from a
-    shell before driving it through a run — the failing test is parked with `#[ignore]` and reads
-    `-- --ignored`.
+    environment.
+
+    **The SBPL syntax has been eliminated as the cause, by measurement.** Driving `sandbox-exec`
+    directly against a four-line profile — `(version 1)` / `(allow default)` / `(deny network*)` /
+    one allow — with a real loopback listener, **all four candidate forms returned HTTP 200**:
+    `(remote ip "localhost:*")`, `(remote ip "localhost:PORT")`, `(remote tcp "localhost:PORT")` and
+    `(remote ip "*:*")`. The original form was correct. So the composed profile the run builds does
+    not contain the allow line at all, which means `spec.proxy` is `None` by the time it reaches
+    `profile_for` — a wiring fault, not a syntax one.
+
+    **Start the next session there, not at the profile.** The chain to walk, in order, printing the
+    value at each hop: the run loop rebinds `containment` with `with_proxy` *after* `start_egress_proxy`
+    — confirm the rebound value is what reaches `dispatch`'s `exec_sandbox` parameter rather than an
+    earlier binding; `resolve_call_mode` clones it; `with_egress` and `with_mode` must both carry
+    `proxy` through (both were written to, and both are worth asserting rather than reading);
+    `ExecContainment::spec` sets `.with_proxy`. A unit test asserting `spec.proxy.is_some()` for a
+    containment built through `with_egress(true)` would have caught this and does not exist yet. The
+    absence of a `dial` row is the corroborating signal: nothing ever reached the proxy, so the
+    refusal happened at the kernel with a profile that never named it.
   - >
     **The Linux half has not been exercised at all.** `landlock::plan` gains `net_ports` and its
     pure test passes, but no Linux host has run it. F8's decision table does not exist yet, and the
