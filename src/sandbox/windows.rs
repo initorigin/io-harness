@@ -978,6 +978,68 @@ mod tests {
         assert_eq!(command_line(&["x".into(), String::new()]), "x \"\"");
     }
 
+    /// N5 — what the container costs per command over the Job Object alone.
+    ///
+    /// The two Windows backends are timed against each other rather than against
+    /// an unconfined spawn, because the Job Object is what a contained Windows run
+    /// got before this release: the interesting number is what selecting the
+    /// container adds, which is a profile lookup, a grant pass over the derived
+    /// set, a suspended spawn and a resume.
+    ///
+    /// `#[ignore]`d for the reason the Linux twin is: it is a measurement with no
+    /// threshold, and a wall-clock number on a shared runner must not gate a merge.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "a measurement, not an assertion — run by the overhead CI step"]
+    async fn n5_per_command_overhead_by_backend() {
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 30;
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = vec!["cmd".into(), "/c".into(), "exit /b 0".into()];
+        let limits = SandboxLimits::none();
+        let spec = || {
+            RunSpec::new(&argv, dir.path(), &limits)
+                .with_network(true)
+                .with_mode(ExecMode::WorkspaceWrite)
+        };
+
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            job::run(spec()).await.expect("the job object must run");
+        }
+        let job_only = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+        println!("N5 windows-job-object: {job_only:.2} ms/command over {ITERATIONS}");
+
+        let started = Instant::now();
+        let mut contained = 0u32;
+        for _ in 0..ITERATIONS {
+            match job::run_contained(&spec()).await {
+                Some(outcome) => {
+                    outcome.expect("the container must run");
+                    contained += 1;
+                }
+                // The container declining is the designed degradation, and a
+                // measurement that silently averaged in a Job Object run would
+                // report the container's cost as the job's.
+                None => break,
+            }
+        }
+        if contained == ITERATIONS {
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 windows-appcontainer: {per:.2} ms/command over {ITERATIONS} \
+                 (over the job object: {:+.2} ms)",
+                per - job_only
+            );
+        } else {
+            println!(
+                "N5 windows-appcontainer: not measured — the container declined after \
+                 {contained} of {ITERATIONS} runs on this host"
+            );
+        }
+    }
+
     fn find<'a>(g: &'a [GrantedPath], p: &str) -> Option<&'a GrantedPath> {
         g.iter().find(|x| x.path == Path::new(p))
     }

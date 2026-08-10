@@ -1189,6 +1189,105 @@ mod tests {
         }
     }
 
+    /// N5 — what each rung costs per command, measured rather than argued.
+    ///
+    /// The Landlock rung's claim is that it installs its restriction between fork
+    /// and exec and spawns **no wrapper**, unlike the namespace rung which prepends
+    /// `unshare`. That is a claim about a number, so it is timed: the same trivial
+    /// command, the same iteration count 0.46.0 used for `sandbox-exec`, run
+    /// unconfined and then under each rung this host actually has.
+    ///
+    /// `#[ignore]`d because it is a measurement and not an assertion — it has no
+    /// threshold to fail, and a wall-clock number on a shared runner is not
+    /// something to gate a merge on ([[never gate CI on a clock]]). CI runs it in
+    /// a step of its own that shows the output; the figures go into the release
+    /// record from that log.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "a measurement, not an assertion — run by the overhead CI step"]
+    async fn n5_per_command_overhead_by_rung() {
+        use crate::sandbox::SandboxLimits;
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 30;
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = vec!["/bin/true".into()];
+        let limits = SandboxLimits::none();
+
+        let spec = || {
+            RunSpec::new(&argv, dir.path(), &limits)
+                .with_network(true)
+                .with_mode(ExecMode::WorkspaceWrite)
+        };
+
+        // The baseline: the shared runner with no wrapper and no rule set, which
+        // is what a `FullAccess` command pays. Every figure below is a cost *over*
+        // this one, so it is measured with the same machinery rather than assumed
+        // to be zero.
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            run_capped(Backend::PortableFloor, spec(), |_cmd| {})
+                .await
+                .expect("the unconfined baseline must run");
+        }
+        let baseline = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+        println!("N5 unconfined (full-access): {baseline:.2} ms/command over {ITERATIONS}");
+
+        if landlock_abi().is_some() {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                landlock_run(&spec())
+                    .await
+                    .expect("the rung is available on this host")
+                    .expect("the rung must run");
+            }
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 linux-landlock: {per:.2} ms/command over {ITERATIONS} \
+                 (over baseline: {:+.2} ms)",
+                per - baseline
+            );
+        } else {
+            println!("N5 linux-landlock: not measured — this host has no usable Landlock");
+        }
+
+        if unshare_works() {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let wrapped = unshare_argv(&argv, dir.path(), true, ExecMode::WorkspaceWrite, &[]);
+                let wspec = RunSpec::new(&wrapped, dir.path(), &limits)
+                    .with_network(true)
+                    .with_mode(ExecMode::WorkspaceWrite);
+                run_capped(Backend::LinuxNamespaces, wspec, |_cmd| {})
+                    .await
+                    .expect("the namespace rung must run");
+            }
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 linux-namespaces: {per:.2} ms/command over {ITERATIONS} \
+                 (over baseline: {:+.2} ms)",
+                per - baseline
+            );
+        } else {
+            println!("N5 linux-namespaces: not measured — no usable user namespace on this host");
+        }
+
+        if bwrap_works() {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                bwrap_run(&spec()).await.expect("the bwrap rung must run");
+            }
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 linux-bubblewrap: {per:.2} ms/command over {ITERATIONS} \
+                 (over baseline: {:+.2} ms)",
+                per - baseline
+            );
+        } else {
+            println!("N5 linux-bubblewrap: not measured — no working bwrap on this host");
+        }
+    }
+
     #[test]
     fn a_wrapper_failure_is_not_a_verification_failure() {
         let fail = |stderr: &str, code: Option<i32>| SandboxOutcome {

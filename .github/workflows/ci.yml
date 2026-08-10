@@ -238,6 +238,20 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
       - run: cargo nextest run ${{ matrix.flags }} --lib --tests
+      # 0.47.0 — N5. The Windows backends' per-command cost, printed rather than
+      # asserted: the measurement tests carry no threshold, because a wall-clock
+      # number on a shared runner is not something a merge should turn on. The
+      # release record quotes this step's log.
+      #
+      # `--success-output immediate` because nextest captures the output of a
+      # passing test, and the whole point of these is what they print.
+      - name: measure the per-command containment overhead (N5)
+        if: runner.os == 'Windows' && matrix.flags == ''
+        run: >
+          cargo nextest run --lib
+          --run-ignored ignored-only
+          --success-output immediate
+          -E 'test(n5_)'
 
   # 0.47.0 — the Linux leg that does NOT touch the sysctl, which is the leg this
   # release exists for.
@@ -298,6 +312,15 @@ jobs:
       - run: cargo nextest run --lib --tests
         env:
           IO_HARNESS_EXPECT_BACKEND: linux-landlock
+      # 0.47.0 — N5, on the leg where the rung under measurement is the one a
+      # real user gets. Printed, never asserted: see the note on the Windows
+      # twin in the `test` job.
+      - name: measure the per-command containment overhead (N5)
+        run: >
+          cargo nextest run --lib
+          --run-ignored ignored-only
+          --success-output immediate
+          -E 'test(n5_)'
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.
   #
