@@ -81,7 +81,9 @@
 //! from the shared runner before the job is queried — so a timeout cannot be
 //! reported as a CPU or memory breach.
 
-use super::{Backend, RunSpec, Sandbox, SandboxOutcome};
+use std::path::{Path, PathBuf};
+
+use super::{Backend, ExecMode, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::Result;
 
 /// The Windows backend: every command runs inside a fresh Job Object whose
@@ -92,6 +94,11 @@ impl Sandbox for WindowsSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
         #[cfg(windows)]
         {
+            // **The Job Object, and only the Job Object.** The AppContainer half
+            // of 0.47.0 was specified here and taken out of the release whole —
+            // see `US-IO-HARNESS-0.47.0-I01` and the 0.59.0 roadmap entry. The
+            // module below is built and unit-tested and reached by nothing on
+            // this path, which is where it has been since 0.26.0.
             job::run(spec).await
         }
         // The type is compiled everywhere so its limit mapping can be unit-tested
@@ -104,6 +111,13 @@ impl Sandbox for WindowsSandbox {
         }
     }
 
+    /// The Job Object, which is what a contained Windows run gets.
+    ///
+    /// A **resource** boundary: memory, CPU, active processes, and a tree kill
+    /// when the handle closes. Not an access boundary, and this method saying so
+    /// plainly is the point — `ExecMode` is routed and reported on this platform
+    /// and enforces nothing for the filesystem, which `docs/CONTRACT.md` states
+    /// in the same words. The access half is 0.59.0.
     fn backend(&self) -> Backend {
         #[cfg(windows)]
         {
@@ -154,6 +168,262 @@ impl From<&super::SandboxLimits> for JobLimits {
     }
 }
 
+/// What an AppContainer may do with one path.
+///
+/// Mirrors `appcontainer::Access`, out here where it can be decided and tested
+/// on any host. The two are kept as separate types on purpose: this one is the
+/// *decision* and that one is the ACE mask, and a build host that has no Win32
+/// can still assert the decision.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Grant {
+    /// **Pass through this directory, and read nothing in it.** `FILE_TRAVERSE`
+    /// and `FILE_READ_ATTRIBUTES`, with no `FILE_LIST_DIRECTORY`: a name may be
+    /// resolved *through* the directory, and the directory itself cannot be
+    /// enumerated and its files cannot be opened.
+    ///
+    /// **Why a granted path is not reachable without this.** Opening a file by a
+    /// relative name resolves it against the working-directory handle the process
+    /// was created with, and no component is re-checked. Opening the *same file*
+    /// by absolute path walks every component from the volume root, and each one
+    /// is an access check the container has to pass. So a payload the run granted
+    /// in full was refused whenever it was named absolutely and permitted
+    /// whenever it was named relative to the working directory — the same bytes,
+    /// the same ACE, two different questions asked of the kernel.
+    ///
+    /// This is the weakest right that answers it. The crate still refuses to
+    /// grant the user's profile directory, and traverse is not a retreat from
+    /// that: it permits reaching `%TEMP%`, not reading what is beside it.
+    Traverse,
+    /// Read and execute. What a binary, a toolchain or a read-only input tree
+    /// needs, and the most that should ever be given to one.
+    ReadExecute,
+    /// Everything. The workspace and the roots the run resolved, and nothing
+    /// else — these are the directories the payload is *meant* to change.
+    Full,
+}
+
+/// How far into a directory one grant is meant to reach.
+///
+/// Windows inheritance is static: a child carries the DACL it was created with,
+/// so an inheritable ACE added to a directory reaches what that directory gains
+/// *later* and nothing it already holds. Re-propagating to what is already there
+/// is a second, much more expensive act — it rewrites every object under the
+/// path — and it is not always the right one.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reach {
+    /// The directory and everything already inside it. What a path the run
+    /// *names* needs: a workspace whose source files predate the run, a registry
+    /// cache whose crates were downloaded last week.
+    Tree,
+    /// The directory itself, and what it comes to hold afterwards.
+    DirectoryOnly,
+}
+
+/// One granted path.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrantedPath {
+    pub(crate) path: PathBuf,
+    pub(crate) grant: Grant,
+    pub(crate) reach: Reach,
+}
+
+/// The grant set for one run.
+///
+/// **This is the problem 0.26.0 declined to solve, and 0.46.0 solved most of it
+/// without meaning to.** An AppContainer is default-deny for reads, so selecting
+/// one means naming every path an arbitrary toolchain needs — which 0.26.0
+/// correctly called a discovery problem and left the module unwired for. Then
+/// 0.46.0 made a run resolve its own writable roots: the workspace, the system
+/// temporary directory and the detected toolchain's cache directories, already
+/// exists-filtered. So the list is now *derived from facts the run has* rather
+/// than guessed, and what remains is the small fixed read-execute set a process
+/// needs in order to start at all.
+///
+/// "Derived" is not "complete", and the release says so rather than implying
+/// otherwise: a toolchain reading a machine-wide configuration file outside this
+/// set will be refused. The answers to that are the escape hatch
+/// (`TaskContract::with_full_access`) and a named addition here with its reason,
+/// not a wider default. In particular the user's profile directory is **not**
+/// granted: that is where credentials live, and a default-deny boundary whose
+/// first act is to hand over the home directory is not one.
+#[allow(dead_code)]
+pub(crate) fn grants(
+    mode: ExecMode,
+    workdir: &Path,
+    writable_roots: &[PathBuf],
+    toolchain_roots: &[PathBuf],
+    program_dir: Option<&Path>,
+    system_root: Option<&Path>,
+    tmp: &Path,
+) -> Vec<GrantedPath> {
+    let mut out: Vec<GrantedPath> = Vec::new();
+
+    // The workspace: writable unless the mode withholds it, readable either way.
+    // Under `ReadOnly` this is the mode's entire difference, exactly as it is on
+    // the unix rungs.
+    out.push(GrantedPath {
+        path: workdir.to_path_buf(),
+        grant: if mode == ExecMode::ReadOnly {
+            Grant::ReadExecute
+        } else {
+            Grant::Full
+        },
+        reach: Reach::Tree,
+    });
+
+    if mode != ExecMode::ReadOnly {
+        for root in writable_roots {
+            out.push(GrantedPath {
+                path: root.clone(),
+                grant: Grant::Full,
+                reach: Reach::Tree,
+            });
+        }
+    }
+    // The temporary directory in every mode: a toolchain that cannot open a
+    // temporary file cannot run at all. The same allowance every other backend
+    // makes.
+    //
+    // **`DirectoryOnly`, and it is a boundary decision before it is a cost.**
+    // What a toolchain needs here is the ability to *create* a temporary file,
+    // and a new file inherits the ACE from the directory. What it does not need
+    // — and what a default-deny container has no business handing over — is
+    // every temporary file every other program on the machine has already
+    // written. `%TEMP%` is shared, it is large, and it is being written to by
+    // other processes while this runs, which made re-propagating it the one
+    // grant in this set that was both expensive and racy: a payload whose ACE
+    // this crate's own test could read a moment earlier was refused, because a
+    // concurrent run's propagation had recomputed that file's DACL in between.
+    out.push(GrantedPath {
+        path: tmp.to_path_buf(),
+        grant: Grant::Full,
+        reach: Reach::DirectoryOnly,
+    });
+
+    // Read-execute on the toolchain homes this machine names, and the reason is a
+    // launcher rather than a compiler. `rustc` on `PATH` is a rustup **shim**: it
+    // reads `RUSTUP_HOME` to find out which toolchain it stands for and then
+    // starts a second binary inside it. Granting the shim's own directory is not
+    // enough, and the failure is not a permission message — the shim cannot see
+    // its home, concludes it must create one, and reports
+    // "could not create home directory ... Cannot create a file when that file
+    // already exists". nvm, volta, pyenv and the JVM launchers all have the same
+    // shape.
+    //
+    // `CARGO_HOME` is deliberately **not** in this set even though it is the same
+    // kind of directory: it holds `credentials.toml`, and this set is read-execute
+    // for a payload. What a cargo build needs out of it arrives as a writable
+    // cache root, which is the run's own resolved fact and the caller's decision.
+    for dir in toolchain_roots {
+        out.push(GrantedPath {
+            path: dir.clone(),
+            grant: Grant::ReadExecute,
+            reach: Reach::Tree,
+        });
+    }
+
+    // Read-execute on the two places a process needs to start: its own program's
+    // directory and the system root. Without these an AppContainer cannot load
+    // the binary or the system libraries it links, and the run fails in a way
+    // that looks like the payload being broken.
+    for dir in [program_dir, system_root].into_iter().flatten() {
+        out.push(GrantedPath {
+            path: dir.to_path_buf(),
+            grant: Grant::ReadExecute,
+            reach: Reach::Tree,
+        });
+    }
+
+    // **Every ancestor of every granted path, traverse-only.** A grant that
+    // cannot be reached by name is not a grant, and an absolute path is checked
+    // component by component — see `Grant::Traverse`. Added last and deduplicated
+    // against the set above, so a directory that is already granted something
+    // stronger is never weakened to a traverse: `retain` keeps the first entry
+    // for a path and these are the last ones added.
+    let named: Vec<PathBuf> = out.iter().map(|g| g.path.clone()).collect();
+    let mut seen: Vec<PathBuf> = named.clone();
+    for path in named {
+        for ancestor in path.ancestors().skip(1) {
+            // A bare prefix (`C:`) is not a directory and cannot carry an ACE.
+            // The volume root is skipped outright rather than attempted: a
+            // process that does not own the machine cannot rewrite its DACL, and
+            // it already permits an AppContainer to pass through — a path under
+            // the profile was reachable as far as its last granted component
+            // before any of this existed, which is the evidence that the volume
+            // root and `C:\Users` were never the missing link.
+            if ancestor.as_os_str().is_empty()
+                || ancestor.parent().is_none()
+                || seen.iter().any(|p| p == ancestor)
+            {
+                continue;
+            }
+            seen.push(ancestor.to_path_buf());
+            out.push(GrantedPath {
+                path: ancestor.to_path_buf(),
+                grant: Grant::Traverse,
+                reach: Reach::DirectoryOnly,
+            });
+        }
+    }
+    out
+}
+
+/// Join an argv into one Windows command line.
+///
+/// Windows passes a *string*, not a vector, and every process parses it back
+/// itself. The rules being followed are the documented MSVCRT ones: a backslash
+/// run is literal unless it precedes a quote, in which case it is doubled, and a
+/// quote inside an argument is escaped.
+///
+/// Out here rather than in the Win32 module so it is asserted on the build host.
+/// A quoting bug is the kind of defect that only shows up on the one argument
+/// containing a space, which is every path on this platform.
+#[allow(dead_code)]
+pub(crate) fn command_line(argv: &[String]) -> String {
+    let mut out = String::new();
+    for (i, arg) in argv.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+            out.push_str(arg);
+            continue;
+        }
+        out.push('"');
+        let mut slashes = 0usize;
+        for c in arg.chars() {
+            match c {
+                '\\' => {
+                    slashes += 1;
+                    out.push('\\');
+                }
+                '"' => {
+                    // The run before a quote is doubled, then the quote escaped.
+                    for _ in 0..slashes {
+                        out.push('\\');
+                    }
+                    slashes = 0;
+                    out.push_str("\\\"");
+                }
+                _ => {
+                    slashes = 0;
+                    out.push(c);
+                }
+            }
+        }
+        // A run at the very end sits before the closing quote, so it is doubled
+        // too — the case that is easiest to leave out and hardest to notice.
+        for _ in 0..slashes {
+            out.push('\\');
+        }
+        out.push('"');
+    }
+    out
+}
+
 /// The Win32 half. Compiled only on Windows; everything above this line builds
 /// on every host so the mapping and its test do too.
 ///
@@ -164,7 +434,12 @@ impl From<&super::SandboxLimits> for JobLimits {
 /// lives for one call, a handle's lives until the handle is killed. That is a
 /// difference in who owns the handle, not a difference in the mechanism, so the
 /// mechanism is shared rather than written twice.
+// The grant set, the container spawn and everything they reach are unselected
+// with the rest of the Windows access half — see the note above
+// `sandbox::appcontainer::win`. The Job Object below is what a contained Windows
+// run gets and is reached normally.
 #[cfg(windows)]
+#[allow(dead_code)]
 pub(crate) mod job {
     use std::io;
 
@@ -184,9 +459,270 @@ pub(crate) mod job {
         OpenThread, ResumeThread, CREATE_SUSPENDED, THREAD_SUSPEND_RESUME,
     };
 
-    use super::JobLimits;
+    use super::{Grant, JobLimits};
     use crate::error::{Error, Result};
     use crate::sandbox::{run_capped, run_capped_hooked, Backend, Cap, RunSpec, SandboxOutcome};
+
+    /// Can this host build an AppContainer at all?
+    ///
+    /// Attempted, not inferred: a profile is created and dropped, which is where
+    /// a host with AppContainers disabled by policy fails. One attempt per
+    /// process — the answer cannot change under a running one.
+    pub(crate) fn container_available() -> bool {
+        static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OK.get_or_init(|| {
+            crate::sandbox::appcontainer::win::Profile::create("io-harness-probe", false).is_ok()
+        })
+    }
+
+    /// Run one command inside an AppContainer **and** a Job Object.
+    ///
+    /// Access and resources together, which is the whole of what 0.47.0 adds to
+    /// this platform. `None` means this path declined and the caller should take
+    /// the Job Object alone: a profile that cannot be created, a grant that
+    /// cannot be applied, a spawn that fails. Declining is a degradation with a
+    /// backend name attached, never an error handed to a caller who asked for a
+    /// contained run and would rather have had a weaker one than none.
+    ///
+    /// **Standard output and standard error arrive merged**, in that order, on
+    /// `stdout`. The container path owns its own spawn — the container SID
+    /// reaches a child only through a process-thread attribute list, which
+    /// neither `std`'s nor `tokio`'s `Command` can carry on stable Rust — and it
+    /// redirects both streams to one file rather than draining two pipes. A
+    /// caller that was parsing `stderr` separately on Windows sees it empty; the
+    /// text is not lost, it is in `stdout`. Stated here because it is the one
+    /// observable difference between this backend and every other.
+    /// Why the container path last declined, for whoever has to explain a run
+    /// that reported the Job Object on a host that can build containers.
+    ///
+    /// Deliberately a process-global last-one-wins rather than a channel: it
+    /// exists so a failure has something to print, and a decline is rare enough
+    /// that the most recent one is the interesting one.
+    pub(crate) fn last_decline() -> Option<String> {
+        DECLINE
+            .get()
+            .and_then(|m| m.lock().ok().and_then(|g| g.clone()))
+    }
+
+    static DECLINE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+        std::sync::OnceLock::new();
+
+    fn note_decline(why: &str) {
+        if let Ok(mut slot) = DECLINE.get_or_init(|| std::sync::Mutex::new(None)).lock() {
+            *slot = Some(why.to_string());
+        }
+    }
+
+    pub(super) async fn run_contained(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
+        use crate::sandbox::appcontainer::win::{grant_for, Profile, Spawned};
+
+        let tmp = std::env::temp_dir();
+        // The **resolved** program's directory, not `argv[0]`'s. A command is
+        // named the way every command is named — `cargo`, `rustc`, `npm` — and
+        // the parent of a bare filename is the empty path, so the one directory
+        // an AppContainer cannot start without was being granted to nothing.
+        let program_dir = crate::sandbox::resolve_program(&spec.argv[0])
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|p| !p.as_os_str().is_empty());
+        let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+        let toolchain_roots = crate::toolchain::Toolchain::launcher_homes();
+        let granted = super::grants(
+            spec.mode,
+            spec.workdir,
+            spec.writable_roots,
+            &toolchain_roots,
+            program_dir.as_deref(),
+            system_root.as_deref(),
+            &tmp,
+        );
+
+        // A deterministic name, so a profile stranded by a crashed run is
+        // re-entered rather than becoming a permanent failure — the module's own
+        // `ERROR_ALREADY_EXISTS` path. Bounded well under the 64-character limit.
+        let profile = match Profile::create("io-harness-sandbox", spec.allow_network) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(
+                    "sandbox: could not create an AppContainer profile ({e}); \
+                     falling back to the job object, which contains resources and not access"
+                );
+                note_decline(&format!("could not create an AppContainer profile: {e}"));
+                return None;
+            }
+        };
+        for g in &granted {
+            let Err(e) = grant_for(&g.path, profile.sid(), g.grant, g.reach) else {
+                continue;
+            };
+            // **A read-execute grant that fails is not fatal, and this is not a
+            // softening.** Granting means rewriting the path's DACL, which needs
+            // `WRITE_DAC` on it — and a process that is not an administrator does
+            // not have that on `%SystemRoot%` or on a toolchain installed under
+            // `Program Files`. Those locations already carry an ALL APPLICATION
+            // PACKAGES ACE by default, which is exactly the access an
+            // AppContainer needs to load a binary and the system libraries it
+            // links, so the grant is belt-and-braces rather than the mechanism.
+            //
+            // Treating it as fatal is what made `windows-latest` decline the
+            // container on every run: the probe could create a profile, so
+            // `backend()` reported `WindowsAppContainer`, and then the run took
+            // the Job Object. The test that caught it was asserting a network
+            // boundary against a run that had honestly reported it did not get
+            // one.
+            //
+            // A **writable** grant that fails stays fatal. That one is the
+            // mechanism: without it the payload cannot write to the workspace at
+            // all, and a container that silently could not is worse than the Job
+            // Object, which at least says what it is.
+            if g.grant == Grant::ReadExecute || g.grant == Grant::Traverse {
+                tracing::debug!(
+                    "sandbox: no DACL write on {} ({e}); relying on its ALL APPLICATION \
+                     PACKAGES access",
+                    g.path.display()
+                );
+                // A traverse grant fails on exactly the directories nobody owns —
+                // the volume root, `C:\Users` — and those already permit an
+                // AppContainer to pass through, which is why a path under the
+                // profile could be reached at all before this existed.
+                continue;
+            }
+            tracing::warn!(
+                "sandbox: could not grant {} to the container ({e}); \
+                 falling back to the job object",
+                g.path.display()
+            );
+            // **A decline must not be a silent fact.** The Job Object then runs
+            // the command with no access boundary and every assertion about the
+            // command still passes, so a test — and an operator reading a green
+            // run — cannot tell containment from its absence. `tracing` is not
+            // enough on its own: nothing subscribes to it in a test binary.
+            note_decline(&format!(
+                "could not grant {} ({:?}) to the container: {e}",
+                g.path.display(),
+                g.grant
+            ));
+            return None;
+        }
+
+        let limits = JobLimits::from(spec.limits);
+        let job = match Job::create(&limits) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::warn!("sandbox: could not create a job object for the container ({e})");
+                return None;
+            }
+        };
+
+        // Unique per *run*, not per process. Two contained commands running at
+        // once in one embedding process — a tree with several children, or a
+        // batch — would otherwise share one capture file and read each other's
+        // output. The process id keeps two processes on the same machine apart;
+        // the counter keeps two runs inside one process apart.
+        static CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let out_path = tmp.join(format!(
+            "io-harness-{}-{}.out",
+            std::process::id(),
+            CAPTURE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let file = match std::fs::File::create(&out_path) {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("sandbox: could not open the container's capture file ({e})");
+                return None;
+            }
+        };
+        let cmdline = super::command_line(spec.argv);
+        let mut child = match Spawned::start(&cmdline, spec.workdir, profile.sid(), &file) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("sandbox: could not spawn into the AppContainer ({e})");
+                let _ = std::fs::remove_file(&out_path);
+                return None;
+            }
+        };
+        drop(file);
+
+        // The ordering that is the correctness argument, and it now has to hold
+        // twice: the process is suspended, so it joins the job before it runs an
+        // instruction, and only then is it resumed. A failure here kills rather
+        // than continuing — a process running outside the job it was promised is
+        // worse than a spawn that never happened.
+        if let Err(e) = job.adopt_raw(child.process()) {
+            child.kill();
+            let _ = std::fs::remove_file(&out_path);
+            return Some(Err(e));
+        }
+        if let Err(e) = child.resume() {
+            child.kill();
+            let _ = std::fs::remove_file(&out_path);
+            return Some(Err(Error::Sandbox {
+                reason: format!(
+                    "the contained process was put in its job object but could not be \
+                     resumed ({e}); it is being killed rather than left suspended"
+                ),
+            }));
+        }
+
+        let wall_ms = spec
+            .limits
+            .max_wall_secs
+            .map(|s| s.saturating_mul(1000).min(u32::MAX as u64) as u32)
+            .unwrap_or(u32::MAX);
+        // **`spawn_blocking`, not `block_in_place`.** Both keep a blocking Win32
+        // wait off a runtime worker, but `block_in_place` *panics* on a
+        // current-thread runtime — which is what `#[tokio::test]` builds by
+        // default and what an embedder writing
+        // `#[tokio::main(flavor = "current_thread")]` gets. The panic was latent
+        // for as long as the container path was declined on every host; the run
+        // that stopped declining it failed four `verify::tests` at once, none of
+        // which are about containment. A backend may not require a runtime
+        // flavour of the process embedding it.
+        //
+        // `Spawned` is `Send`, so the handles move to a blocking thread and the
+        // answer comes back. It is dropped there, which is the same teardown as
+        // dropping it here: `wait` has already reaped or killed the process on
+        // every path that returns.
+        let waited = match tokio::task::spawn_blocking(move || child.wait(wall_ms)).await {
+            Ok(w) => w,
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                return Some(Err(Error::Sandbox {
+                    reason: format!("the thread waiting for the contained process failed: {e}"),
+                }));
+            }
+        };
+        let (exit_code, wall) = match waited {
+            Ok(Some(code)) => (Some(code), false),
+            // `wait` has already terminated it by the time it answers `None`.
+            Ok(None) => (None, true),
+            Err(e) => {
+                let _ = std::fs::remove_file(&out_path);
+                return Some(Err(Error::Sandbox {
+                    reason: format!("waiting for the contained process failed: {e}"),
+                }));
+            }
+        };
+
+        let stdout = std::fs::read_to_string(&out_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&out_path);
+
+        let mut cap_hit = wall.then_some(Cap::Wall);
+        if cap_hit.is_none() && exit_code != Some(0) {
+            cap_hit = job.cap_hit(&limits);
+        }
+
+        Some(Ok(SandboxOutcome {
+            // The job object is what this outcome can honestly claim: the
+            // container is not a backend this crate selects, so it is not a
+            // backend a caller can be told it got. 0.59.0 is where that changes.
+            backend: Backend::WindowsJobObject,
+            argv: spec.argv.to_vec(),
+            exit_code,
+            cap_hit,
+            stdout,
+            stderr: String::new(),
+        }))
+    }
 
     /// Run one command inside a fresh job object.
     ///
@@ -272,7 +808,7 @@ pub(crate) mod job {
         }
 
         /// Create the job and apply `limits` to it, before any process is in it.
-        fn create(limits: &JobLimits) -> io::Result<Self> {
+        pub(crate) fn create(limits: &JobLimits) -> io::Result<Self> {
             // SAFETY: both arguments are the documented "default security, no
             // name" nulls, which `CreateJobObjectW` is specified to accept and
             // not dereference. The returned handle is owned by the `Job` built
@@ -361,6 +897,27 @@ pub(crate) mod job {
             })
         }
 
+        /// Put an already-created process in the job, without resuming it.
+        ///
+        /// [`adopt`](Job::adopt) does both, because the `std::Command` path has
+        /// no thread handle left and has to go the ToolHelp way round. The
+        /// container path kept its thread handle from `CreateProcessW`, so it
+        /// resumes itself and needs only this half.
+        pub(crate) fn adopt_raw(&self, handle: HANDLE) -> Result<()> {
+            // SAFETY: `handle` belongs to a `Spawned` borrowed by the caller for
+            // longer than this call, so it cannot be closed underneath it, and
+            // `self.0` is this job's own handle.
+            if unsafe { AssignProcessToJobObject(self.0, handle) } == 0 {
+                return Err(Error::Sandbox {
+                    reason: format!(
+                        "could not assign the contained process to its job object: {}",
+                        io::Error::last_os_error()
+                    ),
+                });
+            }
+            Ok(())
+        }
+
         /// What, if anything, the job stopped this run for. Consulted only after
         /// a failed run, and only when no other cap already fired.
         ///
@@ -374,7 +931,7 @@ pub(crate) mod job {
         // a job completion port (`JobObjectAssociateCompletionPortInformation`)
         // if a caller ever needs to know *which* allocation was refused, or
         // needs to be told the instant a limit is hit rather than afterwards.
-        fn cap_hit(&self, limits: &JobLimits) -> Option<Cap> {
+        pub(crate) fn cap_hit(&self, limits: &JobLimits) -> Option<Cap> {
             let acct: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION =
                 self.query(JobObjectBasicAccountingInformation)?;
 
@@ -530,6 +1087,510 @@ pub(crate) mod job {
 mod tests {
     use super::*;
     use crate::sandbox::SandboxLimits;
+
+    /// The container path passes a command *line*, not a vector, so the quoting
+    /// is load-bearing. Asserted on the build host because a quoting bug only
+    /// shows up on the one argument containing a space — which on this platform
+    /// is every path.
+    #[test]
+    fn the_command_line_quotes_what_needs_quoting_and_nothing_else() {
+        assert_eq!(command_line(&["cargo".into(), "test".into()]), "cargo test");
+        assert_eq!(
+            command_line(&["c:\\a b\\cargo.exe".into(), "--x".into()]),
+            "\"c:\\a b\\cargo.exe\" --x"
+        );
+        // An argument with nothing to escape is passed through untouched, and a
+        // trailing backslash is only dangerous *inside* quotes — so this one is
+        // correct unquoted, and quoting it would be the bug.
+        assert_eq!(command_line(&["c:\\dir\\".into()]), "c:\\dir\\");
+        // Quoted, the same trailing run has to be doubled or it escapes the
+        // closing quote and swallows the next argument. This is the case that is
+        // easiest to leave out and hardest to notice.
+        assert_eq!(
+            command_line(&["c:\\a b\\".into(), "next".into()]),
+            "\"c:\\a b\\\\\" next"
+        );
+        // A quote inside an argument is escaped, and the run before it doubled.
+        assert_eq!(command_line(&["say \"hi\"".into()]), "\"say \\\"hi\\\"\"");
+        // An empty argument must survive as an empty argument.
+        assert_eq!(command_line(&["x".into(), String::new()]), "x \"\"");
+    }
+
+    /// N5 — what the container costs per command over the Job Object alone.
+    ///
+    /// The two Windows backends are timed against each other rather than against
+    /// an unconfined spawn, because the Job Object is what a contained Windows run
+    /// got before this release: the interesting number is what selecting the
+    /// container adds, which is a profile lookup, a grant pass over the derived
+    /// set, a suspended spawn and a resume.
+    ///
+    /// `#[ignore]`d for the reason the Linux twin is: it is a measurement with no
+    /// threshold, and a wall-clock number on a shared runner must not gate a merge.
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "a measurement, not an assertion — run by the overhead CI step"]
+    async fn n5_per_command_overhead_by_backend() {
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 30;
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = vec!["cmd".into(), "/c".into(), "exit /b 0".into()];
+        let limits = SandboxLimits::none();
+        let spec = || {
+            RunSpec::new(&argv, dir.path(), &limits)
+                .with_network(true)
+                .with_mode(ExecMode::WorkspaceWrite)
+        };
+
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            job::run(spec()).await.expect("the job object must run");
+        }
+        let job_only = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+        println!("N5 windows-job-object: {job_only:.2} ms/command over {ITERATIONS}");
+
+        let started = Instant::now();
+        let mut contained = 0u32;
+        for _ in 0..ITERATIONS {
+            match job::run_contained(&spec()).await {
+                Some(outcome) => {
+                    outcome.expect("the container must run");
+                    contained += 1;
+                }
+                // The container declining is the designed degradation, and a
+                // measurement that silently averaged in a Job Object run would
+                // report the container's cost as the job's.
+                None => break,
+            }
+        }
+        if contained == ITERATIONS {
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 windows-appcontainer: {per:.2} ms/command over {ITERATIONS} \
+                 (over the job object: {:+.2} ms)",
+                per - job_only
+            );
+        } else {
+            println!(
+                "N5 windows-appcontainer: not measured — the container declined after \
+                 {contained} of {ITERATIONS} runs on this host"
+            );
+        }
+    }
+
+    /// **What the container permits on this host, one capability per line.**
+    ///
+    /// Every Windows failure in this release was read wrongly at least once,
+    /// because two very different outcomes look identical from outside a test
+    /// that only asserts success: a container that permitted the operation, and a
+    /// container that **declined** — `run_contained` answers `None` when a grant
+    /// it must have cannot be applied, and the Job Object then runs the command
+    /// with no access boundary at all and every assertion passes. A gate test
+    /// written that way proved nothing about containment and read as if it had.
+    ///
+    /// So this asks each capability separately, through `run_contained` itself so
+    /// there is no doubt which backend answered, and prints all of them before
+    /// asserting. A failure here is a table, not a boolean.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn what_the_container_actually_permits_on_this_host() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("probe.txt"), "io-harness-probe\r\n").expect("probe file");
+        std::fs::write(
+            dir.path().join("probe.bat"),
+            "@echo off\r\necho io-harness-probe\r\n",
+        )
+        .expect("probe batch");
+
+        // **The grant set itself, printed.** `run_contained` swallows a failed
+        // read-execute grant by design — those paths carry an ALL APPLICATION
+        // PACKAGES ACE of their own and a non-administrator cannot rewrite their
+        // DACLs — so a path missing from this set and a path whose grant failed
+        // look the same from outside, and neither is visible in a test that only
+        // reports the command's exit code. Derived exactly as the backend derives
+        // it, and applied to nothing: this is a report, not a second grant.
+        let tmp = std::env::temp_dir();
+        let program_dir = crate::sandbox::resolve_program("cmd")
+            .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+            .filter(|p| !p.as_os_str().is_empty());
+        let system_root = std::env::var_os("SystemRoot").map(std::path::PathBuf::from);
+        let derived = super::grants(
+            ExecMode::WorkspaceWrite,
+            dir.path(),
+            &[],
+            &crate::toolchain::Toolchain::launcher_homes(),
+            program_dir.as_deref(),
+            system_root.as_deref(),
+            &tmp,
+        );
+        let mut report = String::from("\n  the grant set this run derives:");
+        for g in &derived {
+            report.push_str(&format!(
+                "\n    {:?} {:?} exists={} {}",
+                g.grant,
+                g.reach,
+                g.path.is_dir(),
+                g.path.display()
+            ));
+        }
+
+        // The long form of the workspace path. `std::env::temp_dir` answers with
+        // whatever `%TEMP%` holds, and on this runner that is the **8.3 short
+        // name** (`RUNNER~1`), so every payload path these tests build carries
+        // one. Resolving a short name is not the same file-system operation as
+        // opening a long one, and the two cases that still fail are the two that
+        // use an absolute short-name path — so the comparison is made here rather
+        // than assumed either way.
+        let long = std::fs::canonicalize(dir.path())
+            .map(|p| p.to_string_lossy().trim_start_matches(r"\\?\").to_string())
+            .unwrap_or_else(|_| dir.path().display().to_string());
+        let short_abs = dir.path().join("probe.bat").display().to_string();
+        let long_abs = format!("{long}\\probe.bat");
+        let txt_abs = dir.path().join("probe.txt").display().to_string();
+
+        // A second workspace that is not under the user profile at all. The
+        // target directory is beside the build output, which is on whichever
+        // volume the checkout is on — `D:` on this runner, and never `%TEMP%`.
+        let other = std::env::current_dir()
+            .unwrap_or_default()
+            .join("target")
+            .join(format!("io-harness-probe-{}", std::process::id()));
+        let other_bat = if std::fs::create_dir_all(&other).is_ok()
+            && std::fs::write(
+                other.join("probe.bat"),
+                "@echo off\r\necho io-harness-probe\r\n",
+            )
+            .is_ok()
+        {
+            other.join("probe.bat").display().to_string()
+        } else {
+            String::new()
+        };
+
+        let limits = SandboxLimits::none();
+        let roots: Vec<PathBuf> = if other_bat.is_empty() {
+            Vec::new()
+        } else {
+            vec![other.clone()]
+        };
+        // `must_run` is false for the two cases this platform refuses, and they
+        // are kept rather than deleted: they are the control that says the
+        // refusal is `cmd.exe` starting a *script* by absolute path and nothing
+        // about the grant set. The `type` case reads that same file by that same
+        // kind of path, and the off-the-profile case runs from a workspace whose
+        // ancestors are not the user profile at all. If Windows ever changes
+        // this, the table fails and says so.
+        let cases: [(&str, &[&str], bool); 10] = [
+            // The control: a shell builtin needs nothing but `%SystemRoot%`,
+            // which carries an ALL APPLICATION PACKAGES ACE of its own. If this
+            // fails the container is not usable on this host at all.
+            (
+                "a shell builtin",
+                &["cmd", "/c", "echo io-harness-probe"],
+                true,
+            ),
+            // Reading a file the workspace grant covers. This is the claim the
+            // whole grant set rests on and nothing asserted it directly.
+            (
+                "reading a granted file",
+                &["cmd", "/c", "type probe.txt"],
+                true,
+            ),
+            // Executing one. `cmd` opens a batch file itself, so this separates
+            // "the payload cannot be read" from "the payload cannot be started".
+            (
+                "running a granted batch file",
+                &["cmd", "/c", "probe.bat"],
+                true,
+            ),
+            // Writing into the workspace, which `Full` is entirely about.
+            (
+                "writing into the workspace",
+                &["cmd", "/c", "echo written> written.txt"],
+                true,
+            ),
+            // A program on PATH, through its launcher and toolchain home.
+            ("a program on PATH", &["rustc", "--version"], true),
+            // The same batch file by absolute path, in the two forms the path can
+            // take. Every remaining failure in this release runs a payload by an
+            // absolute path that carries an 8.3 short component, and every case
+            // that passes names it relative to a granted working directory.
+            (
+                "a batch file by absolute path",
+                &["cmd", "/c", "@SHORT@"],
+                false,
+            ),
+            (
+                "a batch file by long absolute path",
+                &["cmd", "/c", "@LONG@"],
+                false,
+            ),
+            // The toolchain binary cargo could not start, reached the way cargo
+            // reaches it: by absolute path, not through the launcher shim.
+            (
+                "the toolchain binary by absolute path",
+                &["@RUSTC@", "-vV"],
+                true,
+            ),
+            // The case that separates "an absolute path" from "a batch file".
+            // `type` is a builtin reading the same directory by the same kind of
+            // path, so if it passes while the two above fail, the path resolves
+            // and what cannot be reached is whatever `cmd` does to *start* a
+            // script.
+            (
+                "reading a granted file by absolute path",
+                &["cmd", "/c", "type @TXT@"],
+                true,
+            ),
+            // And the case that separates "an absolute path" from "this chain".
+            // The workspace here sits beside the checkout on the runner's data
+            // volume rather than under the user profile, so `AppData\Local` and
+            // every ACL on it are out of the picture.
+            (
+                "a batch file by absolute path off the profile",
+                &["cmd", "/c", "@OTHER@"],
+                false,
+            ),
+        ];
+
+        // Where the toolchain's own rustc is, which is what `cargo` executes and
+        // what it was refused. Asked of the launcher rather than guessed.
+        let toolchain_rustc = std::process::Command::new("rustup")
+            .args(["which", "rustc"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        report.push_str(&format!("\n  rustup which rustc: {toolchain_rustc:?}"));
+
+        let mut failed = 0;
+        for (what, args, must_run) in cases {
+            let argv: Vec<String> = args
+                .iter()
+                .map(|s| match *s {
+                    "@SHORT@" => short_abs.clone(),
+                    "@LONG@" => long_abs.clone(),
+                    "@RUSTC@" => toolchain_rustc.clone(),
+                    "type @TXT@" => format!("type {txt_abs}"),
+                    "@OTHER@" => other_bat.clone(),
+                    other => other.to_string(),
+                })
+                .collect();
+            // A case whose subject this host could not name is reported as such
+            // rather than run as an empty argv, which would fail for a reason of
+            // its own and read like a denial.
+            if argv.iter().any(String::is_empty) {
+                report.push_str(&format!(
+                    "\n  {what}: not runnable here, no path to the subject"
+                ));
+                continue;
+            }
+            // The second workspace is named as a writable root so the case that
+            // runs from it is testing the *path*, not an ungranted directory.
+            let spec = RunSpec::new(&argv, dir.path(), &limits)
+                .with_mode(ExecMode::WorkspaceWrite)
+                .with_network(false)
+                .with_writable_roots(&roots);
+            match job::run_contained(&spec).await {
+                None => {
+                    failed += 1;
+                    report.push_str(&format!(
+                        "\n  {what}: THE CONTAINER DECLINED — {}",
+                        job::last_decline().unwrap_or_else(|| "no reason recorded".into())
+                    ));
+                }
+                Some(Err(e)) => {
+                    failed += 1;
+                    report.push_str(&format!("\n  {what}: the backend errored: {e}"));
+                }
+                Some(Ok(o)) => {
+                    if o.success() != must_run {
+                        failed += 1;
+                    }
+                    report.push_str(&format!(
+                        "\n  {what}: backend {:?}, exit {:?}{}, output {:?}",
+                        o.backend,
+                        o.exit_code,
+                        if must_run { "" } else { " (expected: refused)" },
+                        o.stdout
+                    ));
+                }
+            }
+        }
+        assert_eq!(
+            failed, 0,
+            "the AppContainer did not behave as the grant set says it does:{report}"
+        );
+    }
+
+    fn find<'a>(g: &'a [GrantedPath], p: &str) -> Option<&'a GrantedPath> {
+        g.iter().find(|x| x.path == Path::new(p))
+    }
+
+    /// F8 — the grant set is derived from the run's own resolved facts.
+    #[test]
+    fn the_grant_set_comes_from_what_the_run_already_resolved() {
+        let roots = vec![
+            PathBuf::from(r"C:\cache\cargo"),
+            PathBuf::from(r"C:\cache\npm"),
+        ];
+        let g = grants(
+            ExecMode::WorkspaceWrite,
+            Path::new(r"C:\work"),
+            &roots,
+            &[PathBuf::from(r"C:\Users\someone\.rustup")],
+            Some(Path::new(r"C:\tools\bin")),
+            Some(Path::new(r"C:\Windows")),
+            Path::new(r"C:\Temp"),
+        );
+
+        assert_eq!(find(&g, r"C:\work").unwrap().grant, Grant::Full);
+        assert_eq!(find(&g, r"C:\cache\cargo").unwrap().grant, Grant::Full);
+        assert_eq!(find(&g, r"C:\cache\npm").unwrap().grant, Grant::Full);
+        assert_eq!(find(&g, r"C:\Temp").unwrap().grant, Grant::Full);
+
+        // A path the run named reaches what is already inside it; the shared
+        // temporary directory is granted for what the run will *create* there,
+        // and re-propagating it is the one grant in this set that was both
+        // expensive and racy.
+        assert_eq!(find(&g, r"C:\work").unwrap().reach, Reach::Tree);
+        assert_eq!(find(&g, r"C:\cache\cargo").unwrap().reach, Reach::Tree);
+        assert_eq!(
+            find(&g, r"C:\Users\someone\.rustup").unwrap().reach,
+            Reach::Tree
+        );
+        assert_eq!(find(&g, r"C:\Temp").unwrap().reach, Reach::DirectoryOnly);
+
+        // Every ancestor of a granted path is reachable by name, traverse-only.
+        // A granted directory that cannot be walked to is refused the moment the
+        // payload is named absolutely rather than relative to the working
+        // directory, which is the same file and a different question.
+        //
+        // **Windows only, and not because the code is.** `grants` is portable and
+        // is asserted on the build host precisely so it does not need a Windows
+        // runner — but `Path::ancestors` splits on the *host's* separator, and a
+        // backslash is an ordinary character in a unix path, so on the build host
+        // `C:\cache\cargo` is a single component with no ancestors to find. The
+        // decision is the same on both; only this half of the assertion needs the
+        // platform that can see it.
+        #[cfg(not(windows))]
+        let _ = &g;
+        #[cfg(windows)]
+        {
+            let cache = find(&g, r"C:\cache").expect("the parent of a granted cache root");
+            assert_eq!(cache.grant, Grant::Traverse);
+            assert_eq!(cache.reach, Reach::DirectoryOnly);
+            assert_eq!(find(&g, r"C:\Users").unwrap().grant, Grant::Traverse);
+            assert_eq!(
+                find(&g, r"C:\Users\someone").unwrap().grant,
+                Grant::Traverse
+            );
+
+            // And a path that is already granted something stronger is never
+            // weakened to a traverse by being some other path's ancestor.
+            assert_eq!(find(&g, r"C:\Windows").unwrap().grant, Grant::ReadExecute);
+        }
+        // The two places a process needs in order to start at all, and no more
+        // than read-execute on either.
+        assert_eq!(find(&g, r"C:\tools\bin").unwrap().grant, Grant::ReadExecute);
+        assert_eq!(find(&g, r"C:\Windows").unwrap().grant, Grant::ReadExecute);
+        // A toolchain launcher's home: read-execute, never writable. This is what
+        // a rustup shim reads to find the binary it stands for, and a shim that
+        // cannot see its home does not report a permission error.
+        assert_eq!(
+            find(&g, r"C:\Users\someone\.rustup").unwrap().grant,
+            Grant::ReadExecute
+        );
+        // Nothing is granted that was not named or walked to. The seven named
+        // paths, and on Windows the ancestors that make them reachable — a count
+        // that differs by platform because `Path::ancestors` splits on the host's
+        // separator and a backslash is an ordinary character in a unix path.
+        let named = 7;
+        assert_eq!(
+            g.iter().filter(|e| e.grant != Grant::Traverse).count(),
+            named,
+            "nothing is granted that was not named"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(g.len(), named, "no ancestors are found on this host");
+        #[cfg(windows)]
+        assert!(
+            g.len() > named && g[named..].iter().all(|e| e.grant == Grant::Traverse),
+            "the ancestors are added after the named set and are traverse-only: {g:?}"
+        );
+    }
+
+    /// F8's mode arm — `ReadOnly` downgrades the workspace to read-execute and
+    /// withholds the writable roots entirely, while the temp directory stays.
+    #[test]
+    fn read_only_downgrades_the_workspace_and_withholds_the_roots() {
+        let roots = vec![PathBuf::from(r"C:\cache\cargo")];
+        let g = grants(
+            ExecMode::ReadOnly,
+            Path::new(r"C:\work"),
+            &roots,
+            &[PathBuf::from(r"C:\Users\someone\.rustup")],
+            None,
+            None,
+            Path::new(r"C:\Temp"),
+        );
+        assert_eq!(find(&g, r"C:\work").unwrap().grant, Grant::ReadExecute);
+        assert!(
+            find(&g, r"C:\cache\cargo").is_none(),
+            "a read-only run has nothing to build and no cache to populate"
+        );
+        assert_eq!(find(&g, r"C:\Temp").unwrap().grant, Grant::Full);
+        // The launcher home survives `ReadOnly` — it is already read-execute, and
+        // a read-only run still has to be able to start the program it was given.
+        assert_eq!(
+            find(&g, r"C:\Users\someone\.rustup").unwrap().grant,
+            Grant::ReadExecute
+        );
+    }
+
+    /// The user's profile directory is deliberately **not** in the set. It is
+    /// where credentials live, and a default-deny boundary whose first act is to
+    /// hand over the home directory is not one. Asserted so that a future
+    /// "convenience" addition has to argue with a test.
+    #[test]
+    fn the_home_directory_is_never_granted() {
+        let home = PathBuf::from(r"C:\Users\someone");
+        let g = grants(
+            ExecMode::WorkspaceWrite,
+            Path::new(r"C:\work"),
+            &[],
+            &[],
+            Some(Path::new(r"C:\tools\bin")),
+            Some(Path::new(r"C:\Windows")),
+            Path::new(r"C:\Temp"),
+        );
+        assert!(
+            !g.iter().any(|x| x.path == home),
+            "the profile directory must never be granted by default"
+        );
+    }
+
+    /// A path a run resolved but which is not there must not reach the grant
+    /// list — the exists-filter is the caller's, and this asserts the derivation
+    /// does not re-add anything of its own.
+    #[test]
+    fn nothing_is_granted_that_the_run_did_not_resolve() {
+        let g = grants(
+            ExecMode::WorkspaceWrite,
+            Path::new(r"C:\work"),
+            &[],
+            &[],
+            None,
+            None,
+            Path::new(r"C:\Temp"),
+        );
+        assert_eq!(
+            g.len(),
+            2,
+            "the workspace and the temp directory, and that is all"
+        );
+    }
 
     #[test]
     fn maps_limits_to_job_object_fields_and_ticks() {

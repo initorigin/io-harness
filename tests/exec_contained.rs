@@ -376,22 +376,25 @@ async fn loopback_listener() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
 /// the ubuntu runners took the floor: the two escape tests failed loudly and the
 /// egress tests skipped silently, which is the same defect wearing two faces.
 fn backend_confines_writes() -> bool {
-    use io_harness::sandbox::{select, Backend, Sandbox};
-    matches!(
-        select(&SandboxConfig::new()).backend(),
-        Backend::MacosSandboxExec | Backend::LinuxNamespaces
-    )
+    use io_harness::sandbox::{select, Sandbox};
+    // One question, one answer, and it lives on `Backend` itself.
+    //
+    // This was a `matches!` list written out here and in three other places. When
+    // 0.47.0's chain added three backends every one of them went silently wrong
+    // at once: a host reporting `LinuxLandlock` took the branch meaning "this
+    // backend confines nothing" and asserted that a write it had correctly
+    // refused ought to have landed. `Backend::confines_writes` is an exhaustive
+    // match, so the next backend added is a compile error there rather than a
+    // passing test here that proves nothing.
+    select(&SandboxConfig::new()).backend().confines_writes()
 }
 
 /// Does this host's backend claim a network boundary at all? A Job Object and the
 /// portable floor do not, and asserting a denial they never promised is how a
 /// suite starts lying about what it proved.
 fn backend_claims_a_network_boundary() -> bool {
-    use io_harness::sandbox::{select, Backend, Sandbox};
-    matches!(
-        select(&SandboxConfig::new()).backend(),
-        Backend::MacosSandboxExec | Backend::LinuxNamespaces
-    )
+    use io_harness::sandbox::{select, Sandbox};
+    select(&SandboxConfig::new()).backend().denies_egress()
 }
 
 #[cfg(unix)]
@@ -601,15 +604,19 @@ async fn an_uncontained_shell_line_still_writes_outside_the_workspace() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn linux_confines_a_contained_commands_writes_to_the_workspace() {
-    use io_harness::sandbox::{select, Backend, Sandbox};
+    use io_harness::sandbox::{select, Sandbox};
 
+    // 0.47.0: any confining rung of the chain, not the namespace rung alone.
+    // Which one a host takes is the chain's business; what this test asserts is
+    // that a host claiming to confine writes actually does.
     let backend = select(&SandboxConfig::new()).backend();
-    if backend != Backend::LinuxNamespaces {
+    if !backend.confines_writes() {
         assert!(
             std::env::var("CI").is_err(),
-            "this runner reported {backend:?} rather than LinuxNamespaces. On CI that is a \
-             failure and not a skip: the confinement assertion below would pass without \
-             confining anything, and the release would claim a boundary it never applied."
+            "this runner reported {backend:?}, which is not a confining rung of the Linux \
+             chain. On CI that is a failure and not a skip: the confinement assertion below \
+             would pass without confining anything, and the release would claim a boundary \
+             it never applied."
         );
         eprintln!("skipped: this host reports {backend:?}, which claims no filesystem boundary");
         return;
@@ -638,7 +645,7 @@ async fn linux_confines_a_contained_commands_writes_to_the_workspace() {
 
     assert!(
         !target.exists(),
-        "the mount namespace confined nothing: {} was written",
+        "the {backend:?} rung confined nothing: {} was written",
         target.display()
     );
     assert!(

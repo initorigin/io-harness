@@ -237,7 +237,102 @@ jobs:
       - name: permit unprivileged user namespaces so the Linux backend is real
         if: runner.os == 'Linux'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-      - run: cargo nextest run ${{ matrix.flags }} --lib --tests
+      # `--no-fail-fast`, added in 0.47.0 and it is a lesson about round trips
+      # rather than about testing. nextest stops the run on the first failures,
+      # and on a platform the development host cannot run at all that turns one
+      # defect into one matrix round: four `verify` tests failed here and 698
+      # tests — including the ones written to say *why* — never ran. A leg that
+      # is going to be red anyway costs nothing extra by finishing, and it
+      # answers the next question in the same round.
+      - run: cargo nextest run ${{ matrix.flags }} --lib --tests --no-fail-fast
+      # 0.47.0 — N5. The Windows backends' per-command cost, printed rather than
+      # asserted: the measurement tests carry no threshold, because a wall-clock
+      # number on a shared runner is not something a merge should turn on. The
+      # release record quotes this step's log.
+      #
+      # `--success-output immediate` because nextest captures the output of a
+      # passing test, and the whole point of these is what they print.
+      # Not macOS: 0.46.0 measured `sandbox-exec` and the figure is in its record.
+      # The Linux leg here is the one that *restores* unprivileged user
+      # namespaces, so it is where the namespace rung can be timed at all — the
+      # `contained-linux` leg leaves the restriction in place by design and
+      # reports that rung as not measurable.
+      - name: measure the per-command containment overhead (N5)
+        if: matrix.flags == '' && runner.os != 'macOS'
+        run: >
+          cargo nextest run --lib
+          --run-ignored ignored-only
+          --success-output immediate
+          -E 'test(n5_)'
+
+  # 0.47.0 — the Linux leg that does NOT touch the sysctl, which is the leg this
+  # release exists for.
+  #
+  # Every leg above restores unprivileged user namespaces so the namespace
+  # backend is exercised rather than the fallback. That was right in 0.40.0 and
+  # it is still right — but it means the configuration a real user is actually
+  # in, a stock Ubuntu 24.04 with `kernel.apparmor_restrict_unprivileged_userns=1`,
+  # was tested nowhere. On that host every release up to 0.46.0 took the portable
+  # floor: a contained run got resource caps, an ephemeral working directory and
+  # a proxy-environment strip, and the filesystem confinement the crate documents
+  # was applied on no machine anywhere.
+  #
+  # So this job leaves the setting alone. `IO_HARNESS_EXPECT_BACKEND` states which
+  # rung is expected, and `tests/sandbox.rs` fails if the chain answers with
+  # anything else — a test-only assertion, read by no code in the crate. On
+  # today's kernels that rung is Landlock, which needs no namespace at all.
+  #
+  # If this job ever reports `portable-floor`, the release regressed to 0.46.0's
+  # behaviour on the commonest Linux CI image in the world, and it will say so
+  # rather than passing.
+  contained-linux:
+    name: contained (ubuntu, userns restricted)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: contained
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-nextest
+      # Deliberately no `sysctl` step. Reported so a reader of the log can see
+      # which state the leg ran in rather than inferring it from an absence.
+      - name: report the host's namespace and Landlock state
+        run: |
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          cat /sys/kernel/security/lsm || true
+      # `--lib --tests` does not build `examples/`, and five of the fixtures are
+      # spawned as child processes by tests this leg runs. Trap 86: splitting a
+      # job removes an ordering nothing declared, and this leg is a split of the
+      # `test` job above. The list is the same one, guarded by
+      # `tests/ci_workflow.rs` against the set the tests actually spawn.
+      - run: >
+          cargo build --tests
+          --example attach_fixture
+          --example crash_fixture
+          --example fleet_fixture
+          --example flood
+          --example mcp_fixture_server
+          --example orphan
+          --example plan_gate_fixture
+          --example tick
+      - run: cargo nextest run --lib --tests --no-fail-fast
+        env:
+          IO_HARNESS_EXPECT_BACKEND: linux-landlock
+      # 0.47.0 — N5, on the leg where the rung under measurement is the one a
+      # real user gets. Printed, never asserted: see the note on the Windows
+      # twin in the `test` job.
+      - name: measure the per-command containment overhead (N5)
+        run: >
+          cargo nextest run --lib
+          --run-ignored ignored-only
+          --success-output immediate
+          -E 'test(n5_)'
 
   # 0.36.1 — the doctests, as a job of their own, per operating system.
   #

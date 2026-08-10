@@ -1331,8 +1331,30 @@ impl Shell {
                 .kill_on_drop(true);
             // The same caps the sandbox's own runner applies, through the same
             // helper rather than a second copy of the `pre_exec` block.
+            //
+            // ...and the containment that is not expressible as an argv wrapper.
+            // `wrap_argv` above answers what the command should become, which was
+            // the whole answer while every rung was a wrapper program. The
+            // Landlock rung installs its restriction in the child instead, so
+            // without this a contained line's stages would spawn unconfined while
+            // the backend reported a confining rung — which is exactly what the
+            // matrix caught on a second stage writing outside the workspace. The
+            // guard owns the rule set and must outlive the spawn below.
+            let mut _contained = None;
             if let Some(sb) = &self.sandbox {
                 crate::sandbox::apply_rlimits(&mut cmd, &sb.containment.config.limits);
+                let mut roots: Vec<std::path::PathBuf> = Vec::new();
+                if sb.containment.config.mode != crate::ExecMode::ReadOnly {
+                    roots.push(sb.workdir.clone());
+                }
+                roots.extend(sb.containment.roots.iter().cloned());
+                _contained = crate::sandbox::contain_command(
+                    &mut cmd,
+                    &sb.containment.config,
+                    &planned.cwd,
+                    sb.containment.config.allow_network,
+                    &roots,
+                );
             }
 
             // A detached line's stages go into containment of their own, and a

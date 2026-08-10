@@ -25,11 +25,87 @@ use std::process::Stdio;
 use super::{run_capped, Backend, ExecMode, RunSpec, Sandbox, SandboxOutcome};
 use crate::error::{Error, Result};
 
+/// The first Landlock ABI carrying `LANDLOCK_ACCESS_NET_CONNECT_TCP`, and
+/// therefore the first that can deny egress. Linux 6.7.
+///
+/// Below it Landlock confines the filesystem and says nothing about the network,
+/// which is why [`rung`] refuses to hand it a run that denies egress.
+pub(crate) const LANDLOCK_NET_ABI: u32 = 4;
+
+/// What each rung's probe answered on this host.
+///
+/// Plain data, deliberately: which rung a host takes is then a *function* of
+/// four answers rather than a nest of conditions at the call site, and the whole
+/// chain can be decided in a table test without a Linux kernel anywhere near it.
+/// Every field is filled by attempting the restriction, never by reading a
+/// sysctl, a `/sys/kernel/security/lsm` line or a package's presence — 0.40.0's
+/// Linux breakage survived three matrix runs behind exactly that shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Rungs {
+    /// The kernel's Landlock ABI as it reported it, or `None` when this host has
+    /// no usable Landlock at all. A version rather than a boolean because the
+    /// network rules arrive at a known version and the chain has to know.
+    pub(crate) landlock_abi: Option<u32>,
+    /// A `bwrap` on `PATH` whose probe spawn of the exact wrapper this backend
+    /// builds succeeded.
+    pub(crate) bubblewrap: bool,
+    /// The `unshare` wrapper this crate has built since 0.9.1, spawned and
+    /// successful — [`unshare_works`].
+    pub(crate) unshare: bool,
+}
+
+/// Which rung this host takes for a run with this egress requirement.
+///
+/// Strength order, and it is the roadmap's: Landlock, bubblewrap, namespaces,
+/// floor. The floor is not a rung anyone probes for — it is what is left.
+///
+/// **The one rule that can send a host below its strongest available primitive**
+/// is the egress requirement. A run that denies egress may not be given a rung
+/// that cannot deny egress, so a kernel with Landlock below
+/// [`LANDLOCK_NET_ABI`] falls through to bubblewrap or to the namespace rung —
+/// both of which have a network namespace — rather than taking a filesystem-only
+/// rung and leaving the run's own policy unenforced. Without that rule the chain
+/// would be ordered but dishonest, which is the failure mode this crate has
+/// already shipped once.
+///
+/// The [`ExecMode`] is deliberately not a parameter: every rung renders all three
+/// modes, so the mode decides what goes in a rung's rule set and never which rung
+/// is chosen. The table test asserts that invariance rather than leaving it as a
+/// claim in this sentence.
+pub(crate) fn rung(probes: Rungs, deny_egress: bool) -> Backend {
+    if let Some(abi) = probes.landlock_abi {
+        if !deny_egress || abi >= LANDLOCK_NET_ABI {
+            return Backend::LinuxLandlock;
+        }
+    }
+    if probes.bubblewrap {
+        return Backend::LinuxBubblewrap;
+    }
+    if probes.unshare {
+        return Backend::LinuxNamespaces;
+    }
+    Backend::PortableFloor
+}
+
 /// The Linux namespaces backend.
 pub struct LinuxSandbox;
 
 impl Sandbox for LinuxSandbox {
     async fn run(&self, spec: RunSpec<'_>) -> Result<SandboxOutcome> {
+        // The chain, in strength order. `rung` decides; this matches on what it
+        // decided. A rung that cannot build its own apparatus for *this* run —
+        // a rule set the kernel refuses, a helper that is not there — falls to
+        // the next one rather than failing the run, and every one of them
+        // reports the backend that was actually applied.
+        match rung(probes(), !spec.allow_network) {
+            Backend::LinuxLandlock => {
+                if let Some(outcome) = landlock_run(&spec).await {
+                    return outcome;
+                }
+            }
+            Backend::LinuxBubblewrap => return bwrap_run(&spec).await,
+            _ => {}
+        }
         if !unshare_works() {
             // No usable namespaces on this host: take the floor rather than
             // failing every run, and report the floor rather than naming an
@@ -56,13 +132,225 @@ impl Sandbox for LinuxSandbox {
         }
     }
 
+    /// The rung this host takes, reported **conservatively**.
+    ///
+    /// The trait method has no run to read, and the chain's one run-dependent
+    /// input is the egress requirement — so this answers for the stricter of the
+    /// two: what a run that *denies* egress would get. A host whose Landlock
+    /// predates the network rules therefore reports the namespace rung here
+    /// while a run permitting egress would really take Landlock.
+    ///
+    /// Under-reporting rather than over-reporting, on purpose. The rule this
+    /// crate keeps is that a backend never names an isolation it did not apply;
+    /// naming a weaker one than was applied costs a reader precision, naming a
+    /// stronger one costs them the boundary. The exact per-command answer is in
+    /// [`SandboxOutcome::backend`] and in the `SandboxEvent` rows either way.
     fn backend(&self) -> Backend {
-        if unshare_works() {
-            Backend::LinuxNamespaces
-        } else {
-            Backend::PortableFloor
-        }
+        rung(probes(), true)
     }
+}
+
+/// Ask every rung, once per process.
+///
+/// Cached inside each probe rather than here, because the probes are three
+/// independent questions and a host can gain none of these answers while a
+/// process is running.
+fn probes() -> Rungs {
+    Rungs {
+        landlock_abi: landlock_abi(),
+        bubblewrap: bwrap_works(),
+        unshare: unshare_works(),
+    }
+}
+
+/// Does the `bwrap` on this host work, running the exact wrapper this rung
+/// builds?
+///
+/// The same shape as [`unshare_works`] and for the same reason: `bwrap` being
+/// on `PATH` is not the question. A `bwrap` without the setuid bit on a kernel
+/// that refuses unprivileged user namespaces is present and useless, which is
+/// precisely the host this rung exists for, so the probe has to be a spawn.
+fn bwrap_works() -> bool {
+    static OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OK.get_or_init(|| {
+        let dir = std::env::temp_dir();
+        // Probed with `--unshare-net`, the strictest form: if that works the
+        // network-allowed subset does too. Same argument as the `unshare` probe.
+        let argv = bwrap_argv(
+            &["true".to_string()],
+            &dir,
+            false,
+            ExecMode::WorkspaceWrite,
+            &[],
+        );
+        std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    })
+}
+
+/// The `bwrap` argv this rung builds, factored out so it is unit-testable
+/// without spawning anything — the same treatment [`unshare_argv`] gets.
+///
+/// The tree is bound read-only, then each writable root is bound back over it,
+/// which is the identical statement the mount setup makes with `remount,bind,ro`
+/// and its `rw` loop. `/proc` and `/dev` are populated because a mount namespace
+/// with neither is a namespace most toolchains cannot start in.
+///
+/// **The payload is the trailing arguments after `--`**, never interpolated, so
+/// a metacharacter in an argument stays an ordinary byte — the property
+/// `src/tools/exec.rs` is built on and the one `unshare_argv` is also careful
+/// about.
+pub(crate) fn bwrap_argv(
+    inner: &[String],
+    workdir: &Path,
+    allow_network: bool,
+    mode: ExecMode,
+    writable_roots: &[PathBuf],
+) -> Vec<String> {
+    let mut v: Vec<String> = vec![
+        "bwrap".into(),
+        "--ro-bind".into(),
+        "/".into(),
+        "/".into(),
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        // A child of a run that ends must not outlive it. The shared runner
+        // kills the tree, and this is the kernel saying the same thing.
+        "--die-with-parent".into(),
+    ];
+
+    // The workdir is bound writable only when the mode grants it, which is what
+    // makes `ReadOnly` a mode rather than a label here too.
+    let mut writable: Vec<&Path> = Vec::new();
+    if mode != ExecMode::ReadOnly {
+        writable.push(workdir);
+    }
+    writable.extend(writable_roots.iter().map(|p| p.as_path()));
+    let tmp = std::env::temp_dir();
+    writable.push(&tmp);
+    for root in writable {
+        v.push("--bind".into());
+        v.push(root.display().to_string());
+        v.push(root.display().to_string());
+    }
+
+    if !allow_network {
+        v.push("--unshare-net".into());
+    }
+    // `--chdir` rather than letting the shared runner's `current_dir` decide.
+    // Both are set — the runner sets its own — and they name the same directory;
+    // stating it here is what makes the wrapper's view and the spawn's view the
+    // same one, which is exactly what 0.46.0 found they were not.
+    v.push("--chdir".into());
+    v.push(workdir.display().to_string());
+    v.push("--".into());
+    v.extend(inner.iter().cloned());
+    v
+}
+
+/// Run `spec` under `bwrap`.
+async fn bwrap_run(spec: &RunSpec<'_>) -> Result<SandboxOutcome> {
+    let wrapped = bwrap_argv(
+        spec.argv,
+        spec.workdir,
+        spec.allow_network,
+        spec.mode,
+        spec.writable_roots,
+    );
+    let wspec = RunSpec::new(&wrapped, spec.workdir, spec.limits)
+        .with_network(spec.allow_network)
+        .with_mode(spec.mode)
+        .with_writable_roots(spec.writable_roots);
+    let outcome = run_capped(Backend::LinuxBubblewrap, wspec, |_cmd| {}).await?;
+    match wrapper_failure(&outcome) {
+        Some(reason) => Err(Error::Sandbox { reason }),
+        None => Ok(outcome),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_abi() -> Option<u32> {
+    super::landlock::abi()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn landlock_abi() -> Option<u32> {
+    None
+}
+
+/// Run `spec` under a Landlock rule set, or return `None` to fall to the next
+/// rung.
+///
+/// `None` is not a failure of the run — it is this rung declining. A kernel that
+/// answers the version query and then refuses a rule set, or a granted path that
+/// cannot be opened, means the confinement this rung would report was not
+/// installed; the honest response is the next rung down, not a run that reports
+/// Landlock and enforces nothing.
+#[cfg(target_os = "linux")]
+async fn landlock_run(spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
+    use std::os::fd::RawFd;
+
+    let abi = super::landlock::abi()?;
+    let tmp = std::env::temp_dir();
+    let plan = super::landlock::plan(
+        abi,
+        spec.mode,
+        !spec.allow_network,
+        spec.workdir,
+        spec.writable_roots,
+        &tmp,
+    );
+    let ruleset = match super::landlock::Ruleset::build(&plan) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "sandbox: the Landlock rule set could not be built ({e}); taking the next rung"
+            );
+            return None;
+        }
+    };
+    let fd: RawFd = ruleset.raw();
+
+    let wspec = RunSpec::new(spec.argv, spec.workdir, spec.limits)
+        .with_network(spec.allow_network)
+        .with_mode(spec.mode)
+        .with_writable_roots(spec.writable_roots);
+
+    // The argv is the caller's own, untouched: this rung wraps the payload in
+    // nothing. What runs between fork and exec is two syscalls with no
+    // allocation, which is why the rule set was built above rather than here.
+    let outcome = run_capped(Backend::LinuxLandlock, wspec, move |cmd| {
+        // SAFETY: the closure runs in the forked child before `exec`. It
+        // allocates nothing, takes no lock and calls only `prctl` and one
+        // `landlock_restrict_self`, both async-signal-safe. `fd` is owned by
+        // `ruleset`, which outlives the spawn below.
+        unsafe {
+            cmd.pre_exec(move || {
+                // Order is not arbitrary: `restrict_self` sets
+                // `PR_SET_NO_NEW_PRIVS`, which installing a seccomp filter also
+                // requires, so the rule set goes on first and the deny-list
+                // second. Neither allocates.
+                super::landlock::restrict_self(fd)?;
+                super::seccomp::install()
+            });
+        }
+    })
+    .await;
+    drop(ruleset);
+    Some(outcome)
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn landlock_run(_spec: &RunSpec<'_>) -> Option<Result<SandboxOutcome>> {
+    None
 }
 
 /// Does the exact wrapper this backend builds actually work on this host?
@@ -110,7 +398,12 @@ fn unshare_works() -> bool {
 /// which is exactly why the Linux breakage needed a CI log to diagnose.
 fn wrapper_failure(outcome: &SandboxOutcome) -> Option<String> {
     let stderr = outcome.stderr.trim();
-    (!outcome.success() && stderr.starts_with("unshare:"))
+    // Both wrapping rungs announce their own setup failures with their program
+    // name and neither reaches the payload when they do. `bwrap` was added to
+    // this list rather than given a second copy of the function: the rule is
+    // about wrappers in general, and two copies is two places for it to drift.
+    let wrapper = ["unshare:", "bwrap:"].iter().any(|p| stderr.starts_with(p));
+    (!outcome.success() && wrapper)
         .then(|| format!("the namespace wrapper failed, the command never ran: {stderr}"))
 }
 
@@ -225,6 +518,478 @@ pub(crate) fn unshare_argv(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// F3 — the chain's order, decided without a host.
+    ///
+    /// Every combination of the four probe answers against both egress answers.
+    /// The strongest serviceable rung is returned, and `PortableFloor` only when
+    /// nothing above it can serve.
+    #[test]
+    fn the_chain_takes_the_strongest_rung_that_can_serve_the_run() {
+        // (landlock_abi, bubblewrap, unshare, deny_egress) -> expected
+        let table = [
+            // Landlock with the network rules serves either kind of run.
+            ((Some(4), true, true, true), Backend::LinuxLandlock),
+            ((Some(4), true, true, false), Backend::LinuxLandlock),
+            ((Some(6), false, false, true), Backend::LinuxLandlock),
+            ((Some(4), false, false, true), Backend::LinuxLandlock),
+            // Landlock below the network ABI still serves a run that permits
+            // egress — the filesystem half is all such a run needs.
+            ((Some(1), true, true, false), Backend::LinuxLandlock),
+            ((Some(3), false, false, false), Backend::LinuxLandlock),
+            // ...and must NOT serve one that denies it. This is the honesty
+            // rule, and it is the only reason a host takes a rung weaker than
+            // its strongest available primitive.
+            ((Some(3), true, true, true), Backend::LinuxBubblewrap),
+            ((Some(3), false, true, true), Backend::LinuxNamespaces),
+            ((Some(1), false, false, true), Backend::PortableFloor),
+            // No Landlock at all: the rest of the chain in order.
+            ((None, true, true, true), Backend::LinuxBubblewrap),
+            ((None, true, false, false), Backend::LinuxBubblewrap),
+            ((None, false, true, true), Backend::LinuxNamespaces),
+            ((None, false, true, false), Backend::LinuxNamespaces),
+            // Nothing above the floor.
+            ((None, false, false, true), Backend::PortableFloor),
+            ((None, false, false, false), Backend::PortableFloor),
+        ];
+
+        for ((landlock_abi, bubblewrap, unshare, deny_egress), expected) in table {
+            let probes = Rungs {
+                landlock_abi,
+                bubblewrap,
+                unshare,
+            };
+            assert_eq!(
+                rung(probes, deny_egress),
+                expected,
+                "probes {probes:?}, deny_egress {deny_egress}"
+            );
+        }
+    }
+
+    /// F3, second half — the mode decides what goes *in* a rung's rule set and
+    /// never *which* rung is chosen. Asserted rather than left as a claim in
+    /// `rung`'s doc comment, because a mode that leaked into the decision would
+    /// make a `ReadOnly` run silently take a different backend from the
+    /// `WorkspaceWrite` run beside it.
+    #[test]
+    fn the_mode_does_not_decide_which_rung_a_host_takes() {
+        // `rung` does not take an `ExecMode` at all, which is the strongest
+        // available form of this assertion; what remains to check is that the
+        // three modes reach it through one call site each producing the same
+        // answer for one host.
+        // Only one rung available, so this test cannot pass or fail on the
+        // chain's *order* — that is F3's first half, and a criterion that
+        // asserts two things is a criterion whose failure does not say which.
+        let probes = Rungs {
+            landlock_abi: Some(4),
+            bubblewrap: false,
+            unshare: false,
+        };
+        let under = |_mode: ExecMode| rung(probes, true);
+        assert_eq!(under(ExecMode::ReadOnly), Backend::LinuxLandlock);
+        assert_eq!(under(ExecMode::WorkspaceWrite), Backend::LinuxLandlock);
+        assert_eq!(under(ExecMode::FullAccess), Backend::LinuxLandlock);
+    }
+
+    /// The rung a host takes must never be a backend that belongs to another
+    /// platform or to a rung the chain does not contain. Cheap, and it is what
+    /// catches a variant added to `Backend` and wired into the chain by
+    /// accident.
+    #[test]
+    fn the_chain_only_ever_returns_a_linux_rung_or_the_floor() {
+        for abi in [None, Some(1), Some(3), Some(4), Some(6)] {
+            for bubblewrap in [false, true] {
+                for unshare in [false, true] {
+                    for deny in [false, true] {
+                        let got = rung(
+                            Rungs {
+                                landlock_abi: abi,
+                                bubblewrap,
+                                unshare,
+                            },
+                            deny,
+                        );
+                        assert!(
+                            matches!(
+                                got,
+                                Backend::LinuxLandlock
+                                    | Backend::LinuxBubblewrap
+                                    | Backend::LinuxNamespaces
+                                    | Backend::PortableFloor
+                            ),
+                            "the Linux chain returned {got:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The Landlock rung's enforcement arms.
+    ///
+    /// These live here rather than in `tests/` for one reason and it is a
+    /// deliberate one: a criterion that pins a rung has to be able to *reach*
+    /// that rung, and the alternative — an environment variable the production
+    /// selection path reads — would be an ambient, attacker-reachable way to
+    /// downgrade containment. A crate-internal test needs no such seam.
+    ///
+    /// Every one of them returns early on a host with no usable Landlock, which
+    /// is every developer machine that is not Linux and every kernel before
+    /// 5.13. That is a skip, and a skip states its reason rather than passing
+    /// quietly — 0.40.0's egress tests reported success for three matrix runs
+    /// while stepping over the thing they existed to assert.
+    #[cfg(target_os = "linux")]
+    mod landlock_rung {
+        use super::*;
+        use crate::sandbox::SandboxLimits;
+
+        /// A scratch directory that is **not** under the system temporary
+        /// directory, plus its cleanup.
+        ///
+        /// This exists because of a defect the matrix found and the development
+        /// host could not. Every rung grants the system temporary directory
+        /// writable — the mount setup binds `${TMPDIR:-/tmp}`, the macOS profile
+        /// allows `/private/var/folders`, and this rung grants it too — and
+        /// `tempfile::tempdir()` creates its directories *inside* it. So a test
+        /// whose workspace and whose "outside" target were both `tempdir()`s was
+        /// asserting about two paths that had **both** been granted, and it
+        /// failed on the one arm that mattered: a write outside the roots landed,
+        /// because the roots included the whole of `/tmp`.
+        ///
+        /// The consequence is not confined to tests, and it is stated in
+        /// `docs/CONTRACT.md` rather than left here: **a workspace located inside
+        /// the system temporary directory is not confined on any unix backend**,
+        /// because the temporary directory is writable by design. That is the
+        /// price of a default under which a toolchain can open a temporary file
+        /// at all.
+        struct Scratch(PathBuf);
+
+        impl Scratch {
+            fn new(tag: &str) -> Self {
+                // Under the crate's own `target/`, which is inside the checkout
+                // and therefore outside `/tmp` on every host the matrix runs.
+                let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("target")
+                    .join("landlock-scratch")
+                    .join(format!("{}-{}", tag, std::process::id()));
+                std::fs::create_dir_all(&root).expect("create the scratch root");
+                Scratch(root)
+            }
+            fn dir(&self, name: &str) -> PathBuf {
+                let p = self.0.join(name);
+                std::fs::create_dir_all(&p).expect("create a scratch directory");
+                p
+            }
+        }
+
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        /// Run `argv` under the Landlock rung specifically, or `None` when this
+        /// host has no Landlock to pin.
+        async fn pinned(
+            argv: &[String],
+            workdir: &Path,
+            mode: ExecMode,
+            allow_network: bool,
+            writable: &[PathBuf],
+        ) -> Option<SandboxOutcome> {
+            if landlock_abi().is_none() {
+                eprintln!("skipped: this host has no usable Landlock");
+                return None;
+            }
+            let limits = SandboxLimits::none();
+            let spec = RunSpec::new(argv, workdir, &limits)
+                .with_network(allow_network)
+                .with_mode(mode)
+                .with_writable_roots(writable);
+            let outcome = landlock_run(&spec).await?.expect("the rung must run");
+            assert_eq!(
+                outcome.backend,
+                Backend::LinuxLandlock,
+                "the rung under test must be the rung that ran"
+            );
+            Some(outcome)
+        }
+
+        fn sh(script: &str) -> Vec<String> {
+            vec!["/bin/sh".into(), "-c".into(), script.into()]
+        }
+
+        /// F4 — a write inside the granted roots lands and a write outside them
+        /// is refused. Both arms, because a rule set that refused everything
+        /// would pass the second alone.
+        #[tokio::test]
+        async fn the_rung_confines_writes_to_what_it_granted() {
+            let scratch = Scratch::new("confines");
+            let dir = scratch.dir("ws");
+            // Deliberately NOT a `tempfile::tempdir()`: that would sit inside the
+            // system temporary directory, which every rung grants, and the
+            // assertion below would be about a path that had been granted.
+            let outside = scratch.dir("outside");
+            let target = outside.join("escaped");
+
+            let inside = pinned(
+                &sh("echo in > ./inside"),
+                &dir,
+                ExecMode::WorkspaceWrite,
+                true,
+                &[],
+            )
+            .await;
+            let Some(inside) = inside else { return };
+            assert!(inside.success(), "a granted write must land: {inside:?}");
+            assert!(dir.join("inside").exists());
+
+            let out = pinned(
+                &sh(&format!("echo out > {}", target.display())),
+                &dir,
+                ExecMode::WorkspaceWrite,
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(!out.success(), "a write outside the roots must be refused");
+            assert!(
+                !target.exists(),
+                "and must not have landed: the rung reported success while enforcing nothing"
+            );
+        }
+
+        /// F4's second half — a root the run resolved is writable, which is what
+        /// makes a real toolchain able to run at all under this rung.
+        #[tokio::test]
+        async fn a_resolved_writable_root_is_granted() {
+            let scratch = Scratch::new("root");
+            let dir = scratch.dir("ws");
+            let cache = scratch.dir("cache");
+            let target = cache.join("artifact");
+
+            let out = pinned(
+                &sh(&format!("echo x > {}", target.display())),
+                &dir,
+                ExecMode::WorkspaceWrite,
+                true,
+                std::slice::from_ref(&cache),
+            )
+            .await;
+            let Some(out) = out else { return };
+            assert!(
+                out.success(),
+                "a granted cache root must be writable: {out:?}"
+            );
+            assert!(target.exists());
+        }
+
+        /// F5 — `ReadOnly` refuses a write into the workspace itself and still
+        /// permits the read. The mode's entire difference is that one directory,
+        /// so both halves are asserted against the same file.
+        #[tokio::test]
+        async fn read_only_refuses_the_workspace_and_still_reads_it() {
+            // Outside the system temporary directory, or the workspace would be
+            // writable through the temp grant whatever the mode says.
+            let scratch = Scratch::new("readonly");
+            let dir = scratch.dir("ws");
+            std::fs::write(dir.join("seed"), "hello").unwrap();
+
+            let read = pinned(&sh("cat ./seed"), &dir, ExecMode::ReadOnly, true, &[]).await;
+            let Some(read) = read else { return };
+            assert!(read.success(), "a read-only run must still read: {read:?}");
+            assert!(read.stdout.contains("hello"));
+
+            let write = pinned(&sh("echo no > ./seed"), &dir, ExecMode::ReadOnly, true, &[])
+                .await
+                .unwrap();
+            assert!(!write.success(), "read-only must refuse the workspace");
+            assert_eq!(
+                std::fs::read_to_string(dir.join("seed")).unwrap(),
+                "hello",
+                "and must not have changed it"
+            );
+
+            // The temporary directory stays writable in every mode: a toolchain
+            // that cannot open a temporary file cannot run at all.
+            let tmp = pinned(
+                &sh("echo t > \"${TMPDIR:-/tmp}/io-harness-ro-probe\""),
+                &dir,
+                ExecMode::ReadOnly,
+                true,
+                &[],
+            )
+            .await
+            .unwrap();
+            assert!(
+                tmp.success(),
+                "the temp directory is writable under every mode"
+            );
+        }
+
+        /// F6 — this rung wraps the payload in nothing, so the argv recorded is
+        /// the argv asked for, and `current_dir` means what it says.
+        #[tokio::test]
+        async fn the_rung_spawns_the_callers_own_argv_and_honours_the_workdir() {
+            let scratch = Scratch::new("argv");
+            let dir = scratch.dir("ws");
+            let sub = scratch.dir("ws/sub");
+
+            let argv = sh("pwd");
+            let out = pinned(
+                &argv,
+                &sub,
+                ExecMode::WorkspaceWrite,
+                true,
+                std::slice::from_ref(&dir),
+            )
+            .await;
+            let Some(out) = out else { return };
+            assert_eq!(
+                out.argv, argv,
+                "no wrapper: the recorded argv is the caller's own"
+            );
+            assert!(
+                !out.argv.iter().any(|a| a == "unshare" || a == "bwrap"),
+                "and names no helper program"
+            );
+            // 0.46.0's defect at its root cause: the wrapper entered the
+            // directory it was handed and beat `Command::current_dir`. There is
+            // no wrapper here, so the working directory is the one named.
+            assert!(
+                out.stdout.trim().ends_with("sub"),
+                "the payload ran in the directory it was given, got {:?}",
+                out.stdout
+            );
+        }
+
+        /// F2's rung-level arm — an egress-denying run cannot dial out, and the
+        /// same run with egress permitted can.
+        ///
+        /// On a kernel below the network ABI the rung is not given an
+        /// egress-denying run at all, so the assertion there is the honesty rule
+        /// itself rather than a skipped connection.
+        #[tokio::test]
+        async fn egress_is_denied_only_where_the_kernel_can_enforce_it() {
+            let Some(abi) = landlock_abi() else {
+                eprintln!("skipped: this host has no usable Landlock");
+                return;
+            };
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let scratch = Scratch::new("egress");
+            let dir = scratch.dir("ws");
+            // `/dev/tcp` is a bash builtin; the probe uses it because it needs no
+            // network tool to be installed on the runner.
+            let dial = vec![
+                "/bin/bash".into(),
+                "-c".into(),
+                format!("exec 3<>/dev/tcp/127.0.0.1/{port}"),
+            ];
+
+            if abi < LANDLOCK_NET_ABI {
+                assert_ne!(
+                    rung(probes(), true),
+                    Backend::LinuxLandlock,
+                    "a kernel that cannot deny egress must not be handed a run that denies it"
+                );
+                return;
+            }
+
+            let allowed = pinned(&dial, &dir, ExecMode::WorkspaceWrite, true, &[])
+                .await
+                .unwrap();
+            assert!(
+                allowed.success(),
+                "a run permitting egress must still connect: {allowed:?}"
+            );
+
+            let denied = pinned(&dial, &dir, ExecMode::WorkspaceWrite, false, &[])
+                .await
+                .unwrap();
+            assert!(
+                !denied.success(),
+                "an egress-denying run must be refused the connection"
+            );
+        }
+    }
+
+    /// The bubblewrap rung's argv, asserted the way `unshare_argv`'s already is:
+    /// the tree read-only, the writable roots bound back over it, the payload
+    /// trailing and untouched.
+    #[test]
+    fn the_bwrap_argv_binds_the_tree_read_only_and_the_roots_back() {
+        let roots = vec![PathBuf::from("/home/u/.cargo")];
+        let argv = bwrap_argv(
+            &["echo".into(), "hi".into()],
+            Path::new("/w"),
+            false,
+            ExecMode::WorkspaceWrite,
+            &roots,
+        );
+
+        let pos = |s: &str| argv.iter().position(|a| a == s).unwrap();
+        assert_eq!(argv[0], "bwrap");
+        assert!(argv.windows(3).any(|w| w == ["--ro-bind", "/", "/"]));
+        assert!(argv.windows(3).any(|w| w == ["--bind", "/w", "/w"]));
+        assert!(argv
+            .windows(3)
+            .any(|w| w == ["--bind", "/home/u/.cargo", "/home/u/.cargo"]));
+        assert!(argv.contains(&"--unshare-net".to_string()));
+        assert!(argv.windows(2).any(|w| w == ["--chdir", "/w"]));
+        // The read-only bind of the whole tree must come before the writable
+        // binds, or the roots are covered by it instead of overriding it.
+        assert!(pos("--ro-bind") < pos("--bind"));
+
+        // The payload is the tail, after `--`, and is never interpolated.
+        let sep = pos("--");
+        assert_eq!(&argv[sep + 1..], &["echo".to_string(), "hi".to_string()]);
+    }
+
+    /// F5's bubblewrap half, host-free: `ReadOnly` does not bind the workspace
+    /// writable, and the temporary directory is bound in every mode.
+    #[test]
+    fn the_bwrap_argv_withholds_the_workdir_under_read_only() {
+        let argv = bwrap_argv(
+            &["true".into()],
+            Path::new("/w"),
+            true,
+            ExecMode::ReadOnly,
+            &[],
+        );
+        assert!(
+            !argv.windows(3).any(|w| w == ["--bind", "/w", "/w"]),
+            "read-only must not bind the workspace writable"
+        );
+        let tmp = std::env::temp_dir().display().to_string();
+        assert!(
+            argv.windows(3)
+                .any(|w| w[0] == "--bind" && w[1] == tmp && w[2] == tmp),
+            "the temp directory is writable under every mode"
+        );
+        assert!(
+            !argv.contains(&"--unshare-net".to_string()),
+            "no network namespace when the run permits egress"
+        );
+    }
+
+    /// A `bwrap` setup failure must be classified as the wrapper failing, not as
+    /// the payload's own non-zero exit — the same distinction `unshare` gets,
+    /// and the reason both prefixes live in one function.
+    #[test]
+    fn a_bwrap_setup_failure_is_a_wrapper_failure() {
+        let fail = SandboxOutcome {
+            backend: Backend::LinuxBubblewrap,
+            argv: vec!["bwrap".into()],
+            exit_code: Some(1),
+            cap_hit: None,
+            stdout: String::new(),
+            stderr: "bwrap: Creating new namespace failed: Operation not permitted\n".into(),
+        };
+        assert!(wrapper_failure(&fail).is_some());
+    }
 
     #[test]
     fn denies_network_with_a_new_net_namespace() {
@@ -354,39 +1119,173 @@ mod tests {
         );
     }
 
+    /// Never name an isolation that was not applied.
+    ///
+    /// Up to 0.46.0 there were two possible answers and this pinned them against
+    /// `unshare_works()` directly. 0.47.0 made it a chain, so the assertion is
+    /// now the *property* rather than the enumeration: whatever rung is reported,
+    /// this host must actually be able to deliver it. `backend()` answers for a
+    /// run that denies egress, which is why the Landlock arm requires the
+    /// network ABI and not merely the presence of Landlock.
     #[test]
     fn the_reported_backend_is_the_one_the_host_can_actually_run() {
-        // Never name an isolation that was not applied: `LinuxNamespaces` only
-        // when the wrapper works, the floor otherwise.
-        let expected = if unshare_works() {
-            Backend::LinuxNamespaces
-        } else {
-            Backend::PortableFloor
-        };
-        assert_eq!(LinuxSandbox.backend(), expected);
+        let p = probes();
+        match LinuxSandbox.backend() {
+            Backend::LinuxLandlock => assert!(
+                p.landlock_abi.is_some_and(|abi| abi >= LANDLOCK_NET_ABI),
+                "reported Landlock for an egress-denying run on a host that \
+                 cannot deny egress with it: {p:?}"
+            ),
+            Backend::LinuxBubblewrap => assert!(p.bubblewrap, "reported a bwrap this host lacks"),
+            Backend::LinuxNamespaces => assert!(
+                p.unshare && !p.bubblewrap,
+                "reported namespaces where a stronger rung was available or none works: {p:?}"
+            ),
+            Backend::PortableFloor => assert!(
+                !p.unshare && !p.bubblewrap,
+                "reported the floor while a rung above it works: {p:?}"
+            ),
+            other => panic!("the Linux chain reported {other:?}"),
+        }
     }
 
-    // The degrade path itself, which runs on any host without a working
-    // `unshare` — including the macOS build host, where the binary does not
-    // exist at all, and the restricted-userns CI runner this release is about.
+    /// The degrade path, and 0.47.0 changed what it degrades *to*.
+    ///
+    /// Written in 0.9.1, when a host without a working `unshare` had exactly one
+    /// place left to fall: the portable floor. That premise is the hole this
+    /// release closes. On a stock Ubuntu 24.04 — the very host the assertion was
+    /// written for — the chain now hands the run to Landlock, and the CI leg that
+    /// leaves the restriction in place is where this first failed, reporting
+    /// `LinuxLandlock` where the test demanded `PortableFloor`.
+    ///
+    /// So the assertion is the property rather than the destination: a host with
+    /// no rung it can serve still *runs*, and reports whatever rung actually
+    /// applied rather than failing. The floor arm is asserted where the floor is
+    /// genuinely what is left.
     #[tokio::test]
-    async fn degrades_to_the_floor_when_the_wrapper_does_not_work() {
-        if unshare_works() {
-            return; // this host has real namespaces; nothing to degrade to
-        }
+    async fn a_host_with_no_working_rung_still_runs_and_reports_what_applied() {
+        let expected = rung(probes(), false);
         let dir = tempfile::tempdir().unwrap();
         let argv = vec!["sh".into(), "-c".into(), "echo hi".into()];
         let out = LinuxSandbox
-            .run(RunSpec::new(
-                &argv,
-                dir.path(),
-                &crate::sandbox::SandboxLimits::default(),
-            ))
+            .run(
+                RunSpec::new(&argv, dir.path(), &crate::sandbox::SandboxLimits::default())
+                    .with_network(true),
+            )
             .await
             .unwrap();
         assert!(out.success(), "a degraded run must still run, got {out:?}");
-        assert_eq!(out.backend, Backend::PortableFloor);
         assert!(out.stdout.contains("hi"));
+        assert_eq!(
+            out.backend, expected,
+            "the backend reported must be the rung the chain chose for this run"
+        );
+        if expected == Backend::PortableFloor {
+            let p = probes();
+            assert!(
+                p.landlock_abi.is_none() && !p.bubblewrap && !p.unshare,
+                "the floor is only reached when nothing above it works: {p:?}"
+            );
+        }
+    }
+
+    /// N5 — what each rung costs per command, measured rather than argued.
+    ///
+    /// The Landlock rung's claim is that it installs its restriction between fork
+    /// and exec and spawns **no wrapper**, unlike the namespace rung which prepends
+    /// `unshare`. That is a claim about a number, so it is timed: the same trivial
+    /// command, the same iteration count 0.46.0 used for `sandbox-exec`, run
+    /// unconfined and then under each rung this host actually has.
+    ///
+    /// `#[ignore]`d because it is a measurement and not an assertion — it has no
+    /// threshold to fail, and a wall-clock number on a shared runner is not
+    /// something to gate a merge on ([[never gate CI on a clock]]). CI runs it in
+    /// a step of its own that shows the output; the figures go into the release
+    /// record from that log.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "a measurement, not an assertion — run by the overhead CI step"]
+    async fn n5_per_command_overhead_by_rung() {
+        use crate::sandbox::SandboxLimits;
+        use std::time::Instant;
+
+        const ITERATIONS: u32 = 30;
+        let dir = tempfile::tempdir().unwrap();
+        let argv: Vec<String> = vec!["/bin/true".into()];
+        let limits = SandboxLimits::none();
+
+        let spec = || {
+            RunSpec::new(&argv, dir.path(), &limits)
+                .with_network(true)
+                .with_mode(ExecMode::WorkspaceWrite)
+        };
+
+        // The baseline: the shared runner with no wrapper and no rule set, which
+        // is what a `FullAccess` command pays. Every figure below is a cost *over*
+        // this one, so it is measured with the same machinery rather than assumed
+        // to be zero.
+        let started = Instant::now();
+        for _ in 0..ITERATIONS {
+            run_capped(Backend::PortableFloor, spec(), |_cmd| {})
+                .await
+                .expect("the unconfined baseline must run");
+        }
+        let baseline = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+        println!("N5 unconfined (full-access): {baseline:.2} ms/command over {ITERATIONS}");
+
+        if landlock_abi().is_some() {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                landlock_run(&spec())
+                    .await
+                    .expect("the rung is available on this host")
+                    .expect("the rung must run");
+            }
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 linux-landlock: {per:.2} ms/command over {ITERATIONS} \
+                 (over baseline: {:+.2} ms)",
+                per - baseline
+            );
+        } else {
+            println!("N5 linux-landlock: not measured — this host has no usable Landlock");
+        }
+
+        if unshare_works() {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                let wrapped = unshare_argv(&argv, dir.path(), true, ExecMode::WorkspaceWrite, &[]);
+                let wspec = RunSpec::new(&wrapped, dir.path(), &limits)
+                    .with_network(true)
+                    .with_mode(ExecMode::WorkspaceWrite);
+                run_capped(Backend::LinuxNamespaces, wspec, |_cmd| {})
+                    .await
+                    .expect("the namespace rung must run");
+            }
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 linux-namespaces: {per:.2} ms/command over {ITERATIONS} \
+                 (over baseline: {:+.2} ms)",
+                per - baseline
+            );
+        } else {
+            println!("N5 linux-namespaces: not measured — no usable user namespace on this host");
+        }
+
+        if bwrap_works() {
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                bwrap_run(&spec()).await.expect("the bwrap rung must run");
+            }
+            let per = started.elapsed().as_secs_f64() * 1000.0 / f64::from(ITERATIONS);
+            println!(
+                "N5 linux-bubblewrap: {per:.2} ms/command over {ITERATIONS} \
+                 (over baseline: {:+.2} ms)",
+                per - baseline
+            );
+        } else {
+            println!("N5 linux-bubblewrap: not measured — no working bwrap on this host");
+        }
     }
 
     #[test]

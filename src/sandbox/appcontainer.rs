@@ -15,12 +15,15 @@
 //!   module is `cfg(windows)`, docs.rs renders on Linux, and an intra-doc link
 //!   into code that does not exist on the rendering host is a broken link on the
 //!   only page a reader actually sees.
-//! - **Network** — the capability array is **empty**. `internetClient` is the
-//!   capability that buys a socket to the outside, and it is not requested, so
-//!   there is no route off the machine. This is the absence of a permission
-//!   rather than the presence of a filter, which is the same shape as an empty
-//!   network namespace on Linux and is why it is worth preferring over a
-//!   filesystem-ACL scheme with a separate network story bolted beside it.
+//! - **Network** — the capability array carries `internetClient` when the run's
+//!   policy permits egress and is **empty** when it does not. Empty is the
+//!   denial: `internetClient` is the capability that buys a socket to the
+//!   outside, so without it there is no route off the machine. This is the
+//!   absence of a permission rather than the presence of a filter, which is the
+//!   same shape as an empty network namespace on Linux and as a Landlock rule
+//!   set that handles `CONNECT_TCP` and permits no port, and is why it is worth
+//!   preferring over a filesystem-ACL scheme with a separate network story
+//!   bolted beside it.
 //!
 //! ## Why this module owns its own spawn
 //!
@@ -56,25 +59,32 @@
 //! empty, which is stated here because it is a real difference from the other
 //! backends rather than an accident.
 
-// Exercised by this module's own tests and by nothing else yet. The smoke test
-// exists to answer whether an AppContainer can be created and entered on the CI
-// runner at all; wiring the backend into `Sandbox` and `select` is the work that
-// answer gates, so until it lands these items are legitimately dead in a
-// non-test build. The allowance comes off with the wiring.
+// **`allow(dead_code)`, because nothing selects this backend — and that is a
+// scheduling fact rather than a defect.** The module has been in this state since
+// 0.26.0: built, unit-tested against negative controls on the Windows runner, and
+// reached by no production path. 0.47.0 was to be the release that wired it up;
+// the Windows half was taken out of that release whole on 2026-08-10 and is
+// 0.59.0's, recorded in `US-IO-HARNESS-0.47.0-I01`.
+//
+// What 0.59.0 inherits is better than what 0.47.0 found, and the three fixes are
+// the reason the allowance is worth keeping rather than deleting the module: an
+// ACE must carry specific rights, a tree grant must survive a locked descendant,
+// and a directory-only grant must not enumerate the directory. Each was a real
+// defect, each is fixed here, and each would otherwise have to be re-found.
 #[cfg(windows)]
 #[allow(dead_code)]
-mod win {
+pub(crate) mod win {
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::io::AsRawHandle;
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS,
-        GENERIC_ALL, GENERIC_EXECUTE, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+        CloseHandle, LocalFree, SetHandleInformation, ERROR_ALREADY_EXISTS, ERROR_SUCCESS, HANDLE,
+        HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
     };
     use windows_sys::Win32::Security::Authorization::{
-        GetNamedSecurityInfoW, SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
+        GetNamedSecurityInfoW, SetEntriesInAclW, TreeSetNamedSecurityInfoW, EXPLICIT_ACCESS_W,
         GRANT_ACCESS, NO_MULTIPLE_TRUSTEE, SE_FILE_OBJECT, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
         TRUSTEE_W,
     };
@@ -82,14 +92,19 @@ mod win {
         CreateAppContainerProfile, DeleteAppContainerProfile,
         DeriveAppContainerSidFromAppContainerName,
     };
-    use windows_sys::Win32::Security::{FreeSid, ACL, DACL_SECURITY_INFORMATION, PSID};
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, FreeSid, GetAce, InitializeSecurityDescriptor,
+        SetKernelObjectSecurity, SetSecurityDescriptorDacl, WinCapabilityInternetClientSid,
+        ACCESS_ALLOWED_ACE, ACL, DACL_SECURITY_INFORMATION, PSID, SECURITY_DESCRIPTOR,
+        SID_AND_ATTRIBUTES, UNPROTECTED_DACL_SECURITY_INFORMATION,
+    };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-        InitializeProcThreadAttributeList, TerminateProcess, UpdateProcThreadAttribute,
-        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES, STARTUPINFOEXW,
-        STARTUPINFOW,
+        InitializeProcThreadAttributeList, ResumeThread, TerminateProcess,
+        UpdateProcThreadAttribute, WaitForSingleObject, CREATE_SUSPENDED,
+        CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+        PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, STARTF_USESTDHANDLES,
+        STARTUPINFOEXW, STARTUPINFOW,
     };
 
     /// A NUL-terminated UTF-16 string, kept alive by the caller.
@@ -103,8 +118,11 @@ mod win {
     }
 
     /// What a grant lets the container do with a path.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub(crate) enum Access {
+        /// Pass through a directory and read nothing in it — see
+        /// `super::super::windows::Grant::Traverse`, which carries the argument.
+        Traverse,
         /// Read and execute. What a binary, a toolchain or a read-only input
         /// tree needs, and the most that should ever be given to one.
         ReadExecute,
@@ -114,12 +132,91 @@ mod win {
     }
 
     impl Access {
+        /// **Specific rights, never generic ones, and this is the whole of why
+        /// the grants were inert.**
+        ///
+        /// `GENERIC_READ`, `GENERIC_EXECUTE` and `GENERIC_ALL` are a calling
+        /// convention for *requesting* access, not a way of describing it. The
+        /// SDK is explicit that generic rights must be mapped to specific ones
+        /// before an ACE is created, and `SetEntriesInAclW` stores the mask it is
+        /// handed rather than mapping it — so an ACE built from `GENERIC_ALL`
+        /// carries `0x1000_0000`, an access check for `FILE_READ_DATA` asks for
+        /// `0x1`, and the two share no bit. The ACE is present, it names the
+        /// container SID, it can be read back off the DACL — and it grants
+        /// nothing.
+        ///
+        /// That is what made this release's Windows failures so hard to read.
+        /// Every case that worked worked for another reason: `cmd.exe` and the
+        /// system libraries live under `%SystemRoot%`, and the runner's workspace
+        /// volume, which already carry an `ALL APPLICATION PACKAGES` ACE; and a
+        /// run whose `Full` grant *failed* was declined by `run_contained` and
+        /// executed by the Job Object with no container at all. Both look like a
+        /// working container from the outside, which is why the test below asks
+        /// each capability separately and prints the backend that answered.
+        ///
+        /// The values are the SDK's own, written out rather than imported: three
+        /// constants do not justify compiling the whole
+        /// `Win32_Storage_FileSystem` binding module into every Windows build,
+        /// and they are ABI-stable.
         fn mask(self) -> u32 {
+            // STANDARD_RIGHTS_READ | FILE_READ_DATA | FILE_READ_EA
+            // | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+            const FILE_GENERIC_READ: u32 = 0x0012_0089;
+            // STANDARD_RIGHTS_EXECUTE | FILE_EXECUTE | FILE_READ_ATTRIBUTES
+            // | SYNCHRONIZE
+            const FILE_GENERIC_EXECUTE: u32 = 0x0012_00A0;
+            // STANDARD_RIGHTS_REQUIRED | SYNCHRONIZE | every file-specific right
+            const FILE_ALL_ACCESS: u32 = 0x001F_01FF;
+            // FILE_TRAVERSE alone, plus the attribute read a stat of the
+            // component needs. Deliberately without FILE_LIST_DIRECTORY: a name
+            // may be resolved through the directory and the directory may not be
+            // enumerated.
+            const FILE_TRAVERSE: u32 = 0x0000_0020;
+            const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
             match self {
-                Access::ReadExecute => GENERIC_READ | GENERIC_EXECUTE,
-                Access::Full => GENERIC_ALL,
+                Access::Traverse => FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+                Access::ReadExecute => FILE_GENERIC_READ | FILE_GENERIC_EXECUTE,
+                Access::Full => FILE_ALL_ACCESS,
             }
         }
+    }
+
+    /// How far into a directory a grant is meant to reach.
+    ///
+    /// Mirrors `super::super::windows::Reach`, for the same reason `Access`
+    /// mirrors `Grant`: the decision is portable data asserted on the build host
+    /// and this is where it becomes a Win32 flag.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub(crate) enum Reach {
+        /// The directory and everything already inside it.
+        Tree,
+        /// The directory itself. What it *later* contains inherits the ACE; what
+        /// it already contains keeps whatever it had.
+        DirectoryOnly,
+    }
+
+    /// Apply one entry of the grant set `super::super::windows::grants` derived.
+    ///
+    /// The bridge exists so the *decision* and the *ACE mask* stay separate
+    /// types: the decision is portable data asserted on the build host, and this
+    /// is the one place it becomes Win32. A single `match` rather than making the
+    /// portable half depend on a `cfg(windows)` enum.
+    pub(crate) fn grant_for(
+        path: &Path,
+        sid: PSID,
+        g: crate::sandbox::windows::Grant,
+        r: crate::sandbox::windows::Reach,
+    ) -> io::Result<()> {
+        let access = match g {
+            crate::sandbox::windows::Grant::Traverse => Access::Traverse,
+            crate::sandbox::windows::Grant::ReadExecute => Access::ReadExecute,
+            crate::sandbox::windows::Grant::Full => Access::Full,
+        };
+        let reach = match r {
+            crate::sandbox::windows::Reach::Tree => Reach::Tree,
+            crate::sandbox::windows::Reach::DirectoryOnly => Reach::DirectoryOnly,
+        };
+        grant(path, sid, access, reach)
     }
 
     /// An AppContainer profile, and the SID it is addressed by.
@@ -147,15 +244,64 @@ mod win {
     impl Profile {
         /// Create (or adopt) the profile called `name`.
         ///
-        /// **The capability array is empty and that is the network boundary.** No
-        /// `internetClient`, no `internetClientServer`, no
-        /// `privateNetworkClientServer` — a payload in this container has no
-        /// capability that grants it a socket to anywhere, so the denial is the
-        /// token's own and not a rule something has to keep enforcing.
-        pub(crate) fn create(name: &str) -> io::Result<Self> {
+        /// **The capability array is the network boundary, in both directions.**
+        ///
+        /// Empty is the denial: no `internetClient`, no `internetClientServer`,
+        /// no `privateNetworkClientServer`, so a payload in this container holds
+        /// no capability that grants it a socket to anywhere and the refusal is
+        /// the token's own rather than a rule something has to keep enforcing.
+        /// That is the same shape as an empty network namespace on Linux and as
+        /// a Landlock rule set that handles `CONNECT_TCP` and permits no port.
+        ///
+        /// A run whose policy *permits* egress is the other direction, and it is
+        /// why this takes an argument at all (0.47.0). Before it, selecting this
+        /// backend would have silently broken every network-permitting run,
+        /// which is a good reason not to select a backend and a bad reason to
+        /// leave one unwired. Exactly `internetClient` is requested — the
+        /// outbound capability — and never the server or private-network ones:
+        /// the crate's own authority on the network is the run's `Policy`, and
+        /// nothing here widens what that already decided.
+        pub(crate) fn create(name: &str, allow_network: bool) -> io::Result<Self> {
             let name = wide(name);
             let display = wide("io-harness sandbox");
             let mut sid: PSID = std::ptr::null_mut();
+
+            // The capability SID buffer, built before the create call and kept
+            // alive across it. `SECURITY_MAX_SID_SIZE` is 68; a fixed buffer
+            // avoids an allocation whose lifetime would be one more thing to get
+            // right.
+            let mut cap_sid = [0u8; 68];
+            let mut caps: [SID_AND_ATTRIBUTES; 1] = unsafe { std::mem::zeroed() };
+            let cap_count = if allow_network {
+                let mut len = cap_sid.len() as u32;
+                // SAFETY: `cap_sid` is a live buffer of at least
+                // `SECURITY_MAX_SID_SIZE` bytes and `len` is its true length as a
+                // live in/out parameter. A null domain SID is what a
+                // capability SID takes.
+                if unsafe {
+                    CreateWellKnownSid(
+                        WinCapabilityInternetClientSid,
+                        std::ptr::null_mut(),
+                        cap_sid.as_mut_ptr().cast::<core::ffi::c_void>(),
+                        &mut len,
+                    )
+                } == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                caps[0].Sid = cap_sid.as_mut_ptr().cast::<core::ffi::c_void>();
+                // `SE_GROUP_ENABLED`. The attribute that makes the capability
+                // present rather than merely listed.
+                caps[0].Attributes = 0x0000_0004;
+                1u32
+            } else {
+                0
+            };
+            let cap_ptr = if cap_count == 0 {
+                std::ptr::null_mut()
+            } else {
+                caps.as_mut_ptr()
+            };
 
             // SAFETY: `name` and `display` are live NUL-terminated UTF-16 buffers
             // owned by this frame and outliving the call. The capability array is
@@ -166,8 +312,8 @@ mod win {
                     name.as_ptr(),
                     display.as_ptr(),
                     display.as_ptr(),
-                    std::ptr::null(),
-                    0,
+                    cap_ptr,
+                    cap_count,
                     &mut sid,
                 )
             };
@@ -231,6 +377,83 @@ mod win {
         }
     }
 
+    /// The grants this process has already applied, completed.
+    ///
+    /// Keyed by path, access and reach together: a directory granted for what it
+    /// will hold is not a directory granted across what it already holds, and a
+    /// read-execute grant does not stand in for a full one.
+    #[allow(clippy::type_complexity)]
+    fn granted_here(
+    ) -> &'static std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, Access, Reach)>>
+    {
+        static DONE: std::sync::OnceLock<
+            std::sync::Mutex<std::collections::HashSet<(std::path::PathBuf, Access, Reach)>>,
+        > = std::sync::OnceLock::new();
+        DONE.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+    }
+
+    /// What `path`'s DACL already allows `sid`, if it names it at all.
+    ///
+    /// `None` is "this SID appears in no allow-ACE on this object", which is the
+    /// only thing that separates a grant that never reached a file from a grant
+    /// that reached it and was not enough. Every Windows failure this release
+    /// has debugged was one of those two, and until this existed the difference
+    /// was inferred from a payload that failed.
+    pub(crate) fn granted_mask(path: &Path, sid: PSID) -> Option<u32> {
+        let wpath = wide(path);
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: `wpath` is a live NUL-terminated path and every out-parameter
+        // is a live local; the owner, group and SACL outs are null, which the
+        // API documents as "do not return this".
+        let rc = unsafe {
+            GetNamedSecurityInfoW(
+                wpath.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut dacl,
+                std::ptr::null_mut(),
+                &mut sd,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return None;
+        }
+        let _sd = LocalGuard(sd);
+
+        if dacl.is_null() {
+            return None;
+        }
+        // SAFETY: `dacl` points into the descriptor `_sd` still owns.
+        let count = unsafe { (*dacl).AceCount };
+        for i in 0..count {
+            let mut ace: *mut core::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: `i` is below the ACE count just read from this ACL.
+            if unsafe { GetAce(dacl, u32::from(i), &mut ace) } == 0 {
+                continue;
+            }
+            let allow = ace.cast::<ACCESS_ALLOWED_ACE>();
+            // Only an allow-ACE (`ACCESS_ALLOWED_ACE_TYPE`, 0) carries a SID at
+            // this offset; reading another type through this layout would be
+            // reading the wrong bytes.
+            // SAFETY: `allow` is the ACE `GetAce` just returned.
+            if unsafe { (*allow).Header.AceType } != 0 {
+                continue;
+            }
+            // SAFETY: `SidStart` is the first word of the ACE's inline SID.
+            let ace_sid = unsafe { std::ptr::addr_of!((*allow).SidStart) } as PSID;
+            // SAFETY: both are live SIDs, one inside the ACL and one the
+            // caller's.
+            if unsafe { EqualSid(ace_sid, sid) } != 0 {
+                // SAFETY: as above.
+                return Some(unsafe { (*allow).Mask });
+            }
+        }
+        None
+    }
+
     /// Grant `sid` `access` to `path`, by adding one ACE to its DACL.
     ///
     /// Adding, never replacing: `GRANT_ACCESS` merges with what is already there,
@@ -246,7 +469,48 @@ mod win {
     /// directory. A missing grant surfaces as a payload that cannot start, which
     /// reads like a broken payload rather than a missing grant — hence the
     /// tracing below.
-    pub(crate) fn grant(path: &Path, sid: PSID, access: Access) -> io::Result<()> {
+    pub(crate) fn grant(path: &Path, sid: PSID, access: Access, reach: Reach) -> io::Result<()> {
+        // **A grant this SID already has is not applied again, and that is a
+        // correctness fix before it is a saving.**
+        //
+        // Re-propagating rewrites the DACL of every object under `path`. Doing
+        // that to a shared tree while another process is reading one of those
+        // DACLs is how a file that demonstrably carries the ACE is refused a
+        // moment later: the rewrite recomputes each child from the parent's
+        // inheritable set, and a reader in the window between sees the object
+        // mid-flight. `windows-latest` runs twenty test processes at once, each
+        // of them granting `%TEMP%` and `CARGO_HOME`, which is exactly that
+        // window twenty times over — and it is what the depth test caught,
+        // reading the ACE off a file that then could not be executed.
+        //
+        // The container SID is derived from a fixed profile name, so it is the
+        // same SID on every run of every process on the machine: the first run
+        // pays for the walk and no later one repeats it.
+        //
+        // **The memo is this process's own completed grants, and reading the ACE
+        // off the directory is not a substitute for it.** `SetNamedSecurityInfoW`
+        // writes the top-level ACE and then walks the tree, so a second process
+        // that only checks the directory can observe a grant that is still in
+        // flight — `.rustup` is thousands of files — conclude it is done, skip,
+        // and then be refused the binary deep inside that the walk had not
+        // reached. That is what the round-two check did, and it is why `cargo`
+        // could not start `rustc.exe` while the launcher shim beside it worked.
+        // A path this process granted itself is safe to skip, because
+        // `SetNamedSecurityInfoW` had returned before it was recorded.
+        let memo_key = (path.to_path_buf(), access, reach);
+        {
+            let done = granted_here()
+                .lock()
+                .expect("the grant memo is not poisoned");
+            if done.contains(&memo_key) {
+                tracing::debug!(
+                    path = %path.display(), ?access,
+                    "sandbox: this process already granted the AppContainer this path"
+                );
+                return Ok(());
+            }
+        }
+
         let wpath = wide(path);
         let mut dacl: *mut ACL = std::ptr::null_mut();
         let mut sd = std::ptr::null_mut();
@@ -273,11 +537,31 @@ mod win {
         // has to outlive `SetEntriesInAclW` and be freed exactly once afterwards.
         let _sd = LocalGuard(sd);
 
+        // **A traverse ACE is not inheritable, and that is a cost decision as
+        // much as a scope one.**
+        //
+        // Scope first: traverse exists so a *named* directory can be reached by
+        // walking to it, and nothing below an ancestor should acquire rights
+        // because the run happened to name a path underneath it.
+        //
+        // The cost is why this is stated rather than assumed. `SetNamedSecurityInfoW`
+        // propagates *inheritable* ACEs to the objects under the path, and the
+        // flag that this function varies by `Reach` decides whether existing
+        // children are recomputed — it does not make an inheritable ACE stop
+        // being inheritable. The ancestors of a granted path include `C:\`, so an
+        // inheritable traverse ACE there is a request to walk the volume: both
+        // Windows legs of the first run with ancestors were still going at forty
+        // minutes and were cancelled by their own timeout, having failed no test.
+        // `NO_INHERITANCE` is one ACE on one directory and nothing to propagate.
+        let inheritance = match access {
+            Access::Traverse => 0,
+            // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE.
+            _ => 3,
+        };
         let ea = EXPLICIT_ACCESS_W {
             grfAccessPermissions: access.mask(),
             grfAccessMode: GRANT_ACCESS,
-            // CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE.
-            grfInheritance: 3,
+            grfInheritance: inheritance,
             Trustee: TRUSTEE_W {
                 pMultipleTrustee: std::ptr::null_mut(),
                 MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
@@ -297,25 +581,163 @@ mod win {
         }
         let _merged = LocalGuard(merged.cast());
 
+        // **`UNPROTECTED_DACL_SECURITY_INFORMATION`, and it is the whole grant.**
+        //
+        // Windows inheritance is *static*: a child object carries its own
+        // materialised DACL, copied from its parent's inheritable ACEs at the
+        // moment it was created. Adding an inheritable ACE to a directory
+        // therefore reaches the directory and **nothing already inside it** — the
+        // system re-propagates to existing children only when the change is made
+        // with this flag.
+        //
+        // Without it every grant here looked applied and did almost nothing, which
+        // is the exact failure mode the comment above `grant` warns about. The
+        // workspace was granted and the source file already in it was not, so
+        // `rustc a.rs` came back "Access is denied"; `%TEMP%` was granted and the
+        // temporary directory created before the run was not. Thirty-one tests on
+        // `windows-latest`, one flag.
+        //
+        // The cost is real and is not hidden: propagation walks the granted tree,
+        // so the *first* grant of a large directory is O(entries in it). It is
+        // paid once per machine rather than once per run — the check at the head
+        // of this function returns early on every later run — and `Reach` is what
+        // decides whether a path is worth walking at all. That is what N5
+        // measures on this backend.
+        //
         // SAFETY: `wpath` is live, `merged` is the ACL just built and still
         // owned by `_merged`, and the owner, group and SACL arguments are null,
-        // which with `DACL_SECURITY_INFORMATION` alone means "change only the
-        // DACL".
-        let rc = unsafe {
-            SetNamedSecurityInfoW(
-                wpath.as_ptr(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                merged,
-                std::ptr::null(),
-            )
-        };
-        if rc != ERROR_SUCCESS {
-            return Err(io::Error::from_raw_os_error(rc as i32));
+        // which with the DACL bits alone means "change only the DACL".
+        match reach {
+            Reach::Tree => {
+                // **`TreeSetNamedSecurityInfoW`, because one locked file must not
+                // lose the whole grant.** `SetNamedSecurityInfoW` propagates
+                // until something refuses it and then returns that error, and a
+                // registry cache being read by another `cargo` at that moment is
+                // enough: the grant fails, `run_contained` declines, and the run
+                // silently gets the Job Object with no access boundary at all.
+                // That is what the crate's own gate caught — it ran, it passed,
+                // and it was not in a container.
+                //
+                // The tree variant visits the whole subtree and keeps going past
+                // an object it cannot set, which is the behaviour a best-effort
+                // grant over someone else's cache directory wants. `TREE_SEC_INFO_SET`
+                // is 1 and `ProgressInvokeNever` is 1; with no callback there is
+                // nothing for it to report to, and the return value still tells
+                // us whether the *root* could be set.
+                let rc = unsafe {
+                    TreeSetNamedSecurityInfoW(
+                        wpath.as_ptr(),
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        merged,
+                        std::ptr::null_mut(),
+                        1,
+                        None,
+                        1,
+                        std::ptr::null_mut(),
+                    )
+                };
+                // **A descendant that refused is not a failed grant, and the
+                // difference decides whether the run is contained at all.**
+                // The tree walk crosses a directory that other processes are
+                // using — `CARGO_HOME` is being read by the very build that
+                // asked for the sandbox — so a locked object is ordinary. The
+                // call reports it and the whole grant used to be discarded,
+                // which made `run_contained` decline and handed the command to
+                // the Job Object with no access boundary: the crate's own gate
+                // ran, passed, and was not in a container.
+                //
+                // So the *root* is what decides. If it carries the ACE the grant
+                // stands, with the failure logged; if it does not, nothing under
+                // it can have been set either and the error is real.
+                if rc != ERROR_SUCCESS {
+                    let want = access.mask();
+                    let root_has = granted_mask(path, sid).is_some_and(|have| have & want == want);
+                    if !root_has {
+                        return Err(io::Error::from_raw_os_error(rc as i32));
+                    }
+                    tracing::warn!(
+                        path = %path.display(),
+                        "sandbox: the container's grant reached this directory but not every \
+                         object under it (os error {rc}); something else holds one of them"
+                    );
+                }
+            }
+            Reach::DirectoryOnly => set_dacl_on_this_object_alone(path, merged)?,
         }
+        granted_here()
+            .lock()
+            .expect("the grant memo is not poisoned")
+            .insert(memo_key);
         tracing::debug!(path = %path.display(), ?access, "sandbox: granted the AppContainer");
+        Ok(())
+    }
+
+    /// Write `dacl` onto `path` **and onto nothing else**.
+    ///
+    /// **Both `aclapi` entry points walk the subtree, and that is the whole
+    /// reason this exists.** `SetNamedSecurityInfoW` and `SetSecurityInfo` are
+    /// documented to "impose the current inheritance model on the ACLs of all
+    /// objects in the hierarchy below the target object" — the flag this module
+    /// varies by `Reach` decides whether existing children are *recomputed*, not
+    /// whether they are visited, and an ACE with `NO_INHERITANCE` does not spare
+    /// them either. The ancestors of a granted path include `%LOCALAPPDATA%`, so
+    /// one traverse grant meant enumerating the whole user profile: both Windows
+    /// legs of the run that introduced it were still going at forty minutes, with
+    /// tests that spawn a single contained command sitting at over three hundred
+    /// seconds each.
+    ///
+    /// The propagation is a user-mode convenience of `aclapi`, not something the
+    /// kernel does. `SetKernelObjectSecurity` sets the descriptor on the object
+    /// the handle names and returns, which is exactly the semantics a directory
+    /// granted for what it will *later* hold wants — new children inherit from
+    /// it, existing ones are not touched and not read.
+    ///
+    /// The DACL is written unprotected: nothing here sets `SE_DACL_PROTECTED`, so
+    /// the directory still inherits from its own parent as it did before.
+    fn set_dacl_on_this_object_alone(path: &Path, dacl: *mut ACL) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        // Opening a *directory* needs backup semantics; the two rights are the
+        // least that lets a DACL be read and replaced.
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        const WRITE_DAC: u32 = 0x0004_0000;
+
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)?;
+
+        // An absolute security descriptor carrying just this DACL. `SECURITY_DESCRIPTOR_REVISION`
+        // is 1 and has been for the life of the API.
+        let mut sd: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
+        let psd = std::ptr::from_mut(&mut sd).cast::<core::ffi::c_void>();
+        // SAFETY: `sd` is a live, correctly sized descriptor owned by this frame.
+        if unsafe { InitializeSecurityDescriptor(psd, 1) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `psd` is the descriptor just initialised and `dacl` is the ACL
+        // the caller still owns for the rest of this call. `TRUE` for present,
+        // `FALSE` for defaulted: this DACL is deliberate, not a default.
+        if unsafe { SetSecurityDescriptorDacl(psd, 1, dacl, 0) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the handle is open for `WRITE_DAC` and lives until the end of
+        // this function; `psd` is a valid absolute descriptor whose DACL outlives
+        // the call.
+        if unsafe {
+            SetKernelObjectSecurity(
+                dir.as_raw_handle() as HANDLE,
+                DACL_SECURITY_INFORMATION,
+                psd,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
         Ok(())
     }
 
@@ -457,7 +879,15 @@ mod win {
                     std::ptr::null(),
                     std::ptr::null(),
                     1,
-                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                    // `CREATE_SUSPENDED` since 0.47.0, and it is the same
+                    // correctness argument `super::super::windows` makes for the
+                    // Job Object — now holding twice, because this process has
+                    // to join the job *as well as* the container. A process that
+                    // runs even briefly outside the job can spawn a descendant
+                    // that is never a member, which then outlives the run and
+                    // ignores every limit, and nothing reports a failure. The
+                    // caller assigns and then calls `resume`.
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                     std::ptr::null(),
                     wcwd.as_ptr(),
                     std::ptr::from_mut(&mut si).cast::<STARTUPINFOW>(),
@@ -473,6 +903,35 @@ mod win {
                 thread: pi.hThread,
                 reaped: false,
             })
+        }
+
+        /// The process handle, for the caller that has to assign this process to
+        /// a Job Object before it runs.
+        ///
+        /// Borrowed, never owned: `Spawned` closes both handles in `Drop` and
+        /// stays the only owner. A caller that closed this would leave `Drop`
+        /// closing a handle it does not have.
+        pub(crate) fn process(&self) -> HANDLE {
+            self.process
+        }
+
+        /// Let the initial thread run.
+        ///
+        /// Called after the process has been assigned to its job, which is the
+        /// only ordering under which there is no instant where the process is
+        /// both running and unassigned.
+        ///
+        /// Unlike `super::super::windows::job`, this needs no ToolHelp thread
+        /// snapshot: `CreateProcessW` handed back the initial thread's handle and
+        /// this type kept it. That detour exists only on the `std::Command` path,
+        /// which closes the thread handle before returning a `Child`.
+        pub(crate) fn resume(&self) -> io::Result<()> {
+            // SAFETY: `self.thread` is this type's own still-open handle to the
+            // initial thread of a suspended process.
+            if unsafe { ResumeThread(self.thread) } == u32::MAX {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         /// Wait up to `ms` for the process, killing it if the ceiling is reached.
@@ -549,7 +1008,7 @@ mod win {
 /// quietly recording the denial as evidence.
 #[cfg(all(test, windows))]
 mod tests {
-    use super::win::{grant, Access, Profile, Spawned};
+    use super::win::{grant, granted_mask, Access, Profile, Reach, Spawned};
     use std::io::Read;
     use std::os::windows::process::CommandExt;
 
@@ -562,19 +1021,23 @@ mod tests {
     /// Run `cmdline` inside a container that has `Full` access to `cwd`, and
     /// return its exit code and combined output.
     fn in_container(tag: &str, cmdline: &str, cwd: &std::path::Path) -> (Option<i32>, String) {
-        let profile = Profile::create(&name(tag)).unwrap_or_else(|e| {
+        let profile = Profile::create(&name(tag), false).unwrap_or_else(|e| {
             panic!(
                 "F1: could not create an AppContainer profile on this host ({e}). This is \
                  fallback_scope Trigger A: the release's central mechanism is unavailable here."
             )
         });
-        grant(cwd, profile.sid(), Access::Full)
+        grant(cwd, profile.sid(), Access::Full, Reach::Tree)
             .unwrap_or_else(|e| panic!("could not grant the workspace to the container: {e}"));
 
         let out_path = cwd.join("io-harness-out.txt");
         let file = std::fs::File::create(&out_path).expect("create the capture file");
         let mut child = Spawned::start(cmdline, cwd, profile.sid(), &file)
             .unwrap_or_else(|e| panic!("F1: CreateProcessW into the AppContainer failed: {e}"));
+        // 0.47.0 spawns suspended so the backend can put the process in its
+        // job object before it runs an instruction. A caller that only starts
+        // and waits gets a frozen process and a wall-clock kill.
+        child.resume().expect("resume the contained process");
         drop(file);
 
         let code = child.wait(30_000).expect("wait");
@@ -716,9 +1179,10 @@ mod tests {
         let bin_dir = exe.parent().expect("it has a directory").to_path_buf();
         let work = tempfile::tempdir().expect("tempdir");
 
-        let profile = Profile::create(&name("toolchain")).expect("profile");
-        grant(work.path(), profile.sid(), Access::Full).expect("grant the workspace");
-        grant(&bin_dir, profile.sid(), Access::ReadExecute).expect("grant the binary's directory");
+        let profile = Profile::create(&name("toolchain"), false).expect("profile");
+        grant(work.path(), profile.sid(), Access::Full, Reach::Tree).expect("grant the workspace");
+        grant(&bin_dir, profile.sid(), Access::ReadExecute, Reach::Tree)
+            .expect("grant the binary's directory");
 
         let out_path = work.path().join("o.txt");
         let file = std::fs::File::create(&out_path).expect("capture");
@@ -730,6 +1194,7 @@ mod tests {
         );
         let mut child =
             Spawned::start(&line, work.path(), profile.sid(), &file).expect("spawn the payload");
+        child.resume().expect("resume the contained process");
         let code = child.wait(60_000).expect("wait");
 
         let mut text = String::new();
@@ -745,6 +1210,85 @@ mod tests {
         );
     }
 
+    /// **How deep a grant on a directory actually goes**, read off the ACL.
+    ///
+    /// `grant` adds one inheritable ACE and relies on the system to re-propagate
+    /// it to what is already inside — the whole of the fix that took
+    /// `windows-latest` from thirty-six failures to thirteen. Every one of the
+    /// thirteen that is left has the same shape: the payload it could not reach
+    /// is **two** levels under a granted directory (`%TEMP%\.tmpXXXX\ok.bat`,
+    /// `<workspace>\src\lib.rs`) while every case that works is one
+    /// (`<workspace>\a.rs`, `<bindir>\test.exe`).
+    ///
+    /// So this measures the depth rather than arguing about it: one file at each
+    /// of three levels, the ACL read back at each, and the payload run at each.
+    /// A failure here names the level, which is the fact the next fix needs.
+    #[test]
+    fn a_grant_on_a_directory_reaches_every_depth_under_it() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let mid = root.path().join("mid");
+        let deep = mid.join("deeper");
+        std::fs::create_dir_all(&deep).expect("the two directories under the root");
+
+        let payload = |dir: &std::path::Path| {
+            let p = dir.join("depth.bat");
+            std::fs::write(&p, "@echo off\r\necho io-harness-depth\r\n")
+                .expect("write the payload");
+            p
+        };
+        let at0 = payload(root.path());
+        let at1 = payload(&mid);
+        let at2 = payload(&deep);
+        let _ = (&at0, &at1, &at2);
+
+        let profile = Profile::create(&name("depth"), false).expect("profile");
+        grant(root.path(), profile.sid(), Access::Full, Reach::Tree).expect("grant the root");
+
+        // The ACL first: a payload that fails cannot say whether the ACE was
+        // missing or insufficient, and that is the question.
+        let masks = [
+            granted_mask(&at0, profile.sid()),
+            granted_mask(&at1, profile.sid()),
+            granted_mask(&at2, profile.sid()),
+        ];
+        assert!(
+            masks.iter().all(Option::is_some),
+            "a grant on a directory did not reach every file under it — depth 0/1/2 \
+             masks {masks:?}. A `None` names the level the system's re-propagation \
+             stopped at, and the level below it is where every remaining Windows \
+             failure lives."
+        );
+
+        // And then the behaviour, so the ACL is not being read as a proxy for it.
+        //
+        // Each payload is named **relative to its own directory**, which is the
+        // working directory the spawn is given. Inside an AppContainer `cmd.exe`
+        // refuses to start a batch file named by an absolute path, however the
+        // file is granted and wherever it lives — see the capability table in
+        // `super::super::windows`, which reads that same file by absolute path
+        // and gets its contents. Naming it absolutely here would be testing that
+        // behaviour of `cmd` rather than how far the grant reached.
+        for (level, dir) in [root.path(), &mid, &deep].iter().enumerate() {
+            let out_path = root.path().join(format!("o{level}.txt"));
+            let file = std::fs::File::create(&out_path).expect("capture");
+            let line = "cmd.exe /c depth.bat".to_string();
+            let mut child =
+                Spawned::start(&line, dir, profile.sid(), &file).expect("spawn the payload");
+            child.resume().expect("resume");
+            let code = child.wait(30_000).expect("wait");
+            drop(file);
+            let mut text = String::new();
+            std::fs::File::open(&out_path)
+                .and_then(|mut f| f.read_to_string(&mut text))
+                .ok();
+            assert_eq!(
+                code,
+                Some(0),
+                "the payload {level} level(s) under the granted directory did not run: {text:?}"
+            );
+        }
+    }
+
     /// F4 — the wall clock fires, and does not fire on a payload that finishes.
     ///
     /// Both halves, because a ceiling that always fires and a ceiling that never
@@ -752,8 +1296,8 @@ mod tests {
     #[test]
     fn the_wall_clock_kills_only_what_overruns() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let profile = Profile::create(&name("wall")).expect("profile");
-        grant(dir.path(), profile.sid(), Access::Full).expect("grant");
+        let profile = Profile::create(&name("wall"), false).expect("profile");
+        grant(dir.path(), profile.sid(), Access::Full, Reach::Tree).expect("grant");
         let file = std::fs::File::create(dir.path().join("o.txt")).expect("capture");
 
         // A `cmd` builtin loop, and every obvious alternative is wrong here:
@@ -775,6 +1319,7 @@ mod tests {
             &file,
         )
         .expect("spawn the slow payload");
+        slow.resume().expect("resume the contained process");
         assert_eq!(
             slow.wait(1_000).expect("wait"),
             None,
@@ -783,6 +1328,7 @@ mod tests {
 
         let mut quick =
             Spawned::start("cmd.exe /c exit 7", dir.path(), profile.sid(), &file).expect("spawn");
+        quick.resume().expect("resume the contained process");
         assert_eq!(
             quick.wait(30_000).expect("wait"),
             Some(7),

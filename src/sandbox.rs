@@ -80,6 +80,31 @@ use crate::error::Result;
 pub enum Backend {
     /// macOS `sandbox-exec` profile + rlimits + RSS monitor.
     MacosSandboxExec,
+    /// Linux Landlock: a filesystem ruleset restricting this process and every
+    /// descendant, applied between fork and exec, plus `PR_SET_NO_NEW_PRIVS`, a
+    /// seccomp deny-list, and the shared rlimits.
+    ///
+    /// **No namespace is involved**, which is the entire reason this rung
+    /// exists: a stock Ubuntu 24.04 refuses an unprivileged user namespace and
+    /// ships Landlock enabled, so this is what a contained run on the commonest
+    /// Linux CI image actually gets. It is also the only rung with no wrapper
+    /// process — the restriction is installed in the child itself — so the argv
+    /// spawned is the argv asked for.
+    ///
+    /// Egress is denied here only when the kernel's Landlock ABI carries the
+    /// network rules (4 and later). A run that denies egress on an older kernel
+    /// is given a lower rung instead of this one, so this backend never names a
+    /// network boundary it did not apply.
+    LinuxLandlock,
+    /// Linux `bwrap` (bubblewrap): a mount namespace with the tree bound
+    /// read-only and the run's writable roots bound back over it, plus a network
+    /// namespace when egress is denied, plus the shared rlimits.
+    ///
+    /// Beneath [`LinuxLandlock`](Backend::LinuxLandlock) because it needs a
+    /// helper the host may not have; above [`LinuxNamespaces`](Backend::LinuxNamespaces)
+    /// because a setuid `bwrap` works on the hosts whose kernel refuses this
+    /// crate's own `unshare` wrapper.
+    LinuxBubblewrap,
     /// Linux user/mount/pid/net namespaces + rlimits. The crate installs no
     /// seccomp filter; only the kernel's own defaults for an unprivileged user
     /// namespace apply on top.
@@ -94,10 +119,74 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Does a run under this backend have its writes confined to what the mode
+    /// granted?
+    ///
+    /// **One exhaustive `match`, and that is the entire point of it.** Before
+    /// 0.47.0 this question was answered by `matches!(backend, MacosSandboxExec |
+    /// LinuxNamespaces)` written out in four places across the test suite. When
+    /// the chain added three backends, every one of those lists was silently
+    /// wrong — a host reporting `LinuxLandlock` took the branch meaning "this
+    /// backend confines nothing" and asserted that a write it had correctly
+    /// refused ought to have landed. Four CI rounds went on that one shape.
+    ///
+    /// A `match` with no wildcard cannot go stale: the next backend added to this
+    /// enum is a compile error here, in one place, instead of a passing test
+    /// somewhere else that proves nothing.
+    ///
+    /// ```
+    /// use io_harness::Backend;
+    ///
+    /// assert!(Backend::MacosSandboxExec.confines_writes());
+    /// // A Job Object has no filesystem facility at all.
+    /// assert!(!Backend::WindowsJobObject.confines_writes());
+    /// assert!(!Backend::PortableFloor.confines_writes());
+    /// ```
+    pub fn confines_writes(&self) -> bool {
+        match self {
+            Backend::MacosSandboxExec
+            | Backend::LinuxLandlock
+            | Backend::LinuxBubblewrap
+            | Backend::LinuxNamespaces => true,
+            // A Job Object is a resource container: there is no path rule to set
+            // on one. The floor is an ephemeral working directory and nothing.
+            Backend::WindowsJobObject | Backend::PortableFloor => false,
+        }
+    }
+
+    /// Does this backend enforce the run's egress answer with a real boundary,
+    /// rather than approximating it by stripping proxy variables?
+    ///
+    /// Same exhaustive shape and the same reason. Note that a backend reported by
+    /// [`Sandbox::backend`] for a run that denies egress already satisfies the
+    /// chain's honesty rule — a rung that cannot deny egress is never handed such
+    /// a run — so `LinuxLandlock` appearing here is a consequence of that rule and
+    /// not an assumption on top of it.
+    ///
+    /// ```
+    /// use io_harness::Backend;
+    ///
+    /// assert!(Backend::LinuxNamespaces.denies_egress());
+    /// // The floor's denial is a proxy-environment strip, which a payload that
+    /// // does not read those variables ignores completely.
+    /// assert!(!Backend::PortableFloor.denies_egress());
+    /// ```
+    pub fn denies_egress(&self) -> bool {
+        match self {
+            Backend::MacosSandboxExec
+            | Backend::LinuxLandlock
+            | Backend::LinuxBubblewrap
+            | Backend::LinuxNamespaces => true,
+            Backend::WindowsJobObject | Backend::PortableFloor => false,
+        }
+    }
+
     /// A stable label for the trace and logs.
     pub fn as_str(&self) -> &'static str {
         match self {
             Backend::MacosSandboxExec => "macos-sandbox-exec",
+            Backend::LinuxLandlock => "linux-landlock",
+            Backend::LinuxBubblewrap => "linux-bubblewrap",
             Backend::LinuxNamespaces => "linux-namespaces",
             Backend::WindowsJobObject => "windows-job-object",
             Backend::PortableFloor => "portable-floor",
@@ -949,6 +1038,53 @@ pub(crate) fn writable_cache_roots(
     roots
 }
 
+/// Where on this machine `program` actually is, by the shell's own rule (0.47.0).
+///
+/// A program with a separator in it is a path and is answered as one; anything
+/// else is looked for in each `PATH` entry, and on Windows under each `PATHEXT`
+/// extension as well. It is not asked to decide *executability* — a file that
+/// exists and cannot be executed is a real failure with a real message, and
+/// reporting it as "not installed" would be a worse answer than the operating
+/// system's own.
+///
+/// Two callers need this and they need different halves of it. `exec` asks
+/// whether a contained spawn would find the payload at all, because a contained
+/// spawn is of a wrapper that exists and would otherwise report a missing program
+/// as its own failure (0.46.0). The Windows container asks *where* it is, because
+/// an AppContainer must be granted read-execute on the program's own directory or
+/// it cannot load the binary — and until 0.47.0 that grant was derived from
+/// `argv[0]` verbatim, so a command named the way every command is named
+/// (`cargo`, `rustc`, `npm`) yielded the parent of a bare filename, which is the
+/// empty path, and the directory the run needed most was granted to nothing.
+pub(crate) fn resolve_program(program: &str) -> Option<PathBuf> {
+    let looks_like_a_path = program.contains('/') || (cfg!(windows) && program.contains('\\'));
+    if looks_like_a_path {
+        let p = Path::new(program);
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| e.to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    std::env::split_paths(&path).find_map(|dir| {
+        let direct = dir.join(program);
+        if direct.is_file() {
+            return Some(direct);
+        }
+        exts.iter().find_map(|ext| {
+            let candidate = dir.join(format!("{program}{ext}"));
+            candidate.is_file().then_some(candidate)
+        })
+    })
+}
+
 /// The argv this host's backend would run, and the backend it chose.
 ///
 /// The native backends confine a command by *wrapping its argv* — macOS prepends
@@ -984,8 +1120,82 @@ pub(crate) fn wrap_argv(
             linux::unshare_argv(argv, workdir, allow_network, config.mode, writable_roots),
         );
     }
-    let _ = writable_roots;
+    #[cfg(target_os = "linux")]
+    if backend == Backend::LinuxBubblewrap {
+        return (
+            backend,
+            linux::bwrap_argv(argv, workdir, allow_network, config.mode, writable_roots),
+        );
+    }
+    // On a platform with no argv-wrapping branch above — Windows, and any host
+    // that took the floor — none of these is read. Named rather than
+    // underscore-prefixed because every other platform does use them, and a
+    // parameter called `_workdir` in a signature this shared would read as if the
+    // working directory were ignored everywhere.
+    let _ = (workdir, allow_network, writable_roots);
     (backend, argv.to_vec())
+}
+
+/// Apply the containment that is **not** expressible as an argv wrapper.
+///
+/// [`wrap_argv`] answers "what should this command become" and is all the `shell`
+/// tool can use: it pipes stages into one another and therefore cannot hand an
+/// argv to [`Sandbox::run`] at all. That was enough while every rung was a
+/// wrapper program. The Landlock rung is not — it installs its restriction in the
+/// child between fork and exec — so a path that only rewrites argv would spawn a
+/// completely unconfined stage while `wrap_argv` reported a confining backend.
+///
+/// The CI matrix found exactly that: a contained shell line's second stage wrote
+/// outside the workspace. This is the other half of the answer, and the two are
+/// called together or neither is right.
+///
+/// The returned value must be held until after the spawn — it owns the rule set
+/// the child will apply. Dropping it early closes the descriptor.
+#[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+pub(crate) fn contain_command(
+    cmd: &mut tokio::process::Command,
+    config: &SandboxConfig,
+    workdir: &Path,
+    allow_network: bool,
+    writable_roots: &[PathBuf],
+) -> Option<Contained> {
+    #[cfg(target_os = "linux")]
+    {
+        if select(config).backend() != Backend::LinuxLandlock {
+            return None;
+        }
+        let abi = landlock::abi()?;
+        let tmp = std::env::temp_dir();
+        let plan = landlock::plan(
+            abi,
+            config.mode,
+            !allow_network,
+            workdir,
+            writable_roots,
+            &tmp,
+        );
+        let ruleset = landlock::Ruleset::build(&plan).ok()?;
+        let fd = ruleset.raw();
+        // SAFETY: the closure runs in the forked child before `exec`, allocates
+        // nothing and calls only `prctl`, `landlock_restrict_self` and one
+        // `seccomp` install. `fd` belongs to the returned guard, which the caller
+        // holds across the spawn.
+        unsafe {
+            cmd.pre_exec(move || {
+                landlock::restrict_self(fd)?;
+                seccomp::install()
+            });
+        }
+        Some(Contained { _ruleset: ruleset })
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+/// The rule set a [`contain_command`] child will apply, alive until the spawn.
+pub(crate) struct Contained {
+    #[cfg(target_os = "linux")]
+    _ruleset: landlock::Ruleset,
 }
 
 async fn run_capped(
@@ -1505,6 +1715,20 @@ pub async fn copy_back(
 pub mod linux;
 pub mod macos;
 pub mod windows;
+
+// The Landlock rung follows the same split: its rule *plan* — which paths, which
+// rights, masked to which ABI — is portable data with no descriptor in it and is
+// unit-tested on the build host, while the syscalls that create and apply a rule
+// set are `cfg(target_os = "linux")`. Most of what can go wrong in this rung is
+// in the plan, and the plan is the half that does not need a matrix round.
+pub(crate) mod landlock;
+
+// The seccomp deny-list installed beside the Landlock rule set. Unlike the rung
+// itself this module has no portable half worth compiling elsewhere — it is a
+// BPF program in one architecture's syscall numbers — so the whole file is
+// `cfg(target_os = "linux")` and is proven on the Linux legs or nowhere.
+#[cfg(target_os = "linux")]
+pub(crate) mod seccomp;
 
 // The AppContainer half is the exception to the paragraph above: it has no
 // portable logic to unit-test on the build host, because unlike a Job Object's
